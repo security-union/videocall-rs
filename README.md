@@ -1,4 +1,4 @@
-# Docker + Actix + Yew Full Stack Template
+# Rust Zoom
 
 [![IMAGE ALT TEXT](http://img.youtube.com/vi/oCiGjrpGk4A/maxresdefault.jpg)](https://youtu.be/oCiGjrpGk4A "YouTube video")
 

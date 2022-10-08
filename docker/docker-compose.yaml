@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  yew-ui:
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+    build: 
+      dockerfile: ../docker/Dockerfile.yew
+    command: bash -c "cd app/yew-ui && trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
+    environment:
+      - ACTIX_PORT=${ACTIX_PORT:-8080}
+      - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
+      - ENABLE_OAUTH=true
+      - LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login
+    ports:
+      - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
+
+  actix-api:
+    build: 
+      dockerfile: ../docker/Dockerfile.actix
+    command: bash -c "cd app/actix-api && cargo watch -x \"run\""
+    environment:
+      - ACTIX_PORT=${ACTIX_PORT:-8080}
+      - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
+      - TRUNK_SERVE_HOST=localhost
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
+      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL}
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+      - OAUTH_REDIRECT_URL=http://localhost:${ACTIX_PORT:-8080}/login/callback
+      - RUST_LOG=info
+      - PG_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+    ports:
+      - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+    depends_on:
+      - postgres
+
+  dbmate:
+    volumes:
+        - ../dbmate/db:/app/db
+    build:
+        context: ../dbmate 
+    environment:
+        DATABASE_URL: "postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable"
+    depends_on:
+      - postgres
+  
+  postgres:
+    image: postgres:12
+    environment:
+      POSTGRES_PASSWORD: "docker"
+      PGPASSWORD: "docker"
+    ports:
+      - 5432

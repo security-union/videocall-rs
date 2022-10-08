@@ -1,0 +1,24 @@
+table {
+    margin-left: auto;
+    margin-right: auto;
+    font-family:'Gilroy', sans-serif;
+    font-size: 36px;
+    width: 75%;
+}
+
+body {
+    color: white;
+    background-color: black
+}
+
+html,body {
+    height:100%;
+    width:100%;
+    margin:0;
+  }
+  body {
+    display:flex;
+  }
+  input {
+    margin:auto;/* nice thing of auto margin if display:flex; it center both horizontal and vertical :) */
+  }

@@ -13,11 +13,11 @@ reqwasm = "0.5.0"
 types = { path= "../types"}
 const_format="0.2.25"
 lazy_static = "1.4.0"
-gloo-console = "0.2.1"
+gloo-console = "0.2.3"
 gloo-utils = "0.1"
 yew-router = "0.16"
 js-sys = "0.3"
-
+yew-websocket = { git = "https://github.com/security-union/yew-websocket.git", rev = "b29388a50c54c417db9cf0bf40033f62d9c616ab" }
 [dependencies.web-sys]
 version = "0.3.60"
 features = [
@@ -50,3 +50,4 @@ features = [
     "VideoDecoderConfig",
     "VideoDecoderInit"
 ]
+

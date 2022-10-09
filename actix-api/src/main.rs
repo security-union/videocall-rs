@@ -1,3 +1,6 @@
+mod actors;
+mod models;
+
 use actix_cors::Cors;
 use actix_web::{
     cookie::{
@@ -6,11 +9,14 @@ use actix_web::{
     },
     error, get, http,
     web::{self, Json},
-    App, Error, HttpResponse, HttpServer,
+    App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
+use actix_web_actors::ws;
 
-use crate::auth::{
-    fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
+use crate::{
+    actors::chat_session::WsChatSession,
+    auth::{fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user},
+    models::AppState,
 };
 use crate::{
     auth::AuthRequest,
@@ -146,6 +152,17 @@ async fn greet(name: web::Path<String>) -> Json<HelloResponse> {
     })
 }
 
+#[get("/lobby/{id}")]
+pub async fn ws_connect(
+    id: String,
+    req: HttpRequest,
+    stream: web::Payload,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let chat = state.chat.clone();
+    ws::start(WsChatSession::new(chat), &req, stream)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
@@ -173,6 +190,7 @@ async fn main() -> std::io::Result<()> {
             .service(greet)
             .service(handle_google_oauth_callback)
             .service(login)
+            .service(ws_connect)
     })
     .bind(("0.0.0.0", ACTIX_PORT.parse::<u16>().unwrap()))?
     .run()

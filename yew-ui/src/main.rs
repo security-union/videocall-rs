@@ -3,7 +3,6 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Number;
 use js_sys::Reflect;
-use js_sys::Uint8Array;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
@@ -158,7 +157,7 @@ fn meeting(props: &MeetingProps) -> Html {
                     let mut chunk_data = chunk_data.as_mut_slice();
                     chunk.copy_to_with_u8_array(&mut chunk_data);
                     media_packet.video = chunk_data.to_vec();
-
+                    log!("yolo!!!");
                     // let video_chunk = chunk.unchecked_into::<EncodedVideoChunk>();
                     // video_context.dispatch(
                     //     EncodedVideoChunkWrapper { chunk: Some(video_chunk)}

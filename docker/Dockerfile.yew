@@ -1,6 +1,7 @@
 FROM rust:1.62-slim-bullseye
 
 RUN apt-get --yes update && apt-get --yes install pkg-config libssl-dev
-RUN cargo install trunk wasm-bindgen-cli
+RUN cargo install wasm-bindgen-cli --version 0.2.78
+RUN cargo install trunk --version 0.16.0
 RUN rustup target add wasm32-unknown-unknown
 

@@ -1,51 +1,53 @@
-use crate::{
-    actors::chat_server::ChatServer,
-    constants::CLIENT_TIMEOUT,
-    models::{RoomId, SessionId, UserInfo},
-};
+use crate::messages;
+use crate::messages::server::MediaPacketUpdate;
+use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
+
 use crate::{
     constants::HEARTBEAT_INTERVAL,
-    messages::{
-        server::{ClientMessage, Connect, CreateRoom, Disconnect, JoinRoom, Leave},
-        session::{
-            command::Command,
-            wsmessage::{MessageType, WsMessage},
-            Message,
-        },
-    },
+    messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
 };
+use actix::ActorFutureExt;
 use actix::{
-    clock::Instant, fut, ActorContext, ActorFuture, ContextFutureSpawner, Handler, Running,
-    StreamHandler, WrapFuture,
+    clock::Instant, fut, ActorContext, ContextFutureSpawner, Handler, Running, StreamHandler,
+    WrapFuture,
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
+use log::{error, info};
+use protobuf::Message;
 use serde_json::json;
 use std::str::FromStr;
+use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
+
+pub type RoomId = String;
+pub type Email = String;
+pub type SessionId = String;
 
 pub struct WsChatSession {
     pub id: SessionId,
-    pub room: Option<RoomId>,
+    pub room: RoomId,
     pub addr: Addr<ChatServer>,
-    pub hb: Instant,
-    pub user: UserInfo,
+    pub heartbeat: Instant,
+    pub email: Email,
 }
 
 impl WsChatSession {
-    pub fn new(addr: Addr<ChatServer>) -> Self {
-        WsChatSession {
-            id: Uuid::new_v4(),
-            room: None,
-            hb: Instant::now(),
-            user: UserInfo::default(),
+    pub fn new(addr: Addr<ChatServer>, room: String, email: String) -> Self {
+        let session = WsChatSession {
+            id: Uuid::new_v4().to_string(),
+            heartbeat: Instant::now(),
+            room,
+            email,
             addr,
-        }
+        };
+
+        session
     }
 
-    fn hb(&self, ctx: &mut WebsocketContext<Self>) {
+    fn heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
-            if Instant::now().duration_since(act.hb) > CLIENT_TIMEOUT {
+            if Instant::now().duration_since(act.heartbeat) > CLIENT_TIMEOUT {
                 // heartbeat timed out
                 println!("Websocket Client heartbeat failed, disconnecting!");
                 // notify chat server
@@ -64,7 +66,7 @@ impl Actor for WsChatSession {
     type Context = WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        self.hb(ctx);
+        self.heartbeat(ctx);
         let addr = ctx.address();
         self.addr
             .send(Connect {
@@ -74,12 +76,13 @@ impl Actor for WsChatSession {
             .into_actor(self)
             .then(|res, _act, ctx| {
                 if let Err(err) = res {
-                    ctx.text(WsMessage::err(err.to_string()));
+                    // ctx.text(WsMessage::err(err.to_string()));
                     ctx.stop();
                 }
                 fut::ready(())
             })
             .wait(ctx);
+        self.join(self.room, ctx);
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
@@ -91,14 +94,12 @@ impl Actor for WsChatSession {
     }
 }
 
-impl Handler<Message> for WsChatSession {
+impl Handler<messages::session::Message> for WsChatSession {
     type Result = ();
 
-    fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
-        ctx.text(WsMessage {
-            ty: MessageType::Msg,
-            data: json!(msg),
-        });
+    fn handle(&mut self, msg: messages::session::Message, ctx: &mut Self::Context) -> Self::Result {
+        let media_packet = msg.msg.write_to_bytes().unwrap();
+        ctx.binary(media_packet);
     }
 }
 
@@ -107,23 +108,30 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
         let msg = match item {
             Ok(msg) => msg,
             Err(err) => {
-                ctx.text(WsMessage::err(err.to_string()));
+                // ctx.text(WsMessage::err(err.to_string()));
                 ctx.stop();
                 return;
             }
         };
 
         match msg {
-            ws::Message::Text(msg) => match serde_json::from_str::<WsMessage>(&msg) {
-                Ok(content) => ctx.notify(content),
-                Err(err) => ctx.text(WsMessage::err(err.to_string())),
-            },
+            ws::Message::Binary(msg) => {
+                let message: protobuf::Result<MediaPacket> =
+                    protobuf::Message::parse_from_bytes(&msg);
+                match message {
+                    Ok(mediaPacket) => ctx.notify(MediaPacketUpdate { mediaPacket }),
+                    Err(err) => {
+                        error!("error {:?}", err);
+                        // ctx.text(WsMessage::err(err.to_string()))
+                    }
+                }
+            }
             ws::Message::Ping(msg) => {
-                self.hb = Instant::now();
+                self.heartbeat = Instant::now();
                 ctx.pong(&msg);
             }
             ws::Message::Pong(_) => {
-                self.hb = Instant::now();
+                self.heartbeat = Instant::now();
             }
             ws::Message::Close(reason) => {
                 ctx.close(reason);
@@ -132,52 +140,29 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             _ => (),
         }
     }
-}
 
-impl Handler<WsMessage> for WsChatSession {
-    type Result = ();
+    fn started(&mut self, ctx: &mut Self::Context) {}
 
-    fn handle(&mut self, msg: WsMessage, ctx: &mut Self::Context) -> Self::Result {
-        let data = msg.data.as_str().unwrap();
-        match msg.ty {
-            MessageType::Create => self.create(ctx),
-            MessageType::Join => match Uuid::from_str(&data) {
-                Ok(uuid) => self.join(uuid, ctx),
-                Err(err) => ctx.text(WsMessage::err(err.to_string())),
-            },
-            MessageType::Msg => self.msg(data.into(), ctx),
-            MessageType::Leave => self.leave(ctx),
-            _ => (),
-        }
+    fn finished(&mut self, ctx: &mut Self::Context) {
+        ctx.stop()
     }
 }
+
+// impl Handler<WsMessage> for WsChatSession {
+//     type Result = ();
+
+//     fn handle(&mut self, msg: WsMessage, ctx: &mut Self::Context) -> Self::Result {
+//         let data = msg.data.as_str().unwrap();
+//         match msg.ty {
+//             MessageType::Msg => self.msg(data.into(), ctx),
+//             MessageType::Leave => self.leave(ctx),
+//             _ => (),
+//         }
+//     }
+// }
 
 impl WsChatSession {
-    fn create(&self, ctx: &mut WebsocketContext<Self>) {
-        let send_create = self.addr.send(CreateRoom {
-            session: self.id.clone(),
-        });
-        let send_create = send_create.into_actor(self);
-        send_create
-            .then(move |res, act, ctx| {
-                // Actor's state updated here
-                match res {
-                    Ok(res) => {
-                        act.room = Some(res.clone());
-                        ctx.text(WsMessage::info(res.to_string()));
-                    }
-                    // something is wrong with chat server
-                    Err(err) => {
-                        ctx.text(WsMessage::err(err.to_string()));
-                        ctx.stop();
-                    }
-                }
-                fut::ready(())
-            })
-            .wait(ctx);
-    }
-
-    fn join(&self, room_id: Uuid, ctx: &mut WebsocketContext<Self>) {
+    fn join(&self, room_id: String, ctx: &mut WebsocketContext<Self>) {
         let join_room = self.addr.send(JoinRoom {
             room: room_id,
             session: self.id.clone(),
@@ -187,15 +172,18 @@ impl WsChatSession {
             .then(move |response, act, ctx| {
                 match response {
                     Ok(res) if res.is_ok() => {
-                        act.room = Some(room_id.clone());
-                        ctx.text(WsMessage {
-                            ty: MessageType::Msg,
-                            data: json!("Joined!"),
-                        })
+                        act.room = room_id.clone();
+                        // ctx.text(WsMessage {
+                        //     ty: MessageType::Msg,
+                        //     data: json!("Joined!"),
+                        // })
                     }
-                    Ok(res) => ctx.text(WsMessage::err(res.unwrap_err().to_string())),
+                    Ok(res) => {
+                        error!("error {:?}", res);
+                        // ctx.text(WsMessage::err(res.unwrap_err().to_string())),
+                    }
                     Err(err) => {
-                        ctx.text(WsMessage::err(err.to_string()));
+                        // ctx.text(WsMessage::err(err.to_string()));
                         ctx.stop();
                     }
                 }
@@ -204,12 +192,15 @@ impl WsChatSession {
             .wait(ctx);
     }
 
-    fn msg(&self, msg: String, ctx: &mut WebsocketContext<Self>) {
-        match Command::from_str(&msg) {
-            Ok(cmd) => ctx.notify(cmd),
-            Err(err) => ctx.text(WsMessage::err(err.to_string())),
-        }
-    }
+    // fn msg(&self, msg: String, ctx: &mut WebsocketContext<Self>) {
+    //     match Command::from_str(&msg) {
+    //         Ok(cmd) => ctx.notify(cmd),
+    //         Err(err) => {
+    //             error!("error {:?}", err);
+    //             // ctx.text(WsMessage::err(err.to_string())),
+    //         }
+    //     }
+    // }
 
     fn leave(&self, ctx: &mut WebsocketContext<Self>) {
         self.addr
@@ -220,12 +211,12 @@ impl WsChatSession {
             .then(move |res, act, ctx| {
                 match res {
                     Ok(_) => {
-                        act.room = None;
-                        ctx.text(WsMessage::info("Room leaved".into()))
+                        info!("info leaved");
+                        // ctx.text(WsMessage::info("Room leaved".into()))
                     }
                     // something is wrong with chat server
                     Err(err) => {
-                        ctx.text(WsMessage::err(err.to_string()));
+                        // ctx.text(WsMessage::err(err.to_string()));
                         ctx.stop();
                     }
                 }
@@ -235,28 +226,16 @@ impl WsChatSession {
     }
 }
 
-impl Handler<Command> for WsChatSession {
+impl Handler<MediaPacketUpdate> for WsChatSession {
     type Result = ();
 
-    fn handle(&mut self, msg: Command, ctx: &mut Self::Context) -> Self::Result {
-        if let None = self.room {
-            ctx.text(WsMessage::err("You are not in a room".into()));
-            return;
-        }
-        let room_id = self.room.clone().unwrap();
-        match msg {
-            Command::Msg(msg) => {
-                self.addr.do_send(ClientMessage {
-                    session: self.id.clone(),
-                    user: self.user.nickname.clone(),
-                    room: room_id,
-                    msg,
-                });
-            }
-            Command::SetName(name) => self.user.nickname = name,
-            Command::GetRoomId => {
-                ctx.text(WsMessage::info(room_id.to_string()));
-            }
-        }
+    fn handle(&mut self, msg: MediaPacketUpdate, ctx: &mut Self::Context) -> Self::Result {
+        let room_id = self.room.clone();
+        self.addr.do_send(ClientMessage {
+            session: self.id.clone(),
+            user: self.email.clone(),
+            room: room_id,
+            msg,
+        });
     }
 }

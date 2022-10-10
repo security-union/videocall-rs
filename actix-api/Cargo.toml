@@ -22,3 +22,7 @@ jsonwebtoken= "8.1.1"
 base64 = "0.13.0"
 serde_json = "1.0.82"
 anyhow = "1.0.60"
+uuid = { version = "0.8", features = ["serde", "v4"] }
+bytestring = "1.1.0"
+derive_more = "0.99.11"
+protobuf = "3.2.0"

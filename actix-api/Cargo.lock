@@ -36,16 +36,20 @@ dependencies = [
  "actix-web-actors",
  "anyhow",
  "base64",
+ "bytestring",
+ "derive_more",
  "env_logger",
  "jsonwebtoken",
  "log",
  "oauth2",
+ "protobuf",
  "r2d2",
  "r2d2_postgres",
  "reqwest",
  "serde",
  "serde_json",
  "types",
+ "uuid",
 ]
 
 [[package]]
@@ -1996,6 +2000,16 @@ dependencies = [
  "idna",
  "matches",
  "percent-encoding",
+ "serde",
+]
+
+[[package]]
+name = "uuid"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc5cf98d8186244414c848017f0e2676b3fcb46807f6668a97dfe67359a3c4b7"
+dependencies = [
+ "getrandom",
  "serde",
 ]
 

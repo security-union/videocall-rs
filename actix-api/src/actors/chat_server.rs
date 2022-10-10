@@ -1,11 +1,13 @@
 use crate::messages::{
-    server::{ClientMessage, Connect, CreateRoom, Disconnect, JoinRoom, Leave},
+    server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
     session::Message,
 };
-use crate::models::{RoomId, SessionId};
+
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
+use types::protos::media_packet::MediaPacket;
+
+use super::chat_session::{RoomId, SessionId};
 
 pub struct ChatServer {
     sessions: HashMap<SessionId, Recipient<Message>>,
@@ -20,21 +22,27 @@ impl ChatServer {
         }
     }
 
-    fn is_empty(&self, room_id: &Uuid) -> bool {
+    fn is_empty(&self, room_id: &RoomId) -> bool {
         self.rooms
-            .get(&room_id)
+            .get(room_id)
             .map(|sessions| sessions.is_empty())
             .unwrap_or(false)
     }
 
-    pub fn send_message(&self, room: &Uuid, message: &str, skip_id: &Uuid, user: Option<String>) {
+    pub fn send_message(
+        &self,
+        room: &RoomId,
+        message: &MediaPacket,
+        skip_id: &String,
+        user: Option<String>,
+    ) {
         self.rooms.get(room).map(|sessions| {
             sessions.iter().for_each(|id| {
                 if id != skip_id {
                     self.sessions.get(id).map(|addr| {
                         addr.do_send(Message {
                             nickname: user.clone(),
-                            msg: message.into(),
+                            msg: *message,
                         })
                     });
                 }
@@ -42,21 +50,21 @@ impl ChatServer {
         });
     }
 
-    pub fn leave_rooms(&mut self, session_id: &Uuid) {
+    pub fn leave_rooms(&mut self, session_id: &SessionId) {
         let mut rooms = Vec::new();
         // remove session from all rooms
         for (id, sessions) in &mut self.rooms {
-            if sessions.remove(&session_id) {
+            if sessions.remove(session_id) {
                 rooms.push(id.to_owned());
             }
         }
         // send message to other users
-        for room in rooms {
-            self.send_message(&room, "Someone disconnected", &session_id, None);
-            if self.is_empty(&room) {
-                self.rooms.remove(&room);
-            }
-        }
+        // for room in rooms {
+        //     self.send_message(&room, "Someone disconnected", &session_id, None);
+        //     if self.is_empty(&room) {
+        //         self.rooms.remove(&room);
+        //     }
+        // }
     }
 }
 
@@ -104,22 +112,7 @@ impl Handler<ClientMessage> for ChatServer {
             room,
             msg,
         } = msg;
-        self.send_message(&room, &msg, &session, Some(user));
-    }
-}
-
-impl Handler<CreateRoom> for ChatServer {
-    type Result = MessageResult<CreateRoom>;
-
-    fn handle(&mut self, msg: CreateRoom, _ctx: &mut Self::Context) -> Self::Result {
-        let CreateRoom { session } = msg;
-        let room_id = RoomId::new_v4();
-        self.leave_rooms(&session);
-        self.rooms.insert(
-            room_id,
-            vec![session].into_iter().collect::<HashSet<Uuid>>(),
-        );
-        MessageResult(room_id)
+        self.send_message(&room, &msg.mediaPacket, &session, Some(user));
     }
 }
 
@@ -132,11 +125,18 @@ impl Handler<JoinRoom> for ChatServer {
     ) -> Self::Result {
         self.leave_rooms(&session);
 
+        // TODO lazily create room:
+        if !self.rooms.contains_key(&room) {
+            self.rooms
+                .insert(room, vec![session].into_iter().collect::<HashSet<String>>());
+        }
+
         let result: Result<(), String> = self
             .rooms
             .get_mut(&room)
             .map(|sessions| sessions.insert(session))
-            .map(|_| self.send_message(&room, "Someone connected", &session, None))
+            .map(|_| ())
+            // .map(|_| self.send_message(&room, "Someone connected", &session, None))
             .ok_or("The room doesn't exists".into());
 
         MessageResult(result)

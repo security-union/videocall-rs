@@ -1,4 +1,6 @@
 mod actors;
+mod constants;
+mod messages;
 mod models;
 
 use actix_cors::Cors;
@@ -152,15 +154,16 @@ async fn greet(name: web::Path<String>) -> Json<HelloResponse> {
     })
 }
 
-#[get("/lobby/{id}")]
+#[get("/lobby/{session}")]
 pub async fn ws_connect(
-    id: String,
+    session: String,
     req: HttpRequest,
     stream: web::Payload,
     state: web::Data<AppState>,
 ) -> impl Responder {
     let chat = state.chat.clone();
-    ws::start(WsChatSession::new(chat), &req, stream)
+    let email = "dario.lencina@gmail.com".to_string();
+    ws::start(WsChatSession::new(chat, session, email), &req, stream)
 }
 
 #[actix_web::main]

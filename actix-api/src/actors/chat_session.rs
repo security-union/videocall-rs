@@ -51,7 +51,9 @@ impl WsChatSession {
                 // heartbeat timed out
                 println!("Websocket Client heartbeat failed, disconnecting!");
                 // notify chat server
-                act.addr.do_send(Disconnect { session: act.id });
+                act.addr.do_send(Disconnect {
+                    session: act.id.clone(),
+                });
                 // stop actor
                 ctx.stop();
                 // don't try to send a ping
@@ -82,7 +84,7 @@ impl Actor for WsChatSession {
                 fut::ready(())
             })
             .wait(ctx);
-        self.join(self.room, ctx);
+        self.join(self.room.clone(), ctx);
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
@@ -164,7 +166,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 impl WsChatSession {
     fn join(&self, room_id: String, ctx: &mut WebsocketContext<Self>) {
         let join_room = self.addr.send(JoinRoom {
-            room: room_id,
+            room: room_id.clone(),
             session: self.id.clone(),
         });
         let join_room = join_room.into_actor(self);

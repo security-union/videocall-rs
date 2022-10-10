@@ -42,7 +42,7 @@ impl ChatServer {
                     self.sessions.get(id).map(|addr| {
                         addr.do_send(Message {
                             nickname: user.clone(),
-                            msg: *message,
+                            msg: message.clone(),
                         })
                     });
                 }
@@ -127,14 +127,18 @@ impl Handler<JoinRoom> for ChatServer {
 
         // TODO lazily create room:
         if !self.rooms.contains_key(&room) {
-            self.rooms
-                .insert(room, vec![session].into_iter().collect::<HashSet<String>>());
+            self.rooms.insert(
+                room.clone(),
+                vec![session.clone()]
+                    .into_iter()
+                    .collect::<HashSet<String>>(),
+            );
         }
 
         let result: Result<(), String> = self
             .rooms
             .get_mut(&room)
-            .map(|sessions| sessions.insert(session))
+            .map(|sessions| sessions.insert(session.clone()))
             .map(|_| ())
             // .map(|_| self.send_message(&room, "Someone connected", &session, None))
             .ok_or("The room doesn't exists".into());

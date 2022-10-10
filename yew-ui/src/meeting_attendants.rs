@@ -1,6 +1,8 @@
-use anyhow::Error;
+use anyhow::{anyhow, Error};
 use serde_derive::{Deserialize, Serialize};
+use types::protos::media_packet::MediaPacket;
 use yew_websocket::macros::Json;
+use protobuf::Message;
 
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
@@ -98,12 +100,9 @@ impl Component for AttendandsComponent {
                     true
                 }
                 WsAction::SendData(binary) => {
-                    let request = WsRequest { value: 321 };
-                    if binary {
-                        self.ws.as_mut().unwrap().send_binary(Json(&request));
-                    } else {
-                        self.ws.as_mut().unwrap().send(Json(&request));
-                    }
+                    let media = MediaPacket::default();
+                    let bytes = media.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
+                    self.ws.as_mut().unwrap().send_binary(bytes);
                     false
                 }
                 WsAction::Disconnect => {

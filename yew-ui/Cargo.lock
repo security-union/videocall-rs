@@ -814,6 +814,7 @@ dependencies = [
  "gloo-utils",
  "js-sys",
  "lazy_static",
+ "protobuf",
  "reqwasm",
  "serde",
  "serde_derive",

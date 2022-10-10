@@ -22,13 +22,6 @@ impl ChatServer {
         }
     }
 
-    fn is_empty(&self, room_id: &RoomId) -> bool {
-        self.rooms
-            .get(room_id)
-            .map(|sessions| sessions.is_empty())
-            .unwrap_or(false)
-    }
-
     pub fn send_message(
         &self,
         room: &RoomId,

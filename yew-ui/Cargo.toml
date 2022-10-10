@@ -21,6 +21,7 @@ yew-websocket = { git = "https://github.com/security-union/yew-websocket.git", r
 anyhow = "1"
 serde = "1"
 serde_derive = "1"
+protobuf = "3.2.0"
 
 [dependencies.web-sys]
 version = "0.3.60"

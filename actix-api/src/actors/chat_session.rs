@@ -184,7 +184,7 @@ impl WsChatSession {
 impl Handler<MediaPacketUpdate> for WsChatSession {
     type Result = ();
 
-    fn handle(&mut self, msg: MediaPacketUpdate, ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: MediaPacketUpdate, _ctx: &mut Self::Context) -> Self::Result {
         let room_id = self.room.clone();
         self.addr.do_send(ClientMessage {
             session: self.id.clone(),

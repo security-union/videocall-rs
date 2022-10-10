@@ -4,7 +4,7 @@ use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
 
 use crate::{
     constants::HEARTBEAT_INTERVAL,
-    messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
+    messages::server::{ClientMessage, Connect, Disconnect, JoinRoom},
 };
 use actix::ActorFutureExt;
 use actix::{
@@ -13,10 +13,8 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use log::{error, info};
+use log::{error};
 use protobuf::Message;
-use serde_json::json;
-use std::str::FromStr;
 use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
 
@@ -121,7 +119,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 let message: protobuf::Result<MediaPacket> =
                     protobuf::Message::parse_from_bytes(&msg);
                 match message {
-                    Ok(mediaPacket) => ctx.notify(MediaPacketUpdate { mediaPacket }),
+                    Ok(media_packet) => ctx.notify(MediaPacketUpdate { media_packet }),
                     Err(err) => {
                         error!("error {:?}", err);
                         // ctx.text(WsMessage::err(err.to_string()))
@@ -150,19 +148,6 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
     }
 }
 
-// impl Handler<WsMessage> for WsChatSession {
-//     type Result = ();
-
-//     fn handle(&mut self, msg: WsMessage, ctx: &mut Self::Context) -> Self::Result {
-//         let data = msg.data.as_str().unwrap();
-//         match msg.ty {
-//             MessageType::Msg => self.msg(data.into(), ctx),
-//             MessageType::Leave => self.leave(ctx),
-//             _ => (),
-//         }
-//     }
-// }
-
 impl WsChatSession {
     fn join(&self, room_id: String, ctx: &mut WebsocketContext<Self>) {
         let join_room = self.addr.send(JoinRoom {
@@ -185,39 +170,7 @@ impl WsChatSession {
                         // ctx.text(WsMessage::err(res.unwrap_err().to_string())),
                     }
                     Err(err) => {
-                        // ctx.text(WsMessage::err(err.to_string()));
-                        ctx.stop();
-                    }
-                }
-                fut::ready(())
-            })
-            .wait(ctx);
-    }
-
-    // fn msg(&self, msg: String, ctx: &mut WebsocketContext<Self>) {
-    //     match Command::from_str(&msg) {
-    //         Ok(cmd) => ctx.notify(cmd),
-    //         Err(err) => {
-    //             error!("error {:?}", err);
-    //             // ctx.text(WsMessage::err(err.to_string())),
-    //         }
-    //     }
-    // }
-
-    fn leave(&self, ctx: &mut WebsocketContext<Self>) {
-        self.addr
-            .send(Leave {
-                session: self.id.clone(),
-            })
-            .into_actor(self)
-            .then(move |res, act, ctx| {
-                match res {
-                    Ok(_) => {
-                        info!("info leaved");
-                        // ctx.text(WsMessage::info("Room leaved".into()))
-                    }
-                    // something is wrong with chat server
-                    Err(err) => {
+                        error!("error {:?}", err);
                         // ctx.text(WsMessage::err(err.to_string()));
                         ctx.stop();
                     }

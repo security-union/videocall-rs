@@ -24,7 +24,7 @@ impl FromStr for Command {
         let words: Vec<&str> = data.trim().split_whitespace().collect();
         let opt = words.split_first();
 
-        if let Some((&command, words)) = opt {
+        if let Some((&command, _words)) = opt {
             return match command {
                 "/roomId" => Ok(Command::GetRoomId),
                 "/setName" => Err(CommandError {

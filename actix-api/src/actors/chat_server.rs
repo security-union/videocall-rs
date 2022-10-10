@@ -112,7 +112,7 @@ impl Handler<ClientMessage> for ChatServer {
             room,
             msg,
         } = msg;
-        self.send_message(&room, &msg.mediaPacket, &session, Some(user));
+        self.send_message(&room, &msg.media_packet, &session, Some(user));
     }
 }
 

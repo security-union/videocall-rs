@@ -1,3 +1,10 @@
+mod meeting_attendants;
+mod constants;
+
+use constants::LOGIN_URL;
+use constants::VIDEO_CODEC;
+use constants::VIDEO_HEIGHT;
+use constants::VIDEO_WIDTH;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
@@ -17,13 +24,8 @@ use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsCast;
 use web_sys::*;
 use yew_router::prelude::*;
+use meeting_attendants::AttendandsComponent;
 
-// This is read at compile time, please restart if you change this value.
-const ACTIX_PORT: &str = std::env!("ACTIX_PORT");
-const LOGIN_URL: &str = std::env!("LOGIN_URL");
-static VIDEO_CODEC: &str = "vp09.00.10.08";
-const VIDEO_HEIGHT: i32 = 720i32;
-const VIDEO_WIDTH: i32 = 1280i32;
 
 fn truthy(s: String) -> bool {
     ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())
@@ -83,7 +85,10 @@ fn app_component() -> Html {
         }
     } else {
         html! {
-            <Meeting id={"234234".to_string()}/>
+            <>
+                <Meeting id={"234234".to_string()}/>
+                <AttendandsComponent/>
+            </>
         }
     }
 }
@@ -103,12 +108,6 @@ fn meeting(props: &MeetingProps) -> Html {
             window().location().set_href("/login").ok();
         }
     }
-    let actix_url: String = format!("http://localhost:{}", ACTIX_PORT);
-    let endpoint = Box::new(format!(
-        "{actix_url}/hello/{name}",
-        actix_url = actix_url,
-        name = "world",
-    ));
     let id = props.id.clone();
 
     use_effect_with_deps(

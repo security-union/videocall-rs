@@ -808,12 +808,15 @@ dependencies = [
 name = "yew-ui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "const_format",
  "gloo-console",
  "gloo-utils",
  "js-sys",
  "lazy_static",
  "reqwasm",
+ "serde",
+ "serde_derive",
  "types",
  "wasm-bindgen",
  "wasm-bindgen-futures",

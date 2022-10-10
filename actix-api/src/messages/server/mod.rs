@@ -30,7 +30,7 @@ pub struct Connect {
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct MediaPacketUpdate {
-    pub mediaPacket: MediaPacket,
+    pub media_packet: MediaPacket,
 }
 
 #[derive(ActixMessage)]

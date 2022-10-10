@@ -18,6 +18,10 @@ gloo-utils = "0.1"
 yew-router = "0.16"
 js-sys = "0.3"
 yew-websocket = { git = "https://github.com/security-union/yew-websocket.git", rev = "b29388a50c54c417db9cf0bf40033f62d9c616ab" }
+anyhow = "1"
+serde = "1"
+serde_derive = "1"
+
 [dependencies.web-sys]
 version = "0.3.60"
 features = [

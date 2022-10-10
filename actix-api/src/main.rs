@@ -3,6 +3,7 @@ mod constants;
 mod messages;
 mod models;
 
+use actix::Actor;
 use actix_cors::Cors;
 use actix_web::{
     cookie::{
@@ -14,9 +15,10 @@ use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use actix_web_actors::ws;
+use log::info;
 
 use crate::{
-    actors::chat_session::WsChatSession,
+    actors::{chat_server::ChatServer, chat_session::WsChatSession},
     auth::{fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user},
     models::AppState,
 };
@@ -161,6 +163,7 @@ pub async fn ws_connect(
     stream: web::Payload,
     state: web::Data<AppState>,
 ) -> impl Responder {
+    info!("connecting socket");
     let chat = state.chat.clone();
     let email = "dario.lencina@gmail.com".to_string();
     ws::start(WsChatSession::new(chat, session, email), &req, stream)
@@ -169,13 +172,14 @@ pub async fn ws_connect(
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
-
+    info!("start");
     // TODO: Deal with https, maybe we should just expose this as an env var?
     let allowed_origin = if UI_PORT != "80" {
         format!("http://{}:{}", UI_HOST, UI_PORT)
     } else {
         format!("http://{}", UI_HOST)
     };
+    let chat = ChatServer::new().start();
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -189,6 +193,7 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(AppState { chat: chat.clone() }))
             .wrap(cors)
             .service(greet)
             .service(handle_google_oauth_callback)

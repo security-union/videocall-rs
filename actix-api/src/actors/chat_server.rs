@@ -29,12 +29,10 @@ impl ChatServer {
         skip_id: &String,
         user: Option<String>,
     ) {
-        println!("send_message");
         self.rooms.get(room).map(|sessions| {
             sessions.iter().for_each(|id| {
                 if id != skip_id {
                     self.sessions.get(id).map(|addr| {
-                        println!("got message 6");
                         addr.do_send(Message {
                             nickname: user.clone(),
                             msg: message.clone(),
@@ -94,7 +92,6 @@ impl Handler<ClientMessage> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: ClientMessage, _ctx: &mut Self::Context) -> Self::Result {
-        println!("got message 3");
         let ClientMessage {
             session,
             user,

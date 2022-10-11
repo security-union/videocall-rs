@@ -156,20 +156,20 @@ async fn greet(name: web::Path<String>) -> Json<HelloResponse> {
     })
 }
 
-#[get("/lobby/{session}")]
+#[get("/lobby/{room}")]
 pub async fn ws_connect(
     session: web::Path<String>,
     req: HttpRequest,
     stream: web::Payload,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let session = session.into_inner();
+    let room = session.into_inner();
     println!("connecting socket");
 
     let chat = state.chat.clone();
     let email = "dario.lencina@gmail.com".to_string();
     // let session = "sdffsdf".to_string();
-    ws::start(WsChatSession::new(chat, session, email), &req, stream)
+    ws::start(WsChatSession::new(chat, room, email), &req, stream)
 }
 
 #[actix_web::main]

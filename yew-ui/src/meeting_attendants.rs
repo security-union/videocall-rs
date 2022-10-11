@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Error};
+use protobuf::Message;
 use serde_derive::{Deserialize, Serialize};
 use types::protos::media_packet::MediaPacket;
 use yew_websocket::macros::Json;
-use protobuf::Message;
 
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
@@ -52,20 +52,6 @@ pub struct AttendandsComponent {
     pub ws: Option<WebSocketTask>,
 }
 
-impl AttendandsComponent {
-    fn view_data(&self) -> Html {
-        if let Some(value) = self.data {
-            html! {
-                <p>{ value }</p>
-            }
-        } else {
-            html! {
-                <p>{ "Data hasn't fetched yet." }</p>
-            }
-        }
-    }
-}
-
 impl Component for AttendandsComponent {
     type Message = Msg;
     type Properties = ();
@@ -90,12 +76,7 @@ impl Component for AttendandsComponent {
                         }
                     });
                     let url = format!("{}{}", ACTIX_WEBSOCKET.to_string(), "mehhh".to_string());
-                    let task = WebSocketService::connect(
-                        &url,
-                        callback,
-                        notification,
-                    )
-                    .unwrap();
+                    let task = WebSocketService::connect(&url, callback, notification).unwrap();
                     self.ws = Some(task);
                     true
                 }
@@ -125,14 +106,9 @@ impl Component for AttendandsComponent {
         html! {
             <div>
                 <nav class="menu">
-                    { self.view_data() }
                     <button disabled={self.ws.is_some()}
                             onclick={ctx.link().callback(|_| WsAction::Connect)}>
                         { "Connect To WebSocket" }
-                    </button>
-                    <button disabled={self.ws.is_none()}
-                            onclick={ctx.link().callback(|_| WsAction::SendData(false))}>
-                        { "Send To WebSocket" }
                     </button>
                     <button disabled={self.ws.is_none()}
                             onclick={ctx.link().callback(|_| WsAction::SendData(true))}>

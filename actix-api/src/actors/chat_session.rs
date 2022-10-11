@@ -120,9 +120,8 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                     protobuf::Message::parse_from_bytes(&msg);
                 match message {
                     Ok(media_packet) => {
-                        println!("got message 1");
                         ctx.notify(MediaPacketUpdate { media_packet });
-                    },
+                    }
                     Err(err) => {
                         error!("error {:?}", err);
                         // ctx.text(WsMessage::err(err.to_string()))

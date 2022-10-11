@@ -11,11 +11,6 @@ use crate::constants::ACTIX_WEBSOCKET;
 
 type AsBinary = bool;
 
-pub enum Format {
-    Json,
-    Toml,
-}
-
 pub enum WsAction {
     Connect,
     SendData(AsBinary),

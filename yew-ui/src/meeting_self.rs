@@ -1,5 +1,4 @@
 use gloo_console::log;
-use gloo_utils::document;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
@@ -14,9 +13,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::HtmlVideoElement;
 use web_sys::*;
 use yew::prelude::*;
-use yew::prelude::*;
 
-use crate::constants::LOGIN_URL;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;

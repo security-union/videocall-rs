@@ -182,6 +182,8 @@ async fn main() -> std::io::Result<()> {
     };
     // let chat = ChatServer::new().start();
 
+    // Yolo
+
     HttpServer::new(move || {
         let cors = Cors::default()
             .allowed_origin(allowed_origin.as_str())

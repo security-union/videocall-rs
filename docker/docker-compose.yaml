@@ -6,6 +6,7 @@ services:
       - type: bind
         source: ../
         target: /app
+      - /app/yew-ui/target
     build: 
       dockerfile: ../docker/Dockerfile.yew
     command: bash -c "cd app/yew-ui && trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
@@ -39,6 +40,7 @@ services:
       - type: bind
         source: ../
         target: /app
+      - /app/actix-api/target
     depends_on:
       - postgres
 

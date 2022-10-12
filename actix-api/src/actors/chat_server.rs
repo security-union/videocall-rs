@@ -51,13 +51,6 @@ impl ChatServer {
                 rooms.push(id.to_owned());
             }
         }
-        // send message to other users
-        // for room in rooms {
-        //     self.send_message(&room, "Someone disconnected", &session_id, None);
-        //     if self.is_empty(&room) {
-        //         self.rooms.remove(&room);
-        //     }
-        // }
     }
 }
 

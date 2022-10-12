@@ -13,7 +13,7 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use log::{error};
+use log::error;
 use protobuf::Message;
 use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
@@ -119,7 +119,9 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 let message: protobuf::Result<MediaPacket> =
                     protobuf::Message::parse_from_bytes(&msg);
                 match message {
-                    Ok(media_packet) => ctx.notify(MediaPacketUpdate { media_packet }),
+                    Ok(media_packet) => {
+                        ctx.notify(MediaPacketUpdate { media_packet });
+                    }
                     Err(err) => {
                         error!("error {:?}", err);
                         // ctx.text(WsMessage::err(err.to_string()))

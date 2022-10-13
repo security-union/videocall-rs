@@ -10,7 +10,6 @@ extern crate lazy_static;
 use gloo_console::log;
 use gloo_utils::window;
 use meeting_attendants::AttendandsComponent;
-use meeting_self::HostComponent;
 use yew_router::prelude::*;
 
 // We need a lazy static block because these vars need to call a
@@ -23,7 +22,7 @@ lazy_static! {
 enum Route {
     #[at("/login")]
     Login,
-    #[at("/:id")]
+    #[at("/meeting/:id")]
     Meeting { id: String },
     #[not_found]
     #[at("/404")]
@@ -35,8 +34,7 @@ fn switch(routes: &Route) -> Html {
         Route::Login => html! { <Login/> },
         Route::Meeting { id } => html! {
             <>
-                <HostComponent/>
-                <AttendandsComponent/>
+                <AttendandsComponent id={id.clone()}/>
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },
@@ -65,8 +63,7 @@ fn app_component() -> Html {
     } else {
         html! {
             <>
-                <HostComponent/>
-                <AttendandsComponent/>
+                <AttendandsComponent id={"blahblah"}/>
             </>
         }
     }

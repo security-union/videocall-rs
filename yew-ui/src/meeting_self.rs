@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use gloo_console::log;
 use gloo_utils::window;
 use js_sys::Array;
@@ -30,13 +32,19 @@ pub struct HostComponent {
 pub struct MeetingProps {
     #[prop_or_default]
     pub id: String,
+
+    #[prop_or_default]
+    pub media_packet: MediaPacket,
+
+    #[prop_or_default]
+    pub on_frame: Callback<MediaPacket>,
 }
 
 impl Component for HostComponent {
     type Message = Msg;
     type Properties = MeetingProps;
 
-    fn create(ctx: &Context<Self>) -> Self {
+    fn create(_ctx: &Context<Self>) -> Self {
         Self { initialized: false }
     }
 
@@ -44,6 +52,23 @@ impl Component for HostComponent {
         match msg {
             Msg::Start => {
                 self.initialized = true;
+                let on_frame = ctx.props().on_frame.clone();
+                let output_handler = Box::new(move |chunk: JsValue| {
+                    // log!("on output handler!!");
+                    let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                    let mut media_packet: MediaPacket = MediaPacket::default();
+                    media_packet.email = "dario".to_string();
+                    let byte_length: Number = Reflect::get(&chunk, &JsString::from("byteLength"))
+                        .unwrap()
+                        .into();
+                    let byte_length: usize = byte_length.as_f64().unwrap() as usize;
+                    let mut chunk_data: Vec<u8> = vec![0; byte_length];
+                    let mut chunk_data = chunk_data.as_mut_slice();
+                    chunk.copy_to_with_u8_array(&mut chunk_data);
+                    media_packet.video = chunk_data.to_vec();
+                    on_frame.emit(media_packet);
+                });
+
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
@@ -77,26 +102,7 @@ impl Component for HostComponent {
                     })
                         as Box<dyn FnMut(JsValue)>);
 
-                    let output_handler = Closure::wrap(Box::new(move |chunk: JsValue| {
-                        let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                        let mut media_packet = MediaPacket::default();
-                        media_packet.email = "dario".to_string();
-                        let byte_length: Number =
-                            Reflect::get(&chunk, &JsString::from("byteLength"))
-                                .unwrap()
-                                .into();
-                        let byte_length: usize = byte_length.as_f64().unwrap() as usize;
-                        let mut chunk_data: Vec<u8> = vec![0; byte_length];
-                        let mut chunk_data = chunk_data.as_mut_slice();
-                        chunk.copy_to_with_u8_array(&mut chunk_data);
-                        media_packet.video = chunk_data.to_vec();
-                        log!("yolo!!!");
-                        // let video_chunk = chunk.unchecked_into::<EncodedVideoChunk>();
-                        // video_context.dispatch(
-                        //     EncodedVideoChunkWrapper { chunk: Some(video_chunk)}
-                        // );sdfsfd
-                    })
-                        as Box<dyn FnMut(JsValue)>);
+                    let output_handler = Closure::wrap(output_handler as Box<dyn FnMut(JsValue)>);
                     let video_encoder_init = VideoEncoderInit::new(
                         error_handler.as_ref().unchecked_ref(),
                         output_handler.as_ref().unchecked_ref(),

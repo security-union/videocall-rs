@@ -10,6 +10,7 @@ actix = "0.13.0"
 actix-cors = "0.6.1"
 actix-web = "4.1.0"
 actix-web-actors = "4.1.0"
+actix-http = "3.2.2"
 types = { path= "../types"}
 serde = "1.0.140"
 reqwest = { version = "0.11.11", features = ["json"]}
@@ -26,3 +27,4 @@ uuid = { version = "0.8", features = ["serde", "v4"] }
 bytestring = "1.1.0"
 derive_more = "0.99.11"
 protobuf = "3.2.0"
+rand = "0.8.5"

@@ -3,19 +3,24 @@ mod constants;
 mod messages;
 mod models;
 
-use actix::Actor;
+use actix::{prelude::Stream, Actor, StreamHandler};
 use actix_cors::Cors;
+use actix_http::{
+    error::PayloadError,
+    ws::{Codec, Message, ProtocolError},
+};
 use actix_web::{
     cookie::{
         time::{Duration, OffsetDateTime},
         Cookie, SameSite,
     },
     error, get, http,
-    web::{self, Json},
+    web::{self, Bytes, Json},
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
-use actix_web_actors::ws;
+use actix_web_actors::ws::{self, handshake, WebsocketContext};
 use log::info;
+use rand::Rng;
 
 use crate::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},
@@ -156,6 +161,20 @@ async fn greet(name: web::Path<String>) -> Json<HelloResponse> {
     })
 }
 
+fn start_with_codec<A, S>(
+    actor: A,
+    req: &HttpRequest,
+    stream: S,
+    codec: Codec,
+) -> Result<HttpResponse, Error>
+where
+    A: Actor<Context = WebsocketContext<A>> + StreamHandler<Result<Message, ProtocolError>>,
+    S: Stream<Item = Result<Bytes, PayloadError>> + 'static,
+{
+    let mut res = handshake(req)?;
+    Ok(res.streaming(WebsocketContext::with_codec(actor, stream, codec)))
+}
+
 #[get("/lobby/{room}")]
 pub async fn ws_connect(
     session: web::Path<String>,
@@ -164,12 +183,17 @@ pub async fn ws_connect(
     state: web::Data<AppState>,
 ) -> impl Responder {
     let room = session.into_inner();
-    println!("connecting socket");
-
+    info!("socket connected");
     let chat = state.chat.clone();
-    let email = "dario.lencina@gmail.com".to_string();
-    // let session = "sdffsdf".to_string();
-    ws::start(WsChatSession::new(chat, room, email), &req, stream)
+    let mut rng = rand::thread_rng();
+    let y: f64 = rng.gen(); // generates a float between 0 and 1
+
+    let email = format!("dario.lencina@gmail.com{}", y);
+    let actor = WsChatSession::new(chat, room, email);
+    let codec = Codec::new().max_size(1_000_000);
+    let res = handshake(&req)?;
+    let resp = start_with_codec(actor, &req, stream, codec);
+    resp
 }
 
 #[actix_web::main]

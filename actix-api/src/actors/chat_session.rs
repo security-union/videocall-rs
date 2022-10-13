@@ -53,6 +53,7 @@ impl WsChatSession {
                     session: act.id.clone(),
                 });
                 // stop actor
+                error!("hearbeat timeout");
                 ctx.stop();
                 // don't try to send a ping
                 return;
@@ -76,6 +77,7 @@ impl Actor for WsChatSession {
             .into_actor(self)
             .then(|res, _act, ctx| {
                 if let Err(err) = res {
+                    error!("error {:?}", err);
                     // ctx.text(WsMessage::err(err.to_string()));
                     ctx.stop();
                 }
@@ -108,6 +110,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
         let msg = match item {
             Ok(msg) => msg,
             Err(err) => {
+                error!("protocol error 2 {:?}", err);
                 // ctx.text(WsMessage::err(err.to_string()));
                 ctx.stop();
                 return;
@@ -137,6 +140,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             }
             ws::Message::Close(reason) => {
                 ctx.close(reason);
+                error!("socket closed");
                 ctx.stop();
             }
             _ => (),

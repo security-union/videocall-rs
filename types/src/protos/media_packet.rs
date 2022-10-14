@@ -35,6 +35,12 @@ pub struct MediaPacket {
     pub video: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:MediaPacket.audio)
     pub audio: ::std::vec::Vec<u8>,
+    // @@protoc_insertion_point(field:MediaPacket.video_type)
+    pub video_type: ::std::string::String,
+    // @@protoc_insertion_point(field:MediaPacket.video_timestamp)
+    pub video_timestamp: i64,
+    // @@protoc_insertion_point(field:MediaPacket.video_duration)
+    pub video_duration: i64,
     // special fields
     // @@protoc_insertion_point(special_field:MediaPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -52,7 +58,7 @@ impl MediaPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut fields = ::std::vec::Vec::with_capacity(6);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "email",
@@ -68,6 +74,21 @@ impl MediaPacket {
             "audio",
             |m: &MediaPacket| { &m.audio },
             |m: &mut MediaPacket| { &mut m.audio },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "video_type",
+            |m: &MediaPacket| { &m.video_type },
+            |m: &mut MediaPacket| { &mut m.video_type },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "video_timestamp",
+            |m: &MediaPacket| { &m.video_timestamp },
+            |m: &mut MediaPacket| { &mut m.video_timestamp },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "video_duration",
+            |m: &MediaPacket| { &m.video_duration },
+            |m: &mut MediaPacket| { &mut m.video_duration },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MediaPacket>(
             "MediaPacket",
@@ -96,6 +117,15 @@ impl ::protobuf::Message for MediaPacket {
                 26 => {
                     self.audio = is.read_bytes()?;
                 },
+                34 => {
+                    self.video_type = is.read_string()?;
+                },
+                40 => {
+                    self.video_timestamp = is.read_int64()?;
+                },
+                48 => {
+                    self.video_duration = is.read_int64()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -117,6 +147,15 @@ impl ::protobuf::Message for MediaPacket {
         if !self.audio.is_empty() {
             my_size += ::protobuf::rt::bytes_size(3, &self.audio);
         }
+        if !self.video_type.is_empty() {
+            my_size += ::protobuf::rt::string_size(4, &self.video_type);
+        }
+        if self.video_timestamp != 0 {
+            my_size += ::protobuf::rt::int64_size(5, self.video_timestamp);
+        }
+        if self.video_duration != 0 {
+            my_size += ::protobuf::rt::int64_size(6, self.video_duration);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -131,6 +170,15 @@ impl ::protobuf::Message for MediaPacket {
         }
         if !self.audio.is_empty() {
             os.write_bytes(3, &self.audio)?;
+        }
+        if !self.video_type.is_empty() {
+            os.write_string(4, &self.video_type)?;
+        }
+        if self.video_timestamp != 0 {
+            os.write_int64(5, self.video_timestamp)?;
+        }
+        if self.video_duration != 0 {
+            os.write_int64(6, self.video_duration)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -152,6 +200,9 @@ impl ::protobuf::Message for MediaPacket {
         self.email.clear();
         self.video.clear();
         self.audio.clear();
+        self.video_type.clear();
+        self.video_timestamp = 0;
+        self.video_duration = 0;
         self.special_fields.clear();
     }
 
@@ -160,6 +211,9 @@ impl ::protobuf::Message for MediaPacket {
             email: ::std::string::String::new(),
             video: ::std::vec::Vec::new(),
             audio: ::std::vec::Vec::new(),
+            video_type: ::std::string::String::new(),
+            video_timestamp: 0,
+            video_duration: 0,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -184,20 +238,30 @@ impl ::protobuf::reflect::ProtobufValue for MediaPacket {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x18types/media_packet.proto\"O\n\x0bMediaPacket\x12\x14\n\x05email\
-    \x18\x01\x20\x01(\tR\x05email\x12\x14\n\x05video\x18\x02\x20\x01(\x0cR\
-    \x05video\x12\x14\n\x05audio\x18\x03\x20\x01(\x0cR\x05audioJ\xcf\x01\n\
-    \x06\x12\x04\0\0\x06\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\
-    \x12\x04\x02\0\x06\x01\n\n\n\x03\x04\0\x01\x12\x03\x02\x08\x13\n\x0b\n\
-    \x04\x04\0\x02\0\x12\x03\x03\x02\x13\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\
-    \x03\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x03\t\x0e\n\x0c\n\x05\
-    \x04\0\x02\0\x03\x12\x03\x03\x11\x12\n\x0b\n\x04\x04\0\x02\x01\x12\x03\
-    \x04\x02\x12\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x04\x02\x07\n\x0c\n\
-    \x05\x04\0\x02\x01\x01\x12\x03\x04\x08\r\n\x0c\n\x05\x04\0\x02\x01\x03\
-    \x12\x03\x04\x10\x11\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x05\x02\x12\n\x0c\
-    \n\x05\x04\0\x02\x02\x05\x12\x03\x05\x02\x07\n\x0c\n\x05\x04\0\x02\x02\
-    \x01\x12\x03\x05\x08\r\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x05\x10\x11\
-    b\x06proto3\
+    \n\x18types/media_packet.proto\"\xbe\x01\n\x0bMediaPacket\x12\x14\n\x05e\
+    mail\x18\x01\x20\x01(\tR\x05email\x12\x14\n\x05video\x18\x02\x20\x01(\
+    \x0cR\x05video\x12\x14\n\x05audio\x18\x03\x20\x01(\x0cR\x05audio\x12\x1d\
+    \n\nvideo_type\x18\x04\x20\x01(\tR\tvideoType\x12'\n\x0fvideo_timestamp\
+    \x18\x05\x20\x01(\x03R\x0evideoTimestamp\x12%\n\x0evideo_duration\x18\
+    \x06\x20\x01(\x03R\rvideoDurationJ\xf4\x02\n\x06\x12\x04\0\0\t\x01\n\x08\
+    \n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\t\x01\n\n\n\x03\
+    \x04\0\x01\x12\x03\x02\x08\x13\n\x0b\n\x04\x04\0\x02\0\x12\x03\x03\x02\
+    \x13\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x03\x02\x08\n\x0c\n\x05\x04\0\
+    \x02\0\x01\x12\x03\x03\t\x0e\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x03\x11\
+    \x12\n\x0b\n\x04\x04\0\x02\x01\x12\x03\x04\x02\x12\n\x0c\n\x05\x04\0\x02\
+    \x01\x05\x12\x03\x04\x02\x07\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x04\
+    \x08\r\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x04\x10\x11\n\x0b\n\x04\x04\
+    \0\x02\x02\x12\x03\x05\x02\x12\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x05\
+    \x02\x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x05\x08\r\n\x0c\n\x05\x04\
+    \0\x02\x02\x03\x12\x03\x05\x10\x11\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x06\
+    \x02\x18\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x06\x02\x08\n\x0c\n\x05\
+    \x04\0\x02\x03\x01\x12\x03\x06\t\x13\n\x0c\n\x05\x04\0\x02\x03\x03\x12\
+    \x03\x06\x16\x17\n\x0b\n\x04\x04\0\x02\x04\x12\x03\x07\x02\x1c\n\x0c\n\
+    \x05\x04\0\x02\x04\x05\x12\x03\x07\x02\x07\n\x0c\n\x05\x04\0\x02\x04\x01\
+    \x12\x03\x07\x08\x17\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x07\x1a\x1b\n\
+    \x0b\n\x04\x04\0\x02\x05\x12\x03\x08\x02\x1b\n\x0c\n\x05\x04\0\x02\x05\
+    \x05\x12\x03\x08\x02\x07\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x08\x08\
+    \x16\n\x0c\n\x05\x04\0\x02\x05\x03\x12\x03\x08\x19\x1ab\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

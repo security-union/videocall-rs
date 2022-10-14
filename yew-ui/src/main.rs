@@ -12,18 +12,21 @@ use gloo_utils::window;
 use meeting_attendants::AttendandsComponent;
 use yew_router::prelude::*;
 
+fn truthy(s: String) -> bool {
+    ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())
+}
 // We need a lazy static block because these vars need to call a
 // few functions.
 lazy_static! {
-    static ref ENABLE_OAUTH: bool = false;//truthy(std::env!("ENABLE_OAUTH").to_string());
+    static ref ENABLE_OAUTH: bool = truthy(std::env!("ENABLE_OAUTH").to_string());
 }
 
 #[derive(Clone, Routable, PartialEq)]
 enum Route {
     #[at("/login")]
     Login,
-    #[at("/meeting/:id")]
-    Meeting { id: String },
+    #[at("/meeting/:email/:id")]
+    Meeting { id: String, email: String },
     #[not_found]
     #[at("/404")]
     NotFound,
@@ -32,9 +35,9 @@ enum Route {
 fn switch(routes: &Route) -> Html {
     match routes {
         Route::Login => html! { <Login/> },
-        Route::Meeting { id } => html! {
+        Route::Meeting { id, email } => html! {
             <>
-                <AttendandsComponent id={id.clone()}/>
+                <AttendandsComponent id={id.clone()} email={email.clone()}/>
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },
@@ -54,18 +57,10 @@ fn login() -> Html {
 #[function_component(App)]
 fn app_component() -> Html {
     log!("OAuth enabled: {}", *ENABLE_OAUTH);
-    if *ENABLE_OAUTH {
-        html! {
-            <BrowserRouter>
-            <Switch<Route> render={Switch::render(switch)} />
-            </BrowserRouter>
-        }
-    } else {
-        html! {
-            <>
-                <AttendandsComponent id={"blahblah"}/>
-            </>
-        }
+    html! {
+        <BrowserRouter>
+        <Switch<Route> render={Switch::render(switch)} />
+        </BrowserRouter>
     }
 }
 

@@ -4,6 +4,7 @@ use crate::messages::{
 };
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
+use log::info;
 use std::collections::{HashMap, HashSet};
 use types::protos::media_packet::MediaPacket;
 
@@ -98,6 +99,11 @@ impl Handler<ClientMessage> for ChatServer {
             room,
             msg,
         } = msg;
+        info!(
+            "got message in server room {} session {}",
+            room.clone(),
+            session.clone()
+        );
         self.send_message(&room, &msg.media_packet, &session, Some(user));
     }
 }
@@ -128,7 +134,12 @@ impl Handler<JoinRoom> for ChatServer {
             .map(|_| ())
             // .map(|_| self.send_message(&room, "Someone connected", &session, None))
             .ok_or("The room doesn't exists".into());
-
+        info!(
+            "someone connected to room {} with session {} result {:?}",
+            room.clone(),
+            session.clone(),
+            result
+        );
         MessageResult(result)
     }
 }

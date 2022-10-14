@@ -175,20 +175,18 @@ where
     Ok(res.streaming(WebsocketContext::with_codec(actor, stream, codec)))
 }
 
-#[get("/lobby/{room}")]
+#[get("/lobby/{email}/{room}")]
 pub async fn ws_connect(
-    session: web::Path<String>,
+    session: web::Path<(String, String)>,
     req: HttpRequest,
     stream: web::Payload,
     state: web::Data<AppState>,
 ) -> impl Responder {
-    let room = session.into_inner();
+    let (email, room) = session.into_inner();
     info!("socket connected");
     let chat = state.chat.clone();
     let mut rng = rand::thread_rng();
     let y: f64 = rng.gen(); // generates a float between 0 and 1
-
-    let email = format!("dario.lencina@gmail.com{}", y);
     let actor = WsChatSession::new(chat, room, email);
     let codec = Codec::new().max_size(1_000_000);
     let res = handshake(&req)?;

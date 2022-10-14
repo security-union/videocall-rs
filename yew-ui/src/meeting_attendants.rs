@@ -1,14 +1,20 @@
-use anyhow::{anyhow, Error};
+use anyhow::anyhow;
 use gloo_console::log;
+use js_sys::Uint8Array;
 use protobuf::Message;
 use serde_derive::{Deserialize, Serialize};
 use types::protos::media_packet::MediaPacket;
+use wasm_bindgen::prelude::Closure;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
+use web_sys::*;
 use yew_websocket::macros::Json;
 
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
-use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
+use yew_websocket::websocket::{Binary, WebSocketService, WebSocketStatus, WebSocketTask};
 
+use crate::constants::{VIDEO_CODEC, VIDEO_HEIGHT, VIDEO_WIDTH};
 use crate::{constants::ACTIX_WEBSOCKET, meeting_self::HostComponent};
 
 pub enum WsAction {
@@ -21,7 +27,7 @@ pub enum WsAction {
 
 pub enum Msg {
     WsAction(WsAction),
-    WsReady(Result<WsResponse, Error>),
+    WsReady(Binary),
     OnFrame(MediaPacket),
 }
 
@@ -50,6 +56,9 @@ pub struct AttendandsComponentProps {
 
     #[prop_or_default]
     pub media_packet: MediaPacket,
+
+    #[prop_or_default]
+    pub email: String,
 }
 
 pub struct AttendandsComponent {
@@ -58,6 +67,7 @@ pub struct AttendandsComponent {
     pub ws: Option<WebSocketTask>,
     pub media_packet: MediaPacket,
     pub connected: bool,
+    pub video_decoder: Option<VideoDecoder>,
 }
 
 impl Component for AttendandsComponent {
@@ -71,6 +81,7 @@ impl Component for AttendandsComponent {
             ws: None,
             connected: false,
             media_packet: MediaPacket::default(),
+            video_decoder: None,
         }
     }
 
@@ -86,7 +97,8 @@ impl Component for AttendandsComponent {
                         }
                     });
                     let meeting_id = ctx.props().id.clone();
-                    let url = format!("{}{}", ACTIX_WEBSOCKET.to_string(), meeting_id);
+                    let email = ctx.props().email.clone();
+                    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, meeting_id);
                     let task = WebSocketService::connect(&url, callback, notification).unwrap();
                     self.ws = Some(task);
                     true
@@ -113,7 +125,73 @@ impl Component for AttendandsComponent {
                 }
             },
             Msg::WsReady(response) => {
-                self.data = response.map(|data| data.value).ok();
+                let data = if let Some(data) = response
+                    .map(|data| MediaPacket::parse_from_bytes(&data).ok())
+                    .ok()
+                    .flatten()
+                {
+                    log!("got data");
+                    if let Some(decoder) = self.video_decoder {
+                        let chunk = data.video;
+                        // let mut video_vector = vec![0u8; chunk.len() as usize];
+                        // let video_message = video_vector.as_mut();
+                        // chunk.copy_to_with_u8_array(video_message);
+                        let data = EncodedVideoChunk::from(&chunk);
+                        // let data = Uint8Array::from(video_message.as_ref());
+                        // let encoded_video_chunk = EncodedVideoChunk::new(
+                        //     &EncodedVideoChunkInit::new(&data, chunk.timestamp(), chunk.type_())
+                        // ).unwrap();
+                        // decoder.decode(&encoded_video_chunk);
+                        // decoder.decode(chunk)
+                    } else {
+                        let error_video = Closure::wrap(Box::new(move |e: JsValue| {
+                            log!(&e);
+                        })
+                            as Box<dyn FnMut(JsValue)>);
+                        let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
+                            let chunk = Box::new(original_chunk);
+                            let video_chunk = chunk.clone().unchecked_into::<HtmlImageElement>();
+                            // let width = Reflect::get(&chunk.clone(), &JsString::from("codedWidth"))
+                            //     .unwrap()
+                            //     .as_f64()
+                            //     .unwrap();
+                            // let height = Reflect::get(&chunk.clone(), &JsString::from("codedHeight"))
+                            //     .unwrap()
+                            //     .as_f64()
+                            //     .unwrap();
+                            // let render_canvas = window()
+                            //     .unwrap()
+                            //     .document()
+                            //     .unwrap()
+                            //     .get_element_by_id("render")
+                            //     .unwrap()
+                            //     .unchecked_into::<HtmlCanvasElement>();
+                            // render_canvas.set_width(width as u32);
+                            // render_canvas.set_height(height as u32);
+                            // let ctx = render_canvas
+                            //     .get_context("2d")
+                            //     .unwrap()
+                            //     .unwrap()
+                            //     .unchecked_into::<CanvasRenderingContext2d>();
+                            // ctx.draw_image_with_html_image_element(
+                            //     &video_chunk,
+                            //     0.0,
+                            //     0.0
+                            // );
+                            // video_chunk.unchecked_into::<VideoFrame>().close();
+                        })
+                            as Box<dyn FnMut(JsValue)>);
+                        let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
+                            error_video.as_ref().unchecked_ref(),
+                            output.as_ref().unchecked_ref(),
+                        ))
+                        .unwrap();
+                        self.video_decoder = Some(video_decoder);
+                        error_video.forget();
+                        output.forget();
+                    }
+                };
+
                 true
             }
             Msg::OnFrame(media) => {

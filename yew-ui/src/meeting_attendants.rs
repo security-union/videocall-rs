@@ -1,3 +1,4 @@
+use crate::meeting_self::MediaPacketWrapper;
 use anyhow::anyhow;
 use gloo_console::log;
 use js_sys::Uint8Array;
@@ -8,13 +9,13 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::*;
-use yew_websocket::macros::Json;
-
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
+use yew_websocket::macros::Json;
 use yew_websocket::websocket::{Binary, WebSocketService, WebSocketStatus, WebSocketTask};
 
 use crate::constants::{VIDEO_CODEC, VIDEO_HEIGHT, VIDEO_WIDTH};
+use crate::meeting_self::EncodedVideoChunkTypeWrapper;
 use crate::{constants::ACTIX_WEBSOCKET, meeting_self::HostComponent};
 
 pub enum WsAction {
@@ -27,7 +28,7 @@ pub enum WsAction {
 
 pub enum Msg {
     WsAction(WsAction),
-    WsReady(Binary),
+    WsReady(MediaPacketWrapper),
     OnFrame(MediaPacket),
 }
 
@@ -35,18 +36,6 @@ impl From<WsAction> for Msg {
     fn from(action: WsAction) -> Self {
         Msg::WsAction(action)
     }
-}
-
-/// This type is used as a request which sent to websocket connection.
-#[derive(Serialize, Debug)]
-struct WsRequest {
-    value: u32,
-}
-
-/// This type is an expected response from a websocket connection.
-#[derive(Deserialize, Debug)]
-pub struct WsResponse {
-    value: u32,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -68,6 +57,7 @@ pub struct AttendandsComponent {
     pub media_packet: MediaPacket,
     pub connected: bool,
     pub video_decoder: Option<VideoDecoder>,
+    pub waiting_for_keyframe: bool,
 }
 
 impl Component for AttendandsComponent {
@@ -82,6 +72,7 @@ impl Component for AttendandsComponent {
             connected: false,
             media_packet: MediaPacket::default(),
             video_decoder: None,
+            waiting_for_keyframe: true,
         }
     }
 
@@ -89,7 +80,7 @@ impl Component for AttendandsComponent {
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
-                    let callback = ctx.link().callback(|Json(data)| Msg::WsReady(data));
+                    let callback = ctx.link().callback(|data| Msg::WsReady(data));
                     let notification = ctx.link().batch_callback(|status| match status {
                         WebSocketStatus::Opened => Some(WsAction::Connected.into()),
                         WebSocketStatus::Closed | WebSocketStatus::Error => {
@@ -125,72 +116,80 @@ impl Component for AttendandsComponent {
                 }
             },
             Msg::WsReady(response) => {
-                let data = if let Some(data) = response
-                    .map(|data| MediaPacket::parse_from_bytes(&data).ok())
-                    .ok()
-                    .flatten()
-                {
-                    log!("got data");
-                    if let Some(decoder) = self.video_decoder {
-                        let chunk = data.video;
-                        // let mut video_vector = vec![0u8; chunk.len() as usize];
-                        // let video_message = video_vector.as_mut();
-                        // chunk.copy_to_with_u8_array(video_message);
-                        let data = EncodedVideoChunk::from(&chunk);
-                        // let data = Uint8Array::from(video_message.as_ref());
-                        // let encoded_video_chunk = EncodedVideoChunk::new(
-                        //     &EncodedVideoChunkInit::new(&data, chunk.timestamp(), chunk.type_())
-                        // ).unwrap();
-                        // decoder.decode(&encoded_video_chunk);
-                        // decoder.decode(chunk)
+                let data = response.0;
+                if data.video.is_empty() {
+                    log!("dropping bad video packet");
+                }
+                log!("video length", data.video.len());
+
+                if let Some(decoder) = &self.video_decoder {
+                    let video_data =
+                        Uint8Array::new_with_length(data.video.len().try_into().unwrap());
+                    let chunk_type = EncodedVideoChunkTypeWrapper::from(data.video_type).0;
+                    video_data.copy_from(&data.video.into_boxed_slice());
+                    let encoded_video_chunk = EncodedVideoChunk::new(&EncodedVideoChunkInit::new(
+                        &video_data,
+                        data.video_timestamp,
+                        chunk_type,
+                    ))
+                    .unwrap();
+                    if self.waiting_for_keyframe && chunk_type == EncodedVideoChunkType::Key
+                        || !self.waiting_for_keyframe
+                    {
+                        decoder.decode(&encoded_video_chunk);
+                        self.waiting_for_keyframe = false;
                     } else {
-                        let error_video = Closure::wrap(Box::new(move |e: JsValue| {
-                            log!(&e);
-                        })
-                            as Box<dyn FnMut(JsValue)>);
-                        let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
-                            let chunk = Box::new(original_chunk);
-                            let video_chunk = chunk.clone().unchecked_into::<HtmlImageElement>();
-                            // let width = Reflect::get(&chunk.clone(), &JsString::from("codedWidth"))
-                            //     .unwrap()
-                            //     .as_f64()
-                            //     .unwrap();
-                            // let height = Reflect::get(&chunk.clone(), &JsString::from("codedHeight"))
-                            //     .unwrap()
-                            //     .as_f64()
-                            //     .unwrap();
-                            // let render_canvas = window()
-                            //     .unwrap()
-                            //     .document()
-                            //     .unwrap()
-                            //     .get_element_by_id("render")
-                            //     .unwrap()
-                            //     .unchecked_into::<HtmlCanvasElement>();
-                            // render_canvas.set_width(width as u32);
-                            // render_canvas.set_height(height as u32);
-                            // let ctx = render_canvas
-                            //     .get_context("2d")
-                            //     .unwrap()
-                            //     .unwrap()
-                            //     .unchecked_into::<CanvasRenderingContext2d>();
-                            // ctx.draw_image_with_html_image_element(
-                            //     &video_chunk,
-                            //     0.0,
-                            //     0.0
-                            // );
-                            // video_chunk.unchecked_into::<VideoFrame>().close();
-                        })
-                            as Box<dyn FnMut(JsValue)>);
-                        let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
-                            error_video.as_ref().unchecked_ref(),
-                            output.as_ref().unchecked_ref(),
-                        ))
-                        .unwrap();
-                        self.video_decoder = Some(video_decoder);
-                        error_video.forget();
-                        output.forget();
+                        log!("dropping frame");
                     }
-                };
+                } else {
+                    let error_video = Closure::wrap(Box::new(move |e: JsValue| {
+                        log!(&e);
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+                    let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
+                        log!("decoded video chunk");
+                        let chunk = Box::new(original_chunk);
+                        let video_chunk = chunk.clone().unchecked_into::<HtmlImageElement>();
+                        // let width = Reflect::get(&chunk.clone(), &JsString::from("codedWidth"))
+                        //     .unwrap()
+                        //     .as_f64()
+                        //     .unwrap();
+                        // let height = Reflect::get(&chunk.clone(), &JsString::from("codedHeight"))
+                        //     .unwrap()
+                        //     .as_f64()
+                        //     .unwrap();
+                        // let render_canvas = window()
+                        //     .unwrap()
+                        //     .document()
+                        //     .unwrap()
+                        //     .get_element_by_id("render")
+                        //     .unwrap()
+                        //     .unchecked_into::<HtmlCanvasElement>();
+                        // render_canvas.set_width(width as u32);
+                        // render_canvas.set_height(height as u32);
+                        // let ctx = render_canvas
+                        //     .get_context("2d")
+                        //     .unwrap()
+                        //     .unwrap()
+                        //     .unchecked_into::<CanvasRenderingContext2d>();
+                        // ctx.draw_image_with_html_image_element(
+                        //     &video_chunk,
+                        //     0.0,
+                        //     0.0
+                        // );
+                        // video_chunk.unchecked_into::<VideoFrame>().close();
+                    }) as Box<dyn FnMut(JsValue)>);
+                    let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
+                        error_video.as_ref().unchecked_ref(),
+                        output.as_ref().unchecked_ref(),
+                    ))
+                    .unwrap();
+                    video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
+                    self.video_decoder = Some(video_decoder);
+                    self.waiting_for_keyframe = true;
+                    error_video.forget();
+                    output.forget();
+                }
 
                 true
             }

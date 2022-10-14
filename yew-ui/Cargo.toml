@@ -49,10 +49,12 @@ features = [
     "VideoEncoder",
     "VideoEncoderInit",
     "VideoEncoderConfig",
+    "VideoEncoderEncodeOptions",
     "VideoFrame",
     "VideoTrack",
     "VideoDecoder",
     "VideoDecoderConfig",
-    "VideoDecoderInit"
+    "VideoDecoderInit",
+    "LatencyMode"
 ]
 

@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use gloo_console::log;
 use gloo_utils::window;
 use js_sys::Array;
@@ -7,6 +5,9 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Number;
 use js_sys::Reflect;
+use protobuf::Message;
+use std::fmt;
+use std::fmt::Debug;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -15,6 +16,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::HtmlVideoElement;
 use web_sys::*;
 use yew::prelude::*;
+use yew_websocket::websocket::{Binary, Text};
 
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
@@ -38,6 +40,45 @@ pub struct MeetingProps {
 
     #[prop_or_default]
     pub on_frame: Callback<MediaPacket>,
+}
+
+pub struct MediaPacketWrapper(pub MediaPacket);
+
+impl From<Text> for MediaPacketWrapper {
+    fn from(_: Text) -> Self {
+        MediaPacketWrapper(MediaPacket::default())
+    }
+}
+
+impl From<Binary> for MediaPacketWrapper {
+    fn from(bin: Binary) -> Self {
+        let media_packet: MediaPacket = bin
+            .map(|data| MediaPacket::parse_from_bytes(&data.into_boxed_slice()).unwrap())
+            .unwrap_or(MediaPacket::default());
+        MediaPacketWrapper(media_packet)
+    }
+}
+
+pub struct EncodedVideoChunkTypeWrapper(pub EncodedVideoChunkType);
+
+impl From<String> for EncodedVideoChunkTypeWrapper {
+    fn from(s: String) -> Self {
+        log!("got value ", s.as_str());
+        match s.as_str() {
+            "Key" => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Key),
+            _ => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Delta),
+        }
+    }
+}
+
+impl fmt::Display for EncodedVideoChunkTypeWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.0 {
+            EncodedVideoChunkType::Delta => write!(f, "Delta"),
+            EncodedVideoChunkType::Key => write!(f, "Key"),
+            _ => todo!(),
+        }
+    }
 }
 
 impl Component for HostComponent {
@@ -66,6 +107,12 @@ impl Component for HostComponent {
                     let mut chunk_data = chunk_data.as_mut_slice();
                     chunk.copy_to_with_u8_array(&mut chunk_data);
                     media_packet.video = chunk_data.to_vec();
+                    media_packet.video_type =
+                        EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
+                    media_packet.video_timestamp = chunk.timestamp();
+                    if let Some(duration0) = chunk.duration() {
+                        media_packet.video_duration = duration0;
+                    }
                     on_frame.emit(media_packet);
                 });
 
@@ -114,11 +161,13 @@ impl Component for HostComponent {
                         .get_settings();
                     settings.width(VIDEO_WIDTH);
                     settings.height(VIDEO_HEIGHT);
-                    let video_encoder_config = VideoEncoderConfig::new(
+                    let mut video_encoder_config = VideoEncoderConfig::new(
                         &VIDEO_CODEC,
                         VIDEO_HEIGHT as u32,
                         VIDEO_WIDTH as u32,
                     );
+                    video_encoder_config.bitrate(10000f64);
+                    video_encoder_config.latency_mode(LatencyMode::Realtime);
                     video_encoder.configure(&video_encoder_config);
                     let processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
@@ -138,7 +187,9 @@ impl Component for HostComponent {
                                 let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
                                     .unwrap()
                                     .unchecked_into::<VideoFrame>();
-                                video_encoder.encode(&video_frame);
+                                let mut opts = VideoEncoderEncodeOptions::new();
+                                opts.key_frame(true);
+                                video_encoder.encode_with_options(&video_frame, &opts);
                                 video_frame.close();
                             }
                             Err(_e) => {

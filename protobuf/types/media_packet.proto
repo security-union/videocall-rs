@@ -5,6 +5,6 @@ message MediaPacket {
   bytes video = 2;
   bytes audio = 3;
   string video_type = 4;
-  int64 video_timestamp = 5;
-  int64 video_duration = 6;
+  double video_timestamp = 5;
+  double video_duration = 6;
 }

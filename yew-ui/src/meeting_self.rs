@@ -209,7 +209,6 @@ impl Component for HostComponent {
         }
         html! {
             <>
-                <h3>{"Buchonasaaa"}</h3>
                 <video autoplay=true id="webcam1"></video>
             </>
         }

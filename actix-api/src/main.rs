@@ -42,7 +42,6 @@ const OAUTH_REDIRECT_URL: &str = std::env!("OAUTH_REDIRECT_URL");
 const SCOPE: &str = "email%20profile%20openid";
 const ACTIX_PORT: &str = std::env!("ACTIX_PORT");
 const UI_PORT: &str = std::env!("TRUNK_SERVE_PORT");
-const UI_HOST: &str = std::env!("TRUNK_SERVE_HOST");
 const AFTER_LOGIN_URL: &'static str = concat!("http://localhost:", std::env!("TRUNK_SERVE_PORT"));
 
 pub mod auth;

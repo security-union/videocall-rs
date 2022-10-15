@@ -1,6 +1,8 @@
 use crate::meeting_self::MediaPacketWrapper;
 use anyhow::anyhow;
 use gloo_console::log;
+use js_sys::JsString;
+use js_sys::Reflect;
 use js_sys::Uint8Array;
 use protobuf::Message;
 use serde_derive::{Deserialize, Serialize};
@@ -150,34 +152,30 @@ impl Component for AttendandsComponent {
                         log!("decoded video chunk");
                         let chunk = Box::new(original_chunk);
                         let video_chunk = chunk.clone().unchecked_into::<HtmlImageElement>();
-                        // let width = Reflect::get(&chunk.clone(), &JsString::from("codedWidth"))
-                        //     .unwrap()
-                        //     .as_f64()
-                        //     .unwrap();
-                        // let height = Reflect::get(&chunk.clone(), &JsString::from("codedHeight"))
-                        //     .unwrap()
-                        //     .as_f64()
-                        //     .unwrap();
-                        // let render_canvas = window()
-                        //     .unwrap()
-                        //     .document()
-                        //     .unwrap()
-                        //     .get_element_by_id("render")
-                        //     .unwrap()
-                        //     .unchecked_into::<HtmlCanvasElement>();
-                        // render_canvas.set_width(width as u32);
-                        // render_canvas.set_height(height as u32);
-                        // let ctx = render_canvas
-                        //     .get_context("2d")
-                        //     .unwrap()
-                        //     .unwrap()
-                        //     .unchecked_into::<CanvasRenderingContext2d>();
-                        // ctx.draw_image_with_html_image_element(
-                        //     &video_chunk,
-                        //     0.0,
-                        //     0.0
-                        // );
-                        // video_chunk.unchecked_into::<VideoFrame>().close();
+                        let width = Reflect::get(&chunk.clone(), &JsString::from("codedWidth"))
+                            .unwrap()
+                            .as_f64()
+                            .unwrap();
+                        let height = Reflect::get(&chunk.clone(), &JsString::from("codedHeight"))
+                            .unwrap()
+                            .as_f64()
+                            .unwrap();
+                        let render_canvas = window()
+                            .unwrap()
+                            .document()
+                            .unwrap()
+                            .get_element_by_id("render")
+                            .unwrap()
+                            .unchecked_into::<HtmlCanvasElement>();
+                        render_canvas.set_width(width as u32);
+                        render_canvas.set_height(height as u32);
+                        let ctx = render_canvas
+                            .get_context("2d")
+                            .unwrap()
+                            .unwrap()
+                            .unchecked_into::<CanvasRenderingContext2d>();
+                        ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0);
+                        video_chunk.unchecked_into::<VideoFrame>().close();
                     }) as Box<dyn FnMut(JsValue)>);
                     let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
                         error_video.as_ref().unchecked_ref(),
@@ -218,6 +216,7 @@ impl Component for AttendandsComponent {
         });
         html! {
             <div>
+                <canvas id="render"></canvas>
                 <nav class="menu">
                     <button disabled={self.ws.is_some()}
                             onclick={ctx.link().callback(|_| WsAction::Connect)}>

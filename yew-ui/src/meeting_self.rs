@@ -36,9 +36,6 @@ pub struct MeetingProps {
     pub id: String,
 
     #[prop_or_default]
-    pub media_packet: MediaPacket,
-
-    #[prop_or_default]
     pub on_frame: Callback<MediaPacket>,
 }
 

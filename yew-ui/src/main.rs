@@ -1,3 +1,4 @@
+mod attendant;
 mod constants;
 mod meeting_attendants;
 mod meeting_self;

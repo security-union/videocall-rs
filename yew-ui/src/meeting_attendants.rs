@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::iter::Map;
+
 use crate::meeting_self::MediaPacketWrapper;
 use anyhow::anyhow;
 use gloo_console::log;
@@ -12,10 +15,12 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::*;
 use yew::prelude::*;
+use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 use yew_websocket::macros::Json;
 use yew_websocket::websocket::{Binary, WebSocketService, WebSocketStatus, WebSocketTask};
 
+use crate::attendant::Attendant;
 use crate::constants::{VIDEO_CODEC, VIDEO_HEIGHT, VIDEO_WIDTH};
 use crate::meeting_self::EncodedVideoChunkTypeWrapper;
 use crate::{constants::ACTIX_WEBSOCKET, meeting_self::HostComponent};
@@ -60,6 +65,7 @@ pub struct AttendandsComponent {
     pub connected: bool,
     pub video_decoder: Option<VideoDecoder>,
     pub waiting_for_keyframe: bool,
+    pub child_canvas: HashMap<String, String>,
 }
 
 impl Component for AttendandsComponent {
@@ -67,6 +73,9 @@ impl Component for AttendandsComponent {
     type Properties = AttendandsComponentProps;
 
     fn create(_ctx: &Context<Self>) -> Self {
+        let mut child_canvas = HashMap::new();
+        child_canvas.insert("dario".to_string(), "value".to_string());
+        child_canvas.insert("make".to_string(), "value".to_string());
         Self {
             fetching: false,
             data: None,
@@ -75,6 +84,7 @@ impl Component for AttendandsComponent {
             media_packet: MediaPacket::default(),
             video_decoder: None,
             waiting_for_keyframe: true,
+            child_canvas,
         }
     }
 
@@ -204,13 +214,18 @@ impl Component for AttendandsComponent {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let media_packet = ctx.props().media_packet.clone();
         let on_frame = ctx
             .link()
             .callback(|frame: MediaPacket| Msg::OnFrame(frame));
+        // let rows: Vec<VNode> = ctx.link().get_component().unwrap().child_canvas.iter().map(|(key, value)| {
+        //     html! {<canvas id={key.clone()}>{value.clone()}</canvas> }
+        // }).collect();
         html! {
             <div>
                 <canvas id="render"></canvas>
+                // { rows }
+                <Attendant name={"coneja"}></Attendant>
+                <Attendant name={"dario"}></Attendant>
                 <nav class="menu">
                     <button disabled={self.ws.is_some()}
                             onclick={ctx.link().callback(|_| WsAction::Connect)}>
@@ -225,7 +240,7 @@ impl Component for AttendandsComponent {
                         { "Close WebSocket connection" }
                     </button>
                 </nav>
-                <HostComponent media_packet={media_packet} on_frame={on_frame}/>
+                <HostComponent on_frame={on_frame}/>
             </div>
         }
     }

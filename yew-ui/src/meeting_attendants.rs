@@ -151,15 +151,9 @@ impl Component for AttendandsComponent {
                     let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
                         log!("decoded video chunk");
                         let chunk = Box::new(original_chunk);
-                        let video_chunk = chunk.clone().unchecked_into::<HtmlImageElement>();
-                        let width = Reflect::get(&chunk.clone(), &JsString::from("codedWidth"))
-                            .unwrap()
-                            .as_f64()
-                            .unwrap();
-                        let height = Reflect::get(&chunk.clone(), &JsString::from("codedHeight"))
-                            .unwrap()
-                            .as_f64()
-                            .unwrap();
+                        let video_chunk = chunk.unchecked_into::<VideoFrame>();
+                        let width = video_chunk.coded_width();
+                        let height = video_chunk.coded_height();
                         let render_canvas = window()
                             .unwrap()
                             .document()
@@ -174,6 +168,7 @@ impl Component for AttendandsComponent {
                             .unwrap()
                             .unwrap()
                             .unchecked_into::<CanvasRenderingContext2d>();
+                        let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
                         ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0);
                         video_chunk.unchecked_into::<VideoFrame>().close();
                     }) as Box<dyn FnMut(JsValue)>);
@@ -210,10 +205,9 @@ impl Component for AttendandsComponent {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let media_packet = ctx.props().media_packet.clone();
-        let on_frame = ctx.link().callback(|frame: MediaPacket| {
-            // log!("on meeting attendant callback");
-            Msg::OnFrame(frame)
-        });
+        let on_frame = ctx
+            .link()
+            .callback(|frame: MediaPacket| Msg::OnFrame(frame));
         html! {
             <div>
                 <canvas id="render"></canvas>

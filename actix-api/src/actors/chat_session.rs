@@ -13,7 +13,7 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use log::{error, info};
+use log::{debug, error, info};
 use protobuf::Message;
 use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
@@ -121,19 +121,12 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             ws::Message::Binary(msg) => {
                 let message: protobuf::Result<MediaPacket> =
                     protobuf::Message::parse_from_bytes(&msg);
-                info!(
-                    "got message and sending to frocessing {} email {} room {}",
-                    self.id.clone(),
-                    self.email.clone(),
-                    self.room.clone()
-                );
                 match message {
                     Ok(media_packet) => {
                         ctx.notify(MediaPacketUpdate { media_packet });
                     }
                     Err(err) => {
                         error!("error {:?}", err);
-                        // ctx.text(WsMessage::err(err.to_string()))
                     }
                 }
             }
@@ -198,7 +191,7 @@ impl Handler<MediaPacketUpdate> for WsChatSession {
 
     fn handle(&mut self, msg: MediaPacketUpdate, _ctx: &mut Self::Context) -> Self::Result {
         let room_id = self.room.clone();
-        info!(
+        debug!(
             "got message and sending to chat session {} email {} room {}",
             self.id.clone(),
             self.email.clone(),

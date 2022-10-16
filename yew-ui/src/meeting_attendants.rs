@@ -132,7 +132,6 @@ impl Component for AttendandsComponent {
                 if data.video.is_empty() {
                     log!("dropping bad video packet");
                 }
-                log!("video length", data.video.len());
 
                 if let Some(decoder) = &self.video_decoder {
                     let video_data =
@@ -168,7 +167,7 @@ impl Component for AttendandsComponent {
                             .unwrap()
                             .document()
                             .unwrap()
-                            .get_element_by_id("render")
+                            .get_element_by_id("dario")
                             .unwrap()
                             .unchecked_into::<HtmlCanvasElement>();
                         render_canvas.set_width(width as u32);
@@ -193,11 +192,9 @@ impl Component for AttendandsComponent {
                     error_video.forget();
                     output.forget();
                 }
-
                 true
             }
             Msg::OnFrame(media) => {
-                // Send image to the server.
                 if let Some(ws) = self.ws.as_mut() {
                     if self.connected {
                         let bytes = media.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
@@ -205,8 +202,6 @@ impl Component for AttendandsComponent {
                     } else {
                         log!("disconnected");
                     }
-                } else {
-                    // log!("No websocket!!!!");
                 }
                 false
             }
@@ -217,15 +212,17 @@ impl Component for AttendandsComponent {
         let on_frame = ctx
             .link()
             .callback(|frame: MediaPacket| Msg::OnFrame(frame));
-        // let rows: Vec<VNode> = ctx.link().get_component().unwrap().child_canvas.iter().map(|(key, value)| {
-        //     html! {<canvas id={key.clone()}>{value.clone()}</canvas> }
-        // }).collect();
+        let rows: Vec<VNode> = self
+            .child_canvas
+            .iter()
+            .map(|(key, value)| {
+                html! {<canvas id={key.clone()}>{value.clone()}</canvas> }
+            })
+            .collect();
         html! {
             <div>
                 <canvas id="render"></canvas>
-                // { rows }
-                <Attendant name={"coneja"}></Attendant>
-                <Attendant name={"dario"}></Attendant>
+                { rows }
                 <nav class="menu">
                     <button disabled={self.ws.is_some()}
                             onclick={ctx.link().callback(|_| WsAction::Connect)}>

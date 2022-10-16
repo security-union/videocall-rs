@@ -4,7 +4,7 @@ use crate::messages::{
 };
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
-use log::info;
+use log::{debug, info};
 use std::collections::{HashMap, HashSet};
 use types::protos::media_packet::MediaPacket;
 
@@ -99,7 +99,7 @@ impl Handler<ClientMessage> for ChatServer {
             room,
             msg,
         } = msg;
-        info!(
+        debug!(
             "got message in server room {} session {}",
             room.clone(),
             session.clone()

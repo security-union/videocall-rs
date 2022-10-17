@@ -1,5 +1,4 @@
 pub mod command;
-pub mod wsmessage;
 use actix::Message as ActixMessage;
 use types::protos::media_packet::MediaPacket;
 

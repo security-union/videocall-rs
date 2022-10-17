@@ -1,3 +1,4 @@
+use gloo_console::log;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
@@ -94,7 +95,6 @@ impl Component for Host {
                 let on_frame = ctx.props().on_frame.clone();
                 let email = ctx.props().email.clone();
                 let output_handler = Box::new(move |chunk: JsValue| {
-                    // log!("on output handler!!");
                     let chunk = web_sys::EncodedVideoChunk::from(chunk);
                     let mut media_packet: MediaPacket = MediaPacket::default();
                     media_packet.email = email.clone();
@@ -143,8 +143,7 @@ impl Component for Host {
                     );
 
                     let error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                        console::log_1(&JsString::from("on errror"));
-                        console::log_1(&e);
+                        log!("encoder error", e);
                     })
                         as Box<dyn FnMut(JsValue)>);
 
@@ -165,7 +164,7 @@ impl Component for Host {
                         VIDEO_HEIGHT as u32,
                         VIDEO_WIDTH as u32,
                     );
-                    video_encoder_config.bitrate(10000f64);
+                    video_encoder_config.bitrate(100000f64);
                     video_encoder_config.latency_mode(LatencyMode::Realtime);
                     video_encoder.configure(&video_encoder_config);
                     let processor =
@@ -178,6 +177,7 @@ impl Component for Host {
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
                     loop {
+                        let mut counter = 0u32;
                         let result = JsFuture::from(reader.read()).await.map_err(|e| {
                             console::log_1(&e);
                         });
@@ -187,6 +187,7 @@ impl Component for Host {
                                     .unwrap()
                                     .unchecked_into::<VideoFrame>();
                                 let mut opts = VideoEncoderEncodeOptions::new();
+                                counter = (counter + 1) % 50;
                                 opts.key_frame(true);
                                 video_encoder.encode_with_options(&video_frame, &opts);
                                 video_frame.close();

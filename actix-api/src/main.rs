@@ -1,16 +1,30 @@
+mod actors;
+mod constants;
+mod messages;
+mod models;
+
+use actix::{prelude::Stream, Actor, StreamHandler};
 use actix_cors::Cors;
+use actix_http::{
+    error::PayloadError,
+    ws::{Codec, Message, ProtocolError},
+};
 use actix_web::{
     cookie::{
         time::{Duration, OffsetDateTime},
         Cookie, SameSite,
     },
-    error, get, http,
-    web::{self, Json},
-    App, Error, HttpResponse, HttpServer,
+    error, get,
+    web::{self, Bytes, Json},
+    App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
+use actix_web_actors::ws::{handshake, WebsocketContext};
+use log::info;
 
-use crate::auth::{
-    fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
+use crate::{
+    actors::{chat_server::ChatServer, chat_session::WsChatSession},
+    auth::{fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user},
+    models::AppState,
 };
 use crate::{
     auth::AuthRequest,
@@ -26,8 +40,6 @@ const OAUTH_SECRET: &str = std::env!("OAUTH_CLIENT_SECRET");
 const OAUTH_REDIRECT_URL: &str = std::env!("OAUTH_REDIRECT_URL");
 const SCOPE: &str = "email%20profile%20openid";
 const ACTIX_PORT: &str = std::env!("ACTIX_PORT");
-const UI_PORT: &str = std::env!("TRUNK_SERVE_PORT");
-const UI_HOST: &str = std::env!("TRUNK_SERVE_HOST");
 const AFTER_LOGIN_URL: &'static str = concat!("http://localhost:", std::env!("TRUNK_SERVE_PORT"));
 
 pub mod auth;
@@ -146,33 +158,57 @@ async fn greet(name: web::Path<String>) -> Json<HelloResponse> {
     })
 }
 
+fn start_with_codec<A, S>(
+    actor: A,
+    req: &HttpRequest,
+    stream: S,
+    codec: Codec,
+) -> Result<HttpResponse, Error>
+where
+    A: Actor<Context = WebsocketContext<A>> + StreamHandler<Result<Message, ProtocolError>>,
+    S: Stream<Item = Result<Bytes, PayloadError>> + 'static,
+{
+    let mut res = handshake(req)?;
+    Ok(res.streaming(WebsocketContext::with_codec(actor, stream, codec)))
+}
+
+#[get("/lobby/{email}/{room}")]
+pub async fn ws_connect(
+    session: web::Path<(String, String)>,
+    req: HttpRequest,
+    stream: web::Payload,
+    state: web::Data<AppState>,
+) -> impl Responder {
+    let (email, room) = session.into_inner();
+    info!("socket connected");
+    let chat = state.chat.clone();
+    let actor = WsChatSession::new(chat, room, email);
+    let codec = Codec::new().max_size(1_000_000);
+    let resp = start_with_codec(actor, &req, stream, codec);
+    resp
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
+    info!("start");
+    let chat = ChatServer::new().start();
 
-    // TODO: Deal with https, maybe we should just expose this as an env var?
-    let allowed_origin = if UI_PORT != "80" {
-        format!("http://{}:{}", UI_HOST, UI_PORT)
-    } else {
-        format!("http://{}", UI_HOST)
-    };
+    // Yolo
 
     HttpServer::new(move || {
-        let cors = Cors::default()
-            .allowed_origin(allowed_origin.as_str())
-            .allowed_methods(vec!["GET", "POST"])
-            .allowed_headers(vec![http::header::AUTHORIZATION, http::header::ACCEPT])
-            .allowed_header(http::header::CONTENT_TYPE)
-            .max_age(3600);
+        let cors = Cors::permissive();
 
         let pool = get_pool();
 
         App::new()
             .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(AppState { chat: chat.clone() }))
             .wrap(cors)
             .service(greet)
             .service(handle_google_oauth_callback)
             .service(login)
+            .service(ws_connect)
     })
     .bind(("0.0.0.0", ACTIX_PORT.parse::<u16>().unwrap()))?
     .run()

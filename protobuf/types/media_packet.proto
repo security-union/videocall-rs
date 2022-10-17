@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+message MediaPacket {
+  string email = 1;
+  bytes video = 2;
+  bytes audio = 3;
+  string video_type = 4;
+  double video_timestamp = 5;
+  double video_duration = 6;
+}

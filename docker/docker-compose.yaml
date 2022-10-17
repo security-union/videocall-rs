@@ -23,7 +23,7 @@ services:
   actix-api:
     build: 
       dockerfile: ../docker/Dockerfile.actix
-    command: bash -c "cd app/actix-api && cargo watch -x \"run\""
+    command: bash -c "cd app/actix-api && cargo watch -x \"run -r\""
     environment:
       - ACTIX_PORT=${ACTIX_PORT:-8080}
       - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}

@@ -1,7 +1,6 @@
-mod attendant;
 mod constants;
+mod host;
 mod meeting_attendants;
-mod meeting_self;
 
 use constants::LOGIN_URL;
 

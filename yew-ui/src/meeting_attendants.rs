@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use crate::constants::{VIDEO_CODEC, VIDEO_HEIGHT, VIDEO_WIDTH};
-use crate::meeting_self::EncodedVideoChunkTypeWrapper;
-use crate::meeting_self::MediaPacketWrapper;
-use crate::{constants::ACTIX_WEBSOCKET, meeting_self::HostComponent};
+use crate::constants::VIDEO_CODEC;
+use crate::host::EncodedVideoChunkTypeWrapper;
+use crate::host::MediaPacketWrapper;
+use crate::{constants::ACTIX_WEBSOCKET, host::Host};
 use anyhow::anyhow;
 use gloo_console::log;
 use js_sys::Uint8Array;
@@ -20,7 +20,6 @@ use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask}
 
 pub enum WsAction {
     Connect,
-    SendData(),
     Connected,
     Disconnect,
     Lost,
@@ -93,12 +92,6 @@ impl Component for AttendandsComponent {
                     let task = WebSocketService::connect(&url, callback, notification).unwrap();
                     self.ws = Some(task);
                     true
-                }
-                WsAction::SendData() => {
-                    let media = MediaPacket::default();
-                    let bytes = media.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
-                    self.ws.as_mut().unwrap().send_binary(bytes);
-                    false
                 }
                 WsAction::Disconnect => {
                     self.ws.take();
@@ -211,27 +204,31 @@ impl Component for AttendandsComponent {
             .connected_peers
             .iter()
             .map(|(key, _value)| {
-                html! {<canvas id={key.clone()}></canvas> }
+                html! {
+                    <div class="grid-item">
+                        <canvas id={key.clone()}></canvas>
+                        <h4 class="floating-name">{key.clone()}</h4>
+                    </div>
+                }
             })
             .collect();
         html! {
-            <div>
+            <div class="grid-container">
                 { rows }
-                <nav class="menu">
-                    <button disabled={self.ws.is_some()}
-                            onclick={ctx.link().callback(|_| WsAction::Connect)}>
-                        { "Connect To WebSocket" }
-                    </button>
-                    <button disabled={self.ws.is_none()}
-                            onclick={ctx.link().callback(|_| WsAction::SendData())}>
-                        { "Send To WebSocket [binary]" }
-                    </button>
-                    <button disabled={self.ws.is_none()}
-                            onclick={ctx.link().callback(|_| WsAction::Disconnect)}>
-                        { "Close WebSocket connection" }
-                    </button>
+                <nav class="grid-item menu">
+                    <div class="controls">
+                        <button disabled={self.ws.is_some()}
+                                onclick={ctx.link().callback(|_| WsAction::Connect)}>
+                            { "Connect" }
+                        </button>
+                        <button disabled={self.ws.is_none()}
+                                onclick={ctx.link().callback(|_| WsAction::Disconnect)}>
+                            { "Close" }
+                        </button>
+                    </div>
+                    <Host on_frame={on_frame} email={email.clone()}/>
+                    <h4 class="floating-name">{email}</h4>
                 </nav>
-                <HostComponent on_frame={on_frame} email={email}/>
             </div>
         }
     }

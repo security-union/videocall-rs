@@ -25,7 +25,7 @@ pub enum Msg {
     Start,
 }
 
-pub struct HostComponent {
+pub struct Host {
     pub initialized: bool,
 }
 
@@ -79,7 +79,7 @@ impl fmt::Display for EncodedVideoChunkTypeWrapper {
     }
 }
 
-impl Component for HostComponent {
+impl Component for Host {
     type Message = Msg;
     type Properties = MeetingProps;
 
@@ -121,7 +121,7 @@ impl Component for HostComponent {
                     let video_element = window()
                         .document()
                         .unwrap()
-                        .get_element_by_id("webcam1")
+                        .get_element_by_id("webcam")
                         .unwrap()
                         .unchecked_into::<HtmlVideoElement>();
 
@@ -207,9 +207,7 @@ impl Component for HostComponent {
             ctx.link().send_message(Msg::Start);
         }
         html! {
-            <>
-                <video autoplay=true id="webcam1"></video>
-            </>
+            <video class="self-camera" autoplay=true id="webcam"></video>
         }
     }
 }

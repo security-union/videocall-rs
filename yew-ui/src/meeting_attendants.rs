@@ -1,14 +1,13 @@
 use std::collections::HashMap;
-use std::iter::Map;
 
+use crate::constants::{VIDEO_CODEC, VIDEO_HEIGHT, VIDEO_WIDTH};
+use crate::meeting_self::EncodedVideoChunkTypeWrapper;
 use crate::meeting_self::MediaPacketWrapper;
+use crate::{constants::ACTIX_WEBSOCKET, meeting_self::HostComponent};
 use anyhow::anyhow;
 use gloo_console::log;
-use js_sys::JsString;
-use js_sys::Reflect;
 use js_sys::Uint8Array;
 use protobuf::Message;
-use serde_derive::{Deserialize, Serialize};
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -17,13 +16,7 @@ use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
-use yew_websocket::macros::Json;
-use yew_websocket::websocket::{Binary, WebSocketService, WebSocketStatus, WebSocketTask};
-
-use crate::attendant::Attendant;
-use crate::constants::{VIDEO_CODEC, VIDEO_HEIGHT, VIDEO_WIDTH};
-use crate::meeting_self::EncodedVideoChunkTypeWrapper;
-use crate::{constants::ACTIX_WEBSOCKET, meeting_self::HostComponent};
+use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
 
 pub enum WsAction {
     Connect,
@@ -58,14 +51,15 @@ pub struct AttendandsComponentProps {
 }
 
 pub struct AttendandsComponent {
-    pub fetching: bool,
-    pub data: Option<u32>,
     pub ws: Option<WebSocketTask>,
     pub media_packet: MediaPacket,
     pub connected: bool,
-    pub video_decoder: Option<VideoDecoder>,
+    pub connected_peers: HashMap<String, ClientSubscription>,
+}
+
+pub struct ClientSubscription {
+    pub video_decoder: VideoDecoder,
     pub waiting_for_keyframe: bool,
-    pub child_canvas: HashMap<String, String>,
 }
 
 impl Component for AttendandsComponent {
@@ -73,18 +67,12 @@ impl Component for AttendandsComponent {
     type Properties = AttendandsComponentProps;
 
     fn create(_ctx: &Context<Self>) -> Self {
-        let mut child_canvas = HashMap::new();
-        child_canvas.insert("dario".to_string(), "value".to_string());
-        child_canvas.insert("make".to_string(), "value".to_string());
+        let connected_peers: HashMap<String, ClientSubscription> = HashMap::new();
         Self {
-            fetching: false,
-            data: None,
             ws: None,
             connected: false,
             media_packet: MediaPacket::default(),
-            video_decoder: None,
-            waiting_for_keyframe: true,
-            child_canvas,
+            connected_peers,
         }
     }
 
@@ -132,8 +120,9 @@ impl Component for AttendandsComponent {
                 if data.video.is_empty() {
                     log!("dropping bad video packet");
                 }
+                let email = data.email.clone();
 
-                if let Some(decoder) = &self.video_decoder {
+                if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
                     let video_data =
                         Uint8Array::new_with_length(data.video.len().try_into().unwrap());
                     let chunk_type = EncodedVideoChunkTypeWrapper::from(data.video_type).0;
@@ -144,21 +133,21 @@ impl Component for AttendandsComponent {
                         chunk_type,
                     ))
                     .unwrap();
-                    if self.waiting_for_keyframe && chunk_type == EncodedVideoChunkType::Key
-                        || !self.waiting_for_keyframe
+                    if peer.waiting_for_keyframe && chunk_type == EncodedVideoChunkType::Key
+                        || !peer.waiting_for_keyframe
                     {
-                        decoder.decode(&encoded_video_chunk);
-                        self.waiting_for_keyframe = false;
+                        peer.video_decoder.decode(&encoded_video_chunk);
+                        peer.waiting_for_keyframe = false;
                     } else {
                         log!("dropping frame");
                     }
+                    false
                 } else {
                     let error_video = Closure::wrap(Box::new(move |e: JsValue| {
                         log!(&e);
                     })
                         as Box<dyn FnMut(JsValue)>);
                     let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
-                        log!("decoded video chunk");
                         let chunk = Box::new(original_chunk);
                         let video_chunk = chunk.unchecked_into::<VideoFrame>();
                         let width = video_chunk.coded_width();
@@ -167,7 +156,7 @@ impl Component for AttendandsComponent {
                             .unwrap()
                             .document()
                             .unwrap()
-                            .get_element_by_id("dario")
+                            .get_element_by_id(&email.clone())
                             .unwrap()
                             .unchecked_into::<HtmlCanvasElement>();
                         render_canvas.set_width(width as u32);
@@ -187,12 +176,17 @@ impl Component for AttendandsComponent {
                     ))
                     .unwrap();
                     video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
-                    self.video_decoder = Some(video_decoder);
-                    self.waiting_for_keyframe = true;
+                    self.connected_peers.insert(
+                        data.email.clone(),
+                        ClientSubscription {
+                            video_decoder,
+                            waiting_for_keyframe: true,
+                        },
+                    );
                     error_video.forget();
                     output.forget();
+                    true
                 }
-                true
             }
             Msg::OnFrame(media) => {
                 if let Some(ws) = self.ws.as_mut() {
@@ -209,19 +203,19 @@ impl Component for AttendandsComponent {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        let email = ctx.props().email.clone();
         let on_frame = ctx
             .link()
             .callback(|frame: MediaPacket| Msg::OnFrame(frame));
         let rows: Vec<VNode> = self
-            .child_canvas
+            .connected_peers
             .iter()
-            .map(|(key, value)| {
-                html! {<canvas id={key.clone()}>{value.clone()}</canvas> }
+            .map(|(key, _value)| {
+                html! {<canvas id={key.clone()}></canvas> }
             })
             .collect();
         html! {
             <div>
-                <canvas id="render"></canvas>
                 { rows }
                 <nav class="menu">
                     <button disabled={self.ws.is_some()}
@@ -237,7 +231,7 @@ impl Component for AttendandsComponent {
                         { "Close WebSocket connection" }
                     </button>
                 </nav>
-                <HostComponent on_frame={on_frame}/>
+                <HostComponent on_frame={on_frame} email={email}/>
             </div>
         }
     }

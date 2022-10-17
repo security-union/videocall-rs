@@ -1,4 +1,3 @@
-use gloo_console::log;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
@@ -37,6 +36,9 @@ pub struct MeetingProps {
 
     #[prop_or_default]
     pub on_frame: Callback<MediaPacket>,
+
+    #[prop_or_default]
+    pub email: String,
 }
 
 pub struct MediaPacketWrapper(pub MediaPacket);
@@ -60,7 +62,6 @@ pub struct EncodedVideoChunkTypeWrapper(pub EncodedVideoChunkType);
 
 impl From<String> for EncodedVideoChunkTypeWrapper {
     fn from(s: String) -> Self {
-        log!("got value ", s.as_str());
         match s.as_str() {
             "Key" => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Key),
             _ => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Delta),
@@ -91,11 +92,12 @@ impl Component for HostComponent {
             Msg::Start => {
                 self.initialized = true;
                 let on_frame = ctx.props().on_frame.clone();
+                let email = ctx.props().email.clone();
                 let output_handler = Box::new(move |chunk: JsValue| {
                     // log!("on output handler!!");
                     let chunk = web_sys::EncodedVideoChunk::from(chunk);
                     let mut media_packet: MediaPacket = MediaPacket::default();
-                    media_packet.email = "dario".to_string();
+                    media_packet.email = email.clone();
                     let byte_length: Number = Reflect::get(&chunk, &JsString::from("byteLength"))
                         .unwrap()
                         .into();

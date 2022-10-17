@@ -13,7 +13,7 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use log::{debug, error, info};
+use log::{debug, error};
 use protobuf::Message;
 use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
@@ -146,7 +146,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
         }
     }
 
-    fn started(&mut self, ctx: &mut Self::Context) {}
+    fn started(&mut self, _ctx: &mut Self::Context) {}
 
     fn finished(&mut self, ctx: &mut Self::Context) {
         ctx.stop()

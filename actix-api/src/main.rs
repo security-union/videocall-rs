@@ -14,13 +14,12 @@ use actix_web::{
         time::{Duration, OffsetDateTime},
         Cookie, SameSite,
     },
-    error, get, http,
+    error, get,
     web::{self, Bytes, Json},
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
-use actix_web_actors::ws::{self, handshake, WebsocketContext};
+use actix_web_actors::ws::{handshake, WebsocketContext};
 use log::info;
-use rand::Rng;
 
 use crate::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},
@@ -41,7 +40,6 @@ const OAUTH_SECRET: &str = std::env!("OAUTH_CLIENT_SECRET");
 const OAUTH_REDIRECT_URL: &str = std::env!("OAUTH_REDIRECT_URL");
 const SCOPE: &str = "email%20profile%20openid";
 const ACTIX_PORT: &str = std::env!("ACTIX_PORT");
-const UI_PORT: &str = std::env!("TRUNK_SERVE_PORT");
 const AFTER_LOGIN_URL: &'static str = concat!("http://localhost:", std::env!("TRUNK_SERVE_PORT"));
 
 pub mod auth;
@@ -184,11 +182,8 @@ pub async fn ws_connect(
     let (email, room) = session.into_inner();
     info!("socket connected");
     let chat = state.chat.clone();
-    let mut rng = rand::thread_rng();
-    let y: f64 = rng.gen(); // generates a float between 0 and 1
     let actor = WsChatSession::new(chat, room, email);
     let codec = Codec::new().max_size(1_000_000);
-    let res = handshake(&req)?;
     let resp = start_with_codec(actor, &req, stream, codec);
     resp
 }
@@ -197,8 +192,6 @@ pub async fn ws_connect(
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     info!("start");
-    // TODO: Deal with https, maybe we should just expose this as an env var? sdfsd
-    let allowed_origin = "*";
     let chat = ChatServer::new().start();
 
     // Yolo

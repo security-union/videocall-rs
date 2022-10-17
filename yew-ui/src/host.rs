@@ -18,6 +18,7 @@ use web_sys::*;
 use yew::prelude::*;
 use yew_websocket::websocket::{Binary, Text};
 
+use crate::constants::AUDIO_CODEC;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
@@ -115,8 +116,8 @@ impl Component for Host {
                     on_frame.emit(media_packet);
                 });
 
-                let audio_output_handler = Box::new(move |chunk: JsValue| {
-
+                let audio_output_handler = Box::new(move |_chunk: JsValue| {
+                    log!("encoded audio packet :) ");
                 });
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
@@ -152,22 +153,24 @@ impl Component for Host {
                     );
 
                     let error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                        log!("encoder error", e);
+                        log!("error_handler error", e);
                     })
                         as Box<dyn FnMut(JsValue)>);
 
                     let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                        log!("encoder error", e);
+                        log!("audio_error_handler error", e);
                     })
                         as Box<dyn FnMut(JsValue)>);
 
                     let output_handler = Closure::wrap(output_handler as Box<dyn FnMut(JsValue)>);
+                    let audio_output_handler =
+                        Closure::wrap(audio_output_handler as Box<dyn FnMut(JsValue)>);
                     let video_encoder_init = VideoEncoderInit::new(
                         error_handler.as_ref().unchecked_ref(),
                         output_handler.as_ref().unchecked_ref(),
                     );
                     let audio_encoder_init = AudioEncoderInit::new(
-                        error_handler.as_ref().unchecked_ref(),
+                        audio_error_handler.as_ref().unchecked_ref(),
                         audio_output_handler.as_ref().unchecked_ref(),
                     );
 
@@ -184,36 +187,64 @@ impl Component for Host {
                         VIDEO_HEIGHT as u32,
                         VIDEO_WIDTH as u32,
                     );
+
                     video_encoder_config.bitrate(100000f64);
                     video_encoder_config.latency_mode(LatencyMode::Realtime);
                     video_encoder.configure(&video_encoder_config);
+
+                    let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
+                    audio_encoder_config.number_of_channels(1);
+                    audio_encoder_config.sample_rate(44100);
+                    audio_encoder.configure(&audio_encoder_config);
+
                     let processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
                             &video_track.unchecked_into::<MediaStreamTrack>(),
                         ))
                         .unwrap();
-                    let reader = processor
+                    let video_reader = processor
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
+
+                    let audio_processor =
+                        MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+                            &audio_track.unchecked_into::<MediaStreamTrack>(),
+                        ))
+                        .unwrap();
+                    let audio_reader = audio_processor
+                        .readable()
+                        .get_reader()
+                        .unchecked_into::<ReadableStreamDefaultReader>();
+
                     loop {
-                        let mut counter = 0u32;
-                        let result = JsFuture::from(reader.read()).await.map_err(|e| {
-                            console::log_1(&e);
-                        });
-                        match result {
+                        // let mut counter = 0u32;
+
+                        match JsFuture::from(video_reader.read()).await {
                             Ok(js_frame) => {
                                 let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
                                     .unwrap()
                                     .unchecked_into::<VideoFrame>();
                                 let mut opts = VideoEncoderEncodeOptions::new();
-                                counter = (counter + 1) % 50;
+                                // counter = (counter + 1) % 50;
                                 opts.key_frame(true);
                                 video_encoder.encode_with_options(&video_frame, &opts);
                                 video_frame.close();
                             }
-                            Err(_e) => {
-                                console::log_1(&JsString::from("error"));
+                            Err(e) => {
+                                log!("error", e);
+                            }
+                        }
+                        match JsFuture::from(audio_reader.read()).await {
+                            Ok(js_frame) => {
+                                let audio_frame = Reflect::get(&js_frame, &JsString::from("value"))
+                                    .unwrap()
+                                    .unchecked_into::<AudioData>();
+                                audio_encoder.encode(&audio_frame);
+                                audio_frame.close();
+                            }
+                            Err(e) => {
+                                log!("error", e);
                             }
                         }
                     }

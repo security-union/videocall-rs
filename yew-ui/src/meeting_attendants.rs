@@ -160,7 +160,11 @@ impl Component for AttendandsComponent {
                             .unwrap()
                             .unchecked_into::<CanvasRenderingContext2d>();
                         let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
-                        ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0);
+                        if let Err(e) =
+                            ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0)
+                        {
+                            log!("error ", e);
+                        }
                         video_chunk.unchecked_into::<VideoFrame>().close();
                     }) as Box<dyn FnMut(JsValue)>);
                     let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(

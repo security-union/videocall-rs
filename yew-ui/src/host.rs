@@ -115,6 +115,9 @@ impl Component for Host {
                     on_frame.emit(media_packet);
                 });
 
+                let audio_output_handler = Box::new(move |chunk: JsValue| {
+
+                });
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
@@ -141,8 +144,19 @@ impl Component for Host {
                             .find(&mut |_: JsValue, _: u32, _: Array| true)
                             .unchecked_into::<VideoTrack>(),
                     );
+                    let audio_track = Box::new(
+                        device
+                            .get_audio_tracks()
+                            .find(&mut |_: JsValue, _: u32, _: Array| true)
+                            .unchecked_into::<AudioTrack>(),
+                    );
 
                     let error_handler = Closure::wrap(Box::new(move |e: JsValue| {
+                        log!("encoder error", e);
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+
+                    let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
                         log!("encoder error", e);
                     })
                         as Box<dyn FnMut(JsValue)>);
@@ -152,6 +166,12 @@ impl Component for Host {
                         error_handler.as_ref().unchecked_ref(),
                         output_handler.as_ref().unchecked_ref(),
                     );
+                    let audio_encoder_init = AudioEncoderInit::new(
+                        error_handler.as_ref().unchecked_ref(),
+                        audio_output_handler.as_ref().unchecked_ref(),
+                    );
+
+                    let audio_encoder = AudioEncoder::new(&audio_encoder_init).unwrap();
                     let video_encoder = VideoEncoder::new(&video_encoder_init).unwrap();
                     let settings = &mut video_track
                         .clone()

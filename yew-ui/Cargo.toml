@@ -26,6 +26,9 @@ protobuf = "3.2.0"
 [dependencies.web-sys]
 version = "0.3.58"
 features = [
+    "AudioTrack",
+    "AudioEncoder",
+    "AudioEncoderInit",
     "HtmlDocument",
     "console",
     "CanvasRenderingContext2d",

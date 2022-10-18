@@ -18,7 +18,9 @@ use web_sys::*;
 use yew::prelude::*;
 use yew_websocket::websocket::{Binary, Text};
 
+use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
+use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
@@ -93,32 +95,59 @@ impl Component for Host {
         match msg {
             Msg::Start => {
                 self.initialized = true;
-                let on_frame = ctx.props().on_frame.clone();
-                let email = ctx.props().email.clone();
-                let output_handler = Box::new(move |chunk: JsValue| {
-                    let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                    let mut media_packet: MediaPacket = MediaPacket::default();
-                    media_packet.email = email.clone();
-                    let byte_length: Number = Reflect::get(&chunk, &JsString::from("byteLength"))
-                        .unwrap()
-                        .into();
-                    let byte_length: usize = byte_length.as_f64().unwrap() as usize;
-                    let mut chunk_data: Vec<u8> = vec![0; byte_length];
-                    let mut chunk_data = chunk_data.as_mut_slice();
-                    chunk.copy_to_with_u8_array(&mut chunk_data);
-                    media_packet.video = chunk_data.to_vec();
-                    media_packet.video_type =
-                        EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
-                    media_packet.video_timestamp = chunk.timestamp();
-                    if let Some(duration0) = chunk.duration() {
-                        media_packet.video_duration = duration0;
-                    }
-                    on_frame.emit(media_packet);
-                });
+                let on_frame = Box::new(ctx.props().on_frame.clone());
+                let email = Box::new(ctx.props().email.clone());
+                let output_handler = {
+                    let email = email.clone();
+                    let on_frame = on_frame.clone();
+                    Box::new(move |chunk: JsValue| {
+                        let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                        let mut media_packet: MediaPacket = MediaPacket::default();
+                        media_packet.email = *email.clone();
+                        let byte_length: Number =
+                            Reflect::get(&chunk, &JsString::from("byteLength"))
+                                .unwrap()
+                                .into();
+                        let byte_length: usize = byte_length.as_f64().unwrap() as usize;
+                        let mut chunk_data: Vec<u8> = vec![0; byte_length];
+                        let mut chunk_data = chunk_data.as_mut_slice();
+                        chunk.copy_to_with_u8_array(&mut chunk_data);
+                        media_packet.video = chunk_data.to_vec();
+                        media_packet.video_type =
+                            EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
+                        media_packet.video_timestamp = chunk.timestamp();
+                        if let Some(duration0) = chunk.duration() {
+                            media_packet.video_duration = duration0;
+                        }
+                        on_frame.emit(media_packet);
+                    })
+                };
 
-                let audio_output_handler = Box::new(move |_chunk: JsValue| {
-                    log!("encoded audio packet :) ");
-                });
+                let audio_output_handler = {
+                    let email = email.clone();
+                    let on_frame = on_frame.clone();
+                    Box::new(move |chunk: JsValue| {
+                        log!("encoded audio packet :) ");
+                        let chunk = web_sys::EncodedAudioChunk::from(chunk);
+                        let mut media_packet: MediaPacket = MediaPacket::default();
+                        media_packet.email = *email.clone();
+                        let byte_length: Number =
+                            Reflect::get(&chunk, &JsString::from("byteLength"))
+                                .unwrap()
+                                .into();
+                        let byte_length: usize = byte_length.as_f64().unwrap() as usize;
+                        let mut chunk_data: Vec<u8> = vec![0; byte_length];
+                        let mut chunk_data = chunk_data.as_mut_slice();
+                        chunk.copy_to_with_u8_array(&mut chunk_data);
+                        media_packet.audio = chunk_data.to_vec();
+                        media_packet.video_timestamp = chunk.timestamp();
+                        if let Some(duration0) = chunk.duration() {
+                            media_packet.video_duration = duration0;
+                        }
+                        on_frame.emit(media_packet);
+                    })
+                };
+
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
@@ -131,6 +160,7 @@ impl Component for Host {
 
                     let mut constraints = MediaStreamConstraints::new();
                     constraints.video(&Boolean::from(true));
+                    constraints.audio(&Boolean::from(true));
                     let devices_query = media_devices
                         .get_user_media_with_constraints(&constraints)
                         .unwrap();
@@ -145,6 +175,7 @@ impl Component for Host {
                             .find(&mut |_: JsValue, _: u32, _: Array| true)
                             .unchecked_into::<VideoTrack>(),
                     );
+
                     let audio_track = Box::new(
                         device
                             .get_audio_tracks()
@@ -182,6 +213,15 @@ impl Component for Host {
                         .get_settings();
                     settings.width(VIDEO_WIDTH);
                     settings.height(VIDEO_HEIGHT);
+                    if let Err(e) = js_sys::Reflect::set(
+                        settings.as_ref(),
+                        &JsValue::from("sampleRate"),
+                        &JsValue::from(AUDIO_SAMPLE_RATE),
+                    ) {
+                        log!("error", e);
+                    }
+                    settings.channel_count(AUDIO_CHANNELS as i32);
+
                     let mut video_encoder_config = VideoEncoderConfig::new(
                         &VIDEO_CODEC,
                         VIDEO_HEIGHT as u32,
@@ -193,8 +233,8 @@ impl Component for Host {
                     video_encoder.configure(&video_encoder_config);
 
                     let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
-                    audio_encoder_config.number_of_channels(1);
-                    audio_encoder_config.sample_rate(44100);
+                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS);
+                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE);
                     audio_encoder.configure(&audio_encoder_config);
 
                     let processor =

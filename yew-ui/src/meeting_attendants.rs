@@ -112,6 +112,7 @@ impl Component for AttendandsComponent {
                 let data = response.0;
                 if data.video.is_empty() {
                     log!("dropping bad video packet");
+                    return false;
                 }
                 let email = data.email.clone();
 

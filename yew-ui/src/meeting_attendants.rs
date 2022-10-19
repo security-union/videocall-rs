@@ -188,20 +188,19 @@ impl Component for AttendandsComponent {
                         let js_tracks = Array::new();
                         js_tracks.push(&audio_stream_generator);
                         let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
-                        let audio = window()
-                            .unwrap()
-                            .document()
-                            .unwrap()
-                            .get_element_by_id(&"audio")
-                            .unwrap()
-                            .unchecked_into::<HtmlAudioElement>();
-                        audio.set_src_object(Some(&media_stream));
-                        audio.set_volume(1.0f64);
-                        wasm_bindgen_futures::spawn_local(async move {
-                            if let Err(e) = JsFuture::from(audio.play().unwrap()).await {
-                                log!("error", e);
-                            }
-                        });
+                        let audio_context = AudioContext::new().unwrap();
+                        let gain_node = audio_context.create_gain().unwrap();
+                        let source = audio_context
+                            .create_media_stream_source(&media_stream)
+                            .unwrap();
+                        if let Err(e) = source.connect_with_audio_node(&gain_node) {
+                            log!("connect_with_audio_node", e);
+                        }
+                        if let Err(e) =
+                            gain_node.connect_with_audio_node(&audio_context.destination())
+                        {
+                            log!("connect_with_audio_node", e);
+                        }
                         Closure::wrap(Box::new(move |audio_data: JsValue| {
                             let audio_data = audio_data.unchecked_into::<AudioData>();
                             log!("audio chunk decoded");

@@ -48,6 +48,7 @@ features = [
     "EncodedVideoChunkInit",
     "EncodedVideoChunkType",
     "MediaStreamAudioDestinationNode",
+    "AudioDestinationNode",
     "HtmlCanvasElement",
     "HtmlImageElement",
     "Navigator",

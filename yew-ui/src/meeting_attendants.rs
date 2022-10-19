@@ -17,11 +17,14 @@ use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+use wasm_bindgen_futures::JsFuture;
 use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
+
+// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 
 pub enum WsAction {
     Connect,
@@ -165,9 +168,9 @@ impl Component for AttendandsComponent {
                             }
                         }
                     }
-
                     false
                 } else {
+                    let audio_id = format!("{}audio", email.clone());
                     let error_video = Closure::wrap(Box::new(move |e: JsValue| {
                         log!(&e);
                     })
@@ -186,19 +189,58 @@ impl Component for AttendandsComponent {
                         let js_tracks = Array::new();
                         js_tracks.push(&audio_stream_generator);
                         let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
-                        audio_context.create_media_stream_source(&media_stream);
+                        let audio = window()
+                            .unwrap()
+                            .document()
+                            .unwrap()
+                            .get_element_by_id(&"audio")
+                            .unwrap()
+                            .unchecked_into::<HtmlAudioElement>();
+                        audio.set_src_object(Some(&media_stream));
+                        wasm_bindgen_futures::spawn_local(async move {
+                            JsFuture::from(audio.play().unwrap()).await;
+                        });
+
+                        if let Err(e) = audio_context.create_media_stream_source(&media_stream) {
+                            log!("create media stream ", e);
+                        }
                         let mut gain_options = GainOptions::new();
                         gain_options.gain(0.5f32);
-                        let gain = GainNode::new_with_options(&audio_context, &gain_options);
-                        audio_context.resume();
+                        if let Err(e) = GainNode::new_with_options(&audio_context, &gain_options) {
+                            log!("gain error ", e);
+                        }
+                        if let Err(e) = audio_context.resume() {
+                            log!("resume error ", e);
+                        }
                         Closure::wrap(Box::new(move |audio_data: JsValue| {
                             let audio_data = audio_data.unchecked_into::<AudioData>();
                             log!("audio chunk decoded");
-                            audio_stream_generator
-                                .writable()
-                                .get_writer()
-                                .unwrap()
-                                .write_with_chunk(&audio_data);
+                            // const ab = new ArrayBuffer(
+                            //     audio_data.allocationSize({ planeIndex: 0, format: 'f32' })
+                            //   );
+                            //   audioData.copyTo(ab, { planeIndex: 0, format: 'f32' });
+                            //   blob = new Blob([blob, ab]);
+
+                            let writable = audio_stream_generator.writable();
+                            if writable.locked() {
+                                log!("dropping because it is locked");
+                            } else {
+                                log!("writing packet");
+                                if let Err(e) = writable.get_writer().map(|writer| {
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        JsFuture::from(writer.ready()).await;
+                                        if let Err(e) =
+                                            JsFuture::from(writer.write_with_chunk(&audio_data))
+                                                .await
+                                        {
+                                            log!("write chunk error ", e);
+                                        };
+                                        writer.release_lock();
+                                    });
+                                }) {
+                                    log!("error", e);
+                                }
+                            }
                         }) as Box<dyn FnMut(JsValue)>)
                     };
                     let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
@@ -286,9 +328,11 @@ impl Component for AttendandsComponent {
             .connected_peers
             .iter()
             .map(|(key, _value)| {
+                let audio_id = format!("{}audio", key.clone());
                 html! {
                     <div class="grid-item">
                         <canvas id={key.clone()}></canvas>
+                        <audio id={audio_id}></audio>
                         <h4 class="floating-name">{key.clone()}</h4>
                     </div>
                 }
@@ -296,6 +340,7 @@ impl Component for AttendandsComponent {
             .collect();
         html! {
             <div class="grid-container">
+                <audio id={"audio"}></audio>
                 { rows }
                 <nav class="grid-item menu">
                     <div class="controls">

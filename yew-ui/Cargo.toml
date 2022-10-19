@@ -24,7 +24,7 @@ serde_derive = "1"
 protobuf = "3.2.0"
 
 [dependencies.web-sys]
-version = "0.3.58"
+version = "0.3.60"
 features = [
     "AudioTrack",
     "AudioData",
@@ -47,6 +47,7 @@ features = [
     "EncodedVideoChunk",
     "EncodedVideoChunkInit",
     "EncodedVideoChunkType",
+    "MediaStreamAudioDestinationNode",
     "HtmlCanvasElement",
     "HtmlImageElement",
     "Navigator",
@@ -75,6 +76,7 @@ features = [
     "VideoDecoder",
     "VideoDecoderConfig",
     "VideoDecoderInit",
-    "LatencyMode"
+    "LatencyMode",
+    "HtmlAudioElement"
 ]
 

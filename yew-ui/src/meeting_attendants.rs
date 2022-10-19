@@ -25,6 +25,7 @@ use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
 
 // This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
+// https://github.com/WebAudio/web-audio-api-v2/issues/133
 
 pub enum WsAction {
     Connect,
@@ -170,7 +171,6 @@ impl Component for AttendandsComponent {
                     }
                     false
                 } else {
-                    let audio_id = format!("{}audio", email.clone());
                     let error_video = Closure::wrap(Box::new(move |e: JsValue| {
                         log!(&e);
                     })
@@ -185,7 +185,6 @@ impl Component for AttendandsComponent {
                             &MediaStreamTrackGeneratorInit::new(&"audio"),
                         )
                         .unwrap();
-                        let audio_context = AudioContext::new().unwrap();
                         let js_tracks = Array::new();
                         js_tracks.push(&audio_stream_generator);
                         let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
@@ -197,30 +196,15 @@ impl Component for AttendandsComponent {
                             .unwrap()
                             .unchecked_into::<HtmlAudioElement>();
                         audio.set_src_object(Some(&media_stream));
+                        audio.set_volume(1.0f64);
                         wasm_bindgen_futures::spawn_local(async move {
-                            JsFuture::from(audio.play().unwrap()).await;
+                            if let Err(e) = JsFuture::from(audio.play().unwrap()).await {
+                                log!("error", e);
+                            }
                         });
-
-                        if let Err(e) = audio_context.create_media_stream_source(&media_stream) {
-                            log!("create media stream ", e);
-                        }
-                        let mut gain_options = GainOptions::new();
-                        gain_options.gain(0.5f32);
-                        if let Err(e) = GainNode::new_with_options(&audio_context, &gain_options) {
-                            log!("gain error ", e);
-                        }
-                        if let Err(e) = audio_context.resume() {
-                            log!("resume error ", e);
-                        }
                         Closure::wrap(Box::new(move |audio_data: JsValue| {
                             let audio_data = audio_data.unchecked_into::<AudioData>();
                             log!("audio chunk decoded");
-                            // const ab = new ArrayBuffer(
-                            //     audio_data.allocationSize({ planeIndex: 0, format: 'f32' })
-                            //   );
-                            //   audioData.copyTo(ab, { planeIndex: 0, format: 'f32' });
-                            //   blob = new Blob([blob, ab]);
-
                             let writable = audio_stream_generator.writable();
                             if writable.locked() {
                                 log!("dropping because it is locked");
@@ -228,13 +212,18 @@ impl Component for AttendandsComponent {
                                 log!("writing packet");
                                 if let Err(e) = writable.get_writer().map(|writer| {
                                     wasm_bindgen_futures::spawn_local(async move {
-                                        JsFuture::from(writer.ready()).await;
+                                        log!("writer.ready()");
+                                        if let Err(e) = JsFuture::from(writer.ready()).await {
+                                            log!("write chunk error ", e);
+                                        }
+                                        log!("write_with_chunk");
                                         if let Err(e) =
                                             JsFuture::from(writer.write_with_chunk(&audio_data))
                                                 .await
                                         {
                                             log!("write chunk error ", e);
                                         };
+                                        log!("release_lock");
                                         writer.release_lock();
                                     });
                                 }) {

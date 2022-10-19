@@ -195,6 +195,7 @@ impl Component for Host {
                         .unwrap()
                         .unchecked_into::<MediaStream>();
                     video_element.set_src_object(Some(&device));
+                    video_element.set_muted(true);
                     let video_track = Box::new(
                         device
                             .get_video_tracks()

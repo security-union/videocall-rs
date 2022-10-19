@@ -1,10 +1,15 @@
 syntax = "proto3";
 
 message MediaPacket {
-  string email = 1;
-  bytes video = 2;
-  bytes audio = 3;
-  string video_type = 4;
-  double video_timestamp = 5;
-  double video_duration = 6;
+  enum MediaType {
+    VIDEO = 0;
+    AUDIO = 1;
+  }
+  MediaType media_type = 1;
+  string email = 2;
+  bytes video = 3;
+  bytes audio = 4;
+  string video_type = 5;
+  double timestamp = 6;
+  double duration = 7;
 }

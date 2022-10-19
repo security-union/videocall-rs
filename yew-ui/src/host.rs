@@ -8,6 +8,7 @@ use js_sys::Reflect;
 use protobuf::Message;
 use std::fmt;
 use std::fmt::Debug;
+use types::protos::media_packet::media_packet;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -83,6 +84,27 @@ impl fmt::Display for EncodedVideoChunkTypeWrapper {
     }
 }
 
+pub struct EncodedAudioChunkTypeWrapper(pub EncodedAudioChunkType);
+
+impl From<String> for EncodedAudioChunkTypeWrapper {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "Key" => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key),
+            _ => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Delta),
+        }
+    }
+}
+
+impl fmt::Display for EncodedAudioChunkTypeWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.0 {
+            EncodedAudioChunkType::Delta => write!(f, "Delta"),
+            EncodedAudioChunkType::Key => write!(f, "Key"),
+            _ => todo!(),
+        }
+    }
+}
+
 impl Component for Host {
     type Message = Msg;
     type Properties = MeetingProps;
@@ -115,9 +137,10 @@ impl Component for Host {
                         media_packet.video = chunk_data.to_vec();
                         media_packet.video_type =
                             EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
-                        media_packet.video_timestamp = chunk.timestamp();
+                        media_packet.media_type = media_packet::MediaType::VIDEO.into();
+                        media_packet.timestamp = chunk.timestamp();
                         if let Some(duration0) = chunk.duration() {
-                            media_packet.video_duration = duration0;
+                            media_packet.duration = duration0;
                         }
                         on_frame.emit(media_packet);
                     })
@@ -140,9 +163,12 @@ impl Component for Host {
                         let mut chunk_data = chunk_data.as_mut_slice();
                         chunk.copy_to_with_u8_array(&mut chunk_data);
                         media_packet.audio = chunk_data.to_vec();
-                        media_packet.video_timestamp = chunk.timestamp();
+                        media_packet.timestamp = chunk.timestamp();
+                        media_packet.media_type = media_packet::MediaType::AUDIO.into();
+                        media_packet.video_type =
+                            EncodedAudioChunkTypeWrapper(chunk.type_()).to_string();
                         if let Some(duration0) = chunk.duration() {
-                            media_packet.video_duration = duration0;
+                            media_packet.duration = duration0;
                         }
                         on_frame.emit(media_packet);
                     })

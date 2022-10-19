@@ -1,13 +1,18 @@
 use std::collections::HashMap;
 
+use crate::constants::AUDIO_CHANNELS;
+use crate::constants::AUDIO_CODEC;
+use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::host::EncodedAudioChunkTypeWrapper;
 use crate::host::EncodedVideoChunkTypeWrapper;
 use crate::host::MediaPacketWrapper;
 use crate::{constants::ACTIX_WEBSOCKET, host::Host};
 use anyhow::anyhow;
 use gloo_console::log;
-use js_sys::Uint8Array;
+use js_sys::*;
 use protobuf::Message;
+use types::protos::media_packet::media_packet;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -58,7 +63,9 @@ pub struct AttendandsComponent {
 
 pub struct ClientSubscription {
     pub video_decoder: VideoDecoder,
-    pub waiting_for_keyframe: bool,
+    pub audio_decoder: AudioDecoder,
+    pub waiting_for_video_keyframe: bool,
+    pub waiting_for_audio_keyframe: bool,
 }
 
 impl Component for AttendandsComponent {
@@ -110,38 +117,91 @@ impl Component for AttendandsComponent {
             },
             Msg::WsReady(response) => {
                 let data = response.0;
-                if data.video.is_empty() {
-                    log!("dropping bad video packet");
-                    return false;
-                }
                 let email = data.email.clone();
 
                 if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
-                    let video_data =
-                        Uint8Array::new_with_length(data.video.len().try_into().unwrap());
-                    let chunk_type = EncodedVideoChunkTypeWrapper::from(data.video_type).0;
-                    video_data.copy_from(&data.video.into_boxed_slice());
-                    let encoded_video_chunk = EncodedVideoChunk::new(&EncodedVideoChunkInit::new(
-                        &video_data,
-                        data.video_timestamp,
-                        chunk_type,
-                    ))
-                    .unwrap();
-                    if peer.waiting_for_keyframe && chunk_type == EncodedVideoChunkType::Key
-                        || !peer.waiting_for_keyframe
-                    {
-                        peer.video_decoder.decode(&encoded_video_chunk);
-                        peer.waiting_for_keyframe = false;
-                    } else {
-                        log!("dropping frame");
+                    match data.media_type.unwrap() {
+                        media_packet::MediaType::VIDEO => {
+                            let video_data =
+                                Uint8Array::new_with_length(data.video.len().try_into().unwrap());
+                            let chunk_type = EncodedVideoChunkTypeWrapper::from(data.video_type).0;
+                            video_data.copy_from(&data.video.into_boxed_slice());
+                            let encoded_video_chunk =
+                                EncodedVideoChunk::new(&EncodedVideoChunkInit::new(
+                                    &video_data,
+                                    data.timestamp,
+                                    chunk_type,
+                                ))
+                                .unwrap();
+                            if peer.waiting_for_video_keyframe
+                                && chunk_type == EncodedVideoChunkType::Key
+                                || !peer.waiting_for_video_keyframe
+                            {
+                                peer.video_decoder.decode(&encoded_video_chunk);
+                                peer.waiting_for_video_keyframe = false;
+                            } else {
+                                log!("dropping video frame");
+                            }
+                        }
+                        media_packet::MediaType::AUDIO => {
+                            let audio_data =
+                                Uint8Array::new_with_length(data.audio.len().try_into().unwrap());
+                            let chunk_type = EncodedAudioChunkTypeWrapper::from(data.video_type).0;
+                            let encoded_audio_chunk =
+                                EncodedAudioChunk::new(&EncodedAudioChunkInit::new(
+                                    &audio_data,
+                                    data.timestamp,
+                                    chunk_type,
+                                ))
+                                .unwrap();
+                            if peer.waiting_for_audio_keyframe
+                                && chunk_type == EncodedAudioChunkType::Key
+                                || !peer.waiting_for_audio_keyframe
+                            {
+                                peer.audio_decoder.decode(&encoded_audio_chunk);
+                                peer.waiting_for_audio_keyframe = false;
+                            } else {
+                                log!("dropping audio frame");
+                            }
+                        }
                     }
+
                     false
                 } else {
                     let error_video = Closure::wrap(Box::new(move |e: JsValue| {
                         log!(&e);
                     })
                         as Box<dyn FnMut(JsValue)>);
-                    let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
+                    let error_audio = Closure::wrap(Box::new(move |e: JsValue| {
+                        log!(&e);
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+
+                    let audio_output = {
+                        let audio_stream_generator = MediaStreamTrackGenerator::new(
+                            &MediaStreamTrackGeneratorInit::new(&"audio"),
+                        )
+                        .unwrap();
+                        let audio_context = AudioContext::new().unwrap();
+                        let js_tracks = Array::new();
+                        js_tracks.push(&audio_stream_generator);
+                        let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
+                        audio_context.create_media_stream_source(&media_stream);
+                        let mut gain_options = GainOptions::new();
+                        gain_options.gain(0.5f32);
+                        let gain = GainNode::new_with_options(&audio_context, &gain_options);
+                        audio_context.resume();
+                        Closure::wrap(Box::new(move |audio_data: JsValue| {
+                            let audio_data = audio_data.unchecked_into::<AudioData>();
+                            log!("audio chunk decoded");
+                            audio_stream_generator
+                                .writable()
+                                .get_writer()
+                                .unwrap()
+                                .write_with_chunk(&audio_data);
+                        }) as Box<dyn FnMut(JsValue)>)
+                    };
+                    let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
                         let chunk = Box::new(original_chunk);
                         let video_chunk = chunk.unchecked_into::<VideoFrame>();
                         let width = video_chunk.coded_width();
@@ -167,22 +227,39 @@ impl Component for AttendandsComponent {
                             log!("error ", e);
                         }
                         video_chunk.unchecked_into::<VideoFrame>().close();
-                    }) as Box<dyn FnMut(JsValue)>);
+                    })
+                        as Box<dyn FnMut(JsValue)>);
                     let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
                         error_video.as_ref().unchecked_ref(),
-                        output.as_ref().unchecked_ref(),
+                        video_output.as_ref().unchecked_ref(),
                     ))
                     .unwrap();
                     video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
+
+                    let audio_decoder = AudioDecoder::new(&AudioDecoderInit::new(
+                        error_audio.as_ref().unchecked_ref(),
+                        audio_output.as_ref().unchecked_ref(),
+                    ))
+                    .unwrap();
+                    audio_decoder.configure(&AudioDecoderConfig::new(
+                        &AUDIO_CODEC,
+                        AUDIO_CHANNELS,
+                        AUDIO_SAMPLE_RATE as u32,
+                    ));
+
                     self.connected_peers.insert(
                         data.email.clone(),
                         ClientSubscription {
                             video_decoder,
-                            waiting_for_keyframe: true,
+                            audio_decoder,
+                            waiting_for_video_keyframe: true,
+                            waiting_for_audio_keyframe: true,
                         },
                     );
+                    error_audio.forget();
+                    audio_output.forget();
                     error_video.forget();
-                    output.forget();
+                    video_output.forget();
                     true
                 }
             }

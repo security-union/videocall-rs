@@ -188,41 +188,38 @@ impl Component for AttendandsComponent {
                         let js_tracks = Array::new();
                         js_tracks.push(&audio_stream_generator);
                         let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
-                        let audio_context = AudioContext::new().unwrap();
+                        let mut audio_context_options = AudioContextOptions::new();
+                        audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);                       
+                        let audio_context = AudioContext::new_with_context_options(&audio_context_options).unwrap();
                         let gain_node = audio_context.create_gain().unwrap();
-                        let source = audio_context
-                            .create_media_stream_source(&media_stream)
-                            .unwrap();
-                        if let Err(e) = source.connect_with_audio_node(&gain_node) {
+                        gain_node.set_channel_count(1);
+                        let source = audio_context.create_media_stream_source(&media_stream).unwrap();
+                        if let Err(e) =  source.connect_with_audio_node(&gain_node) {
                             log!("connect_with_audio_node", e);
                         }
-                        if let Err(e) =
-                            gain_node.connect_with_audio_node(&audio_context.destination())
-                        {
+                        log!("destination", audio_context.destination());
+                        if let Err(e) =  gain_node.connect_with_audio_node(&audio_context.destination()) {
                             log!("connect_with_audio_node", e);
                         }
                         Closure::wrap(Box::new(move |audio_data: JsValue| {
-                            let audio_data = audio_data.unchecked_into::<AudioData>();
-                            log!("audio chunk decoded");
+                            // let audio_data = audio_data.unchecked_into::<AudioData>();
+                            log!("decoded packet", &audio_data);
                             let writable = audio_stream_generator.writable();
                             if writable.locked() {
                                 log!("dropping because it is locked");
                             } else {
-                                log!("writing packet");
                                 if let Err(e) = writable.get_writer().map(|writer| {
                                     wasm_bindgen_futures::spawn_local(async move {
                                         log!("writer.ready()");
                                         if let Err(e) = JsFuture::from(writer.ready()).await {
                                             log!("write chunk error ", e);
                                         }
-                                        log!("write_with_chunk");
                                         if let Err(e) =
                                             JsFuture::from(writer.write_with_chunk(&audio_data))
                                                 .await
                                         {
                                             log!("write chunk error ", e);
                                         };
-                                        log!("release_lock");
                                         writer.release_lock();
                                     });
                                 }) {
@@ -316,11 +313,9 @@ impl Component for AttendandsComponent {
             .connected_peers
             .iter()
             .map(|(key, _value)| {
-                let audio_id = format!("{}audio", key.clone());
                 html! {
                     <div class="grid-item">
                         <canvas id={key.clone()}></canvas>
-                        <audio id={audio_id}></audio>
                         <h4 class="floating-name">{key.clone()}</h4>
                     </div>
                 }
@@ -328,7 +323,6 @@ impl Component for AttendandsComponent {
             .collect();
         html! {
             <div class="grid-container">
-                <audio id={"audio"}></audio>
                 { rows }
                 <nav class="grid-item menu">
                     <div class="controls">

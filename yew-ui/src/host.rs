@@ -68,7 +68,7 @@ pub struct EncodedVideoChunkTypeWrapper(pub EncodedVideoChunkType);
 impl From<String> for EncodedVideoChunkTypeWrapper {
     fn from(s: String) -> Self {
         match s.as_str() {
-            "Key" => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Key),
+            "key" => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Key),
             _ => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Delta),
         }
     }
@@ -77,8 +77,8 @@ impl From<String> for EncodedVideoChunkTypeWrapper {
 impl fmt::Display for EncodedVideoChunkTypeWrapper {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.0 {
-            EncodedVideoChunkType::Delta => write!(f, "Delta"),
-            EncodedVideoChunkType::Key => write!(f, "Key"),
+            EncodedVideoChunkType::Delta => write!(f, "delta"),
+            EncodedVideoChunkType::Key => write!(f, "key"),
             _ => todo!(),
         }
     }
@@ -89,7 +89,7 @@ pub struct EncodedAudioChunkTypeWrapper(pub EncodedAudioChunkType);
 impl From<String> for EncodedAudioChunkTypeWrapper {
     fn from(s: String) -> Self {
         match s.as_str() {
-            "Key" => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key),
+            "key" => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key),
             _ => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Delta),
         }
     }
@@ -98,8 +98,8 @@ impl From<String> for EncodedAudioChunkTypeWrapper {
 impl fmt::Display for EncodedAudioChunkTypeWrapper {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.0 {
-            EncodedAudioChunkType::Delta => write!(f, "Delta"),
-            EncodedAudioChunkType::Key => write!(f, "Key"),
+            EncodedAudioChunkType::Delta => write!(f, "delta"),
+            EncodedAudioChunkType::Key => write!(f, "key"),
             _ => todo!(),
         }
     }
@@ -154,11 +154,7 @@ impl Component for Host {
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
                         let mut media_packet: MediaPacket = MediaPacket::default();
                         media_packet.email = *email.clone();
-                        let byte_length: Number =
-                            Reflect::get(&chunk, &JsString::from("byteLength"))
-                                .unwrap()
-                                .into();
-                        let byte_length: usize = byte_length.as_f64().unwrap() as usize;
+                        let byte_length: usize =  chunk.byte_length() as usize;
                         let mut chunk_data: Vec<u8> = vec![0; byte_length];
                         let mut chunk_data = chunk_data.as_mut_slice();
                         chunk.copy_to_with_u8_array(&mut chunk_data);
@@ -307,6 +303,7 @@ impl Component for Host {
                                 let audio_frame = Reflect::get(&js_frame, &JsString::from("value"))
                                     .unwrap()
                                     .unchecked_into::<AudioData>();
+                                log!("before encode packet", &audio_frame);
                                 audio_encoder.encode(&audio_frame);
                                 audio_frame.close();
                             }

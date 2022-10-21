@@ -3,7 +3,6 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
-use js_sys::Number;
 use js_sys::Reflect;
 use protobuf::Message;
 use std::fmt;
@@ -22,7 +21,6 @@ use yew::prelude::*;
 use yew_websocket::websocket::{Binary, Text};
 
 use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
@@ -155,22 +153,17 @@ impl Component for Host {
                 self.initialized = true;
                 let on_frame = Box::new(ctx.props().on_frame.clone());
                 let email = Box::new(ctx.props().email.clone());
-                let output_handler = {
+                let video_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
+                    let mut buffer: Vec<u8> = vec![0; 20_000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
                         let mut media_packet: MediaPacket = MediaPacket::default();
                         media_packet.email = *email.clone();
-                        let byte_length: Number =
-                            Reflect::get(&chunk, &JsString::from("byteLength"))
-                                .unwrap()
-                                .into();
-                        let byte_length: usize = byte_length.as_f64().unwrap() as usize;
-                        let mut chunk_data: Vec<u8> = vec![0; byte_length];
-                        let mut chunk_data = chunk_data.as_mut_slice();
-                        chunk.copy_to_with_u8_array(&mut chunk_data);
-                        media_packet.video = chunk_data.to_vec();
+                        buffer.clear();
+                        chunk.copy_to_with_u8_array(&mut buffer.as_mut_slice());
+                        media_packet.video = buffer.to_vec();
                         media_packet.video_type =
                             EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
                         media_packet.media_type = media_packet::MediaType::VIDEO.into();
@@ -185,16 +178,14 @@ impl Component for Host {
                 let audio_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
+                    let mut buffer: Vec<u8> = vec![0; 20_000];
                     Box::new(move |chunk: JsValue| {
-                        log!("encoded audio packet :) ");
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
                         let mut media_packet: MediaPacket = MediaPacket::default();
                         media_packet.email = *email.clone();
-                        let byte_length: usize = chunk.byte_length() as usize;
-                        let mut chunk_data: Vec<u8> = vec![0; byte_length];
-                        let mut chunk_data = chunk_data.as_mut_slice();
-                        chunk.copy_to_with_u8_array(&mut chunk_data);
-                        media_packet.audio = chunk_data.to_vec();
+                        buffer.clear();
+                        chunk.copy_to_with_u8_array(&mut buffer.as_mut_slice());
+                        media_packet.audio = buffer.to_vec();
                         media_packet.timestamp = chunk.timestamp();
                         media_packet.media_type = media_packet::MediaType::AUDIO.into();
                         media_packet.video_type =
@@ -217,6 +208,7 @@ impl Component for Host {
                         .unwrap()
                         .unchecked_into::<HtmlVideoElement>();
 
+                    // TODO: Add dropdown so that user can select the device that they want to use.
                     let mut constraints = MediaStreamConstraints::new();
                     constraints.video(&Boolean::from(true));
                     constraints.audio(&Boolean::from(true));
@@ -243,7 +235,7 @@ impl Component for Host {
                             .unchecked_into::<AudioTrack>(),
                     );
 
-                    let error_handler = Closure::wrap(Box::new(move |e: JsValue| {
+                    let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
                         log!("error_handler error", e);
                     })
                         as Box<dyn FnMut(JsValue)>);
@@ -253,12 +245,13 @@ impl Component for Host {
                     })
                         as Box<dyn FnMut(JsValue)>);
 
-                    let output_handler = Closure::wrap(output_handler as Box<dyn FnMut(JsValue)>);
+                    let video_output_handler =
+                        Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue)>);
                     let audio_output_handler =
                         Closure::wrap(audio_output_handler as Box<dyn FnMut(JsValue)>);
                     let video_encoder_init = VideoEncoderInit::new(
-                        error_handler.as_ref().unchecked_ref(),
-                        output_handler.as_ref().unchecked_ref(),
+                        video_error_handler.as_ref().unchecked_ref(),
+                        video_output_handler.as_ref().unchecked_ref(),
                     );
                     let audio_encoder_init = AudioEncoderInit::new(
                         audio_error_handler.as_ref().unchecked_ref(),
@@ -333,6 +326,8 @@ impl Component for Host {
                         }
                     };
                     let poll_audio = async {
+                        // allocate Vec only once to speed up things.
+                        let mut chunk_data: Vec<u8> = Vec::with_capacity(15_000);
                         loop {
                             match JsFuture::from(audio_reader.read()).await {
                                 Ok(js_frame) => {
@@ -343,25 +338,23 @@ impl Component for Host {
                                     let byte_length: usize = audio_frame
                                         .allocation_size(&AudioDataCopyToOptions::new(0))
                                         as usize;
-                                    let mut chunk_data: Vec<u8> = vec![0; byte_length];
-                                    let mut chunk_data = chunk_data.as_mut_slice();
+                                    chunk_data.clear();
                                     audio_frame.copy_to_with_u8_array(
-                                        &mut chunk_data,
+                                        &mut chunk_data.as_mut_slice(),
                                         &AudioDataCopyToOptions::new(0),
                                     );
-                                    let mut media_packet: MediaPacket = MediaPacket::default();
-                                    media_packet.email = *email.clone();
-                                    media_packet.media_type = MediaType::AUDIO.into();
-                                    media_packet.audio = chunk_data.to_vec();
-                                    media_packet.audio_format =
+                                    let mut packet: MediaPacket = MediaPacket::default();
+                                    packet.email = *email.clone();
+                                    packet.media_type = MediaType::AUDIO.into();
+                                    packet.audio = chunk_data.to_vec();
+                                    packet.audio_format =
                                         AudioSampleFormatWrapper(audio_frame.format().unwrap())
                                             .to_string();
-                                    media_packet.audio_number_of_channels =
+                                    packet.audio_number_of_channels =
                                         audio_frame.number_of_channels();
-                                    media_packet.audio_number_of_frames =
-                                        audio_frame.number_of_frames();
-                                    media_packet.audio_sample_rate = audio_frame.sample_rate();
-                                    on_frame.emit(media_packet);
+                                    packet.audio_number_of_frames = audio_frame.number_of_frames();
+                                    packet.audio_sample_rate = audio_frame.sample_rate();
+                                    on_frame.emit(packet);
                                     audio_frame.close();
                                 }
                                 Err(e) => {

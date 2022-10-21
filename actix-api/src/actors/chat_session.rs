@@ -78,7 +78,6 @@ impl Actor for WsChatSession {
             .then(|res, _act, ctx| {
                 if let Err(err) = res {
                     error!("error {:?}", err);
-                    // ctx.text(WsMessage::err(err.to_string()));
                     ctx.stop();
                 }
                 fut::ready(())
@@ -165,18 +164,12 @@ impl WsChatSession {
                 match response {
                     Ok(res) if res.is_ok() => {
                         act.room = room_id.clone();
-                        // ctx.text(WsMessage {
-                        //     ty: MessageType::Msg,
-                        //     data: json!("Joined!"),
-                        // })
                     }
                     Ok(res) => {
                         error!("error {:?}", res);
-                        // ctx.text(WsMessage::err(res.unwrap_err().to_string())),
                     }
                     Err(err) => {
                         error!("error {:?}", err);
-                        // ctx.text(WsMessage::err(err.to_string()));
                         ctx.stop();
                     }
                 }

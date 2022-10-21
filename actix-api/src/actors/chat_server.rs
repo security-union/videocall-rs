@@ -117,7 +117,6 @@ impl Handler<JoinRoom> for ChatServer {
     ) -> Self::Result {
         self.leave_rooms(&session);
 
-        // TODO lazily create room:
         if !self.rooms.contains_key(&room) {
             self.rooms.insert(
                 room.clone(),
@@ -132,7 +131,6 @@ impl Handler<JoinRoom> for ChatServer {
             .get_mut(&room)
             .map(|sessions| sessions.insert(session.clone()))
             .map(|_| ())
-            // .map(|_| self.send_message(&room, "Someone connected", &session, None))
             .ok_or("The room doesn't exists".into());
         info!(
             "someone connected to room {} with session {} result {:?}",

@@ -15,7 +15,7 @@ use actix_web::{
         Cookie, SameSite,
     },
     error, get,
-    web::{self, Bytes, Json},
+    web::{self, Bytes},
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
@@ -31,7 +31,6 @@ use crate::{
     db::{get_pool, PostgresPool},
 };
 use reqwest::header::LOCATION;
-use types::HelloResponse;
 
 const OAUTH_CLIENT_ID: &str = std::env!("OAUTH_CLIENT_ID");
 const OAUTH_AUTH_URL: &str = std::env!("OAUTH_AUTH_URL");
@@ -148,16 +147,6 @@ async fn handle_google_oauth_callback(
     Ok(response.finish())
 }
 
-/**
- * Sample service
- */
-#[get("/hello/{name}")]
-async fn greet(name: web::Path<String>) -> Json<HelloResponse> {
-    Json(HelloResponse {
-        name: name.to_string(),
-    })
-}
-
 fn start_with_codec<A, S>(
     actor: A,
     req: &HttpRequest,
@@ -194,8 +183,6 @@ async fn main() -> std::io::Result<()> {
     info!("start");
     let chat = ChatServer::new().start();
 
-    // Yolo
-
     HttpServer::new(move || {
         let cors = Cors::permissive();
 
@@ -205,7 +192,6 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(AppState { chat: chat.clone() }))
             .wrap(cors)
-            .service(greet)
             .service(handle_google_oauth_callback)
             .service(login)
             .service(ws_connect)

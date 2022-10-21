@@ -336,10 +336,10 @@ impl Component for Host {
                                         Reflect::get(&js_frame, &JsString::from("value"))
                                             .unwrap()
                                             .unchecked_into::<AudioData>();
-                                    
+
                                     let byte_length: usize = audio_frame
-                                    .allocation_size(&AudioDataCopyToOptions::new(0))
-                                    as usize;                                   
+                                        .allocation_size(&AudioDataCopyToOptions::new(0))
+                                        as usize;
                                     audio_frame.copy_to_with_u8_array(
                                         &mut buffer,
                                         &AudioDataCopyToOptions::new(0),

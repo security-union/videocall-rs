@@ -12,4 +12,8 @@ message MediaPacket {
   string video_type = 5;
   double timestamp = 6;
   double duration = 7;
+  string audio_format = 8;
+  uint32 audio_number_of_channels = 9;
+  uint32 audio_number_of_frames = 10;
+  float audio_sample_rate = 11;
 }

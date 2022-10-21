@@ -1,10 +1,8 @@
 use std::collections::HashMap;
 
-use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
-use crate::host::EncodedAudioChunkTypeWrapper;
+use crate::host::AudioSampleFormatWrapper;
 use crate::host::EncodedVideoChunkTypeWrapper;
 use crate::host::MediaPacketWrapper;
 use crate::{constants::ACTIX_WEBSOCKET, host::Host};
@@ -18,6 +16,7 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+
 use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
@@ -67,7 +66,7 @@ pub struct AttendandsComponent {
 
 pub struct ClientSubscription {
     pub video_decoder: VideoDecoder,
-    pub audio_decoder: AudioDecoder,
+    pub audio_output: Box<dyn FnMut(AudioData)>,
     pub waiting_for_video_keyframe: bool,
     pub waiting_for_audio_keyframe: bool,
 }
@@ -148,25 +147,19 @@ impl Component for AttendandsComponent {
                             }
                         }
                         media_packet::MediaType::AUDIO => {
-                            let audio_data =
-                                Uint8Array::new_with_length(data.audio.len().try_into().unwrap());
-                            let chunk_type = EncodedAudioChunkTypeWrapper::from(data.video_type).0;
-                            let encoded_audio_chunk =
-                                EncodedAudioChunk::new(&EncodedAudioChunkInit::new(
-                                    &audio_data,
-                                    data.timestamp,
-                                    chunk_type,
-                                ))
-                                .unwrap();
-                            if peer.waiting_for_audio_keyframe
-                                && chunk_type == EncodedAudioChunkType::Key
-                                || !peer.waiting_for_audio_keyframe
-                            {
-                                peer.audio_decoder.decode(&encoded_audio_chunk);
-                                peer.waiting_for_audio_keyframe = false;
-                            } else {
-                                log!("dropping audio frame");
-                            }
+                            let audio_data = data.audio;
+                            let audio_data_js: js_sys::Uint8Array = js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
+                            audio_data_js.copy_from(&audio_data.as_slice());
+   
+                            let audio_data = AudioData::new(&AudioDataInit::new(
+                                &audio_data_js.into(),
+                                AudioSampleFormatWrapper::from(data.audio_format).0,
+                                data.audio_number_of_channels,
+                                data.audio_number_of_frames,
+                                data.audio_sample_rate,
+                                data.timestamp,
+                            )).unwrap();
+                            (peer.audio_output)(audio_data);
                         }
                     }
                     false
@@ -201,8 +194,7 @@ impl Component for AttendandsComponent {
                         if let Err(e) =  gain_node.connect_with_audio_node(&audio_context.destination()) {
                             log!("connect_with_audio_node", e);
                         }
-                        Closure::wrap(Box::new(move |audio_data: JsValue| {
-                            // let audio_data = audio_data.unchecked_into::<AudioData>();
+                        Box::new(move |audio_data: AudioData| {
                             log!("decoded packet", &audio_data);
                             let writable = audio_stream_generator.writable();
                             if writable.locked() {
@@ -226,7 +218,7 @@ impl Component for AttendandsComponent {
                                     log!("error", e);
                                 }
                             }
-                        }) as Box<dyn FnMut(JsValue)>)
+                        }) as Box<dyn FnMut(AudioData)>
                     };
                     let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
                         let chunk = Box::new(original_chunk);
@@ -263,28 +255,16 @@ impl Component for AttendandsComponent {
                     .unwrap();
                     video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
 
-                    let audio_decoder = AudioDecoder::new(&AudioDecoderInit::new(
-                        error_audio.as_ref().unchecked_ref(),
-                        audio_output.as_ref().unchecked_ref(),
-                    ))
-                    .unwrap();
-                    audio_decoder.configure(&AudioDecoderConfig::new(
-                        &AUDIO_CODEC,
-                        AUDIO_CHANNELS,
-                        AUDIO_SAMPLE_RATE as u32,
-                    ));
-
                     self.connected_peers.insert(
                         data.email.clone(),
                         ClientSubscription {
                             video_decoder,
-                            audio_decoder,
+                            audio_output,
                             waiting_for_video_keyframe: true,
                             waiting_for_audio_keyframe: true,
                         },
                     );
                     error_audio.forget();
-                    audio_output.forget();
                     error_video.forget();
                     video_output.forget();
                     true

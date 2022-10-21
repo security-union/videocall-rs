@@ -50,6 +50,7 @@ features = [
     "MediaStreamAudioDestinationNode",
     "AudioDestinationNode",
     "AudioContextOptions",
+    "AudioDataCopyToOptions",
     "HtmlCanvasElement",
     "HtmlImageElement",
     "Navigator",
@@ -79,6 +80,8 @@ features = [
     "VideoDecoderConfig",
     "VideoDecoderInit",
     "LatencyMode",
-    "HtmlAudioElement"
+    "HtmlAudioElement",
+    "AudioDataInit",
+    "AudioSampleFormat"
 ]
 

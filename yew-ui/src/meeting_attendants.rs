@@ -148,9 +148,10 @@ impl Component for AttendandsComponent {
                         }
                         media_packet::MediaType::AUDIO => {
                             let audio_data = data.audio;
-                            let audio_data_js: js_sys::Uint8Array = js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
+                            let audio_data_js: js_sys::Uint8Array =
+                                js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
                             audio_data_js.copy_from(&audio_data.as_slice());
-   
+
                             let audio_data = AudioData::new(&AudioDataInit::new(
                                 &audio_data_js.into(),
                                 AudioSampleFormatWrapper::from(data.audio_format).0,
@@ -158,7 +159,8 @@ impl Component for AttendandsComponent {
                                 data.audio_number_of_frames,
                                 data.audio_sample_rate,
                                 data.timestamp,
-                            )).unwrap();
+                            ))
+                            .unwrap();
                             (peer.audio_output)(audio_data);
                         }
                     }
@@ -182,16 +184,21 @@ impl Component for AttendandsComponent {
                         js_tracks.push(&audio_stream_generator);
                         let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
                         let mut audio_context_options = AudioContextOptions::new();
-                        audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);                       
-                        let audio_context = AudioContext::new_with_context_options(&audio_context_options).unwrap();
+                        audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);
+                        let audio_context =
+                            AudioContext::new_with_context_options(&audio_context_options).unwrap();
                         let gain_node = audio_context.create_gain().unwrap();
                         gain_node.set_channel_count(1);
-                        let source = audio_context.create_media_stream_source(&media_stream).unwrap();
-                        if let Err(e) =  source.connect_with_audio_node(&gain_node) {
+                        let source = audio_context
+                            .create_media_stream_source(&media_stream)
+                            .unwrap();
+                        if let Err(e) = source.connect_with_audio_node(&gain_node) {
                             log!("connect_with_audio_node", e);
                         }
                         log!("destination", audio_context.destination());
-                        if let Err(e) =  gain_node.connect_with_audio_node(&audio_context.destination()) {
+                        if let Err(e) =
+                            gain_node.connect_with_audio_node(&audio_context.destination())
+                        {
                             log!("connect_with_audio_node", e);
                         }
                         Box::new(move |audio_data: AudioData| {

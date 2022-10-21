@@ -6,10 +6,10 @@ use js_sys::JsString;
 use js_sys::Number;
 use js_sys::Reflect;
 use protobuf::Message;
-use types::protos::media_packet::media_packet::MediaType;
 use std::fmt;
 use std::fmt::Debug;
 use types::protos::media_packet::media_packet;
+use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -189,7 +189,7 @@ impl Component for Host {
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
                         let mut media_packet: MediaPacket = MediaPacket::default();
                         media_packet.email = *email.clone();
-                        let byte_length: usize =  chunk.byte_length() as usize;
+                        let byte_length: usize = chunk.byte_length() as usize;
                         let mut chunk_data: Vec<u8> = vec![0; byte_length];
                         let mut chunk_data = chunk_data.as_mut_slice();
                         chunk.copy_to_with_u8_array(&mut chunk_data);
@@ -339,17 +339,26 @@ impl Component for Host {
                                 let audio_frame = Reflect::get(&js_frame, &JsString::from("value"))
                                     .unwrap()
                                     .unchecked_into::<AudioData>();
-                                let byte_length: usize = audio_frame.allocation_size(&AudioDataCopyToOptions::new(0)) as usize;
+                                let byte_length: usize = audio_frame
+                                    .allocation_size(&AudioDataCopyToOptions::new(0))
+                                    as usize;
                                 let mut chunk_data: Vec<u8> = vec![0; byte_length];
                                 let mut chunk_data = chunk_data.as_mut_slice();
-                                audio_frame.copy_to_with_u8_array(&mut chunk_data, &AudioDataCopyToOptions::new(0));
+                                audio_frame.copy_to_with_u8_array(
+                                    &mut chunk_data,
+                                    &AudioDataCopyToOptions::new(0),
+                                );
                                 let mut media_packet: MediaPacket = MediaPacket::default();
                                 media_packet.email = *email.clone();
                                 media_packet.media_type = MediaType::AUDIO.into();
                                 media_packet.audio = chunk_data.to_vec();
-                                media_packet.audio_format = AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
-                                media_packet.audio_number_of_channels = audio_frame.number_of_channels();
-                                media_packet.audio_number_of_frames = audio_frame.number_of_frames();
+                                media_packet.audio_format =
+                                    AudioSampleFormatWrapper(audio_frame.format().unwrap())
+                                        .to_string();
+                                media_packet.audio_number_of_channels =
+                                    audio_frame.number_of_channels();
+                                media_packet.audio_number_of_frames =
+                                    audio_frame.number_of_frames();
                                 media_packet.audio_sample_rate = audio_frame.sample_rate();
                                 on_frame.emit(media_packet);
                                 audio_frame.close();

@@ -82,6 +82,7 @@ features = [
     "LatencyMode",
     "HtmlAudioElement",
     "AudioDataInit",
-    "AudioSampleFormat"
+    "AudioSampleFormat",
+    "TransformStream"
 ]
 

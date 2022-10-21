@@ -1,3 +1,1 @@
-// @generated
-
-pub mod media_packet;
+pub mod rust;

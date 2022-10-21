@@ -10,8 +10,8 @@ use anyhow::anyhow;
 use gloo_console::log;
 use js_sys::*;
 use protobuf::Message;
-use types::protos::media_packet::media_packet;
-use types::protos::media_packet::MediaPacket;
+use types::protos::rust::media_packet::media_packet;
+use types::protos::rust::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -202,14 +202,12 @@ impl Component for AttendandsComponent {
                             log!("connect_with_audio_node", e);
                         }
                         Box::new(move |audio_data: AudioData| {
-                            log!("decoded packet", &audio_data);
                             let writable = audio_stream_generator.writable();
                             if writable.locked() {
                                 log!("dropping because it is locked");
                             } else {
                                 if let Err(e) = writable.get_writer().map(|writer| {
                                     wasm_bindgen_futures::spawn_local(async move {
-                                        log!("writer.ready()");
                                         if let Err(e) = JsFuture::from(writer.ready()).await {
                                             log!("write chunk error ", e);
                                         }

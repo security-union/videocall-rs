@@ -1,6 +1,6 @@
 pub mod command;
 use actix::Message as ActixMessage;
-use types::protos::media_packet::MediaPacket;
+use types::protos::rust::media_packet::MediaPacket;
 
 #[derive(ActixMessage)]
 #[rtype(result = "()")]

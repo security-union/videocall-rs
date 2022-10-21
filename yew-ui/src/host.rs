@@ -8,9 +8,10 @@ use js_sys::Reflect;
 use protobuf::Message;
 use std::fmt;
 use std::fmt::Debug;
-use types::protos::media_packet::media_packet;
-use types::protos::media_packet::media_packet::MediaType;
-use types::protos::media_packet::MediaPacket;
+use std::future::join;
+use types::protos::rust::media_packet::media_packet;
+use types::protos::rust::media_packet::media_packet::MediaType;
+use types::protos::rust::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -291,11 +292,6 @@ impl Component for Host {
                     video_encoder_config.latency_mode(LatencyMode::Realtime);
                     video_encoder.configure(&video_encoder_config);
 
-                    let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
-                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS);
-                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE);
-                    audio_encoder.configure(&audio_encoder_config);
-
                     let processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
                             &video_track.unchecked_into::<MediaStreamTrack>(),
@@ -316,58 +312,65 @@ impl Component for Host {
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
 
-                    loop {
-                        // let mut counter = 0u32;
-
-                        match JsFuture::from(video_reader.read()).await {
-                            Ok(js_frame) => {
-                                let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                                    .unwrap()
-                                    .unchecked_into::<VideoFrame>();
-                                let mut opts = VideoEncoderEncodeOptions::new();
-                                // counter = (counter + 1) % 50;
-                                opts.key_frame(true);
-                                video_encoder.encode_with_options(&video_frame, &opts);
-                                video_frame.close();
-                            }
-                            Err(e) => {
-                                log!("error", e);
-                            }
-                        }
-                        match JsFuture::from(audio_reader.read()).await {
-                            Ok(js_frame) => {
-                                let audio_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                                    .unwrap()
-                                    .unchecked_into::<AudioData>();
-                                let byte_length: usize = audio_frame
-                                    .allocation_size(&AudioDataCopyToOptions::new(0))
-                                    as usize;
-                                let mut chunk_data: Vec<u8> = vec![0; byte_length];
-                                let mut chunk_data = chunk_data.as_mut_slice();
-                                audio_frame.copy_to_with_u8_array(
-                                    &mut chunk_data,
-                                    &AudioDataCopyToOptions::new(0),
-                                );
-                                let mut media_packet: MediaPacket = MediaPacket::default();
-                                media_packet.email = *email.clone();
-                                media_packet.media_type = MediaType::AUDIO.into();
-                                media_packet.audio = chunk_data.to_vec();
-                                media_packet.audio_format =
-                                    AudioSampleFormatWrapper(audio_frame.format().unwrap())
-                                        .to_string();
-                                media_packet.audio_number_of_channels =
-                                    audio_frame.number_of_channels();
-                                media_packet.audio_number_of_frames =
-                                    audio_frame.number_of_frames();
-                                media_packet.audio_sample_rate = audio_frame.sample_rate();
-                                on_frame.emit(media_packet);
-                                audio_frame.close();
-                            }
-                            Err(e) => {
-                                log!("error", e);
+                    let poll_video = async {
+                        loop {
+                            match JsFuture::from(video_reader.read()).await {
+                                Ok(js_frame) => {
+                                    let video_frame =
+                                        Reflect::get(&js_frame, &JsString::from("value"))
+                                            .unwrap()
+                                            .unchecked_into::<VideoFrame>();
+                                    let mut opts = VideoEncoderEncodeOptions::new();
+                                    // counter = (counter + 1) % 50;
+                                    opts.key_frame(true);
+                                    video_encoder.encode_with_options(&video_frame, &opts);
+                                    video_frame.close();
+                                }
+                                Err(e) => {
+                                    log!("error", e);
+                                }
                             }
                         }
-                    }
+                    };
+                    let poll_audio = async {
+                        loop {
+                            match JsFuture::from(audio_reader.read()).await {
+                                Ok(js_frame) => {
+                                    let audio_frame =
+                                        Reflect::get(&js_frame, &JsString::from("value"))
+                                            .unwrap()
+                                            .unchecked_into::<AudioData>();
+                                    let byte_length: usize = audio_frame
+                                        .allocation_size(&AudioDataCopyToOptions::new(0))
+                                        as usize;
+                                    let mut chunk_data: Vec<u8> = vec![0; byte_length];
+                                    let mut chunk_data = chunk_data.as_mut_slice();
+                                    audio_frame.copy_to_with_u8_array(
+                                        &mut chunk_data,
+                                        &AudioDataCopyToOptions::new(0),
+                                    );
+                                    let mut media_packet: MediaPacket = MediaPacket::default();
+                                    media_packet.email = *email.clone();
+                                    media_packet.media_type = MediaType::AUDIO.into();
+                                    media_packet.audio = chunk_data.to_vec();
+                                    media_packet.audio_format =
+                                        AudioSampleFormatWrapper(audio_frame.format().unwrap())
+                                            .to_string();
+                                    media_packet.audio_number_of_channels =
+                                        audio_frame.number_of_channels();
+                                    media_packet.audio_number_of_frames =
+                                        audio_frame.number_of_frames();
+                                    media_packet.audio_sample_rate = audio_frame.sample_rate();
+                                    on_frame.emit(media_packet);
+                                    audio_frame.close();
+                                }
+                                Err(e) => {
+                                    log!("error", e);
+                                }
+                            }
+                        }
+                    };
+                    join!(poll_video, poll_audio).await;
                 });
                 true
             }

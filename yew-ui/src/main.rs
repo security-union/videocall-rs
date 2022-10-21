@@ -1,3 +1,5 @@
+#![feature(future_join)]
+
 mod constants;
 mod host;
 mod meeting_attendants;

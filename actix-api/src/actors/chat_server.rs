@@ -6,7 +6,7 @@ use crate::messages::{
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
 use std::collections::{HashMap, HashSet};
-use types::protos::media_packet::MediaPacket;
+use types::protos::rust::media_packet::MediaPacket;
 
 use super::chat_session::{RoomId, SessionId};
 

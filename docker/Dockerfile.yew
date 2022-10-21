@@ -1,4 +1,4 @@
-FROM rust:1.62-slim-bullseye
+FROM rustlang/rust:nightly-slim
 
 RUN apt-get --yes update && apt-get --yes install pkg-config libssl-dev
 RUN cargo install wasm-bindgen-cli --version 0.2.78

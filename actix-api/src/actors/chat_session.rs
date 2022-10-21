@@ -15,7 +15,7 @@ use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
 use log::{debug, error};
 use protobuf::Message;
-use types::protos::media_packet::MediaPacket;
+use types::protos::rust::media_packet::MediaPacket;
 use uuid::Uuid;
 
 pub type RoomId = String;

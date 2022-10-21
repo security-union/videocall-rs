@@ -156,14 +156,16 @@ impl Component for Host {
                 let video_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
-                    let mut buffer: Vec<u8> = vec![0; 20_000];
+                    let mut buffer = [0; 500000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
                         let mut media_packet: MediaPacket = MediaPacket::default();
                         media_packet.email = *email.clone();
-                        buffer.clear();
-                        chunk.copy_to_with_u8_array(&mut buffer.as_mut_slice());
-                        media_packet.video = buffer.to_vec();
+                        let byte_length = chunk.byte_length() as usize;
+                        log!("byte length video", byte_length);
+
+                        chunk.copy_to_with_u8_array(&mut buffer);
+                        media_packet.video = buffer[0..byte_length].to_vec();
                         media_packet.video_type =
                             EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
                         media_packet.media_type = media_packet::MediaType::VIDEO.into();
@@ -178,7 +180,7 @@ impl Component for Host {
                 let audio_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
-                    let mut buffer: Vec<u8> = vec![0; 20_000];
+                    let mut buffer: Vec<u8> = vec![0; 1_000_000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
                         let mut media_packet: MediaPacket = MediaPacket::default();
@@ -326,8 +328,7 @@ impl Component for Host {
                         }
                     };
                     let poll_audio = async {
-                        // allocate Vec only once to speed up things.
-                        let mut chunk_data: Vec<u8> = Vec::with_capacity(15_000);
+                        let mut buffer = [0; 2000];
                         loop {
                             match JsFuture::from(audio_reader.read()).await {
                                 Ok(js_frame) => {
@@ -335,18 +336,18 @@ impl Component for Host {
                                         Reflect::get(&js_frame, &JsString::from("value"))
                                             .unwrap()
                                             .unchecked_into::<AudioData>();
+                                    
                                     let byte_length: usize = audio_frame
-                                        .allocation_size(&AudioDataCopyToOptions::new(0))
-                                        as usize;
-                                    chunk_data.clear();
+                                    .allocation_size(&AudioDataCopyToOptions::new(0))
+                                    as usize;                                   
                                     audio_frame.copy_to_with_u8_array(
-                                        &mut chunk_data.as_mut_slice(),
+                                        &mut buffer,
                                         &AudioDataCopyToOptions::new(0),
                                     );
                                     let mut packet: MediaPacket = MediaPacket::default();
                                     packet.email = *email.clone();
                                     packet.media_type = MediaType::AUDIO.into();
-                                    packet.audio = chunk_data.to_vec();
+                                    packet.audio = buffer[0..byte_length].to_vec();
                                     packet.audio_format =
                                         AudioSampleFormatWrapper(audio_frame.format().unwrap())
                                             .to_string();

@@ -4,8 +4,7 @@ use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
-use protobuf::Message;
-use std::fmt;
+
 use std::fmt::Debug;
 use std::future::join;
 use types::protos::rust::media_packet::media_packet;
@@ -18,7 +17,8 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::HtmlVideoElement;
 use web_sys::*;
 use yew::prelude::*;
-use yew_websocket::websocket::{Binary, Text};
+
+use crate::model::{AudioSampleFormatWrapper, EncodedVideoChunkTypeWrapper};
 
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
@@ -44,99 +44,6 @@ pub struct MeetingProps {
 
     #[prop_or_default]
     pub email: String,
-}
-
-pub struct MediaPacketWrapper(pub MediaPacket);
-
-impl From<Text> for MediaPacketWrapper {
-    fn from(_: Text) -> Self {
-        MediaPacketWrapper(MediaPacket::default())
-    }
-}
-
-impl From<Binary> for MediaPacketWrapper {
-    fn from(bin: Binary) -> Self {
-        let media_packet: MediaPacket = bin
-            .map(|data| MediaPacket::parse_from_bytes(&data.into_boxed_slice()).unwrap())
-            .unwrap_or(MediaPacket::default());
-        MediaPacketWrapper(media_packet)
-    }
-}
-
-pub struct EncodedVideoChunkTypeWrapper(pub EncodedVideoChunkType);
-
-impl From<String> for EncodedVideoChunkTypeWrapper {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "key" => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Key),
-            _ => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Delta),
-        }
-    }
-}
-
-impl fmt::Display for EncodedVideoChunkTypeWrapper {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.0 {
-            EncodedVideoChunkType::Delta => write!(f, "delta"),
-            EncodedVideoChunkType::Key => write!(f, "key"),
-            _ => todo!(),
-        }
-    }
-}
-
-pub struct EncodedAudioChunkTypeWrapper(pub EncodedAudioChunkType);
-
-impl From<String> for EncodedAudioChunkTypeWrapper {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "key" => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key),
-            _ => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Delta),
-        }
-    }
-}
-
-impl fmt::Display for EncodedAudioChunkTypeWrapper {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.0 {
-            EncodedAudioChunkType::Delta => write!(f, "delta"),
-            EncodedAudioChunkType::Key => write!(f, "key"),
-            _ => todo!(),
-        }
-    }
-}
-
-pub struct AudioSampleFormatWrapper(pub AudioSampleFormat);
-
-impl From<String> for AudioSampleFormatWrapper {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "u8" => AudioSampleFormatWrapper(AudioSampleFormat::U8),
-            "s16" => AudioSampleFormatWrapper(AudioSampleFormat::S16),
-            "s32" => AudioSampleFormatWrapper(AudioSampleFormat::S32),
-            "f32" => AudioSampleFormatWrapper(AudioSampleFormat::F32),
-            "u8-planar" => AudioSampleFormatWrapper(AudioSampleFormat::U8Planar),
-            "s16-planar" => AudioSampleFormatWrapper(AudioSampleFormat::S16Planar),
-            "s32-planar" => AudioSampleFormatWrapper(AudioSampleFormat::S32Planar),
-            "f32-planar" => AudioSampleFormatWrapper(AudioSampleFormat::F32Planar),
-            _ => todo!(),
-        }
-    }
-}
-
-impl fmt::Display for AudioSampleFormatWrapper {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.0 {
-            AudioSampleFormat::U8 => write!(f, "u8"),
-            AudioSampleFormat::S16 => write!(f, "s16"),
-            AudioSampleFormat::S32 => write!(f, "s32"),
-            AudioSampleFormat::F32 => write!(f, "f32"),
-            AudioSampleFormat::U8Planar => write!(f, "u8-planar"),
-            AudioSampleFormat::S16Planar => write!(f, "s16-planar"),
-            AudioSampleFormat::S32Planar => write!(f, "s32-planar"),
-            AudioSampleFormat::F32Planar => write!(f, "f32-planar"),
-            _ => todo!(),
-        }
-    }
 }
 
 impl Component for Host {
@@ -170,28 +77,6 @@ impl Component for Host {
                             EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
                         media_packet.media_type = media_packet::MediaType::VIDEO.into();
                         media_packet.timestamp = chunk.timestamp();
-                        if let Some(duration0) = chunk.duration() {
-                            media_packet.duration = duration0;
-                        }
-                        on_frame.emit(media_packet);
-                    })
-                };
-
-                let audio_output_handler = {
-                    let email = email.clone();
-                    let on_frame = on_frame.clone();
-                    let mut buffer: Vec<u8> = vec![0; 1_000_000];
-                    Box::new(move |chunk: JsValue| {
-                        let chunk = web_sys::EncodedAudioChunk::from(chunk);
-                        let mut media_packet: MediaPacket = MediaPacket::default();
-                        media_packet.email = *email.clone();
-                        buffer.clear();
-                        chunk.copy_to_with_u8_array(&mut buffer.as_mut_slice());
-                        media_packet.audio = buffer.to_vec();
-                        media_packet.timestamp = chunk.timestamp();
-                        media_packet.media_type = media_packet::MediaType::AUDIO.into();
-                        media_packet.video_type =
-                            EncodedAudioChunkTypeWrapper(chunk.type_()).to_string();
                         if let Some(duration0) = chunk.duration() {
                             media_packet.duration = duration0;
                         }
@@ -242,25 +127,14 @@ impl Component for Host {
                     })
                         as Box<dyn FnMut(JsValue)>);
 
-                    let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                        log!("audio_error_handler error", e);
-                    })
-                        as Box<dyn FnMut(JsValue)>);
-
                     let video_output_handler =
                         Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue)>);
-                    let audio_output_handler =
-                        Closure::wrap(audio_output_handler as Box<dyn FnMut(JsValue)>);
+
                     let video_encoder_init = VideoEncoderInit::new(
                         video_error_handler.as_ref().unchecked_ref(),
                         video_output_handler.as_ref().unchecked_ref(),
                     );
-                    let audio_encoder_init = AudioEncoderInit::new(
-                        audio_error_handler.as_ref().unchecked_ref(),
-                        audio_output_handler.as_ref().unchecked_ref(),
-                    );
 
-                    let audio_encoder = AudioEncoder::new(&audio_encoder_init).unwrap();
                     let video_encoder = VideoEncoder::new(&video_encoder_init).unwrap();
                     let settings = &mut video_track
                         .clone()

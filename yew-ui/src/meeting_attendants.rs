@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
-use crate::host::AudioSampleFormatWrapper;
-use crate::host::EncodedVideoChunkTypeWrapper;
-use crate::host::MediaPacketWrapper;
+use crate::model::AudioSampleFormatWrapper;
+use crate::model::EncodedVideoChunkTypeWrapper;
+use crate::model::MediaPacketWrapper;
 use crate::{constants::ACTIX_WEBSOCKET, host::Host};
 use anyhow::anyhow;
 use gloo_console::log;

@@ -3,6 +3,7 @@
 mod constants;
 mod host;
 mod meeting_attendants;
+mod model;
 
 use constants::LOGIN_URL;
 

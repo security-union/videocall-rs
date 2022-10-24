@@ -1,8 +1,14 @@
+use js_sys::Array;
 use protobuf::Message;
 use std::fmt;
-use types::protos::rust::media_packet::MediaPacket;
+use types::protos::rust::media_packet::{
+    media_packet::{self, MediaType},
+    MediaPacket,
+};
 use web_sys::*;
 use yew_websocket::websocket::{Binary, Text};
+
+use crate::constants::AUDIO_SAMPLE_RATE;
 pub struct MediaPacketWrapper(pub MediaPacket);
 
 impl From<Text> for MediaPacketWrapper {
@@ -94,4 +100,62 @@ impl fmt::Display for AudioSampleFormatWrapper {
             _ => todo!(),
         }
     }
+}
+
+pub fn transform_video_chunk(
+    chunk: EncodedVideoChunk,
+    buffer: &mut [u8],
+    email: Box<String>,
+) -> MediaPacket {
+    let mut media_packet: MediaPacket = MediaPacket::default();
+    media_packet.email = *email.clone();
+    let byte_length = chunk.byte_length() as usize;
+    chunk.copy_to_with_u8_array(buffer);
+    media_packet.video = buffer[0..byte_length].to_vec();
+    media_packet.video_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
+    media_packet.media_type = media_packet::MediaType::VIDEO.into();
+    media_packet.timestamp = chunk.timestamp();
+    if let Some(duration0) = chunk.duration() {
+        media_packet.duration = duration0;
+    }
+    media_packet
+}
+
+pub fn transform_audio_chunk(
+    audio_frame: &AudioData,
+    buffer: &mut [u8],
+    email: &String,
+) -> MediaPacket {
+    let byte_length: usize = audio_frame.allocation_size(&AudioDataCopyToOptions::new(0)) as usize;
+    audio_frame.copy_to_with_u8_array(buffer, &AudioDataCopyToOptions::new(0));
+    let mut packet: MediaPacket = MediaPacket::default();
+    packet.email = email.clone();
+    packet.media_type = MediaType::AUDIO.into();
+    packet.audio = buffer[0..byte_length].to_vec();
+    packet.audio_format = AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
+    packet.audio_number_of_channels = audio_frame.number_of_channels();
+    packet.audio_number_of_frames = audio_frame.number_of_frames();
+    packet.audio_sample_rate = audio_frame.sample_rate();
+    packet
+}
+
+pub fn configure_audio_context(
+    audio_stream_generator: &MediaStreamTrackGenerator,
+) -> anyhow::Result<AudioContext> {
+    let js_tracks = Array::new();
+    js_tracks.push(&audio_stream_generator);
+    let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
+    let mut audio_context_options = AudioContextOptions::new();
+    audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);
+    let audio_context = AudioContext::new_with_context_options(&audio_context_options).unwrap();
+    let gain_node = audio_context.create_gain().unwrap();
+    gain_node.set_channel_count(1);
+    let source = audio_context
+        .create_media_stream_source(&media_stream)
+        .unwrap();
+    let _ = source.connect_with_audio_node(&gain_node).unwrap();
+    let _ = gain_node
+        .connect_with_audio_node(&audio_context.destination())
+        .unwrap();
+    Ok(audio_context)
 }

@@ -7,7 +7,9 @@ use js_sys::Reflect;
 
 use std::fmt::Debug;
 use std::future::join;
-use types::protos::rust::media_packet::media_packet;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use types::protos::rust::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -17,13 +19,12 @@ use web_sys::HtmlVideoElement;
 use web_sys::*;
 use yew::prelude::*;
 
-use crate::model::EncodedVideoChunkTypeWrapper;
-
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
+use crate::model::transform_video_chunk;
 
 pub enum Msg {
     Start,
@@ -31,6 +32,7 @@ pub enum Msg {
 
 pub struct Host {
     pub initialized: bool,
+    pub destroy: Arc<AtomicBool>,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -53,12 +55,20 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(_ctx: &Context<Self>) -> Self {
-        Self { initialized: false }
+        Self {
+            initialized: false,
+            destroy: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Start => {
+                log!("starting...");
+                if self.initialized {
+                    log!("Trying to initialize twice!!!");
+                    return false;
+                }
                 self.initialized = true;
                 let on_frame = Box::new(ctx.props().on_frame.clone());
                 let on_audio = Box::new(ctx.props().on_audio.clone());
@@ -66,25 +76,16 @@ impl Component for Host {
                 let video_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
-                    let mut buffer = [0; 500000];
+                    let mut buffer: [u8; 300000] = [0; 300000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                        let mut media_packet: MediaPacket = MediaPacket::default();
-                        media_packet.email = *email.clone();
-                        let byte_length = chunk.byte_length() as usize;
-                        chunk.copy_to_with_u8_array(&mut buffer);
-                        media_packet.video = buffer[0..byte_length].to_vec();
-                        media_packet.video_type =
-                            EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
-                        media_packet.media_type = media_packet::MediaType::VIDEO.into();
-                        media_packet.timestamp = chunk.timestamp();
-                        if let Some(duration0) = chunk.duration() {
-                            media_packet.duration = duration0;
-                        }
+                        let media_packet: MediaPacket =
+                            transform_video_chunk(chunk, &mut buffer, email.clone());
                         on_frame.emit(media_packet);
                     })
                 };
                 let on_audio = on_audio.clone();
+                let destroy = self.destroy.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
@@ -135,7 +136,7 @@ impl Component for Host {
                         video_output_handler.as_ref().unchecked_ref(),
                     );
 
-                    let video_encoder = VideoEncoder::new(&video_encoder_init).unwrap();
+                    let video_encoder = Box::new(VideoEncoder::new(&video_encoder_init).unwrap());
                     let settings = &mut video_track
                         .clone()
                         .unchecked_into::<MediaStreamTrack>()
@@ -180,8 +181,12 @@ impl Component for Host {
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
+                    let mut counter = 0;
                     let poll_video = async {
                         loop {
+                            if destroy.load(Ordering::Acquire) {
+                                return;
+                            }
                             match JsFuture::from(video_reader.read()).await {
                                 Ok(js_frame) => {
                                     let video_frame =
@@ -189,9 +194,9 @@ impl Component for Host {
                                             .unwrap()
                                             .unchecked_into::<VideoFrame>();
                                     let mut opts = VideoEncoderEncodeOptions::new();
-                                    // counter = (counter + 1) % 50;
-                                    opts.key_frame(true);
-                                    video_encoder.encode_with_options(&video_frame, &opts);
+                                    counter = (counter + 1) % 50;
+                                    opts.key_frame(counter == 0);
+                                    video_encoder.encode(&video_frame);
                                     video_frame.close();
                                 }
                                 Err(e) => {
@@ -201,8 +206,10 @@ impl Component for Host {
                         }
                     };
                     let poll_audio = async {
-                        // let mut buffer = [0; 2000];
                         loop {
+                            if destroy.load(Ordering::Acquire) {
+                                return;
+                            }
                             match JsFuture::from(audio_reader.read()).await {
                                 Ok(js_frame) => {
                                     let audio_frame =
@@ -225,11 +232,16 @@ impl Component for Host {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        // Initialize component on first render.
         if !self.initialized {
             ctx.link().send_message(Msg::Start);
         }
         html! {
             <video class="self-camera" autoplay=true id="webcam"></video>
         }
+    }
+
+    fn destroy(&mut self, _ctx: &Context<Self>) {
+        self.destroy.store(true, Ordering::Release);
     }
 }

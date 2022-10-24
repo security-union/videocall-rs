@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::model::configure_audio_context;
+use crate::model::transform_audio_chunk;
 use crate::model::AudioSampleFormatWrapper;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use crate::model::MediaPacketWrapper;
@@ -17,7 +18,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
-use types::protos::rust::media_packet::media_packet::MediaType;
 use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
@@ -37,9 +37,9 @@ pub enum WsAction {
 
 pub enum Msg {
     WsAction(WsAction),
-    WsReady(MediaPacketWrapper),
-    OnFrame(MediaPacket),
-    OnAudio(AudioData),
+    OnInboundMedia(MediaPacketWrapper),
+    OnOutboundVideoPacket(MediaPacket),
+    OnOutboundAudioPacket(AudioData),
 }
 
 impl From<WsAction> for Msg {
@@ -65,6 +65,7 @@ pub struct AttendandsComponent {
     pub media_packet: MediaPacket,
     pub connected: bool,
     pub connected_peers: HashMap<String, ClientSubscription>,
+    pub outbound_audio_buffer: [u8; 2000],
 }
 
 pub struct ClientSubscription {
@@ -85,6 +86,7 @@ impl Component for AttendandsComponent {
             connected: false,
             media_packet: MediaPacket::default(),
             connected_peers,
+            outbound_audio_buffer: [0; 2000],
         }
     }
 
@@ -92,7 +94,7 @@ impl Component for AttendandsComponent {
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
-                    let callback = ctx.link().callback(|data| Msg::WsReady(data));
+                    let callback = ctx.link().callback(|data| Msg::OnInboundMedia(data));
                     let notification = ctx.link().batch_callback(|status| match status {
                         WebSocketStatus::Opened => Some(WsAction::Connected.into()),
                         WebSocketStatus::Closed | WebSocketStatus::Error => {
@@ -121,13 +123,12 @@ impl Component for AttendandsComponent {
                     log!("Lost");
                     self.ws = None;
                     self.connected = false;
-                    true
+                    false
                 }
             },
-            Msg::WsReady(response) => {
+            Msg::OnInboundMedia(response) => {
                 let data = response.0;
                 let email = data.email.clone();
-
                 if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
                     match data.media_type.unwrap() {
                         media_packet::MediaType::VIDEO => {
@@ -135,21 +136,16 @@ impl Component for AttendandsComponent {
                                 Uint8Array::new_with_length(data.video.len().try_into().unwrap());
                             let chunk_type = EncodedVideoChunkTypeWrapper::from(data.video_type).0;
                             video_data.copy_from(&data.video.into_boxed_slice());
-                            let encoded_video_chunk =
-                                EncodedVideoChunk::new(&EncodedVideoChunkInit::new(
-                                    &video_data,
-                                    data.timestamp,
-                                    chunk_type,
-                                ))
-                                .unwrap();
+                            let mut video_chunk =
+                                EncodedVideoChunkInit::new(&video_data, data.timestamp, chunk_type);
+                            video_chunk.duration(data.duration);
+                            let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
                             if peer.waiting_for_video_keyframe
                                 && chunk_type == EncodedVideoChunkType::Key
                                 || !peer.waiting_for_video_keyframe
                             {
                                 peer.video_decoder.decode(&encoded_video_chunk);
                                 peer.waiting_for_video_keyframe = false;
-                            } else {
-                                log!("dropping video frame");
                             }
                         }
                         media_packet::MediaType::AUDIO => {
@@ -186,48 +182,27 @@ impl Component for AttendandsComponent {
                             &MediaStreamTrackGeneratorInit::new(&"audio"),
                         )
                         .unwrap();
-                        let js_tracks = Array::new();
-                        js_tracks.push(&audio_stream_generator);
-                        let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
-                        let mut audio_context_options = AudioContextOptions::new();
-                        audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);
-                        let audio_context =
-                            AudioContext::new_with_context_options(&audio_context_options).unwrap();
-                        let gain_node = audio_context.create_gain().unwrap();
-                        gain_node.set_channel_count(1);
-                        let source = audio_context
-                            .create_media_stream_source(&media_stream)
-                            .unwrap();
-                        if let Err(e) = source.connect_with_audio_node(&gain_node) {
-                            log!("connect_with_audio_node", e);
-                        }
-                        log!("destination", audio_context.destination());
-                        if let Err(e) =
-                            gain_node.connect_with_audio_node(&audio_context.destination())
-                        {
-                            log!("connect_with_audio_node", e);
-                        }
+                        // The audio context is used to reproduce audio.
+                        let _audio_context = configure_audio_context(&audio_stream_generator);
                         Box::new(move |audio_data: AudioData| {
                             let writable = audio_stream_generator.writable();
                             if writable.locked() {
-                                log!("dropping because it is locked");
-                            } else {
-                                if let Err(e) = writable.get_writer().map(|writer| {
-                                    wasm_bindgen_futures::spawn_local(async move {
-                                        if let Err(e) = JsFuture::from(writer.ready()).await {
-                                            log!("write chunk error ", e);
-                                        }
-                                        if let Err(e) =
-                                            JsFuture::from(writer.write_with_chunk(&audio_data))
-                                                .await
-                                        {
-                                            log!("write chunk error ", e);
-                                        };
-                                        writer.release_lock();
-                                    });
-                                }) {
-                                    log!("error", e);
-                                }
+                                return;
+                            }
+                            if let Err(e) = writable.get_writer().map(|writer| {
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if let Err(e) = JsFuture::from(writer.ready()).await {
+                                        log!("write chunk error ", e);
+                                    }
+                                    if let Err(e) =
+                                        JsFuture::from(writer.write_with_chunk(&audio_data)).await
+                                    {
+                                        log!("write chunk error ", e);
+                                    };
+                                    writer.release_lock();
+                                });
+                            }) {
+                                log!("error", e);
                             }
                         }) as Box<dyn FnMut(AudioData)>
                     };
@@ -281,40 +256,24 @@ impl Component for AttendandsComponent {
                     true
                 }
             }
-            Msg::OnFrame(media) => {
+            Msg::OnOutboundVideoPacket(media) => {
                 if let Some(ws) = self.ws.as_mut() {
                     if self.connected {
                         let bytes = media.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
                         ws.send_binary(bytes);
-                    } else {
-                        // log!("disconnected");
                     }
                 }
                 false
             }
-            Msg::OnAudio(audio_frame) => {
+            Msg::OnOutboundAudioPacket(audio_frame) => {
                 if let Some(ws) = self.ws.as_mut() {
                     if self.connected {
-                        let mut buffer = [0; 2000];
+                        let mut buffer = self.outbound_audio_buffer;
                         let email = ctx.props().email.clone();
-                        let byte_length: usize =
-                            audio_frame.allocation_size(&AudioDataCopyToOptions::new(0)) as usize;
-                        audio_frame
-                            .copy_to_with_u8_array(&mut buffer, &AudioDataCopyToOptions::new(0));
-                        let mut packet: MediaPacket = MediaPacket::default();
-                        packet.email = email;
-                        packet.media_type = MediaType::AUDIO.into();
-                        packet.audio = buffer[0..byte_length].to_vec();
-                        packet.audio_format =
-                            AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
-                        packet.audio_number_of_channels = audio_frame.number_of_channels();
-                        packet.audio_number_of_frames = audio_frame.number_of_frames();
-                        packet.audio_sample_rate = audio_frame.sample_rate();
+                        let packet = transform_audio_chunk(&audio_frame, &mut buffer, &email);
                         if self.connected {
                             let bytes = packet.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
                             ws.send_binary(bytes);
-                        } else {
-                            // log!("disconnected");
                         }
                         audio_frame.close();
                     }
@@ -328,9 +287,11 @@ impl Component for AttendandsComponent {
         let email = ctx.props().email.clone();
         let on_frame = ctx
             .link()
-            .callback(|frame: MediaPacket| Msg::OnFrame(frame));
+            .callback(|frame: MediaPacket| Msg::OnOutboundVideoPacket(frame));
 
-        let on_audio = ctx.link().callback(|frame: AudioData| Msg::OnAudio(frame));
+        let on_audio = ctx
+            .link()
+            .callback(|frame: AudioData| Msg::OnOutboundAudioPacket(frame));
         let rows: Vec<VNode> = self
             .connected_peers
             .iter()

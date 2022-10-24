@@ -1,6 +1,11 @@
 # Rust Zoom
 
-**NOTE** This is still a wip!!! I am making this a public project so that I can share it with my community.
+![rust](https://user-images.githubusercontent.com/1176339/197537597-2e9147dc-5892-47c9-9a7d-d5b0102800db.png)
+
+
+
+MVP of a teleconferencing system written in rust, both the backend and the UI.
+
 
 # How to test?
 

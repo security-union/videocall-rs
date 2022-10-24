@@ -1,8 +1,7 @@
 #![feature(future_join)]
 
+mod components;
 mod constants;
-mod host;
-mod meeting_attendants;
 mod model;
 
 use constants::LOGIN_URL;
@@ -10,9 +9,9 @@ use constants::LOGIN_URL;
 use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
+use components::attendants::AttendandsComponent;
 use gloo_console::log;
 use gloo_utils::window;
-use meeting_attendants::AttendandsComponent;
 use yew_router::prelude::*;
 
 use crate::constants::ENABLE_OAUTH;

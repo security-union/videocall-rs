@@ -5,7 +5,7 @@ use crate::constants::VIDEO_CODEC;
 use crate::model::AudioSampleFormatWrapper;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use crate::model::MediaPacketWrapper;
-use crate::{constants::ACTIX_WEBSOCKET, host::Host};
+use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use anyhow::anyhow;
 use gloo_console::log;
 use js_sys::*;
@@ -26,6 +26,7 @@ use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask}
 // This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 // https://github.com/WebAudio/web-audio-api-v2/issues/133
 
+#[derive(Debug)]
 pub enum WsAction {
     Connect,
     Connected,
@@ -104,15 +105,18 @@ impl Component for AttendandsComponent {
                     true
                 }
                 WsAction::Disconnect => {
+                    log!("Disconnect");
                     self.ws.take();
                     self.connected = false;
                     true
                 }
                 WsAction::Connected => {
+                    log!("Connected");
                     self.connected = true;
                     true
                 }
                 WsAction::Lost => {
+                    log!("Lost");
                     self.ws = None;
                     self.connected = false;
                     true
@@ -281,7 +285,7 @@ impl Component for AttendandsComponent {
                         let bytes = media.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
                         ws.send_binary(bytes);
                     } else {
-                        log!("disconnected");
+                        // log!("disconnected");
                     }
                 }
                 false

@@ -69,8 +69,6 @@ impl Component for Host {
                         let mut media_packet: MediaPacket = MediaPacket::default();
                         media_packet.email = *email.clone();
                         let byte_length = chunk.byte_length() as usize;
-                        log!("byte length video", byte_length);
-
                         chunk.copy_to_with_u8_array(&mut buffer);
                         media_packet.video = buffer[0..byte_length].to_vec();
                         media_packet.video_type =
@@ -180,7 +178,6 @@ impl Component for Host {
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
-
                     let poll_video = async {
                         loop {
                             match JsFuture::from(video_reader.read()).await {

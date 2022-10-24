@@ -7,9 +7,9 @@ use js_sys::Reflect;
 
 use std::fmt::Debug;
 use std::future::join;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use types::protos::rust::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -55,7 +55,10 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(_ctx: &Context<Self>) -> Self {
-        Self { initialized: false, destroy: Arc::new(AtomicBool::new(false)) }
+        Self {
+            initialized: false,
+            destroy: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
@@ -238,7 +241,7 @@ impl Component for Host {
         }
     }
 
-    fn destroy(&mut self, ctx: &Context<Self>) {
+    fn destroy(&mut self, _ctx: &Context<Self>) {
         self.destroy.store(true, Ordering::Release);
     }
 }

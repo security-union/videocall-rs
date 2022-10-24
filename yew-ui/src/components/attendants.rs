@@ -136,13 +136,10 @@ impl Component for AttendandsComponent {
                                 Uint8Array::new_with_length(data.video.len().try_into().unwrap());
                             let chunk_type = EncodedVideoChunkTypeWrapper::from(data.video_type).0;
                             video_data.copy_from(&data.video.into_boxed_slice());
-                            let mut video_chunk = EncodedVideoChunkInit::new(
-                                &video_data,
-                                data.timestamp,
-                                chunk_type,
-                            );
+                            let mut video_chunk =
+                                EncodedVideoChunkInit::new(&video_data, data.timestamp, chunk_type);
                             video_chunk.duration(data.duration);
-                            let  encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
+                            let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
                             if peer.waiting_for_video_keyframe
                                 && chunk_type == EncodedVideoChunkType::Key
                                 || !peer.waiting_for_video_keyframe
@@ -198,8 +195,7 @@ impl Component for AttendandsComponent {
                                         log!("write chunk error ", e);
                                     }
                                     if let Err(e) =
-                                        JsFuture::from(writer.write_with_chunk(&audio_data))
-                                            .await
+                                        JsFuture::from(writer.write_with_chunk(&audio_data)).await
                                     {
                                         log!("write chunk error ", e);
                                     };
@@ -208,7 +204,6 @@ impl Component for AttendandsComponent {
                             }) {
                                 log!("error", e);
                             }
-                            
                         }) as Box<dyn FnMut(AudioData)>
                     };
                     let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
@@ -294,7 +289,9 @@ impl Component for AttendandsComponent {
             .link()
             .callback(|frame: MediaPacket| Msg::OnOutboundVideoPacket(frame));
 
-        let on_audio = ctx.link().callback(|frame: AudioData| Msg::OnOutboundAudioPacket(frame));
+        let on_audio = ctx
+            .link()
+            .callback(|frame: AudioData| Msg::OnOutboundAudioPacket(frame));
         let rows: Vec<VNode> = self
             .connected_peers
             .iter()

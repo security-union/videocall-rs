@@ -16,8 +16,6 @@ use web_sys::HtmlVideoElement;
 use web_sys::*;
 use yew::prelude::*;
 
-use crate::model::EncodedVideoChunkTypeWrapper;
-
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
@@ -181,9 +179,9 @@ impl Component for Host {
                                         Reflect::get(&js_frame, &JsString::from("value"))
                                             .unwrap()
                                             .unchecked_into::<VideoFrame>();
-                                    let mut opts = VideoEncoderEncodeOptions::new();
+                                    let opts = VideoEncoderEncodeOptions::new();
                                     // counter = (counter + 1) % 50;
-                                    opts.key_frame(true);
+                                    // opts.key_frame(counter == 0);
                                     video_encoder.encode_with_options(&video_frame, &opts);
                                     video_frame.close();
                                 }
@@ -194,7 +192,6 @@ impl Component for Host {
                         }
                     };
                     let poll_audio = async {
-                        // let mut buffer = [0; 2000];
                         loop {
                             match JsFuture::from(audio_reader.read()).await {
                                 Ok(js_frame) => {

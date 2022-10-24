@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::model::transform_audio_chunk;
 use crate::model::AudioSampleFormatWrapper;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use crate::model::MediaPacketWrapper;
@@ -17,7 +18,6 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
-use types::protos::rust::media_packet::media_packet::MediaType;
 use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
@@ -148,8 +148,6 @@ impl Component for AttendandsComponent {
                             {
                                 peer.video_decoder.decode(&encoded_video_chunk);
                                 peer.waiting_for_video_keyframe = false;
-                            } else {
-                                log!("dropping video frame");
                             }
                         }
                         media_packet::MediaType::AUDIO => {
@@ -186,27 +184,8 @@ impl Component for AttendandsComponent {
                             &MediaStreamTrackGeneratorInit::new(&"audio"),
                         )
                         .unwrap();
-                        let js_tracks = Array::new();
-                        js_tracks.push(&audio_stream_generator);
-                        let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
-                        let mut audio_context_options = AudioContextOptions::new();
-                        audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);
-                        let audio_context =
-                            AudioContext::new_with_context_options(&audio_context_options).unwrap();
-                        let gain_node = audio_context.create_gain().unwrap();
-                        gain_node.set_channel_count(1);
-                        let source = audio_context
-                            .create_media_stream_source(&media_stream)
-                            .unwrap();
-                        if let Err(e) = source.connect_with_audio_node(&gain_node) {
-                            log!("connect_with_audio_node", e);
-                        }
-                        log!("destination", audio_context.destination());
-                        if let Err(e) =
-                            gain_node.connect_with_audio_node(&audio_context.destination())
-                        {
-                            log!("connect_with_audio_node", e);
-                        }
+                        // The audio context is used to reproduce audio.
+                        let _audio_context = configure_audio_context(&audio_stream_generator);
                         Box::new(move |audio_data: AudioData| {
                             let writable = audio_stream_generator.writable();
                             if writable.locked() {
@@ -295,24 +274,10 @@ impl Component for AttendandsComponent {
                     if self.connected {
                         let mut buffer = [0; 2000];
                         let email = ctx.props().email.clone();
-                        let byte_length: usize =
-                            audio_frame.allocation_size(&AudioDataCopyToOptions::new(0)) as usize;
-                        audio_frame
-                            .copy_to_with_u8_array(&mut buffer, &AudioDataCopyToOptions::new(0));
-                        let mut packet: MediaPacket = MediaPacket::default();
-                        packet.email = email;
-                        packet.media_type = MediaType::AUDIO.into();
-                        packet.audio = buffer[0..byte_length].to_vec();
-                        packet.audio_format =
-                            AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
-                        packet.audio_number_of_channels = audio_frame.number_of_channels();
-                        packet.audio_number_of_frames = audio_frame.number_of_frames();
-                        packet.audio_sample_rate = audio_frame.sample_rate();
+                        let packet = transform_audio_chunk(&audio_frame, &mut buffer, &email);
                         if self.connected {
                             let bytes = packet.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
                             ws.send_binary(bytes);
-                        } else {
-                            // log!("disconnected");
                         }
                         audio_frame.close();
                     }
@@ -361,4 +326,25 @@ impl Component for AttendandsComponent {
             </div>
         }
     }
+}
+
+fn configure_audio_context(
+    audio_stream_generator: &MediaStreamTrackGenerator,
+) -> anyhow::Result<AudioContext> {
+    let js_tracks = Array::new();
+    js_tracks.push(&audio_stream_generator);
+    let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
+    let mut audio_context_options = AudioContextOptions::new();
+    audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);
+    let audio_context = AudioContext::new_with_context_options(&audio_context_options).unwrap();
+    let gain_node = audio_context.create_gain().unwrap();
+    gain_node.set_channel_count(1);
+    let source = audio_context
+        .create_media_stream_source(&media_stream)
+        .unwrap();
+    let _ = source.connect_with_audio_node(&gain_node).unwrap();
+    let _ = gain_node
+        .connect_with_audio_node(&audio_context.destination())
+        .unwrap();
+    Ok(audio_context)
 }

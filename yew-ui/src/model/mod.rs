@@ -1,6 +1,9 @@
 use protobuf::Message;
 use std::fmt;
-use types::protos::rust::media_packet::{media_packet, MediaPacket};
+use types::protos::rust::media_packet::{
+    media_packet::{self, MediaType},
+    MediaPacket,
+};
 use web_sys::*;
 use yew_websocket::websocket::{Binary, Text};
 pub struct MediaPacketWrapper(pub MediaPacket);
@@ -113,4 +116,22 @@ pub fn transform_video_chunk(
         media_packet.duration = duration0;
     }
     media_packet
+}
+
+pub fn transform_audio_chunk(
+    audio_frame: &AudioData,
+    buffer: &mut [u8],
+    email: &String,
+) -> MediaPacket {
+    let byte_length: usize = audio_frame.allocation_size(&AudioDataCopyToOptions::new(0)) as usize;
+    audio_frame.copy_to_with_u8_array(buffer, &AudioDataCopyToOptions::new(0));
+    let mut packet: MediaPacket = MediaPacket::default();
+    packet.email = email.clone();
+    packet.media_type = MediaType::AUDIO.into();
+    packet.audio = buffer[0..byte_length].to_vec();
+    packet.audio_format = AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
+    packet.audio_number_of_channels = audio_frame.number_of_channels();
+    packet.audio_number_of_frames = audio_frame.number_of_frames();
+    packet.audio_sample_rate = audio_frame.sample_rate();
+    packet
 }

@@ -7,7 +7,6 @@ use js_sys::Reflect;
 
 use std::fmt::Debug;
 use std::future::join;
-use types::protos::rust::media_packet::media_packet;
 use types::protos::rust::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -24,6 +23,7 @@ use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
+use crate::model::transform_video_chunk;
 
 pub enum Msg {
     Start,
@@ -59,6 +59,9 @@ impl Component for Host {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Start => {
+                if self.initialized {
+                    return false;
+                }
                 self.initialized = true;
                 let on_frame = Box::new(ctx.props().on_frame.clone());
                 let on_audio = Box::new(ctx.props().on_audio.clone());
@@ -66,21 +69,11 @@ impl Component for Host {
                 let video_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
-                    let mut buffer = [0; 500000];
+                    let mut buffer: [u8; 300000] = [0; 300000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                        let mut media_packet: MediaPacket = MediaPacket::default();
-                        media_packet.email = *email.clone();
-                        let byte_length = chunk.byte_length() as usize;
-                        chunk.copy_to_with_u8_array(&mut buffer);
-                        media_packet.video = buffer[0..byte_length].to_vec();
-                        media_packet.video_type =
-                            EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
-                        media_packet.media_type = media_packet::MediaType::VIDEO.into();
-                        media_packet.timestamp = chunk.timestamp();
-                        if let Some(duration0) = chunk.duration() {
-                            media_packet.duration = duration0;
-                        }
+                        let media_packet: MediaPacket =
+                            transform_video_chunk(chunk, &mut buffer, email.clone());
                         on_frame.emit(media_packet);
                     })
                 };
@@ -225,6 +218,7 @@ impl Component for Host {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        // Initialize component on first render.
         if !self.initialized {
             ctx.link().send_message(Msg::Start);
         }

@@ -286,8 +286,6 @@ impl Component for AttendandsComponent {
                     if self.connected {
                         let bytes = media.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
                         ws.send_binary(bytes);
-                    } else {
-                        // log!("disconnected");
                     }
                 }
                 false

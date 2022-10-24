@@ -1,6 +1,6 @@
 use protobuf::Message;
 use std::fmt;
-use types::protos::rust::media_packet::MediaPacket;
+use types::protos::rust::media_packet::{media_packet, MediaPacket};
 use web_sys::*;
 use yew_websocket::websocket::{Binary, Text};
 pub struct MediaPacketWrapper(pub MediaPacket);
@@ -94,4 +94,23 @@ impl fmt::Display for AudioSampleFormatWrapper {
             _ => todo!(),
         }
     }
+}
+
+pub fn transform_video_chunk(
+    chunk: EncodedVideoChunk,
+    buffer: &mut [u8],
+    email: Box<String>,
+) -> MediaPacket {
+    let mut media_packet: MediaPacket = MediaPacket::default();
+    media_packet.email = *email.clone();
+    let byte_length = chunk.byte_length() as usize;
+    chunk.copy_to_with_u8_array(buffer);
+    media_packet.video = buffer[0..byte_length].to_vec();
+    media_packet.video_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
+    media_packet.media_type = media_packet::MediaType::VIDEO.into();
+    media_packet.timestamp = chunk.timestamp();
+    if let Some(duration0) = chunk.duration() {
+        media_packet.duration = duration0;
+    }
+    media_packet
 }

@@ -1,3 +1,5 @@
+use gloo_console::log;
+use js_sys::Array;
 use protobuf::Message;
 use std::fmt;
 use types::protos::rust::media_packet::{
@@ -6,6 +8,8 @@ use types::protos::rust::media_packet::{
 };
 use web_sys::*;
 use yew_websocket::websocket::{Binary, Text};
+
+use crate::constants::AUDIO_SAMPLE_RATE;
 pub struct MediaPacketWrapper(pub MediaPacket);
 
 impl From<Text> for MediaPacketWrapper {
@@ -108,6 +112,7 @@ pub fn transform_video_chunk(
     media_packet.email = *email.clone();
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
+    log!("before encoder ", &chunk);
     media_packet.video = buffer[0..byte_length].to_vec();
     media_packet.video_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
     media_packet.media_type = media_packet::MediaType::VIDEO.into();
@@ -134,4 +139,25 @@ pub fn transform_audio_chunk(
     packet.audio_number_of_frames = audio_frame.number_of_frames();
     packet.audio_sample_rate = audio_frame.sample_rate();
     packet
+}
+
+pub fn configure_audio_context(
+    audio_stream_generator: &MediaStreamTrackGenerator,
+) -> anyhow::Result<AudioContext> {
+    let js_tracks = Array::new();
+    js_tracks.push(&audio_stream_generator);
+    let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
+    let mut audio_context_options = AudioContextOptions::new();
+    audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);
+    let audio_context = AudioContext::new_with_context_options(&audio_context_options).unwrap();
+    let gain_node = audio_context.create_gain().unwrap();
+    gain_node.set_channel_count(1);
+    let source = audio_context
+        .create_media_stream_source(&media_stream)
+        .unwrap();
+    let _ = source.connect_with_audio_node(&gain_node).unwrap();
+    let _ = gain_node
+        .connect_with_audio_node(&audio_context.destination())
+        .unwrap();
+    Ok(audio_context)
 }

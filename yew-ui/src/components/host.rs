@@ -57,7 +57,9 @@ impl Component for Host {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Start => {
+                log!("starting...");
                 if self.initialized {
+                    log!("Trying to initialize twice!!!");
                     return false;
                 }
                 self.initialized = true;
@@ -171,6 +173,7 @@ impl Component for Host {
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
+                    let mut counter = 0;
                     let poll_video = async {
                         loop {
                             match JsFuture::from(video_reader.read()).await {
@@ -179,10 +182,10 @@ impl Component for Host {
                                         Reflect::get(&js_frame, &JsString::from("value"))
                                             .unwrap()
                                             .unchecked_into::<VideoFrame>();
-                                    let opts = VideoEncoderEncodeOptions::new();
-                                    // counter = (counter + 1) % 50;
-                                    // opts.key_frame(counter == 0);
-                                    video_encoder.encode_with_options(&video_frame, &opts);
+                                    let mut opts = VideoEncoderEncodeOptions::new();
+                                    counter = (counter + 1) % 50;
+                                    opts.key_frame(counter == 0);
+                                    video_encoder.encode(&video_frame);
                                     video_frame.close();
                                 }
                                 Err(e) => {

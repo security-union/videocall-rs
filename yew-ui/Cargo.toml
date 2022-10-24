@@ -24,14 +24,33 @@ serde_derive = "1"
 protobuf = "3.2.0"
 
 [dependencies.web-sys]
-version = "0.3.58"
+version = "0.3.60"
 features = [
+    "AudioTrack",
+    "AudioData",
+    "AudioEncoder",
+    "AudioEncoderInit",
+    "AudioEncoderConfig",
+    "AudioDecoder",
+    "AudioDecoderInit",
+    "AudioDecoderConfig",
+    "AudioContext",
+    "BaseAudioContext",
+    "GainOptions",
+    "GainNode",
     "HtmlDocument",
     "console",
     "CanvasRenderingContext2d",
+    "EncodedAudioChunk",
+    "EncodedAudioChunkInit",
+    "EncodedAudioChunkType",
     "EncodedVideoChunk",
     "EncodedVideoChunkInit",
     "EncodedVideoChunkType",
+    "MediaStreamAudioDestinationNode",
+    "AudioDestinationNode",
+    "AudioContextOptions",
+    "AudioDataCopyToOptions",
     "HtmlCanvasElement",
     "HtmlImageElement",
     "Navigator",
@@ -41,6 +60,11 @@ features = [
     "MediaTrackSettings",
     "MediaStreamTrackProcessor",
     "MediaStreamTrackProcessorInit",
+    "MediaStreamTrackGenerator",
+    "MediaStreamTrackGeneratorInit",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "MediaStreamAudioSourceNode",
     "HtmlVideoElement",
     "MediaStreamConstraints",
     "ReadableStream",
@@ -55,6 +79,10 @@ features = [
     "VideoDecoder",
     "VideoDecoderConfig",
     "VideoDecoderInit",
-    "LatencyMode"
+    "LatencyMode",
+    "HtmlAudioElement",
+    "AudioDataInit",
+    "AudioSampleFormat",
+    "TransformStream"
 ]
 

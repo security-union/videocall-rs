@@ -2,7 +2,7 @@ use crate::actors::chat_session::{RoomId, SessionId};
 
 use super::session::Message;
 use actix::{Message as ActixMessage, Recipient};
-use types::protos::media_packet::MediaPacket;
+use types::protos::rust::media_packet::MediaPacket;
 
 #[derive(ActixMessage)]
 #[rtype(result = "()")]

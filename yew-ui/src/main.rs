@@ -1,25 +1,20 @@
+#![feature(future_join)]
+
+mod components;
 mod constants;
-mod host;
-mod meeting_attendants;
+mod model;
 
 use constants::LOGIN_URL;
 
 use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
+use components::attendants::AttendandsComponent;
 use gloo_console::log;
 use gloo_utils::window;
-use meeting_attendants::AttendandsComponent;
 use yew_router::prelude::*;
 
-fn truthy(s: String) -> bool {
-    ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())
-}
-// We need a lazy static block because these vars need to call a
-// few functions.
-lazy_static! {
-    static ref ENABLE_OAUTH: bool = truthy(std::env!("ENABLE_OAUTH").to_string());
-}
+use crate::constants::ENABLE_OAUTH;
 
 #[derive(Clone, Routable, PartialEq)]
 enum Route {

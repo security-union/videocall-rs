@@ -17,6 +17,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
+use types::protos::rust::media_packet::media_packet::MediaType;
 use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
@@ -38,6 +39,7 @@ pub enum Msg {
     WsAction(WsAction),
     WsReady(MediaPacketWrapper),
     OnFrame(MediaPacket),
+    OnAudio(AudioData),
 }
 
 impl From<WsAction> for Msg {
@@ -290,6 +292,35 @@ impl Component for AttendandsComponent {
                 }
                 false
             }
+            Msg::OnAudio(audio_frame) => {
+                if let Some(ws) = self.ws.as_mut() {
+                    if self.connected {
+                        let mut buffer = [0; 2000];
+                        let email = ctx.props().email.clone();
+                        let byte_length: usize =
+                            audio_frame.allocation_size(&AudioDataCopyToOptions::new(0)) as usize;
+                        audio_frame
+                            .copy_to_with_u8_array(&mut buffer, &AudioDataCopyToOptions::new(0));
+                        let mut packet: MediaPacket = MediaPacket::default();
+                        packet.email = email;
+                        packet.media_type = MediaType::AUDIO.into();
+                        packet.audio = buffer[0..byte_length].to_vec();
+                        packet.audio_format =
+                            AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
+                        packet.audio_number_of_channels = audio_frame.number_of_channels();
+                        packet.audio_number_of_frames = audio_frame.number_of_frames();
+                        packet.audio_sample_rate = audio_frame.sample_rate();
+                        if self.connected {
+                            let bytes = packet.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
+                            ws.send_binary(bytes);
+                        } else {
+                            // log!("disconnected");
+                        }
+                        audio_frame.close();
+                    }
+                }
+                false
+            }
         }
     }
 
@@ -298,6 +329,8 @@ impl Component for AttendandsComponent {
         let on_frame = ctx
             .link()
             .callback(|frame: MediaPacket| Msg::OnFrame(frame));
+
+        let on_audio = ctx.link().callback(|frame: AudioData| Msg::OnAudio(frame));
         let rows: Vec<VNode> = self
             .connected_peers
             .iter()
@@ -324,7 +357,7 @@ impl Component for AttendandsComponent {
                             { "Close" }
                         </button>
                     </div>
-                    <Host on_frame={on_frame} email={email.clone()}/>
+                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()}/>
                     <h4 class="floating-name">{email}</h4>
                 </nav>
             </div>

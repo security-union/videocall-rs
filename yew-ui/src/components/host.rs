@@ -8,7 +8,6 @@ use js_sys::Reflect;
 use std::fmt::Debug;
 use std::future::join;
 use types::protos::rust::media_packet::media_packet;
-use types::protos::rust::media_packet::media_packet::MediaType;
 use types::protos::rust::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -18,7 +17,7 @@ use web_sys::HtmlVideoElement;
 use web_sys::*;
 use yew::prelude::*;
 
-use crate::model::{AudioSampleFormatWrapper, EncodedVideoChunkTypeWrapper};
+use crate::model::EncodedVideoChunkTypeWrapper;
 
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
@@ -43,6 +42,9 @@ pub struct MeetingProps {
     pub on_frame: Callback<MediaPacket>,
 
     #[prop_or_default]
+    pub on_audio: Callback<AudioData>,
+
+    #[prop_or_default]
     pub email: String,
 }
 
@@ -59,6 +61,7 @@ impl Component for Host {
             Msg::Start => {
                 self.initialized = true;
                 let on_frame = Box::new(ctx.props().on_frame.clone());
+                let on_audio = Box::new(ctx.props().on_audio.clone());
                 let email = Box::new(ctx.props().email.clone());
                 let video_output_handler = {
                     let email = email.clone();
@@ -81,8 +84,7 @@ impl Component for Host {
                         on_frame.emit(media_packet);
                     })
                 };
-
-                let on_frame = on_frame.clone();
+                let on_audio = on_audio.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
@@ -199,7 +201,7 @@ impl Component for Host {
                         }
                     };
                     let poll_audio = async {
-                        let mut buffer = [0; 2000];
+                        // let mut buffer = [0; 2000];
                         loop {
                             match JsFuture::from(audio_reader.read()).await {
                                 Ok(js_frame) => {
@@ -207,27 +209,7 @@ impl Component for Host {
                                         Reflect::get(&js_frame, &JsString::from("value"))
                                             .unwrap()
                                             .unchecked_into::<AudioData>();
-
-                                    let byte_length: usize = audio_frame
-                                        .allocation_size(&AudioDataCopyToOptions::new(0))
-                                        as usize;
-                                    audio_frame.copy_to_with_u8_array(
-                                        &mut buffer,
-                                        &AudioDataCopyToOptions::new(0),
-                                    );
-                                    let mut packet: MediaPacket = MediaPacket::default();
-                                    packet.email = *email.clone();
-                                    packet.media_type = MediaType::AUDIO.into();
-                                    packet.audio = buffer[0..byte_length].to_vec();
-                                    packet.audio_format =
-                                        AudioSampleFormatWrapper(audio_frame.format().unwrap())
-                                            .to_string();
-                                    packet.audio_number_of_channels =
-                                        audio_frame.number_of_channels();
-                                    packet.audio_number_of_frames = audio_frame.number_of_frames();
-                                    packet.audio_sample_rate = audio_frame.sample_rate();
-                                    on_frame.emit(packet);
-                                    audio_frame.close();
+                                    on_audio.emit(audio_frame);
                                 }
                                 Err(e) => {
                                     log!("error", e);

@@ -106,18 +106,18 @@ impl Component for AttendandsComponent {
                     let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, meeting_id);
                     let task = WebSocketService::connect(&url, callback, notification).unwrap();
                     self.ws = Some(task);
-                    false
+                    true
                 }
                 WsAction::Disconnect => {
                     log!("Disconnect");
                     self.ws.take();
                     self.connected = false;
-                    false
+                    true
                 }
                 WsAction::Connected => {
                     log!("Connected");
                     self.connected = true;
-                    false
+                    true
                 }
                 WsAction::Lost => {
                     log!("Lost");
@@ -143,7 +143,6 @@ impl Component for AttendandsComponent {
                             );
                             video_chunk.duration(data.duration);
                             let  encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
-                            log!("on receive encoded_video_chunk", &encoded_video_chunk);
                             if peer.waiting_for_video_keyframe
                                 && chunk_type == EncodedVideoChunkType::Key
                                 || !peer.waiting_for_video_keyframe

@@ -1,4 +1,3 @@
-use gloo_console::log;
 use js_sys::Array;
 use protobuf::Message;
 use std::fmt;
@@ -112,7 +111,6 @@ pub fn transform_video_chunk(
     media_packet.email = *email.clone();
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
-    log!("before encoder ", &chunk);
     media_packet.video = buffer[0..byte_length].to_vec();
     media_packet.video_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
     media_packet.media_type = media_packet::MediaType::VIDEO.into();

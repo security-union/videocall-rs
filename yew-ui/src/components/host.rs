@@ -7,6 +7,9 @@ use js_sys::Reflect;
 
 use std::fmt::Debug;
 use std::future::join;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use types::protos::rust::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -29,6 +32,7 @@ pub enum Msg {
 
 pub struct Host {
     pub initialized: bool,
+    pub destroy: Arc<AtomicBool>,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -51,7 +55,7 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(_ctx: &Context<Self>) -> Self {
-        Self { initialized: false }
+        Self { initialized: false, destroy: Arc::new(AtomicBool::new(false)) }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
@@ -78,6 +82,7 @@ impl Component for Host {
                     })
                 };
                 let on_audio = on_audio.clone();
+                let destroy = self.destroy.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
@@ -128,7 +133,7 @@ impl Component for Host {
                         video_output_handler.as_ref().unchecked_ref(),
                     );
 
-                    let video_encoder = VideoEncoder::new(&video_encoder_init).unwrap();
+                    let video_encoder = Box::new(VideoEncoder::new(&video_encoder_init).unwrap());
                     let settings = &mut video_track
                         .clone()
                         .unchecked_into::<MediaStreamTrack>()
@@ -176,6 +181,9 @@ impl Component for Host {
                     let mut counter = 0;
                     let poll_video = async {
                         loop {
+                            if destroy.load(Ordering::Acquire) {
+                                return;
+                            }
                             match JsFuture::from(video_reader.read()).await {
                                 Ok(js_frame) => {
                                     let video_frame =
@@ -196,6 +204,9 @@ impl Component for Host {
                     };
                     let poll_audio = async {
                         loop {
+                            if destroy.load(Ordering::Acquire) {
+                                return;
+                            }
                             match JsFuture::from(audio_reader.read()).await {
                                 Ok(js_frame) => {
                                     let audio_frame =
@@ -225,5 +236,9 @@ impl Component for Host {
         html! {
             <video class="self-camera" autoplay=true id="webcam"></video>
         }
+    }
+
+    fn destroy(&mut self, ctx: &Context<Self>) {
+        self.destroy.store(true, Ordering::Release);
     }
 }

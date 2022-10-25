@@ -29,7 +29,8 @@ Technically you could test this with a single computer, but it is more fun if yo
 
 5. Click connect on both browsers, and enjoy:
 
-![Oct-24-2022 08-28-17](https://user-images.githubusercontent.com/1176339/197537123-1cfaa463-b5c8-4036-be1f-f710799a9a58.gif)
+![Oct-24-2022 08-37-09](https://user-images.githubusercontent.com/1176339/197853024-171e0dcc-2098-4780-b3be-bfc3cb5adb43.gif)
+
 
 ## ▶️ YouTube Channel
 https://www.youtube.com/@securityunion

@@ -27,8 +27,13 @@ Technically you could test this with a single computer, but it is more fun if yo
 
 ![Oct-24-2022 08-28-17](https://user-images.githubusercontent.com/1176339/197537123-1cfaa463-b5c8-4036-be1f-f710799a9a58.gif)
 
+## ▶️ YouTube Channel
+
+https://www.youtube.com/@securityunion
+
 ## 👉 Join our Discord Community
 You can join our Discord Community, here is the [invite link](https://discord.gg/JP38NRe4CJ).
+
 
 ## 👨‍💻 Project Structure
 

@@ -8,7 +8,7 @@ https://www.youtube.com/@securityunion
 
 MVP of a teleconferencing system written in rust, both the backend and the UI.
 
-Security Union LLC is not associated with Zoom Video Communications, but we are big fans of their products!!
+Security Union LLC is not associated with Zoom Video Communications, we are big fans of their products!!
 
 # How to test?
 
@@ -58,6 +58,19 @@ make up
 make down
 make build
 ```
+
+## 👤 Contributors ✨
+
+<table>
+<tr>
+<td align="center"><a href="https://github.com/darioalessandro"><img src="https://avatars0.githubusercontent.com/u/1176339?s=400&v=4" width="100" alt=""/><br /><sub><b>Dario</b></sub></a></td>
+<td align="center"><a href="https://github.com/JasterV"><img src="https://avatars3.githubusercontent.com/u/49537445?v=4" width="100" alt=""/><br /><sub><b>Victor Martínez</b></sub></a></td>
+</tr>
+</table>
+
+## Show your support
+
+Give a ⭐️ if this project helped you!
 
 # Legal Notice
 

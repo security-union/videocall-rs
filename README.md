@@ -68,6 +68,8 @@ make build
 </tr>
 </table>
 
+The Actix websocket implementation contains fragments from https://github.com/JasterV/chat-rooms-actix in particular the usage of an actor to orchestrate all sessions and rooms.
+
 ## Show your support
 
 Give a ⭐️ if this project helped you!

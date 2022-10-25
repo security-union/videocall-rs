@@ -2,10 +2,9 @@
 
 ![rust](https://user-images.githubusercontent.com/1176339/197537597-2e9147dc-5892-47c9-9a7d-d5b0102800db.png)
 
-
-
 MVP of a teleconferencing system written in rust, both the backend and the UI.
 
+Security Union LLC is not associated with Zoom Video Communications, but we are big fans of their products!!
 
 # How to test?
 
@@ -50,3 +49,9 @@ make up
 make down
 make build
 ```
+
+# Legal Notice
+
+ZOOM is a trademark of Zoom Video Communications, Inc.
+
+Security Union LLC is not associated with Zoom Video Communications, but we are big fans of their product!!

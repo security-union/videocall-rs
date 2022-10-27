@@ -1,4 +1,3 @@
-pub mod command;
 use actix::Message as ActixMessage;
 use types::protos::rust::media_packet::MediaPacket;
 

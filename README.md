@@ -18,7 +18,8 @@ Technically you could test this with a single computer, but it is more fun if yo
 ## Steps
 
 1. Open chrome://flags on all the computers that you want to use to test the tele-conferencing system, add the ip of the computer that you will use as the server to the Insecure origins treated as secure list.
-<img width="1840" alt="Screen Shot 2022-10-24 at 8 18 15 AM" src="https://user-images.githubusercontent.com/1176339/197534920-6bcc495d-ba14-441a-9ea5-00d3b3b7c738.png">
+<img width="1728" alt="Screen Shot 2022-10-30 at 10 00 43 PM" src="https://user-images.githubusercontent.com/1176339/198916116-e85bd52a-02b3-40ed-9764-d08fd3df8487.png">
+
 
 2. Start the servers on the computer that you intent to use as the server using `make up` (requires docker).
 

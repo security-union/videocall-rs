@@ -64,7 +64,6 @@ impl Component for Host {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Start => {
-                log!("starting...");
                 if self.initialized {
                     log!("Trying to initialize twice!!!");
                     return false;

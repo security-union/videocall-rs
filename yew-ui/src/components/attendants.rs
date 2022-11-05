@@ -35,6 +35,13 @@ pub enum WsAction {
     Lost,
 }
 
+#[derive(Clone, Copy)]
+enum State {
+    Created,
+    Connected,
+    Disconnected,
+}
+
 pub enum Msg {
     WsAction(WsAction),
     OnInboundMedia(MediaPacketWrapper),
@@ -45,6 +52,55 @@ pub enum Msg {
 impl From<WsAction> for Msg {
     fn from(action: WsAction) -> Self {
         Msg::WsAction(action)
+    }
+}
+
+pub struct ClientSubscription {
+    pub video_decoder: VideoDecoder,
+    pub audio_output: Box<dyn FnMut(AudioData)>,
+    pub waiting_for_video_keyframe: bool,
+    pub waiting_for_audio_keyframe: bool,
+}
+
+impl ClientSubscription {
+    fn handle_media_packet(&mut self, packet: MediaPacket) {
+        match packet.media_type.enum_value() {
+            Ok(media_packet::MediaType::VIDEO) => {
+                let video_data =
+                    Uint8Array::new_with_length(packet.video.len().try_into().unwrap());
+                let chunk_type = EncodedVideoChunkTypeWrapper::from(packet.video_type).0;
+                video_data.copy_from(&packet.video.into_boxed_slice());
+                let mut video_chunk =
+                    EncodedVideoChunkInit::new(&video_data, packet.timestamp, chunk_type);
+                video_chunk.duration(packet.duration);
+                let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
+                if self.waiting_for_video_keyframe && chunk_type == EncodedVideoChunkType::Key
+                    || !self.waiting_for_video_keyframe
+                {
+                    self.video_decoder.decode(&encoded_video_chunk);
+                    self.waiting_for_video_keyframe = false;
+                }
+            }
+            Ok(media_packet::MediaType::AUDIO) => {
+                let audio_data = packet.audio;
+                let audio_data_js: js_sys::Uint8Array =
+                    js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
+                audio_data_js.copy_from(&audio_data.as_slice());
+
+                let audio_data = AudioData::new(&AudioDataInit::new(
+                    &audio_data_js.into(),
+                    AudioSampleFormatWrapper::from(packet.audio_format).0,
+                    packet.audio_number_of_channels,
+                    packet.audio_number_of_frames,
+                    packet.audio_sample_rate,
+                    packet.timestamp,
+                ))
+                .unwrap();
+                (self.audio_output)(audio_data);
+            }
+            // TODO: Handle unknown Media type
+            Err(_) => (),
+        }
     }
 }
 
@@ -63,16 +119,132 @@ pub struct AttendandsComponentProps {
 pub struct AttendandsComponent {
     pub ws: Option<WebSocketTask>,
     pub media_packet: MediaPacket,
-    pub connected: bool,
+    state: State,
     pub connected_peers: HashMap<String, ClientSubscription>,
     pub outbound_audio_buffer: [u8; 2000],
 }
 
-pub struct ClientSubscription {
-    pub video_decoder: VideoDecoder,
-    pub audio_output: Box<dyn FnMut(AudioData)>,
-    pub waiting_for_video_keyframe: bool,
-    pub waiting_for_audio_keyframe: bool,
+impl AttendandsComponent {
+    fn connect(&mut self, ctx: &Context<Self>) {
+        let callback = ctx.link().callback(|data| Msg::OnInboundMedia(data));
+        let notification = ctx.link().batch_callback(|status| match status {
+            WebSocketStatus::Opened => Some(WsAction::Connected.into()),
+            WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost.into()),
+        });
+        let meeting_id = ctx.props().id.clone();
+        let email = ctx.props().email.clone();
+        let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, meeting_id);
+        let task = WebSocketService::connect(&url, callback, notification).unwrap();
+        self.ws = Some(task);
+    }
+
+    fn disconnect(&mut self) {
+        self.ws.take();
+        self.state = State::Disconnected;
+    }
+
+    fn send_video_packet(&mut self, packet: MediaPacket) {
+        if let Some(ws) = self.ws.as_mut() {
+            let bytes = packet.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
+            ws.send_binary(bytes);
+        }
+    }
+
+    fn send_audio_packet(&mut self, ctx: &Context<Self>, audio_frame: AudioData) {
+        if let Some(ws) = self.ws.as_mut() {
+            let mut buffer = self.outbound_audio_buffer;
+            let email = ctx.props().email.clone();
+            let packet = transform_audio_chunk(&audio_frame, &mut buffer, &email);
+            let bytes = packet.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
+            ws.send_binary(bytes);
+            audio_frame.close();
+        }
+    }
+
+    fn peer_connected(&self, peer_email: &str) -> bool {
+        self.connected_peers.contains_key(peer_email)
+    }
+
+    fn get_peer_mut(&mut self, peer_email: &str) -> Option<&mut ClientSubscription> {
+        self.connected_peers.get_mut(peer_email)
+    }
+
+    fn register_peer(&mut self, packet: MediaPacket) {
+        let peer_email = packet.email.clone();
+        let audio_output = {
+            let audio_stream_generator =
+                MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new(&"audio"))
+                    .unwrap();
+            // The audio context is used to reproduce audio.
+            let _audio_context = configure_audio_context(&audio_stream_generator);
+            Box::new(move |audio_data: AudioData| {
+                let writable = audio_stream_generator.writable();
+                if writable.locked() {
+                    return;
+                }
+                writable.get_writer().map_or_else(
+                    |e| log!("error", e),
+                    |writer| {
+                        wasm_bindgen_futures::spawn_local(async move {
+                            JsFuture::from(writer.ready())
+                                .await
+                                .map_or((), |e| log!("write chunk error ", e));
+
+                            JsFuture::from(writer.write_with_chunk(&audio_data))
+                                .await
+                                .map_or((), |e| log!("write chunk error ", e));
+                            writer.release_lock();
+                        });
+                    },
+                );
+            }) as Box<dyn FnMut(AudioData)>
+        };
+        let error_video = Closure::wrap(Box::new(move |e: JsValue| {
+            log!(&e);
+        }) as Box<dyn FnMut(JsValue)>);
+        let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
+            let chunk = Box::new(original_chunk);
+            let video_chunk = chunk.unchecked_into::<VideoFrame>();
+            let width = video_chunk.coded_width();
+            let height = video_chunk.coded_height();
+            let render_canvas = window()
+                .unwrap()
+                .document()
+                .unwrap()
+                .get_element_by_id(&peer_email.clone())
+                .unwrap()
+                .unchecked_into::<HtmlCanvasElement>();
+            render_canvas.set_width(width as u32);
+            render_canvas.set_height(height as u32);
+            let ctx = render_canvas
+                .get_context("2d")
+                .unwrap()
+                .unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
+            if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
+                log!("error ", e);
+            }
+        }) as Box<dyn FnMut(JsValue)>);
+        let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
+            error_video.as_ref().unchecked_ref(),
+            video_output.as_ref().unchecked_ref(),
+        ))
+        .unwrap();
+        video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
+
+        self.connected_peers.insert(
+            packet.email.clone(),
+            ClientSubscription {
+                video_decoder,
+                audio_output,
+                waiting_for_video_keyframe: true,
+                waiting_for_audio_keyframe: true,
+            },
+        );
+        video_output.forget();
+        error_video.forget();
+    }
 }
 
 impl Component for AttendandsComponent {
@@ -83,7 +255,7 @@ impl Component for AttendandsComponent {
         let connected_peers: HashMap<String, ClientSubscription> = HashMap::new();
         Self {
             ws: None,
-            connected: false,
+            state: State::Created,
             media_packet: MediaPacket::default(),
             connected_peers,
             outbound_audio_buffer: [0; 2000],
@@ -91,195 +263,50 @@ impl Component for AttendandsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        match msg {
-            Msg::WsAction(action) => match action {
+        match (self.state, msg) {
+            (_, Msg::WsAction(action)) => match action {
                 WsAction::Connect => {
-                    let callback = ctx.link().callback(|data| Msg::OnInboundMedia(data));
-                    let notification = ctx.link().batch_callback(|status| match status {
-                        WebSocketStatus::Opened => Some(WsAction::Connected.into()),
-                        WebSocketStatus::Closed | WebSocketStatus::Error => {
-                            Some(WsAction::Lost.into())
-                        }
-                    });
-                    let meeting_id = ctx.props().id.clone();
-                    let email = ctx.props().email.clone();
-                    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, meeting_id);
-                    let task = WebSocketService::connect(&url, callback, notification).unwrap();
-                    self.ws = Some(task);
+                    self.connect(ctx);
                     true
                 }
                 WsAction::Disconnect => {
-                    log!("Disconnect");
-                    self.ws.take();
-                    self.connected = false;
+                    self.disconnect();
                     true
                 }
                 WsAction::Connected => {
-                    log!("Connected");
-                    self.connected = true;
+                    self.state = State::Connected;
                     true
                 }
                 WsAction::Lost => {
-                    log!("Lost");
-                    self.ws = None;
-                    self.connected = false;
+                    self.disconnect();
                     false
                 }
             },
-            Msg::OnInboundMedia(response) => {
-                let data = response.0;
-                let email = data.email.clone();
-                if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
-                    match data.media_type.unwrap() {
-                        media_packet::MediaType::VIDEO => {
-                            let video_data =
-                                Uint8Array::new_with_length(data.video.len().try_into().unwrap());
-                            let chunk_type = EncodedVideoChunkTypeWrapper::from(data.video_type).0;
-                            video_data.copy_from(&data.video.into_boxed_slice());
-                            let mut video_chunk =
-                                EncodedVideoChunkInit::new(&video_data, data.timestamp, chunk_type);
-                            video_chunk.duration(data.duration);
-                            let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
-                            if peer.waiting_for_video_keyframe
-                                && chunk_type == EncodedVideoChunkType::Key
-                                || !peer.waiting_for_video_keyframe
-                            {
-                                peer.video_decoder.decode(&encoded_video_chunk);
-                                peer.waiting_for_video_keyframe = false;
-                            }
-                        }
-                        media_packet::MediaType::AUDIO => {
-                            let audio_data = data.audio;
-                            let audio_data_js: js_sys::Uint8Array =
-                                js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
-                            audio_data_js.copy_from(&audio_data.as_slice());
-
-                            let audio_data = AudioData::new(&AudioDataInit::new(
-                                &audio_data_js.into(),
-                                AudioSampleFormatWrapper::from(data.audio_format).0,
-                                data.audio_number_of_channels,
-                                data.audio_number_of_frames,
-                                data.audio_sample_rate,
-                                data.timestamp,
-                            ))
-                            .unwrap();
-                            (peer.audio_output)(audio_data);
-                        }
-                    }
-                    false
-                } else {
-                    let error_video = Closure::wrap(Box::new(move |e: JsValue| {
-                        log!(&e);
-                    })
-                        as Box<dyn FnMut(JsValue)>);
-                    let error_audio = Closure::wrap(Box::new(move |e: JsValue| {
-                        log!(&e);
-                    })
-                        as Box<dyn FnMut(JsValue)>);
-
-                    let audio_output = {
-                        let audio_stream_generator = MediaStreamTrackGenerator::new(
-                            &MediaStreamTrackGeneratorInit::new(&"audio"),
-                        )
-                        .unwrap();
-                        // The audio context is used to reproduce audio.
-                        let _audio_context = configure_audio_context(&audio_stream_generator);
-                        Box::new(move |audio_data: AudioData| {
-                            let writable = audio_stream_generator.writable();
-                            if writable.locked() {
-                                return;
-                            }
-                            if let Err(e) = writable.get_writer().map(|writer| {
-                                wasm_bindgen_futures::spawn_local(async move {
-                                    if let Err(e) = JsFuture::from(writer.ready()).await {
-                                        log!("write chunk error ", e);
-                                    }
-                                    if let Err(e) =
-                                        JsFuture::from(writer.write_with_chunk(&audio_data)).await
-                                    {
-                                        log!("write chunk error ", e);
-                                    };
-                                    writer.release_lock();
-                                });
-                            }) {
-                                log!("error", e);
-                            }
-                        }) as Box<dyn FnMut(AudioData)>
-                    };
-                    let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
-                        let chunk = Box::new(original_chunk);
-                        let video_chunk = chunk.unchecked_into::<VideoFrame>();
-                        let width = video_chunk.coded_width();
-                        let height = video_chunk.coded_height();
-                        let render_canvas = window()
-                            .unwrap()
-                            .document()
-                            .unwrap()
-                            .get_element_by_id(&email.clone())
-                            .unwrap()
-                            .unchecked_into::<HtmlCanvasElement>();
-                        render_canvas.set_width(width as u32);
-                        render_canvas.set_height(height as u32);
-                        let ctx = render_canvas
-                            .get_context("2d")
-                            .unwrap()
-                            .unwrap()
-                            .unchecked_into::<CanvasRenderingContext2d>();
-                        let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
-                        if let Err(e) =
-                            ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0)
-                        {
-                            log!("error ", e);
-                        }
-                        video_chunk.unchecked_into::<VideoFrame>().close();
-                    })
-                        as Box<dyn FnMut(JsValue)>);
-                    let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
-                        error_video.as_ref().unchecked_ref(),
-                        video_output.as_ref().unchecked_ref(),
-                    ))
-                    .unwrap();
-                    video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
-
-                    self.connected_peers.insert(
-                        data.email.clone(),
-                        ClientSubscription {
-                            video_decoder,
-                            audio_output,
-                            waiting_for_video_keyframe: true,
-                            waiting_for_audio_keyframe: true,
-                        },
-                    );
-                    error_audio.forget();
-                    error_video.forget();
-                    video_output.forget();
-                    true
+            (State::Connected, Msg::OnInboundMedia(response)) => {
+                let packet = response.0;
+                let peer_email = packet.email.clone();
+                if !self.peer_connected(&peer_email) {
+                    self.register_peer(packet);
+                    return true;
                 }
-            }
-            Msg::OnOutboundVideoPacket(media) => {
-                if let Some(ws) = self.ws.as_mut() {
-                    if self.connected {
-                        let bytes = media.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
-                        ws.send_binary(bytes);
-                    }
-                }
+                let peer = self.get_peer_mut(&peer_email).unwrap();
+                peer.handle_media_packet(packet);
                 false
             }
-            Msg::OnOutboundAudioPacket(audio_frame) => {
-                if let Some(ws) = self.ws.as_mut() {
-                    if self.connected {
-                        let mut buffer = self.outbound_audio_buffer;
-                        let email = ctx.props().email.clone();
-                        let packet = transform_audio_chunk(&audio_frame, &mut buffer, &email);
-                        if self.connected {
-                            let bytes = packet.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
-                            ws.send_binary(bytes);
-                        }
-                        audio_frame.close();
-                    }
-                }
+            (State::Connected, Msg::OnOutboundVideoPacket(packet)) => {
+                self.send_video_packet(packet);
                 false
             }
+            (State::Connected, Msg::OnOutboundAudioPacket(audio_frame)) => {
+                self.send_audio_packet(ctx, audio_frame);
+                false
+            }
+            (State::Disconnected, Msg::OnInboundMedia(_))
+            | (State::Disconnected, Msg::OnOutboundAudioPacket(_))
+            | (State::Disconnected, Msg::OnOutboundVideoPacket(_))
+            | (State::Created, Msg::OnInboundMedia(_))
+            | (State::Created, Msg::OnOutboundAudioPacket(_))
+            | (State::Created, Msg::OnOutboundVideoPacket(_)) => false,
         }
     }
 

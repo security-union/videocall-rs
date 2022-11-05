@@ -11,8 +11,8 @@ use anyhow::anyhow;
 use gloo_console::log;
 use js_sys::*;
 use protobuf::Message;
-use types::protos::rust::media_packet::media_packet;
-use types::protos::rust::media_packet::MediaPacket;
+use types::protos::media_packet::media_packet;
+use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -126,18 +126,22 @@ impl Component for AttendandsComponent {
                 }
             },
             Msg::OnInboundMedia(response) => {
-                let data = response.0;
-                let email = data.email.clone();
+                let packet = response.0;
+                let email = packet.email.clone();
                 if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
-                    match data.media_type.unwrap() {
+                    match packet.media_type.unwrap() {
                         media_packet::MediaType::VIDEO => {
                             let video_data =
-                                Uint8Array::new_with_length(data.video.len().try_into().unwrap());
-                            let chunk_type = EncodedVideoChunkTypeWrapper::from(data.video_type).0;
-                            video_data.copy_from(&data.video.into_boxed_slice());
-                            let mut video_chunk =
-                                EncodedVideoChunkInit::new(&video_data, data.timestamp, chunk_type);
-                            video_chunk.duration(data.duration);
+                                Uint8Array::new_with_length(packet.data.len().try_into().unwrap());
+                            let chunk_type =
+                                EncodedVideoChunkTypeWrapper::from(packet.frame_type).0;
+                            video_data.copy_from(&packet.data.into_boxed_slice());
+                            let mut video_chunk = EncodedVideoChunkInit::new(
+                                &video_data,
+                                packet.timestamp,
+                                chunk_type,
+                            );
+                            video_chunk.duration(packet.duration);
                             let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
                             if peer.waiting_for_video_keyframe
                                 && chunk_type == EncodedVideoChunkType::Key
@@ -148,18 +152,21 @@ impl Component for AttendandsComponent {
                             }
                         }
                         media_packet::MediaType::AUDIO => {
-                            let audio_data = data.audio;
+                            let audio_data = packet.data;
                             let audio_data_js: js_sys::Uint8Array =
                                 js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
                             audio_data_js.copy_from(&audio_data.as_slice());
 
                             let audio_data = AudioData::new(&AudioDataInit::new(
                                 &audio_data_js.into(),
-                                AudioSampleFormatWrapper::from(data.audio_format).0,
-                                data.audio_number_of_channels,
-                                data.audio_number_of_frames,
-                                data.audio_sample_rate,
-                                data.timestamp,
+                                AudioSampleFormatWrapper::from(
+                                    packet.audio_metadata.audio_format.clone(),
+                                )
+                                .0,
+                                packet.audio_metadata.audio_number_of_channels,
+                                packet.audio_metadata.audio_number_of_frames,
+                                packet.audio_metadata.audio_sample_rate,
+                                packet.timestamp,
                             ))
                             .unwrap();
                             (peer.audio_output)(audio_data);
@@ -241,7 +248,7 @@ impl Component for AttendandsComponent {
                     video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
 
                     self.connected_peers.insert(
-                        data.email.clone(),
+                        packet.email.clone(),
                         ClientSubscription {
                             video_decoder,
                             audio_output,

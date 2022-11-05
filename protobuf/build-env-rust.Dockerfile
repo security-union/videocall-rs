@@ -1,4 +1,3 @@
-# syntax = docker/dockerfile:1.2
 FROM rust:1.62-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ARG USER

@@ -69,7 +69,7 @@ impl Component for Host {
         match msg {
             Msg::Start => {
                 // 1. Query the first device with a camera and a mic attached.
-                // 2. setup streaming 
+                // 2. setup WebCodecs, in particular
                 // 3. send encoded video frames and raw audio to the server.
                 let on_frame = Box::new(ctx.props().on_frame.clone());
                 let on_audio = Box::new(ctx.props().on_audio.clone());
@@ -233,7 +233,7 @@ impl Component for Host {
         }
     }
 
-    fn view(&self, ctx: &Context<Self>) -> Html {
+    fn view(&self, _ctx: &Context<Self>) -> Html {
         html! {
             <video class="self-camera" autoplay=true id="webcam"></video>
         }

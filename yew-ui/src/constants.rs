@@ -1,6 +1,6 @@
 // This is read at compile time, please restart if you change this value.
 pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
-pub static VIDEO_CODEC: &str = "vp09.00.10.08"; // profile 0,level 1.0, bit depth 8, 
+pub static VIDEO_CODEC: &str = "vp09.00.10.08"; // profile 0,level 1.0, bit depth 8,
 
 pub const AUDIO_CHANNELS: u32 = 1u32;
 pub const AUDIO_SAMPLE_RATE: u32 = 48000u32;

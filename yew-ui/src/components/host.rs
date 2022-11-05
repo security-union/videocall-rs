@@ -31,7 +31,6 @@ pub enum Msg {
 }
 
 pub struct Host {
-    pub initialized: bool,
     pub destroy: Arc<AtomicBool>,
 }
 
@@ -56,19 +55,22 @@ impl Component for Host {
 
     fn create(_ctx: &Context<Self>) -> Self {
         Self {
-            initialized: false,
             destroy: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render {
+            ctx.link().send_message(Msg::Start);
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Start => {
-                if self.initialized {
-                    log!("Trying to initialize twice!!!");
-                    return false;
-                }
-                self.initialized = true;
+                // 1. Query the first device with a camera and a mic attached.
+                // 2. setup streaming 
+                // 3. send encoded video frames and raw audio to the server.
                 let on_frame = Box::new(ctx.props().on_frame.clone());
                 let on_audio = Box::new(ctx.props().on_audio.clone());
                 let email = Box::new(ctx.props().email.clone());
@@ -211,6 +213,7 @@ impl Component for Host {
                             }
                             match JsFuture::from(audio_reader.read()).await {
                                 Ok(js_frame) => {
+                                    // TODO: use AudioEncoder as opposed to sending raw audio to the peer.
                                     let audio_frame =
                                         Reflect::get(&js_frame, &JsString::from("value"))
                                             .unwrap()
@@ -231,10 +234,6 @@ impl Component for Host {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        // Initialize component on first render.
-        if !self.initialized {
-            ctx.link().send_message(Msg::Start);
-        }
         html! {
             <video class="self-camera" autoplay=true id="webcam"></video>
         }

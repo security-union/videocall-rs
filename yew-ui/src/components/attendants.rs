@@ -101,9 +101,8 @@ impl Component for AttendandsComponent {
                             Some(WsAction::Lost.into())
                         }
                     });
-                    let meeting_id = ctx.props().id.clone();
-                    let email = ctx.props().email.clone();
-                    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, meeting_id);
+                    let AttendandsComponentProps{id, email, ..} = ctx.props();
+                    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, id);
                     let task = WebSocketService::connect(&url, callback, notification).unwrap();
                     self.ws = Some(task);
                     true

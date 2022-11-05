@@ -21,7 +21,7 @@ enum Route {
     #[at("/login")]
     Login,
     #[at("/meeting/:email/:id")]
-    Meeting { id: String, email: String },
+    Meeting {email: String, id: String },
     #[not_found]
     #[at("/404")]
     NotFound,
@@ -30,9 +30,9 @@ enum Route {
 fn switch(routes: &Route) -> Html {
     match routes {
         Route::Login => html! { <Login/> },
-        Route::Meeting { id, email } => html! {
+        Route::Meeting { email, id,  } => html! {
             <>
-                <AttendandsComponent id={id.clone()} email={email.clone()}/>
+                <AttendandsComponent email={email.clone()} id={id.clone()} />
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },

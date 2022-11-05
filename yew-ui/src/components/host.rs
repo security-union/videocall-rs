@@ -159,7 +159,7 @@ impl Component for Host {
                         VIDEO_WIDTH as u32,
                     );
 
-                    video_encoder_config.bitrate(100000f64);
+                    video_encoder_config.bitrate(100_000f64);
                     video_encoder_config.latency_mode(LatencyMode::Realtime);
                     video_encoder.configure(&video_encoder_config);
 

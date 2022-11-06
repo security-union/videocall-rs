@@ -7,7 +7,7 @@ use std::fmt::Debug;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use types::protos::rust::media_packet::MediaPacket;
+use types::protos::media_packet::MediaPacket;
 use web_sys::*;
 use yew::prelude::*;
 

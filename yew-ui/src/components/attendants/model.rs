@@ -8,7 +8,7 @@ use crate::model::MediaPacketWrapper;
 use anyhow::anyhow;
 use gloo_console::log;
 use protobuf::Message;
-use types::protos::rust::media_packet::MediaPacket;
+use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;

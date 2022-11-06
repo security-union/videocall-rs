@@ -13,7 +13,7 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub(crate) fn handle_media_packet(&mut self, packet: MediaPacket) {
+    pub fn handle_media_packet(&mut self, packet: MediaPacket) {
         match packet.media_type.enum_value() {
             Ok(media_packet::MediaType::VIDEO) => {
                 let video_data =

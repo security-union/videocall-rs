@@ -1,9 +1,9 @@
 use js_sys::Array;
 use protobuf::Message;
 use std::fmt;
-use types::protos::rust::media_packet::{
+use types::protos::media_packet::{
     media_packet::{self, MediaType},
-    MediaPacket,
+    AudioMetadata, MediaPacket,
 };
 use web_sys::*;
 use yew_websocket::websocket::{Binary, Text};
@@ -111,8 +111,8 @@ pub fn transform_video_chunk(
     media_packet.email = *email.clone();
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
-    media_packet.video = buffer[0..byte_length].to_vec();
-    media_packet.video_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
+    media_packet.data = buffer[0..byte_length].to_vec();
+    media_packet.frame_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
     media_packet.media_type = media_packet::MediaType::VIDEO.into();
     media_packet.timestamp = chunk.timestamp();
     if let Some(duration0) = chunk.duration() {
@@ -131,11 +131,14 @@ pub fn transform_audio_chunk(
     let mut packet: MediaPacket = MediaPacket::default();
     packet.email = email.clone();
     packet.media_type = MediaType::AUDIO.into();
-    packet.audio = buffer[0..byte_length].to_vec();
-    packet.audio_format = AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
-    packet.audio_number_of_channels = audio_frame.number_of_channels();
-    packet.audio_number_of_frames = audio_frame.number_of_frames();
-    packet.audio_sample_rate = audio_frame.sample_rate();
+    packet.data = buffer[0..byte_length].to_vec();
+    let mut audio_metadata = AudioMetadata::default();
+    audio_metadata.audio_format =
+        AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
+    audio_metadata.audio_number_of_channels = audio_frame.number_of_channels();
+    audio_metadata.audio_number_of_frames = audio_frame.number_of_frames();
+    audio_metadata.audio_sample_rate = audio_frame.sample_rate();
+    packet.audio_metadata = Some(audio_metadata).into();
     packet
 }
 

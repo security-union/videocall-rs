@@ -23,9 +23,9 @@ impl Peer {
     }
 
     fn handle_video_packet(&mut self, packet: MediaPacket) {
-        let video_data = Uint8Array::new_with_length(packet.video.len().try_into().unwrap());
-        let chunk_type = EncodedVideoChunkTypeWrapper::from(packet.video_type).0;
-        video_data.copy_from(&packet.video.into_boxed_slice());
+        let video_data = Uint8Array::new_with_length(packet.data.len().try_into().unwrap());
+        let chunk_type = EncodedVideoChunkTypeWrapper::from(packet.frame_type).0;
+        video_data.copy_from(&packet.data.into_boxed_slice());
         let mut video_chunk = EncodedVideoChunkInit::new(&video_data, packet.timestamp, chunk_type);
         video_chunk.duration(packet.duration);
         let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
@@ -38,7 +38,7 @@ impl Peer {
     }
 
     fn handle_audio_packet(&mut self, packet: MediaPacket) {
-        let audio_data = packet.audio;
+        let audio_data = packet.data;
         let audio_data_js: js_sys::Uint8Array =
             js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
         audio_data_js.copy_from(&audio_data.as_slice());

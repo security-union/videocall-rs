@@ -49,13 +49,12 @@ impl Component for AttendandsComponent {
                             Some(WsAction::Lost.into())
                         }
                     });
-                    let meeting_id = ctx.props().id.clone();
-                    let email = ctx.props().email.clone();
+                    let AttendandsProps { id, email, .. } = ctx.props();
                     self.model.connect(ConnectArgs {
                         callback,
                         notification,
-                        meeting_id,
-                        email,
+                        meeting_id: id.to_string(),
+                        email: email.to_string(),
                     });
                     true
                 }

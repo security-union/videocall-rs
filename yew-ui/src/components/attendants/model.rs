@@ -63,6 +63,9 @@ impl Model {
     }
 
     pub fn connect(&mut self, args: ConnectArgs) {
+        if let State::Connected = self.state {
+            return;
+        }
         let url = format!(
             "{}/{}/{}",
             ACTIX_WEBSOCKET.to_string(),
@@ -80,7 +83,9 @@ impl Model {
     }
 
     pub fn connection_succeed(&mut self) {
-        self.state = State::Connected;
+        if let State::Connecting = self.state {
+            self.state = State::Connected;
+        }
     }
 
     pub fn send_video_packet(&mut self, packet: MediaPacket) {

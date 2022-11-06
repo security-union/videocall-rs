@@ -25,17 +25,17 @@ use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
 use crate::model::transform_video_chunk;
 
-pub struct Host;
+pub struct Model;
 
-pub struct InitializationArgs {
+pub struct StartStreamingArgs {
     pub destroy: Arc<AtomicBool>,
     pub on_frame: Box<Callback<MediaPacket>>,
     pub on_audio: Box<Callback<AudioData>>,
     pub email: Box<String>,
 }
 
-impl Host {
-    pub fn initialize(args: InitializationArgs) {
+impl Model {
+    pub fn start(args: StartStreamingArgs) {
         wasm_bindgen_futures::spawn_local(async move {
             Self::start_streaming(
                 args.email,

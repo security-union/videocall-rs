@@ -3,7 +3,7 @@ mod msg;
 mod peer;
 
 use super::host::HostComponent;
-use model::{Attendands, ConnectArgs, State};
+use model::{ConnectArgs, Model, State};
 use msg::{Msg, WsAction};
 use types::protos::rust::media_packet::MediaPacket;
 use web_sys::AudioData;
@@ -25,7 +25,7 @@ pub struct AttendandsProps {
 }
 
 pub struct AttendandsComponent {
-    model: Attendands,
+    model: Model,
 }
 
 impl Component for AttendandsComponent {
@@ -34,12 +34,12 @@ impl Component for AttendandsComponent {
 
     fn create(_ctx: &Context<Self>) -> Self {
         AttendandsComponent {
-            model: Attendands::new(),
+            model: Model::new(),
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        match (self.model.state, msg) {
+        match (self.model.state(), msg) {
             (_, Msg::WsAction(action)) => match action {
                 WsAction::Connect => {
                     let callback = ctx.link().callback(|data| Msg::OnInboundMedia(data));
@@ -97,7 +97,10 @@ impl Component for AttendandsComponent {
             | (State::Disconnected, Msg::OnOutboundVideoPacket(_))
             | (State::Created, Msg::OnInboundMedia(_))
             | (State::Created, Msg::OnOutboundAudioPacket(_))
-            | (State::Created, Msg::OnOutboundVideoPacket(_)) => false,
+            | (State::Created, Msg::OnOutboundVideoPacket(_))
+            | (State::Connecting, Msg::OnInboundMedia(_))
+            | (State::Connecting, Msg::OnOutboundVideoPacket(_))
+            | (State::Connecting, Msg::OnOutboundAudioPacket(_)) => false,
         }
     }
 
@@ -112,7 +115,7 @@ impl Component for AttendandsComponent {
             .callback(|frame: AudioData| Msg::OnOutboundAudioPacket(frame));
         let rows: Vec<VNode> = self
             .model
-            .connected_peers
+            .connected_peers()
             .iter()
             .map(|(key, _value)| {
                 html! {
@@ -123,16 +126,22 @@ impl Component for AttendandsComponent {
                 }
             })
             .collect();
+
+        let connect_btn_disabled = match self.model.state() {
+            State::Connecting | State::Connected => true,
+            State::Created | State::Disconnected => false,
+        };
+
         html! {
             <div class="grid-container">
                 { rows }
                 <nav class="grid-item menu">
                     <div class="controls">
-                        <button disabled={self.model.ws.is_some()}
+                        <button disabled={connect_btn_disabled}
                                 onclick={ctx.link().callback(|_| WsAction::Connect)}>
                             { "Connect" }
                         </button>
-                        <button disabled={self.model.ws.is_none()}
+                        <button disabled={!connect_btn_disabled}
                                 onclick={ctx.link().callback(|_| WsAction::Disconnect)}>
                             { "Close" }
                         </button>

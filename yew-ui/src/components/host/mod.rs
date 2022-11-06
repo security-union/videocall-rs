@@ -1,7 +1,7 @@
 mod model;
 mod msg;
 
-use model::{Host, InitializationArgs};
+use model::{Model, StartStreamingArgs};
 use msg::Msg;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicBool;
@@ -49,7 +49,7 @@ impl Component for HostComponent {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Start => {
-                Host::initialize(InitializationArgs {
+                Model::start(StartStreamingArgs {
                     on_frame: Box::new(ctx.props().on_frame.clone()),
                     on_audio: Box::new(ctx.props().on_audio.clone()),
                     email: Box::new(ctx.props().email.clone()),

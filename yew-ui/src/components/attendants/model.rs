@@ -19,19 +19,21 @@ use super::peer::Peer;
 use web_sys::*;
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
 
+type PeerMap = HashMap<String, Peer>;
+
 #[derive(Clone, Copy)]
 pub enum State {
     Created,
+    Connecting,
     Connected,
     Disconnected,
 }
 
-pub struct Attendands {
-    pub ws: Option<WebSocketTask>,
-    pub media_packet: MediaPacket,
-    pub state: State,
-    pub connected_peers: HashMap<String, Peer>,
-    pub outbound_audio_buffer: [u8; 2000],
+pub struct Model {
+    ws: Option<WebSocketTask>,
+    state: State,
+    connected_peers: PeerMap,
+    outbound_audio_buffer: [u8; 2000],
 }
 
 pub struct ConnectArgs {
@@ -41,16 +43,23 @@ pub struct ConnectArgs {
     pub email: String,
 }
 
-impl Attendands {
+impl Model {
     pub fn new() -> Self {
-        let connected_peers: HashMap<String, Peer> = HashMap::new();
+        let connected_peers: PeerMap = HashMap::new();
         Self {
             ws: None,
             state: State::Created,
-            media_packet: MediaPacket::default(),
             connected_peers,
             outbound_audio_buffer: [0; 2000],
         }
+    }
+
+    pub fn connected_peers(&self) -> &PeerMap {
+        &self.connected_peers
+    }
+
+    pub fn state(&self) -> State {
+        self.state
     }
 
     pub fn connect(&mut self, args: ConnectArgs) {
@@ -62,6 +71,7 @@ impl Attendands {
         );
         let task = WebSocketService::connect(&url, args.callback, args.notification).unwrap();
         self.ws = Some(task);
+        self.state = State::Connecting;
     }
 
     pub fn disconnect(&mut self) {

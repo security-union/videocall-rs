@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-
+use super::peer::Peer;
 use crate::constants::ACTIX_WEBSOCKET;
 use crate::constants::VIDEO_CODEC;
 use crate::model::configure_audio_context;
@@ -8,15 +7,14 @@ use crate::model::MediaPacketWrapper;
 use anyhow::anyhow;
 use gloo_console::log;
 use protobuf::Message;
-use types::protos::rust::media_packet::MediaPacket;
+use std::collections::HashMap;
+use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
-use yew::Callback;
-
-use super::peer::Peer;
 use web_sys::*;
+use yew::Callback;
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
 
 type PeerMap = HashMap<String, Peer>;

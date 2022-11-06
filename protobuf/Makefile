@@ -21,6 +21,7 @@ build/rust:
 .PHONY: generate_rust
 generate_rust: build/rust
 	protoc --rust_out=build/rust types/*.proto
+
 .PHONY: build-env-rust
 build-env-rust:
 	# We don't tag so that we can use generate `latest` tag which makes
@@ -29,4 +30,9 @@ build-env-rust:
 
 build-env-generate-rust:
 	$(DOCKER_RUN_RUST_CMD) make generate_rust
-	mv build/rust/* ../types/src/protos/rust/
+	mv build/rust/* ../types/src/protos
+
+.PHONY: build
+build:
+	make build-env-rust
+	make build-env-generate-rust

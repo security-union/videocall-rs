@@ -1,5 +1,5 @@
 use crate::model::MediaPacketWrapper;
-use types::protos::rust::media_packet::MediaPacket;
+use types::protos::media_packet::MediaPacket;
 use web_sys::AudioData;
 
 // This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview

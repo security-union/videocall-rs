@@ -7,13 +7,16 @@ message MediaPacket {
   }
   MediaType media_type = 1;
   string email = 2;
-  bytes video = 3;
-  bytes audio = 4;
-  string video_type = 5;
-  double timestamp = 6;
-  double duration = 7;
-  string audio_format = 8;
-  uint32 audio_number_of_channels = 9;
-  uint32 audio_number_of_frames = 10;
-  float audio_sample_rate = 11;
+  bytes data = 3;
+  string frame_type = 4;
+  double timestamp = 5;
+  double duration = 6;
+  AudioMetadata audio_metadata = 7;
+}
+
+message AudioMetadata {
+  string audio_format = 1;
+  uint32 audio_number_of_channels = 2;
+  uint32 audio_number_of_frames = 3;
+  float audio_sample_rate = 4;
 }

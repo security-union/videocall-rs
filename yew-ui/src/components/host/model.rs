@@ -9,7 +9,7 @@ use std::future::join;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use types::protos::rust::media_packet::MediaPacket;
+use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -53,6 +53,8 @@ impl Model {
         on_frame: Box<Callback<MediaPacket>>,
         destroy: Arc<AtomicBool>,
     ) {
+        // 1. setup WebCodecs, in particular
+        // 2. send encoded video frames to the server.
         let mut buffer: [u8; 300000] = [0; 300000];
         let video_output_handler = Box::new(move |chunk: JsValue| {
             let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -96,7 +98,7 @@ impl Model {
         let mut video_encoder_config =
             VideoEncoderConfig::new(&VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
 
-        video_encoder_config.bitrate(100000f64);
+        video_encoder_config.bitrate(100_000f64);
         video_encoder_config.latency_mode(LatencyMode::Realtime);
         video_encoder.configure(&video_encoder_config);
 
@@ -146,6 +148,8 @@ impl Model {
         on_audio: Box<Callback<AudioData>>,
         destroy: Arc<AtomicBool>,
     ) {
+        // 1. setup WebCodecs, in particular
+        // 2. send raw audio to the server.
         let audio_track = Box::new(
             device
                 .get_audio_tracks()
@@ -167,6 +171,7 @@ impl Model {
             }
             match JsFuture::from(audio_reader.read()).await {
                 Ok(js_frame) => {
+                    // TODO: use AudioEncoder as opposed to sending raw audio to the peer.
                     let audio_frame = Reflect::get(&js_frame, &JsString::from("value"))
                         .unwrap()
                         .unchecked_into::<AudioData>();
@@ -201,6 +206,7 @@ impl Model {
         on_audio: Box<Callback<AudioData>>,
         destroy: Arc<AtomicBool>,
     ) {
+        // Query the first device with a camera and a mic attached.
         let device = Self::get_device().await;
         join!(
             Self::start_video(email, device.clone(), on_frame, destroy.clone()),

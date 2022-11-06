@@ -5,7 +5,7 @@ mod peer;
 use super::host::HostComponent;
 use model::{ConnectArgs, Model, State};
 use msg::{Msg, WsAction};
-use types::protos::rust::media_packet::MediaPacket;
+use types::protos::media_packet::MediaPacket;
 use web_sys::AudioData;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;

@@ -109,6 +109,7 @@ impl Model {
     }
 
     pub fn register_peer(&mut self, packet: MediaPacket) {
+        // TODO: This method is too long, most of the logic could be moved to the Peer
         let peer_email = packet.email.clone();
         let audio_output = {
             let audio_stream_generator =

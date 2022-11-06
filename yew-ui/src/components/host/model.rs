@@ -5,7 +5,6 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 
-use std::fmt::Debug;
 use std::future::join;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -26,36 +25,28 @@ use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
 use crate::model::transform_video_chunk;
 
-pub enum Msg {
-    Start,
-}
+pub struct Host;
 
-enum State {
-    Created,
-    Initialized,
-}
-
-pub struct Host {
-    state: State,
+pub struct InitializationArgs {
     pub destroy: Arc<AtomicBool>,
-}
-
-#[derive(Properties, Debug, PartialEq)]
-pub struct MeetingProps {
-    #[prop_or_default]
-    pub id: String,
-
-    #[prop_or_default]
-    pub on_frame: Callback<MediaPacket>,
-
-    #[prop_or_default]
-    pub on_audio: Callback<AudioData>,
-
-    #[prop_or_default]
-    pub email: String,
+    pub on_frame: Box<Callback<MediaPacket>>,
+    pub on_audio: Box<Callback<AudioData>>,
+    pub email: Box<String>,
 }
 
 impl Host {
+    pub fn initialize(args: InitializationArgs) {
+        wasm_bindgen_futures::spawn_local(async move {
+            Self::start_streaming(
+                args.email,
+                args.on_frame,
+                args.on_audio,
+                args.destroy.clone(),
+            )
+            .await;
+        });
+    }
+
     async fn start_video(
         email: Box<String>,
         device: MediaStream,
@@ -216,53 +207,5 @@ impl Host {
             Self::start_audio(device, on_audio, destroy)
         )
         .await;
-    }
-
-    fn initialize(&mut self, ctx: &Context<Self>) {
-        self.state = State::Initialized;
-        let on_frame = Box::new(ctx.props().on_frame.clone());
-        let on_audio = Box::new(ctx.props().on_audio.clone());
-        let email = Box::new(ctx.props().email.clone());
-        let destroy = self.destroy.clone();
-
-        wasm_bindgen_futures::spawn_local(async move {
-            Self::start_streaming(email, on_frame, on_audio, destroy).await;
-        });
-    }
-}
-
-impl Component for Host {
-    type Message = Msg;
-    type Properties = MeetingProps;
-
-    fn create(_ctx: &Context<Self>) -> Self {
-        Self {
-            state: State::Created,
-            destroy: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        match (&self.state, msg) {
-            (&State::Initialized, Msg::Start) => false,
-            (&State::Created, Msg::Start) => {
-                self.initialize(ctx);
-                true
-            }
-        }
-    }
-
-    fn view(&self, ctx: &Context<Self>) -> Html {
-        // Initialize component on first render.
-        if let State::Created = self.state {
-            ctx.link().send_message(Msg::Start);
-        }
-        html! {
-            <video class="self-camera" autoplay=true id="webcam"></video>
-        }
-    }
-
-    fn destroy(&mut self, _ctx: &Context<Self>) {
-        self.destroy.store(true, Ordering::Release);
     }
 }

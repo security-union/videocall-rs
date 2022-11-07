@@ -29,9 +29,9 @@ pub struct Model;
 
 pub struct StartStreamingArgs {
     pub destroy: Arc<AtomicBool>,
-    pub on_frame: Box<Callback<MediaPacket>>,
-    pub on_audio: Box<Callback<AudioData>>,
-    pub email: Box<String>,
+    pub on_frame: Callback<MediaPacket>,
+    pub on_audio: Callback<AudioData>,
+    pub email: String,
 }
 
 impl Model {
@@ -47,79 +47,56 @@ impl Model {
         });
     }
 
+    async fn start_streaming(
+        email: String,
+        on_frame: Callback<MediaPacket>,
+        on_audio: Callback<AudioData>,
+        destroy: Arc<AtomicBool>,
+    ) {
+        // Query the first device with a camera and a mic attached.
+        let device = Self::get_device().await;
+        let video_encoder = Self::get_video_encoder(email, on_frame);
+        let video_reader = Self::get_video_reader(device.clone());
+        Self::bind_device_to_video_element("webcam", device.clone());
+        let audio_reader = Self::get_audio_reader(device);
+        let poll_video = Self::start_video(video_encoder, video_reader, destroy.clone());
+        let poll_audio = Self::start_audio(audio_reader, on_audio, destroy);
+        join!(poll_video, poll_audio).await;
+    }
+
+    async fn start_audio(
+        audio_reader: ReadableStreamDefaultReader,
+        on_audio: Callback<AudioData>,
+        destroy: Arc<AtomicBool>,
+    ) {
+        // 1. setup WebCodecs, in particular
+        // 2. send raw audio to the server.
+        loop {
+            if destroy.load(Ordering::Acquire) {
+                return;
+            }
+            match JsFuture::from(audio_reader.read()).await {
+                Ok(js_frame) => {
+                    // TODO: use AudioEncoder as opposed to sending raw audio to the peer.
+                    let audio_frame = Reflect::get(&js_frame, &JsString::from("value"))
+                        .unwrap()
+                        .unchecked_into::<AudioData>();
+                    on_audio.emit(audio_frame);
+                }
+                Err(e) => {
+                    log!("error", e);
+                }
+            }
+        }
+    }
+
     async fn start_video(
-        email: Box<String>,
-        device: MediaStream,
-        on_frame: Box<Callback<MediaPacket>>,
+        video_encoder: VideoEncoder,
+        video_reader: ReadableStreamDefaultReader,
         destroy: Arc<AtomicBool>,
     ) {
         // 1. setup WebCodecs, in particular
         // 2. send encoded video frames to the server.
-        let mut buffer: [u8; 300000] = [0; 300000];
-        let video_output_handler = Box::new(move |chunk: JsValue| {
-            let chunk = web_sys::EncodedVideoChunk::from(chunk);
-            let media_packet: MediaPacket =
-                transform_video_chunk(chunk, &mut buffer, email.clone());
-            on_frame.emit(media_packet);
-        });
-        let video_track = Box::new(
-            device
-                .get_video_tracks()
-                .find(&mut |_: JsValue, _: u32, _: Array| true)
-                .unchecked_into::<VideoTrack>(),
-        );
-        let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-            log!("error_handler error", e);
-        }) as Box<dyn FnMut(JsValue)>);
-
-        let video_output_handler = Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue)>);
-
-        let video_encoder_init = VideoEncoderInit::new(
-            video_error_handler.as_ref().unchecked_ref(),
-            video_output_handler.as_ref().unchecked_ref(),
-        );
-
-        let video_encoder = Box::new(VideoEncoder::new(&video_encoder_init).unwrap());
-        let settings = &mut video_track
-            .clone()
-            .unchecked_into::<MediaStreamTrack>()
-            .get_settings();
-        settings.width(VIDEO_WIDTH);
-        settings.height(VIDEO_HEIGHT);
-        if let Err(e) = js_sys::Reflect::set(
-            settings.as_ref(),
-            &JsValue::from("sampleRate"),
-            &JsValue::from(AUDIO_SAMPLE_RATE),
-        ) {
-            log!("error", e);
-        }
-        settings.channel_count(AUDIO_CHANNELS as i32);
-
-        let mut video_encoder_config =
-            VideoEncoderConfig::new(&VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
-
-        video_encoder_config.bitrate(100_000f64);
-        video_encoder_config.latency_mode(LatencyMode::Realtime);
-        video_encoder.configure(&video_encoder_config);
-
-        let processor = MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
-            &video_track.unchecked_into::<MediaStreamTrack>(),
-        ))
-        .unwrap();
-        let video_reader = processor
-            .readable()
-            .get_reader()
-            .unchecked_into::<ReadableStreamDefaultReader>();
-
-        let video_element = window()
-            .document()
-            .unwrap()
-            .get_element_by_id("webcam")
-            .unwrap()
-            .unchecked_into::<HtmlVideoElement>();
-        video_element.set_src_object(Some(&device));
-        video_element.set_muted(true);
-
         let mut counter = 0;
         loop {
             if destroy.load(Ordering::Acquire) {
@@ -143,13 +120,69 @@ impl Model {
         }
     }
 
-    async fn start_audio(
-        device: MediaStream,
-        on_audio: Box<Callback<AudioData>>,
-        destroy: Arc<AtomicBool>,
-    ) {
-        // 1. setup WebCodecs, in particular
-        // 2. send raw audio to the server.
+    fn get_video_encoder(email: String, on_frame: Callback<MediaPacket>) -> VideoEncoder {
+        let mut buffer: [u8; 300000] = [0; 300000];
+        let video_output_handler = Box::new(move |chunk: JsValue| {
+            let chunk = web_sys::EncodedVideoChunk::from(chunk);
+            let media_packet: MediaPacket =
+                transform_video_chunk(chunk, &mut buffer, email.clone());
+            on_frame.emit(media_packet);
+        });
+        let video_output_handler = Closure::wrap(video_output_handler as Box<dyn FnMut(JsValue)>);
+        let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
+            log!("error_handler error", e);
+        }) as Box<dyn FnMut(JsValue)>);
+        let video_encoder_init = VideoEncoderInit::new(
+            video_error_handler.as_ref().unchecked_ref(),
+            video_output_handler.as_ref().unchecked_ref(),
+        );
+
+        let mut video_encoder_config =
+            VideoEncoderConfig::new(&VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
+
+        video_encoder_config.bitrate(100_000f64);
+        video_encoder_config.latency_mode(LatencyMode::Realtime);
+
+        let video_encoder = VideoEncoder::new(&video_encoder_init).unwrap();
+        video_encoder.configure(&video_encoder_config);
+        video_encoder
+    }
+
+    fn get_video_reader(device: MediaStream) -> ReadableStreamDefaultReader {
+        let video_track = Box::new(
+            device
+                .get_video_tracks()
+                .find(&mut |_: JsValue, _: u32, _: Array| true)
+                .unchecked_into::<VideoTrack>(),
+        );
+
+        let settings = &mut video_track
+            .clone()
+            .unchecked_into::<MediaStreamTrack>()
+            .get_settings();
+        settings.width(VIDEO_WIDTH);
+        settings.height(VIDEO_HEIGHT);
+        if let Err(e) = js_sys::Reflect::set(
+            settings.as_ref(),
+            &JsValue::from("sampleRate"),
+            &JsValue::from(AUDIO_SAMPLE_RATE),
+        ) {
+            log!("error", e);
+        }
+        settings.channel_count(AUDIO_CHANNELS as i32);
+
+        let processor = MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+            &video_track.unchecked_into::<MediaStreamTrack>(),
+        ))
+        .unwrap();
+        let video_reader = processor
+            .readable()
+            .get_reader()
+            .unchecked_into::<ReadableStreamDefaultReader>();
+        video_reader
+    }
+
+    fn get_audio_reader(device: MediaStream) -> ReadableStreamDefaultReader {
         let audio_track = Box::new(
             device
                 .get_audio_tracks()
@@ -164,24 +197,18 @@ impl Model {
             .readable()
             .get_reader()
             .unchecked_into::<ReadableStreamDefaultReader>();
+        audio_reader
+    }
 
-        loop {
-            if destroy.load(Ordering::Acquire) {
-                return;
-            }
-            match JsFuture::from(audio_reader.read()).await {
-                Ok(js_frame) => {
-                    // TODO: use AudioEncoder as opposed to sending raw audio to the peer.
-                    let audio_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                        .unwrap()
-                        .unchecked_into::<AudioData>();
-                    on_audio.emit(audio_frame);
-                }
-                Err(e) => {
-                    log!("error", e);
-                }
-            }
-        }
+    fn bind_device_to_video_element(element_id: &str, device: MediaStream) {
+        let video_element = window()
+            .document()
+            .unwrap()
+            .get_element_by_id(element_id)
+            .unwrap()
+            .unchecked_into::<HtmlVideoElement>();
+        video_element.set_src_object(Some(&device));
+        video_element.set_muted(true);
     }
 
     async fn get_device() -> MediaStream {
@@ -198,20 +225,5 @@ impl Model {
             .await
             .unwrap()
             .unchecked_into::<MediaStream>()
-    }
-
-    async fn start_streaming(
-        email: Box<String>,
-        on_frame: Box<Callback<MediaPacket>>,
-        on_audio: Box<Callback<AudioData>>,
-        destroy: Arc<AtomicBool>,
-    ) {
-        // Query the first device with a camera and a mic attached.
-        let device = Self::get_device().await;
-        join!(
-            Self::start_video(email, device.clone(), on_frame, destroy.clone()),
-            Self::start_audio(device, on_audio, destroy)
-        )
-        .await;
     }
 }

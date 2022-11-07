@@ -105,10 +105,10 @@ impl fmt::Display for AudioSampleFormatWrapper {
 pub fn transform_video_chunk(
     chunk: EncodedVideoChunk,
     buffer: &mut [u8],
-    email: Box<String>,
+    email: String,
 ) -> MediaPacket {
     let mut media_packet: MediaPacket = MediaPacket::default();
-    media_packet.email = *email.clone();
+    media_packet.email = email;
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
     media_packet.data = buffer[0..byte_length].to_vec();

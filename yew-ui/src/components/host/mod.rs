@@ -50,9 +50,9 @@ impl Component for HostComponent {
         match msg {
             Msg::Start => {
                 Model::start(StartStreamingArgs {
-                    on_frame: Box::new(ctx.props().on_frame.clone()),
-                    on_audio: Box::new(ctx.props().on_audio.clone()),
-                    email: Box::new(ctx.props().email.clone()),
+                    on_frame: (ctx.props().on_frame.clone()),
+                    on_audio: (ctx.props().on_audio.clone()),
+                    email: (ctx.props().email.clone()),
                     destroy: self.destroy.clone(),
                 });
                 true

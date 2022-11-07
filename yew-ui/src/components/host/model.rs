@@ -69,8 +69,6 @@ impl Model {
         on_audio: Callback<AudioData>,
         destroy: Arc<AtomicBool>,
     ) {
-        // 1. setup WebCodecs, in particular
-        // 2. send raw audio to the server.
         loop {
             if destroy.load(Ordering::Acquire) {
                 return;
@@ -95,8 +93,6 @@ impl Model {
         video_reader: ReadableStreamDefaultReader,
         destroy: Arc<AtomicBool>,
     ) {
-        // 1. setup WebCodecs, in particular
-        // 2. send encoded video frames to the server.
         let mut counter = 0;
         loop {
             if destroy.load(Ordering::Acquire) {

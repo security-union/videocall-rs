@@ -54,6 +54,8 @@ impl Model {
         destroy: Arc<AtomicBool>,
     ) {
         // Query the first device with a camera and a mic attached.
+        // TODO: Device selection should be made on the Yew component, here we should receive the device already
+        // configured and binded
         let device = Self::get_device().await;
         let video_encoder = Self::get_video_encoder(email, on_frame);
         let video_reader = Self::get_video_reader(device.clone());

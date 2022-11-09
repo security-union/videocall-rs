@@ -197,7 +197,7 @@ impl Component for Host {
                                     let mut opts = VideoEncoderEncodeOptions::new();
                                     counter = (counter + 1) % 50;
                                     opts.key_frame(counter == 0);
-                                    video_encoder.encode(&video_frame);
+                                    video_encoder.encode_with_options(&video_frame, &opts);
                                     video_frame.close();
                                 }
                                 Err(e) => {

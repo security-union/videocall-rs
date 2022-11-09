@@ -147,8 +147,13 @@ impl Component for AttendandsComponent {
                                 && chunk_type == EncodedVideoChunkType::Key
                                 || !peer.waiting_for_video_keyframe
                             {
-                                peer.video_decoder.decode(&encoded_video_chunk);
-                                peer.waiting_for_video_keyframe = false;
+                                if peer.video_decoder.state() == CodecState::Configured {
+                                    peer.video_decoder.decode(&encoded_video_chunk);
+                                    peer.waiting_for_video_keyframe = false;
+                                } else if peer.video_decoder.state() == CodecState::Closed {
+                                    // Codec crashed, reconfigure it...
+                                    self.connected_peers.remove(&email.clone());
+                                }
                             }
                         }
                         media_packet::MediaType::AUDIO => {

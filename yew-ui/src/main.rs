@@ -9,7 +9,7 @@ use constants::LOGIN_URL;
 use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
-use components::attendants::AttendandsComponent;
+use components::attendants::AttendantsComponent;
 use gloo_console::log;
 use gloo_utils::window;
 use yew_router::prelude::*;
@@ -32,7 +32,7 @@ fn switch(routes: &Route) -> Html {
         Route::Login => html! { <Login/> },
         Route::Meeting { email, id } => html! {
             <>
-                <AttendandsComponent email={email.clone()} id={id.clone()} />
+                <AttendantsComponent email={email.clone()} id={id.clone()} />
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },

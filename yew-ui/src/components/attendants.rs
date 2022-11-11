@@ -49,7 +49,7 @@ impl From<WsAction> for Msg {
 }
 
 #[derive(Properties, Debug, PartialEq)]
-pub struct AttendandsComponentProps {
+pub struct AttendantsComponentProps {
     #[prop_or_default]
     pub id: String,
 
@@ -60,7 +60,7 @@ pub struct AttendandsComponentProps {
     pub email: String,
 }
 
-pub struct AttendandsComponent {
+pub struct AttendantsComponent {
     pub ws: Option<WebSocketTask>,
     pub media_packet: MediaPacket,
     pub connected: bool,
@@ -75,9 +75,9 @@ pub struct ClientSubscription {
     pub waiting_for_audio_keyframe: bool,
 }
 
-impl Component for AttendandsComponent {
+impl Component for AttendantsComponent {
     type Message = Msg;
-    type Properties = AttendandsComponentProps;
+    type Properties = AttendantsComponentProps;
 
     fn create(_ctx: &Context<Self>) -> Self {
         let connected_peers: HashMap<String, ClientSubscription> = HashMap::new();
@@ -101,7 +101,7 @@ impl Component for AttendandsComponent {
                             Some(WsAction::Lost.into())
                         }
                     });
-                    let AttendandsComponentProps { id, email, .. } = ctx.props();
+                    let AttendantsComponentProps { id, email, .. } = ctx.props();
                     let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, id);
                     let task = WebSocketService::connect(&url, callback, notification).unwrap();
                     self.ws = Some(task);

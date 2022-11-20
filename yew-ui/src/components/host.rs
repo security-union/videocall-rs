@@ -47,6 +47,9 @@ pub struct MeetingProps {
 
     #[prop_or_default]
     pub email: String,
+
+    #[prop_or_default]
+    pub share_screen: bool
 }
 
 impl Component for Host {
@@ -68,6 +71,7 @@ impl Component for Host {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Start => {
+                let share_screen = true;//ctx.props().share_screen;
                 // 1. Query the first device with a camera and a mic attached.
                 // 2. setup WebCodecs, in particular
                 // 3. send encoded video frames and raw audio to the server.
@@ -89,7 +93,12 @@ impl Component for Host {
                 let destroy = self.destroy.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
+                    
                     let media_devices = navigator.media_devices().unwrap();
+                    let screen_to_share = JsFuture::from(
+                        media_devices.get_display_media().unwrap()
+                    ).await
+                    .unwrap().unchecked_into::<MediaStream>();
                     let video_element = window()
                         .document()
                         .unwrap()
@@ -115,6 +124,11 @@ impl Component for Host {
                             .get_video_tracks()
                             .find(&mut |_: JsValue, _: u32, _: Array| true)
                             .unchecked_into::<VideoTrack>(),
+                    );
+
+                    let screen_track = Box::new(screen_to_share.get_video_tracks()
+                        .find(&mut |_: JsValue, _: u32, _: Array| true)
+                        .unchecked_into::<VideoTrack>(),
                     );
 
                     let audio_track = Box::new(
@@ -162,6 +176,16 @@ impl Component for Host {
                     video_encoder_config.bitrate(100_000f64);
                     video_encoder_config.latency_mode(LatencyMode::Realtime);
                     video_encoder.configure(&video_encoder_config);
+
+                    let scren_processor =
+                        MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+                            &screen_track.unchecked_into::<MediaStreamTrack>(),
+                        ))
+                        .unwrap();
+                    let screen_reader = scren_processor
+                        .readable()
+                        .get_reader()
+                        .unchecked_into::<ReadableStreamDefaultReader>();
 
                     let processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
@@ -226,7 +250,32 @@ impl Component for Host {
                             }
                         }
                     };
-                    join!(poll_video, poll_audio).await;
+
+                    let poll_screen = async {
+                        loop {
+                            if destroy.load(Ordering::Acquire) {
+                                return;
+                            }
+                            match JsFuture::from(screen_reader.read()).await {
+                                Ok(js_frame) => {
+                                    log!("");
+                                    // let video_frame =
+                                    //     Reflect::get(&js_frame, &JsString::from("value"))
+                                    //         .unwrap()
+                                    //         .unchecked_into::<VideoFrame>();
+                                    // let mut opts = VideoEncoderEncodeOptions::new();
+                                    // counter = (counter + 1) % 50;
+                                    // opts.key_frame(counter == 0);
+                                    // video_encoder.encode_with_options(&video_frame, &opts);
+                                    // video_frame.close();
+                                }
+                                Err(e) => {
+                                    log!("error", e);
+                                }
+                            }
+                        }
+                    };
+                    join!(poll_video, poll_audio, poll_screen).await;
                 });
                 true
             }

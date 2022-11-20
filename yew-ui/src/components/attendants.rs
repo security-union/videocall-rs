@@ -176,6 +176,9 @@ impl Component for AttendantsComponent {
                             .unwrap();
                             (peer.audio_output)(audio_data);
                         }
+                        media_packet::MediaType::SCREEN => {
+                            // TODO: decode screen??
+                        }
                     }
                     false
                 } else {

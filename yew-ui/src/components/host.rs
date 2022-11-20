@@ -24,6 +24,7 @@ use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
+use crate::model::transform_screen_chunk;
 use crate::model::transform_video_chunk;
 
 pub enum Msg {
@@ -78,10 +79,21 @@ impl Component for Host {
                 let on_frame = Box::new(ctx.props().on_frame.clone());
                 let on_audio = Box::new(ctx.props().on_audio.clone());
                 let email = Box::new(ctx.props().email.clone());
+                let screen_output_handler = {
+                    let email = email.clone();
+                    let on_frame = on_frame.clone();
+                    let mut buffer: [u8; 100000] = [0; 100000];
+                    Box::new(move |chunk: JsValue| {
+                        let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                        let media_packet: MediaPacket =
+                            transform_screen_chunk(chunk, &mut buffer, email.clone());
+                        on_frame.emit(media_packet);
+                    })
+                };
                 let video_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
-                    let mut buffer: [u8; 300000] = [0; 300000];
+                    let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
                         let media_packet: MediaPacket =
@@ -138,6 +150,29 @@ impl Component for Host {
                             .unchecked_into::<AudioTrack>(),
                     );
 
+                    let screen_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
+                        log!("error_handler error", e);
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+
+                    let screen_output_handler =
+                        Closure::wrap(screen_output_handler as Box<dyn FnMut(JsValue)>);
+
+                    let screen_encoder_init = VideoEncoderInit::new(
+                        screen_error_handler.as_ref().unchecked_ref(),
+                        screen_output_handler.as_ref().unchecked_ref(),
+                    );
+
+                    let screen_encoder = Box::new(VideoEncoder::new(&screen_encoder_init).unwrap());
+                    let mut screen_encoder_config = VideoEncoderConfig::new(
+                        &VIDEO_CODEC,
+                        VIDEO_HEIGHT as u32,
+                        VIDEO_WIDTH as u32,
+                    );
+                    screen_encoder_config.bitrate(100_000f64);
+                    screen_encoder_config.latency_mode(LatencyMode::Realtime);
+                    screen_encoder.configure(&screen_encoder_config);
+
                     let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
                         log!("error_handler error", e);
                     })
@@ -152,6 +187,7 @@ impl Component for Host {
                     );
 
                     let video_encoder = Box::new(VideoEncoder::new(&video_encoder_init).unwrap());
+                    
                     let settings = &mut video_track
                         .clone()
                         .unchecked_into::<MediaStreamTrack>()
@@ -177,12 +213,12 @@ impl Component for Host {
                     video_encoder_config.latency_mode(LatencyMode::Realtime);
                     video_encoder.configure(&video_encoder_config);
 
-                    let scren_processor =
+                    let screen_processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
                             &screen_track.unchecked_into::<MediaStreamTrack>(),
                         ))
                         .unwrap();
-                    let screen_reader = scren_processor
+                    let screen_reader = screen_processor
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
@@ -206,7 +242,8 @@ impl Component for Host {
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
-                    let mut counter = 0;
+                    let mut video_frame_counter = 0;
+                    let mut screen_frame_counter = 0;
                     let poll_video = async {
                         loop {
                             if destroy.load(Ordering::Acquire) {
@@ -219,8 +256,8 @@ impl Component for Host {
                                             .unwrap()
                                             .unchecked_into::<VideoFrame>();
                                     let mut opts = VideoEncoderEncodeOptions::new();
-                                    counter = (counter + 1) % 50;
-                                    opts.key_frame(counter == 0);
+                                    video_frame_counter = (video_frame_counter + 1) % 50;
+                                    opts.key_frame(video_frame_counter == 0);
                                     video_encoder.encode_with_options(&video_frame, &opts);
                                     video_frame.close();
                                 }
@@ -250,7 +287,6 @@ impl Component for Host {
                             }
                         }
                     };
-
                     let poll_screen = async {
                         loop {
                             if destroy.load(Ordering::Acquire) {
@@ -259,15 +295,15 @@ impl Component for Host {
                             match JsFuture::from(screen_reader.read()).await {
                                 Ok(js_frame) => {
                                     log!("");
-                                    // let video_frame =
-                                    //     Reflect::get(&js_frame, &JsString::from("value"))
-                                    //         .unwrap()
-                                    //         .unchecked_into::<VideoFrame>();
-                                    // let mut opts = VideoEncoderEncodeOptions::new();
-                                    // counter = (counter + 1) % 50;
-                                    // opts.key_frame(counter == 0);
-                                    // video_encoder.encode_with_options(&video_frame, &opts);
-                                    // video_frame.close();
+                                    let video_frame =
+                                        Reflect::get(&js_frame, &JsString::from("value"))
+                                            .unwrap()
+                                            .unchecked_into::<VideoFrame>();
+                                    let mut opts = VideoEncoderEncodeOptions::new();
+                                    screen_frame_counter = (screen_frame_counter + 1) % 50;
+                                    opts.key_frame(screen_frame_counter == 0);
+                                    screen_encoder.encode_with_options(&video_frame, &opts);
+                                    video_frame.close();
                                 }
                                 Err(e) => {
                                     log!("error", e);

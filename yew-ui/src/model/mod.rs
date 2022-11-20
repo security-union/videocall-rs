@@ -121,6 +121,25 @@ pub fn transform_video_chunk(
     media_packet
 }
 
+pub fn transform_screen_chunk(
+    chunk: EncodedVideoChunk,
+    buffer: &mut [u8],
+    email: Box<String>,
+) -> MediaPacket {
+    let mut media_packet: MediaPacket = MediaPacket::default();
+    media_packet.email = *email.clone();
+    let byte_length = chunk.byte_length() as usize;
+    chunk.copy_to_with_u8_array(buffer);
+    media_packet.data = buffer[0..byte_length].to_vec();
+    media_packet.frame_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
+    media_packet.media_type = media_packet::MediaType::SCREEN.into();
+    media_packet.timestamp = chunk.timestamp();
+    if let Some(duration0) = chunk.duration() {
+        media_packet.duration = duration0;
+    }
+    media_packet
+}
+
 pub fn transform_audio_chunk(
     audio_frame: &AudioData,
     buffer: &mut [u8],

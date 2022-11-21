@@ -1,0 +1,32 @@
+on: [pull_request]
+
+name: Lints
+
+env:
+  ACTIX_PORT: 8080
+  TRUNK_SERVE_PORT: 80
+  TRUNK_SERVE_HOST: localhost
+  OAUTH_CLIENT_ID: blah
+  OAUTH_AUTH_URL: blah
+  OAUTH_TOKEN_URL: blah
+  OAUTH_CLIENT_SECRET: blah
+  OAUTH_REDIRECT_URL: http://localhost:8080/login/callback
+  RUST_LOG: info
+  PG_URL: postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+
+jobs:
+  fmt:
+    name: Rust Fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+          components: rustfmt
+      - uses: actions-rs/cargo@v1        
+        with:
+          command: fmt
+          args: --manifest-path ./actix-api/Cargo.toml --all -- --check 

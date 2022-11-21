@@ -35,8 +35,14 @@ pub enum WsAction {
     Lost,
 }
 
+#[derive(Debug)]
+pub enum MeetingAction {
+    ToggleScreenShare,
+}
+
 pub enum Msg {
     WsAction(WsAction),
+    MeetingAction(MeetingAction),
     OnInboundMedia(MediaPacketWrapper),
     OnOutboundVideoPacket(MediaPacket),
     OnOutboundAudioPacket(AudioData),
@@ -45,6 +51,12 @@ pub enum Msg {
 impl From<WsAction> for Msg {
     fn from(action: WsAction) -> Self {
         Msg::WsAction(action)
+    }
+}
+
+impl From<MeetingAction> for Msg {
+    fn from(action: MeetingAction) -> Self {
+        Msg::MeetingAction(action)
     }
 }
 
@@ -66,13 +78,16 @@ pub struct AttendantsComponent {
     pub connected: bool,
     pub connected_peers: HashMap<String, ClientSubscription>,
     pub outbound_audio_buffer: [u8; 2000],
+    pub share_screen: bool,
 }
 
 pub struct ClientSubscription {
     pub video_decoder: VideoDecoder,
+    pub screen_decoder: VideoDecoder,
     pub audio_output: Box<dyn FnMut(AudioData)>,
     pub waiting_for_video_keyframe: bool,
     pub waiting_for_audio_keyframe: bool,
+    pub waiting_for_screen_keyframe: bool,
 }
 
 impl Component for AttendantsComponent {
@@ -87,6 +102,7 @@ impl Component for AttendantsComponent {
             media_packet: MediaPacket::default(),
             connected_peers,
             outbound_audio_buffer: [0; 2000],
+            share_screen: false,
         }
     }
 
@@ -128,6 +144,7 @@ impl Component for AttendantsComponent {
             Msg::OnInboundMedia(response) => {
                 let packet = response.0;
                 let email = packet.email.clone();
+                let screen_canvas_id = { format!("screen-share-{}", &email) };
                 if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
                     match packet.media_type.unwrap() {
                         media_packet::MediaType::VIDEO => {
@@ -177,7 +194,30 @@ impl Component for AttendantsComponent {
                             (peer.audio_output)(audio_data);
                         }
                         media_packet::MediaType::SCREEN => {
-                            // TODO: decode screen??
+                            let video_data =
+                                Uint8Array::new_with_length(packet.data.len().try_into().unwrap());
+                            let chunk_type =
+                                EncodedVideoChunkTypeWrapper::from(packet.frame_type).0;
+                            video_data.copy_from(&packet.data.into_boxed_slice());
+                            let mut video_chunk = EncodedVideoChunkInit::new(
+                                &video_data,
+                                packet.timestamp,
+                                chunk_type,
+                            );
+                            video_chunk.duration(packet.duration);
+                            let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
+                            if peer.waiting_for_screen_keyframe
+                                && chunk_type == EncodedVideoChunkType::Key
+                                || !peer.waiting_for_screen_keyframe
+                            {
+                                if peer.screen_decoder.state() == CodecState::Configured {
+                                    peer.screen_decoder.decode(&encoded_video_chunk);
+                                    peer.waiting_for_screen_keyframe = false;
+                                } else if peer.screen_decoder.state() == CodecState::Closed {
+                                    // Codec crashed, reconfigure it...
+                                    self.connected_peers.remove(&email.clone());
+                                }
+                            }
                         }
                     }
                     false
@@ -254,18 +294,63 @@ impl Component for AttendantsComponent {
                     ))
                     .unwrap();
                     video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
+                    let screen_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
+                        let chunk = Box::new(original_chunk);
+                        let video_chunk = chunk.unchecked_into::<VideoFrame>();
+                        let width = video_chunk.coded_width();
+                        let height = video_chunk.coded_height();
+                        let render_canvas = window()
+                            .unwrap()
+                            .document()
+                            .unwrap()
+                            .get_element_by_id(&screen_canvas_id.clone())
+                            .unwrap()
+                            .unchecked_into::<HtmlCanvasElement>();
+                        render_canvas.set_width(width as u32);
+                        render_canvas.set_height(height as u32);
+                        let ctx = render_canvas
+                            .get_context("2d")
+                            .unwrap()
+                            .unwrap()
+                            .unchecked_into::<CanvasRenderingContext2d>();
+                        let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
+                        if let Err(e) =
+                            ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0)
+                        {
+                            log!("error ", e);
+                        }
+                        video_chunk.unchecked_into::<VideoFrame>().close();
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+
+                    let error_screen = Closure::wrap(Box::new(move |e: JsValue| {
+                        log!(&e);
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+
+                    let screen_decoder = VideoDecoder::new(&VideoDecoderInit::new(
+                        error_screen.as_ref().unchecked_ref(),
+                        screen_output.as_ref().unchecked_ref(),
+                    ))
+                    .unwrap();
+                    screen_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
 
                     self.connected_peers.insert(
                         packet.email.clone(),
                         ClientSubscription {
                             video_decoder,
                             audio_output,
+                            screen_decoder,
                             waiting_for_video_keyframe: true,
                             waiting_for_audio_keyframe: true,
+                            waiting_for_screen_keyframe: true,
                         },
                     );
+                    // TODO: These are leaks, store them into the client instead of leaking!!
                     error_audio.forget();
                     error_video.forget();
+                    error_screen.forget();
+                    screen_output.forget();
                     video_output.forget();
                     true
                 }
@@ -294,6 +379,14 @@ impl Component for AttendantsComponent {
                 }
                 false
             }
+            Msg::MeetingAction(action) => {
+                match action {
+                    MeetingAction::ToggleScreenShare => {
+                        self.share_screen = !self.share_screen;
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -309,12 +402,22 @@ impl Component for AttendantsComponent {
         let rows: Vec<VNode> = self
             .connected_peers
             .iter()
-            .map(|(key, _value)| {
+            .map(|(key, value)| {
                 html! {
-                    <div class="grid-item">
-                        <canvas id={key.clone()}></canvas>
-                        <h4 class="floating-name">{key.clone()}</h4>
-                    </div>
+                    <>
+                        // if !value.waiting_for_screen_keyframe {
+                            <div class="grid-item">
+                                // Canvas for Screen share.
+                                <canvas id={format!("screen-share-{}", &key)}></canvas>
+                                <h4 class="floating-name">{key.clone()}</h4>
+                            </div>
+                        // }
+                        <div class="grid-item">
+                            // One canvas for the User Video
+                            <canvas id={key.clone()}></canvas>
+                            <h4 class="floating-name">{key.clone()}</h4>
+                        </div>
+                    </>
                 }
             })
             .collect();
@@ -323,6 +426,10 @@ impl Component for AttendantsComponent {
                 { rows }
                 <nav class="grid-item menu">
                     <div class="controls">
+                    <button
+                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
+                            { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
+                        </button>
                         <button disabled={self.ws.is_some()}
                                 onclick={ctx.link().callback(|_| WsAction::Connect)}>
                             { "Connect" }
@@ -332,7 +439,7 @@ impl Component for AttendantsComponent {
                             { "Close" }
                         </button>
                     </div>
-                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()}/>
+                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()} share_screen={self.share_screen}/>
                     <h4 class="floating-name">{email}</h4>
                 </nav>
             </div>

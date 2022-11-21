@@ -213,9 +213,11 @@ impl Component for AttendantsComponent {
                                 if peer.screen_decoder.state() == CodecState::Configured {
                                     peer.screen_decoder.decode(&encoded_video_chunk);
                                     peer.waiting_for_screen_keyframe = false;
+                                    return true;
                                 } else if peer.screen_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
                                     self.connected_peers.remove(&email.clone());
+                                    return true;
                                 }
                             }
                         }
@@ -403,15 +405,18 @@ impl Component for AttendantsComponent {
             .connected_peers
             .iter()
             .map(|(key, value)| {
+                let screen_share_css = if value.waiting_for_screen_keyframe {
+                    "grid-item hidden"
+                } else {
+                    "grid-item"
+                };
                 html! {
                     <>
-                        // if !value.waiting_for_screen_keyframe {
-                            <div class="grid-item">
-                                // Canvas for Screen share.
-                                <canvas id={format!("screen-share-{}", &key)}></canvas>
-                                <h4 class="floating-name">{key.clone()}</h4>
-                            </div>
-                        // }
+                        <div class={screen_share_css}>
+                            // Canvas for Screen share.
+                            <canvas id={format!("screen-share-{}", &key)}></canvas>
+                            <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                        </div>
                         <div class="grid-item">
                             // One canvas for the User Video
                             <canvas id={key.clone()}></canvas>

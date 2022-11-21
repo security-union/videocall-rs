@@ -301,7 +301,6 @@ impl Component for Host {
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
                     let mut video_frame_counter = 0;
-                    let mut screen_frame_counter = 0;
                     let poll_video = async {
                         loop {
                             if destroy.load(Ordering::Acquire) {

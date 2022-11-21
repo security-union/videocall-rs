@@ -26,6 +26,10 @@ input {
   position: relative;
 }
 
+.hidden {
+  display: none
+}
+
 canvas {
   width: 100%;
   /* height: 100%; */

@@ -28,7 +28,8 @@ use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask}
 // https://github.com/WebAudio/web-audio-api-v2/issues/133
 
 #[derive(Debug)]
-pub enum WsAction {
+pub enum Action {
+    ToggleShare,
     Connect,
     Connected,
     Disconnect,
@@ -36,15 +37,15 @@ pub enum WsAction {
 }
 
 pub enum Msg {
-    WsAction(WsAction),
+    Action(Action),
     OnInboundMedia(MediaPacketWrapper),
     OnOutboundVideoPacket(MediaPacket),
     OnOutboundAudioPacket(AudioData),
 }
 
-impl From<WsAction> for Msg {
-    fn from(action: WsAction) -> Self {
-        Msg::WsAction(action)
+impl From<Action> for Msg {
+    fn from(action: Action) -> Self {
+        Msg::Action(action)
     }
 }
 
@@ -66,6 +67,7 @@ pub struct AttendantsComponent {
     pub connected: bool,
     pub connected_peers: HashMap<String, ClientSubscription>,
     pub outbound_audio_buffer: [u8; 2000],
+    pub sharing_screen: bool,
 }
 
 pub struct ClientSubscription {
@@ -87,18 +89,19 @@ impl Component for AttendantsComponent {
             media_packet: MediaPacket::default(),
             connected_peers,
             outbound_audio_buffer: [0; 2000],
+            sharing_screen: false
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            Msg::WsAction(action) => match action {
-                WsAction::Connect => {
+            Msg::Action(action) => match action {
+                Action::Connect => {
                     let callback = ctx.link().callback(|data| Msg::OnInboundMedia(data));
                     let notification = ctx.link().batch_callback(|status| match status {
-                        WebSocketStatus::Opened => Some(WsAction::Connected.into()),
+                        WebSocketStatus::Opened => Some(Action::Connected.into()),
                         WebSocketStatus::Closed | WebSocketStatus::Error => {
-                            Some(WsAction::Lost.into())
+                            Some(Action::Lost.into())
                         }
                     });
                     let AttendantsComponentProps { id, email, .. } = ctx.props();
@@ -107,22 +110,26 @@ impl Component for AttendantsComponent {
                     self.ws = Some(task);
                     true
                 }
-                WsAction::Disconnect => {
+                Action::Disconnect => {
                     log!("Disconnect");
                     self.ws.take();
                     self.connected = false;
                     true
                 }
-                WsAction::Connected => {
+                Action::Connected => {
                     log!("Connected");
                     self.connected = true;
                     true
                 }
-                WsAction::Lost => {
+                Action::Lost => {
                     log!("Lost");
                     self.ws = None;
                     self.connected = false;
                     false
+                },
+                Action::ToggleShare => {
+                    self.sharing_screen = !self.sharing_screen;
+                    true
                 }
             },
             Msg::OnInboundMedia(response) => {
@@ -175,6 +182,9 @@ impl Component for AttendantsComponent {
                             ))
                             .unwrap();
                             (peer.audio_output)(audio_data);
+                        }
+                        media_packet::MediaType::SCREEN => {
+                            
                         }
                     }
                     false
@@ -320,16 +330,20 @@ impl Component for AttendantsComponent {
                 { rows }
                 <nav class="grid-item menu">
                     <div class="controls">
+                        <button
+                                onclick={ctx.link().callback(|_| Action::ToggleShare)}>
+                            { if !self.sharing_screen {"Share"} else { "Disable Share"} }
+                        </button>
                         <button disabled={self.ws.is_some()}
-                                onclick={ctx.link().callback(|_| WsAction::Connect)}>
+                                onclick={ctx.link().callback(|_| Action::Connect)}>
                             { "Connect" }
                         </button>
                         <button disabled={self.ws.is_none()}
-                                onclick={ctx.link().callback(|_| WsAction::Disconnect)}>
+                                onclick={ctx.link().callback(|_| Action::Disconnect)}>
                             { "Close" }
                         </button>
                     </div>
-                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()}/>
+                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()} sharing_screen={self.sharing_screen}/>
                     <h4 class="floating-name">{email}</h4>
                 </nav>
             </div>

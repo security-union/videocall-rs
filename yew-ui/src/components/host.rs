@@ -28,10 +28,12 @@ use crate::model::transform_video_chunk;
 
 pub enum Msg {
     Start,
+    StartScreenShare
 }
 
 pub struct Host {
     pub destroy: Arc<AtomicBool>,
+    pub sharing_screen: Arc<AtomicBool>,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -47,6 +49,9 @@ pub struct MeetingProps {
 
     #[prop_or_default]
     pub email: String,
+
+    #[prop_or_default]
+    pub sharing_screen: bool,
 }
 
 impl Component for Host {
@@ -56,10 +61,22 @@ impl Component for Host {
     fn create(_ctx: &Context<Self>) -> Self {
         Self {
             destroy: Arc::new(AtomicBool::new(false)),
+            sharing_screen: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        let local_sharing_screen = self.sharing_screen.load(Ordering::Acquire);
+        log!("local_sharing_screen {}", local_sharing_screen);
+
+        log!("ctx.props().sharing_screen {}", ctx.props().sharing_screen);
+        if ctx.props().sharing_screen && ctx.props().sharing_screen != local_sharing_screen  {
+            log!("start screen sharing...");
+            ctx.link().send_message(Msg::StartScreenShare);
+        }
+        
+        self.sharing_screen.store(ctx.props().sharing_screen, Ordering::Release);
+
         if first_render {
             ctx.link().send_message(Msg::Start);
         }
@@ -67,6 +84,63 @@ impl Component for Host {
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
+            Msg::StartScreenShare => {
+                let destroy = self.destroy.clone();
+                let sharing_screen = self.sharing_screen.clone();
+                let screen_output_handler = {
+                    Box::new(move |chunks: JsValue| {
+                        // send frame to peer.
+                    })
+                };
+                wasm_bindgen_futures::spawn_local(async move {
+                    let navigator = window().navigator();
+                    let media_devices = navigator.media_devices().unwrap();
+                    let screen_stream = JsFuture::from(media_devices.get_display_media().unwrap())
+                        .await.unwrap().unchecked_into::<MediaStream>();
+                    let screen_track = Box::new(screen_stream
+                    .get_video_tracks()
+                    .find(&mut |_: JsValue, _: u32, _: Array| true)
+                    .unchecked_into::<VideoTrack>());
+                    let screen_processor =
+                        MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+                            &screen_track.unchecked_into::<MediaStreamTrack>(),
+                        ))
+                        .unwrap();
+                    let screen_reader = screen_processor
+                        .readable()
+                        .get_reader()
+                        .unchecked_into::<ReadableStreamDefaultReader>();
+                    let poll_screen = async {
+                        loop {
+                            if destroy.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if !sharing_screen.load(Ordering::Acquire) {
+                                return;
+                            }
+                            match JsFuture::from(screen_reader.read()).await {
+                                Ok(js_frame) => {
+                                    let video_frame =
+                                        Reflect::get(&js_frame, &JsString::from("value"))
+                                            .unwrap()
+                                            .unchecked_into::<VideoFrame>();
+                                    log!("got frame!~");
+                                    // let mut opts = VideoEncoderEncodeOptions::new();
+                                    // counter = (counter + 1) % 50;
+                                    // opts.key_frame(counter == 0);
+                                    // video_encoder.encode_with_options(&video_frame, &opts);
+                                    video_frame.close();
+                                }
+                                Err(e) => {
+                                    log!("error", e);
+                                }
+                            }
+                        }
+                    };
+                    poll_screen.await;
+                });
+                false
+            },
             Msg::Start => {
                 // 1. Query the first device with a camera and a mic attached.
                 // 2. setup WebCodecs, in particular
@@ -74,6 +148,7 @@ impl Component for Host {
                 let on_frame = Box::new(ctx.props().on_frame.clone());
                 let on_audio = Box::new(ctx.props().on_audio.clone());
                 let email = Box::new(ctx.props().email.clone());
+                
                 let video_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
@@ -226,6 +301,7 @@ impl Component for Host {
                             }
                         }
                     };
+
                     join!(poll_video, poll_audio).await;
                 });
                 true

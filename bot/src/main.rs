@@ -1,9 +1,9 @@
-use std::env;
-use tokio::{net::TcpStream, task::JoinHandle, try_join};
-use tokio_tungstenite::{connect_async, WebSocketStream, MaybeTlsStream};
 use futures::SinkExt;
 use rand::Rng;
-use url::{Url};
+use std::env;
+use tokio::{net::TcpStream, task::JoinHandle, try_join};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use url::Url;
 
 #[tokio::main]
 async fn main() {

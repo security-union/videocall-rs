@@ -5,22 +5,8 @@ The bot connects to a specified websocket endpoint and sends hello messages ever
 
 To build and run the application, execute the following commands:
 
-1. Build the application:
-
 ```
-make build
-```
-
-2. Run the application:
-
-```
-make run
-```
-
-3. To test the application, run:
-
-```
-make test
-```
+N_CLIENTS=1 ENDPOINT=ws://localhost:8080 ROOM=redrum cargo run
+``` 
 
 Before running the application, make sure to set the environment variables `N_CLIENTS`, `ENDPOINT`, and `ROOM`.

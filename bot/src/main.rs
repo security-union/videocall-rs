@@ -1,8 +1,9 @@
 use futures::SinkExt;
+use futures::StreamExt;
 use rand::Rng;
 use std::env;
-use tokio::{net::TcpStream, task::JoinHandle, try_join};
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio::{net::TcpStream, task::JoinHandle};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
 #[tokio::main]
@@ -28,12 +29,31 @@ async fn create_client(endpoint: &str, room: &str) -> JoinHandle<()> {
     let (ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
     println!("Connected to {}", url);
     tokio::spawn(async move {
-        println!("Spawned");
-        handle_connection(ws_stream).await;
+        // Receive messages
+        let mut ws_stream = ws_stream;
+        while let Some(msg) = ws_stream.next().await {
+            let msg = msg.unwrap();
+            println!("Received: {}", msg);
+            match msg {
+                Message::Text(text) => {
+                    if text == "Hello" {
+                        ws_stream.send("Hello".into()).await.unwrap();
+                    }
+                }
+                Message::Ping(data) => {
+                    ws_stream.send(Message::Pong(data)).await.unwrap();
+                }
+                _ => {}
+            }
+        }
     })
+    // tokio::spawn(async move {
+    //     println!("Spawned");
+    //     send_hello(ws_stream).await;
+    // })
 }
 
-async fn handle_connection(mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>) {
+async fn send_hello(mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>) {
     println!("Connected");
     loop {
         ws_stream.send("Hello".into()).await.unwrap();

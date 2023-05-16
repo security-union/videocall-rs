@@ -336,7 +336,7 @@ impl Component for Host {
                                         Reflect::get(&js_frame, &JsString::from("value"))
                                             .unwrap()
                                             .unchecked_into::<AudioData>();
-                                    //on_audio.emit(audio_frame);
+                                    on_audio.emit(audio_frame);
                                 }
                                 Err(e) => {
                                     log!("error", e);

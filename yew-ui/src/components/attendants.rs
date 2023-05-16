@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use crate::constants::AUDIO_CHANNELS;
+use crate::constants::AUDIO_CODEC;
+use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::model::configure_audio_context;
 use crate::model::transform_audio_chunk;
@@ -44,7 +47,7 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnInboundMedia(MediaPacketWrapper),
     OnOutboundVideoPacket(MediaPacket),
-    OnOutboundAudioPacket(AudioData),
+    OnOutboundAudioPacket(MediaPacket),
 }
 
 impl From<WsAction> for Msg {
@@ -83,7 +86,7 @@ pub struct AttendantsComponent {
 pub struct ClientSubscription {
     pub video_decoder: VideoDecoder,
     pub screen_decoder: VideoDecoder,
-    pub audio_output: Box<dyn FnMut(AudioData)>,
+    pub audio_decoder: AudioDecoder,
     pub waiting_for_video_keyframe: bool,
     pub waiting_for_audio_keyframe: bool,
     pub waiting_for_screen_keyframe: bool,
@@ -177,20 +180,29 @@ impl Component for AttendantsComponent {
                             let audio_data_js: js_sys::Uint8Array =
                                 js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
                             audio_data_js.copy_from(&audio_data.as_slice());
-
-                            let audio_data = AudioData::new(&AudioDataInit::new(
-                                &audio_data_js.into(),
-                                AudioSampleFormatWrapper::from(
-                                    packet.audio_metadata.audio_format.clone(),
-                                )
-                                .0,
-                                packet.audio_metadata.audio_number_of_channels,
-                                packet.audio_metadata.audio_number_of_frames,
-                                packet.audio_metadata.audio_sample_rate,
-                                packet.timestamp,
+                            let chunk_type = EncodedAudioChunkType::from_js_value(&JsValue::from(
+                                packet.frame_type,
                             ))
                             .unwrap();
-                            (peer.audio_output)(audio_data);
+                            let mut audio_chunk = EncodedAudioChunkInit::new(
+                                &audio_data_js.into(),
+                                packet.timestamp,
+                                chunk_type,
+                            );
+                            audio_chunk.duration(packet.duration);
+                            let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
+                            if peer.waiting_for_audio_keyframe
+                                && chunk_type == EncodedAudioChunkType::Key
+                                || !peer.waiting_for_audio_keyframe
+                            {
+                                if peer.audio_decoder.state() == CodecState::Configured {
+                                    peer.audio_decoder.decode(&encoded_audio_chunk);
+                                    peer.waiting_for_audio_keyframe = false;
+                                } else if peer.audio_decoder.state() == CodecState::Closed {
+                                    // Codec crashed, reconfigure it...
+                                    self.connected_peers.remove(&email.clone());
+                                }
+                            }
                         }
                         media_packet::MediaType::SCREEN => {
                             let video_data =
@@ -231,36 +243,45 @@ impl Component for AttendantsComponent {
                         log!(&e);
                     })
                         as Box<dyn FnMut(JsValue)>);
+                    let audio_stream_generator = MediaStreamTrackGenerator::new(
+                        &MediaStreamTrackGeneratorInit::new(&"audio"),
+                    )
+                    .unwrap();
+                    // The audio context is used to reproduce audio.
+                    let _audio_context = configure_audio_context(&audio_stream_generator).unwrap();
 
-                    let audio_output = {
-                        let audio_stream_generator = MediaStreamTrackGenerator::new(
-                            &MediaStreamTrackGeneratorInit::new(&"audio"),
-                        )
-                        .unwrap();
-                        // The audio context is used to reproduce audio.
-                        let _audio_context = configure_audio_context(&audio_stream_generator);
-                        Box::new(move |audio_data: AudioData| {
-                            let writable = audio_stream_generator.writable();
-                            if writable.locked() {
-                                return;
-                            }
-                            if let Err(e) = writable.get_writer().map(|writer| {
-                                wasm_bindgen_futures::spawn_local(async move {
-                                    if let Err(e) = JsFuture::from(writer.ready()).await {
-                                        log!("write chunk error ", e);
-                                    }
-                                    if let Err(e) =
-                                        JsFuture::from(writer.write_with_chunk(&audio_data)).await
-                                    {
-                                        log!("write chunk error ", e);
-                                    };
-                                    writer.release_lock();
-                                });
-                            }) {
-                                log!("error", e);
-                            }
-                        }) as Box<dyn FnMut(AudioData)>
-                    };
+                    let audio_output = Closure::wrap(Box::new(move |audio_data: AudioData| {
+                        let writable = audio_stream_generator.writable();
+                        if writable.locked() {
+                            return;
+                        }
+                        if let Err(e) = writable.get_writer().map(|writer| {
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if let Err(e) = JsFuture::from(writer.ready()).await {
+                                    log!("write chunk error ", e);
+                                }
+                                if let Err(e) =
+                                    JsFuture::from(writer.write_with_chunk(&audio_data)).await
+                                {
+                                    log!("write chunk error ", e);
+                                };
+                                writer.release_lock();
+                            });
+                        }) {
+                            log!("error", e);
+                        }
+                    })
+                        as Box<dyn FnMut(AudioData)>);
+                    let audio_decoder = AudioDecoder::new(&AudioDecoderInit::new(
+                        error_audio.as_ref().unchecked_ref(),
+                        audio_output.as_ref().unchecked_ref(),
+                    ))
+                    .unwrap();
+                    audio_decoder.configure(&AudioDecoderConfig::new(
+                        &AUDIO_CODEC,
+                        AUDIO_CHANNELS as u32,
+                        AUDIO_SAMPLE_RATE as u32,
+                    ));
                     let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
                         let chunk = Box::new(original_chunk);
                         let video_chunk = chunk.unchecked_into::<VideoFrame>();
@@ -340,7 +361,7 @@ impl Component for AttendantsComponent {
                         packet.email.clone(),
                         ClientSubscription {
                             video_decoder,
-                            audio_output,
+                            audio_decoder,
                             screen_decoder,
                             waiting_for_video_keyframe: true,
                             waiting_for_audio_keyframe: true,
@@ -351,6 +372,7 @@ impl Component for AttendantsComponent {
                     error_audio.forget();
                     error_video.forget();
                     error_screen.forget();
+                    audio_output.forget();
                     screen_output.forget();
                     video_output.forget();
                     true
@@ -359,9 +381,12 @@ impl Component for AttendantsComponent {
             Msg::OnOutboundVideoPacket(media) => {
                 if let Some(ws) = self.ws.as_mut() {
                     if self.connected {
-                        match media.write_to_bytes().map_err(|w| JsValue::from(format!("{:?}", w))) {
+                        match media
+                            .write_to_bytes()
+                            .map_err(|w| JsValue::from(format!("{:?}", w)))
+                        {
                             Ok(bytes) => {
-                                log!("sending video packet: {:?} bytes", bytes.len());
+                                // log!("sending video packet: ", bytes.len(), " bytes");
                                 ws.send_binary(bytes);
                             }
                             Err(e) => {
@@ -372,24 +397,21 @@ impl Component for AttendantsComponent {
                 }
                 false
             }
-            Msg::OnOutboundAudioPacket(audio_frame) => {
+            Msg::OnOutboundAudioPacket(media) => {
                 if let Some(ws) = self.ws.as_mut() {
                     if self.connected {
-                        let mut buffer = self.outbound_audio_buffer;
-                        let email = ctx.props().email.clone();
-                        let packet = transform_audio_chunk(&audio_frame, &mut buffer, &email);
-                        if self.connected {
-                            match packet.write_to_bytes().map_err(|w| JsValue::from(format!("{:?}", w))) {
-                                Ok(bytes) => {
-                                    log!("sending audio packet: {:?} bytes", bytes.len());
-                                    ws.send_binary(bytes);
-                                }
-                                Err(e) => {
-                                    log!("error sending audio packet: {:?}", e);
-                                }
+                        match media
+                            .write_to_bytes()
+                            .map_err(|w| JsValue::from(format!("{:?}", w)))
+                        {
+                            Ok(bytes) => {
+                                // log!("sending audio packet: ", bytes.len(), " bytes");
+                                ws.send_binary(bytes);
+                            }
+                            Err(e) => {
+                                log!("error sending audio packet: {:?}", e);
                             }
                         }
-                        audio_frame.close();
                     }
                 }
                 false
@@ -413,7 +435,7 @@ impl Component for AttendantsComponent {
 
         let on_audio = ctx
             .link()
-            .callback(|frame: AudioData| Msg::OnOutboundAudioPacket(frame));
+            .callback(|frame: MediaPacket| Msg::OnOutboundAudioPacket(frame));
         let rows: Vec<VNode> = self
             .connected_peers
             .iter()

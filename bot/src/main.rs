@@ -1,10 +1,12 @@
 use futures::SinkExt;
 use futures::StreamExt;
 use rand::Rng;
+use types::protos::media_packet::MediaPacket;
 use std::env;
 use tokio::{net::TcpStream, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use url::Url;
+use protobuf::Message as ProtoMessage;
 
 #[tokio::main]
 async fn main() {
@@ -29,16 +31,26 @@ async fn create_client(endpoint: &str, room: &str) -> JoinHandle<()> {
     let (ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
     println!("Connected to {}", url);
     tokio::spawn(async move {
-        // Receive messages
         let mut ws_stream = ws_stream;
         while let Some(msg) = ws_stream.next().await {
             let msg = msg.unwrap();
-            println!("Received: {}", msg);
             match msg {
                 Message::Text(text) => {
                     if text == "Hello" {
                         ws_stream.send("Hello".into()).await.unwrap();
                     }
+                },
+                Message::Binary(bin) => {
+                    // decode bin as protobuf
+                    let mut media_packet = MediaPacket::parse_from_bytes(&bin.into_boxed_slice()).unwrap();
+                    
+                    // rewrite whatever is in the protobuf so that it seems like it is coming from this bot
+                    media_packet.email = email.clone();
+
+                    // send the protobuf back to the server
+                    let mut buf = Vec::new();
+                    media_packet.write_to_vec(&mut buf).unwrap();
+                    ws_stream.send(Message::Binary(buf)).await.unwrap();
                 }
                 Message::Ping(data) => {
                     ws_stream.send(Message::Pong(data)).await.unwrap();
@@ -47,10 +59,6 @@ async fn create_client(endpoint: &str, room: &str) -> JoinHandle<()> {
             }
         }
     })
-    // tokio::spawn(async move {
-    //     println!("Spawned");
-    //     send_hello(ws_stream).await;
-    // })
 }
 
 async fn send_hello(mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>) {

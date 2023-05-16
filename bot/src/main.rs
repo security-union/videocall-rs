@@ -45,12 +45,14 @@ async fn create_client(endpoint: &str, room: &str) -> JoinHandle<()> {
                     let mut media_packet = MediaPacket::parse_from_bytes(&bin.into_boxed_slice()).unwrap();
                     
                     // rewrite whatever is in the protobuf so that it seems like it is coming from this bot
-                    media_packet.email = email.clone();
+                    if media_packet.email == "dario" {
+                        media_packet.email = email.clone();
 
-                    // send the protobuf back to the server
-                    let mut buf = Vec::new();
-                    media_packet.write_to_vec(&mut buf).unwrap();
-                    ws_stream.send(Message::Binary(buf)).await.unwrap();
+                        // send the protobuf back to the server
+                        let mut buf = Vec::new();
+                        media_packet.write_to_vec(&mut buf).unwrap();
+                        ws_stream.send(Message::Binary(buf)).await.unwrap();
+                    }
                 }
                 Message::Ping(data) => {
                     ws_stream.send(Message::Pong(data)).await.unwrap();

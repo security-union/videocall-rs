@@ -1,7 +1,7 @@
 Bot
 ===
 
-The bot connects to a specified websocket endpoint and sends hello messages every second. It utilizes Tokio runtime to support multiple concurrent websocket clients.
+The bot connects to a specified websocket endpoint and echoes messages produces by user ECHO_USER which is an env var passed to the bot command.
 
 To build and run the application, execute the following commands:
 

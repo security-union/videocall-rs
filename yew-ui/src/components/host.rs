@@ -20,10 +20,12 @@ use web_sys::*;
 use yew::prelude::*;
 
 use crate::constants::AUDIO_CHANNELS;
+use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
+use crate::model::transform_audio_chunk;
 use crate::model::transform_screen_chunk;
 use crate::model::transform_video_chunk;
 
@@ -46,7 +48,7 @@ pub struct MeetingProps {
     pub on_frame: Callback<MediaPacket>,
 
     #[prop_or_default]
-    pub on_audio: Callback<AudioData>,
+    pub on_audio: Callback<MediaPacket>,
 
     #[prop_or_default]
     pub email: String,
@@ -200,7 +202,19 @@ impl Component for Host {
                         on_frame.emit(media_packet);
                     })
                 };
-                let on_audio = on_audio.clone();
+
+                let audio_output_handler = {
+                    let email = email.clone();
+                    let on_audio = on_audio.clone();
+                    let mut buffer: [u8; 100000] = [0; 100000];
+                    log!("Handling audio");
+                    Box::new(move |chunk: JsValue| {
+                        let chunk = web_sys::EncodedAudioChunk::from(chunk);
+                        let media_packet: MediaPacket =
+                            transform_audio_chunk(&chunk, &mut buffer, &email);
+                        on_audio.emit(media_packet);
+                    })
+                };
                 let destroy = self.destroy.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
@@ -234,12 +248,7 @@ impl Component for Host {
                             .unchecked_into::<VideoTrack>(),
                     );
 
-                    let audio_track = Box::new(
-                        device
-                            .get_audio_tracks()
-                            .find(&mut |_: JsValue, _: u32, _: Array| true)
-                            .unchecked_into::<AudioTrack>(),
-                    );
+                    // Setup video encoder
 
                     let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
                         log!("error_handler error", e);
@@ -256,20 +265,12 @@ impl Component for Host {
 
                     let video_encoder = Box::new(VideoEncoder::new(&video_encoder_init).unwrap());
 
-                    let settings = &mut video_track
+                    let video_settings = &mut video_track
                         .clone()
                         .unchecked_into::<MediaStreamTrack>()
                         .get_settings();
-                    settings.width(VIDEO_WIDTH);
-                    settings.height(VIDEO_HEIGHT);
-                    if let Err(e) = js_sys::Reflect::set(
-                        settings.as_ref(),
-                        &JsValue::from("sampleRate"),
-                        &JsValue::from(AUDIO_SAMPLE_RATE),
-                    ) {
-                        log!("error", e);
-                    }
-                    settings.channel_count(AUDIO_CHANNELS as i32);
+                    video_settings.width(VIDEO_WIDTH);
+                    video_settings.height(VIDEO_HEIGHT);
 
                     let mut video_encoder_config = VideoEncoderConfig::new(
                         &VIDEO_CODEC,
@@ -281,15 +282,42 @@ impl Component for Host {
                     video_encoder_config.latency_mode(LatencyMode::Realtime);
                     video_encoder.configure(&video_encoder_config);
 
-                    let processor =
+                    let video_processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
                             &video_track.unchecked_into::<MediaStreamTrack>(),
                         ))
                         .unwrap();
-                    let video_reader = processor
+                    let video_reader = video_processor
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
+
+                    // Setup audio encoder.
+
+                    let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
+                        log!("error_handler error", e);
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+
+                    let audio_output_handler =
+                        Closure::wrap(audio_output_handler as Box<dyn FnMut(JsValue)>);
+
+                    let audio_encoder_init = AudioEncoderInit::new(
+                        audio_error_handler.as_ref().unchecked_ref(),
+                        audio_output_handler.as_ref().unchecked_ref(),
+                    );
+                    let audio_encoder = Box::new(AudioEncoder::new(&audio_encoder_init).unwrap());
+                    let audio_track = Box::new(
+                        device
+                            .get_audio_tracks()
+                            .find(&mut |_: JsValue, _: u32, _: Array| true)
+                            .unchecked_into::<AudioTrack>(),
+                    );
+                    let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
+                    audio_encoder_config.bitrate(100_000f64);
+                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE as u32);
+                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS as u32);
+                    audio_encoder.configure(&audio_encoder_config);
 
                     let audio_processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
@@ -300,6 +328,8 @@ impl Component for Host {
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
+
+                    // Start encoding video and audio.
                     let mut video_frame_counter = 0;
                     let poll_video = async {
                         loop {
@@ -331,12 +361,12 @@ impl Component for Host {
                             }
                             match JsFuture::from(audio_reader.read()).await {
                                 Ok(js_frame) => {
-                                    // TODO: use AudioEncoder as opposed to sending raw audio to the peer.
                                     let audio_frame =
                                         Reflect::get(&js_frame, &JsString::from("value"))
                                             .unwrap()
                                             .unchecked_into::<AudioData>();
-                                    on_audio.emit(audio_frame);
+                                    audio_encoder.encode(&audio_frame);
+                                    audio_frame.close();
                                 }
                                 Err(e) => {
                                     log!("error", e);

@@ -141,23 +141,20 @@ pub fn transform_screen_chunk(
 }
 
 pub fn transform_audio_chunk(
-    audio_frame: &AudioData,
+    chunk: &EncodedAudioChunk,
     buffer: &mut [u8],
     email: &String,
 ) -> MediaPacket {
-    let byte_length: usize = audio_frame.allocation_size(&AudioDataCopyToOptions::new(0)) as usize;
-    audio_frame.copy_to_with_u8_array(buffer, &AudioDataCopyToOptions::new(0));
+    chunk.copy_to_with_u8_array(buffer);
     let mut packet: MediaPacket = MediaPacket::default();
     packet.email = email.clone();
     packet.media_type = MediaType::AUDIO.into();
-    packet.data = buffer[0..byte_length].to_vec();
-    let mut audio_metadata = AudioMetadata::default();
-    audio_metadata.audio_format =
-        AudioSampleFormatWrapper(audio_frame.format().unwrap()).to_string();
-    audio_metadata.audio_number_of_channels = audio_frame.number_of_channels();
-    audio_metadata.audio_number_of_frames = audio_frame.number_of_frames();
-    audio_metadata.audio_sample_rate = audio_frame.sample_rate();
-    packet.audio_metadata = Some(audio_metadata).into();
+    packet.data = buffer[0..chunk.byte_length() as usize].to_vec();
+    packet.frame_type = EncodedAudioChunkTypeWrapper(chunk.type_()).to_string();
+    packet.timestamp = chunk.timestamp();
+    if let Some(duration0) = chunk.duration() {
+        packet.duration = duration0;
+    }
     packet
 }
 

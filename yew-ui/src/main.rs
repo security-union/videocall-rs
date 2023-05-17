@@ -27,7 +27,7 @@ enum Route {
     NotFound,
 }
 
-fn switch(routes: &Route) -> Html {
+fn switch(routes: Route) -> Html {
     match routes {
         Route::Login => html! { <Login/> },
         Route::Meeting { email, id } => html! {
@@ -54,11 +54,11 @@ fn app_component() -> Html {
     log!("OAuth enabled: {}", *ENABLE_OAUTH);
     html! {
         <BrowserRouter>
-        <Switch<Route> render={Switch::render(switch)} />
+        <Switch<Route> render={switch} />
         </BrowserRouter>
     }
 }
 
 fn main() {
-    yew::start_app::<App>();
+    yew::Renderer::<App>::new().render();
 }

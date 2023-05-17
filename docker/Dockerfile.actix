@@ -1,4 +1,4 @@
 FROM rust:1.64-slim-bullseye
 
-RUN apt-get --yes update && apt-get --yes install pkg-config libssl-dev
+RUN apt-get --yes update && apt-get --yes install git pkg-config libssl-dev
 RUN cargo install cargo-watch

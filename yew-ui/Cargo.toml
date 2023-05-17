@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-yew = "0.19.3"
+yew = { version = "0.20", features = ["csr"] }
 wasm-bindgen = "0.2.78"
 wasm-bindgen-futures = "0.4.30"
 reqwasm = "0.5.0"
@@ -15,9 +15,9 @@ const_format="0.2.25"
 lazy_static = "1.4.0"
 gloo-console = "0.2.3"
 gloo-utils = "0.1"
-yew-router = "0.16"
+yew-router = "0.17"
 js-sys = "0.3"
-yew-websocket = { git = "https://github.com/security-union/yew-websocket.git", rev = "b29388a50c54c417db9cf0bf40033f62d9c616ab" }
+yew-websocket = { git = "https://github.com/security-union/yew-websocket.git", rev = "65ba143" }
 anyhow = "1"
 serde = "1"
 serde_derive = "1"

@@ -7,7 +7,6 @@ use crate::model::AudioSampleFormatWrapper;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use anyhow::anyhow;
 use gloo_console::log;
 use js_sys::*;
 use protobuf::Message;
@@ -360,8 +359,15 @@ impl Component for AttendantsComponent {
             Msg::OnOutboundVideoPacket(media) => {
                 if let Some(ws) = self.ws.as_mut() {
                     if self.connected {
-                        let bytes = media.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
-                        ws.send_binary(bytes);
+                        match media.write_to_bytes().map_err(|w| JsValue::from(format!("{:?}", w))) {
+                            Ok(bytes) => {
+                                log!("sending video packet: {:?} bytes", bytes.len());
+                                ws.send_binary(bytes);
+                            }
+                            Err(e) => {
+                                log!("error sending video packet: {:?}", e);
+                            }
+                        }
                     }
                 }
                 false
@@ -373,8 +379,15 @@ impl Component for AttendantsComponent {
                         let email = ctx.props().email.clone();
                         let packet = transform_audio_chunk(&audio_frame, &mut buffer, &email);
                         if self.connected {
-                            let bytes = packet.write_to_bytes().map_err(|w| anyhow!("{:?}", w));
-                            ws.send_binary(bytes);
+                            match packet.write_to_bytes().map_err(|w| JsValue::from(format!("{:?}", w))) {
+                                Ok(bytes) => {
+                                    log!("sending audio packet: {:?} bytes", bytes.len());
+                                    ws.send_binary(bytes);
+                                }
+                                Err(e) => {
+                                    log!("error sending audio packet: {:?}", e);
+                                }
+                            }
                         }
                         audio_frame.close();
                     }

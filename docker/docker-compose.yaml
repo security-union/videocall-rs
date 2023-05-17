@@ -7,7 +7,7 @@ services:
         source: ../
         target: /app
       - /app/yew-ui/target
-    build: 
+    build:
       dockerfile: ../docker/Dockerfile.yew
     command: bash -c "cd app/yew-ui && trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
     environment:
@@ -22,7 +22,7 @@ services:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
 
   actix-api:
-    build: 
+    build:
       dockerfile: ../docker/Dockerfile.actix
     command: bash -c "cd app/actix-api && cargo watch -x \"run -r\""
     environment:
@@ -50,12 +50,12 @@ services:
     volumes:
         - ../dbmate/db:/app/db
     build:
-        context: ../dbmate 
+        context: ../dbmate
     environment:
         DATABASE_URL: "postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable"
     depends_on:
       - postgres
-  
+
   postgres:
     image: postgres:12
     environment:

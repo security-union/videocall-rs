@@ -16,7 +16,7 @@ input {
     width: 100%;
     margin: 16px 16px;
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
     grid-template-rows: repeat(auto-fit, minmax(50px, 1fr));
     grid-gap: 8px;
     align-items: center; /* Center items vertically */
@@ -37,25 +37,12 @@ input {
   height: auto;
 }
 
-/*.grid-container {
-  display: flex;
-  flex-wrap: wrap;
-  background-color: black;
-}*/
-/*.grid-item {
-  flex: 1 0 20%;
-  width: 15%;
-  height: fit-content;
-  position: relative;
-}*/
-
 .hidden {
   display: none
 }
 
 canvas {
   width: 100%;
-  /* height: 100%; */
 }
 
 .self-camera {

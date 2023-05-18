@@ -5,8 +5,6 @@ use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::model::configure_audio_context;
-use crate::model::transform_audio_chunk;
-use crate::model::AudioSampleFormatWrapper;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
@@ -464,7 +462,7 @@ impl Component for AttendantsComponent {
         html! {
             <div class="grid-container">
                 { rows }
-                <nav class="grid-item menu">
+                <nav class="host">
                     <div class="controls">
                     <button
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>

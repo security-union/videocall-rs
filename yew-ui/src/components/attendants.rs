@@ -425,12 +425,15 @@ impl Component for AttendantsComponent {
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
+                        log!("ToggleScreenShare");
                         self.share_screen = !self.share_screen;
                     }
                     MeetingAction::ToggleMicMute => {
+                        log!("ToggleMicMute");
                         self.mic_enabled = !self.mic_enabled;
                     }
                     MeetingAction::ToggleVideoOnOff => {
+                        log!("ToggleVideoOnOff");
                         self.video_enabled = !self.video_enabled;
                     }
                 }
@@ -484,12 +487,12 @@ impl Component for AttendantsComponent {
                         </button>
                         <button
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
-                            { if self.share_screen { "Start Video"} else { "Stop Video"} }
+                            { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
                         </button>
                         <button
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
-                            { if self.share_screen { "Unmute"} else { "Mute"} }
-                        </button>
+                            { if !self.mic_enabled { "Unmute"} else { "Mute"} }
+                            </button>
                         <button disabled={self.ws.is_some()}
                                 onclick={ctx.link().callback(|_| WsAction::Connect)}>
                             { "Connect" }
@@ -499,7 +502,7 @@ impl Component for AttendantsComponent {
                             { "Close" }
                         </button>
                     </div>
-                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()} share_screen={self.share_screen}/>
+                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>
                     <h4 class="floating-name">{email}</h4>
                 </nav>
             </div>

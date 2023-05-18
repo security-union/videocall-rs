@@ -39,8 +39,8 @@ pub enum Msg {
 pub struct Host {
     pub destroy: Arc<AtomicBool>,
     pub share_screen: Arc<AtomicBool>,
-    pub mute_microphone: Arc<AtomicBool>,
-    pub share_video: Arc<AtomicBool>,
+    pub mic_enabled: Arc<AtomicBool>,
+    pub video_enabled: Arc<AtomicBool>,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -57,14 +57,11 @@ pub struct MeetingProps {
     #[prop_or_default]
     pub email: String,
 
-    #[prop_or_default]
     pub share_screen: bool,
 
-    #[prop_or_default]
-    pub mute_microphone: bool,
+    pub mic_enabled: bool,
 
-    #[prop_or_default]
-    pub share_video: bool,
+    pub video_enabled: bool,
 }
 
 impl Component for Host {
@@ -75,8 +72,8 @@ impl Component for Host {
         Self {
             destroy: Arc::new(AtomicBool::new(false)),
             share_screen: Arc::new(AtomicBool::new(false)),
-            mute_microphone: Arc::new(AtomicBool::new(false)),
-            share_video: Arc::new(AtomicBool::new(false)),
+            mic_enabled: Arc::new(AtomicBool::new(false)),
+            video_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -90,18 +87,18 @@ impl Component for Host {
             }
         }
         // Determine if we should start/stop microphone.
-        if ctx.props().mute_microphone != self.mute_microphone.load(Ordering::Acquire) {
-            self.mute_microphone
-                .store(ctx.props().mute_microphone, Ordering::Release);
+        if ctx.props().mic_enabled != self.mic_enabled.load(Ordering::Acquire) {
+            self.mic_enabled
+                .store(ctx.props().mic_enabled, Ordering::Release);
             ctx.link()
-                .send_message(Msg::EnableMicrophone(!ctx.props().mute_microphone));
+                .send_message(Msg::EnableMicrophone(!ctx.props().mic_enabled));
         }
         // Determine if we should start/stop video.
-        if ctx.props().share_video != self.share_video.load(Ordering::Acquire) {
-            self.share_video
-                .store(ctx.props().share_video, Ordering::Release);
+        if ctx.props().video_enabled != self.video_enabled.load(Ordering::Acquire) {
+            self.video_enabled
+                .store(ctx.props().video_enabled, Ordering::Release);
             ctx.link()
-                .send_message(Msg::EnableVideo(ctx.props().share_video));
+                .send_message(Msg::EnableVideo(ctx.props().video_enabled));
         }
 
         if first_render {
@@ -210,69 +207,36 @@ impl Component for Host {
                 });
                 true
             }
-            Msg::Start => {
-                // 1. Query the first device with a camera and a mic attached.
-                // 2. setup WebCodecs, in particular
-                // 3. send encoded video frames and raw audio to the server.
-                let on_frame = Box::new(ctx.props().on_frame.clone());
-                let on_audio = Box::new(ctx.props().on_audio.clone());
-                let email = Box::new(ctx.props().email.clone());
+            Msg::Start => true,
 
-                let video_output_handler = {
-                    let email = email.clone();
-                    let on_frame = on_frame.clone();
-                    let mut buffer: [u8; 100000] = [0; 100000];
-                    Box::new(move |chunk: JsValue| {
-                        let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                        let media_packet: MediaPacket =
-                            transform_video_chunk(chunk, &mut buffer, email.clone());
-                        on_frame.emit(media_packet);
-                    })
-                };
+            Msg::EnableMicrophone(should_enable) => {
+                if !should_enable {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let navigator = window().navigator();
+                        let media_devices = navigator.media_devices().unwrap();
+                        // TODO: Add dropdown so that user can select the device that they want to use.
+                        let mut constraints = MediaStreamConstraints::new();
+                        constraints.video(&Boolean::from(true));
+                        constraints.audio(&Boolean::from(true));
+                        let devices_query = media_devices
+                            .get_user_media_with_constraints(&constraints)
+                            .unwrap();
+                        let device = JsFuture::from(devices_query)
+                            .await
+                            .unwrap()
+                            .unchecked_into::<MediaStream>();
 
-                let audio_output_handler = {
-                    let email = email.clone();
-                    let on_audio = on_audio.clone();
-                    let mut buffer: [u8; 100000] = [0; 100000];
-                    log!("Handling audio");
-                    Box::new(move |chunk: JsValue| {
-                        let chunk = web_sys::EncodedAudioChunk::from(chunk);
-                        let media_packet: MediaPacket =
-                            transform_audio_chunk(&chunk, &mut buffer, &email);
-                        on_audio.emit(media_packet);
-                    })
-                };
-                let destroy = self.destroy.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let navigator = window().navigator();
-
-                    let media_devices = navigator.media_devices().unwrap();
-
-                    let video_element = window()
-                        .document()
-                        .unwrap()
-                        .get_element_by_id("webcam")
-                        .unwrap()
-                        .unchecked_into::<HtmlVideoElement>();
-
-                    // TODO: Add dropdown so that user can select the device that they want to use.
-                    let mut constraints = MediaStreamConstraints::new();
-                    constraints.video(&Boolean::from(true));
-                    constraints.audio(&Boolean::from(true));
-                    let devices_query = media_devices
-                        .get_user_media_with_constraints(&constraints)
-                        .unwrap();
-                    let device = JsFuture::from(devices_query)
-                        .await
-                        .unwrap()
-                        .unchecked_into::<MediaStream>();
-                    video_element.set_src_object(Some(&device));
-                    video_element.set_muted(true);
-                });
-                true
-            }
-
-            Msg::EnableMicrophone(_) => {
+                        let video_track = Box::new(
+                            device
+                                .get_audio_tracks()
+                                .find(&mut |_: JsValue, _: u32, _: Array| true)
+                                .unchecked_into::<VideoTrack>(),
+                        );
+                        let video_track = video_track.unchecked_into::<MediaStreamTrack>();
+                        video_track.stop();
+                    });
+                    return true;
+                }
                 let on_audio = Box::new(ctx.props().on_audio.clone());
                 let email = Box::new(ctx.props().email.clone());
 
@@ -370,7 +334,37 @@ impl Component for Host {
                 });
                 true
             }
-            Msg::EnableVideo(_) => {
+            
+            Msg::EnableVideo(should_enable) => {
+                if !should_enable {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let navigator = window().navigator();
+                        let media_devices = navigator.media_devices().unwrap();
+                        // TODO: Add dropdown so that user can select the device that they want to use.
+                        let mut constraints = MediaStreamConstraints::new();
+                        constraints.video(&Boolean::from(true));
+                        constraints.audio(&Boolean::from(true));
+                        let devices_query = media_devices
+                            .get_user_media_with_constraints(&constraints)
+                            .unwrap();
+                        let device = JsFuture::from(devices_query)
+                            .await
+                            .unwrap()
+                            .unchecked_into::<MediaStream>();
+
+                        let video_track = Box::new(
+                            device
+                                .get_video_tracks()
+                                .find(&mut |_: JsValue, _: u32, _: Array| true)
+                                .unchecked_into::<VideoTrack>(),
+                        );
+                        let video_track = video_track.unchecked_into::<MediaStreamTrack>();
+                        video_track.stop();
+                    });
+                    return true;
+                }
+
+
                 // 1. Query the first device with a camera and a mic attached.
                 // 2. setup WebCodecs, in particular
                 // 3. send encoded video frames and raw audio to the server.
@@ -388,10 +382,15 @@ impl Component for Host {
                         on_frame.emit(media_packet);
                     })
                 };
-
                 let destroy = self.destroy.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
+                    let video_element = window()
+                        .document()
+                        .unwrap()
+                        .get_element_by_id("webcam")
+                        .unwrap()
+                        .unchecked_into::<HtmlVideoElement>();
 
                     let media_devices = navigator.media_devices().unwrap();
                     // TODO: Add dropdown so that user can select the device that they want to use.
@@ -405,6 +404,9 @@ impl Component for Host {
                         .await
                         .unwrap()
                         .unchecked_into::<MediaStream>();
+                    // TODO: Add dropdown so that user can select the device that they want to use.
+                    video_element.set_src_object(Some(&device));
+                    video_element.set_muted(true);
 
                     let video_track = Box::new(
                         device

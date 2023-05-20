@@ -91,7 +91,7 @@ impl Component for Host {
             self.mic_enabled
                 .store(ctx.props().mic_enabled, Ordering::Release);
             ctx.link()
-                .send_message(Msg::EnableMicrophone(!ctx.props().mic_enabled));
+                .send_message(Msg::EnableMicrophone(ctx.props().mic_enabled));
         }
         // Determine if we should start/stop video.
         if ctx.props().video_enabled != self.video_enabled.load(Ordering::Acquire) {
@@ -211,6 +211,7 @@ impl Component for Host {
 
             Msg::EnableMicrophone(should_enable) => {
                 if !should_enable {
+                    log!("stopping mic");
                     wasm_bindgen_futures::spawn_local(async move {
                         let navigator = window().navigator();
                         let media_devices = navigator.media_devices().unwrap();
@@ -244,8 +245,8 @@ impl Component for Host {
                     let email = email.clone();
                     let on_audio = on_audio.clone();
                     let mut buffer: [u8; 100000] = [0; 100000];
-                    log!("Handling audio");
                     Box::new(move |chunk: JsValue| {
+                        log!("Handling audio");
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
                         let media_packet: MediaPacket =
                             transform_audio_chunk(&chunk, &mut buffer, &email);
@@ -253,7 +254,9 @@ impl Component for Host {
                     })
                 };
                 let destroy = self.destroy.clone();
+                let mic_enabled = self.mic_enabled.clone();
                 wasm_bindgen_futures::spawn_local(async move {
+                    log!("starting mic");
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
                     // TODO: Add dropdown so that user can select the device that they want to use.
@@ -310,6 +313,9 @@ impl Component for Host {
 
                     let poll_audio = async {
                         loop {
+                            if !mic_enabled.load(Ordering::Acquire) {
+                                return;
+                            }
                             if destroy.load(Ordering::Acquire) {
                                 return;
                             }
@@ -334,12 +340,19 @@ impl Component for Host {
                 });
                 true
             }
-            
+
             Msg::EnableVideo(should_enable) => {
                 if !should_enable {
                     wasm_bindgen_futures::spawn_local(async move {
                         let navigator = window().navigator();
                         let media_devices = navigator.media_devices().unwrap();
+                        let video_element = window()
+                            .document()
+                            .unwrap()
+                            .get_element_by_id("webcam")
+                            .unwrap()
+                            .unchecked_into::<HtmlVideoElement>();
+                        video_element.set_src_object(None);
                         // TODO: Add dropdown so that user can select the device that they want to use.
                         let mut constraints = MediaStreamConstraints::new();
                         constraints.video(&Boolean::from(true));
@@ -352,30 +365,29 @@ impl Component for Host {
                             .unwrap()
                             .unchecked_into::<MediaStream>();
 
-                        let video_track = Box::new(
-                            device
-                                .get_video_tracks()
-                                .find(&mut |_: JsValue, _: u32, _: Array| true)
-                                .unchecked_into::<VideoTrack>(),
-                        );
-                        let video_track = video_track.unchecked_into::<MediaStreamTrack>();
-                        video_track.stop();
+                        let video_tracks = device.get_video_tracks();
+                        for video_track in video_tracks.iter() {
+                            let video_track = video_track.unchecked_into::<MediaStreamTrack>();
+                            video_track.stop();
+                            log!("stopping video track");
+                        }
                     });
                     return true;
                 }
-
 
                 // 1. Query the first device with a camera and a mic attached.
                 // 2. setup WebCodecs, in particular
                 // 3. send encoded video frames and raw audio to the server.
                 let on_frame = Box::new(ctx.props().on_frame.clone());
                 let email = Box::new(ctx.props().email.clone());
+                let is_video_enabled = self.video_enabled.clone();
 
                 let video_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
+                        log!("Handling video");
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
                         let media_packet: MediaPacket =
                             transform_video_chunk(chunk, &mut buffer, email.clone());
@@ -459,12 +471,13 @@ impl Component for Host {
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
 
-                    // Setup audio encoder.
-
                     // Start encoding video and audio.
                     let mut video_frame_counter = 0;
                     let poll_video = async {
                         loop {
+                            if !is_video_enabled.load(Ordering::Acquire) {
+                                return;
+                            }
                             if destroy.load(Ordering::Acquire) {
                                 return;
                             }

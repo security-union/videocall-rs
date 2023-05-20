@@ -1,29 +1,46 @@
+html,
 body {
-    color: white;
-    background-color: black
+  width: 100%;
+  margin: 0;
 }
 
-html,body {
-  height:100%;
-  width:100%;
-  margin:0;
-}
 body {
-  display:flex;
+  height: 100vh;
+  color: white;
+  background-color: #111;
+  display: flex;
 }
+
 input {
-  margin:auto;/* nice thing of auto margin if display:flex; it center both horizontal and vertical :) */
+  margin: auto;
+  /* nice thing of auto margin if display:flex; it center both horizontal and vertical :) */
 }
 
 .grid-container {
-  display: flex;
-  background-color: black;
+  width: 100%;
+  margin: 16px 16px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+  grid-template-rows: repeat(auto-fit, minmax(500px, 1fr));
+  grid-gap: 8px;
+  align-items: center;
+  /* Center items vertically */
+  justify-content: center;
+  /* Center items horizontally */
 }
+
 .grid-item {
-  flex: 1;
-  width: 30%;
   height: fit-content;
   position: relative;
+}
+
+/* Host camera frame rendered in the bottom right corner */
+.host {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 20%;
+  height: auto;
 }
 
 .hidden {
@@ -32,7 +49,7 @@ input {
 
 canvas {
   width: 100%;
-  /* height: 100%; */
+  height: 100%;
 }
 
 .self-camera {
@@ -40,22 +57,12 @@ canvas {
   height: 100%;
 }
 
-.menu {
-  position:absolute;
-  bottom:0;
-  right:0;
-}
-
 .floating-name {
-  color: black;
   position: absolute;
   bottom: 0;
-  right: 0;
   margin-bottom: 0;
   background-color: black;
   color: white;
-  padding-left: 20px;
-  padding-right: 20px;
 }
 
 .controls {

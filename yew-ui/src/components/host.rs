@@ -6,7 +6,6 @@ use js_sys::JsString;
 use js_sys::Reflect;
 
 use std::fmt::Debug;
-use std::future::join;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -246,7 +245,6 @@ impl Component for Host {
                     let on_audio = on_audio.clone();
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
-                        log!("Handling audio");
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
                         let media_packet: MediaPacket =
                             transform_audio_chunk(&chunk, &mut buffer, &email);
@@ -308,9 +306,6 @@ impl Component for Host {
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
 
-                    // Start encoding video and audio.
-                    let mut video_frame_counter = 0;
-
                     let poll_audio = async {
                         loop {
                             if !mic_enabled.load(Ordering::Acquire) {
@@ -334,9 +329,8 @@ impl Component for Host {
                             }
                         }
                     };
-
-                    join!(poll_audio).await;
-                    log!("Killing streamer");
+                    poll_audio.await;
+                    log!("Killing audio streamer");
                 });
                 true
             }
@@ -387,7 +381,6 @@ impl Component for Host {
                     let on_frame = on_frame.clone();
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
-                        log!("Handling video");
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
                         let media_packet: MediaPacket =
                             transform_video_chunk(chunk, &mut buffer, email.clone());
@@ -499,8 +492,8 @@ impl Component for Host {
                             }
                         }
                     };
-                    join!(poll_video).await;
-                    log!("Killing streamer");
+                    poll_video.await;
+                    log!("Killing video streamer");
                 });
                 true
             }

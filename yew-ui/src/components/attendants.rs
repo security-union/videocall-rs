@@ -423,15 +423,12 @@ impl Component for AttendantsComponent {
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
-                        log!("ToggleScreenShare");
                         self.share_screen = !self.share_screen;
                     }
                     MeetingAction::ToggleMicMute => {
-                        log!("ToggleMicMute");
                         self.mic_enabled = !self.mic_enabled;
                     }
                     MeetingAction::ToggleVideoOnOff => {
-                        log!("ToggleVideoOnOff");
                         self.video_enabled = !self.video_enabled;
                     }
                 }

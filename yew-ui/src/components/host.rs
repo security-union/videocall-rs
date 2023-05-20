@@ -28,6 +28,8 @@ use crate::model::transform_audio_chunk;
 use crate::model::transform_screen_chunk;
 use crate::model::transform_video_chunk;
 
+const VIDEO_ELEMENT_ID : &str = "webcam";
+
 pub enum Msg {
     Start,
     EnableScreenShare,
@@ -343,7 +345,7 @@ impl Component for Host {
                         let video_element = window()
                             .document()
                             .unwrap()
-                            .get_element_by_id("webcam")
+                            .get_element_by_id(VIDEO_ELEMENT_ID)
                             .unwrap()
                             .unchecked_into::<HtmlVideoElement>();
                         video_element.set_src_object(None);
@@ -393,7 +395,7 @@ impl Component for Host {
                     let video_element = window()
                         .document()
                         .unwrap()
-                        .get_element_by_id("webcam")
+                        .get_element_by_id(VIDEO_ELEMENT_ID)
                         .unwrap()
                         .unchecked_into::<HtmlVideoElement>();
 
@@ -502,7 +504,7 @@ impl Component for Host {
 
     fn view(&self, _ctx: &Context<Self>) -> Html {
         html! {
-            <video class="self-camera" autoplay=true id="webcam"></video>
+            <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
         }
     }
 

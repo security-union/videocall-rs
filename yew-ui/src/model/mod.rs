@@ -3,7 +3,7 @@ use protobuf::Message;
 use std::fmt;
 use types::protos::media_packet::{
     media_packet::{self, MediaType},
-    AudioMetadata, MediaPacket,
+    MediaPacket,
 };
 use web_sys::*;
 use yew_websocket::websocket::{Binary, Text};

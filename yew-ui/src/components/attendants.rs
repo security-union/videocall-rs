@@ -38,6 +38,8 @@ pub enum WsAction {
 #[derive(Debug)]
 pub enum MeetingAction {
     ToggleScreenShare,
+    ToggleMicMute,
+    ToggleVideoOnOff,
 }
 
 pub enum Msg {
@@ -79,6 +81,8 @@ pub struct AttendantsComponent {
     pub connected_peers: HashMap<String, ClientSubscription>,
     pub outbound_audio_buffer: [u8; 2000],
     pub share_screen: bool,
+    pub mic_enabled: bool,
+    pub video_enabled: bool,
 }
 
 pub struct ClientSubscription {
@@ -103,6 +107,8 @@ impl Component for AttendantsComponent {
             connected_peers,
             outbound_audio_buffer: [0; 2000],
             share_screen: false,
+            mic_enabled: false,
+            video_enabled: false,
         }
     }
 
@@ -419,6 +425,12 @@ impl Component for AttendantsComponent {
                     MeetingAction::ToggleScreenShare => {
                         self.share_screen = !self.share_screen;
                     }
+                    MeetingAction::ToggleMicMute => {
+                        self.mic_enabled = !self.mic_enabled;
+                    }
+                    MeetingAction::ToggleVideoOnOff => {
+                        self.video_enabled = !self.video_enabled;
+                    }
                 }
                 true
             }
@@ -464,10 +476,18 @@ impl Component for AttendantsComponent {
                 { rows }
                 <nav class="host">
                     <div class="controls">
-                    <button
+                        <button
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
                             { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
                         </button>
+                        <button
+                            onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
+                            { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
+                        </button>
+                        <button
+                            onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
+                            { if !self.mic_enabled { "Unmute"} else { "Mute"} }
+                            </button>
                         <button disabled={self.ws.is_some()}
                                 onclick={ctx.link().callback(|_| WsAction::Connect)}>
                             { "Connect" }
@@ -477,7 +497,7 @@ impl Component for AttendantsComponent {
                             { "Close" }
                         </button>
                     </div>
-                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()} share_screen={self.share_screen}/>
+                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>
                     <h4 class="floating-name">{email}</h4>
                 </nav>
             </div>

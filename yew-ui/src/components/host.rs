@@ -6,7 +6,6 @@ use js_sys::JsString;
 use js_sys::Reflect;
 
 use std::fmt::Debug;
-use std::future::join;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -29,14 +28,20 @@ use crate::model::transform_audio_chunk;
 use crate::model::transform_screen_chunk;
 use crate::model::transform_video_chunk;
 
+const VIDEO_ELEMENT_ID: &str = "webcam";
+
 pub enum Msg {
     Start,
     EnableScreenShare,
+    EnableMicrophone(bool),
+    EnableVideo(bool),
 }
 
 pub struct Host {
     pub destroy: Arc<AtomicBool>,
     pub share_screen: Arc<AtomicBool>,
+    pub mic_enabled: Arc<AtomicBool>,
+    pub video_enabled: Arc<AtomicBool>,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -53,8 +58,11 @@ pub struct MeetingProps {
     #[prop_or_default]
     pub email: String,
 
-    #[prop_or_default]
     pub share_screen: bool,
+
+    pub mic_enabled: bool,
+
+    pub video_enabled: bool,
 }
 
 impl Component for Host {
@@ -65,6 +73,8 @@ impl Component for Host {
         Self {
             destroy: Arc::new(AtomicBool::new(false)),
             share_screen: Arc::new(AtomicBool::new(false)),
+            mic_enabled: Arc::new(AtomicBool::new(false)),
+            video_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -77,6 +87,21 @@ impl Component for Host {
                 ctx.link().send_message(Msg::EnableScreenShare);
             }
         }
+        // Determine if we should start/stop microphone.
+        if ctx.props().mic_enabled != self.mic_enabled.load(Ordering::Acquire) {
+            self.mic_enabled
+                .store(ctx.props().mic_enabled, Ordering::Release);
+            ctx.link()
+                .send_message(Msg::EnableMicrophone(ctx.props().mic_enabled));
+        }
+        // Determine if we should start/stop video.
+        if ctx.props().video_enabled != self.video_enabled.load(Ordering::Acquire) {
+            self.video_enabled
+                .store(ctx.props().video_enabled, Ordering::Release);
+            ctx.link()
+                .send_message(Msg::EnableVideo(ctx.props().video_enabled));
+        }
+
         if first_render {
             ctx.link().send_message(Msg::Start);
         }
@@ -183,13 +208,125 @@ impl Component for Host {
                 });
                 true
             }
-            Msg::Start => {
+            Msg::Start => true,
+
+            Msg::EnableMicrophone(should_enable) => {
+                if !should_enable {
+                    log!("stopping mic");
+                    return true;
+                }
+                let on_audio = Box::new(ctx.props().on_audio.clone());
+                let email = Box::new(ctx.props().email.clone());
+
+                let audio_output_handler = {
+                    let email = email.clone();
+                    let on_audio = on_audio.clone();
+                    let mut buffer: [u8; 100000] = [0; 100000];
+                    Box::new(move |chunk: JsValue| {
+                        let chunk = web_sys::EncodedAudioChunk::from(chunk);
+                        let media_packet: MediaPacket =
+                            transform_audio_chunk(&chunk, &mut buffer, &email);
+                        on_audio.emit(media_packet);
+                    })
+                };
+                let destroy = self.destroy.clone();
+                let mic_enabled = self.mic_enabled.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    log!("starting mic");
+                    let navigator = window().navigator();
+                    let media_devices = navigator.media_devices().unwrap();
+                    // TODO: Add dropdown so that user can select the device that they want to use.
+                    let mut constraints = MediaStreamConstraints::new();
+                    constraints.video(&Boolean::from(false));
+                    constraints.audio(&Boolean::from(true));
+                    let devices_query = media_devices
+                        .get_user_media_with_constraints(&constraints)
+                        .unwrap();
+                    let device = JsFuture::from(devices_query)
+                        .await
+                        .unwrap()
+                        .unchecked_into::<MediaStream>();
+
+                    // Setup audio encoder.
+
+                    let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
+                        log!("error_handler error", e);
+                    })
+                        as Box<dyn FnMut(JsValue)>);
+
+                    let audio_output_handler =
+                        Closure::wrap(audio_output_handler as Box<dyn FnMut(JsValue)>);
+
+                    let audio_encoder_init = AudioEncoderInit::new(
+                        audio_error_handler.as_ref().unchecked_ref(),
+                        audio_output_handler.as_ref().unchecked_ref(),
+                    );
+                    let audio_encoder = Box::new(AudioEncoder::new(&audio_encoder_init).unwrap());
+                    let audio_track = Box::new(
+                        device
+                            .get_audio_tracks()
+                            .find(&mut |_: JsValue, _: u32, _: Array| true)
+                            .unchecked_into::<AudioTrack>(),
+                    );
+                    let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
+                    audio_encoder_config.bitrate(100_000f64);
+                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE as u32);
+                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS as u32);
+                    audio_encoder.configure(&audio_encoder_config);
+
+                    let audio_processor =
+                        MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+                            &audio_track.clone().unchecked_into::<MediaStreamTrack>(),
+                        ))
+                        .unwrap();
+                    let audio_reader = audio_processor
+                        .readable()
+                        .get_reader()
+                        .unchecked_into::<ReadableStreamDefaultReader>();
+
+                    let poll_audio = async {
+                        loop {
+                            if !mic_enabled.load(Ordering::Acquire)
+                                || destroy.load(Ordering::Acquire)
+                            {
+                                let audio_track =
+                                    audio_track.clone().unchecked_into::<MediaStreamTrack>();
+                                audio_track.stop();
+                                audio_encoder.close();
+                                return;
+                            }
+                            match JsFuture::from(audio_reader.read()).await {
+                                Ok(js_frame) => {
+                                    let audio_frame =
+                                        Reflect::get(&js_frame, &JsString::from("value"))
+                                            .unwrap()
+                                            .unchecked_into::<AudioData>();
+                                    audio_encoder.encode(&audio_frame);
+                                    audio_frame.close();
+                                }
+                                Err(e) => {
+                                    log!("error", e);
+                                }
+                            }
+                        }
+                    };
+                    poll_audio.await;
+                    log!("Killing audio streamer");
+                });
+                true
+            }
+
+            Msg::EnableVideo(should_enable) => {
+                if !should_enable {
+                    return true;
+                }
+
                 // 1. Query the first device with a camera and a mic attached.
                 // 2. setup WebCodecs, in particular
                 // 3. send encoded video frames and raw audio to the server.
                 let on_frame = Box::new(ctx.props().on_frame.clone());
-                let on_audio = Box::new(ctx.props().on_audio.clone());
                 let email = Box::new(ctx.props().email.clone());
+                let is_video_enabled = self.video_enabled.clone();
 
                 let video_output_handler = {
                     let email = email.clone();
@@ -202,36 +339,21 @@ impl Component for Host {
                         on_frame.emit(media_packet);
                     })
                 };
-
-                let audio_output_handler = {
-                    let email = email.clone();
-                    let on_audio = on_audio.clone();
-                    let mut buffer: [u8; 100000] = [0; 100000];
-                    log!("Handling audio");
-                    Box::new(move |chunk: JsValue| {
-                        let chunk = web_sys::EncodedAudioChunk::from(chunk);
-                        let media_packet: MediaPacket =
-                            transform_audio_chunk(&chunk, &mut buffer, &email);
-                        on_audio.emit(media_packet);
-                    })
-                };
                 let destroy = self.destroy.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
-
-                    let media_devices = navigator.media_devices().unwrap();
-
                     let video_element = window()
                         .document()
                         .unwrap()
-                        .get_element_by_id("webcam")
+                        .get_element_by_id(VIDEO_ELEMENT_ID)
                         .unwrap()
                         .unchecked_into::<HtmlVideoElement>();
 
+                    let media_devices = navigator.media_devices().unwrap();
                     // TODO: Add dropdown so that user can select the device that they want to use.
                     let mut constraints = MediaStreamConstraints::new();
                     constraints.video(&Boolean::from(true));
-                    constraints.audio(&Boolean::from(true));
+                    constraints.audio(&Boolean::from(false));
                     let devices_query = media_devices
                         .get_user_media_with_constraints(&constraints)
                         .unwrap();
@@ -239,8 +361,10 @@ impl Component for Host {
                         .await
                         .unwrap()
                         .unchecked_into::<MediaStream>();
+                    // TODO: Add dropdown so that user can select the device that they want to use.
                     video_element.set_src_object(Some(&device));
                     video_element.set_muted(true);
+
                     let video_track = Box::new(
                         device
                             .get_video_tracks()
@@ -284,47 +408,10 @@ impl Component for Host {
 
                     let video_processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
-                            &video_track.unchecked_into::<MediaStreamTrack>(),
+                            &video_track.clone().unchecked_into::<MediaStreamTrack>(),
                         ))
                         .unwrap();
                     let video_reader = video_processor
-                        .readable()
-                        .get_reader()
-                        .unchecked_into::<ReadableStreamDefaultReader>();
-
-                    // Setup audio encoder.
-
-                    let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                        log!("error_handler error", e);
-                    })
-                        as Box<dyn FnMut(JsValue)>);
-
-                    let audio_output_handler =
-                        Closure::wrap(audio_output_handler as Box<dyn FnMut(JsValue)>);
-
-                    let audio_encoder_init = AudioEncoderInit::new(
-                        audio_error_handler.as_ref().unchecked_ref(),
-                        audio_output_handler.as_ref().unchecked_ref(),
-                    );
-                    let audio_encoder = Box::new(AudioEncoder::new(&audio_encoder_init).unwrap());
-                    let audio_track = Box::new(
-                        device
-                            .get_audio_tracks()
-                            .find(&mut |_: JsValue, _: u32, _: Array| true)
-                            .unchecked_into::<AudioTrack>(),
-                    );
-                    let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
-                    audio_encoder_config.bitrate(100_000f64);
-                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE as u32);
-                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS as u32);
-                    audio_encoder.configure(&audio_encoder_config);
-
-                    let audio_processor =
-                        MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
-                            &audio_track.unchecked_into::<MediaStreamTrack>(),
-                        ))
-                        .unwrap();
-                    let audio_reader = audio_processor
                         .readable()
                         .get_reader()
                         .unchecked_into::<ReadableStreamDefaultReader>();
@@ -333,7 +420,14 @@ impl Component for Host {
                     let mut video_frame_counter = 0;
                     let poll_video = async {
                         loop {
-                            if destroy.load(Ordering::Acquire) {
+                            if !is_video_enabled.load(Ordering::Acquire)
+                                || destroy.load(Ordering::Acquire)
+                            {
+                                video_track
+                                    .clone()
+                                    .unchecked_into::<MediaStreamTrack>()
+                                    .stop();
+                                video_encoder.close();
                                 return;
                             }
                             match JsFuture::from(video_reader.read()).await {
@@ -354,29 +448,8 @@ impl Component for Host {
                             }
                         }
                     };
-                    let poll_audio = async {
-                        loop {
-                            if destroy.load(Ordering::Acquire) {
-                                return;
-                            }
-                            match JsFuture::from(audio_reader.read()).await {
-                                Ok(js_frame) => {
-                                    let audio_frame =
-                                        Reflect::get(&js_frame, &JsString::from("value"))
-                                            .unwrap()
-                                            .unchecked_into::<AudioData>();
-                                    audio_encoder.encode(&audio_frame);
-                                    audio_frame.close();
-                                }
-                                Err(e) => {
-                                    log!("error", e);
-                                }
-                            }
-                        }
-                    };
-
-                    join!(poll_video, poll_audio).await;
-                    log!("Killing streamer");
+                    poll_video.await;
+                    log!("Killing video streamer");
                 });
                 true
             }
@@ -385,7 +458,7 @@ impl Component for Host {
 
     fn view(&self, _ctx: &Context<Self>) -> Html {
         html! {
-            <video class="self-camera" autoplay=true id="webcam"></video>
+            <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
         }
     }
 

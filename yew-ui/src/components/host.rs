@@ -28,7 +28,7 @@ use crate::model::transform_audio_chunk;
 use crate::model::transform_screen_chunk;
 use crate::model::transform_video_chunk;
 
-const VIDEO_ELEMENT_ID : &str = "webcam";
+const VIDEO_ELEMENT_ID: &str = "webcam";
 
 pub enum Msg {
     Start,
@@ -213,30 +213,6 @@ impl Component for Host {
             Msg::EnableMicrophone(should_enable) => {
                 if !should_enable {
                     log!("stopping mic");
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let navigator = window().navigator();
-                        let media_devices = navigator.media_devices().unwrap();
-                        // TODO: Add dropdown so that user can select the device that they want to use.
-                        let mut constraints = MediaStreamConstraints::new();
-                        constraints.video(&Boolean::from(true));
-                        constraints.audio(&Boolean::from(true));
-                        let devices_query = media_devices
-                            .get_user_media_with_constraints(&constraints)
-                            .unwrap();
-                        let device = JsFuture::from(devices_query)
-                            .await
-                            .unwrap()
-                            .unchecked_into::<MediaStream>();
-
-                        let video_track = Box::new(
-                            device
-                                .get_audio_tracks()
-                                .find(&mut |_: JsValue, _: u32, _: Array| true)
-                                .unchecked_into::<VideoTrack>(),
-                        );
-                        let video_track = video_track.unchecked_into::<MediaStreamTrack>();
-                        video_track.stop();
-                    });
                     return true;
                 }
                 let on_audio = Box::new(ctx.props().on_audio.clone());
@@ -261,7 +237,7 @@ impl Component for Host {
                     let media_devices = navigator.media_devices().unwrap();
                     // TODO: Add dropdown so that user can select the device that they want to use.
                     let mut constraints = MediaStreamConstraints::new();
-                    constraints.video(&Boolean::from(true));
+                    constraints.video(&Boolean::from(false));
                     constraints.audio(&Boolean::from(true));
                     let devices_query = media_devices
                         .get_user_media_with_constraints(&constraints)
@@ -300,7 +276,7 @@ impl Component for Host {
 
                     let audio_processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
-                            &audio_track.unchecked_into::<MediaStreamTrack>(),
+                            &audio_track.clone().unchecked_into::<MediaStreamTrack>(),
                         ))
                         .unwrap();
                     let audio_reader = audio_processor
@@ -310,10 +286,13 @@ impl Component for Host {
 
                     let poll_audio = async {
                         loop {
-                            if !mic_enabled.load(Ordering::Acquire) {
-                                return;
-                            }
-                            if destroy.load(Ordering::Acquire) {
+                            if !mic_enabled.load(Ordering::Acquire)
+                                || destroy.load(Ordering::Acquire)
+                            {
+                                let audio_track =
+                                    audio_track.clone().unchecked_into::<MediaStreamTrack>();
+                                audio_track.stop();
+                                audio_encoder.close();
                                 return;
                             }
                             match JsFuture::from(audio_reader.read()).await {
@@ -339,35 +318,6 @@ impl Component for Host {
 
             Msg::EnableVideo(should_enable) => {
                 if !should_enable {
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let navigator = window().navigator();
-                        let media_devices = navigator.media_devices().unwrap();
-                        let video_element = window()
-                            .document()
-                            .unwrap()
-                            .get_element_by_id(VIDEO_ELEMENT_ID)
-                            .unwrap()
-                            .unchecked_into::<HtmlVideoElement>();
-                        video_element.set_src_object(None);
-                        // TODO: Add dropdown so that user can select the device that they want to use.
-                        let mut constraints = MediaStreamConstraints::new();
-                        constraints.video(&Boolean::from(true));
-                        constraints.audio(&Boolean::from(true));
-                        let devices_query = media_devices
-                            .get_user_media_with_constraints(&constraints)
-                            .unwrap();
-                        let device = JsFuture::from(devices_query)
-                            .await
-                            .unwrap()
-                            .unchecked_into::<MediaStream>();
-
-                        let video_tracks = device.get_video_tracks();
-                        for video_track in video_tracks.iter() {
-                            let video_track = video_track.unchecked_into::<MediaStreamTrack>();
-                            video_track.stop();
-                            log!("stopping video track");
-                        }
-                    });
                     return true;
                 }
 
@@ -403,7 +353,7 @@ impl Component for Host {
                     // TODO: Add dropdown so that user can select the device that they want to use.
                     let mut constraints = MediaStreamConstraints::new();
                     constraints.video(&Boolean::from(true));
-                    constraints.audio(&Boolean::from(true));
+                    constraints.audio(&Boolean::from(false));
                     let devices_query = media_devices
                         .get_user_media_with_constraints(&constraints)
                         .unwrap();
@@ -458,7 +408,7 @@ impl Component for Host {
 
                     let video_processor =
                         MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
-                            &video_track.unchecked_into::<MediaStreamTrack>(),
+                            &video_track.clone().unchecked_into::<MediaStreamTrack>(),
                         ))
                         .unwrap();
                     let video_reader = video_processor
@@ -470,10 +420,14 @@ impl Component for Host {
                     let mut video_frame_counter = 0;
                     let poll_video = async {
                         loop {
-                            if !is_video_enabled.load(Ordering::Acquire) {
-                                return;
-                            }
-                            if destroy.load(Ordering::Acquire) {
+                            if !is_video_enabled.load(Ordering::Acquire)
+                                || destroy.load(Ordering::Acquire)
+                            {
+                                video_track
+                                    .clone()
+                                    .unchecked_into::<MediaStreamTrack>()
+                                    .stop();
+                                video_encoder.close();
                                 return;
                             }
                             match JsFuture::from(video_reader.read()).await {

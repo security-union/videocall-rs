@@ -1,12 +1,13 @@
 use futures::SinkExt;
 use futures::StreamExt;
+use protobuf::Message as ProtoMessage;
 use rand::Rng;
-use types::protos::media_packet::MediaPacket;
+use types::protos::media_packet::media_packet::MediaType;
 use std::env;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use types::protos::media_packet::MediaPacket;
 use url::Url;
-use protobuf::Message as ProtoMessage;
 
 #[tokio::main]
 async fn main() {
@@ -22,7 +23,12 @@ async fn main() {
     }
 
     for client in clients {
-        client.await;
+        match client.await {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Error joining bot handle: {}", e);
+            }
+        }
     }
 }
 
@@ -41,13 +47,14 @@ async fn create_client(endpoint: &str, room: &str, echo_user: &str) -> JoinHandl
                     if text == "Hello" {
                         ws_stream.send("Hello".into()).await.unwrap();
                     }
-                },
+                }
                 Message::Binary(bin) => {
                     // decode bin as protobuf
-                    let mut media_packet = MediaPacket::parse_from_bytes(&bin.into_boxed_slice()).unwrap();
+                    let mut media_packet =
+                        MediaPacket::parse_from_bytes(&bin.into_boxed_slice()).unwrap();
 
-                    // rewrite whatever is in the protobuf so that it seems like it is coming from this bot
-                    if media_packet.email == echo_user {
+                    // rewrite whatever video is in the protobuf so that it seems like it is coming from this bot
+                    if media_packet.email == echo_user && media_packet.media_type.unwrap() == MediaType::VIDEO {
                         media_packet.email = email.clone();
 
                         // send the protobuf back to the server

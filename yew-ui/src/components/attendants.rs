@@ -236,6 +236,14 @@ impl Component for AttendantsComponent {
                                 }
                             }
                         }
+                        media_packet::MediaType::COMMAND => {
+                            match packet.command_type.unwrap() {
+                                media_packet::CommandType::MUTE => {
+                                    log!("Muting mic from server command");
+                                    self.mic_enabled = false;
+                                }
+                            }
+                        }
                     }
                     false
                 } else {

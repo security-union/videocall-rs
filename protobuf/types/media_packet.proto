@@ -5,6 +5,10 @@ message MediaPacket {
     VIDEO = 0;
     AUDIO = 1;
     SCREEN = 2;
+    COMMAND = 3;
+  }
+  enum CommandType {
+    MUTE = 0;
   }
   MediaType media_type = 1;
   string email = 2;
@@ -12,12 +16,6 @@ message MediaPacket {
   string frame_type = 4;
   double timestamp = 5;
   double duration = 6;
-  AudioMetadata audio_metadata = 7;
+  CommandType command_type = 7;
 }
 
-message AudioMetadata {
-  string audio_format = 1;
-  uint32 audio_number_of_channels = 2;
-  uint32 audio_number_of_frames = 3;
-  float audio_sample_rate = 4;
-}

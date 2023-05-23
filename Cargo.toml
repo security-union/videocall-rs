@@ -1,0 +1,12 @@
+[workspace]
+
+exclude = [
+    "yew-ui"
+]
+
+members = [
+    "actix-api",
+    "bot",
+    "types",
+]
+

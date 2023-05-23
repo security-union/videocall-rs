@@ -45,7 +45,7 @@ impl WsChatSession {
 
     fn heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
-            if Instant::now().duration_since(act.heartbeat) > CLIENT_TIMEOUT {
+            if act.heartbeat.elapsed() > CLIENT_TIMEOUT {
                 // heartbeat timed out
                 println!("Websocket Client heartbeat failed, disconnecting!");
                 // notify chat server
@@ -60,6 +60,31 @@ impl WsChatSession {
             }
             ctx.ping(b"");
         });
+    }
+
+    fn join(&self, room_id: String, ctx: &mut WebsocketContext<Self>) {
+        let join_room = self.addr.send(JoinRoom {
+            room: room_id.clone(),
+            session: self.id.clone(),
+        });
+        let join_room = join_room.into_actor(self);
+        join_room
+            .then(move |response, act, ctx| {
+                match response {
+                    Ok(res) if res.is_ok() => {
+                        act.room = room_id.clone();
+                    }
+                    Ok(res) => {
+                        error!("error {:?}", res);
+                    }
+                    Err(err) => {
+                        error!("error {:?}", err);
+                        ctx.stop();
+                    }
+                }
+                fut::ready(())
+            })
+            .wait(ctx);
     }
 }
 
@@ -99,8 +124,8 @@ impl Handler<messages::session::Message> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: messages::session::Message, ctx: &mut Self::Context) -> Self::Result {
-        let media_packet = msg.msg.write_to_bytes().unwrap();
-        ctx.binary(media_packet);
+        let bytes = msg.msg.write_to_bytes().unwrap();
+        ctx.binary(bytes);
     }
 }
 
@@ -152,48 +177,18 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
     }
 }
 
-impl WsChatSession {
-    fn join(&self, room_id: String, ctx: &mut WebsocketContext<Self>) {
-        let join_room = self.addr.send(JoinRoom {
-            room: room_id.clone(),
-            session: self.id.clone(),
-        });
-        let join_room = join_room.into_actor(self);
-        join_room
-            .then(move |response, act, ctx| {
-                match response {
-                    Ok(res) if res.is_ok() => {
-                        act.room = room_id.clone();
-                    }
-                    Ok(res) => {
-                        error!("error {:?}", res);
-                    }
-                    Err(err) => {
-                        error!("error {:?}", err);
-                        ctx.stop();
-                    }
-                }
-                fut::ready(())
-            })
-            .wait(ctx);
-    }
-}
-
 impl Handler<MediaPacketUpdate> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: MediaPacketUpdate, _ctx: &mut Self::Context) -> Self::Result {
-        let room_id = self.room.clone();
         debug!(
             "got message and sending to chat session {} email {} room {}",
-            self.id.clone(),
-            self.email.clone(),
-            room_id.clone()
+            self.id, self.email, self.room
         );
         self.addr.do_send(ClientMessage {
             session: self.id.clone(),
             user: self.email.clone(),
-            room: room_id,
+            room: self.room.clone(),
             msg,
         });
     }

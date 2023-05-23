@@ -6,7 +6,7 @@ use crate::messages::{
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
 use std::collections::{HashMap, HashSet};
-use types::protos::media_packet::{MediaPacket, media_packet::CommandType};
+use types::protos::media_packet::{media_packet::CommandType, MediaPacket};
 
 use super::chat_session::{RoomId, SessionId};
 
@@ -48,7 +48,10 @@ impl ChatServer {
         self.sessions.get(&session_id).map(|addr| {
             let mut msg = MediaPacket::new();
             msg.command_type = command_type.into();
-            addr.do_send(Message { msg, nickname: None });
+            addr.do_send(Message {
+                msg,
+                nickname: None,
+            });
         });
     }
 

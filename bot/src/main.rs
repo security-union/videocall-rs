@@ -2,10 +2,10 @@ use futures::SinkExt;
 use futures::StreamExt;
 use protobuf::Message as ProtoMessage;
 use rand::Rng;
-use types::protos::media_packet::media_packet::MediaType;
 use std::env;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
 use url::Url;
 
@@ -54,7 +54,9 @@ async fn create_client(endpoint: &str, room: &str, echo_user: &str) -> JoinHandl
                         MediaPacket::parse_from_bytes(&bin.into_boxed_slice()).unwrap();
 
                     // rewrite whatever video is in the protobuf so that it seems like it is coming from this bot
-                    if media_packet.email == echo_user && media_packet.media_type.unwrap() == MediaType::VIDEO {
+                    if media_packet.email == echo_user
+                        && media_packet.media_type.unwrap() == MediaType::VIDEO
+                    {
                         media_packet.email = email.clone();
 
                         // send the protobuf back to the server

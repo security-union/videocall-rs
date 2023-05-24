@@ -8,11 +8,13 @@ use crate::model::configure_audio_context;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
+use gloo::timers::callback::Interval;
 use gloo_console::log;
 use js_sys::*;
 use protobuf::Message;
 use types::protos::media_packet::media_packet;
 use types::protos::media_packet::MediaPacket;
+use types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -46,8 +48,7 @@ pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
     OnInboundMedia(MediaPacketWrapper),
-    OnOutboundVideoPacket(MediaPacket),
-    OnOutboundAudioPacket(MediaPacket),
+    OnOutboundPacket(MediaPacket),
 }
 
 impl From<WsAction> for Msg {
@@ -83,6 +84,7 @@ pub struct AttendantsComponent {
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
+    pub heartbeat: Option<Interval>,
 }
 
 pub struct ClientSubscription {
@@ -109,6 +111,7 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
+            heartbeat: None,
         }
     }
 
@@ -118,7 +121,9 @@ impl Component for AttendantsComponent {
                 WsAction::Connect => {
                     let callback = ctx.link().callback(|data| Msg::OnInboundMedia(data));
                     let notification = ctx.link().batch_callback(|status| match status {
-                        WebSocketStatus::Opened => Some(WsAction::Connected.into()),
+                        WebSocketStatus::Opened => {
+                                                        Some(WsAction::Connected.into())
+                        },
                         WebSocketStatus::Closed | WebSocketStatus::Error => {
                             Some(WsAction::Lost.into())
                         }
@@ -126,12 +131,28 @@ impl Component for AttendantsComponent {
                     let AttendantsComponentProps { id, email, .. } = ctx.props();
                     let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, id);
                     let task = WebSocketService::connect(&url, callback, notification).unwrap();
+                    let link = ctx.link().clone();
+                    let email = email.clone();
+                    self.heartbeat = Some(Interval::new(1000, move || {
+                        let mut media_packet = MediaPacket::default();
+                        media_packet.media_type = MediaType::HEARTBEAT.into();
+                        media_packet.email = email.clone();
+                        media_packet.timestamp = js_sys::Date::now() as f64;
+                        link.send_message(Msg::OnOutboundPacket(media_packet));
+                    }));
                     self.ws = Some(task);
                     true
                 }
                 WsAction::Disconnect => {
                     log!("Disconnect");
                     self.ws.take();
+                    let heartbeat = self.heartbeat.take();
+                    match heartbeat {
+                        Some(heartbeat) => {
+                            heartbeat.cancel();
+                        }
+                        None => {}
+                    }
                     self.connected = false;
                     true
                 }
@@ -143,6 +164,13 @@ impl Component for AttendantsComponent {
                 WsAction::Lost => {
                     log!("Lost");
                     self.ws = None;
+                    let heartbeat = self.heartbeat.take();
+                    match heartbeat {
+                        Some(heartbeat) => {
+                            heartbeat.cancel();
+                        }
+                        None => {}
+                    }
                     self.connected = false;
                     false
                 }
@@ -235,6 +263,9 @@ impl Component for AttendantsComponent {
                                     return true;
                                 }
                             }
+                        }
+                        media_packet::MediaType::HEARTBEAT => {
+                            return true;
                         }
                     }
                     false
@@ -382,7 +413,7 @@ impl Component for AttendantsComponent {
                     true
                 }
             }
-            Msg::OnOutboundVideoPacket(media) => {
+            Msg::OnOutboundPacket(media) => {
                 if let Some(ws) = self.ws.as_mut() {
                     if self.connected {
                         match media
@@ -394,26 +425,8 @@ impl Component for AttendantsComponent {
                                 ws.send_binary(bytes);
                             }
                             Err(e) => {
-                                log!("error sending video packet: {:?}", e);
-                            }
-                        }
-                    }
-                }
-                false
-            }
-            Msg::OnOutboundAudioPacket(media) => {
-                if let Some(ws) = self.ws.as_mut() {
-                    if self.connected {
-                        match media
-                            .write_to_bytes()
-                            .map_err(|w| JsValue::from(format!("{:?}", w)))
-                        {
-                            Ok(bytes) => {
-                                // log!("sending audio packet: ", bytes.len(), " bytes");
-                                ws.send_binary(bytes);
-                            }
-                            Err(e) => {
-                                log!("error sending audio packet: {:?}", e);
+                                let packet_type = media.media_type.enum_value().unwrap();
+                                log!("error sending {} packet: {:?}", JsValue::from(format!("{}", packet_type)), e);
                             }
                         }
                     }
@@ -439,13 +452,10 @@ impl Component for AttendantsComponent {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let email = ctx.props().email.clone();
-        let on_frame = ctx
+        let on_packet = ctx
             .link()
-            .callback(|frame: MediaPacket| Msg::OnOutboundVideoPacket(frame));
+            .callback(|frame: MediaPacket| Msg::OnOutboundPacket(frame));
 
-        let on_audio = ctx
-            .link()
-            .callback(|frame: MediaPacket| Msg::OnOutboundAudioPacket(frame));
         let rows: Vec<VNode> = self
             .connected_peers
             .iter()
@@ -497,7 +507,7 @@ impl Component for AttendantsComponent {
                             { "Close" }
                         </button>
                     </div>
-                    <Host on_frame={on_frame} on_audio={on_audio} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>
+                    <Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>
                     <h4 class="floating-name">{email}</h4>
                 </nav>
             </div>

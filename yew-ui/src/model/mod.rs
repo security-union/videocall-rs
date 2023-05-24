@@ -2,7 +2,7 @@ use js_sys::Array;
 use protobuf::Message;
 use std::fmt;
 use types::protos::media_packet::{
-    media_packet::{self, MediaType},
+    media_packet::MediaType,
     MediaPacket,
 };
 use web_sys::*;
@@ -113,7 +113,7 @@ pub fn transform_video_chunk(
     chunk.copy_to_with_u8_array(buffer);
     media_packet.data = buffer[0..byte_length].to_vec();
     media_packet.frame_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
-    media_packet.media_type = media_packet::MediaType::VIDEO.into();
+    media_packet.media_type = MediaType::VIDEO.into();
     media_packet.timestamp = chunk.timestamp();
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
@@ -132,7 +132,7 @@ pub fn transform_screen_chunk(
     chunk.copy_to_with_u8_array(buffer);
     media_packet.data = buffer[0..byte_length].to_vec();
     media_packet.frame_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
-    media_packet.media_type = media_packet::MediaType::SCREEN.into();
+    media_packet.media_type = MediaType::SCREEN.into();
     media_packet.timestamp = chunk.timestamp();
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;

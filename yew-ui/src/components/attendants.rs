@@ -13,8 +13,8 @@ use gloo_console::log;
 use js_sys::*;
 use protobuf::Message;
 use types::protos::media_packet::media_packet;
-use types::protos::media_packet::MediaPacket;
 use types::protos::media_packet::media_packet::MediaType;
+use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -121,9 +121,7 @@ impl Component for AttendantsComponent {
                 WsAction::Connect => {
                     let callback = ctx.link().callback(|data| Msg::OnInboundMedia(data));
                     let notification = ctx.link().batch_callback(|status| match status {
-                        WebSocketStatus::Opened => {
-                                                        Some(WsAction::Connected.into())
-                        },
+                        WebSocketStatus::Opened => Some(WsAction::Connected.into()),
                         WebSocketStatus::Closed | WebSocketStatus::Error => {
                             Some(WsAction::Lost.into())
                         }
@@ -426,7 +424,11 @@ impl Component for AttendantsComponent {
                             }
                             Err(e) => {
                                 let packet_type = media.media_type.enum_value().unwrap();
-                                log!("error sending {} packet: {:?}", JsValue::from(format!("{}", packet_type)), e);
+                                log!(
+                                    "error sending {} packet: {:?}",
+                                    JsValue::from(format!("{}", packet_type)),
+                                    e
+                                );
                             }
                         }
                     }

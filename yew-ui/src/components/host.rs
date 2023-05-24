@@ -50,10 +50,7 @@ pub struct MeetingProps {
     pub id: String,
 
     #[prop_or_default]
-    pub on_frame: Callback<MediaPacket>,
-
-    #[prop_or_default]
-    pub on_audio: Callback<MediaPacket>,
+    pub on_packet: Callback<MediaPacket>,
 
     #[prop_or_default]
     pub email: String,
@@ -111,7 +108,7 @@ impl Component for Host {
         match msg {
             Msg::EnableScreenShare => {
                 let share_screen = self.share_screen.clone();
-                let on_frame = Box::new(ctx.props().on_frame.clone());
+                let on_frame = Box::new(ctx.props().on_packet.clone());
                 let email = Box::new(ctx.props().email.clone());
                 let destroy = self.destroy.clone();
                 let screen_output_handler = {
@@ -215,7 +212,7 @@ impl Component for Host {
                     log!("stopping mic");
                     return true;
                 }
-                let on_audio = Box::new(ctx.props().on_audio.clone());
+                let on_audio = Box::new(ctx.props().on_packet.clone());
                 let email = Box::new(ctx.props().email.clone());
 
                 let audio_output_handler = {
@@ -324,7 +321,7 @@ impl Component for Host {
                 // 1. Query the first device with a camera and a mic attached.
                 // 2. setup WebCodecs, in particular
                 // 3. send encoded video frames and raw audio to the server.
-                let on_frame = Box::new(ctx.props().on_frame.clone());
+                let on_frame = Box::new(ctx.props().on_packet.clone());
                 let email = Box::new(ctx.props().email.clone());
                 let is_video_enabled = self.video_enabled.clone();
 

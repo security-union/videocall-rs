@@ -1025,6 +1025,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "const_format",
+ "gloo",
  "gloo-console",
  "gloo-utils",
  "js-sys",

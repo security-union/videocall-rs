@@ -70,3 +70,11 @@ canvas {
   margin-top: 0;
   margin-left: 0;
 }
+
+.device-selector {
+  width: 200px;
+}
+
+.device-selector-wrapper {
+  margin-bottom: 20px;
+}

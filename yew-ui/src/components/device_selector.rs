@@ -5,13 +5,15 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::EventTarget;
 use web_sys::HtmlSelectElement;
+use web_sys::MediaDeviceInfo;
 use web_sys::MediaDeviceKind;
-use web_sys::{MediaDeviceInfo};
 use yew::prelude::*;
 
 pub struct DeviceSelector {
     audio_devices: Vec<MediaDeviceInfo>,
     video_devices: Vec<MediaDeviceInfo>,
+    video_selected: Option<String>,
+    audio_selected: Option<String>,
 }
 
 pub enum Msg {
@@ -56,6 +58,8 @@ impl Component for DeviceSelector {
         Self {
             audio_devices: Vec::new(),
             video_devices: Vec::new(),
+            audio_selected: None,
+            video_selected: None,
         }
     }
 
@@ -77,20 +81,26 @@ impl Component for DeviceSelector {
                 ctx.props()
                     .on_microphone_select
                     .emit(self.audio_devices[0].device_id());
+                self.video_selected = Some(self.video_devices[0].device_id());
+                self.audio_selected = Some(self.audio_devices[0].device_id());
                 true
             }
             Msg::OnCameraSelect(camera) => {
-                ctx.props().on_camera_select.emit(camera);
-                false
+                ctx.props().on_camera_select.emit(camera.clone());
+                self.video_selected = Some(camera);
+                true
             }
             Msg::OnMicSelect(mic) => {
-                ctx.props().on_microphone_select.emit(mic);
-                false
+                ctx.props().on_microphone_select.emit(mic.clone());
+                self.audio_selected = Some(mic);
+                true
             }
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        let selected_mic = self.audio_selected.clone().unwrap_or("".to_string());
+        let selected_camera = self.video_selected.clone().unwrap_or("".to_string());
         html! {
             <div class={"device-selector-wrapper"}>
                 <label for={"audio-select"}>{ "Audio:" }</label>
@@ -103,7 +113,7 @@ impl Component for DeviceSelector {
                     Msg::OnMicSelect(new_audio)
                 })}>
                     { for self.audio_devices.iter().map(|device| html! {
-                        <option value={device.device_id()}>
+                        <option value={device.device_id()} selected={selected_mic == device.device_id()}>
                             { device.label() }
                         </option>
                     }) }
@@ -117,7 +127,7 @@ impl Component for DeviceSelector {
                     Msg::OnCameraSelect(new_audio)
                 })}>
                     { for self.video_devices.iter().map(|device| html! {
-                        <option value={device.device_id()}>
+                        <option value={device.device_id()} selected={selected_camera == device.device_id()}>
                             { device.label() }
                         </option>
                     }) }

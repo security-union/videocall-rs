@@ -1,4 +1,5 @@
 use gloo_console::log;
+use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
@@ -18,6 +19,7 @@ use web_sys::HtmlVideoElement;
 use web_sys::*;
 use yew::prelude::*;
 
+use crate::components::device_selector::DeviceSelector;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
@@ -35,6 +37,8 @@ pub enum Msg {
     EnableScreenShare,
     EnableMicrophone(bool),
     EnableVideo(bool),
+    AudioDeviceChanged(String),
+    VideoDeviceChanged(String),
 }
 
 pub struct Host {
@@ -42,6 +46,12 @@ pub struct Host {
     pub share_screen: Arc<AtomicBool>,
     pub mic_enabled: Arc<AtomicBool>,
     pub video_enabled: Arc<AtomicBool>,
+
+    pub mic_selected: Option<String>,
+
+    pub video_selected: Option<String>,
+    pub switching_mic: Arc<AtomicBool>,
+    pub switching_video: Arc<AtomicBool>,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -72,6 +82,10 @@ impl Component for Host {
             share_screen: Arc::new(AtomicBool::new(false)),
             mic_enabled: Arc::new(AtomicBool::new(false)),
             video_enabled: Arc::new(AtomicBool::new(false)),
+            mic_selected: None,
+            video_selected: None,
+            switching_mic: Arc::new(AtomicBool::new(false)),
+            switching_video: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -206,14 +220,17 @@ impl Component for Host {
                 true
             }
             Msg::Start => true,
-
             Msg::EnableMicrophone(should_enable) => {
                 if !should_enable {
-                    log!("stopping mic");
                     return true;
                 }
                 let on_audio = Box::new(ctx.props().on_packet.clone());
                 let email = Box::new(ctx.props().email.clone());
+                let device_id = if let Some(mic) = &self.mic_selected {
+                    mic.to_string()
+                } else {
+                    return true;
+                };
 
                 let audio_output_handler = {
                     let email = email.clone();
@@ -228,14 +245,19 @@ impl Component for Host {
                 };
                 let destroy = self.destroy.clone();
                 let mic_enabled = self.mic_enabled.clone();
+                let switching_mic = self.switching_mic.clone();
+
                 wasm_bindgen_futures::spawn_local(async move {
                     log!("starting mic");
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
                     // TODO: Add dropdown so that user can select the device that they want to use.
                     let mut constraints = MediaStreamConstraints::new();
+                    let mut media_info = web_sys::MediaTrackConstraints::new();
+                    media_info.device_id(&device_id.into());
+
+                    constraints.audio(&media_info.into());
                     constraints.video(&Boolean::from(false));
-                    constraints.audio(&Boolean::from(true));
                     let devices_query = media_devices
                         .get_user_media_with_constraints(&constraints)
                         .unwrap();
@@ -285,7 +307,9 @@ impl Component for Host {
                         loop {
                             if !mic_enabled.load(Ordering::Acquire)
                                 || destroy.load(Ordering::Acquire)
+                                || switching_mic.load(Ordering::Acquire)
                             {
+                                switching_mic.store(false, Ordering::Release);
                                 let audio_track =
                                     audio_track.clone().unchecked_into::<MediaStreamTrack>();
                                 audio_track.stop();
@@ -312,7 +336,6 @@ impl Component for Host {
                 });
                 true
             }
-
             Msg::EnableVideo(should_enable) => {
                 if !should_enable {
                     return true;
@@ -324,7 +347,7 @@ impl Component for Host {
                 let on_frame = Box::new(ctx.props().on_packet.clone());
                 let email = Box::new(ctx.props().email.clone());
                 let is_video_enabled = self.video_enabled.clone();
-
+                let switching_video = self.switching_video.clone();
                 let video_output_handler = {
                     let email = email.clone();
                     let on_frame = on_frame.clone();
@@ -337,6 +360,11 @@ impl Component for Host {
                     })
                 };
                 let destroy = self.destroy.clone();
+                let device_id = if let Some(vid) = &self.video_selected {
+                    vid.to_string()
+                } else {
+                    return true;
+                };
                 wasm_bindgen_futures::spawn_local(async move {
                     let navigator = window().navigator();
                     let video_element = window()
@@ -349,8 +377,12 @@ impl Component for Host {
                     let media_devices = navigator.media_devices().unwrap();
                     // TODO: Add dropdown so that user can select the device that they want to use.
                     let mut constraints = MediaStreamConstraints::new();
-                    constraints.video(&Boolean::from(true));
+                    let mut media_info = web_sys::MediaTrackConstraints::new();
+                    media_info.device_id(&device_id.into());
+
+                    constraints.video(&media_info.into());
                     constraints.audio(&Boolean::from(false));
+
                     let devices_query = media_devices
                         .get_user_media_with_constraints(&constraints)
                         .unwrap();
@@ -419,12 +451,14 @@ impl Component for Host {
                         loop {
                             if !is_video_enabled.load(Ordering::Acquire)
                                 || destroy.load(Ordering::Acquire)
+                                || switching_video.load(Ordering::Acquire)
                             {
                                 video_track
                                     .clone()
                                     .unchecked_into::<MediaStreamTrack>()
                                     .stop();
                                 video_encoder.close();
+                                switching_video.store(false, Ordering::Release);
                                 return;
                             }
                             match JsFuture::from(video_reader.read()).await {
@@ -450,12 +484,47 @@ impl Component for Host {
                 });
                 true
             }
+            Msg::AudioDeviceChanged(audio) => {
+                log!("got audio device");
+                self.mic_selected = Some(audio);
+                if self.mic_enabled.load(Ordering::Acquire) {
+                    self.switching_mic.store(true, Ordering::Release);
+                    let link = ctx.link().clone();
+                    let timeout = Timeout::new(1000, move || {
+                        link.send_message(Msg::EnableMicrophone(true));
+                    });
+                    timeout.forget();
+                }
+                false
+            }
+            Msg::VideoDeviceChanged(video) => {
+                log!("got video device");
+                self.video_selected = Some(video);
+                if self.video_enabled.load(Ordering::Acquire) {
+                    self.switching_video.store(true, Ordering::Release);
+                    let link = ctx.link().clone();
+                    let timeout = Timeout::new(1000, move || {
+                        link.send_message(Msg::EnableVideo(true));
+                    });
+                    timeout.forget();
+                }
+                false
+            }
         }
     }
 
-    fn view(&self, _ctx: &Context<Self>) -> Html {
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        let mic_callback = ctx
+            .link()
+            .callback(|device: String| Msg::AudioDeviceChanged(device));
+        let cam_callback = ctx
+            .link()
+            .callback(|device: String| Msg::VideoDeviceChanged(device));
         html! {
-            <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
+            <>
+                <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
+                <DeviceSelector on_microphone_select={mic_callback} on_camera_select={cam_callback}/>
+            </>
         }
     }
 

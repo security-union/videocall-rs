@@ -23,6 +23,7 @@ serde = "1"
 serde_derive = "1"
 protobuf = "3.2.0"
 gloo = "0.8.0"
+gloo-timers = "0.2.6"
 
 [dependencies.web-sys]
 version = "0.3.60"
@@ -85,6 +86,9 @@ features = [
     "HtmlAudioElement",
     "AudioDataInit",
     "AudioSampleFormat",
-    "TransformStream"
+    "TransformStream",
+    "MediaDeviceInfo",
+    "MediaDeviceKind",
+    "MediaTrackConstraints"
 ]
 

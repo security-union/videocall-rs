@@ -1027,6 +1027,7 @@ dependencies = [
  "const_format",
  "gloo",
  "gloo-console",
+ "gloo-timers",
  "gloo-utils",
  "js-sys",
  "lazy_static",

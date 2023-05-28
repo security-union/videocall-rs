@@ -26,6 +26,8 @@ use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
 
+use super::device_permissions::request_permissions;
+
 // This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 // https://github.com/WebAudio/web-audio-api-v2/issues/133
 
@@ -35,6 +37,9 @@ pub enum WsAction {
     Connected,
     Disconnect,
     Lost,
+    RequestMediaPermissions,
+    MediaPermissionsGranted,
+    MediaPermissionsError(String),
 }
 
 #[derive(Debug)]
@@ -85,6 +90,8 @@ pub struct AttendantsComponent {
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub heartbeat: Option<Interval>,
+    pub error: Option<String>,
+    pub media_access_granted: bool,
 }
 
 pub struct ClientSubscription {
@@ -112,6 +119,8 @@ impl Component for AttendantsComponent {
             mic_enabled: false,
             video_enabled: false,
             heartbeat: None,
+            error: None,
+            media_access_granted: false,
         }
     }
 
@@ -172,6 +181,31 @@ impl Component for AttendantsComponent {
                     }
                     self.connected = false;
                     false
+                }
+                WsAction::RequestMediaPermissions => {
+                    let future = request_permissions();
+                    let link = ctx.link().clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match future.await {
+                            Ok(_) => {
+                                link.send_message(WsAction::MediaPermissionsGranted);
+                            }
+                            Err(_) => {
+                                link.send_message(WsAction::MediaPermissionsError("Error requesting permissions. Please make sure to allow access to both camera and microphone.".to_string()));
+                            }
+                        }
+                    });
+                    false
+                }
+                WsAction::MediaPermissionsGranted => {
+                    self.error = None;
+                    self.media_access_granted = true;
+                    ctx.link().send_message(WsAction::Connect);
+                    true
+                }
+                WsAction::MediaPermissionsError(error) => {
+                    self.error = Some(error);
+                    true
                 }
             },
             Msg::OnInboundMedia(response) => {
@@ -456,7 +490,7 @@ impl Component for AttendantsComponent {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let email = ctx.props().email.clone();
         let on_packet = ctx.link().callback(Msg::OnOutboundPacket);
-
+        let media_access_granted = self.media_access_granted;
         let rows: Vec<VNode> = self
             .connected_peers
             .iter()
@@ -484,6 +518,7 @@ impl Component for AttendantsComponent {
             .collect();
         html! {
             <div class="grid-container">
+                { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
                 { rows }
                 <nav class="host">
                     <div class="controls">
@@ -500,7 +535,7 @@ impl Component for AttendantsComponent {
                             { if !self.mic_enabled { "Unmute"} else { "Mute"} }
                             </button>
                         <button disabled={self.ws.is_some()}
-                                onclick={ctx.link().callback(|_| WsAction::Connect)}>
+                                onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
                             { "Connect" }
                         </button>
                         <button disabled={self.ws.is_none()}
@@ -508,7 +543,13 @@ impl Component for AttendantsComponent {
                             { "Close" }
                         </button>
                     </div>
-                    <Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>
+                    {
+                        if media_access_granted {
+                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>}
+                        } else {
+                            html! {<></>}
+                        }
+                    }
                     <h4 class="floating-name">{email}</h4>
                 </nav>
             </div>

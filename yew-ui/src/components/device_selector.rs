@@ -20,6 +20,7 @@ pub enum Msg {
     DevicesLoaded(Vec<MediaDeviceInfo>),
     OnCameraSelect(String),
     OnMicSelect(String),
+    LoadDevices(),
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -34,27 +35,9 @@ impl Component for DeviceSelector {
 
     fn create(ctx: &Context<Self>) -> Self {
         let link = ctx.link().clone();
-
         wasm_bindgen_futures::spawn_local(async move {
-            let navigator = window().navigator();
-            let media_devices = navigator.media_devices().unwrap();
-
-            let promise: Promise = media_devices
-                .enumerate_devices()
-                .expect("enumerate devices");
-            let future = JsFuture::from(promise);
-            let devices = future
-                .await
-                .expect("await devices")
-                .unchecked_into::<Array>();
-            let devices = devices.to_vec();
-            let devices = devices
-                .into_iter()
-                .map(|d| d.unchecked_into::<MediaDeviceInfo>())
-                .collect::<Vec<MediaDeviceInfo>>();
-            link.send_message(Msg::DevicesLoaded(devices));
+            link.send_message(Msg::LoadDevices());
         });
-
         Self {
             audio_devices: Vec::new(),
             video_devices: Vec::new(),
@@ -63,8 +46,37 @@ impl Component for DeviceSelector {
         }
     }
 
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render {
+            ctx.link().send_message(Msg::LoadDevices());
+        }
+    }
+
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
+            Msg::LoadDevices() => {
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let navigator = window().navigator();
+                    let media_devices = navigator.media_devices().unwrap();
+
+                    let promise: Promise = media_devices
+                        .enumerate_devices()
+                        .expect("enumerate devices");
+                    let future = JsFuture::from(promise);
+                    let devices = future
+                        .await
+                        .expect("await devices")
+                        .unchecked_into::<Array>();
+                    let devices = devices.to_vec();
+                    let devices = devices
+                        .into_iter()
+                        .map(|d| d.unchecked_into::<MediaDeviceInfo>())
+                        .collect::<Vec<MediaDeviceInfo>>();
+                    link.send_message(Msg::DevicesLoaded(devices));
+                });
+                false
+            }
             Msg::DevicesLoaded(devices) => {
                 self.audio_devices = devices
                     .clone()

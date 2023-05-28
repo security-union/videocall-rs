@@ -20,6 +20,7 @@ use web_sys::*;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
+use crate::constants::AUDIO_BITRATE;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
@@ -288,7 +289,7 @@ impl Component for Host {
                             .unchecked_into::<AudioTrack>(),
                     );
                     let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
-                    audio_encoder_config.bitrate(100_000f64);
+                    audio_encoder_config.bitrate(AUDIO_BITRATE);
                     audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE as u32);
                     audio_encoder_config.number_of_channels(AUDIO_CHANNELS as u32);
                     audio_encoder.configure(&audio_encoder_config);

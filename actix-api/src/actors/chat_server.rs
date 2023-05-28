@@ -135,7 +135,7 @@ impl Handler<JoinRoom> for ChatServer {
         info!(
             "someone connected to room {} with session {} result {:?}",
             room.clone(),
-            session.clone(),
+            session.clone().trim(),
             result
         );
         MessageResult(result)

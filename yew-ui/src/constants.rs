@@ -1,6 +1,6 @@
 // This is read at compile time, please restart if you change this value.
 pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
-pub static AUDIO_CODEC: &str = "opus"; // https://www.w3.org/TR/webcodecs-codec-registry/#audio-codec-registry
+pub static AUDIO_CODEC: &str = "mp4a.40.05"; // https://www.w3.org/TR/webcodecs-codec-registry/#audio-codec-registry
 pub static VIDEO_CODEC: &str = "vp09.00.10.08"; // profile 0,level 1.0, bit depth 8,
 
 // Commented out because it is not as fast as vp9.
@@ -14,14 +14,12 @@ pub static VIDEO_CODEC: &str = "vp09.00.10.08"; // profile 0,level 1.0, bit dept
 
 pub const AUDIO_CHANNELS: u32 = 1u32;
 pub const AUDIO_SAMPLE_RATE: u32 = 48000u32;
+pub const AUDIO_BITRATE: f64 = 96000f64;
 
 pub const VIDEO_HEIGHT: i32 = 720i32;
 pub const VIDEO_WIDTH: i32 = 1280i32;
 pub const ACTIX_WEBSOCKET: &'static str = concat!(
-    "ws://",
-    std::env!("ACTIX_HOST"),
-    ":",
-    std::env!("ACTIX_PORT"),
+    std::env!("ACTIX_UI_BACKEND_URL"),
     "/lobby"
 );
 

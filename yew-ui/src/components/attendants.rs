@@ -128,6 +128,7 @@ impl Component for AttendantsComponent {
                     });
                     let AttendantsComponentProps { id, email, .. } = ctx.props();
                     let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, id);
+                    log!("Connecting to ", &url);
                     let task = WebSocketService::connect(&url, callback, notification).unwrap();
                     let link = ctx.link().clone();
                     let email = email.clone();

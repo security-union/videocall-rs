@@ -13,7 +13,7 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use log::{debug, error};
+use log::{debug, error, info};
 use protobuf::Message;
 use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
@@ -32,7 +32,8 @@ pub struct WsChatSession {
 
 impl WsChatSession {
     pub fn new(addr: Addr<ChatServer>, room: String, email: String) -> Self {
-        let session = WsChatSession {
+        info!("new session with room {} and email {}", room, email);
+        let session = WsChatSession { 
             id: Uuid::new_v4().to_string(),
             heartbeat: Instant::now(),
             room,

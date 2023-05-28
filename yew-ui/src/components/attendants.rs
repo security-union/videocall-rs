@@ -119,7 +119,7 @@ impl Component for AttendantsComponent {
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
-                    let callback = ctx.link().callback(|data| Msg::OnInboundMedia(data));
+                    let callback = ctx.link().callback(Msg::OnInboundMedia);
                     let notification = ctx.link().batch_callback(|status| match status {
                         WebSocketStatus::Opened => Some(WsAction::Connected.into()),
                         WebSocketStatus::Closed | WebSocketStatus::Error => {
@@ -127,7 +127,7 @@ impl Component for AttendantsComponent {
                         }
                     });
                     let AttendantsComponentProps { id, email, .. } = ctx.props();
-                    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET.to_string(), email, id);
+                    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
                     log!("Connecting to ", &url);
                     let task = WebSocketService::connect(&url, callback, notification).unwrap();
                     let link = ctx.link().clone();
@@ -136,7 +136,7 @@ impl Component for AttendantsComponent {
                         let mut media_packet = MediaPacket::default();
                         media_packet.media_type = MediaType::HEARTBEAT.into();
                         media_packet.email = email.clone();
-                        media_packet.timestamp = js_sys::Date::now() as f64;
+                        media_packet.timestamp = js_sys::Date::now();
                         link.send_message(Msg::OnOutboundPacket(media_packet));
                     }));
                     self.ws = Some(task);
@@ -202,7 +202,7 @@ impl Component for AttendantsComponent {
                                     peer.waiting_for_video_keyframe = false;
                                 } else if peer.video_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
-                                    self.connected_peers.remove(&email.clone());
+                                    self.connected_peers.remove(&email);
                                 }
                             }
                         }
@@ -210,7 +210,7 @@ impl Component for AttendantsComponent {
                             let audio_data = packet.data;
                             let audio_data_js: js_sys::Uint8Array =
                                 js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
-                            audio_data_js.copy_from(&audio_data.as_slice());
+                            audio_data_js.copy_from(audio_data.as_slice());
                             let chunk_type = EncodedAudioChunkType::from_js_value(&JsValue::from(
                                 packet.frame_type,
                             ))
@@ -231,7 +231,7 @@ impl Component for AttendantsComponent {
                                     peer.waiting_for_audio_keyframe = false;
                                 } else if peer.audio_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
-                                    self.connected_peers.remove(&email.clone());
+                                    self.connected_peers.remove(&email);
                                 }
                             }
                         }
@@ -258,7 +258,7 @@ impl Component for AttendantsComponent {
                                     return true;
                                 } else if peer.screen_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
-                                    self.connected_peers.remove(&email.clone());
+                                    self.connected_peers.remove(&email);
                                     return true;
                                 }
                             }
@@ -278,7 +278,7 @@ impl Component for AttendantsComponent {
                     })
                         as Box<dyn FnMut(JsValue)>);
                     let audio_stream_generator = MediaStreamTrackGenerator::new(
-                        &MediaStreamTrackGeneratorInit::new(&"audio"),
+                        &MediaStreamTrackGeneratorInit::new("audio"),
                     )
                     .unwrap();
                     // The audio context is used to reproduce audio.
@@ -312,9 +312,9 @@ impl Component for AttendantsComponent {
                     ))
                     .unwrap();
                     audio_decoder.configure(&AudioDecoderConfig::new(
-                        &AUDIO_CODEC,
-                        AUDIO_CHANNELS as u32,
-                        AUDIO_SAMPLE_RATE as u32,
+                        AUDIO_CODEC,
+                        AUDIO_CHANNELS,
+                        AUDIO_SAMPLE_RATE,
                     ));
                     let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
                         let chunk = Box::new(original_chunk);
@@ -328,8 +328,8 @@ impl Component for AttendantsComponent {
                             .get_element_by_id(&email.clone())
                             .unwrap()
                             .unchecked_into::<HtmlCanvasElement>();
-                        render_canvas.set_width(width as u32);
-                        render_canvas.set_height(height as u32);
+                        render_canvas.set_width(width);
+                        render_canvas.set_height(height);
                         let ctx = render_canvas
                             .get_context("2d")
                             .unwrap()
@@ -349,7 +349,7 @@ impl Component for AttendantsComponent {
                         video_output.as_ref().unchecked_ref(),
                     ))
                     .unwrap();
-                    video_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
+                    video_decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC));
                     let screen_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
                         let chunk = Box::new(original_chunk);
                         let video_chunk = chunk.unchecked_into::<VideoFrame>();
@@ -362,8 +362,8 @@ impl Component for AttendantsComponent {
                             .get_element_by_id(&screen_canvas_id.clone())
                             .unwrap()
                             .unchecked_into::<HtmlCanvasElement>();
-                        render_canvas.set_width(width as u32);
-                        render_canvas.set_height(height as u32);
+                        render_canvas.set_width(width);
+                        render_canvas.set_height(height);
                         let ctx = render_canvas
                             .get_context("2d")
                             .unwrap()
@@ -389,10 +389,10 @@ impl Component for AttendantsComponent {
                         screen_output.as_ref().unchecked_ref(),
                     ))
                     .unwrap();
-                    screen_decoder.configure(&VideoDecoderConfig::new(&VIDEO_CODEC));
+                    screen_decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC));
 
                     self.connected_peers.insert(
-                        packet.email.clone(),
+                        packet.email,
                         ClientSubscription {
                             video_decoder,
                             audio_decoder,
@@ -457,7 +457,7 @@ impl Component for AttendantsComponent {
         let email = ctx.props().email.clone();
         let on_packet = ctx
             .link()
-            .callback(|frame: MediaPacket| Msg::OnOutboundPacket(frame));
+            .callback(Msg::OnOutboundPacket);
 
         let rows: Vec<VNode> = self
             .connected_peers

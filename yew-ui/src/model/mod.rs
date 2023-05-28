@@ -18,7 +18,7 @@ impl From<Binary> for MediaPacketWrapper {
     fn from(bin: Binary) -> Self {
         let media_packet: MediaPacket = bin
             .map(|data| MediaPacket::parse_from_bytes(&data.into_boxed_slice()).unwrap())
-            .unwrap_or(MediaPacket::default());
+            .unwrap_or_default();
         MediaPacketWrapper(media_packet)
     }
 }
@@ -105,7 +105,7 @@ pub fn transform_video_chunk(
     email: Box<String>,
 ) -> MediaPacket {
     let mut media_packet: MediaPacket = MediaPacket::default();
-    media_packet.email = *email.clone();
+    media_packet.email = *email;
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
     media_packet.data = buffer[0..byte_length].to_vec();
@@ -124,7 +124,7 @@ pub fn transform_screen_chunk(
     email: Box<String>,
 ) -> MediaPacket {
     let mut media_packet: MediaPacket = MediaPacket::default();
-    media_packet.email = *email.clone();
+    media_packet.email = *email;
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
     media_packet.data = buffer[0..byte_length].to_vec();
@@ -159,7 +159,7 @@ pub fn configure_audio_context(
     audio_stream_generator: &MediaStreamTrackGenerator,
 ) -> anyhow::Result<AudioContext> {
     let js_tracks = Array::new();
-    js_tracks.push(&audio_stream_generator);
+    js_tracks.push(audio_stream_generator);
     let media_stream = MediaStream::new_with_tracks(&js_tracks).unwrap();
     let mut audio_context_options = AudioContextOptions::new();
     audio_context_options.sample_rate(AUDIO_SAMPLE_RATE as f32);

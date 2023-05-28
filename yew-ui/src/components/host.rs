@@ -127,8 +127,8 @@ impl Component for Host {
                 let email = Box::new(ctx.props().email.clone());
                 let destroy = self.destroy.clone();
                 let screen_output_handler = {
-                    let email = email.clone();
-                    let on_frame = on_frame.clone();
+                    let email = email;
+                    let on_frame = on_frame;
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -168,7 +168,7 @@ impl Component for Host {
 
                     let screen_encoder = Box::new(VideoEncoder::new(&screen_encoder_init).unwrap());
                     let mut screen_encoder_config = VideoEncoderConfig::new(
-                        &VIDEO_CODEC,
+                        VIDEO_CODEC,
                         VIDEO_HEIGHT as u32,
                         VIDEO_WIDTH as u32,
                     );
@@ -234,8 +234,8 @@ impl Component for Host {
                 };
 
                 let audio_output_handler = {
-                    let email = email.clone();
-                    let on_audio = on_audio.clone();
+                    let email = email;
+                    let on_audio = on_audio;
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
@@ -288,10 +288,10 @@ impl Component for Host {
                             .find(&mut |_: JsValue, _: u32, _: Array| true)
                             .unchecked_into::<AudioTrack>(),
                     );
-                    let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
+                    let mut audio_encoder_config = AudioEncoderConfig::new(AUDIO_CODEC);
                     audio_encoder_config.bitrate(AUDIO_BITRATE);
-                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE as u32);
-                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS as u32);
+                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE);
+                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS);
                     audio_encoder.configure(&audio_encoder_config);
 
                     let audio_processor =
@@ -350,8 +350,8 @@ impl Component for Host {
                 let is_video_enabled = self.video_enabled.clone();
                 let switching_video = self.switching_video.clone();
                 let video_output_handler = {
-                    let email = email.clone();
-                    let on_frame = on_frame.clone();
+                    let email = email;
+                    let on_frame = on_frame;
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -427,7 +427,7 @@ impl Component for Host {
                     video_settings.height(VIDEO_HEIGHT);
 
                     let mut video_encoder_config = VideoEncoderConfig::new(
-                        &VIDEO_CODEC,
+                        VIDEO_CODEC,
                         VIDEO_HEIGHT as u32,
                         VIDEO_WIDTH as u32,
                     );
@@ -517,10 +517,10 @@ impl Component for Host {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let mic_callback = ctx
             .link()
-            .callback(|device: String| Msg::AudioDeviceChanged(device));
+            .callback(Msg::AudioDeviceChanged);
         let cam_callback = ctx
             .link()
-            .callback(|device: String| Msg::VideoDeviceChanged(device));
+            .callback(Msg::VideoDeviceChanged);
         html! {
             <>
                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>

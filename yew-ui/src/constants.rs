@@ -18,7 +18,7 @@ pub const AUDIO_BITRATE: f64 = 96000f64;
 
 pub const VIDEO_HEIGHT: i32 = 720i32;
 pub const VIDEO_WIDTH: i32 = 1280i32;
-pub const ACTIX_WEBSOCKET: &'static str = concat!(
+pub const ACTIX_WEBSOCKET: &str = concat!(
     std::env!("ACTIX_UI_BACKEND_URL"),
     "/lobby"
 );

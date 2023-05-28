@@ -33,9 +33,8 @@ pub struct WsChatSession {
 impl WsChatSession {
     pub fn new(addr: Addr<ChatServer>, room: String, email: String) -> Self {
         info!("new session with room {} and email {}", room, email);
-        
 
-        WsChatSession { 
+        WsChatSession {
             id: Uuid::new_v4().to_string(),
             heartbeat: Instant::now(),
             room,

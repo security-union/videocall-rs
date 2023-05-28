@@ -173,7 +173,7 @@ pub async fn ws_connect(
     let chat = state.chat.clone();
     let actor = WsChatSession::new(chat, room, email);
     let codec = Codec::new().max_size(1_000_000);
-    
+
     start_with_codec(actor, &req, stream, codec)
 }
 

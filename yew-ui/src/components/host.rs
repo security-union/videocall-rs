@@ -515,12 +515,8 @@ impl Component for Host {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let mic_callback = ctx
-            .link()
-            .callback(Msg::AudioDeviceChanged);
-        let cam_callback = ctx
-            .link()
-            .callback(Msg::VideoDeviceChanged);
+        let mic_callback = ctx.link().callback(Msg::AudioDeviceChanged);
+        let cam_callback = ctx.link().callback(Msg::VideoDeviceChanged);
         html! {
             <>
                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>

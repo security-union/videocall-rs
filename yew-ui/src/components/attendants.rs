@@ -455,9 +455,7 @@ impl Component for AttendantsComponent {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let email = ctx.props().email.clone();
-        let on_packet = ctx
-            .link()
-            .callback(Msg::OnOutboundPacket);
+        let on_packet = ctx.link().callback(Msg::OnOutboundPacket);
 
         let rows: Vec<VNode> = self
             .connected_peers

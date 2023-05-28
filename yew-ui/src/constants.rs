@@ -18,10 +18,7 @@ pub const AUDIO_BITRATE: f64 = 96000f64;
 
 pub const VIDEO_HEIGHT: i32 = 720i32;
 pub const VIDEO_WIDTH: i32 = 1280i32;
-pub const ACTIX_WEBSOCKET: &str = concat!(
-    std::env!("ACTIX_UI_BACKEND_URL"),
-    "/lobby"
-);
+pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
 
 fn truthy(s: String) -> bool {
     ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())

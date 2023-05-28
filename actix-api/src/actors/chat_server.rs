@@ -30,14 +30,18 @@ impl ChatServer {
         skip_id: &String,
         user: Option<String>,
     ) {
-        if let Some(sessions) = self.rooms.get(room) { sessions.iter().for_each(|id| {
+        if let Some(sessions) = self.rooms.get(room) {
+            sessions.iter().for_each(|id| {
                 if id != skip_id {
-                    if let Some(addr) = self.sessions.get(id) { addr.do_send(Message {
+                    if let Some(addr) = self.sessions.get(id) {
+                        addr.do_send(Message {
                             nickname: user.clone(),
                             msg: message.clone(),
-                        }) }
+                        })
+                    }
                 }
-            }); }
+            });
+        }
     }
 
     pub fn leave_rooms(&mut self, session_id: &SessionId) {
@@ -95,11 +99,7 @@ impl Handler<ClientMessage> for ChatServer {
             room,
             msg,
         } = msg;
-        debug!(
-            "got message in server room {} session {}",
-            room,
-            session
-        );
+        debug!("got message in server room {} session {}", room, session);
         self.send_message(&room, &msg.media_packet, &session, Some(user));
     }
 }

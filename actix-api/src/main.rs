@@ -39,7 +39,7 @@ const OAUTH_SECRET: &str = std::env!("OAUTH_CLIENT_SECRET");
 const OAUTH_REDIRECT_URL: &str = std::env!("OAUTH_REDIRECT_URL");
 const SCOPE: &str = "email%20profile%20openid";
 const ACTIX_PORT: &str = std::env!("ACTIX_PORT");
-const AFTER_LOGIN_URL: &'static str = concat!("http://localhost:", std::env!("TRUNK_SERVE_PORT"));
+const AFTER_LOGIN_URL: &str = concat!("http://localhost:", std::env!("TRUNK_SERVE_PORT"));
 
 pub mod auth;
 pub mod db;
@@ -59,7 +59,7 @@ async fn login(pool: web::Data<PostgresPool>) -> Result<HttpResponse, Error> {
     // 2. Generate and Store OAuth Request.
     let (csrf_token, pkce_challenge) = {
         let pool = pool2.clone();
-        web::block(move || generate_and_store_oauth_request(pool.clone())).await?
+        web::block(move || generate_and_store_oauth_request(pool)).await?
     }
     .map_err(|e| {
         log::error!("{:?}", e);
@@ -173,8 +173,8 @@ pub async fn ws_connect(
     let chat = state.chat.clone();
     let actor = WsChatSession::new(chat, room, email);
     let codec = Codec::new().max_size(1_000_000);
-    let resp = start_with_codec(actor, &req, stream, codec);
-    resp
+    
+    start_with_codec(actor, &req, stream, codec)
 }
 
 #[actix_web::main]
@@ -189,7 +189,7 @@ async fn main() -> std::io::Result<()> {
         let pool = get_pool();
 
         App::new()
-            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(pool))
             .app_data(web::Data::new(AppState { chat: chat.clone() }))
             .wrap(cors)
             .service(handle_google_oauth_callback)

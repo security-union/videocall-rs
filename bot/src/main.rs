@@ -2,11 +2,14 @@ use futures::SinkExt;
 use futures::StreamExt;
 use rand::Rng;
 use types::protos::media_packet::MediaPacket;
+use types::protos::media_packet::media_packet::MediaType;
 use std::env;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 use protobuf::Message as ProtoMessage;
+use chrono::Utc;
+
 
 #[tokio::main]
 async fn main() {
@@ -29,9 +32,17 @@ async fn main() {
 async fn create_client(endpoint: &str, room: &str, echo_user: &str) -> JoinHandle<()> {
     let email = generate_email();
     let url = format!("{}/lobby/{}/{}", endpoint, email, room);
-    let (ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
+    let (mut ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
     println!("Connected to {}", url);
     let echo_user = echo_user.to_string();
+    // Send a single heartbeat just so that we show up on the ui
+    let mut media_packet = MediaPacket::default();
+    media_packet.media_type = MediaType::HEARTBEAT.into();
+    media_packet.email = email.clone();
+    media_packet.timestamp = Utc::now().timestamp_millis() as f64;
+    let mut buf = Vec::new();
+    media_packet.write_to_vec(&mut buf).unwrap();
+    ws_stream.send(Message::Binary(buf)).await.unwrap();
     tokio::spawn(async move {
         let mut ws_stream = ws_stream;
         while let Some(msg) = ws_stream.next().await {

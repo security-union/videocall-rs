@@ -145,7 +145,7 @@ impl Component for AttendantsComponent {
                         let mut media_packet = MediaPacket::default();
                         media_packet.media_type = MediaType::HEARTBEAT.into();
                         media_packet.email = email.clone();
-                        media_packet.timestamp = js_sys::Date::now();
+                        media_packet.timestamp = js_sys::Date::now() ;
                         link.send_message(Msg::OnOutboundPacket(media_packet));
                     }));
                     self.ws = Some(task);
@@ -298,7 +298,7 @@ impl Component for AttendantsComponent {
                             }
                         }
                         media_packet::MediaType::HEARTBEAT => {
-                            return true;
+                            return false;
                         }
                     }
                     false
@@ -488,6 +488,7 @@ impl Component for AttendantsComponent {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        log!("rendering meeting");
         let email = ctx.props().email.clone();
         let on_packet = ctx.link().callback(Msg::OnOutboundPacket);
         let media_access_granted = self.media_access_granted;

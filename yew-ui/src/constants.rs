@@ -16,8 +16,12 @@ pub const AUDIO_CHANNELS: u32 = 1u32;
 pub const AUDIO_SAMPLE_RATE: u32 = 48000u32;
 pub const AUDIO_BITRATE: f64 = 96000f64;
 
-pub const VIDEO_HEIGHT: i32 = 720i32;
-pub const VIDEO_WIDTH: i32 = 1280i32;
+// vga resolution
+pub const VIDEO_HEIGHT: i32 = 480i32;
+pub const VIDEO_WIDTH: i32 = 640i32;
+
+// pub const VIDEO_HEIGHT: i32 = 720i32;
+// pub const VIDEO_WIDTH: i32 = 1280i32;
 pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
 
 fn truthy(s: String) -> bool {

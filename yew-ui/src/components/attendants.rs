@@ -488,26 +488,24 @@ impl AttendantsComponent {
             AUDIO_SAMPLE_RATE,
         ));
         let canvas_email = email.clone();
+        let document = window().unwrap().document().unwrap();
         let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
             let chunk = Box::new(original_chunk);
             let video_chunk = chunk.unchecked_into::<VideoFrame>();
             let width = video_chunk.coded_width();
             let height = video_chunk.coded_height();
-            let render_canvas = window()
-                .unwrap()
-                .document()
-                .unwrap()
+            let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
+            let render_canvas = document
                 .get_element_by_id(&canvas_email)
                 .unwrap()
-                .unchecked_into::<HtmlCanvasElement>();
-            render_canvas.set_width(width);
-            render_canvas.set_height(height);
+                .unchecked_into::<HtmlCanvasElement>();   
             let ctx = render_canvas
                 .get_context("2d")
                 .unwrap()
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
-            let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
+            render_canvas.set_width(width);
+            render_canvas.set_height(height);
             if let Err(e) =
                 ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0)
             {

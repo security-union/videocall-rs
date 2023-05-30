@@ -19,7 +19,7 @@ use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
-use log::info;
+use log::{info, debug};
 
 use crate::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},
@@ -169,11 +169,10 @@ pub async fn ws_connect(
     state: web::Data<AppState>,
 ) -> impl Responder {
     let (email, room) = session.into_inner();
-    info!("socket connected");
+    debug!("socket connected");
     let chat = state.chat.clone();
     let actor = WsChatSession::new(chat, room, email);
     let codec = Codec::new().max_size(1_000_000);
-
     start_with_codec(actor, &req, stream, codec)
 }
 

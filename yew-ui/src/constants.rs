@@ -1,7 +1,7 @@
 // This is read at compile time, please restart if you change this value.
 pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
 pub static AUDIO_CODEC: &str = "mp4a.40.05"; // https://www.w3.org/TR/webcodecs-codec-registry/#audio-codec-registry
-pub static VIDEO_CODEC: &str = "vp09.00.10.08"; // profile 0,level 1.0, bit depth 8,
+pub static VIDEO_CODEC: &str = "vp8"; // profile 0,level 1.0, bit depth 8,
 
 // Commented out because it is not as fast as vp9.
 
@@ -17,11 +17,11 @@ pub const AUDIO_SAMPLE_RATE: u32 = 48000u32;
 pub const AUDIO_BITRATE: f64 = 96000f64;
 
 // vga resolution
-pub const VIDEO_HEIGHT: i32 = 480i32;
-pub const VIDEO_WIDTH: i32 = 640i32;
+// pub const VIDEO_HEIGHT: i32 = 480i32;
+// pub const VIDEO_WIDTH: i32 = 640i32;
 
-// pub const VIDEO_HEIGHT: i32 = 720i32;
-// pub const VIDEO_WIDTH: i32 = 1280i32;
+pub const VIDEO_HEIGHT: i32 = 720i32;
+pub const VIDEO_WIDTH: i32 = 1280i32;
 pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
 
 fn truthy(s: String) -> bool {

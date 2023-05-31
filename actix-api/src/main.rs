@@ -19,7 +19,7 @@ use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
-use log::{info, debug};
+use log::{debug, info};
 
 use crate::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},

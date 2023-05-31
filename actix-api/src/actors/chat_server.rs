@@ -5,7 +5,10 @@ use crate::messages::{
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use types::protos::media_packet::MediaPacket;
 
 use super::chat_session::{RoomId, SessionId};
@@ -26,9 +29,9 @@ impl ChatServer {
     pub fn send_message(
         &self,
         room: &RoomId,
-        message: &MediaPacket,
+        message: Arc<MediaPacket>,
         skip_id: &String,
-        user: Option<String>,
+        user: Arc<Option<String>>,
     ) {
         if let Some(sessions) = self.rooms.get(room) {
             sessions.iter().for_each(|id| {
@@ -100,7 +103,9 @@ impl Handler<ClientMessage> for ChatServer {
             msg,
         } = msg;
         debug!("got message in server room {} session {}", room, session);
-        self.send_message(&room, &msg.media_packet, &session, Some(user));
+        let message = Arc::new(msg.media_packet);
+        let nickname = Arc::new(Some(user));
+        self.send_message(&room, message, &session, nickname);
     }
 }
 

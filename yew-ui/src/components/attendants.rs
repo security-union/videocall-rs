@@ -153,7 +153,7 @@ impl Component for AttendantsComponent {
                         let mut media_packet = MediaPacket::default();
                         media_packet.media_type = MediaType::HEARTBEAT.into();
                         media_packet.email = email.clone();
-                        media_packet.timestamp = js_sys::Date::now() ;
+                        media_packet.timestamp = js_sys::Date::now();
                         link.send_message(Msg::OnOutboundPacket(media_packet));
                     }));
                     self.ws = Some(task);
@@ -249,7 +249,8 @@ impl Component for AttendantsComponent {
                                     if let Some(index) = self
                                         .sorted_connected_peers_keys
                                         .iter()
-                                        .position(|x| *x == email) {
+                                        .position(|x| *x == email)
+                                    {
                                         self.sorted_connected_peers_keys.remove(index);
                                     }
                                     self.insert_peer(email.clone(), screen_canvas_id);
@@ -364,10 +365,7 @@ impl Component for AttendantsComponent {
         }
     }
 
-
-
     fn view(&self, ctx: &Context<Self>) -> Html {
-        log!("rendering meeting");
         let email = ctx.props().email.clone();
         let on_packet = ctx.link().callback(Msg::OnOutboundPacket);
         let media_access_granted = self.media_access_granted;
@@ -442,16 +440,12 @@ impl AttendantsComponent {
     fn insert_peer(&mut self, email: String, screen_canvas_id: String) {
         let error_video = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
-        })
-            as Box<dyn FnMut(JsValue)>);
+        }) as Box<dyn FnMut(JsValue)>);
         let error_audio = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
-        })
-            as Box<dyn FnMut(JsValue)>);
-        let audio_stream_generator = MediaStreamTrackGenerator::new(
-            &MediaStreamTrackGeneratorInit::new("audio"),
-        )
-        .unwrap();
+        }) as Box<dyn FnMut(JsValue)>);
+        let audio_stream_generator =
+            MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
         // The audio context is used to reproduce audio.
         let _audio_context = configure_audio_context(&audio_stream_generator).unwrap();
 
@@ -465,9 +459,7 @@ impl AttendantsComponent {
                     if let Err(e) = JsFuture::from(writer.ready()).await {
                         log!("write chunk error ", e);
                     }
-                    if let Err(e) =
-                        JsFuture::from(writer.write_with_chunk(&audio_data)).await
-                    {
+                    if let Err(e) = JsFuture::from(writer.write_with_chunk(&audio_data)).await {
                         log!("write chunk error ", e);
                     };
                     writer.release_lock();
@@ -475,8 +467,7 @@ impl AttendantsComponent {
             }) {
                 log!("error", e);
             }
-        })
-            as Box<dyn FnMut(AudioData)>);
+        }) as Box<dyn FnMut(AudioData)>);
         let audio_decoder = AudioDecoder::new(&AudioDecoderInit::new(
             error_audio.as_ref().unchecked_ref(),
             audio_output.as_ref().unchecked_ref(),
@@ -498,7 +489,7 @@ impl AttendantsComponent {
             let render_canvas = document
                 .get_element_by_id(&canvas_email)
                 .unwrap()
-                .unchecked_into::<HtmlCanvasElement>();   
+                .unchecked_into::<HtmlCanvasElement>();
             let ctx = render_canvas
                 .get_context("2d")
                 .unwrap()
@@ -506,14 +497,11 @@ impl AttendantsComponent {
                 .unchecked_into::<CanvasRenderingContext2d>();
             render_canvas.set_width(width);
             render_canvas.set_height(height);
-            if let Err(e) =
-                ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0)
-            {
+            if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
                 log!("error ", e);
             }
             video_chunk.unchecked_into::<VideoFrame>().close();
-        })
-            as Box<dyn FnMut(JsValue)>);
+        }) as Box<dyn FnMut(JsValue)>);
         let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
             error_video.as_ref().unchecked_ref(),
             video_output.as_ref().unchecked_ref(),
@@ -540,19 +528,15 @@ impl AttendantsComponent {
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
             let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
-            if let Err(e) =
-                ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0)
-            {
+            if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
                 log!("error ", e);
             }
             video_chunk.unchecked_into::<VideoFrame>().close();
-        })
-            as Box<dyn FnMut(JsValue)>);
+        }) as Box<dyn FnMut(JsValue)>);
 
         let error_screen = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
-        })
-            as Box<dyn FnMut(JsValue)>);
+        }) as Box<dyn FnMut(JsValue)>);
 
         let screen_decoder = VideoDecoder::new(&VideoDecoderInit::new(
             error_screen.as_ref().unchecked_ref(),

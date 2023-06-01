@@ -579,7 +579,7 @@ pub struct UserVideoProps {
 fn user_video(props: &UserVideoProps) -> Html {
     // create use_effect hook that gets called only once and sets a thumbnail
     // for the user video
-    let video_ref = use_state(||  NodeRef::default());
+    let video_ref = use_state(NodeRef::default);
     let video_ref_clone = video_ref.clone();
     use_effect_with_deps( move |_| {
         // Set thumbnail for the video

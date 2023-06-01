@@ -5,6 +5,7 @@ use crate::messages::{
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -34,7 +35,7 @@ impl ChatServer {
         user: Arc<Option<String>>,
     ) {
         if let Some(sessions) = self.rooms.get(room) {
-            sessions.iter().for_each(|id| {
+            sessions.par_iter().for_each(|id| {
                 if id != skip_id {
                     if let Some(addr) = self.sessions.get(id) {
                         addr.do_send(Message {

@@ -17,11 +17,12 @@ async fn main() {
     let endpoint = env::var("ENDPOINT").unwrap();
     let room = env::var("ROOM").unwrap();
     let echo_user = env::var("ECHO_USER").unwrap();
+    let email_prefix = env::var("EMAIL_PREFIX").unwrap_or_else(|_| "".to_string());
 
     // create n_clients and await for them to be created.
     let mut clients = Vec::new();
     for _ in 0..n_clients {
-        clients.push(create_client(&endpoint, &room, &echo_user).await);
+        clients.push(create_client(&endpoint, &room, &echo_user, &email_prefix).await);
     }
 
     for client in clients {
@@ -29,8 +30,8 @@ async fn main() {
     }
 }
 
-async fn create_client(endpoint: &str, room: &str, echo_user: &str) -> JoinHandle<()> {
-    let email = generate_email();
+async fn create_client(endpoint: &str, room: &str, echo_user: &str, email_prefix: &str) -> JoinHandle<()> {
+    let email = generate_email(email_prefix);
     let url = format!("{}/lobby/{}/{}", endpoint, email, room);
     let (mut ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
     println!("Connected to {}", url);
@@ -76,7 +77,7 @@ async fn create_client(endpoint: &str, room: &str, echo_user: &str) -> JoinHandl
     })
 }
 
-fn generate_email() -> String {
+fn generate_email(email_prefix: &str) -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
     let mut rng = rand::thread_rng();
@@ -87,5 +88,5 @@ fn generate_email() -> String {
         })
         .collect();
 
-    format!("{}@example.com", email)
+    format!("{}{}@example.com", email_prefix, email)
 }

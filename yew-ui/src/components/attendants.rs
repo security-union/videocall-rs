@@ -388,7 +388,7 @@ impl Component for AttendantsComponent {
                         </div>
                         <div class="grid-item">
                             // One canvas for the User Video
-                            <canvas id={key.clone()}></canvas>
+                            <UserVideo id={key.clone()}></UserVideo>
                             <h4 class="floating-name">{key.clone()}</h4>
                         </div>
                     </>
@@ -528,6 +528,8 @@ impl AttendantsComponent {
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
             let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
+            // clear ctx
+            ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
             if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
                 log!("error ", e);
             }
@@ -564,5 +566,42 @@ impl AttendantsComponent {
         );
         self.sorted_connected_peers_keys.push(email);
         self.sorted_connected_peers_keys.sort();
+    }
+}
+
+// props for the video component
+#[derive(Properties, Debug, PartialEq)]
+pub struct UserVideoProps {
+    pub id: String,
+}
+
+// user video functional component
+#[function_component(UserVideo)]
+fn user_video(props: &UserVideoProps) -> Html {
+    // create use_effect hook that gets called only once and sets a thumbnail
+    // for the user video
+    let video_ref = use_state(||  NodeRef::default());
+    let video_ref_clone = video_ref.clone();
+    use_effect_with_deps( move |_| {
+        // Set thumbnail for the video
+        let video = (*video_ref_clone).cast::<HtmlCanvasElement>().unwrap();
+        let ctx = video
+            .get_context("2d")
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<CanvasRenderingContext2d>();
+
+        ctx.set_fill_style(&JsValue::from_str("black"));
+        ctx.fill_rect(0.0, 0.0, video.width() as f64, video.height() as f64);
+        ctx.set_fill_style(&JsValue::from_str("white"));
+        ctx.fill_text("No Video", 0.0, 20.0).unwrap();
+
+        || ()
+    }, (),
+    );
+
+
+    html! {
+        <canvas ref={(*video_ref).clone()} id={props.id.clone()}></canvas>
     }
 }

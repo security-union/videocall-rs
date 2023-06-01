@@ -528,8 +528,7 @@ impl AttendantsComponent {
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
             let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
-            // clear ctx
-            ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
+            
             if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
                 log!("error ", e);
             }
@@ -590,14 +589,9 @@ fn user_video(props: &UserVideoProps) -> Html {
             .unwrap()
             .unwrap()
             .unchecked_into::<CanvasRenderingContext2d>();
-
-        ctx.set_fill_style(&JsValue::from_str("black"));
-        ctx.fill_rect(0.0, 0.0, video.width() as f64, video.height() as f64);
-        ctx.set_fill_style(&JsValue::from_str("white"));
-        ctx.fill_text("No Video", 0.0, 20.0).unwrap();
-
+        ctx.clear_rect(0.0,0.0,video.width() as f64, video.height() as f64);
         || ()
-    }, (),
+    }, vec!(props.id.clone()),
     );
 
 

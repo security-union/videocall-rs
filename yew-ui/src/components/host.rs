@@ -249,7 +249,6 @@ impl Component for Host {
                 let switching_mic = self.switching_mic.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    log!("starting mic");
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
                     // TODO: Add dropdown so that user can select the device that they want to use.
@@ -333,7 +332,6 @@ impl Component for Host {
                         }
                     };
                     poll_audio.await;
-                    log!("Killing audio streamer");
                 });
                 true
             }
@@ -486,7 +484,6 @@ impl Component for Host {
                 true
             }
             Msg::AudioDeviceChanged(audio) => {
-                log!("got audio device");
                 self.mic_selected = Some(audio);
                 if self.mic_enabled.load(Ordering::Acquire) {
                     self.switching_mic.store(true, Ordering::Release);
@@ -499,7 +496,6 @@ impl Component for Host {
                 false
             }
             Msg::VideoDeviceChanged(video) => {
-                log!("got video device");
                 self.video_selected = Some(video);
                 if self.video_enabled.load(Ordering::Acquire) {
                     self.switching_video.store(true, Ordering::Release);

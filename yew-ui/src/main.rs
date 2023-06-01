@@ -32,7 +32,7 @@ fn switch(routes: Route) -> Html {
         Route::Login => html! { <Login/> },
         Route::Meeting { email, id } => html! {
             <>
-                <AttendantsComponent email={email.clone()} id={id.clone()} />
+                <AttendantsComponent email={email} id={id} />
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },

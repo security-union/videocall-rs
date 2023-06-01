@@ -20,6 +20,7 @@ use web_sys::*;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
+use crate::constants::AUDIO_BITRATE;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
@@ -126,8 +127,8 @@ impl Component for Host {
                 let email = Box::new(ctx.props().email.clone());
                 let destroy = self.destroy.clone();
                 let screen_output_handler = {
-                    let email = email.clone();
-                    let on_frame = on_frame.clone();
+                    let email = email;
+                    let on_frame = on_frame;
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -167,7 +168,7 @@ impl Component for Host {
 
                     let screen_encoder = Box::new(VideoEncoder::new(&screen_encoder_init).unwrap());
                     let mut screen_encoder_config = VideoEncoderConfig::new(
-                        &VIDEO_CODEC,
+                        VIDEO_CODEC,
                         VIDEO_HEIGHT as u32,
                         VIDEO_WIDTH as u32,
                     );
@@ -233,8 +234,8 @@ impl Component for Host {
                 };
 
                 let audio_output_handler = {
-                    let email = email.clone();
-                    let on_audio = on_audio.clone();
+                    let email = email;
+                    let on_audio = on_audio;
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
@@ -248,7 +249,6 @@ impl Component for Host {
                 let switching_mic = self.switching_mic.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    log!("starting mic");
                     let navigator = window().navigator();
                     let media_devices = navigator.media_devices().unwrap();
                     // TODO: Add dropdown so that user can select the device that they want to use.
@@ -287,10 +287,10 @@ impl Component for Host {
                             .find(&mut |_: JsValue, _: u32, _: Array| true)
                             .unchecked_into::<AudioTrack>(),
                     );
-                    let mut audio_encoder_config = AudioEncoderConfig::new(&AUDIO_CODEC);
-                    audio_encoder_config.bitrate(100_000f64);
-                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE as u32);
-                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS as u32);
+                    let mut audio_encoder_config = AudioEncoderConfig::new(AUDIO_CODEC);
+                    audio_encoder_config.bitrate(AUDIO_BITRATE);
+                    audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE);
+                    audio_encoder_config.number_of_channels(AUDIO_CHANNELS);
                     audio_encoder.configure(&audio_encoder_config);
 
                     let audio_processor =
@@ -332,7 +332,6 @@ impl Component for Host {
                         }
                     };
                     poll_audio.await;
-                    log!("Killing audio streamer");
                 });
                 true
             }
@@ -349,8 +348,8 @@ impl Component for Host {
                 let is_video_enabled = self.video_enabled.clone();
                 let switching_video = self.switching_video.clone();
                 let video_output_handler = {
-                    let email = email.clone();
-                    let on_frame = on_frame.clone();
+                    let email = email;
+                    let on_frame = on_frame;
                     let mut buffer: [u8; 100000] = [0; 100000];
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -426,7 +425,7 @@ impl Component for Host {
                     video_settings.height(VIDEO_HEIGHT);
 
                     let mut video_encoder_config = VideoEncoderConfig::new(
-                        &VIDEO_CODEC,
+                        VIDEO_CODEC,
                         VIDEO_HEIGHT as u32,
                         VIDEO_WIDTH as u32,
                     );
@@ -485,7 +484,6 @@ impl Component for Host {
                 true
             }
             Msg::AudioDeviceChanged(audio) => {
-                log!("got audio device");
                 self.mic_selected = Some(audio);
                 if self.mic_enabled.load(Ordering::Acquire) {
                     self.switching_mic.store(true, Ordering::Release);
@@ -498,7 +496,6 @@ impl Component for Host {
                 false
             }
             Msg::VideoDeviceChanged(video) => {
-                log!("got video device");
                 self.video_selected = Some(video);
                 if self.video_enabled.load(Ordering::Acquire) {
                     self.switching_video.store(true, Ordering::Release);
@@ -514,12 +511,8 @@ impl Component for Host {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let mic_callback = ctx
-            .link()
-            .callback(|device: String| Msg::AudioDeviceChanged(device));
-        let cam_callback = ctx
-            .link()
-            .callback(|device: String| Msg::VideoDeviceChanged(device));
+        let mic_callback = ctx.link().callback(Msg::AudioDeviceChanged);
+        let cam_callback = ctx.link().callback(Msg::VideoDeviceChanged);
         html! {
             <>
                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>

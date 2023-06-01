@@ -5,7 +5,11 @@ use crate::messages::{
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
-use std::collections::{HashMap, HashSet};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use types::protos::media_packet::MediaPacket;
 
 use super::chat_session::{RoomId, SessionId};
@@ -26,22 +30,22 @@ impl ChatServer {
     pub fn send_message(
         &self,
         room: &RoomId,
-        message: &MediaPacket,
+        message: Arc<MediaPacket>,
         skip_id: &String,
-        user: Option<String>,
+        user: Arc<Option<String>>,
     ) {
-        self.rooms.get(room).map(|sessions| {
-            sessions.iter().for_each(|id| {
+        if let Some(sessions) = self.rooms.get(room) {
+            sessions.par_iter().for_each(|id| {
                 if id != skip_id {
-                    self.sessions.get(id).map(|addr| {
+                    if let Some(addr) = self.sessions.get(id) {
                         addr.do_send(Message {
                             nickname: user.clone(),
                             msg: message.clone(),
                         })
-                    });
+                    }
                 }
             });
-        });
+        }
     }
 
     pub fn leave_rooms(&mut self, session_id: &SessionId) {
@@ -99,12 +103,10 @@ impl Handler<ClientMessage> for ChatServer {
             room,
             msg,
         } = msg;
-        debug!(
-            "got message in server room {} session {}",
-            room.clone(),
-            session.clone()
-        );
-        self.send_message(&room, &msg.media_packet, &session, Some(user));
+        debug!("got message in server room {} session {}", room, session);
+        let message = Arc::new(msg.media_packet);
+        let nickname = Arc::new(Some(user));
+        self.send_message(&room, message, &session, nickname);
     }
 }
 
@@ -135,7 +137,7 @@ impl Handler<JoinRoom> for ChatServer {
         info!(
             "someone connected to room {} with session {} result {:?}",
             room.clone(),
-            session.clone(),
+            session.clone().trim(),
             result
         );
         MessageResult(result)

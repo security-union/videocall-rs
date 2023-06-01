@@ -89,6 +89,7 @@ features = [
     "TransformStream",
     "MediaDeviceInfo",
     "MediaDeviceKind",
-    "MediaTrackConstraints"
+    "MediaTrackConstraints",
+    "CanvasRenderingContext2d"
 ]
 

@@ -2,11 +2,14 @@ use futures::SinkExt;
 use futures::StreamExt;
 use rand::Rng;
 use types::protos::media_packet::MediaPacket;
+use types::protos::media_packet::media_packet::MediaType;
 use std::env;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url;
 use protobuf::Message as ProtoMessage;
+use chrono::Utc;
+
 
 #[tokio::main]
 async fn main() {
@@ -14,11 +17,12 @@ async fn main() {
     let endpoint = env::var("ENDPOINT").unwrap();
     let room = env::var("ROOM").unwrap();
     let echo_user = env::var("ECHO_USER").unwrap();
+    let email_prefix = env::var("EMAIL_PREFIX").unwrap_or_else(|_| "".to_string());
 
     // create n_clients and await for them to be created.
     let mut clients = Vec::new();
     for _ in 0..n_clients {
-        clients.push(create_client(&endpoint, &room, &echo_user).await);
+        clients.push(create_client(&endpoint, &room, &echo_user, &email_prefix).await);
     }
 
     for client in clients {
@@ -26,12 +30,20 @@ async fn main() {
     }
 }
 
-async fn create_client(endpoint: &str, room: &str, echo_user: &str) -> JoinHandle<()> {
-    let email = generate_email();
+async fn create_client(endpoint: &str, room: &str, echo_user: &str, email_prefix: &str) -> JoinHandle<()> {
+    let email = generate_email(email_prefix);
     let url = format!("{}/lobby/{}/{}", endpoint, email, room);
-    let (ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
+    let (mut ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
     println!("Connected to {}", url);
     let echo_user = echo_user.to_string();
+    // Send a single heartbeat just so that we show up on the ui
+    let mut media_packet = MediaPacket::default();
+    media_packet.media_type = MediaType::HEARTBEAT.into();
+    media_packet.email = email.clone();
+    media_packet.timestamp = Utc::now().timestamp_millis() as f64;
+    let mut buf = Vec::new();
+    media_packet.write_to_vec(&mut buf).unwrap();
+    ws_stream.send(Message::Binary(buf)).await.unwrap();
     tokio::spawn(async move {
         let mut ws_stream = ws_stream;
         while let Some(msg) = ws_stream.next().await {
@@ -65,7 +77,7 @@ async fn create_client(endpoint: &str, room: &str, echo_user: &str) -> JoinHandl
     })
 }
 
-fn generate_email() -> String {
+fn generate_email(email_prefix: &str) -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 
     let mut rng = rand::thread_rng();
@@ -76,5 +88,5 @@ fn generate_email() -> String {
         })
         .collect();
 
-    format!("{}@example.com", email)
+    format!("{}{}@example.com", email_prefix, email)
 }

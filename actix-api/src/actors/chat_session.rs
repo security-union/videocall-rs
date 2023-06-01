@@ -13,7 +13,7 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use log::{debug, error};
+use log::{debug, error, info};
 use protobuf::Message;
 use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
@@ -32,15 +32,15 @@ pub struct WsChatSession {
 
 impl WsChatSession {
     pub fn new(addr: Addr<ChatServer>, room: String, email: String) -> Self {
-        let session = WsChatSession {
+        info!("new session with room {} and email {}", room, email);
+
+        WsChatSession {
             id: Uuid::new_v4().to_string(),
             heartbeat: Instant::now(),
             room,
             email,
             addr,
-        };
-
-        session
+        }
     }
 
     fn heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
@@ -163,7 +163,7 @@ impl WsChatSession {
             .then(move |response, act, ctx| {
                 match response {
                     Ok(res) if res.is_ok() => {
-                        act.room = room_id.clone();
+                        act.room = room_id;
                     }
                     Ok(res) => {
                         error!("error {:?}", res);
@@ -188,7 +188,7 @@ impl Handler<MediaPacketUpdate> for WsChatSession {
             "got message and sending to chat session {} email {} room {}",
             self.id.clone(),
             self.email.clone(),
-            room_id.clone()
+            room_id
         );
         self.addr.do_send(ClientMessage {
             session: self.id.clone(),

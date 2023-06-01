@@ -20,7 +20,7 @@ input {
   width: 100%;
   margin: 16px 16px;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   grid-gap: 8px;
   align-items: center;
   /* Center items vertically */

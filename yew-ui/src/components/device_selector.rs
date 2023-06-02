@@ -130,6 +130,7 @@ impl Component for DeviceSelector {
                         </option>
                     }) }
                 </select>
+                <br/>
                 <label for={"video-select"}>{ "Video:" }</label>
                 <select id={"video-select"} class={"device-selector"} onchange={ctx.link().callback(|e:Event| {
                     let target: EventTarget = e

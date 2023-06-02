@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::actors::chat_session::{RoomId, SessionId};
 
 use super::session::Message;
@@ -30,7 +32,7 @@ pub struct Connect {
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct MediaPacketUpdate {
-    pub media_packet: MediaPacket,
+    pub media_packet: Arc<MediaPacket>,
 }
 
 #[derive(ActixMessage)]

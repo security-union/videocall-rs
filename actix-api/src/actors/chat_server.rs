@@ -7,7 +7,7 @@ use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 use types::protos::media_packet::MediaPacket;
@@ -16,7 +16,7 @@ use super::chat_session::{RoomId, SessionId};
 
 pub struct ChatServer {
     sessions: HashMap<SessionId, Recipient<Message>>,
-    rooms: HashMap<RoomId, HashSet<SessionId>>,
+    rooms: HashMap<RoomId, BTreeSet<SessionId>>,
 }
 
 impl ChatServer {
@@ -35,7 +35,7 @@ impl ChatServer {
         user: Arc<Option<String>>,
     ) {
         if let Some(sessions) = self.rooms.get(room) {
-            sessions.par_iter().for_each(|id| {
+            sessions.into_iter().for_each(|id| {
                 if id != skip_id {
                     if let Some(addr) = self.sessions.get(id) {
                         addr.do_send(Message {
@@ -104,9 +104,8 @@ impl Handler<ClientMessage> for ChatServer {
             msg,
         } = msg;
         debug!("got message in server room {} session {}", room, session);
-        let message = Arc::new(msg.media_packet);
         let nickname = Arc::new(Some(user));
-        self.send_message(&room, message, &session, nickname);
+        self.send_message(&room, msg.media_packet, &session, nickname);
     }
 }
 
@@ -124,7 +123,7 @@ impl Handler<JoinRoom> for ChatServer {
                 room.clone(),
                 vec![session.clone()]
                     .into_iter()
-                    .collect::<HashSet<String>>(),
+                    .collect::<BTreeSet<String>>(),
             );
         }
 

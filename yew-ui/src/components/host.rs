@@ -140,7 +140,7 @@ impl Component for Host {
                             email.clone(),
                         );
                         on_frame.emit(media_packet);
-                        sequence_number = sequence_number + 1;
+                        sequence_number += 1;
                     })
                 };
                 wasm_bindgen_futures::spawn_local(async move {

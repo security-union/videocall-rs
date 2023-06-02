@@ -38,7 +38,7 @@ impl VideoDecoderWithBuffer {
         let frame_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
         let cache_size = self.cache.len();
         if self.sequence.is_none() && frame_type == EncodedVideoChunkType::Key {
-            self.internal_decode(image.clone());
+            self.internal_decode(image);
             self.sequence = Some(new_sequence_number);
         } else if let Some(sequence) = self.sequence {
             let is_future_frame = new_sequence_number > sequence;
@@ -98,7 +98,7 @@ impl VideoDecoderWithBuffer {
                     to_remove.push(*sequence); // Again, add to the remove list instead of removing directly
                 }
             }
-            index = index + 1;
+            index += 1;
         }
         // After the iteration, we can now remove the items from the cache
         for sequence in to_remove {
@@ -123,7 +123,7 @@ impl VideoDecoderWithBuffer {
 
     fn play_queued_follow_up_frames(&mut self) {
         let sorted_frames = self.cache.keys().collect::<Vec<_>>();
-        if !self.sequence.is_some() || sorted_frames.is_empty() {
+        if self.sequence.is_none() || sorted_frames.is_empty() {
             return;
         }
         for index in 0..sorted_frames.len() {
@@ -132,7 +132,7 @@ impl VideoDecoderWithBuffer {
             if *current_sequence < next_sequence {
                 continue;
             } else if *current_sequence == next_sequence {
-                if let Some(next_image) = self.cache.get(&current_sequence) {
+                if let Some(next_image) = self.cache.get(current_sequence) {
                     self.internal_decode(next_image.clone());
                     self.sequence = Some(next_sequence);
                 }

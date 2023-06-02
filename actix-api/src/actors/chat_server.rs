@@ -5,7 +5,7 @@ use crate::messages::{
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{ParallelIterator};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,

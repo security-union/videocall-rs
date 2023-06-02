@@ -7,7 +7,7 @@ use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 use types::protos::media_packet::MediaPacket;
@@ -16,7 +16,7 @@ use super::chat_session::{RoomId, SessionId};
 
 pub struct ChatServer {
     sessions: HashMap<SessionId, Recipient<Message>>,
-    rooms: HashMap<RoomId, BTreeSet<SessionId>>,
+    rooms: HashMap<RoomId, HashSet<SessionId>>,
 }
 
 impl ChatServer {
@@ -35,7 +35,7 @@ impl ChatServer {
         user: Arc<Option<String>>,
     ) {
         if let Some(sessions) = self.rooms.get(room) {
-            sessions.into_iter().for_each(|id| {
+            sessions.iter().for_each(|id| {
                 if id != skip_id {
                     if let Some(addr) = self.sessions.get(id) {
                         addr.do_send(Message {
@@ -123,7 +123,7 @@ impl Handler<JoinRoom> for ChatServer {
                 room.clone(),
                 vec![session.clone()]
                     .into_iter()
-                    .collect::<BTreeSet<String>>(),
+                    .collect::<HashSet<String>>(),
             );
         }
 

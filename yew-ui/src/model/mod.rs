@@ -1,7 +1,7 @@
 use js_sys::Array;
 use protobuf::Message;
 use std::fmt;
-use types::protos::media_packet::{media_packet::MediaType, MediaPacket};
+use types::protos::media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata};
 use web_sys::*;
 use yew_websocket::websocket::{Binary, Text};
 
@@ -25,9 +25,9 @@ impl From<Binary> for MediaPacketWrapper {
 
 pub struct EncodedVideoChunkTypeWrapper(pub EncodedVideoChunkType);
 
-impl From<String> for EncodedVideoChunkTypeWrapper {
-    fn from(s: String) -> Self {
-        match s.as_str() {
+impl From<&str> for EncodedVideoChunkTypeWrapper {
+    fn from(s: &str) -> Self {
+        match s {
             "key" => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Key),
             _ => EncodedVideoChunkTypeWrapper(EncodedVideoChunkType::Delta),
         }
@@ -101,6 +101,7 @@ impl fmt::Display for AudioSampleFormatWrapper {
 
 pub fn transform_video_chunk(
     chunk: EncodedVideoChunk,
+    sequence: u64,
     buffer: &mut [u8],
     email: Box<String>,
 ) -> MediaPacket {
@@ -112,6 +113,9 @@ pub fn transform_video_chunk(
     media_packet.frame_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
     media_packet.media_type = MediaType::VIDEO.into();
     media_packet.timestamp = chunk.timestamp();
+    let mut video_metadata = VideoMetadata::default();
+    video_metadata.sequence = sequence;
+    media_packet.video_metadata = Some(video_metadata).into();
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
@@ -120,6 +124,7 @@ pub fn transform_video_chunk(
 
 pub fn transform_screen_chunk(
     chunk: EncodedVideoChunk,
+    sequence: u64,
     buffer: &mut [u8],
     email: Box<String>,
 ) -> MediaPacket {
@@ -131,6 +136,9 @@ pub fn transform_screen_chunk(
     media_packet.frame_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
     media_packet.media_type = MediaType::SCREEN.into();
     media_packet.timestamp = chunk.timestamp();
+    let mut video_metadata = VideoMetadata::default();
+    video_metadata.sequence = sequence;
+    media_packet.video_metadata = Some(video_metadata).into();
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }

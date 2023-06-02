@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
@@ -10,7 +11,6 @@ use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo::timers::callback::Interval;
 use gloo_console::log;
-use js_sys::*;
 use protobuf::Message;
 use types::protos::media_packet::media_packet;
 use types::protos::media_packet::media_packet::MediaType;
@@ -27,6 +27,7 @@ use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
 
 use super::device_permissions::request_permissions;
+use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
 
 // This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 // https://github.com/WebAudio/web-audio-api-v2/issues/133
@@ -96,8 +97,8 @@ pub struct AttendantsComponent {
 }
 
 pub struct ClientSubscription {
-    pub video_decoder: VideoDecoder,
-    pub screen_decoder: VideoDecoder,
+    pub video_decoder: VideoDecoderWithBuffer,
+    pub screen_decoder: VideoDecoderWithBuffer,
     pub audio_decoder: AudioDecoder,
     pub waiting_for_video_keyframe: bool,
     pub waiting_for_audio_keyframe: bool,
@@ -217,30 +218,21 @@ impl Component for AttendantsComponent {
                 }
             },
             Msg::OnInboundMedia(response) => {
-                let packet = response.0;
+                let packet = Arc::new(response.0);
                 let email = packet.email.clone();
                 let screen_canvas_id = { format!("screen-share-{}", &email) };
+                let frame_type = packet.frame_type.clone();
                 if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
                     match packet.media_type.unwrap() {
                         media_packet::MediaType::VIDEO => {
-                            let video_data =
-                                Uint8Array::new_with_length(packet.data.len().try_into().unwrap());
                             let chunk_type =
-                                EncodedVideoChunkTypeWrapper::from(packet.frame_type).0;
-                            video_data.copy_from(&packet.data.into_boxed_slice());
-                            let mut video_chunk = EncodedVideoChunkInit::new(
-                                &video_data,
-                                packet.timestamp,
-                                chunk_type,
-                            );
-                            video_chunk.duration(packet.duration);
-                            let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
+                                EncodedVideoChunkTypeWrapper::from(frame_type.as_str()).0;
                             if peer.waiting_for_video_keyframe
                                 && chunk_type == EncodedVideoChunkType::Key
                                 || !peer.waiting_for_video_keyframe
                             {
                                 if peer.video_decoder.state() == CodecState::Configured {
-                                    peer.video_decoder.decode(&encoded_video_chunk);
+                                    peer.video_decoder.decode(packet.clone());
                                     peer.waiting_for_video_keyframe = false;
                                 } else if peer.video_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
@@ -258,14 +250,13 @@ impl Component for AttendantsComponent {
                             }
                         }
                         media_packet::MediaType::AUDIO => {
-                            let audio_data = packet.data;
+                            let audio_data = &packet.data;
                             let audio_data_js: js_sys::Uint8Array =
                                 js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
                             audio_data_js.copy_from(audio_data.as_slice());
-                            let chunk_type = EncodedAudioChunkType::from_js_value(&JsValue::from(
-                                packet.frame_type,
-                            ))
-                            .unwrap();
+                            let chunk_type =
+                                EncodedAudioChunkType::from_js_value(&JsValue::from(frame_type))
+                                    .unwrap();
                             let mut audio_chunk = EncodedAudioChunkInit::new(
                                 &audio_data_js.into(),
                                 packet.timestamp,
@@ -287,24 +278,14 @@ impl Component for AttendantsComponent {
                             }
                         }
                         media_packet::MediaType::SCREEN => {
-                            let video_data =
-                                Uint8Array::new_with_length(packet.data.len().try_into().unwrap());
                             let chunk_type =
-                                EncodedVideoChunkTypeWrapper::from(packet.frame_type).0;
-                            video_data.copy_from(&packet.data.into_boxed_slice());
-                            let mut video_chunk = EncodedVideoChunkInit::new(
-                                &video_data,
-                                packet.timestamp,
-                                chunk_type,
-                            );
-                            video_chunk.duration(packet.duration);
-                            let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
+                                EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0;
                             if peer.waiting_for_screen_keyframe
                                 && chunk_type == EncodedVideoChunkType::Key
                                 || !peer.waiting_for_screen_keyframe
                             {
                                 if peer.screen_decoder.state() == CodecState::Configured {
-                                    peer.screen_decoder.decode(&encoded_video_chunk);
+                                    peer.screen_decoder.decode(packet.clone());
                                     peer.waiting_for_screen_keyframe = false;
                                     return true;
                                 } else if peer.screen_decoder.state() == CodecState::Closed {
@@ -502,7 +483,7 @@ impl AttendantsComponent {
             }
             video_chunk.unchecked_into::<VideoFrame>().close();
         }) as Box<dyn FnMut(JsValue)>);
-        let video_decoder = VideoDecoder::new(&VideoDecoderInit::new(
+        let video_decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
             error_video.as_ref().unchecked_ref(),
             video_output.as_ref().unchecked_ref(),
         ))
@@ -528,7 +509,7 @@ impl AttendantsComponent {
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
             let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
-            
+
             if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
                 log!("error ", e);
             }
@@ -539,7 +520,7 @@ impl AttendantsComponent {
             log!(&e);
         }) as Box<dyn FnMut(JsValue)>);
 
-        let screen_decoder = VideoDecoder::new(&VideoDecoderInit::new(
+        let screen_decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
             error_screen.as_ref().unchecked_ref(),
             screen_output.as_ref().unchecked_ref(),
         ))
@@ -581,19 +562,20 @@ fn user_video(props: &UserVideoProps) -> Html {
     // for the user video
     let video_ref = use_state(NodeRef::default);
     let video_ref_clone = video_ref.clone();
-    use_effect_with_deps( move |_| {
-        // Set thumbnail for the video
-        let video = (*video_ref_clone).cast::<HtmlCanvasElement>().unwrap();
-        let ctx = video
-            .get_context("2d")
-            .unwrap()
-            .unwrap()
-            .unchecked_into::<CanvasRenderingContext2d>();
-        ctx.clear_rect(0.0,0.0,video.width() as f64, video.height() as f64);
-        || ()
-    }, vec!(props.id.clone()),
+    use_effect_with_deps(
+        move |_| {
+            // Set thumbnail for the video
+            let video = (*video_ref_clone).cast::<HtmlCanvasElement>().unwrap();
+            let ctx = video
+                .get_context("2d")
+                .unwrap()
+                .unwrap()
+                .unchecked_into::<CanvasRenderingContext2d>();
+            ctx.clear_rect(0.0, 0.0, video.width() as f64, video.height() as f64);
+            || ()
+        },
+        vec![props.id.clone()],
     );
-
 
     html! {
         <canvas ref={(*video_ref).clone()} id={props.id.clone()}></canvas>

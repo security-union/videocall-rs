@@ -130,11 +130,17 @@ impl Component for Host {
                     let email = email;
                     let on_frame = on_frame;
                     let mut buffer: [u8; 100000] = [0; 100000];
+                    let mut sequence_number = 0;
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                        let media_packet: MediaPacket =
-                            transform_screen_chunk(chunk, &mut buffer, email.clone());
+                        let media_packet: MediaPacket = transform_screen_chunk(
+                            chunk,
+                            sequence_number,
+                            &mut buffer,
+                            email.clone(),
+                        );
                         on_frame.emit(media_packet);
+                        sequence_number += 1;
                     })
                 };
                 wasm_bindgen_futures::spawn_local(async move {
@@ -172,7 +178,7 @@ impl Component for Host {
                         VIDEO_HEIGHT as u32,
                         VIDEO_WIDTH as u32,
                     );
-                    screen_encoder_config.bitrate(100_000f64);
+                    screen_encoder_config.bitrate(60_000f64);
                     screen_encoder_config.latency_mode(LatencyMode::Realtime);
                     screen_encoder.configure(&screen_encoder_config);
 
@@ -351,11 +357,17 @@ impl Component for Host {
                     let email = email;
                     let on_frame = on_frame;
                     let mut buffer: [u8; 100000] = [0; 100000];
+                    let mut sequence_number = 0;
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                        let media_packet: MediaPacket =
-                            transform_video_chunk(chunk, &mut buffer, email.clone());
+                        let media_packet: MediaPacket = transform_video_chunk(
+                            chunk,
+                            sequence_number,
+                            &mut buffer,
+                            email.clone(),
+                        );
                         on_frame.emit(media_packet);
+                        sequence_number += 1;
                     })
                 };
                 let destroy = self.destroy.clone();

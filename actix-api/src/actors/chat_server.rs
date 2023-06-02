@@ -35,7 +35,7 @@ impl ChatServer {
         user: Arc<Option<String>>,
     ) {
         if let Some(sessions) = self.rooms.get(room) {
-            sessions.par_iter().for_each(|id| {
+            sessions.iter().for_each(|id| {
                 if id != skip_id {
                     if let Some(addr) = self.sessions.get(id) {
                         addr.do_send(Message {
@@ -104,9 +104,8 @@ impl Handler<ClientMessage> for ChatServer {
             msg,
         } = msg;
         debug!("got message in server room {} session {}", room, session);
-        let message = Arc::new(msg.media_packet);
         let nickname = Arc::new(Some(user));
-        self.send_message(&room, message, &session, nickname);
+        self.send_message(&room, msg.media_packet, &session, nickname);
     }
 }
 

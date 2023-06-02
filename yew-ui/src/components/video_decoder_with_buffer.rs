@@ -69,7 +69,7 @@ impl VideoDecoderWithBuffer {
         let mut should_skip = false;
         let mut index = 0;
         let sorted_frames = self.cache.keys().cloned().collect::<Vec<_>>();
-        let mut to_remove = Vec::new();  // We will store the keys that we want to remove here
+        let mut to_remove = Vec::new(); // We will store the keys that we want to remove here
         for sequence in &sorted_frames {
             let image = self.cache.get(sequence).unwrap();
             let frame_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;

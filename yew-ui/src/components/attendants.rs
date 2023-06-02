@@ -151,10 +151,7 @@ impl Component for AttendantsComponent {
                     let link = ctx.link().clone();
                     let email = email.clone();
                     self.heartbeat = Some(Interval::new(1000, move || {
-                        let mut media_packet = MediaPacket::default();
-                        media_packet.media_type = MediaType::HEARTBEAT.into();
-                        media_packet.email = email.clone();
-                        media_packet.timestamp = js_sys::Date::now();
+                        let media_packet = MediaPacket { media_type: MediaType::HEARTBEAT.into(), email: email.clone(), timestamp: js_sys::Date::now(), ..Default::default() };
                         link.send_message(Msg::OnOutboundPacket(media_packet));
                     }));
                     self.ws = Some(task);
@@ -163,12 +160,8 @@ impl Component for AttendantsComponent {
                 WsAction::Disconnect => {
                     log!("Disconnect");
                     self.ws.take();
-                    let heartbeat = self.heartbeat.take();
-                    match heartbeat {
-                        Some(heartbeat) => {
-                            heartbeat.cancel();
-                        }
-                        None => {}
+                    if let Some(heartbeat) = self.heartbeat.take() {
+                        heartbeat.cancel();
                     }
                     self.connected = false;
                     true
@@ -227,10 +220,7 @@ impl Component for AttendantsComponent {
                         media_packet::MediaType::VIDEO => {
                             let chunk_type =
                                 EncodedVideoChunkTypeWrapper::from(frame_type.as_str()).0;
-                            if peer.waiting_for_video_keyframe
-                                && chunk_type == EncodedVideoChunkType::Key
-                                || !peer.waiting_for_video_keyframe
-                            {
+                            if !peer.waiting_for_video_keyframe || chunk_type == EncodedVideoChunkType::Key {
                                 if peer.video_decoder.state() == CodecState::Configured {
                                     peer.video_decoder.decode(packet.clone());
                                     peer.waiting_for_video_keyframe = false;
@@ -266,7 +256,6 @@ impl Component for AttendantsComponent {
                             let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
                             if peer.waiting_for_audio_keyframe
                                 && chunk_type == EncodedAudioChunkType::Key
-                                || !peer.waiting_for_audio_keyframe
                             {
                                 if peer.audio_decoder.state() == CodecState::Configured {
                                     peer.audio_decoder.decode(&encoded_audio_chunk);
@@ -282,7 +271,6 @@ impl Component for AttendantsComponent {
                                 EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0;
                             if peer.waiting_for_screen_keyframe
                                 && chunk_type == EncodedVideoChunkType::Key
-                                || !peer.waiting_for_screen_keyframe
                             {
                                 if peer.screen_decoder.state() == CodecState::Configured {
                                     peer.screen_decoder.decode(packet.clone());

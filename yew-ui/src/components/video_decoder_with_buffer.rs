@@ -67,15 +67,12 @@ impl VideoDecoderWithBuffer {
 
     fn fast_forward_frames_and_then_prune_buffer(&mut self) {
         let mut should_skip = false;
-        let mut index = 0;
         let sorted_frames = self.cache.keys().cloned().collect::<Vec<_>>();
         let mut to_remove = Vec::new(); // We will store the keys that we want to remove here
-        for sequence in &sorted_frames {
+        for (index, sequence) in sorted_frames.iter().enumerate() {
             let image = self.cache.get(sequence).unwrap();
             let frame_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
-            let next_sequence = if index == 0 {
-                Some(*sequence)
-            } else if *sequence == sorted_frames[index - 1] + 1 {
+            let next_sequence = if index == 0 || *sequence == sorted_frames[index - 1] + 1 {
                 Some(*sequence)
             } else if self.sequence.is_some()
                 && *sequence > self.sequence.unwrap()
@@ -98,7 +95,6 @@ impl VideoDecoderWithBuffer {
                     to_remove.push(*sequence); // Again, add to the remove list instead of removing directly
                 }
             }
-            index += 1;
         }
         // After the iteration, we can now remove the items from the cache
         for sequence in to_remove {

@@ -115,7 +115,6 @@ pub fn transform_video_chunk(
         timestamp: chunk.timestamp(),
         ..Default::default()
     };
-    
     let mut video_metadata = VideoMetadata::default();
     video_metadata.sequence = sequence;
     media_packet.video_metadata = Some(video_metadata).into();

@@ -26,7 +26,7 @@ async fn main() {
     }
 
     for client in clients {
-        client.await;
+        let _ = client.await;
     }
 }
 

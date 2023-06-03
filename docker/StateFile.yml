@@ -1,0 +1,68 @@
+Kind: Deployment
+ApiVersion: v0.8
+
+Namespace: global
+
+Cargoes:
+  - Name: db
+    Container:
+      Image: postgres:12
+      Env:
+        - POSTGRES_PASSWORD=docker
+        - PGPASSWORD=docker
+
+  - Name: dbmate
+    Container:
+      Image: docker-dbmate:latest
+      HostConfig:
+        AutoRemove: true
+        Binds:
+          - ../dbmate/db:/app/db
+      Env:
+        - DATABASE_URL=postgres://postgres:docker@db.global.c:5432/actix-api-db?sslmode=disable
+
+  - Name: api
+    Container:
+      Image: docker-actix-api:latest
+      WorkingDir: /app/actix-api
+      Cmd:
+        - bash
+        - -c
+        - cargo watch -x run
+      HostConfig:
+        Binds:
+          - ../:/app
+          - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
+      Env:
+        - ACTIX_PORT=8080
+        - TRUNK_SERVE_PORT=default:8081
+        - TRUNK_SERVE_HOST=localhost
+        - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
+        - OAUTH_AUTH_URL=${OAUTH_AUTH_URL}
+        - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
+        - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+        - OAUTH_REDIRECT_URL=http://localhost:default:8080/login/callback
+        - RUST_LOG=debug
+        - PG_URL=postgres://postgres:docker@db.global.c:5432/actix-api-db?sslmode=disable
+
+  - Name: ui
+    Container:
+      Image: docker-yew-ui:latest
+      WorkingDir: /app/yew-ui
+      Cmd:
+        - bash
+        - -c
+        - trunk serve --address 0.0.0.0 --port 8081
+      HostConfig:
+        Binds:
+          - ../:/app
+          - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
+      Env:
+      - ACTIX_HOST=localhost
+      - ACTIX_PORT=8080
+      - ACTIX_UI_BACKEND_URL=ws://localhost:8080
+      - TRUNK_SERVE_PORT=8081
+      - ENABLE_OAUTH=false
+      - LOGIN_URL=http://localhost:8080/login
+      - RUSTFLAGS=--cfg=web_sys_unstable_apis
+      - RUST_BACKTRACE=1

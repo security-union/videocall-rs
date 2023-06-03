@@ -1,6 +1,10 @@
-## ▶️ YouTube Video
+## ▶️ YouTube Videos
 
- https://www.youtube.com/watch?v=kZ9isFw1TQ8
+Here's how we scaled it to support 1000 user per call
+https://youtu.be/LWwOSZJwEJI
+
+The initial POC from 2022
+https://www.youtube.com/watch?v=kZ9isFw1TQ8
 
 # Rust Zoom Research Project
 

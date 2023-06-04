@@ -6,6 +6,7 @@ Namespace: global
 Cargoes:
   - Name: db
     Container:
+      Tty: true
       Image: postgres:12
       Env:
         - POSTGRES_PASSWORD=docker
@@ -13,40 +14,21 @@ Cargoes:
 
   - Name: dbmate
     Container:
+      Tty: true
       Image: docker-dbmate:latest
       HostConfig:
         AutoRemove: true
+        Dns:
+          - ${{ Namespaces.global.Gateway }}
+          - 1.1.1.1
         Binds:
           - ../dbmate/db:/app/db
       Env:
-        - DATABASE_URL=postgres://postgres:docker@db.global.c:5432/actix-api-db?sslmode=disable
-
-  - Name: api
-    Container:
-      Image: docker-actix-api:latest
-      WorkingDir: /app/actix-api
-      Cmd:
-        - bash
-        - -c
-        - cargo watch -x run
-      HostConfig:
-        Binds:
-          - ../:/app
-          - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
-      Env:
-        - ACTIX_PORT=8080
-        - TRUNK_SERVE_PORT=default:8081
-        - TRUNK_SERVE_HOST=localhost
-        - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
-        - OAUTH_AUTH_URL=${OAUTH_AUTH_URL}
-        - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
-        - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
-        - OAUTH_REDIRECT_URL=http://localhost:default:8080/login/callback
-        - RUST_LOG=debug
-        - PG_URL=postgres://postgres:docker@db.global.c:5432/actix-api-db?sslmode=disable
+        - DATABASE_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
 
   - Name: ui
     Container:
+      Tty: true
       Image: docker-yew-ui:latest
       WorkingDir: /app/yew-ui
       Cmd:
@@ -54,6 +36,9 @@ Cargoes:
         - -c
         - trunk serve --address 0.0.0.0 --port 8081
       HostConfig:
+        Dns:
+          - ${{ Namespaces.global.Gateway }}
+          - 1.1.1.1
         Binds:
           - ../:/app
           - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
@@ -66,3 +51,91 @@ Cargoes:
       - LOGIN_URL=http://localhost:8080/login
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
       - RUST_BACKTRACE=1
+
+  - Name: api
+    Container:
+      Tty: true
+      Image: docker-actix-api:latest
+      WorkingDir: /app/actix-api
+      Cmd:
+        - bash
+        - -c
+        - cargo watch -x run
+      HostConfig:
+        Dns:
+          - ${{ Namespaces.global.Gateway }}
+          - 1.1.1.1
+        Binds:
+          - ../:/app
+          - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
+      Env:
+        - ACTIX_PORT=8080
+        - TRUNK_SERVE_PORT=default:8081
+        - TRUNK_SERVE_HOST=zoom.rs
+        - OAUTH_CLIENT_ID=${{Envs.OAUTH_CLIENT_ID}}
+        - OAUTH_AUTH_URL=${{Envs.OAUTH_AUTH_URL}}
+        - OAUTH_TOKEN_URL=${{Envs.OAUTH_TOKEN_URL}}
+        - OAUTH_CLIENT_SECRET=${{Envs.OAUTH_CLIENT_SECRET}}
+        - OAUTH_REDIRECT_URL=http://api.zoom.rs/login/callback
+        - RUST_LOG=debug
+        - PG_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
+
+Resources:
+  - Name: dns
+    Kind: DnsRule
+    Version: v0.2
+    Config:
+      Network: global.nsp
+      Entries:
+        - Name: api.zoom.rs
+          IpAddress: global.nsp
+        - Name: zoom.rs
+          IpAddress: global.nsp
+        - Name: db.zoom.rs
+          IpAddress: global.nsp
+
+  - Name: zoom.rs
+    Kind: ProxyRule
+    Version: v0.5
+    Config:
+      Watch:
+        - ui.global.c
+        - api.global.c
+      Rules:
+        - Domain: zoom.rs
+          Network: Public
+          Locations:
+            - Path: /
+              Version: 1.1
+              Headers:
+                - Upgrade $http_upgrade
+                - Connection "Upgrade"
+              Target:
+                Key: ui.global.c
+                Port: 8081
+
+        - Domain: api.zoom.rs
+          Network: Public
+          Locations:
+            - Path: /
+              Version: 1.1
+              Headers:
+                - Upgrade $http_upgrade
+                - Connection "Upgrade"
+              Target:
+                Key: api.global.c
+                Port: 8080
+
+  - Name: db.zoom.rs
+    Kind: ProxyRule
+    Version: v0.5
+    Config:
+      Watch:
+        - db.global.c
+      Rules:
+        - Network: Public
+          Protocol: Tcp
+          Port: 5432
+          Target:
+            Key: db.global.c
+            Port: 5432

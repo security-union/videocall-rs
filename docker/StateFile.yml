@@ -43,12 +43,12 @@ Cargoes:
           - ../:/app
           - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
       Env:
-      - ACTIX_HOST=localhost
+      - ACTIX_HOST=api.zoom.rs
       - ACTIX_PORT=8080
-      - ACTIX_UI_BACKEND_URL=ws://localhost:8080
+      - ACTIX_UI_BACKEND_URL=ws://api.zoom.rs
       - TRUNK_SERVE_PORT=8081
       - ENABLE_OAUTH=false
-      - LOGIN_URL=http://localhost:8080/login
+      - LOGIN_URL=http://api.zoom.rs/login
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
       - RUST_BACKTRACE=1
 

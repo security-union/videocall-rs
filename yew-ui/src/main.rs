@@ -3,6 +3,7 @@
 mod components;
 mod constants;
 mod model;
+mod pages;
 
 use constants::LOGIN_URL;
 
@@ -14,10 +15,14 @@ use gloo_console::log;
 use gloo_utils::window;
 use yew_router::prelude::*;
 
+use pages::home::Home;
+
 use crate::constants::ENABLE_OAUTH;
 
 #[derive(Clone, Routable, PartialEq)]
 enum Route {
+    #[at("/")]
+    Home,
     #[at("/login")]
     Login,
     #[at("/meeting/:email/:id")]
@@ -29,6 +34,7 @@ enum Route {
 
 fn switch(routes: Route) -> Html {
     match routes {
+        Route::Home => html! { <Home /> },
         Route::Login => html! { <Login/> },
         Route::Meeting { email, id } => html! {
             <>
@@ -54,7 +60,7 @@ fn app_component() -> Html {
     log!("OAuth enabled: {}", *ENABLE_OAUTH);
     html! {
         <BrowserRouter>
-        <Switch<Route> render={switch} />
+            <Switch<Route> render={switch} />
         </BrowserRouter>
     }
 }

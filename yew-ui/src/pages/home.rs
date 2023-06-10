@@ -1,5 +1,6 @@
 use yew::prelude::*;
 use yew_router::prelude::*;
+use web_sys::HtmlInputElement;
 
 use crate::Route;
 
@@ -7,10 +8,22 @@ use crate::Route;
 pub fn home () -> Html {
     let navigator = use_navigator().unwrap();
 
-    let onsubmit = Callback::from(move |_| navigator.push(&Route::Meeting {
-        id: "123".to_string(),
-        email: "gg@gg.com".to_string(),
-    }));
+    let username_ref = use_node_ref();
+    let meeting_id_ref = use_node_ref();
+
+    let onsubmit = {
+            let username_ref = username_ref.clone();
+            let meeting_id_ref = meeting_id_ref.clone();
+            Callback::from(move |e: SubmitEvent| {
+            e.prevent_default();
+            let username = username_ref.cast::<HtmlInputElement>().unwrap().value();
+            let meeting_id = meeting_id_ref.cast::<HtmlInputElement>().unwrap().value();
+            navigator.push(&Route::Meeting {
+                id: meeting_id,
+                email: username,
+            })
+        })
+    };
     html! {
         <div class="home-page">
             <div>
@@ -18,8 +31,8 @@ pub fn home () -> Html {
                 <p>{ "This is a web app to manage your zoom meetings." }</p>
             </div>
             <form {onsubmit}>
-                <input type="text" placeholder="Username" />
-                <input type="text" placeholder="Meeting ID" />
+                <input label="username" type="text" placeholder="Username" ref={username_ref}  />
+                <input label="meeting_id" type="text" placeholder="Meeting ID" ref={meeting_id_ref} />
                 <input type="submit" value="Join" />
             </form>
         </div>

@@ -15,6 +15,23 @@ body {
   display: flex;
 }
 
+input {
+  margin: auto;
+  /* nice thing of auto margin if display:flex; it center both horizontal and vertical :) */
+}
+
+.grid-container {
+  width: 100%;
+  margin: 16px 16px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-gap: 8px;
+  align-items: center;
+  /* Center items vertically */
+  justify-content: center;
+  /* Center items horizontally */
+}
+
 .grid-item {
   height: fit-content;
   position: relative;

@@ -1,0 +1,8 @@
+FROM node:18-alpine as tailwind
+
+RUN apk add --no-cache \
+    bash \
+    && rm -rf /var/cache/apk/*
+RUN npm install -g tailwindcss
+
+ENTRYPOINT [ "tailwindcss" ]

@@ -371,22 +371,29 @@ impl Component for AttendantsComponent {
                 <nav class="host">
                     <div class="controls">
                         <button
+                            class="bg-yew-blue p-2 rounded-md text-white"
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
                             { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
                         </button>
                         <button
+                            class="bg-yew-blue p-2 rounded-md text-white"
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
                             { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
                         </button>
                         <button
+                            class="bg-yew-blue p-2 rounded-md text-white"
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
                             { if !self.mic_enabled { "Unmute"} else { "Mute"} }
                             </button>
-                        <button disabled={self.ws.is_some()}
-                                onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
+                        <button
+                            class="bg-yew-blue p-2 rounded-md text-white"
+                            disabled={self.ws.is_some()}
+                            onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
                             { "Connect" }
                         </button>
-                        <button disabled={self.ws.is_none()}
+                        <button
+                            class="bg-yew-blue p-2 rounded-md text-white"
+                            disabled={self.ws.is_none()}
                                 onclick={ctx.link().callback(|_| WsAction::Disconnect)}>
                             { "Close" }
                         </button>

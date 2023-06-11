@@ -1,5 +1,6 @@
 use futures::SinkExt;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use rand::Rng;
 use types::protos::media_packet::MediaPacket;
 use types::protos::media_packet::media_packet::MediaType;
@@ -13,21 +14,19 @@ use chrono::Utc;
 
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
+
     let n_clients = env::var("N_CLIENTS").unwrap().parse::<usize>().unwrap();
     let endpoint = env::var("ENDPOINT").unwrap();
     let room = env::var("ROOM").unwrap();
     let echo_user = env::var("ECHO_USER").unwrap();
     let email_prefix = env::var("EMAIL_PREFIX").unwrap_or_else(|_| "".to_string());
 
-    // create n_clients and await for them to be created.
-    let mut clients = Vec::new();
-    for _ in 0..n_clients {
-        clients.push(create_client(&endpoint, &room, &echo_user, &email_prefix).await);
-    }
-
-    for client in clients {
-        client.await;
-    }
+    (0..n_clients)
+    .into_iter().map(|_| async {
+        let handle = create_client(&endpoint, &room, &echo_user, &email_prefix).await;
+        let _ = handle.await;
+    }).collect::<FuturesUnordered<_>>().collect::<Vec<_>>().await;
 }
 
 async fn create_client(endpoint: &str, room: &str, echo_user: &str, email_prefix: &str) -> JoinHandle<()> {

@@ -11,3 +11,11 @@ N_CLIENTS=1 ENDPOINT=ws://localhost:3030 ROOM=redrum ECHO_USER=test cargo run
 
 Before running the application, make sure to set the environment variables `N_CLIENTS`, `ENDPOINT`, `ROOM`, and `ECHO_USER`.
 
+It's also supporting `.env` file eg:
+
+```
+N_CLIENTS=1
+ENDPOINT=ws://localhost:3030
+ROOM=redrum
+ECHO_USER=test
+```

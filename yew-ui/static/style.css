@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 html,
 body {
   width: 100%;
@@ -59,6 +63,7 @@ canvas {
 .floating-name {
   position: absolute;
   bottom: 0;
+  right: 0;
   margin-bottom: 0;
   background-color: black;
   color: white;

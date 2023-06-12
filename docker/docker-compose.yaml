@@ -66,3 +66,14 @@ services:
       PGPASSWORD: "docker"
     ports:
       - 5432
+
+  tailwind:
+    tty: true
+    build:
+      dockerfile: ../docker/Dockerfile.tailwind
+    working_dir: /app/yew-ui
+    command: -o ./static/tailwind.css --watch
+    volumes:
+      - type: bind
+        source: ../
+        target: /app

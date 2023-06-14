@@ -9,7 +9,8 @@ services:
       - /app/yew-ui/target
     build:
       dockerfile: ../docker/Dockerfile.yew
-    command: bash -c "cd app/yew-ui && trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
+    working_dir: /app/yew-ui
+    command: bash -c "trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
     environment:
       - ACTIX_HOST=${ACTIX_HOST:-localhost}
       - ACTIX_PORT=${ACTIX_PORT:-8080}
@@ -25,7 +26,8 @@ services:
   actix-api:
     build:
       dockerfile: ../docker/Dockerfile.actix
-    command: bash -c "cd app/actix-api && cargo watch -x \"run -r\""
+    working_dir: /app/actix-api
+    command: bash -c "cargo watch -x \"run -r\""
     environment:
       - ACTIX_PORT=${ACTIX_PORT:-8080}
       - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}

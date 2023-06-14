@@ -1,0 +1,141 @@
+Kind: Deployment
+ApiVersion: v0.8
+
+Namespace: global
+
+Cargoes:
+  - Name: db
+    Container:
+      Tty: true
+      Image: postgres:12
+      Env:
+        - POSTGRES_PASSWORD=docker
+        - PGPASSWORD=docker
+
+  - Name: dbmate
+    Container:
+      Tty: true
+      Image: docker-dbmate:latest
+      HostConfig:
+        AutoRemove: true
+        Dns:
+          - ${{ Namespaces.global.Gateway }}
+          - 1.1.1.1
+        Binds:
+          - ../dbmate/db:/app/db
+      Env:
+        - DATABASE_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
+
+  - Name: ui
+    Container:
+      Tty: true
+      Image: docker-yew-ui:latest
+      WorkingDir: /app/yew-ui
+      Cmd:
+        - bash
+        - -c
+        - trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT}
+      HostConfig:
+        Dns:
+          - ${{ Namespaces.global.Gateway }}
+          - 1.1.1.1
+        Binds:
+          - ../:/app
+          - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
+      Env:
+      - ACTIX_HOST=api.zoom.rs
+      - ACTIX_PORT=8080
+      - ACTIX_UI_BACKEND_URL=ws://api.zoom.rs
+      - TRUNK_SERVE_PORT=8081
+      - ENABLE_OAUTH=false
+      - LOGIN_URL=http://api.zoom.rs/login
+      - RUSTFLAGS=--cfg=web_sys_unstable_apis
+      - RUST_BACKTRACE=1
+
+  - Name: api
+    Container:
+      Tty: true
+      Image: docker-actix-api:latest
+      WorkingDir: /app/actix-api
+      Cmd:
+        - bash
+        - -c
+        - cargo watch -x run
+      HostConfig:
+        Dns:
+          - ${{ Namespaces.global.Gateway }}
+          - 1.1.1.1
+        Binds:
+          - ../:/app
+          - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
+      Env:
+        - ACTIX_PORT=8080
+        - TRUNK_SERVE_PORT=8081
+        - TRUNK_SERVE_HOST=zoom.rs
+        - OAUTH_CLIENT_ID=${{Envs.OAUTH_CLIENT_ID}}
+        - OAUTH_AUTH_URL=${{Envs.OAUTH_AUTH_URL}}
+        - OAUTH_TOKEN_URL=${{Envs.OAUTH_TOKEN_URL}}
+        - OAUTH_CLIENT_SECRET=${{Envs.OAUTH_CLIENT_SECRET}}
+        - OAUTH_REDIRECT_URL=http://api.zoom.rs/login/callback
+        - RUST_LOG=debug
+        - PG_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
+
+Resources:
+  - Name: dns
+    Kind: DnsRule
+    Version: v0.2
+    Config:
+      Network: global.nsp
+      Entries:
+        - Name: api.zoom.rs
+          IpAddress: global.nsp
+        - Name: zoom.rs
+          IpAddress: global.nsp
+        - Name: db.zoom.rs
+          IpAddress: global.nsp
+
+  - Name: zoom.rs
+    Kind: ProxyRule
+    Version: v0.5
+    Config:
+      Watch:
+        - ui.global.c
+        - api.global.c
+      Rules:
+        - Domain: zoom.rs
+          Network: Public
+          Locations:
+            - Path: /
+              Version: 1.1
+              Headers:
+                - Upgrade $http_upgrade
+                - Connection "Upgrade"
+              Target:
+                Key: ui.global.c
+                Port: 8081
+
+        - Domain: api.zoom.rs
+          Network: Public
+          Locations:
+            - Path: /
+              Version: 1.1
+              Headers:
+                - Upgrade $http_upgrade
+                - Connection "Upgrade"
+              Target:
+                Key: api.global.c
+                Port: 8080
+
+  - Name: db.zoom.rs
+    Kind: ProxyRule
+    Version: v0.5
+    Config:
+      Watch:
+        - db.global.c
+      Rules:
+        - Network: Public
+          Protocol: Tcp
+          Port: 5432
+          Target:
+            Key: db.global.c
+            Port: 5432

@@ -12,6 +12,11 @@ Cargoes:
         - POSTGRES_PASSWORD=docker
         - PGPASSWORD=docker
 
+  - Name: nats
+    Container:
+      Tty: true
+      Image: nats:2.9
+
   - Name: dbmate
     Container:
       Tty: true
@@ -79,6 +84,7 @@ Cargoes:
         - OAUTH_REDIRECT_URL=http://api.zoom.rs/login/callback
         - RUST_LOG=debug
         - PG_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
+        - NATS_URL=nats.zoom.rs
 
 Resources:
   - Name: dns
@@ -90,6 +96,8 @@ Resources:
         - Name: api.zoom.rs
           IpAddress: global.nsp
         - Name: zoom.rs
+          IpAddress: global.nsp
+        - Name: nats.zoom.rs
           IpAddress: global.nsp
         - Name: db.zoom.rs
           IpAddress: global.nsp
@@ -125,6 +133,20 @@ Resources:
               Target:
                 Key: api.global.c
                 Port: 8080
+
+  - Name: nats.zoom.rs
+    Kind: ProxyRule
+    Version: v0.5
+    Config:
+      Watch:
+        - nats.global.c
+      Rules:
+        - Network: Public
+          Protocol: Tcp
+          Port: 4222
+          Target:
+            Key: nats.global.c
+            Port: 4222
 
   - Name: db.zoom.rs
     Kind: ProxyRule

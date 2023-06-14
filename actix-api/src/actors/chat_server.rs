@@ -5,8 +5,9 @@ use crate::messages::{
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
 use log::{debug, info};
+use protobuf::Message as ProtobufMessage;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
 };
 use types::protos::media_packet::MediaPacket;
@@ -14,15 +15,18 @@ use types::protos::media_packet::MediaPacket;
 use super::chat_session::{RoomId, SessionId};
 
 pub struct ChatServer {
+    nc: nats::Connection,
     sessions: HashMap<SessionId, Recipient<Message>>,
-    rooms: HashMap<RoomId, HashSet<SessionId>>,
+    active_subs: HashMap<SessionId, nats::Handler>,
 }
 
 impl ChatServer {
     pub fn new() -> Self {
+        let nc = nats::Options::new().with_name("actix-api").connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined")).unwrap();
         ChatServer {
+            nc,
+            active_subs: HashMap::new(),
             sessions: HashMap::new(),
-            rooms: HashMap::new(),
         }
     }
 
@@ -31,29 +35,15 @@ impl ChatServer {
         room: &RoomId,
         message: Arc<MediaPacket>,
         skip_id: &String,
-        user: Arc<Option<String>>,
+        user: String,
     ) {
-        if let Some(sessions) = self.rooms.get(room) {
-            sessions.into_iter().for_each(|id| {
-                if id != skip_id {
-                    if let Some(addr) = self.sessions.get(id) {
-                        addr.do_send(Message {
-                            nickname: user.clone(),
-                            msg: message.clone(),
-                        })
-                    }
-                }
-            });
-        }
+        let subject = format!("room.{}.{}", room, user);
+        self.nc.publish(&subject, message.write_to_bytes().unwrap()).unwrap();
     }
 
     pub fn leave_rooms(&mut self, session_id: &SessionId) {
-        let mut rooms = Vec::new();
-        // remove session from all rooms
-        for (id, sessions) in &mut self.rooms {
-            if sessions.remove(session_id) {
-                rooms.push(id.to_owned());
-            }
+        if let Some(sub) = self.active_subs.remove(session_id) {
+            sub.unsubscribe().unwrap();
         }
     }
 }
@@ -103,8 +93,7 @@ impl Handler<ClientMessage> for ChatServer {
             msg,
         } = msg;
         debug!("got message in server room {} session {}", room, session);
-        let nickname = Arc::new(Some(user));
-        self.send_message(&room, msg.media_packet, &session, nickname);
+        self.send_message(&room, msg.media_packet, &session, user);
     }
 }
 
@@ -117,21 +106,26 @@ impl Handler<JoinRoom> for ChatServer {
     ) -> Self::Result {
         self.leave_rooms(&session);
 
-        if !self.rooms.contains_key(&room) {
-            self.rooms.insert(
-                room.clone(),
-                vec![session.clone()]
-                    .into_iter()
-                    .collect::<HashSet<String>>(),
-            );
-        }
+        let subject = format!("room.{}.*", room);
+        let queue = format!("{}-{}", session, room);
+        let session_recipient = self.sessions.get(&session).unwrap().clone();
+        let session_clone = session.clone();
+        let sub = self.nc.queue_subscribe(&subject, &queue).unwrap().with_handler(move |msg| {
+            let msg = Message {
+                nickname: Arc::new(None),
+                msg: Arc::new(MediaPacket::parse_from_bytes(&msg.data).unwrap()),
+            };
+            match session_recipient.try_send(msg) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    log::error!("error sending message to session: {}", e);
+                    Ok(())
+                }
+            }
+        });
+        debug!("Subscribed to subject {} with queue {}", subject, queue);
 
-        let result: Result<(), String> = self
-            .rooms
-            .get_mut(&room)
-            .map(|sessions| sessions.insert(session.clone()))
-            .map(|_| ())
-            .ok_or("The room doesn't exists".into());
+        let result = self.active_subs.insert(session.clone(), sub).map(|_| ()).ok_or("The session is already subscribed".into());
         info!(
             "someone connected to room {} with session {} result {:?}",
             room.clone(),

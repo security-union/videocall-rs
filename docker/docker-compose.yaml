@@ -39,6 +39,7 @@ services:
       - OAUTH_REDIRECT_URL=http://localhost:${ACTIX_PORT:-8080}/login/callback
       - RUST_LOG=info
       - PG_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - NATS_URL=nats:4222
     ports:
       - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
     volumes:
@@ -48,6 +49,13 @@ services:
       - /app/actix-api/target
     depends_on:
       - postgres
+
+  nats:
+    image: nats
+    command: "--http_port 8222"
+    ports:
+      - "4222:4222"
+      - "8222:8222"
 
   dbmate:
     volumes:

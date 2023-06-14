@@ -34,7 +34,7 @@ Cargoes:
       Cmd:
         - bash
         - -c
-        - trunk serve --address 0.0.0.0 --port 8081
+        - trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT}
       HostConfig:
         Dns:
           - ${{ Namespaces.global.Gateway }}
@@ -70,7 +70,7 @@ Cargoes:
           - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
       Env:
         - ACTIX_PORT=8080
-        - TRUNK_SERVE_PORT=default:8081
+        - TRUNK_SERVE_PORT=8081
         - TRUNK_SERVE_HOST=zoom.rs
         - OAUTH_CLIENT_ID=${{Envs.OAUTH_CLIENT_ID}}
         - OAUTH_AUTH_URL=${{Envs.OAUTH_AUTH_URL}}

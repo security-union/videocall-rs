@@ -83,3 +83,14 @@ canvas {
 .device-selector-wrapper {
   margin-bottom: 20px;
 }
+
+:disabled {
+  cursor: default;
+  background-color: dimgrey !important;
+  color: linen !important;
+  opacity: 1 !important;
+}
+
+select {
+  color: black;
+}

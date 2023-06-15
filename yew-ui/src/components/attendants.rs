@@ -392,7 +392,7 @@ impl Component for AttendantsComponent {
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
                             { if !self.mic_enabled { "Unmute"} else { "Mute"} }
                             </button>
-                        {if !self.ws.is_some() {
+                        {if self.ws.is_none() {
                             html! {<button
                                 class="bg-yew-blue p-2 rounded-md text-white"
                                 disabled={self.ws.is_some()}

@@ -385,12 +385,17 @@ impl Component for AttendantsComponent {
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
                             { if !self.mic_enabled { "Unmute"} else { "Mute"} }
                             </button>
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            disabled={self.ws.is_some()}
-                            onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
-                            { "Connect" }
-                        </button>
+                        {if !self.ws.is_some() {
+                            html! {<button
+                                class="bg-yew-blue p-2 rounded-md text-white"
+                                disabled={self.ws.is_some()}
+                                onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
+                                { "Connect" }
+                            </button>
+                            }
+                        } else {
+                            html! {}
+                        }}
                         <button
                             class="bg-yew-blue p-2 rounded-md text-white"
                             disabled={self.ws.is_none()}

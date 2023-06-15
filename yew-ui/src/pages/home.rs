@@ -1,20 +1,20 @@
+use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
-use web_sys::HtmlInputElement;
 
 use crate::Route;
 
 #[function_component(Home)]
-pub fn home () -> Html {
+pub fn home() -> Html {
     let navigator = use_navigator().unwrap();
 
     let username_ref = use_node_ref();
     let meeting_id_ref = use_node_ref();
 
     let onsubmit = {
-            let username_ref = username_ref.clone();
-            let meeting_id_ref = meeting_id_ref.clone();
-            Callback::from(move |e: SubmitEvent| {
+        let username_ref = username_ref.clone();
+        let meeting_id_ref = meeting_id_ref.clone();
+        Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
             let username = username_ref.cast::<HtmlInputElement>().unwrap().value();
             let meeting_id = meeting_id_ref.cast::<HtmlInputElement>().unwrap().value();

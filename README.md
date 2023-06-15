@@ -24,15 +24,16 @@ Technically you could test this with a single computer, but it is more fun if yo
 1. Open chrome://flags on all the computers that you want to use to test the tele-conferencing system, add the ip of the computer that you will use as the server to the Insecure origins treated as secure list.
 <img width="1728" alt="Screen Shot 2022-10-30 at 10 00 43 PM" src="https://user-images.githubusercontent.com/1176339/198916116-e85bd52a-02b3-40ed-9764-d08fd3df8487.png">
 
+2. Start the servers on the computer that you intend to use as the server using `ACTIX_UI_BACKEND_URL=ws://<server-ip>:8080 make up` (requires docker).
 
-2. Start the servers on the computer that you intent to use as the server using `make up` (requires docker).
+3. If your server computer is behind a firewall, make sure that TCP ports 80 and 8080 are open
 
-3. Connect all computers to `http://<server-ip>/meeting/<username>/<meeting-id>`
+4. Connect all computers to `http://<server-ip>/meeting/<username>/<meeting-id>`
 
-4. Make sure that you "allow" access to your mic and camera:
+5. Make sure that you "allow" access to your mic and camera:
 <img width="1840" alt="Screen Shot 2022-10-24 at 8 23 50 AM" src="https://user-images.githubusercontent.com/1176339/197536159-61f0d9c8-c8fa-454c-8f40-404ed52dca98.png">
 
-5. Click connect on both browsers, and enjoy:
+6. Click connect on both browsers, and enjoy:
 
 ![Oct-24-2022 08-37-09](https://user-images.githubusercontent.com/1176339/197853024-171e0dcc-2098-4780-b3be-bfc3cb5adb43.gif)
 

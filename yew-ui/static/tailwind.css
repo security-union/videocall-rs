@@ -218,6 +218,7 @@ select {
   color: black;
 }
 
+
 /*
 1. Correct the inability to style clickable types in iOS and Safari.
 2. Remove default button styles.
@@ -388,8 +389,10 @@ Make sure disabled buttons don't get the pointer cursor.
 
 :disabled {
   cursor: default;
+  background-color: dimgrey !important;
+  color: linen !important;
+  opacity: 1 !important;
 }
-
 /*
 1. Make replaced elements `display: block` by default. (https://github.com/mozdevs/cssremedy/issues/14)
 2. Add `vertical-align: middle` to align replaced elements more sensibly by default. (https://github.com/jensimmons/cssremedy/issues/14#issuecomment-634934210)

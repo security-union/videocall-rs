@@ -34,7 +34,7 @@ impl ChatServer {
         user: Arc<Option<String>>,
     ) {
         if let Some(sessions) = self.rooms.get(room) {
-            sessions.into_iter().for_each(|id| {
+            sessions.iter().for_each(|id| {
                 if id != skip_id {
                     if let Some(addr) = self.sessions.get(id) {
                         addr.do_send(Message {

@@ -276,8 +276,8 @@ impl Component for AttendantsComponent {
                         media_packet::MediaType::SCREEN => {
                             let chunk_type =
                                 EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0;
-                            if peer.waiting_for_screen_keyframe
-                                && chunk_type == EncodedVideoChunkType::Key
+                            if !peer.waiting_for_screen_keyframe
+                                || chunk_type == EncodedVideoChunkType::Key
                             {
                                 if peer.screen_decoder.state() == CodecState::Configured {
                                     peer.screen_decoder.decode(packet.clone());

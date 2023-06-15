@@ -151,7 +151,12 @@ impl Component for AttendantsComponent {
                     let link = ctx.link().clone();
                     let email = email.clone();
                     self.heartbeat = Some(Interval::new(1000, move || {
-                        let media_packet = MediaPacket { media_type: MediaType::HEARTBEAT.into(), email: email.clone(), timestamp: js_sys::Date::now(), ..Default::default() };
+                        let media_packet = MediaPacket {
+                            media_type: MediaType::HEARTBEAT.into(),
+                            email: email.clone(),
+                            timestamp: js_sys::Date::now(),
+                            ..Default::default()
+                        };
                         link.send_message(Msg::OnOutboundPacket(media_packet));
                     }));
                     self.ws = Some(task);
@@ -220,7 +225,9 @@ impl Component for AttendantsComponent {
                         media_packet::MediaType::VIDEO => {
                             let chunk_type =
                                 EncodedVideoChunkTypeWrapper::from(frame_type.as_str()).0;
-                            if !peer.waiting_for_video_keyframe || chunk_type == EncodedVideoChunkType::Key {
+                            if !peer.waiting_for_video_keyframe
+                                || chunk_type == EncodedVideoChunkType::Key
+                            {
                                 if peer.video_decoder.state() == CodecState::Configured {
                                     peer.video_decoder.decode(packet.clone());
                                     peer.waiting_for_video_keyframe = false;
@@ -254,8 +261,8 @@ impl Component for AttendantsComponent {
                             );
                             audio_chunk.duration(packet.duration);
                             let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
-                            if peer.waiting_for_audio_keyframe
-                                && chunk_type == EncodedAudioChunkType::Key
+                            if !peer.waiting_for_audio_keyframe
+                                || chunk_type == EncodedAudioChunkType::Key
                             {
                                 if peer.audio_decoder.state() == CodecState::Configured {
                                     peer.audio_decoder.decode(&encoded_audio_chunk);
@@ -269,8 +276,8 @@ impl Component for AttendantsComponent {
                         media_packet::MediaType::SCREEN => {
                             let chunk_type =
                                 EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0;
-                            if peer.waiting_for_screen_keyframe
-                                && chunk_type == EncodedVideoChunkType::Key
+                            if !peer.waiting_for_screen_keyframe
+                                || chunk_type == EncodedVideoChunkType::Key
                             {
                                 if peer.screen_decoder.state() == CodecState::Configured {
                                     peer.screen_decoder.decode(packet.clone());
@@ -385,12 +392,17 @@ impl Component for AttendantsComponent {
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
                             { if !self.mic_enabled { "Unmute"} else { "Mute"} }
                             </button>
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            disabled={self.ws.is_some()}
-                            onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
-                            { "Connect" }
-                        </button>
+                        {if self.ws.is_none() {
+                            html! {<button
+                                class="bg-yew-blue p-2 rounded-md text-white"
+                                disabled={self.ws.is_some()}
+                                onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
+                                { "Connect" }
+                            </button>
+                            }
+                        } else {
+                            html! {}
+                        }}
                         <button
                             class="bg-yew-blue p-2 rounded-md text-white"
                             disabled={self.ws.is_none()}

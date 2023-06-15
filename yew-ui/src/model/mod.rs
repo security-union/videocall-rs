@@ -107,10 +107,10 @@ pub fn transform_video_chunk(
 ) -> MediaPacket {
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
-    let mut media_packet: MediaPacket = MediaPacket { 
+    let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
         frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
-        email: *email, 
+        email: *email,
         media_type: MediaType::VIDEO.into(),
         timestamp: chunk.timestamp(),
         ..Default::default()

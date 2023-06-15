@@ -111,8 +111,12 @@ impl Component for DeviceSelector {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let selected_mic = self.audio_selected.clone().unwrap_or_else(|| "".to_string());
-        let selected_camera = self.video_selected.clone().unwrap_or_else(|| "".to_string());
+        let selected_mic = self
+            .audio_selected
+            .clone().unwrap_or_default();
+        let selected_camera = self
+            .video_selected
+            .clone().unwrap_or_default();
         html! {
             <div class={"device-selector-wrapper"}>
                 <label for={"audio-select"}>{ "Audio:" }</label>

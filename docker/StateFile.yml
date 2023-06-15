@@ -17,20 +17,6 @@ Cargoes:
       Tty: true
       Image: nats:2.9
 
-  - Name: dbmate
-    Container:
-      Tty: true
-      Image: docker-dbmate:latest
-      HostConfig:
-        AutoRemove: true
-        Dns:
-          - ${{ Namespaces.global.Gateway }}
-          - 1.1.1.1
-        Binds:
-          - ../dbmate/db:/app/db
-      Env:
-        - DATABASE_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
-
   - Name: ui
     Container:
       Tty: true
@@ -58,6 +44,9 @@ Cargoes:
       - RUST_BACKTRACE=1
 
   - Name: api
+    Replication:
+      Mode: Static
+      Number: 3
     Container:
       Tty: true
       Image: docker-actix-api:latest
@@ -65,7 +54,7 @@ Cargoes:
       Cmd:
         - bash
         - -c
-        - cargo watch -x run
+        - /app/dbmate/startup.sh && cargo watch -x run
       HostConfig:
         Dns:
           - ${{ Namespaces.global.Gateway }}
@@ -85,6 +74,7 @@ Cargoes:
         - RUST_LOG=debug
         - PG_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
         - NATS_URL=nats.zoom.rs
+        - DATABASE_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
 
 Resources:
   - Name: dns

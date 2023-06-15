@@ -254,8 +254,8 @@ impl Component for AttendantsComponent {
                             );
                             audio_chunk.duration(packet.duration);
                             let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
-                            if peer.waiting_for_audio_keyframe
-                                && chunk_type == EncodedAudioChunkType::Key
+                            if !peer.waiting_for_audio_keyframe
+                                || chunk_type == EncodedAudioChunkType::Key
                             {
                                 if peer.audio_decoder.state() == CodecState::Configured {
                                     peer.audio_decoder.decode(&encoded_audio_chunk);

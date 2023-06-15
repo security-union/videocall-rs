@@ -214,6 +214,10 @@ select {
   text-transform: none;
 }
 
+select {
+  color: black;
+}
+
 /*
 1. Correct the inability to style clickable types in iOS and Safari.
 2. Remove default button styles.
@@ -568,10 +572,6 @@ video {
 
 .justify-center {
   justify-content: center;
-}
-
-.rounded {
-  border-radius: 0.25rem;
 }
 
 .rounded-md {

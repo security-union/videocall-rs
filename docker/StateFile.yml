@@ -12,19 +12,10 @@ Cargoes:
         - POSTGRES_PASSWORD=docker
         - PGPASSWORD=docker
 
-  - Name: dbmate
+  - Name: nats
     Container:
       Tty: true
-      Image: docker-dbmate:latest
-      HostConfig:
-        AutoRemove: true
-        Dns:
-          - ${{ Namespaces.global.Gateway }}
-          - 1.1.1.1
-        Binds:
-          - ../dbmate/db:/app/db
-      Env:
-        - DATABASE_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
+      Image: nats:2.9
 
   - Name: ui
     Container:
@@ -53,6 +44,9 @@ Cargoes:
       - RUST_BACKTRACE=1
 
   - Name: api
+    Replication:
+      Mode: Static
+      Number: 3
     Container:
       Tty: true
       Image: docker-actix-api:latest
@@ -60,7 +54,7 @@ Cargoes:
       Cmd:
         - bash
         - -c
-        - cargo watch -x run
+        - /app/dbmate/startup.sh && cargo watch -x run
       HostConfig:
         Dns:
           - ${{ Namespaces.global.Gateway }}
@@ -79,6 +73,8 @@ Cargoes:
         - OAUTH_REDIRECT_URL=http://api.zoom.rs/login/callback
         - RUST_LOG=debug
         - PG_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
+        - NATS_URL=nats.zoom.rs
+        - DATABASE_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
 
 Resources:
   - Name: dns
@@ -90,6 +86,8 @@ Resources:
         - Name: api.zoom.rs
           IpAddress: global.nsp
         - Name: zoom.rs
+          IpAddress: global.nsp
+        - Name: nats.zoom.rs
           IpAddress: global.nsp
         - Name: db.zoom.rs
           IpAddress: global.nsp
@@ -125,6 +123,20 @@ Resources:
               Target:
                 Key: api.global.c
                 Port: 8080
+
+  - Name: nats.zoom.rs
+    Kind: ProxyRule
+    Version: v0.5
+    Config:
+      Watch:
+        - nats.global.c
+      Rules:
+        - Network: Public
+          Protocol: Tcp
+          Port: 4222
+          Target:
+            Key: nats.global.c
+            Port: 4222
 
   - Name: db.zoom.rs
     Kind: ProxyRule

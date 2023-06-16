@@ -1,7 +1,12 @@
+# Builder and Runtime
+# NOTE: This Dockerfile is used for development only. It is not used in production.
+# TODO: Use a multi-stage build to reduce the size of the final image for production.
 FROM rust:1.70-slim-bullseye
 
-RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev
-RUN curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate && chmod +x /usr/bin/dbmate
-RUN cargo install cargo-watch
-RUN rustup component add clippy-preview
-RUN rustup component add rustfmt
+# Initialize the Rust toolchain
+RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev \
+    && curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate && chmod +x /usr/bin/dbmate \
+    && cargo install cargo-watch \
+    && rustup component add clippy \
+    && rustup component add rustfmt \
+    && rm -rf /var/lib/apt/lists/*

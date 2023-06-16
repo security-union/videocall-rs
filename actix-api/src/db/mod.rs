@@ -8,7 +8,7 @@ pub type PostgresPool = Pool<PostgresConnectionManager<NoTls>>;
 pub type PostgresConnection = PooledConnection<PostgresConnectionManager<NoTls>>;
 
 pub fn get_database_url() -> String {
-    env::var("PG_URL").unwrap()
+    env::var("DATABASE_URL").unwrap()
 }
 
 pub fn get_pool() -> PostgresPool {

@@ -14,7 +14,7 @@ env:
   OAUTH_CLIENT_SECRET: blah
   OAUTH_REDIRECT_URL: http://localhost:8080/login/callback
   RUST_LOG: info
-  PG_URL: postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+  DATABASE_URL: postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
 
 jobs:
 

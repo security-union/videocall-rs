@@ -1,0 +1,8 @@
+nats:
+  nats:
+    natsbox:
+      enabled: true
+    cluster:
+      enabled: true
+      replicas: 5
+      noAdvertise: true

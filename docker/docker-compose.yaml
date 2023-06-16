@@ -55,7 +55,7 @@ services:
       - "8222:8222"
 
   postgres:
-    image: postgres:12
+    image: postgres:12-alpine
     environment:
       POSTGRES_PASSWORD: "docker"
       PGPASSWORD: "docker"

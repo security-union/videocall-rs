@@ -1,10 +1,15 @@
-FROM rust:1.64-slim-bullseye
+# Builder and Runtime
+# NOTE: This Dockerfile is used for development only. It is not used in production.
+# TODO: Use a multi-stage build to reduce the size of the final image for production.
+FROM rust:1.70-slim-bullseye
 
-RUN rustup default nightly-2022-10-21
-
-RUN apt-get --yes update && apt-get --yes install git pkg-config libssl-dev
-RUN cargo install wasm-bindgen-cli --version 0.2.78
-RUN cargo install trunk --version 0.16.0
-RUN rustup target add wasm32-unknown-unknown
-RUN rustup component add clippy-preview
-RUN rustup component add rustfmt
+# Initialize the Rust toolchain
+RUN apt-get --yes update \
+    && apt-get --yes install git pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup default 1.70 \
+    && cargo install wasm-bindgen-cli --version 0.2.78 \
+    && cargo install trunk --version 0.16.0 \
+    && rustup target add wasm32-unknown-unknown \
+    && rustup component add clippy \
+    && rustup component add rustfmt

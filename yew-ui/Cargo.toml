@@ -17,7 +17,7 @@ gloo-console = "0.2.3"
 gloo-utils = "0.1"
 yew-router = "0.17"
 js-sys = "0.3"
-yew-websocket = { git = "https://github.com/security-union/yew-websocket.git", rev = "65ba143" }
+yew-websocket = "1.0.0"
 anyhow = "1"
 serde = "1"
 serde_derive = "1"

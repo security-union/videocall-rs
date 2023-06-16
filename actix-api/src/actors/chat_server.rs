@@ -4,7 +4,7 @@ use crate::messages::{
 };
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
-use log::{debug, info, trace};
+use log::{debug, error, info, trace};
 use protobuf::Message as ProtobufMessage;
 use std::{collections::HashMap, sync::Arc};
 use types::protos::media_packet::MediaPacket;
@@ -32,14 +32,17 @@ impl ChatServer {
 
     pub fn send_message(&self, room: &RoomId, message: Arc<MediaPacket>, session_id: SessionId) {
         let subject = format!("room.{}.{}", room, session_id);
-        self.nc
-            .publish(&subject, message.write_to_bytes().unwrap())
-            .unwrap();
+        if let Ok(message) = message.write_to_bytes() {
+            match self.nc.publish(&subject, message) {
+                Ok(_) => trace!("published message to {}", subject),
+                Err(e) => error!("error publishing message to {}: {}", subject, e),
+            }
+        }
     }
 
     pub fn leave_rooms(&mut self, session_id: &SessionId) {
         if let Some(sub) = self.active_subs.remove(session_id) {
-            sub.unsubscribe().unwrap();
+            let _ = sub.unsubscribe();
         }
     }
 }
@@ -107,39 +110,39 @@ impl Handler<JoinRoom> for ChatServer {
         let session_recipient = self.sessions.get(&session).unwrap().clone();
         let room_clone = room.clone();
         let session_clone = session.clone();
-        let sub = self
-            .nc
-            .queue_subscribe(&subject, &queue)
-            .unwrap()
-            .with_handler(move |msg| {
-                if msg.subject == format!("room.{}.{}", room_clone, session_clone) {
-                    return Ok(());
-                }
-                let msg = MediaPacket::parse_from_bytes(&msg.data).unwrap();
-                let msg = Message {
-                    nickname: Arc::new(Some(msg.email.clone())),
-                    msg: Arc::new(msg),
-                };
+        let sub = match self.nc.queue_subscribe(&subject, &queue) {
+            Ok(sub) => sub,
+            Err(e) => {
+                let err = format!("error subscribing to subject {}: {}", subject, e);
+                error!("{}", err);
+                return MessageResult(Err(err));
+            }
+        };
+        let handler = sub.with_handler(move |msg| {
+            if msg.subject == format!("room.{}.{}", room_clone, session_clone) {
+                return Ok(());
+            }
+            let msg = MediaPacket::parse_from_bytes(&msg.data).unwrap();
+            let msg = Message {
+                nickname: Arc::new(Some(msg.email.clone())),
+                msg: Arc::new(msg),
+            };
 
-                match session_recipient.try_send(msg) {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        log::error!("error sending message to session: {}", e);
-                        Ok(())
-                    }
-                }
-            });
+            session_recipient.try_send(msg).map_err(|e| {
+                error!("error sending message to session {}: {}", session_clone, e);
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })
+        });
         debug!("Subscribed to subject {} with queue {}", subject, queue);
-
         let result = self
             .active_subs
-            .insert(session.clone(), sub)
+            .insert(session.clone(), handler)
             .map(|_| ())
             .ok_or("The session is already subscribed".into());
         info!(
             "someone connected to room {} with session {} result {:?}",
-            room.clone(),
-            session.clone().trim(),
+            room,
+            session.trim(),
             result
         );
         MessageResult(result)

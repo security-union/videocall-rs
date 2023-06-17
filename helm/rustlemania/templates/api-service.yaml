@@ -10,6 +10,6 @@ spec:
     - port: {{ .Values.api.service.port }}
       targetPort: 8080
       protocol: TCP
-      name: http
+      name: api
   selector:
     {{- include "rustlemania.selectorLabels" . | nindent 4 }}

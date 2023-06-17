@@ -35,7 +35,7 @@ spec:
           env:
             {{- toYaml .Values.api.env | nindent 12 }}
           ports:
-            - name: http
+            - name: api
               containerPort: {{ .Values.api.service.port }}
               protocol: TCP
                 #livenessProbe:

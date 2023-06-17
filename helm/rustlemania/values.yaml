@@ -7,18 +7,18 @@ fullnameOverride: ""
 api:
   replicaCount: 3
   image:
-    repository: securtiyunion/rustlemania-api
-    pullPolicy: IfNotPresent
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
     tag: latest
   env:
     - name: RUST_LOG
       value: info
     - name: ACTIX_PORT
-      value: 8080
+      value: "8080"
     - name: UI_ENDPOINT
       value: https://rustlemania.com
     - name: NATS_URL
-      value: nats.rustlemania.com # TODO: switch to incluster DNS
+      value: nats:4222
     - name: DATABASE_URL
       valueFrom:
         secretKeyRef:
@@ -67,20 +67,12 @@ api:
   affinity: {}
 
 ui:
-  replicaCount: 3
+  replicaCount: 1
   image:
-    repository: securtiyunion/rustlemania-ui
-    pullPolicy: IfNotPresent
+    repository: securityunion/rustlemania-ui
+    pullPolicy: Always
     tag: latest
   env:
-    - name: ACTIX_HOST
-      value: https://api.rustlemania.com
-    - name: ACTIX_UI_BACKEND_URL
-      value: wss://api.rustlemania.com
-    - name: TRUNK_SERVE_PORT
-      value: 8081
-    - name: ENABLE_OAUTH
-      value: false
     - name: LOGIN_URL
       value: https://api.rustlemania.com/login
   resources: {}
@@ -89,7 +81,7 @@ ui:
   securityContext: {}
   service:
     type: ClusterIP
-    port: 8081
+    port: 80
   autoscaling:
     enabled: false
     minReplicas: 1
@@ -102,20 +94,27 @@ ui:
 
 
 ingress:
-  enabled: false
-  className: ""
+  enabled: true
+  className: nginx
   annotations: {}
-    # kubernetes.io/ingress.class: nginx
     # kubernetes.io/tls-acme: "true"
   hosts:
     - host: api.rustlemania.com
       paths:
         - path: /
-          pathType: ImplementationSpecific
+          pathType: Prefix
+          service:
+            name: rustlemania-api
+            port:
+              number: 8080
     - host: rustlemania.com
       paths:
         - path: /
-          pathType: ImplementationSpecific
+          pathType: Prefix
+          service:
+            name: rustlemania-ui
+            port:
+              number: 80
   tls: []
   #  - secretName: chart-example-tls
   #    hosts:

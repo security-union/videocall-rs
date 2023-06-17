@@ -1,6 +1,6 @@
 // This is read at compile time, please restart if you change this value.
 pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
-pub static AUDIO_CODEC: &str = "mp4a.40.05"; // https://www.w3.org/TR/webcodecs-codec-registry/#audio-codec-registry
+pub static AUDIO_CODEC: &str = "opus"; // https://www.w3.org/TR/webcodecs-codec-registry/#audio-codec-registry
 pub static VIDEO_CODEC: &str = "vp8"; // profile 0,level 1.0, bit depth 8,
 
 // Commented out because it is not as fast as vp9.

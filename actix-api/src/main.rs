@@ -45,7 +45,10 @@ const SCOPE: &str = "email%20profile%20openid";
  * The server implements PKCE (Proof Key for Code Exchange) to protect itself and the users.
  */
 #[get("/login")]
-async fn login(pool: web::Data<PostgresPool>, cfg: web::Data<AppConfig>) -> Result<HttpResponse, Error> {
+async fn login(
+    pool: web::Data<PostgresPool>,
+    cfg: web::Data<AppConfig>,
+) -> Result<HttpResponse, Error> {
     // TODO: verify if user exists in the db by looking at the session cookie, (if the client provides one.)
     let pool2 = pool.clone();
 
@@ -179,7 +182,8 @@ async fn main() -> std::io::Result<()> {
     let oauth_auth_url: String = std::env::var("OAUTH_AUTH_URL").unwrap_or(String::from(""));
     let oauth_token_url: String = std::env::var("OAUTH_TOKEN_URL").unwrap_or(String::from(""));
     let oauth_secret: String = std::env::var("OAUTH_CLIENT_SECRET").unwrap_or(String::from(""));
-    let oauth_redirect_url: String = std::env::var("OAUTH_REDIRECT_URL").unwrap_or(String::from(""));
+    let oauth_redirect_url: String =
+        std::env::var("OAUTH_REDIRECT_URL").unwrap_or(String::from(""));
     let after_login_url: String = std::env::var("UI_ENDPOINT").unwrap_or(String::from(""));
 
     HttpServer::new(move || {
@@ -203,7 +207,13 @@ async fn main() -> std::io::Result<()> {
             .service(login)
             .service(ws_connect)
     })
-    .bind(("0.0.0.0", std::env::var("ACTIX_PORT").unwrap_or(String::from("8080")).parse::<u16>().unwrap()))?
+    .bind((
+        "0.0.0.0",
+        std::env::var("ACTIX_PORT")
+            .unwrap_or(String::from("8080"))
+            .parse::<u16>()
+            .unwrap(),
+    ))?
     .run()
     .await
 }

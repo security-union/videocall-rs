@@ -96,7 +96,8 @@ ui:
 ingress:
   enabled: true
   className: nginx
-  annotations: {}
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
     # kubernetes.io/tls-acme: "true"
   hosts:
     - host: api.rustlemania.com
@@ -115,8 +116,9 @@ ingress:
             name: rustlemania-ui
             port:
               number: 80
-  tls: []
-  #  - secretName: chart-example-tls
-  #    hosts:
-  #      - chart-example.local
+  tls:
+    - secretName: rustlemania-tls
+      hosts:
+        - rustlemania.com
+        - api.rustlemania.com
 

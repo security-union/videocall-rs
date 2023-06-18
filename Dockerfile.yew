@@ -1,6 +1,4 @@
-FROM rust:1.64-slim-bullseye as development
-
-RUN rustup default nightly-2022-10-21
+FROM --platform=linux/amd64  rust:1.64-slim-bullseye as development
 
 RUN apt-get --yes update && apt-get --yes install git pkg-config libssl-dev
 RUN cargo install wasm-bindgen-cli --version 0.2.78
@@ -9,18 +7,18 @@ RUN rustup target add wasm32-unknown-unknown
 RUN rustup component add clippy-preview
 RUN rustup component add rustfmt
 
-FROM development as build
+FROM --platform=linux/amd64  development as build
 
 # TODO - this is a hack to get around the fact that the yew-ui crate is not bundled with the backend
 ENV ENABLE_OAUTH=false
 ENV LOGIN_URL=""
-ENV ACTIX_UI_BACKEND_URL="ws://api.rustlemania.com"
+ENV ACTIX_UI_BACKEND_URL="wss://api.rustlemania.com"
 WORKDIR /app
 COPY . .
 WORKDIR /app/yew-ui
 
 RUN trunk build --release
 
-FROM nginx:1.21.5-alpine as production
+FROM --platform=linux/amd64 nginx:1.21.5-alpine as production
 
 COPY --from=build /app/yew-ui/dist /usr/share/nginx/html

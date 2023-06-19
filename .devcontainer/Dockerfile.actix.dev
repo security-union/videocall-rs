@@ -3,10 +3,18 @@ FROM rust:1.70-slim-bullseye
 
 # Initialize the Rust toolchain
 RUN apt-get update
-RUN apt-get install -y curl git pkg-config libssl-dev
-RUN curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate
-RUN chmod +x /usr/bin/dbmate
-RUN cargo install cargo-watch
+RUN apt-get install -y --no-install-recommends curl git pkg-config libssl-dev
+RUN cargo install --locked cargo-watch
 RUN rustup component add clippy
 RUN rustup component add rustfmt
-RUN rm -rf /var/lib/apt/lists/*
+
+# Initialize the Database
+RUN export ARCH=$(uname -m) \
+  && if [ "$ARCH" = "x86_64" ]; then export ARCH="amd64"; fi \
+  && if [ "$ARCH" = "aarch64" ]; then export ARCH="arm64"; fi \
+  && curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-${ARCH} -L -o /usr/bin/dbmate \
+  && chmod +x /usr/bin/dbmate
+
+# Clean up
+RUN apt-get clean \
+  && rm -rf /var/lib/apt/lists/*

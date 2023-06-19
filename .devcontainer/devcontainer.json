@@ -7,21 +7,36 @@
   "service": "devcontainer",
   "workspaceFolder": "/workspace/${localWorkspaceFolderBasename}",
 
+  // Use 'mounts' to make the cargo cache persistent in a Docker Volume.
+  "mounts": [
+    {
+      "source": "devcontainer-cargo-cache-${devcontainerId}",
+      "target": "/usr/local/cargo",
+      "type": "volume"
+    }
+  ],
+
   // Features to add to the dev container. More info: https://containers.dev/features.
   "features": {
     "ghcr.io/devcontainers/features/rust:1": {}
-  },
-
-  // Host recommended requirements for the dev container.
-  "hostRequirements": {
-    "cpus": 2,
-    "memory": "2gb",
-    "storage": "8gb"
   },
 
   // Use 'forwardPorts' to make a list of ports inside the container available locally.
   "forwardPorts": [80],
 
   // Use 'postCreateCommand' to run commands after the container is created.
-  "postCreateCommand": "rustc --version"
+  "postCreateCommand": "rustc --version",
+
+  // Host recommended requirements for the dev container.
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "4gb",
+    "storage": "20gb"
+  }
+
+  // Configure tool-specific properties.
+  // "customizations": {},
+
+  // Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+  // "remoteUser": "root"
 }

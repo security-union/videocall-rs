@@ -1,19 +1,22 @@
 # Builder and Runtime
-FROM rust:1.70-slim-bullseye
+FROM rust:1.64-slim-bullseye
+
+RUN rustup default nightly-2022-10-21
 
 # Initialize the Rust toolchain
-RUN apt-get --yes update
-RUN apt-get --yes install git pkg-config libssl-dev
-RUN cargo install wasm-bindgen-cli --version 0.2.87
-RUN cargo install trunk --version 0.16.0
+RUN apt-get update
+RUN apt-get -y --no-install-recommends install git pkg-config libssl-dev
+RUN cargo install --locked wasm-bindgen-cli --version 0.2.78
+RUN cargo install --locked trunk --version 0.16.0
 RUN rustup target add wasm32-unknown-unknown
 RUN rustup component add clippy
 RUN rustup component add rustfmt
 
 # Add npm and npx after trunk to avoid compilation errors
-RUN apt-get -y --no-install-recommends install curl \
-  && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - &&\
+RUN apt-get -y --no-install-recommends install curl
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - &&\
   apt-get -y --no-install-recommends install nodejs
 
 # Clean up
-RUN rm -rf /var/lib/apt/lists/*
+RUN apt-get clean \
+  && rm -rf /var/lib/apt/lists/*

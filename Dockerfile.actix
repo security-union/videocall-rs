@@ -1,0 +1,24 @@
+FROM rust:1.70-slim-bullseye as development
+
+RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev
+RUN curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate && chmod +x /usr/bin/dbmate
+RUN cargo install cargo-watch
+RUN rustup component add clippy-preview
+RUN rustup component add rustfmt
+
+FROM development as build
+
+COPY . /app
+WORKDIR /app/actix-api
+RUN cargo build --release
+
+FROM debian:bullseye-slim as production
+
+COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
+COPY --from=build /app/actix-api/target/release/actix-api /usr/bin/actix-api
+COPY --from=build /app/actix-api/startup.sh /usr/bin/startup.sh
+COPY --from=build /app/dbmate /app/dbmate
+
+STOPSIGNAL SIGINT
+
+CMD [ "startup.sh" ]

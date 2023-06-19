@@ -1,0 +1,3 @@
+postgresql:
+  auth:
+    existingSecret: rustlemania

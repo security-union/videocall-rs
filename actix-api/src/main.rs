@@ -20,6 +20,7 @@ use actix_web::{
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
 use log::{debug, info};
+use models::AppConfig;
 
 use crate::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},
@@ -32,18 +33,10 @@ use crate::{
 };
 use reqwest::header::LOCATION;
 
-const OAUTH_CLIENT_ID: &str = std::env!("OAUTH_CLIENT_ID");
-const OAUTH_AUTH_URL: &str = std::env!("OAUTH_AUTH_URL");
-const OAUTH_TOKEN_URL: &str = std::env!("OAUTH_TOKEN_URL");
-const OAUTH_SECRET: &str = std::env!("OAUTH_CLIENT_SECRET");
-const OAUTH_REDIRECT_URL: &str = std::env!("OAUTH_REDIRECT_URL");
-const SCOPE: &str = "email%20profile%20openid";
-const ACTIX_PORT: &str = std::env!("ACTIX_PORT");
-const AFTER_LOGIN_URL: &str = concat!("http://localhost:", std::env!("TRUNK_SERVE_PORT"));
-
 pub mod auth;
 pub mod db;
 
+const SCOPE: &str = "email%20profile%20openid";
 /**
  * Function used by the Web Application to initiate OAuth.
  *
@@ -52,7 +45,10 @@ pub mod db;
  * The server implements PKCE (Proof Key for Code Exchange) to protect itself and the users.
  */
 #[get("/login")]
-async fn login(pool: web::Data<PostgresPool>) -> Result<HttpResponse, Error> {
+async fn login(
+    pool: web::Data<PostgresPool>,
+    cfg: web::Data<AppConfig>,
+) -> Result<HttpResponse, Error> {
     // TODO: verify if user exists in the db by looking at the session cookie, (if the client provides one.)
     let pool2 = pool.clone();
 
@@ -68,9 +64,9 @@ async fn login(pool: web::Data<PostgresPool>) -> Result<HttpResponse, Error> {
 
     // 3. Craft OAuth Login URL
     let oauth_login_url = format!("{oauth_url}?client_id={client_id}&redirect_uri={redirect_url}&response_type=code&scope={scope}&prompt=select_account&pkce_challenge={pkce_challenge}&state={state}&access_type=offline",
-                                    oauth_url=OAUTH_AUTH_URL,
-                                    redirect_url=OAUTH_REDIRECT_URL,
-                                    client_id=OAUTH_CLIENT_ID,
+                                    oauth_url=cfg.oauth_auth_url,
+                                    redirect_url=cfg.oauth_redirect_url,
+                                    client_id=cfg.oauth_client_id,
                                     scope=SCOPE,
                                     pkce_challenge=pkce_challenge.as_str(),
                                     state=&csrf_token.secret()
@@ -94,6 +90,7 @@ async fn login(pool: web::Data<PostgresPool>) -> Result<HttpResponse, Error> {
 async fn handle_google_oauth_callback(
     pool: web::Data<PostgresPool>,
     info: web::Query<AuthRequest>,
+    cfg: web::Data<AppConfig>,
 ) -> Result<HttpResponse, Error> {
     let state = info.state.clone();
 
@@ -109,11 +106,11 @@ async fn handle_google_oauth_callback(
 
     // 2. Request token from OAuth provider.
     let (oauth_response, claims) = request_token(
-        OAUTH_REDIRECT_URL,
-        OAUTH_CLIENT_ID,
-        OAUTH_SECRET,
+        &cfg.oauth_auth_url,
+        &cfg.oauth_client_id,
+        &cfg.oauth_secret,
         &oauth_request.pkce_verifier,
-        OAUTH_TOKEN_URL,
+        &cfg.oauth_token_url,
         &info.code,
     )
     .await
@@ -142,7 +139,7 @@ async fn handle_google_oauth_callback(
 
     // 5. Send cookie and redirect browser to AFTER_LOGIN_URL
     let mut response = HttpResponse::Found();
-    response.append_header((LOCATION, AFTER_LOGIN_URL));
+    response.append_header((LOCATION, cfg.after_login_url.clone()));
     response.cookie(cookie);
     Ok(response.finish())
 }
@@ -181,6 +178,13 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     info!("start");
     let chat = ChatServer::new().start();
+    let oauth_client_id: String = std::env::var("OAUTH_CLIENT_ID").unwrap_or(String::from(""));
+    let oauth_auth_url: String = std::env::var("OAUTH_AUTH_URL").unwrap_or(String::from(""));
+    let oauth_token_url: String = std::env::var("OAUTH_TOKEN_URL").unwrap_or(String::from(""));
+    let oauth_secret: String = std::env::var("OAUTH_CLIENT_SECRET").unwrap_or(String::from(""));
+    let oauth_redirect_url: String =
+        std::env::var("OAUTH_REDIRECT_URL").unwrap_or(String::from(""));
+    let after_login_url: String = std::env::var("UI_ENDPOINT").unwrap_or(String::from(""));
 
     HttpServer::new(move || {
         let cors = Cors::permissive();
@@ -190,12 +194,26 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(pool))
             .app_data(web::Data::new(AppState { chat: chat.clone() }))
+            .app_data(web::Data::new(AppConfig {
+                oauth_client_id: oauth_client_id.clone(),
+                oauth_auth_url: oauth_auth_url.clone(),
+                oauth_token_url: oauth_token_url.clone(),
+                oauth_secret: oauth_secret.clone(),
+                oauth_redirect_url: oauth_redirect_url.clone(),
+                after_login_url: after_login_url.clone(),
+            }))
             .wrap(cors)
             .service(handle_google_oauth_callback)
             .service(login)
             .service(ws_connect)
     })
-    .bind(("0.0.0.0", ACTIX_PORT.parse::<u16>().unwrap()))?
+    .bind((
+        "0.0.0.0",
+        std::env::var("ACTIX_PORT")
+            .unwrap_or(String::from("8080"))
+            .parse::<u16>()
+            .unwrap(),
+    ))?
     .run()
     .await
 }

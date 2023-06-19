@@ -1,0 +1,8 @@
+apiVersion: v2
+name: rustlemania-cert-manager
+version: 1.0.0
+
+dependencies:
+  - name: cert-manager
+    version: 1.12.2
+    repository: https://charts.jetstack.io

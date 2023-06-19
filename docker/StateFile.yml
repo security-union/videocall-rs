@@ -35,7 +35,6 @@ Cargoes:
           - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
       Env:
       - ACTIX_HOST=api.zoom.rs
-      - ACTIX_PORT=8080
       - ACTIX_UI_BACKEND_URL=ws://api.zoom.rs
       - TRUNK_SERVE_PORT=8081
       - ENABLE_OAUTH=false
@@ -72,7 +71,6 @@ Cargoes:
         - OAUTH_CLIENT_SECRET=${{Envs.OAUTH_CLIENT_SECRET}}
         - OAUTH_REDIRECT_URL=http://api.zoom.rs/login/callback
         - RUST_LOG=debug
-        - PG_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
         - NATS_URL=nats.zoom.rs
         - DATABASE_URL=postgres://postgres:docker@db.zoom.rs:5432/actix-api-db?sslmode=disable
 

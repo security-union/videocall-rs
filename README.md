@@ -1,12 +1,12 @@
-## ▶️ YouTube Videos
+# ▶️ YouTube Videos
 
 Here's how we scaled it to support 1000 user per call
-https://youtu.be/LWwOSZJwEJI
+<https://youtu.be/LWwOSZJwEJI>
 
 The initial POC from 2022
-https://www.youtube.com/watch?v=kZ9isFw1TQ8
+<https://www.youtube.com/watch?v=kZ9isFw1TQ8>
 
-# Rust Zoom Research Project
+## Rust Zoom Research Project
 
 ![rust](https://user-images.githubusercontent.com/1176339/197537597-2e9147dc-5892-47c9-9a7d-d5b0102800db.png)
 
@@ -14,12 +14,13 @@ MVP of a teleconferencing system written in rust, both the backend and the UI.
 
 Security Union LLC is not associated with Zoom Video Communications, we are big fans of their products!!
 
-# How to test?
+## How to test?
 
-## Setup
+### Setup
+
 Technically you could test this with a single computer, but it is more fun if you use 2+.
 
-## Steps
+### Steps
 
 1. Open chrome://flags on all the computers that you want to use to test the tele-conferencing system, add the ip of the computer that you will use as the server to the Insecure origins treated as secure list.
 <img width="1728" alt="Screen Shot 2022-10-30 at 10 00 43 PM" src="https://user-images.githubusercontent.com/1176339/198916116-e85bd52a-02b3-40ed-9764-d08fd3df8487.png">
@@ -37,13 +38,13 @@ Technically you could test this with a single computer, but it is more fun if yo
 
 ![Oct-24-2022 08-37-09](https://user-images.githubusercontent.com/1176339/197853024-171e0dcc-2098-4780-b3be-bfc3cb5adb43.gif)
 
-
 ## ▶️ YouTube Channel
-https://www.youtube.com/@securityunion
+
+<https://www.youtube.com/@securityunion>
 
 ## 👉 Join our Discord Community
-You can join our Discord Community, here is the [invite link](https://discord.gg/JP38NRe4CJ).
 
+You can join our Discord Community, here is the [invite link](https://discord.gg/JP38NRe4CJ).
 
 ## 👨‍💻 Project Structure
 
@@ -53,16 +54,17 @@ Contains 3 sub-projects
 2. yew-ui: Yew frontend
 3. types: json serializable structures used to communicate the frontend and backend.
 
-# Dockerized workflow
+## Dockerized workflow
 
 1. Install docker
 2. Run one of the supported make commands
 
-```
+```sh
 make test
 make up
 make down
 make build
+make dev
 ```
 
 ## 👤 Contributors ✨
@@ -77,13 +79,13 @@ make build
 </tr>
 </table>
 
-The Actix websocket implementation contains fragments from https://github.com/JasterV/chat-rooms-actix in particular the usage of an actor to orchestrate all sessions and rooms.
+The Actix websocket implementation contains fragments from <https://github.com/JasterV/chat-rooms-actix> in particular the usage of an actor to orchestrate all sessions and rooms.
 
 ## Show your support
 
 Give a ⭐️ if this project helped you!
 
-# Legal Notice
+## Legal Notice
 
 ZOOM is a trademark of Zoom Video Communications, Inc.
 

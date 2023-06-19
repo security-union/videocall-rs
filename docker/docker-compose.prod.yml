@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  yew-ui:
+    image: zoom-rs/yew-ui
+    build:
+      dockerfile: Dockerfile.yew.prod
+    ports:
+      - '${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}'
+
+  actix-api:
+    image: zoom-rs/actix-api
+    build:
+      dockerfile: Dockerfile.actix.prod
+    environment:
+      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - NATS_URL=nats:4222
+    ports:
+      - '${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}'
+    depends_on:
+      - postgres
+
+  nats:
+    image: nats:latest
+    command: '--http_port 8222'
+    ports:
+      - '4222:4222'
+      - '8222:8222'
+
+  postgres:
+    image: postgres:12-alpine
+    environment:
+      POSTGRES_PASSWORD: 'docker'
+      PGPASSWORD: 'docker'
+    ports:
+      - 5432

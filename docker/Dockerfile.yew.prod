@@ -1,0 +1,61 @@
+################
+##### Builder
+FROM rust:slim AS builder
+
+# Set the environment variables
+ENV ACTIX_HOST=${ACTIX_HOST:-localhost}
+ENV ACTIX_PORT=${ACTIX_PORT:-8080}
+ENV ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:8080}
+ENV TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
+ENV ENABLE_OAUTH=false
+ENV LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login
+ENV RUSTFLAGS=--cfg=web_sys_unstable_apis
+ENV RUST_BACKTRACE=1
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Create blank project
+RUN USER=root cargo new yew-ui
+
+# Cache the dependencies
+COPY yew-ui/Cargo.toml yew-ui/Cargo.lock /app/yew-ui/
+
+# Copy the types into the container
+COPY types /app/types
+
+# Set the working directory inside the container
+WORKDIR /app/yew-ui
+
+# Initialize the Rust toolchain
+RUN apt-get update
+RUN apt-get -y --no-install-recommends install pkg-config libssl-dev curl
+RUN cargo install --locked wasm-bindgen-cli --version 0.2.87
+RUN cargo install --locked trunk --version 0.16.0
+RUN rustup target add wasm32-unknown-unknown
+
+# Install nodejs, npm, and npx
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - &&\
+  apt-get -y --no-install-recommends install nodejs
+
+## Install target platform (Cross-Compilation) --> Needed for Alpine
+RUN rustup target add $(uname -m)-unknown-linux-musl
+
+# Copy the yew-ui directory and its contents into the container
+COPY yew-ui /app/yew-ui
+
+## Touch main.rs to prevent cached release build
+RUN touch /app/yew-ui/src/main.rs
+
+# This is the application build.
+RUN trunk build --release
+
+################
+##### Runtime
+FROM nginx:stable-alpine
+
+COPY --from=builder /app/yew-ui/dist /usr/share/nginx/html
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]

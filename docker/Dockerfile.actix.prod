@@ -1,0 +1,75 @@
+################
+##### Builder
+FROM rust:slim AS builder
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Create blank project
+RUN USER=root cargo new actix-api
+
+# Cache the dependencies
+COPY actix-api/Cargo.toml actix-api/Cargo.lock /app/actix-api/
+
+# Copy the types into the container
+COPY types /app/types
+
+# Set the working directory inside the container
+WORKDIR /app/actix-api
+
+# Install the dependencies
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends pkg-config libssl-dev curl
+
+# Set the environment variables
+ENV ACTIX_PORT=${ACTIX_PORT:-8080}
+ENV TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
+ENV TRUNK_SERVE_HOST=localhost
+ENV OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
+ENV OAUTH_AUTH_URL=${OAUTH_AUTH_URL}
+ENV OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
+ENV OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+ENV OAUTH_REDIRECT_URL=http://localhost:${ACTIX_PORT:-8080}/login/callback
+ENV RUST_LOG=info
+
+## Install target platform (Cross-Compilation) --> Needed for Alpine
+RUN rustup target add $(uname -m)-unknown-linux-musl
+
+# This is a dummy build to get the dependencies cached.
+RUN cargo build --release
+
+# Copy the actix-api directory and its contents into the container
+COPY actix-api /app/actix-api
+
+## Touch main.rs to prevent cached release build
+RUN touch /app/actix-api/src/main.rs
+
+# This is the actual application build.
+RUN cargo build --release
+
+# Initialize the Database
+RUN export ARCH=$(uname -m) \
+  && if [ "$ARCH" = "x86_64" ]; then export ARCH="amd64"; fi \
+  && if [ "$ARCH" = "aarch64" ]; then export ARCH="arm64"; fi \
+  && curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-${ARCH} -L -o /usr/bin/dbmate \
+  && chmod +x /usr/bin/dbmate
+
+# # Copy the database migrations into the container
+COPY dbmate/db /app/dbmate/db
+
+################
+##### Runtime
+FROM alpine:latest
+
+# Install bash
+RUN apk add --no-cache bash
+
+# Copy application binary from builder image
+COPY --from=builder /app/actix-api/target/release/actix-api /usr/local/bin/actix-api
+COPY --from=builder /usr/bin/dbmate /usr/bin/dbmate
+COPY --from=builder /app/dbmate/db /app/dbmate/db
+
+EXPOSE 8080
+
+# Run the application
+CMD ["/bin/bash", "-c", "cd /app/dbmate && dbmate wait && dbmate up && /usr/local/bin/actix-api"]

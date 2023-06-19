@@ -1,5 +1,3 @@
-#![feature(future_join)]
-
 mod components;
 mod constants;
 mod model;

@@ -1,0 +1,27 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+{
+  "name": "zoom-rs Dev Container",
+
+  "dockerComposeFile": "docker-compose.dev.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace/${localWorkspaceFolderBasename}",
+
+  // Features to add to the dev container. More info: https://containers.dev/features.
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {}
+  },
+
+  // Host recommended requirements for the dev container.
+  "hostRequirements": {
+    "cpus": 2,
+    "memory": "2gb",
+    "storage": "8gb"
+  },
+
+  // Use 'forwardPorts' to make a list of ports inside the container available locally.
+  "forwardPorts": [80],
+
+  // Use 'postCreateCommand' to run commands after the container is created.
+  "postCreateCommand": "rustc --version"
+}

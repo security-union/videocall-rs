@@ -1,0 +1,12 @@
+# Builder and Runtime
+FROM rust:1.70-slim-bullseye
+
+# Initialize the Rust toolchain
+RUN apt-get update
+RUN apt-get install -y curl git pkg-config libssl-dev
+RUN curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate
+RUN chmod +x /usr/bin/dbmate
+RUN cargo install cargo-watch
+RUN rustup component add clippy
+RUN rustup component add rustfmt
+RUN rm -rf /var/lib/apt/lists/*

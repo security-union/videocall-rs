@@ -1,0 +1,8 @@
+# Builder and Runtime
+FROM node:18-alpine as tailwind
+
+# Install TailwindCSS globally and avoid storing the package cache in the Docker layer
+RUN npm install -g tailwindcss --no-cache
+
+# Set the default command to run when a container starts
+ENTRYPOINT [ "tailwindcss" ]

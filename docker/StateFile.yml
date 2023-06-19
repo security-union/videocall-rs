@@ -20,7 +20,7 @@ Cargoes:
   - Name: ui
     Container:
       Tty: true
-      Image: docker-yew-ui:latest
+      Image: zoom-rs/yew-ui:latest
       WorkingDir: /app/yew-ui
       Cmd:
         - bash
@@ -34,13 +34,14 @@ Cargoes:
           - ../:/app
           - ${{ Envs.HOME }}/.cargo/registry:/usr/local/cargo/registry
       Env:
-      - ACTIX_HOST=api.zoom.rs
-      - ACTIX_UI_BACKEND_URL=ws://api.zoom.rs
-      - TRUNK_SERVE_PORT=8081
-      - ENABLE_OAUTH=false
-      - LOGIN_URL=http://api.zoom.rs/login
-      - RUSTFLAGS=--cfg=web_sys_unstable_apis
-      - RUST_BACKTRACE=1
+        - ACTIX_HOST=api.zoom.rs
+        - ACTIX_PORT=8080
+        - ACTIX_UI_BACKEND_URL=ws://api.zoom.rs
+        - TRUNK_SERVE_PORT=8081
+        - ENABLE_OAUTH=false
+        - LOGIN_URL=http://api.zoom.rs/login
+        - RUSTFLAGS=--cfg=web_sys_unstable_apis
+        - RUST_BACKTRACE=1
 
   - Name: api
     Replication:
@@ -48,7 +49,7 @@ Cargoes:
       Number: 3
     Container:
       Tty: true
-      Image: docker-actix-api:latest
+      Image: zoom-rs/actix-api:latest
       WorkingDir: /app/actix-api
       Cmd:
         - bash

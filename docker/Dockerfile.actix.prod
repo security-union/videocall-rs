@@ -1,6 +1,6 @@
 ################
 ##### Builder
-FROM rust:slim AS builder
+FROM rust:1.70-slim-bullseye AS builder
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -18,8 +18,17 @@ COPY types /app/types
 WORKDIR /app/actix-api
 
 # Install the dependencies
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends pkg-config libssl-dev curl
+RUN apt-get update
+RUN apt-get install -y --no-install-recommends pkg-config libssl-dev curl
+
+# This is a dummy build to get the dependencies cached.
+RUN cargo build --release
+
+# Copy the actix-api directory and its contents into the container
+COPY actix-api /app/actix-api
+
+## Touch main.rs to prevent cached release build
+RUN touch /app/actix-api/src/main.rs
 
 # Set the environment variables
 ENV ACTIX_PORT=${ACTIX_PORT:-8080}
@@ -31,20 +40,9 @@ ENV OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
 ENV OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
 ENV OAUTH_REDIRECT_URL=http://localhost:${ACTIX_PORT:-8080}/login/callback
 ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
 
-## Install target platform (Cross-Compilation) --> Needed for Alpine
-RUN rustup target add $(uname -m)-unknown-linux-musl
-
-# This is a dummy build to get the dependencies cached.
-RUN cargo build --release
-
-# Copy the actix-api directory and its contents into the container
-COPY actix-api /app/actix-api
-
-## Touch main.rs to prevent cached release build
-RUN touch /app/actix-api/src/main.rs
-
-# This is the actual application build.
+# This is the actual application build
 RUN cargo build --release
 
 # Initialize the Database
@@ -59,10 +57,12 @@ COPY dbmate/db /app/dbmate/db
 
 ################
 ##### Runtime
-FROM alpine:latest
+FROM debian:bullseye-slim AS runtime
 
-# Install bash
-RUN apk add --no-cache bash
+# Install bash and ca-certificates
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends bash ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 # Copy application binary from builder image
 COPY --from=builder /app/actix-api/target/release/actix-api /usr/local/bin/actix-api

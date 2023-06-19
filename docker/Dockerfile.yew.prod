@@ -1,6 +1,8 @@
 ################
 ##### Builder
-FROM rust:slim AS builder
+FROM rust:1.64-slim-bullseye AS builder
+
+RUN rustup default nightly-2022-10-21
 
 # Set the environment variables
 ENV ACTIX_HOST=${ACTIX_HOST:-localhost}
@@ -29,22 +31,26 @@ WORKDIR /app/yew-ui
 
 # Initialize the Rust toolchain
 RUN apt-get update
-RUN apt-get -y --no-install-recommends install pkg-config libssl-dev curl
-RUN cargo install --locked wasm-bindgen-cli --version 0.2.87
+RUN apt-get -y --no-install-recommends install pkg-config libssl-dev
+RUN cargo install --locked wasm-bindgen-cli --version 0.2.78
 RUN cargo install --locked trunk --version 0.16.0
+RUN rustup update
 RUN rustup target add wasm32-unknown-unknown
 
+# NOTE: Install curl after trunk compilation to prevent error
+RUN apt-get -y --no-install-recommends install curl
 # Install nodejs, npm, and npx
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - &&\
   apt-get -y --no-install-recommends install nodejs
+RUN rm -rf /var/lib/apt/lists/*
 
-## Install target platform (Cross-Compilation) --> Needed for Alpine
+# Install target platform (Cross-Compilation) --> Needed for Alpine
 RUN rustup target add $(uname -m)-unknown-linux-musl
 
 # Copy the yew-ui directory and its contents into the container
 COPY yew-ui /app/yew-ui
 
-## Touch main.rs to prevent cached release build
+# Touch main.rs to prevent cached release build
 RUN touch /app/yew-ui/src/main.rs
 
 # This is the application build.
@@ -52,7 +58,7 @@ RUN trunk build --release
 
 ################
 ##### Runtime
-FROM nginx:stable-alpine
+FROM nginx:stable-alpine AS runtime
 
 COPY --from=builder /app/yew-ui/dist /usr/share/nginx/html
 

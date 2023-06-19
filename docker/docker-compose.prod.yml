@@ -1,5 +1,6 @@
 version: '3.8'
 
+name: zoom-rs
 services:
   yew-ui:
     image: zoom-rs/yew-ui
@@ -14,6 +15,7 @@ services:
       dockerfile: Dockerfile.actix.prod
     environment:
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - PG_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222
     ports:
       - '${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}'
@@ -29,8 +31,13 @@ services:
 
   postgres:
     image: postgres:12-alpine
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     environment:
       POSTGRES_PASSWORD: 'docker'
       PGPASSWORD: 'docker'
     ports:
       - 5432
+
+volumes:
+  postgres-data:

@@ -1,26 +1,23 @@
-# ▶️ YouTube Videos
+# Rust Zoom Research Project
 
-Here's how we scaled it to support 1000 user per call
-<https://youtu.be/LWwOSZJwEJI>
-
-The initial POC from 2022
-<https://www.youtube.com/watch?v=kZ9isFw1TQ8>
-
-## Rust Zoom Research Project
-
-![rust](https://user-images.githubusercontent.com/1176339/197537597-2e9147dc-5892-47c9-9a7d-d5b0102800db.png)
+![zoom-rs](https://user-images.githubusercontent.com/1176339/197537597-2e9147dc-5892-47c9-9a7d-d5b0102800db.png)
 
 MVP of a teleconferencing system written in rust, both the backend and the UI.
 
 Security Union LLC is not associated with Zoom Video Communications, we are big fans of their products!!
 
-## How to test?
+## ▶️ YouTube Videos
 
-### Setup
+- The initial POC from 2022 <https://www.youtube.com/watch?v=kZ9isFw1TQ8>
+- Here's how we scaled it to support 1000 user per call <https://youtu.be/LWwOSZJwEJI>
 
-Technically you could test this with a single computer, but it is more fun if you use 2+.
+## 🧪 How to test?
 
-### Steps
+### 🖥️ Technical Setup
+
+Technically you could test this with a single computer, but it is more fun if you use 2+ computers so that you can see how the video + audio streaming works better.
+
+### 🐾 Steps
 
 1. Open chrome://flags on all the computers that you want to use to test the tele-conferencing system, add the ip of the computer that you will use as the server to the Insecure origins treated as secure list.
 <img width="1728" alt="Screen Shot 2022-10-30 at 10 00 43 PM" src="https://user-images.githubusercontent.com/1176339/198916116-e85bd52a-02b3-40ed-9764-d08fd3df8487.png">
@@ -38,11 +35,13 @@ Technically you could test this with a single computer, but it is more fun if yo
 
 ![Oct-24-2022 08-37-09](https://user-images.githubusercontent.com/1176339/197853024-171e0dcc-2098-4780-b3be-bfc3cb5adb43.gif)
 
-## ▶️ YouTube Channel
+## 🌐 Community
+
+### ▶️ YouTube Channel
 
 <https://www.youtube.com/@securityunion>
 
-## 👉 Join our Discord Community
+### 👉 Join our Discord Community
 
 You can join our Discord Community, here is the [invite link](https://discord.gg/JP38NRe4CJ).
 
@@ -54,20 +53,26 @@ Contains 3 sub-projects
 2. yew-ui: Yew frontend
 3. types: json serializable structures used to communicate the frontend and backend.
 
-## Dockerized workflow
+## 🐳 Dockerized Workflow
 
-1. Install docker
+1. Install docker (we recommend using [Orbstack](https://orbstack.dev/) over Docker Desktop for GUI support)
 2. Run one of the supported make commands
 
 ```sh
+# Production containers
 make test
 make up
 make down
 make build
+# Development containers
 make dev
 ```
 
-## 👤 Contributors ✨
+### 🛠️ Dev Containers
+
+This project uses [devcontainers](https://code.visualstudio.com/docs/remote/containers) to provide a consistent development environment.
+
+## 👤 Contributors
 
 <table>
 <tr>
@@ -81,14 +86,18 @@ make dev
 
 The Actix websocket implementation contains fragments from <https://github.com/JasterV/chat-rooms-actix> in particular the usage of an actor to orchestrate all sessions and rooms.
 
-## Show your support
+## ✨ Show Your Support
 
 Give a ⭐️ if this project helped you!
 
-## Legal Notice
+## 📝 Legal Notice
 
 ZOOM is a trademark of Zoom Video Communications, Inc.
 
 Security Union LLC is not associated with Zoom Video Communications, but we are big fans of their product!!
 
 This project was created to learn about video + audio streaming using only RUST (with some html + css).
+
+### 📝 License
+
+[MIT](./LICENSE)

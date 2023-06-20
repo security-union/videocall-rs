@@ -13,12 +13,18 @@
       "source": "devcontainer-cargo-cache-${devcontainerId}",
       "target": "/usr/local/cargo",
       "type": "volume"
-    }
+    },
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind",
+    "source=devcontainer-bashhistory,target=/commandhistory,type=volume"
   ],
 
   // Features to add to the dev container. More info: https://containers.dev/features.
   "features": {
-    "ghcr.io/devcontainers/features/rust:1": {}
+    "ghcr.io/devcontainers/features/rust:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers-contrib/features/pre-commit:2": {},
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+    "ghcr.io/mikaello/devcontainer-features/modern-shell-utils:1": {}
   },
 
   // Use 'forwardPorts' to make a list of ports inside the container available locally.
@@ -37,7 +43,39 @@
   // Configure tool-specific properties.
   "customizations": {
     "vscode": {
-      "extensions": ["ms-vscode.makefile-tools", "ms-azuretools.vscode-docker"]
+      "extensions": [
+        "ms-vscode.makefile-tools",
+        "ms-azuretools.vscode-docker",
+        "GitHub.vscode-pull-request-github",
+        "esbenp.prettier-vscode",
+        "mhutchie.git-graph",
+        "eamodio.gitlens",
+        "github.vscode-github-actions"
+      ],
+      "settings": {
+        "editor.tabSize": 4,
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "bash": {
+            "path": "bash",
+            "icon": "terminal-bash"
+          },
+          "zsh": {
+            "path": "zsh"
+          },
+          "fish": {
+            "path": "fish"
+          },
+          "tmux": {
+            "path": "tmux",
+            "icon": "terminal-tmux"
+          },
+          "pwsh": {
+            "path": "pwsh",
+            "icon": "terminal-powershell"
+          }
+        }
+      }
     }
   }
 

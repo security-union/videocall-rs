@@ -44,38 +44,15 @@
   "customizations": {
     "vscode": {
       "extensions": [
+        "GitHub.copilot",
+        "GitHub.vscode-pull-request-github",
+        "github.vscode-github-actions",
         "ms-vscode.makefile-tools",
         "ms-azuretools.vscode-docker",
-        "GitHub.vscode-pull-request-github",
         "esbenp.prettier-vscode",
         "mhutchie.git-graph",
-        "eamodio.gitlens",
-        "github.vscode-github-actions"
-      ],
-      "settings": {
-        "editor.tabSize": 4,
-        "terminal.integrated.defaultProfile.linux": "zsh",
-        "terminal.integrated.profiles.linux": {
-          "bash": {
-            "path": "bash",
-            "icon": "terminal-bash"
-          },
-          "zsh": {
-            "path": "zsh"
-          },
-          "fish": {
-            "path": "fish"
-          },
-          "tmux": {
-            "path": "tmux",
-            "icon": "terminal-tmux"
-          },
-          "pwsh": {
-            "path": "pwsh",
-            "icon": "terminal-powershell"
-          }
-        }
-      }
+        "eamodio.gitlens"
+      ]
     }
   }
 

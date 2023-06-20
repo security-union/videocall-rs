@@ -5,7 +5,7 @@ services:
   devcontainer:
     image: mcr.microsoft.com/devcontainers/rust:0-1-bullseye
     volumes:
-      - ../..:/workspaces:cached
+      - ../:/workspaces/zoom-rs:cached
     network_mode: service:postgres
     command: sleep infinity
 

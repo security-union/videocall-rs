@@ -12,7 +12,7 @@ use types::protos::media_packet::MediaPacket;
 use super::chat_session::{RoomId, SessionId};
 
 pub struct ChatServer {
-    nc: nats::Connection,
+    nats_connection: nats::Connection,
     sessions: HashMap<SessionId, Recipient<Message>>,
     active_subs: HashMap<SessionId, nats::Handler>,
 }
@@ -24,7 +24,7 @@ impl ChatServer {
             .connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
             .unwrap();
         ChatServer {
-            nc,
+            nats_connection: nc,
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
         }
@@ -33,7 +33,7 @@ impl ChatServer {
     pub fn send_message(&self, room: &RoomId, message: Arc<MediaPacket>, session_id: SessionId) {
         let subject = format!("room.{}.{}", room, session_id);
         if let Ok(message) = message.write_to_bytes() {
-            match self.nc.publish(&subject, message) {
+            match self.nats_connection.publish(&subject, message) {
                 Ok(_) => trace!("published message to {}", subject),
                 Err(e) => error!("error publishing message to {}: {}", subject, e),
             }
@@ -116,7 +116,7 @@ impl Handler<JoinRoom> for ChatServer {
         };
 
         let sub = match self
-            .nc
+            .nats_connection
             .queue_subscribe(&subject, &queue)
             .map_err(|e| handle_subscription_error(e, &subject))
         {

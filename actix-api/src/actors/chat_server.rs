@@ -122,7 +122,13 @@ impl Handler<JoinRoom> for ChatServer {
             if msg.subject == format!("room.{}.{}", room_clone, session_clone) {
                 return Ok(());
             }
-            let msg = MediaPacket::parse_from_bytes(&msg.data).unwrap();
+            let msg = match MediaPacket::parse_from_bytes(&msg.data) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    error!("error parsing message: {}", e);
+                    return Ok(());
+                }
+            };
             let msg = Message {
                 nickname: Arc::new(Some(msg.email.clone())),
                 msg: Arc::new(msg),

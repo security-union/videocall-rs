@@ -173,7 +173,7 @@ fn build_handler(
             Ok(media_packet) => media_packet,
             Err(e) => {
                 error!("error parsing message: {}", e);
-                return Ok(());
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
             }
         };
 

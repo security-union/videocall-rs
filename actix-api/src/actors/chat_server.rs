@@ -111,7 +111,7 @@ impl Handler<JoinRoom> for ChatServer {
             None => {
                 let err = format!("session {} is not connected", session);
                 error!("{}", err);
-                return MessageResult(Err(err.into()));
+                return MessageResult(Err(err));
             }
         };
 

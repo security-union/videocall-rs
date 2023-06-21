@@ -105,52 +105,86 @@ impl Handler<JoinRoom> for ChatServer {
     ) -> Self::Result {
         self.leave_rooms(&session);
 
-        let subject = format!("room.{}.*", room);
-        let queue = format!("{}-{}", session, room);
-        let session_recipient = self.sessions.get(&session).unwrap().clone();
-        let room_clone = room.clone();
-        let session_clone = session.clone();
-        let sub = match self.nc.queue_subscribe(&subject, &queue) {
-            Ok(sub) => sub,
-            Err(e) => {
-                let err = format!("error subscribing to subject {}: {}", subject, e);
+        let (subject, queue) = build_subject_and_queue(&room, &session);
+        let session_recipient = match self.sessions.get(&session) {
+            Some(recipient) => recipient.clone(),
+            None => {
+                let err = format!("session {} is not connected", session);
                 error!("{}", err);
-                return MessageResult(Err(err));
+                return MessageResult(Err(err.into()));
             }
         };
-        let handler = sub.with_handler(move |msg| {
-            if msg.subject == format!("room.{}.{}", room_clone, session_clone) {
-                return Ok(());
-            }
-            let msg = match MediaPacket::parse_from_bytes(&msg.data) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!("error parsing message: {}", e);
-                    return Ok(());
-                }
-            };
-            let msg = Message {
-                nickname: Arc::new(Some(msg.email.clone())),
-                msg: Arc::new(msg),
-            };
 
-            session_recipient.try_send(msg).map_err(|e| {
-                error!("error sending message to session {}: {}", session_clone, e);
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            })
-        });
+        let sub = match self
+            .nc
+            .queue_subscribe(&subject, &queue)
+            .map_err(|e| handle_subscription_error(e, &subject))
+        {
+            Ok(sub) => sub,
+            Err(e) => return MessageResult(Err(e)),
+        };
+
+        let handler = sub.with_handler(build_handler(
+            session_recipient,
+            room.clone(),
+            session.clone(),
+        ));
+
         debug!("Subscribed to subject {} with queue {}", subject, queue);
+
         let result = self
             .active_subs
             .insert(session.clone(), handler)
             .map(|_| ())
             .ok_or("The session is already subscribed".into());
+
         info!(
             "someone connected to room {} with session {} result {:?}",
             room,
             session.trim(),
             result
         );
+
         MessageResult(result)
+    }
+}
+
+fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {
+    (format!("room.{}.*", room), format!("{}-{}", session, room))
+}
+
+fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {
+    let err = format!("error subscribing to subject {}: {}", subject, e);
+    error!("{}", err);
+    err
+}
+
+fn build_handler(
+    session_recipient: Recipient<Message>, // Assuming Recipient is a type
+    room: String,
+    session: String,
+) -> impl Fn(nats::Message) -> Result<(), std::io::Error> {
+    move |msg| {
+        if msg.subject == format!("room.{}.{}", room, session) {
+            return Ok(());
+        }
+
+        let media_packet = match MediaPacket::parse_from_bytes(&msg.data) {
+            Ok(media_packet) => media_packet,
+            Err(e) => {
+                error!("error parsing message: {}", e);
+                return Ok(());
+            }
+        };
+
+        let message = Message {
+            nickname: Arc::new(Some(media_packet.email.clone())),
+            msg: Arc::new(media_packet),
+        };
+
+        session_recipient.try_send(message).map_err(|e| {
+            error!("error sending message to session {}: {}", session, e);
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })
     }
 }

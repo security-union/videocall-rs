@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
-use bytes::{BufMut, Bytes, BytesMut};
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use http::Method;
 
 use rustls::{Certificate, PrivateKey};
+use sec_http3::error::Code;
 use sec_http3::sec_http3_quinn as h3_quinn;
 use sec_http3::webtransport::{
     server::{self, WebTransportSession},
@@ -151,11 +152,19 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
                 let ext = req.extensions();
                 match req.method() {
                     &Method::CONNECT if ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT) => {
-                        
-                        let uri = req.uri();
+                        let uri = req.uri().clone();
 
                         info!("Got path : {} ", uri.path());
-                        
+
+                        let parts = uri.path().split('/').collect::<Vec<&str>>();
+                        if parts.len() != 3 || parts[0] != "lobby" {
+                            conn.close(Code::H3_REQUEST_REJECTED, "Invalid path");
+                            return Err(anyhow!("Invalid path"));
+                        }
+
+                        let username = parts[1];
+                        let lobby_id = parts[2];
+
                         info!("Peer wants to initiate a webtransport session");
 
                         info!("Handing over connection to WebTransport");
@@ -164,7 +173,7 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
                         info!("Established webtransport session");
                         // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
                         // h3_conn needs to handover the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
-                        handle_session(session).await?;
+                        handle_session(session, username, lobby_id).await?;
 
                         return Ok(());
                     }
@@ -254,6 +263,8 @@ where
 #[tracing::instrument(level = "info", skip(session))]
 async fn handle_session<C>(
     session: WebTransportSession<C, Bytes>,
+    username: &str,
+    lobby_id: &str,
 ) -> anyhow::Result<()>
 where
     // Use trait bounds to ensure we only happen to use implementation that are only for the quinn
@@ -287,19 +298,30 @@ where
 
     tokio::spawn(async move { log_result!(open_bidi_test(stream).await) });
 
+    let nc =
+        nats::asynk::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
+            .await
+            .unwrap();
+
+    let subject = format!("room.{}.*", lobby_id);
+    let specific_subject = format!("room.{}.{}", lobby_id, username);
+    let queue = format!("{:?}-{}", session_id, lobby_id);
+    let sub = match nc.queue_subscribe(&subject, &queue).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let err = format!("error subscribing to subject {}: {}", subject, e);
+            error!("{}", err);
+            return Err(anyhow!(err));
+        }
+    };
+
     loop {
         tokio::select! {
             datagram = session.accept_datagram() => {
                 let datagram = datagram?;
                 if let Some((_, datagram)) = datagram {
-                    info!("Responding with {datagram:?}");
-                    // Put something before to make sure encoding and decoding works and don't just
-                    // pass through
-                    let mut resp = BytesMut::from(&b"Response: "[..]);
-                    resp.put(datagram);
-
-                    session.send_datagram(resp.freeze())?;
-                    info!("Finished sending datagram");
+                    info!("Got datagram: {:?}", datagram);
+                    nc.publish(&specific_subject, datagram).await.unwrap();
                 }
             }
             uni_stream = session.accept_uni() => {
@@ -312,6 +334,14 @@ where
                 if let Some(server::AcceptedBi::BidiStream(_, stream)) = stream? {
                     let (send, recv) = quic::BidiStream::split(stream);
                     tokio::spawn( async move { log_result!(echo_stream(send, recv).await); });
+                }
+            }
+            msg = sub.next() => {
+                if let Some(msg) = msg {
+                    if msg.subject == specific_subject {
+                        continue;
+                    }
+                    session.send_datagram(msg.data.into()).unwrap();
                 }
             }
             else => {

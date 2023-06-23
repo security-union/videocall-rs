@@ -14,14 +14,17 @@ use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
-use tracing::{debug, error, info};
+use reqwest::header::LOCATION;
 use sec_api::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},
-    auth::{AuthRequest, fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user},
+    auth::{
+        fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
+        AuthRequest,
+    },
     db::{get_pool, PostgresPool},
     models::{AppConfig, AppState},
 };
-use reqwest::header::LOCATION;
+use tracing::{debug, error, info};
 
 const SCOPE: &str = "email%20profile%20openid";
 /**

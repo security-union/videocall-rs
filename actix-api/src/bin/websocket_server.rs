@@ -1,8 +1,3 @@
-mod actors;
-mod constants;
-mod messages;
-mod models;
-
 use actix::{prelude::Stream, Actor, StreamHandler};
 use actix_cors::Cors;
 use actix_http::{
@@ -19,22 +14,14 @@ use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
-use log::{debug, info};
-use models::AppConfig;
-
-use crate::{
+use tracing::{debug, error, info};
+use sec_api::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},
-    auth::{fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user},
-    models::AppState,
-};
-use crate::{
-    auth::AuthRequest,
+    auth::{AuthRequest, fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user},
     db::{get_pool, PostgresPool},
+    models::{AppConfig, AppState},
 };
 use reqwest::header::LOCATION;
-
-pub mod auth;
-pub mod db;
 
 const SCOPE: &str = "email%20profile%20openid";
 /**
@@ -58,7 +45,7 @@ async fn login(
         web::block(move || generate_and_store_oauth_request(pool)).await?
     }
     .map_err(|e| {
-        log::error!("{:?}", e);
+        error!("{:?}", e);
         error::ErrorInternalServerError(e)
     })?;
 
@@ -100,7 +87,7 @@ async fn handle_google_oauth_callback(
         web::block(move || fetch_oauth_request(pool, state)).await?
     }
     .map_err(|e| {
-        log::error!("{:?}", e);
+        error!("{:?}", e);
         error::ErrorBadRequest("couldn't find a request, are you a hacker?")
     })?;
 
@@ -115,7 +102,7 @@ async fn handle_google_oauth_callback(
     )
     .await
     .map_err(|err| {
-        log::error!("{:?}", err);
+        error!("{:?}", err);
         error::ErrorBadRequest("couldn't find a request, are you a hacker?")
     })?;
 
@@ -125,7 +112,7 @@ async fn handle_google_oauth_callback(
         web::block(move || upsert_user(pool, &claims, &oauth_response)).await?
     }
     .map_err(|err| {
-        log::error!("{:?}", err);
+        error!("{:?}", err);
         error::ErrorInternalServerError(err)
     })?;
 
@@ -175,7 +162,11 @@ pub async fn ws_connect(
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .with_writer(std::io::stderr)
+        .init();
     info!("start");
     let chat = ChatServer::new().start();
     let oauth_client_id: String = std::env::var("OAUTH_CLIENT_ID").unwrap_or(String::from(""));

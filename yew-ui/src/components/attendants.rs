@@ -12,6 +12,10 @@ use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo::timers::callback::Interval;
 use gloo_console::log;
+use js_sys::Boolean;
+use js_sys::JsString;
+use js_sys::Reflect;
+use js_sys::Uint8Array;
 use protobuf::Message;
 use types::protos::media_packet::media_packet;
 use types::protos::media_packet::media_packet::MediaType;
@@ -26,9 +30,7 @@ use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
-use yew_webtransport::webtransport::WebTransportService;
-use yew_webtransport::webtransport::WebTransportStatus;
-use yew_webtransport::webtransport::WebTransportTask;
+use yew_webtransport::webtransport::{process_binary, WebTransportService, WebTransportStatus, WebTransportTask};
 
 use super::device_permissions::request_permissions;
 use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
@@ -69,6 +71,7 @@ pub enum Msg {
     OnDatagram(Vec<u8>),
     OnUniStream(WebTransportReceiveStream),
     OnBidiStream(WebTransportBidirectionalStream),
+    OnMessage(Vec<u8>, WebTransportMessageType),
 }
 
 impl From<WsAction> for Msg {
@@ -95,6 +98,14 @@ pub struct AttendantsComponentProps {
     pub email: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebTransportMessageType {
+    Datagram,
+    UnidirectionalStream,
+    BidirectionalStream,
+    Unknown,
+}
+
 pub struct AttendantsComponent {
     pub connection: Option<Connection>,
     pub media_packet: MediaPacket,
@@ -109,6 +120,7 @@ pub struct AttendantsComponent {
     pub heartbeat: Option<Interval>,
     pub error: Option<String>,
     pub media_access_granted: bool,
+    pub stream_buffer: Vec<u8>,
 }
 
 pub struct ClientSubscription {
@@ -185,6 +197,7 @@ impl Component for AttendantsComponent {
             heartbeat: None,
             error: None,
             media_access_granted: false,
+            stream_buffer: vec![],
         }
     }
 
@@ -441,13 +454,100 @@ impl Component for AttendantsComponent {
                     false
                 }
             }
-            Msg::OnUniStream(_stream) => {
-                log!("unistream not implemented yet");
-                false
+            Msg::OnMessage(response, message_type) => {
+                self.stream_buffer.extend(response);
+                let res = MediaPacket::parse_from_bytes(&self.stream_buffer);
+                if let Ok(media_packet) = res {
+                    self.stream_buffer.clear();
+                    ctx.link()
+                        .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
+                } else {
+                    log!("failed to parse media packet");
+                }
+                true
             }
-            Msg::OnBidiStream(_stream) => {
-                log!("bidistream not implemented yet");
-                false
+            Msg::OnUniStream(stream) => {
+                // TODO: Read from the stream and do something useful with the data.
+                log!("OnUniStream: ", &stream);
+                if stream.is_undefined() {
+                    log!("stream is undefined");
+                    return true;
+                }
+                let incoming_datagrams: ReadableStreamDefaultReader =
+                    stream.get_reader().unchecked_into();
+                let callback = ctx
+                    .link()
+                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::UnidirectionalStream));
+                wasm_bindgen_futures::spawn_local(async move {
+                    loop {
+                        let read_result = JsFuture::from(incoming_datagrams.read()).await;
+                        match read_result {
+                            Err(e) => {
+                                let mut reason = WebTransportCloseInfo::default();
+                                reason.reason(
+                                    format!("Failed to read incoming datagrams {e:?}").as_str(),
+                                );
+                                break;
+                            }
+                            Ok(result) => {
+                                let done = Reflect::get(&result, &JsString::from("done"))
+                                    .unwrap()
+                                    .unchecked_into::<Boolean>();
+                                if done.is_truthy() {
+                                    break;
+                                }
+                                let value: Uint8Array =
+                                    Reflect::get(&result, &JsString::from("value"))
+                                        .unwrap()
+                                        .unchecked_into();
+                                process_binary(&value, &callback);
+                            }
+                        }
+                    }
+                });
+                true
+            }
+            Msg::OnBidiStream(stream) => {
+                log!("OnBidiStream: ", &stream);
+                if stream.is_undefined() {
+                    log!("stream is undefined");
+                    return true;
+                }
+                let readable: ReadableStreamDefaultReader =
+                    stream.readable().get_reader().unchecked_into();
+                let callback = ctx
+                    .link()
+                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::BidirectionalStream));
+                wasm_bindgen_futures::spawn_local(async move {
+                    loop {
+                        log!("reading from stream");
+                        let read_result = JsFuture::from(readable.read()).await;
+                        match read_result {
+                            Err(e) => {
+                                let mut reason = WebTransportCloseInfo::default();
+                                reason.reason(
+                                    format!("Failed to read incoming datagrams {e:?}").as_str(),
+                                );
+                                break;
+                            }
+                            Ok(result) => {
+                                let done = Reflect::get(&result, &JsString::from("done"))
+                                    .unwrap()
+                                    .unchecked_into::<Boolean>();
+                                if done.is_truthy() {
+                                    break;
+                                }
+                                let value: Uint8Array =
+                                    Reflect::get(&result, &JsString::from("value"))
+                                        .unwrap()
+                                        .unchecked_into();
+                                process_binary(&value, &callback);
+                            }
+                        }
+                    }
+                    log!("readable stream closed");
+                });
+                true
             }
             Msg::MeetingAction(action) => {
                 match action {

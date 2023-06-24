@@ -308,12 +308,16 @@ where
         nats::asynk::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
             .await
             .unwrap();
+    info!("Connected to NATS");
 
     let subject = format!("room.{}.*", lobby_id);
     let specific_subject = format!("room.{}.{}", lobby_id, username);
     let queue = format!("{:?}-{}", session_id, lobby_id);
     let sub = match nc.queue_subscribe(&subject, &queue).await {
-        Ok(sub) => sub,
+        Ok(sub) => {
+            info!("Subscribed to subject {}", subject);
+            sub
+        }
         Err(e) => {
             let err = format!("error subscribing to subject {}: {}", subject, e);
             error!("{}", err);

@@ -30,7 +30,9 @@ use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
-use yew_webtransport::webtransport::{process_binary, WebTransportService, WebTransportStatus, WebTransportTask};
+use yew_webtransport::webtransport::{
+    process_binary, WebTransportService, WebTransportStatus, WebTransportTask,
+};
 
 use super::device_permissions::request_permissions;
 use super::video_decoder_with_buffer::VideoDecoderWithBuffer;

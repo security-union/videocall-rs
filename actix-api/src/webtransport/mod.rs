@@ -5,10 +5,7 @@ use http::Method;
 use rustls::{Certificate, PrivateKey};
 use sec_http3::error::Code;
 use sec_http3::sec_http3_quinn as h3_quinn;
-use sec_http3::webtransport::{
-    server::WebTransportSession,
-    stream,
-};
+use sec_http3::webtransport::{server::WebTransportSession, stream};
 use sec_http3::{
     error::ErrorLevel,
     ext::Protocol,

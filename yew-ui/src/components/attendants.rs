@@ -422,7 +422,7 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        // log!("sending video packet: ", bytes.len(), " bytes");
+                                        log!("sending media packet: ", bytes.len(), " bytes");
                                         WebTransportTask::send_datagram(
                                             wt.transport.clone(),
                                             bytes,

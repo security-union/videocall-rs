@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http::Method;
 
@@ -6,7 +6,7 @@ use rustls::{Certificate, PrivateKey};
 use sec_http3::error::Code;
 use sec_http3::sec_http3_quinn as h3_quinn;
 use sec_http3::webtransport::{
-    server::{self, WebTransportSession},
+    server::WebTransportSession,
     stream,
 };
 use sec_http3::{
@@ -17,8 +17,7 @@ use sec_http3::{
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::pin;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{error, info, trace_span};
 
 #[derive(StructOpt, Debug)]
@@ -206,66 +205,6 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
     Ok(())
 }
 
-macro_rules! log_result {
-    ($expr:expr) => {
-        if let Err(err) = $expr {
-            error!("{err:?}");
-        }
-    };
-}
-
-async fn echo_stream<T, R>(send: T, recv: R) -> anyhow::Result<()>
-where
-    T: AsyncWrite,
-    R: AsyncRead,
-{
-    pin!(send);
-    pin!(recv);
-
-    info!("Got stream");
-    let mut buf = Vec::new();
-    recv.read_to_end(&mut buf).await?;
-
-    let message = Bytes::from(buf);
-
-    send_chunked(send, message).await?;
-
-    Ok(())
-}
-
-// Used to test that all chunks arrive properly as it is easy to write an impl which only reads and
-// writes the first chunk.
-async fn send_chunked(mut send: impl AsyncWrite + Unpin, data: Bytes) -> anyhow::Result<()> {
-    for chunk in data.chunks(4) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        info!("Sending {chunk:?}");
-        send.write_all(chunk).await?;
-    }
-
-    Ok(())
-}
-
-async fn open_bidi_test<S>(mut stream: S) -> anyhow::Result<()>
-where
-    S: Unpin + AsyncRead + AsyncWrite,
-{
-    info!("Opening bidirectional stream");
-
-    stream
-        .write_all(b"Hello from a server initiated bidi stream")
-        .await
-        .context("Failed to respond")?;
-
-    let mut resp = Vec::new();
-    stream.shutdown().await?;
-    stream.read_to_end(&mut resp).await?;
-
-    info!("Got response from client: {resp:?}");
-
-    Ok(())
-}
-
-/// This method will echo all inbound datagrams, unidirectional and bidirectional streams.
 #[tracing::instrument(level = "info", skip(session))]
 async fn handle_session<C>(
     session: WebTransportSession<C, Bytes>,
@@ -299,11 +238,6 @@ where
 {
     let session_id = session.session_id();
 
-    // This will open a bidirectional stream and send a message to the client right after connecting!
-    let stream = session.open_bi(session_id).await?;
-
-    tokio::spawn(async move { log_result!(open_bidi_test(stream).await) });
-
     let nc =
         nats::asynk::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
             .await
@@ -334,17 +268,11 @@ where
                     nc.publish(&specific_subject, datagram).await.unwrap();
                 }
             }
-            uni_stream = session.accept_uni() => {
-                let (id, stream) = uni_stream?.unwrap();
-
-                let send = session.open_uni(id).await?;
-                tokio::spawn( async move { log_result!(echo_stream(send, stream).await); });
+            _uni_stream = session.accept_uni() => {
+                // TODO: Handle uni streams
             }
-            stream = session.accept_bi() => {
-                if let Some(server::AcceptedBi::BidiStream(_, stream)) = stream? {
-                    let (send, recv) = quic::BidiStream::split(stream);
-                    tokio::spawn( async move { log_result!(echo_stream(send, recv).await); });
-                }
+            _stream = session.accept_bi() => {
+                // TODO: Handle bi streams
             }
             msg = sub.next() => {
                 if let Some(msg) = msg {

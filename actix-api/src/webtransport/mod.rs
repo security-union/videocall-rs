@@ -157,9 +157,15 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
                         info!("Got path : {} ", uri.path());
 
                         let parts = uri.path().split('/').collect::<Vec<&str>>();
-                        if parts.len() != 3 || parts[0] != "lobby" {
-                            conn.close(Code::H3_REQUEST_REJECTED, "Invalid path");
-                            return Err(anyhow!("Invalid path"));
+                        // filter out the empty strings
+                        let parts = parts.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+                        info!("Parts {:?}", parts);
+                        if parts.len() != 3 {
+                            conn.close(Code::H3_REQUEST_REJECTED, "Invalid path wrong length");
+                            return Err(anyhow!("Invalid path wrong length"));
+                        } else if parts[0] != &"lobby" {
+                            conn.close(Code::H3_REQUEST_REJECTED, "Invalid path wrong prefix");
+                            return Err(anyhow!("Invalid path wrong prefix"));
                         }
 
                         let username = parts[1];

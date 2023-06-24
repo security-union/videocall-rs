@@ -165,7 +165,7 @@ pub fn connect_webtransport(
     let on_unidirectional_stream = ctx.link().callback(|d| Msg::OnUniStream(d));
     let on_bidirectional_stream = ctx.link().callback(|d| Msg::OnBidiStream(d));
     let notification = ctx.link().batch_callback(|status| match status {
-        WebTransportStatus::Opened => Some(WsAction::Log(String::from("Connected")).into()),
+        WebTransportStatus::Opened => Some(WsAction::Connected.into()),
         WebTransportStatus::Closed | WebTransportStatus::Error => Some(WsAction::Lost.into()),
     });
     let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
@@ -439,6 +439,7 @@ impl Component for AttendantsComponent {
                                         );
                                     }
                                 }
+                                self.connection = Some(Connection::WebTransport(wt));
                             }
                         }
                     }

@@ -19,6 +19,7 @@ services:
       - LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
       - RUST_BACKTRACE=1
+      - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
     ports:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
 

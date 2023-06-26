@@ -6,6 +6,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::constants::WEBTRANSPORT_ENABLED;
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::configure_audio_context;
 use crate::model::EncodedVideoChunkTypeWrapper;
@@ -196,7 +197,7 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
-            webtransport_enabled: true,
+            webtransport_enabled: WEBTRANSPORT_ENABLED,
             heartbeat: None,
             error: None,
             media_access_granted: false,

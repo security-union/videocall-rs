@@ -211,7 +211,7 @@ macro_rules! log_result {
     };
 }
 
-#[tracing::instrument(level = "info", skip(session))]
+#[tracing::instrument(level = "trace", skip(session))]
 async fn handle_session<C>(
     session: WebTransportSession<C, Bytes>,
     username: &str,
@@ -270,14 +270,12 @@ where
             datagram = session.accept_datagram() => {
                 let datagram = datagram?;
                 if let Some((_, datagram)) = datagram {
-                    info!("Got datagram: {:?}", datagram);
                     nc.publish(&specific_subject, datagram).await.unwrap();
                 }
             }
             uni_stream = session.accept_uni() => {
                 let uni_stream = uni_stream?;
-                if let Some((id, mut uni_stream)) = uni_stream {
-                    info!("Got uni stream: {:?}", id);
+                if let Some((_id, mut uni_stream)) = uni_stream {
                     let nats_connection = nc.clone();
                     let specific_subject_clone = specific_subject.clone();
                     tokio::spawn(async move {

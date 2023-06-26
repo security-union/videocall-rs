@@ -14,7 +14,7 @@ use sec_http3::{
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{error, info, trace_span};
 
 #[derive(StructOpt, Debug)]
@@ -202,6 +202,15 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
     Ok(())
 }
 
+
+macro_rules! log_result {
+    ($expr:expr) => {
+        if let Err(err) = $expr {
+            tracing::error!("{err:?}");
+        }
+    };
+}
+
 #[tracing::instrument(level = "info", skip(session))]
 async fn handle_session<C>(
     session: WebTransportSession<C, Bytes>,
@@ -265,8 +274,18 @@ where
                     nc.publish(&specific_subject, datagram).await.unwrap();
                 }
             }
-            _uni_stream = session.accept_uni() => {
-                // TODO: Handle uni streams
+            uni_stream = session.accept_uni() => {
+                let uni_stream = uni_stream?;
+                if let Some((id, mut uni_stream)) = uni_stream {
+                    info!("Got uni stream: {:?}", id);
+                    let nats_connection = nc.clone();
+                    let specific_subject_clone = specific_subject.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        log_result!(uni_stream.read_to_end(&mut buf).await);
+                        log_result!(nats_connection.publish(&specific_subject_clone, buf).await);
+                    });
+                }
             }
             _stream = session.accept_bi() => {
                 // TODO: Handle bi streams
@@ -276,7 +295,12 @@ where
                     if msg.subject == specific_subject {
                         continue;
                     }
-                    session.send_datagram(msg.data.into()).unwrap();
+                    if msg.data.len() < 1024 {
+                        session.send_datagram(msg.data.into()).unwrap();
+                    } else {
+                        let mut stream = session.open_uni(session_id).await?;
+                        stream.write_all(&msg.data).await?;
+                    }
                 }
             }
             else => {

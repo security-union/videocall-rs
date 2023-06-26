@@ -425,10 +425,17 @@ impl Component for AttendantsComponent {
                                 {
                                     Ok(bytes) => {
                                         log!("sending media packet: ", bytes.len(), " bytes");
-                                        WebTransportTask::send_datagram(
-                                            wt.transport.clone(),
-                                            bytes,
-                                        );
+                                        if bytes.len() < 1024 {
+                                            WebTransportTask::send_datagram(
+                                                wt.transport.clone(),
+                                                bytes,
+                                            );
+                                        } else {
+                                            WebTransportTask::send_unidirectional_stream(
+                                                wt.transport.clone(),
+                                                bytes,
+                                            );
+                                        }
                                     }
                                     Err(e) => {
                                         let packet_type = media.media_type.enum_value().unwrap();

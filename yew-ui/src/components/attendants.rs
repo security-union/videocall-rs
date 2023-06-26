@@ -6,6 +6,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::configure_audio_context;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use crate::model::MediaPacketWrapper;
@@ -168,7 +169,7 @@ pub fn connect_webtransport(
         WebTransportStatus::Opened => Some(WsAction::Connected.into()),
         WebTransportStatus::Closed | WebTransportStatus::Error => Some(WsAction::Lost.into()),
     });
-    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
+    let url = format!("{}/{}/{}", WEBTRANSPORT_HOST, email, id);
     let task = WebTransportService::connect(
         &url,
         on_datagram,
@@ -228,6 +229,7 @@ impl Component for AttendantsComponent {
                                 "WebTransport connect failed: {}",
                                 e.to_string()
                             )));
+                            log!("falling back to WebSocket");
                             ctx.link().send_message(WsAction::Connect(false));
                             false
                         });
@@ -464,7 +466,7 @@ impl Component for AttendantsComponent {
                     false
                 }
             }
-            Msg::OnMessage(response, message_type) => {
+            Msg::OnMessage(response, _message_type) => {
                 self.stream_buffer.extend(response);
                 let res = MediaPacket::parse_from_bytes(&self.stream_buffer);
                 if let Ok(media_packet) = res {
@@ -477,7 +479,6 @@ impl Component for AttendantsComponent {
                 true
             }
             Msg::OnUniStream(stream) => {
-                // TODO: Read from the stream and do something useful with the data.
                 log!("OnUniStream: ", &stream);
                 if stream.is_undefined() {
                     log!("stream is undefined");

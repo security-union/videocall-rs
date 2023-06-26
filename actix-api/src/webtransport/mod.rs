@@ -202,7 +202,6 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
     Ok(())
 }
 
-
 macro_rules! log_result {
     ($expr:expr) => {
         if let Err(err) = $expr {

@@ -12,7 +12,8 @@ services:
     working_dir: /app/yew-ui
     command: bash -c "trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
     environment:
-      - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-https://127.0.0.1:4433}
+      - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
+      - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
       - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
       - ENABLE_OAUTH=false
       - LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login

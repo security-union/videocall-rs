@@ -53,7 +53,7 @@ Cargoes:
       Cmd:
         - bash
         - -c
-        - /app/dbmate/startup.sh && cargo watch -x run
+        - /app/dbmate/startup.sh && cargo watch -x run --bin websocket_server
       HostConfig:
         Dns:
           - ${{ Namespaces.global.Gateway }}

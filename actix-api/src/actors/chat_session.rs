@@ -13,8 +13,8 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use log::{error, info, trace};
 use protobuf::Message;
+use tracing::{error, info, trace};
 use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
 

@@ -1,16 +1,23 @@
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::constants::WEBTRANSPORT_ENABLED;
+use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::configure_audio_context;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo::timers::callback::Interval;
 use gloo_console::log;
+use js_sys::Boolean;
+use js_sys::JsString;
+use js_sys::Reflect;
+use js_sys::Uint8Array;
 use protobuf::Message;
 use types::protos::media_packet::media_packet;
 use types::protos::media_packet::media_packet::MediaType;
@@ -25,6 +32,9 @@ use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
+use yew_webtransport::webtransport::{
+    process_binary, WebTransportService, WebTransportStatus, WebTransportTask,
+};
 
 use super::device_permissions::request_permissions;
 use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
@@ -34,13 +44,20 @@ use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
 
 #[derive(Debug)]
 pub enum WsAction {
-    Connect,
+    Connect(bool),
     Connected,
     Disconnect,
     Lost,
     RequestMediaPermissions,
     MediaPermissionsGranted,
     MediaPermissionsError(String),
+    Log(String),
+}
+
+#[derive(Debug)]
+pub enum Connection {
+    WebSocket(WebSocketTask),
+    WebTransport(WebTransportTask),
 }
 
 #[derive(Debug)]
@@ -55,6 +72,10 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnInboundMedia(MediaPacketWrapper),
     OnOutboundPacket(MediaPacket),
+    OnDatagram(Vec<u8>),
+    OnUniStream(WebTransportReceiveStream),
+    OnBidiStream(WebTransportBidirectionalStream),
+    OnMessage(Vec<u8>, WebTransportMessageType),
 }
 
 impl From<WsAction> for Msg {
@@ -81,19 +102,29 @@ pub struct AttendantsComponentProps {
     pub email: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WebTransportMessageType {
+    Datagram,
+    UnidirectionalStream,
+    BidirectionalStream,
+    Unknown,
+}
+
 pub struct AttendantsComponent {
-    pub ws: Option<WebSocketTask>,
+    pub connection: Option<Connection>,
     pub media_packet: MediaPacket,
     pub connected: bool,
     pub connected_peers: HashMap<String, ClientSubscription>,
     pub sorted_connected_peers_keys: Vec<String>,
     pub outbound_audio_buffer: [u8; 2000],
     pub share_screen: bool,
+    pub webtransport_enabled: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub heartbeat: Option<Interval>,
     pub error: Option<String>,
     pub media_access_granted: bool,
+    pub stream_buffer: Vec<u8>,
 }
 
 pub struct ClientSubscription {
@@ -111,6 +142,45 @@ pub struct ClientSubscription {
     pub screen_output: Closure<dyn FnMut(JsValue)>,
 }
 
+pub fn connect_websocket(
+    ctx: &Context<AttendantsComponent>,
+    email: &str,
+    id: &str,
+) -> anyhow::Result<WebSocketTask> {
+    let callback = ctx.link().callback(Msg::OnInboundMedia);
+    let notification = ctx.link().batch_callback(|status| match status {
+        WebSocketStatus::Opened => Some(WsAction::Connected.into()),
+        WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost.into()),
+    });
+    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
+    log!("Connecting to ", &url);
+    let task = WebSocketService::connect(&url, callback, notification)?;
+    Ok(task)
+}
+
+pub fn connect_webtransport(
+    ctx: &Context<AttendantsComponent>,
+    email: &str,
+    id: &str,
+) -> anyhow::Result<WebTransportTask> {
+    let on_datagram = ctx.link().callback(|d| Msg::OnDatagram(d));
+    let on_unidirectional_stream = ctx.link().callback(|d| Msg::OnUniStream(d));
+    let on_bidirectional_stream = ctx.link().callback(|d| Msg::OnBidiStream(d));
+    let notification = ctx.link().batch_callback(|status| match status {
+        WebTransportStatus::Opened => Some(WsAction::Connected.into()),
+        WebTransportStatus::Closed | WebTransportStatus::Error => Some(WsAction::Lost.into()),
+    });
+    let url = format!("{}/{}/{}", WEBTRANSPORT_HOST, email, id);
+    let task = WebTransportService::connect(
+        &url,
+        on_datagram,
+        on_unidirectional_stream,
+        on_bidirectional_stream,
+        notification,
+    )?;
+    Ok(task)
+}
+
 impl Component for AttendantsComponent {
     type Message = Msg;
     type Properties = AttendantsComponentProps;
@@ -118,7 +188,7 @@ impl Component for AttendantsComponent {
     fn create(_ctx: &Context<Self>) -> Self {
         let connected_peers: HashMap<String, ClientSubscription> = HashMap::new();
         Self {
-            ws: None,
+            connection: None,
             connected: false,
             media_packet: MediaPacket::default(),
             connected_peers,
@@ -127,29 +197,50 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
+            webtransport_enabled: WEBTRANSPORT_ENABLED,
             heartbeat: None,
             error: None,
             media_access_granted: false,
+            stream_buffer: vec![],
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::WsAction(action) => match action {
-                WsAction::Connect => {
-                    let callback = ctx.link().callback(Msg::OnInboundMedia);
-                    let notification = ctx.link().batch_callback(|status| match status {
-                        WebSocketStatus::Opened => Some(WsAction::Connected.into()),
-                        WebSocketStatus::Closed | WebSocketStatus::Error => {
-                            Some(WsAction::Lost.into())
+                WsAction::Connect(webtransport) => {
+                    let id = ctx.props().id.clone();
+                    let email = ctx.props().email.clone();
+                    if !webtransport {
+                        let task = connect_websocket(ctx, &email, &id).map_err(|e| {
+                            ctx.link().send_message(WsAction::Log(format!(
+                                "WebSocket connect failed: {}",
+                                e.to_string()
+                            )));
+                            false
+                        });
+                        if task.is_err() {
+                            return false;
                         }
-                    });
-                    let AttendantsComponentProps { id, email, .. } = ctx.props();
-                    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
-                    log!("Connecting to ", &url);
-                    let task = WebSocketService::connect(&url, callback, notification).unwrap();
+                        let task = task.unwrap();
+                        self.connection = Some(Connection::WebSocket(task));
+                    } else {
+                        let task = connect_webtransport(ctx, &email, &id).map_err(|e| {
+                            ctx.link().send_message(WsAction::Log(format!(
+                                "WebTransport connect failed: {}",
+                                e.to_string()
+                            )));
+                            log!("falling back to WebSocket");
+                            ctx.link().send_message(WsAction::Connect(false));
+                            false
+                        });
+                        if task.is_err() {
+                            return false;
+                        }
+                        self.connection = Some(Connection::WebTransport(task.unwrap()));
+                    }
+
                     let link = ctx.link().clone();
-                    let email = email.clone();
                     self.heartbeat = Some(Interval::new(1000, move || {
                         let media_packet = MediaPacket {
                             media_type: MediaType::HEARTBEAT.into(),
@@ -159,12 +250,11 @@ impl Component for AttendantsComponent {
                         };
                         link.send_message(Msg::OnOutboundPacket(media_packet));
                     }));
-                    self.ws = Some(task);
                     true
                 }
                 WsAction::Disconnect => {
                     log!("Disconnect");
-                    self.ws.take();
+                    self.connection.take();
                     if let Some(heartbeat) = self.heartbeat.take() {
                         heartbeat.cancel();
                     }
@@ -176,9 +266,13 @@ impl Component for AttendantsComponent {
                     self.connected = true;
                     true
                 }
+                WsAction::Log(msg) => {
+                    log!("{}", msg);
+                    true
+                }
                 WsAction::Lost => {
                     log!("Lost");
-                    self.ws = None;
+                    self.connection.take();
                     let heartbeat = self.heartbeat.take();
                     match heartbeat {
                         Some(heartbeat) => {
@@ -207,7 +301,8 @@ impl Component for AttendantsComponent {
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
                     self.media_access_granted = true;
-                    ctx.link().send_message(WsAction::Connect);
+                    ctx.link()
+                        .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
                 }
                 WsAction::MediaPermissionsError(error) => {
@@ -301,28 +396,170 @@ impl Component for AttendantsComponent {
                 }
             }
             Msg::OnOutboundPacket(media) => {
-                if let Some(ws) = self.ws.as_mut() {
-                    if self.connected {
-                        match media
-                            .write_to_bytes()
-                            .map_err(|w| JsValue::from(format!("{:?}", w)))
-                        {
-                            Ok(bytes) => {
-                                // log!("sending video packet: ", bytes.len(), " bytes");
-                                ws.send_binary(bytes);
+                if let Some(connection) = self.connection.take() {
+                    match connection {
+                        Connection::WebSocket(mut ws) => {
+                            if self.connected {
+                                match media
+                                    .write_to_bytes()
+                                    .map_err(|w| JsValue::from(format!("{:?}", w)))
+                                {
+                                    Ok(bytes) => {
+                                        // log!("sending video packet: ", bytes.len(), " bytes");
+                                        ws.send_binary(bytes);
+                                    }
+                                    Err(e) => {
+                                        let packet_type = media.media_type.enum_value().unwrap();
+                                        log!(
+                                            "error sending {} packet: {:?}",
+                                            JsValue::from(format!("{}", packet_type)),
+                                            e
+                                        );
+                                    }
+                                }
+                                self.connection = Some(Connection::WebSocket(ws));
                             }
-                            Err(e) => {
-                                let packet_type = media.media_type.enum_value().unwrap();
-                                log!(
-                                    "error sending {} packet: {:?}",
-                                    JsValue::from(format!("{}", packet_type)),
-                                    e
-                                );
+                        }
+                        Connection::WebTransport(wt) => {
+                            if self.connected {
+                                match media
+                                    .write_to_bytes()
+                                    .map_err(|w| JsValue::from(format!("{:?}", w)))
+                                {
+                                    Ok(bytes) => {
+                                        log!("sending media packet: ", bytes.len(), " bytes");
+                                        if bytes.len() < 1024 {
+                                            WebTransportTask::send_datagram(
+                                                wt.transport.clone(),
+                                                bytes,
+                                            );
+                                        } else {
+                                            WebTransportTask::send_unidirectional_stream(
+                                                wt.transport.clone(),
+                                                bytes,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let packet_type = media.media_type.enum_value().unwrap();
+                                        log!(
+                                            "error sending {} packet: {:?}",
+                                            JsValue::from(format!("{}", packet_type)),
+                                            e
+                                        );
+                                    }
+                                }
+                                self.connection = Some(Connection::WebTransport(wt));
                             }
                         }
                     }
                 }
                 false
+            }
+            Msg::OnDatagram(bytes) => {
+                let media_packet = MediaPacket::parse_from_reader(&mut Cursor::new(bytes))
+                    .map_err(|e| JsValue::from(format!("{:?}", e)));
+                if let Ok(media_packet) = media_packet {
+                    ctx.link()
+                        .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
+                    true
+                } else {
+                    false
+                }
+            }
+            Msg::OnMessage(response, _message_type) => {
+                self.stream_buffer.extend(response);
+                let res = MediaPacket::parse_from_bytes(&self.stream_buffer);
+                if let Ok(media_packet) = res {
+                    self.stream_buffer.clear();
+                    ctx.link()
+                        .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
+                } else {
+                    log!("failed to parse media packet");
+                }
+                true
+            }
+            Msg::OnUniStream(stream) => {
+                log!("OnUniStream: ", &stream);
+                if stream.is_undefined() {
+                    log!("stream is undefined");
+                    return true;
+                }
+                let incoming_datagrams: ReadableStreamDefaultReader =
+                    stream.get_reader().unchecked_into();
+                let callback = ctx
+                    .link()
+                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::UnidirectionalStream));
+                wasm_bindgen_futures::spawn_local(async move {
+                    loop {
+                        let read_result = JsFuture::from(incoming_datagrams.read()).await;
+                        match read_result {
+                            Err(e) => {
+                                let mut reason = WebTransportCloseInfo::default();
+                                reason.reason(
+                                    format!("Failed to read incoming datagrams {e:?}").as_str(),
+                                );
+                                break;
+                            }
+                            Ok(result) => {
+                                let done = Reflect::get(&result, &JsString::from("done"))
+                                    .unwrap()
+                                    .unchecked_into::<Boolean>();
+                                if done.is_truthy() {
+                                    break;
+                                }
+                                let value: Uint8Array =
+                                    Reflect::get(&result, &JsString::from("value"))
+                                        .unwrap()
+                                        .unchecked_into();
+                                process_binary(&value, &callback);
+                            }
+                        }
+                    }
+                });
+                true
+            }
+            Msg::OnBidiStream(stream) => {
+                log!("OnBidiStream: ", &stream);
+                if stream.is_undefined() {
+                    log!("stream is undefined");
+                    return true;
+                }
+                let readable: ReadableStreamDefaultReader =
+                    stream.readable().get_reader().unchecked_into();
+                let callback = ctx
+                    .link()
+                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::BidirectionalStream));
+                wasm_bindgen_futures::spawn_local(async move {
+                    loop {
+                        log!("reading from stream");
+                        let read_result = JsFuture::from(readable.read()).await;
+                        match read_result {
+                            Err(e) => {
+                                let mut reason = WebTransportCloseInfo::default();
+                                reason.reason(
+                                    format!("Failed to read incoming datagrams {e:?}").as_str(),
+                                );
+                                break;
+                            }
+                            Ok(result) => {
+                                let done = Reflect::get(&result, &JsString::from("done"))
+                                    .unwrap()
+                                    .unchecked_into::<Boolean>();
+                                if done.is_truthy() {
+                                    break;
+                                }
+                                let value: Uint8Array =
+                                    Reflect::get(&result, &JsString::from("value"))
+                                        .unwrap()
+                                        .unchecked_into();
+                                process_binary(&value, &callback);
+                            }
+                        }
+                    }
+                    log!("readable stream closed");
+                });
+                true
             }
             Msg::MeetingAction(action) => {
                 match action {
@@ -392,10 +629,10 @@ impl Component for AttendantsComponent {
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
                             { if !self.mic_enabled { "Unmute"} else { "Mute"} }
                             </button>
-                        {if self.ws.is_none() {
+                        {if self.connection.is_none() {
                             html! {<button
                                 class="bg-yew-blue p-2 rounded-md text-white"
-                                disabled={self.ws.is_some()}
+                                disabled={self.connection.is_some() }
                                 onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
                                 { "Connect" }
                             </button>
@@ -405,7 +642,7 @@ impl Component for AttendantsComponent {
                         }}
                         <button
                             class="bg-yew-blue p-2 rounded-md text-white"
-                            disabled={self.ws.is_none()}
+                            disabled={self.connection.is_none() }
                                 onclick={ctx.link().callback(|_| WsAction::Disconnect)}>
                             { "Close" }
                         </button>

@@ -4,9 +4,9 @@ use crate::messages::{
 };
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
-use log::{debug, error, info, trace};
 use protobuf::Message as ProtobufMessage;
 use std::{collections::HashMap, sync::Arc};
+use tracing::{debug, error, info, trace};
 use types::protos::media_packet::MediaPacket;
 
 use super::chat_session::{RoomId, SessionId};
@@ -20,7 +20,7 @@ pub struct ChatServer {
 impl ChatServer {
     pub fn new() -> Self {
         let nc = nats::Options::new()
-            .with_name("actix-api")
+            .with_name("websocket-api")
             .connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
             .unwrap();
         ChatServer {

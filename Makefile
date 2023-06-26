@@ -1,6 +1,6 @@
 test:
 		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app/yew-ui && cargo test"
-		docker compose -f docker/docker-compose.yaml run actix-api bash -c "cd /app/actix-api && cargo test"
+		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo test"
 
 up:
 		docker compose -f docker/docker-compose.yaml up
@@ -14,8 +14,8 @@ connect_to_db:
 
 clippy-fix:
 		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app/yew-ui && cargo clippy --fix"
-		docker compose -f docker/docker-compose.yaml run actix-api bash -c "cd /app/actix-api && cargo clippy --fix"
+		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo clippy --fix"
 
 fmt:
 		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app/yew-ui && cargo fmt"
-		docker compose -f docker/docker-compose.yaml run actix-api bash -c "cd /app/actix-api && cargo fmt"
+		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo fmt"

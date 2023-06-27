@@ -130,6 +130,9 @@ pub struct ClientSubscription {
     pub waiting_for_video_keyframe: bool,
     pub waiting_for_audio_keyframe: bool,
     pub waiting_for_screen_keyframe: bool,
+    pub last_video_sequence: u64,
+    pub last_audio_sequence: u64,
+    pub last_screen_sequence: u64,
     pub error_audio: Closure<dyn FnMut(JsValue)>,
     pub error_video: Closure<dyn FnMut(JsValue)>,
     pub error_screen: Closure<dyn FnMut(JsValue)>,
@@ -320,9 +323,10 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_video_keyframe
                                 || chunk_type == EncodedVideoChunkType::Key
                             {
-                                if peer.video_decoder.state() == CodecState::Configured {
+                                if peer.video_decoder.state() == CodecState::Configured && peer.last_video_sequence < packet.video_metadata.sequence {
                                     peer.video_decoder.decode(packet.clone());
                                     peer.waiting_for_video_keyframe = false;
+                                    peer.last_video_sequence = packet.video_metadata.sequence;
                                 } else if peer.video_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
                                     self.connected_peers.remove(&email);
@@ -356,9 +360,10 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_audio_keyframe
                                 || chunk_type == EncodedAudioChunkType::Key
                             {
-                                if peer.audio_decoder.state() == CodecState::Configured {
+                                if peer.audio_decoder.state() == CodecState::Configured && peer.last_audio_sequence < packet.video_metadata.sequence {
                                     peer.audio_decoder.decode(&encoded_audio_chunk);
                                     peer.waiting_for_audio_keyframe = false;
+                                    peer.last_audio_sequence = packet.video_metadata.sequence;
                                 } else if peer.audio_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
                                     self.connected_peers.remove(&email);
@@ -371,9 +376,10 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_screen_keyframe
                                 || chunk_type == EncodedVideoChunkType::Key
                             {
-                                if peer.screen_decoder.state() == CodecState::Configured {
+                                if peer.screen_decoder.state() == CodecState::Configured && peer.last_screen_sequence < packet.video_metadata.sequence {
                                     peer.screen_decoder.decode(packet.clone());
                                     peer.waiting_for_screen_keyframe = false;
+                                    peer.last_screen_sequence = packet.video_metadata.sequence;
                                     return true;
                                 } else if peer.screen_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
@@ -771,6 +777,9 @@ impl AttendantsComponent {
                 video_decoder,
                 audio_decoder,
                 screen_decoder,
+                last_audio_sequence: 0,
+                last_video_sequence: 0,
+                last_screen_sequence: 0,
                 waiting_for_video_keyframe: true,
                 waiting_for_audio_keyframe: true,
                 waiting_for_screen_keyframe: true,

@@ -1,7 +1,7 @@
 use crate::constants::AUDIO_SAMPLE_RATE;
 use js_sys::Array;
-use web_sys::{AudioContext,AudioContextOptions};
-use web_sys::{MediaStream,MediaStreamTrackGenerator};
+use web_sys::{AudioContext, AudioContextOptions};
+use web_sys::{MediaStream, MediaStreamTrackGenerator};
 
 pub fn configure_audio_context(
     audio_stream_generator: &MediaStreamTrackGenerator,

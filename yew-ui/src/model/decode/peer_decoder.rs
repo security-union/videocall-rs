@@ -10,6 +10,8 @@
 // and each one's new() contains the type-specific creation/configuration code.
 //
 
+use super::config::configure_audio_context;
+use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
@@ -17,25 +19,25 @@ use crate::constants::VIDEO_CODEC;
 use crate::model::EncodedVideoChunkTypeWrapper;
 use gloo_console::log;
 use std::sync::Arc;
-use super::config::configure_audio_context;
-use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
 use types::protos::media_packet::MediaPacket;
+use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
-use wasm_bindgen::prelude::Closure;
-use web_sys::{AudioData,AudioDecoder,AudioDecoderConfig,AudioDecoderInit};
-use web_sys::{CanvasRenderingContext2d,CodecState};
-use web_sys::{EncodedAudioChunk,EncodedAudioChunkInit,EncodedAudioChunkType,EncodedVideoChunkType};
-use web_sys::{HtmlCanvasElement,HtmlImageElement};
+use web_sys::window;
+use web_sys::{AudioData, AudioDecoder, AudioDecoderConfig, AudioDecoderInit};
+use web_sys::{CanvasRenderingContext2d, CodecState};
+use web_sys::{
+    EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType, EncodedVideoChunkType,
+};
+use web_sys::{HtmlCanvasElement, HtmlImageElement};
 use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
-use web_sys::{VideoDecoderConfig,VideoDecoderInit,VideoFrame};
-use web_sys::{window};
+use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 
 //
 // Generic type for decoders captures common functionality.
 //
-pub struct PeerDecoder<WebDecoder,Chunk> {
+pub struct PeerDecoder<WebDecoder, Chunk> {
     decoder: WebDecoder,
     waiting_for_keyframe: bool,
     last_sequence: u64,
@@ -43,8 +45,10 @@ pub struct PeerDecoder<WebDecoder,Chunk> {
     _output: Closure<dyn FnMut(Chunk)>, // member exists to keep the closure in scope for the life of the struct
 }
 
-impl<WebDecoder,ChunkType> PeerDecoder<WebDecoder,ChunkType> {
-    pub fn is_waiting_for_keyframe(&self) -> bool { self.waiting_for_keyframe }
+impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
+    pub fn is_waiting_for_keyframe(&self) -> bool {
+        self.waiting_for_keyframe
+    }
 }
 
 ///
@@ -52,33 +56,37 @@ impl<WebDecoder,ChunkType> PeerDecoder<WebDecoder,ChunkType> {
 ///
 /// (Defined as a macro rather than a trait because traits can't refer to members.)
 ///
-macro_rules! impl_decode{
-    ($self: expr, $packet: expr, $ChunkType: ty, $ref: tt) => {
-        {
-            let chunk_type = $self.get_chunk_type(&$packet);
-            if !$self.waiting_for_keyframe || chunk_type == <$ChunkType>::Key {
-                match $self.decoder.state() {
-                    CodecState::Configured => {
-                        if $self.last_sequence < $packet.video_metadata.sequence {
-                            $self.decoder.decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
-                            $self.waiting_for_keyframe = false;
-                            $self.last_sequence = $packet.video_metadata.sequence;
-                        }
+macro_rules! impl_decode {
+    ($self: expr, $packet: expr, $ChunkType: ty, $ref: tt) => {{
+        let chunk_type = $self.get_chunk_type(&$packet);
+        if !$self.waiting_for_keyframe || chunk_type == <$ChunkType>::Key {
+            match $self.decoder.state() {
+                CodecState::Configured => {
+                    if $self.last_sequence < $packet.video_metadata.sequence {
+                        $self
+                            .decoder
+                            .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
+                        $self.waiting_for_keyframe = false;
+                        $self.last_sequence = $packet.video_metadata.sequence;
                     }
-                    CodecState::Closed => {
-                        return Err(());
-                    }
-                    _ => {}
                 }
+                CodecState::Closed => {
+                    return Err(());
+                }
+                _ => {}
             }
-            Ok(())
         }
-    }
+        Ok(())
+    }};
 }
 
-macro_rules! opt_ref{
-    ($val: expr, "ref") => { & $val };
-    ($val: expr, "") => { $val }
+macro_rules! opt_ref {
+    ($val: expr, "ref") => {
+        &$val
+    };
+    ($val: expr, "") => {
+        $val
+    };
 }
 
 ///
@@ -90,8 +98,8 @@ macro_rules! opt_ref{
 ///
 pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer, JsValue>;
 
-impl PeerDecoder<VideoDecoderWithBuffer,JsValue> {
-    pub fn new(canvas_id: &String) -> PeerDecoder<VideoDecoderWithBuffer,JsValue> {
+impl PeerDecoder<VideoDecoderWithBuffer, JsValue> {
+    pub fn new(canvas_id: &String) -> PeerDecoder<VideoDecoderWithBuffer, JsValue> {
         let id = canvas_id.clone();
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
@@ -149,7 +157,6 @@ impl PeerDecoder<VideoDecoderWithBuffer,JsValue> {
     }
 }
 
-
 ///
 /// AudioPeerDecoder
 ///
@@ -157,8 +164,8 @@ impl PeerDecoder<VideoDecoderWithBuffer,JsValue> {
 ///
 pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
 
-impl PeerDecoder<AudioDecoder,AudioData> {
-    pub fn new() -> PeerDecoder<AudioDecoder,AudioData> {
+impl PeerDecoder<AudioDecoder, AudioData> {
+    pub fn new() -> PeerDecoder<AudioDecoder, AudioData> {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
         }) as Box<dyn FnMut(JsValue)>);
@@ -213,15 +220,17 @@ impl PeerDecoder<AudioDecoder,AudioData> {
         EncodedAudioChunkType::from_js_value(&JsValue::from(packet.frame_type.clone())).unwrap()
     }
 
-    fn get_chunk(&self, packet: &Arc<MediaPacket>, chunk_type: EncodedAudioChunkType) -> EncodedAudioChunk {
+    fn get_chunk(
+        &self,
+        packet: &Arc<MediaPacket>,
+        chunk_type: EncodedAudioChunkType,
+    ) -> EncodedAudioChunk {
         let audio_data = &packet.data;
-        let audio_data_js: js_sys::Uint8Array = js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
+        let audio_data_js: js_sys::Uint8Array =
+            js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
         audio_data_js.copy_from(audio_data.as_slice());
-        let mut audio_chunk = EncodedAudioChunkInit::new(
-            &audio_data_js.into(),
-            packet.timestamp,
-            chunk_type,
-            );
+        let mut audio_chunk =
+            EncodedAudioChunkInit::new(&audio_data_js.into(), packet.timestamp, chunk_type);
         audio_chunk.duration(packet.duration);
         EncodedAudioChunk::new(&audio_chunk).unwrap()
     }

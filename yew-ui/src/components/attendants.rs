@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use crate::constants::WEBTRANSPORT_ENABLED;
 use crate::constants::WEBTRANSPORT_HOST;
+use crate::model::decode::{AudioPeerDecoder, VideoPeerDecoder};
 use crate::model::MediaPacketWrapper;
-use crate::model::decode::{AudioPeerDecoder,VideoPeerDecoder};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo::timers::callback::Interval;
 use gloo_console::log;
@@ -308,11 +308,11 @@ impl Component for AttendantsComponent {
                                 // remove email from connected_peers_keys
                                 if let Some(index) = self
                                     .sorted_connected_peers_keys
-                                        .iter()
-                                        .position(|x| *x == email)
-                                        {
-                                            self.sorted_connected_peers_keys.remove(index);
-                                        }
+                                    .iter()
+                                    .position(|x| *x == email)
+                                {
+                                    self.sorted_connected_peers_keys.remove(index);
+                                }
                                 self.insert_peer(email.clone(), screen_canvas_id);
                             }
                         }

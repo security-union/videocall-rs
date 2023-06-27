@@ -243,11 +243,13 @@ impl Component for Host {
                     let email = email;
                     let on_audio = on_audio;
                     let mut buffer: [u8; 100000] = [0; 100000];
+                    let mut sequence = 0;
                     Box::new(move |chunk: JsValue| {
                         let chunk = web_sys::EncodedAudioChunk::from(chunk);
                         let media_packet: MediaPacket =
-                            transform_audio_chunk(&chunk, &mut buffer, &email);
+                            transform_audio_chunk(&chunk, &mut buffer, &email, sequence);
                         on_audio.emit(media_packet);
+                        sequence += 1;
                     })
                 };
                 let destroy = self.destroy.clone();

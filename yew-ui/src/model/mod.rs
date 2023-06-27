@@ -151,6 +151,7 @@ pub fn transform_audio_chunk(
     chunk: &EncodedAudioChunk,
     buffer: &mut [u8],
     email: &String,
+    sequence: u64,
 ) -> MediaPacket {
     chunk.copy_to_with_u8_array(buffer);
     let mut packet: MediaPacket = MediaPacket::default();
@@ -159,6 +160,9 @@ pub fn transform_audio_chunk(
     packet.data = buffer[0..chunk.byte_length() as usize].to_vec();
     packet.frame_type = EncodedAudioChunkTypeWrapper(chunk.type_()).to_string();
     packet.timestamp = chunk.timestamp();
+    let mut video_metadata = VideoMetadata::default();
+    video_metadata.sequence = sequence;
+    packet.video_metadata = Some(video_metadata).into();
     if let Some(duration0) = chunk.duration() {
         packet.duration = duration0;
     }

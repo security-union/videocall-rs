@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http::Method;
 
+use nats::asynk::Message;
 use rustls::{Certificate, PrivateKey};
 use sec_http3::error::Code;
 use sec_http3::sec_http3_quinn as h3_quinn;
@@ -250,7 +251,7 @@ where
     info!("Connected to NATS");
 
     let subject = format!("room.{}.*", lobby_id);
-    let specific_subject = format!("room.{}.{}", lobby_id, username);
+    let specific_subject =format!("room.{}.{}", lobby_id, username);
     let queue = format!("{:?}-{}", session_id, lobby_id);
     let sub = match nc.queue_subscribe(&subject, &queue).await {
         Ok(sub) => {
@@ -263,6 +264,18 @@ where
             return Err(anyhow!(err));
         }
     };
+
+    // create mpsc tokio channel
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(100);
+    let specific_subject_2 = specific_subject.clone();
+    let handler = tokio::spawn(async move {
+        while let Some(msg) = sub.next().await {
+            if msg.subject == specific_subject_2 {
+                continue;
+            }
+            tx.send(msg).await.unwrap();
+        }
+    });
 
     loop {
         tokio::select! {
@@ -284,14 +297,8 @@ where
                     });
                 }
             }
-            _stream = session.accept_bi() => {
-                // TODO: Handle bi streams
-            }
-            msg = sub.next() => {
+            msg = rx.recv() => {
                 if let Some(msg) = msg {
-                    if msg.subject == specific_subject {
-                        continue;
-                    }
                     if msg.data.len() < 1024 {
                         session.send_datagram(msg.data.into()).unwrap();
                     } else {

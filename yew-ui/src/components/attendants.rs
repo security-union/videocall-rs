@@ -197,7 +197,7 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
-            webtransport_enabled: WEBTRANSPORT_ENABLED,
+            webtransport_enabled: *WEBTRANSPORT_ENABLED,
             heartbeat: None,
             error: None,
             media_access_granted: false,
@@ -209,6 +209,7 @@ impl Component for AttendantsComponent {
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect(webtransport) => {
+                    log!("webtransport connect = {}", webtransport);
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
                     if !webtransport {
@@ -427,7 +428,6 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        log!("sending media packet: ", bytes.len(), " bytes");
                                         if bytes.len() < 1024 {
                                             WebTransportTask::send_datagram(
                                                 wt.transport.clone(),
@@ -480,7 +480,6 @@ impl Component for AttendantsComponent {
                 true
             }
             Msg::OnUniStream(stream) => {
-                log!("OnUniStream: ", &stream);
                 if stream.is_undefined() {
                     log!("stream is undefined");
                     return true;

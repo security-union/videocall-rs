@@ -274,7 +274,7 @@ where
                 if !should_run.load(Ordering::SeqCst) {
                     break;
                 }
-                if &msg.subject == &specific_subject_clone {
+                if msg.subject == specific_subject_clone {
                     continue;
                 }
                 let session = session.read().await;
@@ -317,7 +317,7 @@ where
         })
     };
 
-    let datagrams_task = {
+    let _datagrams_task = {
         tokio::spawn(async move {
             let session = session.read().await;
             while let Ok(datagram) = session.accept_datagram().await {

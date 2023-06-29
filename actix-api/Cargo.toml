@@ -51,4 +51,3 @@ tracing-subscriber = { version = "0.3.17", features = ["fmt", "ansi", "env-filte
 tracing-tree = "0.2.3"
 types = { path= "../types"}
 uuid = { version = "0.8", features = ["serde", "v4"] }
-futures-util = "0.3.28"

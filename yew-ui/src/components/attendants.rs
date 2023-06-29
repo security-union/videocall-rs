@@ -426,17 +426,10 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        if bytes.len() < 1024 {
-                                            WebTransportTask::send_datagram(
-                                                wt.transport.clone(),
-                                                bytes,
-                                            );
-                                        } else {
-                                            WebTransportTask::send_unidirectional_stream(
-                                                wt.transport.clone(),
-                                                bytes,
-                                            );
-                                        }
+                                        WebTransportTask::send_unidirectional_stream(
+                                            wt.transport.clone(),
+                                            bytes,
+                                        );
                                     }
                                     Err(e) => {
                                         let packet_type = media.media_type.enum_value().unwrap();

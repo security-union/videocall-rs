@@ -275,51 +275,56 @@ where
                     break;
                 }
                 if &msg.subject == &specific_subject_clone {
-                    info!("Ignoring message on subject {}", &specific_subject_clone);
                     continue;
                 }
-                info!(
-                    "{} Received message on subject {}",
-                    &specific_subject_clone, &msg.subject
-                );
-                let specific_subject_clone = specific_subject_clone.clone();
                 let session = session.read().await;
-                let stream = session.open_uni(session_id).await;
-                tokio::spawn(async move {
-                    match stream {
-                        Ok(mut uni_stream) => {
-                            info!(
-                                "{} Writing message on subject {}",
-                                &specific_subject_clone, &msg.subject
-                            );
-                            uni_stream.write_all(&msg.data).await;
+                if msg.data.len() > 400 {
+                    let stream = session.open_uni(session_id).await;
+                    tokio::spawn(async move {
+                        match stream {
+                            Ok(mut uni_stream) => {
+                                uni_stream.write_all(&msg.data).await;
+                            }
+                            Err(e) => {
+                                error!("Error opening unidirectional stream: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            error!("Error opening unidirectional stream: {}", e);
-                        }
-                    }
-                });
+                    });
+                } else {
+                    session.send_datagram(msg.data.into());
+                }
             }
         })
     };
 
     let quic_task = {
+        let session = session.clone();
+        let nc = nc.clone();
+        let specific_subject = specific_subject.clone();
         tokio::spawn(async move {
             let session = session.read().await;
             while let Ok(uni_stream) = session.accept_uni().await {
-                info!(
-                    "{} Received message on unidirectional stream",
-                    &specific_subject
-                );
                 if let Some((_id, mut uni_stream)) = uni_stream {
                     let nc = nc.clone();
-                    let specific_subject_clone = specific_subject.clone();
+                    let specific_subject = specific_subject.clone();
                     tokio::spawn(async move {
                         let mut buf = Vec::new();
                         uni_stream.read_to_end(&mut buf).await;
-                        info!("{} writing message to nats", &specific_subject_clone);
-                        nc.publish(&specific_subject_clone, buf).await;
+                        nc.publish(&specific_subject, buf).await;
                     });
+                }
+            }
+        })
+    };
+
+    let datagrams_task = {
+        tokio::spawn(async move {
+            let session = session.read().await;
+            while let Ok(datagram) = session.accept_datagram().await {
+                if let Some((_id, buf)) = datagram {
+                    let nc = nc.clone();
+                    let specific_subject_clone = specific_subject.clone();
+                    nc.publish(&specific_subject_clone, buf);
                 }
             }
         })

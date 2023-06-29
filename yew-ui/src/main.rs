@@ -5,7 +5,7 @@ mod constants;
 mod model;
 mod pages;
 
-use constants::{truthy, LOGIN_URL, WEBTRANSPORT_ENABLED};
+use constants::{truthy, LOGIN_URL};
 
 use yew::prelude::*;
 #[macro_use]
@@ -42,14 +42,16 @@ fn switch(routes: Route) -> Html {
     match routes {
         Route::Home => html! { <Home /> },
         Route::Login => html! { <Login/> },
-        Route::Meeting { email, id } => 
-            html! {
+        Route::Meeting { email, id } => html! {
             <>
                 <AttendantsComponent email={email} id={id} webtransport_enabled={false} />
             </>
         },
-        Route::Meeting2 { email, id, webtransport_enabled } => 
-            html! {
+        Route::Meeting2 {
+            email,
+            id,
+            webtransport_enabled,
+        } => html! {
             <>
                 <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} />
             </>

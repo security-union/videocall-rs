@@ -81,16 +81,21 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
     // 1. create quinn server endpoint and bind UDP socket
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
     server_config.transport = Arc::new(transport_config);
     let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
 
     info!("listening on {}", opt.listen);
 
+    let nc =
+        nats::asynk::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
+            .await
+            .unwrap();
+
     // 2. Accept new quic connections and spawn a new task to handle them
     while let Some(new_conn) = endpoint.accept().await {
         trace_span!("New connection being attempted");
-
+        let nc = nc.clone();
         tokio::spawn(async move {
             match new_conn.await {
                 Ok(conn) => {
@@ -109,18 +114,12 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
                     // // 3. TODO: Conditionally, if the client indicated that this is a webtransport session, we should accept it here, else use regular h3.
                     // // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
                     // // to the webtransport session.
-
+                    let nc = nc.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_connection(h3_conn).await {
+                        if let Err(err) = handle_connection(h3_conn, nc).await {
                             error!("Failed to handle connection: {err:?}");
                         }
                     });
-                    // let mut session: WebTransportSession<_, Bytes> =
-                    //     WebTransportSession::accept(h3_conn).await.unwrap();
-                    // info!("Finished establishing webtransport session");
-                    // // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
-                    // // h3_conn needs to handover the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
-                    // let result = handle.await;
                 }
                 Err(err) => {
                     error!("accepting connection failed: {:?}", err);
@@ -136,12 +135,16 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) -> Result<()> {
+async fn handle_connection(
+    mut conn: Connection<h3_quinn::Connection, Bytes>,
+    nc: nats::asynk::Connection,
+) -> Result<()> {
     // 3. TODO: Conditionally, if the client indicated that this is a webtransport session, we should accept it here, else use regular h3.
     // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
     // to the webtransport session.
 
     loop {
+        info!("loop");
         match conn.accept().await {
             Ok(Some((req, stream))) => {
                 info!("new request: {:#?}", req);
@@ -176,7 +179,7 @@ async fn handle_connection(mut conn: Connection<h3_quinn::Connection, Bytes>) ->
                         info!("Established webtransport session");
                         // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
                         // h3_conn needs to handover the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
-                        handle_session(session, username, lobby_id).await?;
+                        handle_session(session, username, lobby_id, nc.clone()).await?;
 
                         return Ok(());
                     }
@@ -216,6 +219,7 @@ async fn handle_session<C>(
     session: WebTransportSession<C, Bytes>,
     username: &str,
     lobby_id: &str,
+    nc: nats::asynk::Connection,
 ) -> anyhow::Result<()>
 where
     // Use trait bounds to ensure we only happen to use implementation that are only for the quinn
@@ -247,10 +251,6 @@ where
     let session_id = session.session_id();
     let session = Arc::new(RwLock::new(session));
 
-    let nc =
-        nats::asynk::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
-            .await
-            .unwrap();
     info!("Connected to NATS");
 
     let subject = format!("room.{}.*", lobby_id);
@@ -275,26 +275,23 @@ where
             if msg.subject == specific_subject_clone {
                 continue;
             }
-            let mut session = session_clone
-                .read()
-                .await
-                .open_uni(session_id)
-                .await
-                .unwrap();
+            let session = session_clone.clone();
             tokio::spawn(async move {
-                session.write_all(&msg.data).await;
+                if let Ok(mut stream) = session.read().await.open_uni(session_id).await {
+                    stream.write_all(&msg.data).await;
+                }
             });
         }
     });
 
     while let Ok(uni_stream) = session.read().await.accept_uni().await {
         if let Some((_id, mut uni_stream)) = uni_stream {
-            let nats_connection = nc.clone();
+            let nc = nc.clone();
             let specific_subject_clone = specific_subject.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 log_result!(uni_stream.read_to_end(&mut buf).await);
-                log_result!(nats_connection.publish(&specific_subject_clone, buf).await);
+                log_result!(nc.publish(&specific_subject_clone, buf).await);
             });
         }
     }

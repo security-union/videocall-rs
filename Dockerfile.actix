@@ -15,7 +15,8 @@ RUN cargo build --release
 FROM debian:bullseye-slim as production
 
 COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
-COPY --from=build /app/actix-api/target/release/actix-api /usr/bin/actix-api
+COPY --from=build /app/actix-api/target/release/websocket_server /usr/bin/websocket_server
+COPY --from=build /app/actix-api/target/release/webtransport_server /usr/bin/webtransport_server
 COPY --from=build /app/actix-api/startup.sh /usr/bin/startup.sh
 COPY --from=build /app/dbmate /app/dbmate
 

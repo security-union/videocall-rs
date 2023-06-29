@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http::Method;
-
+use quinn::VarInt;
 use rustls::{Certificate, PrivateKey};
 use sec_http3::error::Code;
 use sec_http3::sec_http3_quinn as h3_quinn;
@@ -12,6 +12,7 @@ use sec_http3::{
     quic::{self, RecvDatagramExt, SendDatagramExt, SendStreamUnframed},
     server::Connection,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -81,7 +82,8 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
     // 1. create quinn server endpoint and bind UDP socket
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
     let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
+    transport_config.max_idle_timeout(Some(VarInt::from_u32(10_000).into()));
     server_config.transport = Arc::new(transport_config);
     let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
 
@@ -115,11 +117,9 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
                     // // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
                     // // to the webtransport session.
                     let nc = nc.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = handle_connection(h3_conn, nc).await {
-                            error!("Failed to handle connection: {err:?}");
-                        }
-                    });
+                    if let Err(err) = handle_connection(h3_conn, nc).await {
+                        error!("Failed to handle connection: {err:?}");
+                    }
                 }
                 Err(err) => {
                     error!("accepting connection failed: {:?}", err);
@@ -144,11 +144,9 @@ async fn handle_connection(
     // to the webtransport session.
 
     loop {
-        info!("loop");
         match conn.accept().await {
             Ok(Some((req, stream))) => {
                 info!("new request: {:#?}", req);
-
                 let ext = req.extensions();
                 match req.method() {
                     &Method::CONNECT if ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT) => {
@@ -180,7 +178,6 @@ async fn handle_connection(
                         // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
                         // h3_conn needs to handover the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
                         handle_session(session, username, lobby_id, nc.clone()).await?;
-
                         return Ok(());
                     }
                     _ => {
@@ -250,13 +247,12 @@ where
 {
     let session_id = session.session_id();
     let session = Arc::new(RwLock::new(session));
-
+    let should_run = Arc::new(AtomicBool::new(true));
     info!("Connected to NATS");
 
     let subject = format!("room.{}.*", lobby_id);
     let specific_subject = format!("room.{}.{}", lobby_id, username);
-    let queue = format!("{:?}-{}", session_id, lobby_id);
-    let sub = match nc.queue_subscribe(&subject, &queue).await {
+    let sub = match nc.queue_subscribe(&subject, &specific_subject).await {
         Ok(sub) => {
             info!("Subscribed to subject {}", subject);
             sub
@@ -268,34 +264,69 @@ where
         }
     };
 
-    let session_clone = session.clone();
     let specific_subject_clone = specific_subject.clone();
-    let _receive_task = tokio::spawn(async move {
-        while let Some(msg) = sub.next().await {
-            if msg.subject == specific_subject_clone {
-                continue;
-            }
-            let session = session_clone.clone();
-            tokio::spawn(async move {
-                if let Ok(mut stream) = session.read().await.open_uni(session_id).await {
-                    stream.write_all(&msg.data).await;
+
+    let nats_task = {
+        let session = session.clone();
+        let should_run = should_run.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = sub.next().await {
+                if !should_run.load(Ordering::SeqCst) {
+                    break;
                 }
-            });
-        }
-    });
+                if &msg.subject == &specific_subject_clone {
+                    info!("Ignoring message on subject {}", &specific_subject_clone);
+                    continue;
+                }
+                info!(
+                    "{} Received message on subject {}",
+                    &specific_subject_clone, &msg.subject
+                );
+                let specific_subject_clone = specific_subject_clone.clone();
+                let session = session.read().await;
+                let stream = session.open_uni(session_id).await;
+                tokio::spawn(async move {
+                    match stream {
+                        Ok(mut uni_stream) => {
+                            info!(
+                                "{} Writing message on subject {}",
+                                &specific_subject_clone, &msg.subject
+                            );
+                            uni_stream.write_all(&msg.data).await;
+                        }
+                        Err(e) => {
+                            error!("Error opening unidirectional stream: {}", e);
+                        }
+                    }
+                });
+            }
+        })
+    };
 
-    while let Ok(uni_stream) = session.read().await.accept_uni().await {
-        if let Some((_id, mut uni_stream)) = uni_stream {
-            let nc = nc.clone();
-            let specific_subject_clone = specific_subject.clone();
-            tokio::spawn(async move {
-                let mut buf = Vec::new();
-                log_result!(uni_stream.read_to_end(&mut buf).await);
-                log_result!(nc.publish(&specific_subject_clone, buf).await);
-            });
-        }
-    }
-
+    let quic_task = {
+        tokio::spawn(async move {
+            let session = session.read().await;
+            while let Ok(uni_stream) = session.accept_uni().await {
+                info!(
+                    "{} Received message on unidirectional stream",
+                    &specific_subject
+                );
+                if let Some((_id, mut uni_stream)) = uni_stream {
+                    let nc = nc.clone();
+                    let specific_subject_clone = specific_subject.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        uni_stream.read_to_end(&mut buf).await;
+                        info!("{} writing message to nats", &specific_subject_clone);
+                        nc.publish(&specific_subject_clone, buf).await;
+                    });
+                }
+            }
+        })
+    };
+    quic_task.await?;
+    should_run.store(false, Ordering::SeqCst);
+    nats_task.abort();
     info!("Finished handling session");
 
     Ok(())

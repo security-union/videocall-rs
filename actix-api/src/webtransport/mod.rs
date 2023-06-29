@@ -15,6 +15,7 @@ use sec_http3::{
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, trace_span};
 
 #[derive(StructOpt, Debug)]
@@ -234,14 +235,17 @@ where
         Unpin + AsyncWrite + Send + Sync,
     <stream::BidiStream<C::BidiStream, Bytes> as quic::BidiStream<Bytes>>::RecvStream:
         Unpin + AsyncRead + Send + Sync,
-    C::SendStream: Send + Unpin,
+    C::SendStream: Send + Sync + Unpin,
     C::RecvStream: Send + Unpin,
     C::BidiStream: Send + Unpin,
     stream::SendStream<C::SendStream, Bytes>: AsyncWrite,
     C::BidiStream: SendStreamUnframed<Bytes>,
-    C::SendStream: SendStreamUnframed<Bytes>,
+    C::SendStream: SendStreamUnframed<Bytes> + Send,
+    <C as sec_http3::quic::Connection<bytes::Bytes>>::OpenStreams: Send,
+    <C as sec_http3::quic::Connection<bytes::Bytes>>::BidiStream: Sync,
 {
     let session_id = session.session_id();
+    let session = Arc::new(RwLock::new(session));
 
     let nc =
         nats::asynk::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
@@ -264,40 +268,34 @@ where
         }
     };
 
-    loop {
-        tokio::select! {
-            datagram = session.accept_datagram() => {
-                let datagram = datagram?;
-                if let Some((_, datagram)) = datagram {
-                    nc.publish(&specific_subject, datagram).await.unwrap();
-                }
+    let session_clone = session.clone();
+    let specific_subject_clone = specific_subject.clone();
+    let receive_task = tokio::spawn(async move {
+        while let Some(msg) = sub.next().await {
+            if msg.subject == specific_subject_clone {
+                continue;
             }
-            uni_stream = session.accept_uni() => {
-                let uni_stream = uni_stream?;
-                if let Some((_id, mut uni_stream)) = uni_stream {
-                    let nats_connection = nc.clone();
-                    let specific_subject_clone = specific_subject.clone();
-                    tokio::spawn(async move {
-                        let mut buf = Vec::new();
-                        log_result!(uni_stream.read_to_end(&mut buf).await);
-                        log_result!(nats_connection.publish(&specific_subject_clone, buf).await);
-                    });
-                }
-            }
-            msg = sub.next() => {
-                if let Some(msg) = msg {
-                    if msg.subject == specific_subject {
-                        continue;
-                    }
-                    let mut stream = session.open_uni(session_id).await.unwrap();
-                    tokio::spawn(async move {
-                        stream.write_all(&msg.data).await;
-                    });
-                }
-            }
-            else => {
-                break
-            }
+            let mut session = session_clone
+                .read()
+                .await
+                .open_uni(session_id)
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                session.write_all(&msg.data).await;
+            });
+        }
+    });
+
+    while let Ok(uni_stream) = session.read().await.accept_uni().await {
+        if let Some((_id, mut uni_stream)) = uni_stream {
+            let nats_connection = nc.clone();
+            let specific_subject_clone = specific_subject.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                log_result!(uni_stream.read_to_end(&mut buf).await);
+                log_result!(nats_connection.publish(&specific_subject_clone, buf).await);
+            });
         }
     }
 

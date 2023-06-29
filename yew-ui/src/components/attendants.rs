@@ -121,7 +121,6 @@ pub struct AttendantsComponent {
     pub heartbeat: Option<Interval>,
     pub error: Option<String>,
     pub media_access_granted: bool,
-    pub stream_buffer: Vec<u8>,
 }
 
 pub struct ClientSubscription {
@@ -199,7 +198,6 @@ impl Component for AttendantsComponent {
             heartbeat: None,
             error: None,
             media_access_granted: false,
-            stream_buffer: vec![],
         }
     }
 
@@ -459,10 +457,8 @@ impl Component for AttendantsComponent {
                 }
             }
             Msg::OnMessage(response, _message_type) => {
-                self.stream_buffer.extend(response);
-                let res = MediaPacket::parse_from_bytes(&self.stream_buffer);
+                let res = MediaPacket::parse_from_bytes(&response);
                 if let Ok(media_packet) = res {
-                    self.stream_buffer.clear();
                     ctx.link()
                         .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
                 } else {

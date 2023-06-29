@@ -25,7 +25,8 @@ protobuf = "3.2.0"
 gloo = "0.8.0"
 gloo-timers = "0.2.6"
 urlencoding = "2.1.2"
-yew-webtransport = "0.2.3"
+yew-webtransport = "0.2.4"
+
 [dependencies.web-sys]
 version = "0.3.60"
 features = [

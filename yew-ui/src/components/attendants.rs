@@ -1,12 +1,10 @@
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
-use crate::constants::WEBTRANSPORT_ENABLED;
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::configure_audio_context;
 use crate::model::EncodedVideoChunkTypeWrapper;
@@ -100,6 +98,8 @@ pub struct AttendantsComponentProps {
 
     #[prop_or_default]
     pub email: String,
+
+    pub webtransport_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,8 +185,9 @@ impl Component for AttendantsComponent {
     type Message = Msg;
     type Properties = AttendantsComponentProps;
 
-    fn create(_ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self {
         let connected_peers: HashMap<String, ClientSubscription> = HashMap::new();
+        let webtransport_enabled = ctx.props().webtransport_enabled;
         Self {
             connection: None,
             connected: false,
@@ -197,7 +198,7 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
-            webtransport_enabled: WEBTRANSPORT_ENABLED,
+            webtransport_enabled,
             heartbeat: None,
             error: None,
             media_access_granted: false,

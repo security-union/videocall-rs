@@ -25,13 +25,11 @@ pub const VIDEO_WIDTH: i32 = 1280i32;
 pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
 pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lobby");
 
-fn truthy(s: String) -> bool {
+pub fn truthy(s: String) -> bool {
     ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())
 }
 // We need a lazy static block because these vars need to call a
 // few functions.
 lazy_static! {
     pub static ref ENABLE_OAUTH: bool = truthy(std::env!("ENABLE_OAUTH").to_string());
-    pub static ref WEBTRANSPORT_ENABLED: bool =
-        truthy(std::env!("WEBTRANSPORT_ENABLED").to_string());
 }

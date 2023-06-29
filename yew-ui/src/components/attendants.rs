@@ -436,7 +436,6 @@ impl Component for AttendantsComponent {
                                                 bytes,
                                             );
                                         }
-                                       
                                     }
                                     Err(e) => {
                                         let packet_type = media.media_type.enum_value().unwrap();

@@ -15,7 +15,7 @@ use sec_http3::{
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{error, info, trace_span};
 
 #[derive(StructOpt, Debug)]
@@ -270,7 +270,7 @@ where
 
     let session_clone = session.clone();
     let specific_subject_clone = specific_subject.clone();
-    let receive_task = tokio::spawn(async move {
+    let _receive_task = tokio::spawn(async move {
         while let Some(msg) = sub.next().await {
             if msg.subject == specific_subject_clone {
                 continue;

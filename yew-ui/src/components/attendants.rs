@@ -159,9 +159,9 @@ pub fn connect_webtransport(
     email: &str,
     id: &str,
 ) -> anyhow::Result<WebTransportTask> {
-    let on_datagram = ctx.link().callback(|d| Msg::OnDatagram(d));
-    let on_unidirectional_stream = ctx.link().callback(|d| Msg::OnUniStream(d));
-    let on_bidirectional_stream = ctx.link().callback(|d| Msg::OnBidiStream(d));
+    let on_datagram = ctx.link().callback(Msg::OnDatagram);
+    let on_unidirectional_stream = ctx.link().callback(Msg::OnUniStream);
+    let on_bidirectional_stream = ctx.link().callback(Msg::OnBidiStream);
     let notification = ctx.link().batch_callback(|status| match status {
         WebTransportStatus::Opened => Some(WsAction::Connected.into()),
         WebTransportStatus::Closed | WebTransportStatus::Error => Some(WsAction::Lost.into()),
@@ -212,7 +212,7 @@ impl Component for AttendantsComponent {
                         let task = connect_websocket(ctx, &email, &id).map_err(|e| {
                             ctx.link().send_message(WsAction::Log(format!(
                                 "WebSocket connect failed: {}",
-                                e.to_string()
+                                e
                             )));
                             false
                         });
@@ -225,7 +225,7 @@ impl Component for AttendantsComponent {
                         let task = connect_webtransport(ctx, &email, &id).map_err(|e| {
                             ctx.link().send_message(WsAction::Log(format!(
                                 "WebTransport connect failed: {}",
-                                e.to_string()
+                                e
                             )));
                             log!("falling back to WebSocket");
                             ctx.link().send_message(WsAction::Connect(false));

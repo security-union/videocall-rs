@@ -457,7 +457,7 @@ impl Component for AttendantsComponent {
                 false
             }
             Msg::OnDatagram(bytes) => {
-                let media_packet = MediaPacket::parse_from_reader(&mut Cursor::new(bytes))
+                let media_packet = MediaPacket::parse_from_bytes(&bytes)
                     .map_err(|e| JsValue::from(format!("{:?}", e)));
                 if let Ok(media_packet) = media_packet {
                     ctx.link()

@@ -284,22 +284,15 @@ where
                     });
                 }
             }
-            _stream = session.accept_bi() => {
-                // TODO: Handle bi streams
-            }
             msg = sub.next() => {
                 if let Some(msg) = msg {
                     if msg.subject == specific_subject {
                         continue;
                     }
-                    if msg.data.len() < 1024 {
-                        session.send_datagram(msg.data.into()).unwrap();
-                    } else {
-                        let mut stream = session.open_uni(session_id).await.unwrap();
-                        tokio::spawn(async move {
-                            stream.write_all(&msg.data).await;
-                        });
-                    }
+                    let mut stream = session.open_uni(session_id).await.unwrap();
+                    tokio::spawn(async move {
+                        stream.write_all(&msg.data).await;
+                    });
                 }
             }
             else => {

@@ -32,6 +32,7 @@ jsonwebtoken= "8.1.1"
 nats = "0.24.0"
 oauth2 = { version = "4" }
 octets = "0.2.0"
+openssl = "0.10.55"
 protobuf = "3.2.0"
 quinn = { version = "0.10.1", features = ["runtime-tokio", "tls-rustls", "ring"] }
 r2d2 = "0.8.10"

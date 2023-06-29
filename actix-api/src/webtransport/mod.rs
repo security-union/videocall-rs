@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use http::Method;
+use openssl::pkey::PKey;
+use openssl::x509::X509;
 use quinn::VarInt;
 use rustls::{Certificate, PrivateKey};
 use sec_http3::error::Code;
@@ -17,7 +19,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use structopt::StructOpt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
-use tracing::{error, info, trace_span};
+use tracing::{error, info, trace_span, debug};
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "server")]
@@ -34,7 +36,7 @@ pub struct WebTransportOpt {
     pub certs: Certs,
 }
 
-#[derive(StructOpt, Debug)]
+#[derive(StructOpt, Debug, Clone)]
 pub struct Certs {
     #[structopt(
         long,
@@ -53,13 +55,50 @@ pub struct Certs {
     pub key: PathBuf,
 }
 
+// Attempt to convert PEM-encoded certs to DER-encoded certs with openssl
+pub fn try_convert_pem_to_der(certs: &Certs) -> Result<Certs> {
+    let Certs { cert, key } = certs.clone();
+
+    // Read the maybe PEM-encoded certificate and key from files
+    let cert = std::fs::read(cert)?;
+    let key = std::fs::read(key)?;
+
+    // Convert the certificate from PEM to DER
+    let cert = X509::from_pem(&cert[..])?;
+    let cert_der = cert.to_der()?;
+
+    // Convert the private key from PEM to DER
+    let key = PKey::private_key_from_pem(&key[..])?;
+    let key_der = key.private_key_to_der()?;
+
+    // write them to files
+    let new_cert_path = "/tmp/cert.der";
+    std::fs::write(&new_cert_path, cert_der)?;
+    let new_key_path = "/tmp/key.der";
+    std::fs::write(&new_key_path, key_der)?;
+
+    Ok(Certs { cert: new_cert_path.into(), key: new_key_path.into()  })
+}
+
+fn get_certificate_and_key(certs: Certs) -> Result<(Certificate, PrivateKey)> {
+    // Attempt to convert PEM-encoded certs to DER-encoded certs with openssl
+    return if let Ok(certs) = try_convert_pem_to_der(&certs) {
+        let certificate = Certificate(std::fs::read(certs.cert)?);
+        let private_key = PrivateKey(std::fs::read(certs.key)?);
+        Ok((certificate, private_key))
+    } else {
+        debug!("Failed to convert PEM-encoded certs to DER-encoded certs with openssl. Assuming they are DER-encoded certs.");
+        let certificate = Certificate(std::fs::read(certs.cert)?);
+        let private_key = PrivateKey(std::fs::read(certs.key)?);
+        Ok((certificate, private_key))
+    };
+}
+
 pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
-    let Certs { cert, key } = opt.certs;
 
-    // both cert and key must be DER-encoded
-    let cert = Certificate(std::fs::read(cert)?);
-    let key = PrivateKey(std::fs::read(key)?);
+    // both cert and key must be PEM or DER-encoded
+    let (cert, key) = get_certificate_and_key(opt.certs)?;
 
     let mut tls_config = rustls::ServerConfig::builder()
         .with_safe_default_cipher_suites()

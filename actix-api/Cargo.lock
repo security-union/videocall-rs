@@ -2122,6 +2122,7 @@ dependencies = [
  "nats",
  "oauth2",
  "octets",
+ "openssl",
  "protobuf",
  "quinn",
  "r2d2",

@@ -2117,7 +2117,6 @@ dependencies = [
  "bytestring",
  "derive_more",
  "futures",
- "futures-util",
  "http",
  "jsonwebtoken",
  "nats",

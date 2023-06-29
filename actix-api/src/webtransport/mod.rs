@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use futures::future::try_join3;
 use http::Method;
 
 use rustls::{Certificate, PrivateKey};

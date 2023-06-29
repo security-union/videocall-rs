@@ -94,9 +94,6 @@ pub struct AttendantsComponentProps {
     pub id: String,
 
     #[prop_or_default]
-    pub media_packet: MediaPacket,
-
-    #[prop_or_default]
     pub email: String,
 
     pub webtransport_enabled: bool,

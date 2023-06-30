@@ -1109,9 +1109,9 @@ dependencies = [
 
 [[package]]
 name = "yew-webtransport"
-version = "0.2.4"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee26e39064d9d25a0f9d3de41f467c62cc73722a86858155ae54d58372bc1e23"
+checksum = "8a325950f4ec38c2d4641f26b55c1a2331035c7bc788d47c3e4c1584609a02c9"
 dependencies = [
  "anyhow",
  "futures",

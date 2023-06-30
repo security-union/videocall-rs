@@ -45,7 +45,7 @@ pub enum WsAction {
     Connect(bool),
     Connected,
     Disconnect,
-    Lost,
+    Lost(Option<JsValue>),
     RequestMediaPermissions,
     MediaPermissionsGranted,
     MediaPermissionsError(String),
@@ -149,7 +149,7 @@ pub fn connect_websocket(
     let callback = ctx.link().callback(Msg::OnInboundMedia);
     let notification = ctx.link().batch_callback(|status| match status {
         WebSocketStatus::Opened => Some(WsAction::Connected.into()),
-        WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost.into()),
+        WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost(None).into()),
     });
     let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
     log!("Connecting to ", &url);
@@ -167,7 +167,9 @@ pub fn connect_webtransport(
     let on_bidirectional_stream = ctx.link().callback(Msg::OnBidiStream);
     let notification = ctx.link().batch_callback(|status| match status {
         WebTransportStatus::Opened => Some(WsAction::Connected.into()),
-        WebTransportStatus::Closed | WebTransportStatus::Error => Some(WsAction::Lost.into()),
+        WebTransportStatus::Closed(error) | WebTransportStatus::Error(error) => {
+            Some(WsAction::Lost(Some(error)).into())
+        }
     });
     let url = format!("{}/{}/{}", WEBTRANSPORT_HOST, email, id);
     let task = WebTransportService::connect(
@@ -270,8 +272,14 @@ impl Component for AttendantsComponent {
                     log!("{}", msg);
                     true
                 }
-                WsAction::Lost => {
+                WsAction::Lost(reason) => {
                     log!("Lost");
+                    if let Some(window) = window() {
+                        window.alert_with_message(&format!(
+                            "Connection lost. Please reconnect. Reason: {:?}",
+                            reason
+                        ));
+                    }
                     self.connection.take();
                     let heartbeat = self.heartbeat.take();
                     match heartbeat {
@@ -281,7 +289,7 @@ impl Component for AttendantsComponent {
                         None => {}
                     }
                     self.connected = false;
-                    false
+                    true
                 }
                 WsAction::RequestMediaPermissions => {
                     let future = request_permissions();
@@ -323,7 +331,9 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_video_keyframe
                                 || chunk_type == EncodedVideoChunkType::Key
                             {
-                                if peer.video_decoder.state() == CodecState::Configured && peer.last_video_sequence < packet.video_metadata.sequence {
+                                if peer.video_decoder.state() == CodecState::Configured
+                                    && peer.last_video_sequence < packet.video_metadata.sequence
+                                {
                                     peer.video_decoder.decode(packet.clone());
                                     peer.waiting_for_video_keyframe = false;
                                     peer.last_video_sequence = packet.video_metadata.sequence;
@@ -360,7 +370,9 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_audio_keyframe
                                 || chunk_type == EncodedAudioChunkType::Key
                             {
-                                if peer.audio_decoder.state() == CodecState::Configured && peer.last_audio_sequence < packet.video_metadata.sequence {
+                                if peer.audio_decoder.state() == CodecState::Configured
+                                    && peer.last_audio_sequence < packet.video_metadata.sequence
+                                {
                                     peer.audio_decoder.decode(&encoded_audio_chunk);
                                     peer.waiting_for_audio_keyframe = false;
                                     peer.last_audio_sequence = packet.video_metadata.sequence;
@@ -376,7 +388,9 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_screen_keyframe
                                 || chunk_type == EncodedVideoChunkType::Key
                             {
-                                if peer.screen_decoder.state() == CodecState::Configured && peer.last_screen_sequence < packet.video_metadata.sequence {
+                                if peer.screen_decoder.state() == CodecState::Configured
+                                    && peer.last_screen_sequence < packet.video_metadata.sequence
+                                {
                                     peer.screen_decoder.decode(packet.clone());
                                     peer.waiting_for_screen_keyframe = false;
                                     peer.last_screen_sequence = packet.video_metadata.sequence;

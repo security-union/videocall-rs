@@ -67,7 +67,7 @@ wsApi:
   affinity: {}
 
 wtApi:
-  replicaCount: 1
+  replicaCount: 3
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always

@@ -157,3 +157,4 @@ ingress:
       hosts:
         - rustlemania.com
         - api.rustlemania.com
+        - '*.rustlemania.com'

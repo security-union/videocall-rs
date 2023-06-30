@@ -156,5 +156,4 @@ ingress:
     - secretName: rustlemania-tls
       hosts:
         - rustlemania.com
-        - api.rustlemania.com
         - '*.rustlemania.com'

@@ -1,8 +1,6 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Result, Context};
 use bytes::Bytes;
 use http::Method;
-use openssl::pkey::PKey;
-use openssl::x509::X509;
 use quinn::VarInt;
 use rustls::{Certificate, PrivateKey};
 use sec_http3::error::Code;
@@ -16,89 +14,64 @@ use sec_http3::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
-use structopt::StructOpt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
-use tracing::{error, info, trace_span, debug};
+use tracing::{error, info, trace_span};
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "server")]
+#[derive(Debug)]
 pub struct WebTransportOpt {
-    #[structopt(
-        short,
-        long,
-        default_value = "127.0.0.1:4433",
-        help = "What address:port to listen for new connections"
-    )]
     pub listen: SocketAddr,
-
-    #[structopt(flatten)]
     pub certs: Certs,
 }
 
-#[derive(StructOpt, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct Certs {
-    #[structopt(
-        long,
-        short,
-        default_value = "examples/server.cert",
-        help = "Certificate for TLS. If present, `--key` is mandatory."
-    )]
     pub cert: PathBuf,
-
-    #[structopt(
-        long,
-        short,
-        default_value = "examples/server.key",
-        help = "Private key for the certificate."
-    )]
     pub key: PathBuf,
 }
 
-// Attempt to convert PEM-encoded certs to DER-encoded certs with openssl
-pub fn try_convert_pem_to_der(certs: &Certs) -> Result<Certs> {
-    let Certs { cert, key } = certs.clone();
-
-    // Read the maybe PEM-encoded certificate and key from files
-    let cert = std::fs::read(cert)?;
-    let key = std::fs::read(key)?;
-
-    // Convert the certificate from PEM to DER
-    let cert = X509::from_pem(&cert[..])?;
-    let cert_der = cert.to_der()?;
-
-    // Convert the private key from PEM to DER
-    let key = PKey::private_key_from_pem(&key[..])?;
-    let key_der = key.private_key_to_der()?;
-
-    // write them to files
-    let new_cert_path = "/tmp/cert.der";
-    std::fs::write(&new_cert_path, cert_der)?;
-    let new_key_path = "/tmp/key.der";
-    std::fs::write(&new_key_path, key_der)?;
-
-    Ok(Certs { cert: new_cert_path.into(), key: new_key_path.into()  })
-}
-
-fn get_certificate_and_key(certs: Certs) -> Result<(Certificate, PrivateKey)> {
-    // Attempt to convert PEM-encoded certs to DER-encoded certs with openssl
-    return if let Ok(certs) = try_convert_pem_to_der(&certs) {
-        let certificate = Certificate(std::fs::read(certs.cert)?);
-        let private_key = PrivateKey(std::fs::read(certs.key)?);
-        Ok((certificate, private_key))
+fn get_key_and_cert_chain(
+    certs: Certs
+) -> anyhow::Result<(PrivateKey, Vec<Certificate>)> {
+    let key_path = certs.key;
+    let cert_path = certs.cert;
+    let key = std::fs::read(&key_path).context("failed to read private key")?;
+    let key = if key_path.extension().map_or(false, |x| x == "der") {
+        PrivateKey(key)
     } else {
-        debug!("Failed to convert PEM-encoded certs to DER-encoded certs with openssl. Assuming they are DER-encoded certs.");
-        let certificate = Certificate(std::fs::read(certs.cert)?);
-        let private_key = PrivateKey(std::fs::read(certs.key)?);
-        Ok((certificate, private_key))
+        let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)
+            .context("malformed PKCS #8 private key")?;
+        match pkcs8.into_iter().next() {
+            Some(x) => PrivateKey(x),
+            None => {
+                let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)
+                    .context("malformed PKCS #1 private key")?;
+                match rsa.into_iter().next() {
+                    Some(x) => PrivateKey(x),
+                    None => {
+                        anyhow::bail!("no private keys found");
+                    }
+                }
+            }
+        }
     };
+    let certs = std::fs::read(&cert_path).context("failed to read certificate chain")?;
+    let certs = if cert_path.extension().map_or(false, |x| x == "der") {
+        vec![Certificate(certs)]
+    } else {
+        rustls_pemfile::certs(&mut &*certs)
+            .context("invalid PEM-encoded certificate")?
+            .into_iter()
+            .map(Certificate)
+            .collect()
+    };
+    Ok((key, certs))
 }
 
 pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
-    // both cert and key must be PEM or DER-encoded
-    let (cert, key) = get_certificate_and_key(opt.certs)?;
+    let (key, certs) = get_key_and_cert_chain(opt.certs)?;
 
     let mut tls_config = rustls::ServerConfig::builder()
         .with_safe_default_cipher_suites()
@@ -106,7 +79,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)?;
+        .with_single_cert(certs, key)?;
 
     tls_config.max_early_data_size = u32::MAX;
     let alpn: Vec<Vec<u8>> = vec![

@@ -32,7 +32,6 @@ jsonwebtoken= "8.1.1"
 nats = "0.24.0"
 oauth2 = { version = "4" }
 octets = "0.2.0"
-openssl = "0.10.55"
 protobuf = "3.2.0"
 quinn = { version = "0.10.1", features = ["runtime-tokio", "tls-rustls", "ring"] }
 r2d2 = "0.8.10"
@@ -42,10 +41,10 @@ rayon = "1.7.0"
 reqwest = { version = "0.11.11", features = ["json"]}
 rustls = { version = "0.21.2", features = ["dangerous_configuration"] }
 rustls-native-certs = "0.6.3"
+rustls-pemfile = "1.0.3"
 sec-http3 = "0.1.1"
 serde = "1.0.140"
 serde_json = "1.0.82"
-structopt = "0.3.26"
 tokio = { version = "1.28.2", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["fmt", "ansi", "env-filter", "time", "tracing-log"] }

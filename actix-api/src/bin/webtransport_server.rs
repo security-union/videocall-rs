@@ -49,5 +49,6 @@ async fn main() {
 
     actix_rt::spawn(async move {
         webtransport::start(opt).await.unwrap();
-    }).await;
+    })
+    .await;
 }

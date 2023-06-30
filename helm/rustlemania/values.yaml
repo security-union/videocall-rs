@@ -99,9 +99,17 @@ wtApi:
     maxReplicas: 100
     targetCPUUtilizationPercentage: 80
     targetMemoryUtilizationPercentage: 80
-  nodeSelector: {}
+  nodeSelector:
+    node-role: worker
   tolerations: []
-  affinity: {}
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app
+                operator: Exists
+          topologyKey: "kubernetes.io/hostname"
   # Used to configure cloud provider specific LB service type
   # loadBalancerAnnotations:
 

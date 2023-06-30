@@ -1,12 +1,10 @@
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
-use crate::constants::WEBTRANSPORT_ENABLED;
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::configure_audio_context;
 use crate::model::EncodedVideoChunkTypeWrapper;
@@ -96,10 +94,9 @@ pub struct AttendantsComponentProps {
     pub id: String,
 
     #[prop_or_default]
-    pub media_packet: MediaPacket,
-
-    #[prop_or_default]
     pub email: String,
+
+    pub webtransport_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,7 +121,6 @@ pub struct AttendantsComponent {
     pub heartbeat: Option<Interval>,
     pub error: Option<String>,
     pub media_access_granted: bool,
-    pub stream_buffer: Vec<u8>,
 }
 
 pub struct ClientSubscription {
@@ -134,6 +130,9 @@ pub struct ClientSubscription {
     pub waiting_for_video_keyframe: bool,
     pub waiting_for_audio_keyframe: bool,
     pub waiting_for_screen_keyframe: bool,
+    pub last_video_sequence: u64,
+    pub last_audio_sequence: u64,
+    pub last_screen_sequence: u64,
     pub error_audio: Closure<dyn FnMut(JsValue)>,
     pub error_video: Closure<dyn FnMut(JsValue)>,
     pub error_screen: Closure<dyn FnMut(JsValue)>,
@@ -163,9 +162,9 @@ pub fn connect_webtransport(
     email: &str,
     id: &str,
 ) -> anyhow::Result<WebTransportTask> {
-    let on_datagram = ctx.link().callback(|d| Msg::OnDatagram(d));
-    let on_unidirectional_stream = ctx.link().callback(|d| Msg::OnUniStream(d));
-    let on_bidirectional_stream = ctx.link().callback(|d| Msg::OnBidiStream(d));
+    let on_datagram = ctx.link().callback(Msg::OnDatagram);
+    let on_unidirectional_stream = ctx.link().callback(Msg::OnUniStream);
+    let on_bidirectional_stream = ctx.link().callback(Msg::OnBidiStream);
     let notification = ctx.link().batch_callback(|status| match status {
         WebTransportStatus::Opened => Some(WsAction::Connected.into()),
         WebTransportStatus::Closed | WebTransportStatus::Error => Some(WsAction::Lost.into()),
@@ -185,8 +184,9 @@ impl Component for AttendantsComponent {
     type Message = Msg;
     type Properties = AttendantsComponentProps;
 
-    fn create(_ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self {
         let connected_peers: HashMap<String, ClientSubscription> = HashMap::new();
+        let webtransport_enabled = ctx.props().webtransport_enabled;
         Self {
             connection: None,
             connected: false,
@@ -197,11 +197,10 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
-            webtransport_enabled: *WEBTRANSPORT_ENABLED,
+            webtransport_enabled,
             heartbeat: None,
             error: None,
             media_access_granted: false,
-            stream_buffer: vec![],
         }
     }
 
@@ -216,7 +215,7 @@ impl Component for AttendantsComponent {
                         let task = connect_websocket(ctx, &email, &id).map_err(|e| {
                             ctx.link().send_message(WsAction::Log(format!(
                                 "WebSocket connect failed: {}",
-                                e.to_string()
+                                e
                             )));
                             false
                         });
@@ -229,7 +228,7 @@ impl Component for AttendantsComponent {
                         let task = connect_webtransport(ctx, &email, &id).map_err(|e| {
                             ctx.link().send_message(WsAction::Log(format!(
                                 "WebTransport connect failed: {}",
-                                e.to_string()
+                                e
                             )));
                             log!("falling back to WebSocket");
                             ctx.link().send_message(WsAction::Connect(false));
@@ -324,9 +323,10 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_video_keyframe
                                 || chunk_type == EncodedVideoChunkType::Key
                             {
-                                if peer.video_decoder.state() == CodecState::Configured {
+                                if peer.video_decoder.state() == CodecState::Configured && peer.last_video_sequence < packet.video_metadata.sequence {
                                     peer.video_decoder.decode(packet.clone());
                                     peer.waiting_for_video_keyframe = false;
+                                    peer.last_video_sequence = packet.video_metadata.sequence;
                                 } else if peer.video_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
                                     self.connected_peers.remove(&email);
@@ -360,9 +360,10 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_audio_keyframe
                                 || chunk_type == EncodedAudioChunkType::Key
                             {
-                                if peer.audio_decoder.state() == CodecState::Configured {
+                                if peer.audio_decoder.state() == CodecState::Configured && peer.last_audio_sequence < packet.video_metadata.sequence {
                                     peer.audio_decoder.decode(&encoded_audio_chunk);
                                     peer.waiting_for_audio_keyframe = false;
+                                    peer.last_audio_sequence = packet.video_metadata.sequence;
                                 } else if peer.audio_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
                                     self.connected_peers.remove(&email);
@@ -375,9 +376,10 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_screen_keyframe
                                 || chunk_type == EncodedVideoChunkType::Key
                             {
-                                if peer.screen_decoder.state() == CodecState::Configured {
+                                if peer.screen_decoder.state() == CodecState::Configured && peer.last_screen_sequence < packet.video_metadata.sequence {
                                     peer.screen_decoder.decode(packet.clone());
                                     peer.waiting_for_screen_keyframe = false;
+                                    peer.last_screen_sequence = packet.video_metadata.sequence;
                                     return true;
                                 } else if peer.screen_decoder.state() == CodecState::Closed {
                                     // Codec crashed, reconfigure it...
@@ -428,13 +430,14 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        if bytes.len() < 1024 {
-                                            WebTransportTask::send_datagram(
+                                        // TODO: Investigate why using datagrams causes issues
+                                        if bytes.len() > 100 {
+                                            WebTransportTask::send_unidirectional_stream(
                                                 wt.transport.clone(),
                                                 bytes,
                                             );
                                         } else {
-                                            WebTransportTask::send_unidirectional_stream(
+                                            WebTransportTask::send_datagram(
                                                 wt.transport.clone(),
                                                 bytes,
                                             );
@@ -457,7 +460,7 @@ impl Component for AttendantsComponent {
                 false
             }
             Msg::OnDatagram(bytes) => {
-                let media_packet = MediaPacket::parse_from_reader(&mut Cursor::new(bytes))
+                let media_packet = MediaPacket::parse_from_bytes(&bytes)
                     .map_err(|e| JsValue::from(format!("{:?}", e)));
                 if let Ok(media_packet) = media_packet {
                     ctx.link()
@@ -468,10 +471,8 @@ impl Component for AttendantsComponent {
                 }
             }
             Msg::OnMessage(response, _message_type) => {
-                self.stream_buffer.extend(response);
-                let res = MediaPacket::parse_from_bytes(&self.stream_buffer);
+                let res = MediaPacket::parse_from_bytes(&response);
                 if let Ok(media_packet) = res {
-                    self.stream_buffer.clear();
                     ctx.link()
                         .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
                 } else {
@@ -776,6 +777,9 @@ impl AttendantsComponent {
                 video_decoder,
                 audio_decoder,
                 screen_decoder,
+                last_audio_sequence: 0,
+                last_video_sequence: 0,
+                last_screen_sequence: 0,
                 waiting_for_video_keyframe: true,
                 waiting_for_audio_keyframe: true,
                 waiting_for_screen_keyframe: true,

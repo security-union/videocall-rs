@@ -5,7 +5,7 @@ mod constants;
 mod model;
 mod pages;
 
-use constants::LOGIN_URL;
+use constants::{truthy, LOGIN_URL, WEBTRANSPORT_ENABLED};
 
 use yew::prelude::*;
 #[macro_use]
@@ -27,6 +27,12 @@ enum Route {
     Login,
     #[at("/meeting/:email/:id")]
     Meeting { email: String, id: String },
+    #[at("/meeting/:email/:id/:webtransport_enabled")]
+    Meeting2 {
+        email: String,
+        id: String,
+        webtransport_enabled: String,
+    },
     #[not_found]
     #[at("/404")]
     NotFound,
@@ -38,7 +44,16 @@ fn switch(routes: Route) -> Html {
         Route::Login => html! { <Login/> },
         Route::Meeting { email, id } => html! {
             <>
-                <AttendantsComponent email={email} id={id} />
+                <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} />
+            </>
+        },
+        Route::Meeting2 {
+            email,
+            id,
+            webtransport_enabled,
+        } => html! {
+            <>
+                <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(webtransport_enabled)} />
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },

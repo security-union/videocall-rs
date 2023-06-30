@@ -53,15 +53,6 @@ fn switch(routes: Route) -> Html {
             webtransport_enabled,
         } => html! {
             <>
-                <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} />
-            </>
-        },
-        Route::Meeting2 {
-            email,
-            id,
-            webtransport_enabled,
-        } => html! {
-            <>
                 <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(webtransport_enabled)} />
             </>
         },

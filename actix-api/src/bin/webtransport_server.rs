@@ -1,10 +1,15 @@
 use std::net::ToSocketAddrs;
 
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::{error, info};
 
 use sec_api::webtransport::{self, Certs};
 
-#[tokio::main]
+async fn health_responder() -> impl Responder {
+    HttpResponse::Ok().body("Ok")
+}
+
+#[actix_rt::main]
 async fn main() {
     // Turned this off because it's too verbose
     tracing_subscriber::fmt()
@@ -29,8 +34,20 @@ async fn main() {
                 .into(),
         },
     };
-    match webtransport::start(opt).await {
-        Ok(_) => info!("webtransport server stopped"),
-        Err(e) => error!("webtransport server error: {}", e),
-    }
+
+    let listen = opt.listen.clone();
+    actix_rt::spawn(async move {
+        info!("Starting http server: {:?}", listen);
+        let server =
+            HttpServer::new(|| App::new().route("/healthz", web::get().to(health_responder)))
+                .bind(&listen)
+                .unwrap();
+        if let Err(e) = server.run().await {
+            error!("http server error: {}", e);
+        }
+    });
+
+    actix_rt::spawn(async move {
+        webtransport::start(opt).await.unwrap();
+    }).await;
 }

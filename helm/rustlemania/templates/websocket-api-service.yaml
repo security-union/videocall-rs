@@ -10,6 +10,6 @@ spec:
     - port: {{ .Values.wsApi.service.port }}
       targetPort: 8080
       protocol: TCP
-      name: wt-api
+      name: ws-api
   selector:
     {{- include "rustlemania.selectorLabels" . | nindent 4 }}

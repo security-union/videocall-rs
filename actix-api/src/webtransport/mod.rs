@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Result, Context};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use http::Method;
 use quinn::VarInt;
@@ -30,9 +31,7 @@ pub struct Certs {
     pub key: PathBuf,
 }
 
-fn get_key_and_cert_chain(
-    certs: Certs
-) -> anyhow::Result<(PrivateKey, Vec<Certificate>)> {
+fn get_key_and_cert_chain(certs: Certs) -> anyhow::Result<(PrivateKey, Vec<Certificate>)> {
     let key_path = certs.key;
     let cert_path = certs.cert;
     let key = std::fs::read(&key_path).context("failed to read private key")?;

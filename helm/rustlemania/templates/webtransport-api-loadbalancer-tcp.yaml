@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "rustlemania.fullname" . }}-wt-api-lb
+  name: {{ include "rustlemania.fullname" . }}-wt-api-lb-tcp
   labels:
     {{- include "rustlemania.labels" . | nindent 4 }}
   {{- if .Values.wtApi.loadBalancerAnnotations}}
@@ -15,10 +15,6 @@ spec:
   selector:
     {{- include "rustlemania.selectorLabels" . | nindent 4 }}
   ports:
-    - protocol: UDP
-      port: 4433
-      targetPort: 4433
-      name: wt-api
     - protocol: TCP
       port: 4433
       targetPort: 4433

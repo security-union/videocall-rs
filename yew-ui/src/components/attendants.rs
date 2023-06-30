@@ -275,7 +275,7 @@ impl Component for AttendantsComponent {
                 WsAction::Lost(reason) => {
                     log!("Lost");
                     if let Some(window) = window() {
-                        window.alert_with_message(&format!(
+                        let _ = window.alert_with_message(&format!(
                             "Connection lost. Please reconnect. Reason: {:?}",
                             reason
                         ));

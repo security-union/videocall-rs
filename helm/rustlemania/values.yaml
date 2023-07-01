@@ -118,7 +118,7 @@ ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: 900c7390b5a6c4663b67d59b392078363ff12792
+    tag: 75adccce47e00d9a630abd06a0dbe758f3d4c49b
   resources: {}
   podAnnotations: {}
   podSecurityContext: {}

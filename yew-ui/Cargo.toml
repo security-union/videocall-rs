@@ -25,7 +25,7 @@ protobuf = "3.2.0"
 gloo = "0.8.0"
 gloo-timers = "0.2.6"
 urlencoding = "2.1.2"
-yew-webtransport = { git="https://github.com/security-union/yew-webtransport.git", rev="71d8e0d2e4bb6769f44d1945fd3561027862547f"}
+yew-webtransport = { git="https://github.com/security-union/yew-webtransport.git", rev="b7ad8ea8c8c6f4d1879049167965ccfaa4f36300"}
 
 [dependencies.web-sys]
 version = "0.3.60"

@@ -344,6 +344,5 @@ where
     should_run.store(false, Ordering::SeqCst);
     nats_task.abort();
     info!("Finished handling session");
-
     Ok(())
 }

@@ -214,32 +214,25 @@ impl Component for AttendantsComponent {
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
                     if !webtransport {
-                        let task = connect_websocket(ctx, &email, &id).map_err(|e| {
+                        if let Ok(task) = connect_websocket(ctx, &email, &id).map_err(|e| {
                             ctx.link().send_message(WsAction::Log(format!(
                                 "WebSocket connect failed: {}",
                                 e
                             )));
-                            false
-                        });
-                        if task.is_err() {
-                            return false;
+                        }) {
+                            self.connection = Some(Connection::WebSocket(task));
                         }
-                        let task = task.unwrap();
-                        self.connection = Some(Connection::WebSocket(task));
                     } else {
-                        let task = connect_webtransport(ctx, &email, &id).map_err(|e| {
-                            ctx.link().send_message(WsAction::Log(format!(
-                                "WebTransport connect failed: {}",
-                                e
-                            )));
-                            log!("falling back to WebSocket");
-                            ctx.link().send_message(WsAction::Connect(false));
-                            false
-                        });
-                        if task.is_err() {
-                            return false;
+                        let task= connect_webtransport(ctx, &email, &id);
+                        match task {
+                            Ok(task) => {
+                                self.connection = Some(Connection::WebTransport(task));
+                            },
+                            Err(e) => {
+                                log!("WebTransport connect failed:");
+                                ctx.link().send_message(WsAction::Connect(false));
+                            }
                         }
-                        self.connection = Some(Connection::WebTransport(task.unwrap()));
                     }
 
                     let link = ctx.link().clone();
@@ -256,7 +249,17 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Disconnect => {
                     log!("Disconnect");
-                    self.connection.take();
+                    if let Some(connection) = self.connection.take() {
+                        match connection {
+                            Connection::WebSocket(task) => {
+
+                            }
+                            Connection::WebTransport(task) => {
+                                log!("close webtransport");
+                                task.transport.close();
+                            }
+                        }
+                    }
                     if let Some(heartbeat) = self.heartbeat.take() {
                         heartbeat.cancel();
                     }
@@ -270,7 +273,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Log(msg) => {
                     log!("{}", msg);
-                    true
+                    false
                 }
                 WsAction::Lost(reason) => {
                     log!("Lost");
@@ -281,13 +284,9 @@ impl Component for AttendantsComponent {
                         ));
                     }
                     self.connection.take();
-                    let heartbeat = self.heartbeat.take();
-                    match heartbeat {
-                        Some(heartbeat) => {
-                            heartbeat.cancel();
-                        }
-                        None => {}
-                    }
+                    if let Some(heartbeat ) = self.heartbeat.take() {
+                        heartbeat.cancel();
+                    };
                     self.connected = false;
                     true
                 }
@@ -479,10 +478,8 @@ impl Component for AttendantsComponent {
                 if let Ok(media_packet) = media_packet {
                     ctx.link()
                         .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
-                    true
-                } else {
-                    false
                 }
+                false
             }
             Msg::OnMessage(response, _message_type) => {
                 let res = MediaPacket::parse_from_bytes(&response);
@@ -492,7 +489,7 @@ impl Component for AttendantsComponent {
                 } else {
                     log!("failed to parse media packet");
                 }
-                true
+                false
             }
             Msg::OnUniStream(stream) => {
                 if stream.is_undefined() {
@@ -531,7 +528,7 @@ impl Component for AttendantsComponent {
                         }
                     }
                 });
-                true
+                false
             }
             Msg::OnBidiStream(stream) => {
                 log!("OnBidiStream: ", &stream);
@@ -573,7 +570,7 @@ impl Component for AttendantsComponent {
                     }
                     log!("readable stream closed");
                 });
-                true
+                false
             }
             Msg::MeetingAction(action) => {
                 match action {

@@ -54,10 +54,13 @@ services:
     build:
       dockerfile: ../docker/Dockerfile.actix
     working_dir: /app/actix-api
-    command: bash -c "cargo watch -x \"run -r --bin webtransport_server -- --listen 0.0.0.0:4433 --cert certs/localhost.der --key certs/localhost_key.der\""
+    command: bash -c "cargo watch -x \"run -r --bin webtransport_server\""
     environment:
       - RUST_LOG=info
       - NATS_URL=nats:4222
+      - LISTEN_URL=0.0.0.0:4433
+      - CERT_PATH=certs/localhost.pem
+      - KEY_PATH=certs/localhost.key
     ports:
       - "4433:4433/udp"
     volumes:

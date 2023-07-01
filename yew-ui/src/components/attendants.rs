@@ -45,7 +45,7 @@ pub enum WsAction {
     Connect(bool),
     Connected,
     Disconnect,
-    Lost,
+    Lost(Option<JsValue>),
     RequestMediaPermissions,
     MediaPermissionsGranted,
     MediaPermissionsError(String),
@@ -149,7 +149,7 @@ pub fn connect_websocket(
     let callback = ctx.link().callback(Msg::OnInboundMedia);
     let notification = ctx.link().batch_callback(|status| match status {
         WebSocketStatus::Opened => Some(WsAction::Connected.into()),
-        WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost.into()),
+        WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost(None).into()),
     });
     let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
     log!("Connecting to ", &url);
@@ -167,7 +167,9 @@ pub fn connect_webtransport(
     let on_bidirectional_stream = ctx.link().callback(Msg::OnBidiStream);
     let notification = ctx.link().batch_callback(|status| match status {
         WebTransportStatus::Opened => Some(WsAction::Connected.into()),
-        WebTransportStatus::Closed | WebTransportStatus::Error => Some(WsAction::Lost.into()),
+        WebTransportStatus::Closed(error) | WebTransportStatus::Error(error) => {
+            Some(WsAction::Lost(Some(error)).into())
+        }
     });
     let url = format!("{}/{}/{}", WEBTRANSPORT_HOST, email, id);
     let task = WebTransportService::connect(
@@ -212,32 +214,25 @@ impl Component for AttendantsComponent {
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
                     if !webtransport {
-                        let task = connect_websocket(ctx, &email, &id).map_err(|e| {
+                        if let Ok(task) = connect_websocket(ctx, &email, &id).map_err(|e| {
                             ctx.link().send_message(WsAction::Log(format!(
                                 "WebSocket connect failed: {}",
                                 e
                             )));
-                            false
-                        });
-                        if task.is_err() {
-                            return false;
+                        }) {
+                            self.connection = Some(Connection::WebSocket(task));
                         }
-                        let task = task.unwrap();
-                        self.connection = Some(Connection::WebSocket(task));
                     } else {
-                        let task = connect_webtransport(ctx, &email, &id).map_err(|e| {
-                            ctx.link().send_message(WsAction::Log(format!(
-                                "WebTransport connect failed: {}",
-                                e
-                            )));
-                            log!("falling back to WebSocket");
-                            ctx.link().send_message(WsAction::Connect(false));
-                            false
-                        });
-                        if task.is_err() {
-                            return false;
+                        let task= connect_webtransport(ctx, &email, &id);
+                        match task {
+                            Ok(task) => {
+                                self.connection = Some(Connection::WebTransport(task));
+                            },
+                            Err(e) => {
+                                log!("WebTransport connect failed:");
+                                ctx.link().send_message(WsAction::Connect(false));
+                            }
                         }
-                        self.connection = Some(Connection::WebTransport(task.unwrap()));
                     }
 
                     let link = ctx.link().clone();
@@ -254,7 +249,17 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Disconnect => {
                     log!("Disconnect");
-                    self.connection.take();
+                    if let Some(connection) = self.connection.take() {
+                        match connection {
+                            Connection::WebSocket(task) => {
+
+                            }
+                            Connection::WebTransport(task) => {
+                                log!("close webtransport");
+                                task.transport.close();
+                            }
+                        }
+                    }
                     if let Some(heartbeat) = self.heartbeat.take() {
                         heartbeat.cancel();
                     }
@@ -268,20 +273,22 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Log(msg) => {
                     log!("{}", msg);
-                    true
-                }
-                WsAction::Lost => {
-                    log!("Lost");
-                    self.connection.take();
-                    let heartbeat = self.heartbeat.take();
-                    match heartbeat {
-                        Some(heartbeat) => {
-                            heartbeat.cancel();
-                        }
-                        None => {}
-                    }
-                    self.connected = false;
                     false
+                }
+                WsAction::Lost(reason) => {
+                    log!("Lost");
+                    if let Some(window) = window() {
+                        let _ = window.alert_with_message(&format!(
+                            "Connection lost. Please reconnect. Reason: {:?}",
+                            reason
+                        ));
+                    }
+                    self.connection.take();
+                    if let Some(heartbeat ) = self.heartbeat.take() {
+                        heartbeat.cancel();
+                    };
+                    self.connected = false;
+                    true
                 }
                 WsAction::RequestMediaPermissions => {
                     let future = request_permissions();
@@ -323,7 +330,9 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_video_keyframe
                                 || chunk_type == EncodedVideoChunkType::Key
                             {
-                                if peer.video_decoder.state() == CodecState::Configured && peer.last_video_sequence < packet.video_metadata.sequence {
+                                if peer.video_decoder.state() == CodecState::Configured
+                                    && peer.last_video_sequence < packet.video_metadata.sequence
+                                {
                                     peer.video_decoder.decode(packet.clone());
                                     peer.waiting_for_video_keyframe = false;
                                     peer.last_video_sequence = packet.video_metadata.sequence;
@@ -360,7 +369,9 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_audio_keyframe
                                 || chunk_type == EncodedAudioChunkType::Key
                             {
-                                if peer.audio_decoder.state() == CodecState::Configured && peer.last_audio_sequence < packet.video_metadata.sequence {
+                                if peer.audio_decoder.state() == CodecState::Configured
+                                    && peer.last_audio_sequence < packet.video_metadata.sequence
+                                {
                                     peer.audio_decoder.decode(&encoded_audio_chunk);
                                     peer.waiting_for_audio_keyframe = false;
                                     peer.last_audio_sequence = packet.video_metadata.sequence;
@@ -376,7 +387,9 @@ impl Component for AttendantsComponent {
                             if !peer.waiting_for_screen_keyframe
                                 || chunk_type == EncodedVideoChunkType::Key
                             {
-                                if peer.screen_decoder.state() == CodecState::Configured && peer.last_screen_sequence < packet.video_metadata.sequence {
+                                if peer.screen_decoder.state() == CodecState::Configured
+                                    && peer.last_screen_sequence < packet.video_metadata.sequence
+                                {
                                     peer.screen_decoder.decode(packet.clone());
                                     peer.waiting_for_screen_keyframe = false;
                                     peer.last_screen_sequence = packet.video_metadata.sequence;
@@ -465,10 +478,8 @@ impl Component for AttendantsComponent {
                 if let Ok(media_packet) = media_packet {
                     ctx.link()
                         .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
-                    true
-                } else {
-                    false
                 }
+                false
             }
             Msg::OnMessage(response, _message_type) => {
                 let res = MediaPacket::parse_from_bytes(&response);
@@ -478,7 +489,7 @@ impl Component for AttendantsComponent {
                 } else {
                     log!("failed to parse media packet");
                 }
-                true
+                false
             }
             Msg::OnUniStream(stream) => {
                 if stream.is_undefined() {
@@ -517,7 +528,7 @@ impl Component for AttendantsComponent {
                         }
                     }
                 });
-                true
+                false
             }
             Msg::OnBidiStream(stream) => {
                 log!("OnBidiStream: ", &stream);
@@ -559,7 +570,7 @@ impl Component for AttendantsComponent {
                     }
                     log!("readable stream closed");
                 });
-                true
+                false
             }
             Msg::MeetingAction(action) => {
                 match action {

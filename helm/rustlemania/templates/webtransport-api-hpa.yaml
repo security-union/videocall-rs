@@ -1,0 +1,32 @@
+{{- if .Values.wtApi.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "rustlemania.fullname" . }}-wt-api
+  labels:
+    {{- include "rustlemania.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "rustlemania.fullname" . }}
+  minReplicas: {{ .Values.wtApi.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.wtApi.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.wtApi.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.wtApi.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.wtApi.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.wtApi.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+{{- end }}

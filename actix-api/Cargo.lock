@@ -2091,8 +2091,7 @@ dependencies = [
 [[package]]
 name = "sec-http3"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95421c373d2c94a60b5dd4989c98779e2888b56ac4af1a81f10a927b81a26375"
+source = "git+https://github.com/security-union/sec-http3.git?rev=4c505a86b98da2aaa21cd17f37908e4ce9b64f3a#4c505a86b98da2aaa21cd17f37908e4ce9b64f3a"
 dependencies = [
  "bytes",
  "fastrand",

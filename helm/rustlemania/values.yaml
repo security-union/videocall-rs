@@ -118,7 +118,7 @@ ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: latest
+    tag: 900c7390b5a6c4663b67d59b392078363ff12792
   resources: {}
   podAnnotations: {}
   podSecurityContext: {}
@@ -152,6 +152,14 @@ ingress:
             name: rustlemania-ws-api
             port:
               number: 8080
+    - host: api2.rustlemania.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: rustlemania-wt-api
+            port:
+              number: 4433
     - host: rustlemania.com
       paths:
         - path: /

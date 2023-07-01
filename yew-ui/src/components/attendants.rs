@@ -1,8 +1,11 @@
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::constants::WEBTRANSPORT_ENABLED;
+use crate::constants::AUDIO_CHANNELS;
+use crate::constants::AUDIO_CODEC;
+use crate::constants::AUDIO_SAMPLE_RATE;
+use crate::constants::VIDEO_CODEC;
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::decode::{AudioPeerDecoder, VideoPeerDecoder};
 use crate::model::MediaPacketWrapper;
@@ -40,7 +43,7 @@ pub enum WsAction {
     Connect(bool),
     Connected,
     Disconnect,
-    Lost,
+    Lost(Option<JsValue>),
     RequestMediaPermissions,
     MediaPermissionsGranted,
     MediaPermissionsError(String),
@@ -89,10 +92,9 @@ pub struct AttendantsComponentProps {
     pub id: String,
 
     #[prop_or_default]
-    pub media_packet: MediaPacket,
-
-    #[prop_or_default]
     pub email: String,
+
+    pub webtransport_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,7 +119,6 @@ pub struct AttendantsComponent {
     pub heartbeat: Option<Interval>,
     pub error: Option<String>,
     pub media_access_granted: bool,
-    pub stream_buffer: Vec<u8>,
 }
 
 pub struct ClientSubscription {
@@ -134,7 +135,7 @@ pub fn connect_websocket(
     let callback = ctx.link().callback(Msg::OnInboundMedia);
     let notification = ctx.link().batch_callback(|status| match status {
         WebSocketStatus::Opened => Some(WsAction::Connected.into()),
-        WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost.into()),
+        WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost(None).into()),
     });
     let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
     log!("Connecting to ", &url);
@@ -147,12 +148,14 @@ pub fn connect_webtransport(
     email: &str,
     id: &str,
 ) -> anyhow::Result<WebTransportTask> {
-    let on_datagram = ctx.link().callback(|d| Msg::OnDatagram(d));
-    let on_unidirectional_stream = ctx.link().callback(|d| Msg::OnUniStream(d));
-    let on_bidirectional_stream = ctx.link().callback(|d| Msg::OnBidiStream(d));
+    let on_datagram = ctx.link().callback(Msg::OnDatagram);
+    let on_unidirectional_stream = ctx.link().callback(Msg::OnUniStream);
+    let on_bidirectional_stream = ctx.link().callback(Msg::OnBidiStream);
     let notification = ctx.link().batch_callback(|status| match status {
         WebTransportStatus::Opened => Some(WsAction::Connected.into()),
-        WebTransportStatus::Closed | WebTransportStatus::Error => Some(WsAction::Lost.into()),
+        WebTransportStatus::Closed(error) | WebTransportStatus::Error(error) => {
+            Some(WsAction::Lost(Some(error)).into())
+        }
     });
     let url = format!("{}/{}/{}", WEBTRANSPORT_HOST, email, id);
     let task = WebTransportService::connect(
@@ -169,8 +172,9 @@ impl Component for AttendantsComponent {
     type Message = Msg;
     type Properties = AttendantsComponentProps;
 
-    fn create(_ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self {
         let connected_peers: HashMap<String, ClientSubscription> = HashMap::new();
+        let webtransport_enabled = ctx.props().webtransport_enabled;
         Self {
             connection: None,
             connected: false,
@@ -181,11 +185,10 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
-            webtransport_enabled: *WEBTRANSPORT_ENABLED,
+            webtransport_enabled,
             heartbeat: None,
             error: None,
             media_access_granted: false,
-            stream_buffer: vec![],
         }
     }
 
@@ -197,32 +200,25 @@ impl Component for AttendantsComponent {
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
                     if !webtransport {
-                        let task = connect_websocket(ctx, &email, &id).map_err(|e| {
+                        if let Ok(task) = connect_websocket(ctx, &email, &id).map_err(|e| {
                             ctx.link().send_message(WsAction::Log(format!(
                                 "WebSocket connect failed: {}",
-                                e.to_string()
+                                e
                             )));
-                            false
-                        });
-                        if task.is_err() {
-                            return false;
+                        }) {
+                            self.connection = Some(Connection::WebSocket(task));
                         }
-                        let task = task.unwrap();
-                        self.connection = Some(Connection::WebSocket(task));
                     } else {
-                        let task = connect_webtransport(ctx, &email, &id).map_err(|e| {
-                            ctx.link().send_message(WsAction::Log(format!(
-                                "WebTransport connect failed: {}",
-                                e.to_string()
-                            )));
-                            log!("falling back to WebSocket");
-                            ctx.link().send_message(WsAction::Connect(false));
-                            false
-                        });
-                        if task.is_err() {
-                            return false;
+                        let task= connect_webtransport(ctx, &email, &id);
+                        match task {
+                            Ok(task) => {
+                                self.connection = Some(Connection::WebTransport(task));
+                            },
+                            Err(e) => {
+                                log!("WebTransport connect failed:");
+                                ctx.link().send_message(WsAction::Connect(false));
+                            }
                         }
-                        self.connection = Some(Connection::WebTransport(task.unwrap()));
                     }
 
                     let link = ctx.link().clone();
@@ -239,7 +235,17 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Disconnect => {
                     log!("Disconnect");
-                    self.connection.take();
+                    if let Some(connection) = self.connection.take() {
+                        match connection {
+                            Connection::WebSocket(task) => {
+
+                            }
+                            Connection::WebTransport(task) => {
+                                log!("close webtransport");
+                                task.transport.close();
+                            }
+                        }
+                    }
                     if let Some(heartbeat) = self.heartbeat.take() {
                         heartbeat.cancel();
                     }
@@ -253,20 +259,22 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Log(msg) => {
                     log!("{}", msg);
-                    true
-                }
-                WsAction::Lost => {
-                    log!("Lost");
-                    self.connection.take();
-                    let heartbeat = self.heartbeat.take();
-                    match heartbeat {
-                        Some(heartbeat) => {
-                            heartbeat.cancel();
-                        }
-                        None => {}
-                    }
-                    self.connected = false;
                     false
+                }
+                WsAction::Lost(reason) => {
+                    log!("Lost");
+                    if let Some(window) = window() {
+                        let _ = window.alert_with_message(&format!(
+                            "Connection lost. Please reconnect. Reason: {:?}",
+                            reason
+                        ));
+                    }
+                    self.connection.take();
+                    if let Some(heartbeat ) = self.heartbeat.take() {
+                        heartbeat.cancel();
+                    };
+                    self.connected = false;
+                    true
                 }
                 WsAction::RequestMediaPermissions => {
                     let future = request_permissions();
@@ -370,13 +378,14 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        if bytes.len() < 1024 {
-                                            WebTransportTask::send_datagram(
+                                        // TODO: Investigate why using datagrams causes issues
+                                        if bytes.len() > 100 {
+                                            WebTransportTask::send_unidirectional_stream(
                                                 wt.transport.clone(),
                                                 bytes,
                                             );
                                         } else {
-                                            WebTransportTask::send_unidirectional_stream(
+                                            WebTransportTask::send_datagram(
                                                 wt.transport.clone(),
                                                 bytes,
                                             );
@@ -399,27 +408,23 @@ impl Component for AttendantsComponent {
                 false
             }
             Msg::OnDatagram(bytes) => {
-                let media_packet = MediaPacket::parse_from_reader(&mut Cursor::new(bytes))
+                let media_packet = MediaPacket::parse_from_bytes(&bytes)
                     .map_err(|e| JsValue::from(format!("{:?}", e)));
                 if let Ok(media_packet) = media_packet {
                     ctx.link()
                         .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
-                    true
-                } else {
-                    false
                 }
+                false
             }
             Msg::OnMessage(response, _message_type) => {
-                self.stream_buffer.extend(response);
-                let res = MediaPacket::parse_from_bytes(&self.stream_buffer);
+                let res = MediaPacket::parse_from_bytes(&response);
                 if let Ok(media_packet) = res {
-                    self.stream_buffer.clear();
                     ctx.link()
                         .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
                 } else {
                     log!("failed to parse media packet");
                 }
-                true
+                false
             }
             Msg::OnUniStream(stream) => {
                 if stream.is_undefined() {
@@ -458,7 +463,7 @@ impl Component for AttendantsComponent {
                         }
                     }
                 });
-                true
+                false
             }
             Msg::OnBidiStream(stream) => {
                 log!("OnBidiStream: ", &stream);
@@ -500,7 +505,7 @@ impl Component for AttendantsComponent {
                     }
                     log!("readable stream closed");
                 });
-                true
+                false
             }
             Msg::MeetingAction(action) => {
                 match action {

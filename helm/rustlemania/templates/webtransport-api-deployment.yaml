@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rustlemania.fullname" . }}-wt-api
+  labels:
+    {{- include "rustlemania.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.wtApi.autoscaling.enabled }}
+  replicas: {{ .Values.wtApi.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "rustlemania.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.wtApi.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "rustlemania.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.wtApi.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.wtApi.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ include "rustlemania.fullname" . }}-wt-api
+          securityContext:
+            {{- toYaml .Values.wtApi.securityContext | nindent 12 }}
+          image: "{{ .Values.wtApi.image.repository }}:{{ .Values.wtApi.image.tag }}"
+          command: {{ .Values.wtApi.command }}
+          args: {{ .Values.wtApi.args }}
+          imagePullPolicy: {{ .Values.wtApi.image.pullPolicy }}
+          env:
+            {{- toYaml .Values.wtApi.env | nindent 12 }}
+          ports:
+            - name: wt-api
+              containerPort: {{ .Values.wtApi.service.port }}
+              protocol: UDP
+            - name: wt-api-health
+              containerPort: {{ .Values.wtApi.service.port }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.wtApi.resources | nindent 12 }}
+          volumeMounts:
+            - name: tls
+              mountPath: "/certs"
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.wtApi.tlsSecret }}
+            optional: true
+      {{- with .Values.wtApi.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.wtApi.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.wtApi.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

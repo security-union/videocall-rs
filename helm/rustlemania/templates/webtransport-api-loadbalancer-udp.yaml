@@ -19,3 +19,7 @@ spec:
       port: 4433
       targetPort: 4433
       name: wt-api
+    - protocol: UDP
+      port: 4434
+      targetPort: 4434
+      name: wt-api-debug

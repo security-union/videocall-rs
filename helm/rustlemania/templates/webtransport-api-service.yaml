@@ -11,6 +11,10 @@ spec:
       targetPort: 4433
       protocol: UDP
       name: wt-api
+    - port: {{ .Values.wtApi.service.port2 }}
+      targetPort: 4434
+      protocol: UDP
+      name: wt-api-debug
     - port: {{ .Values.wtApi.service.port }}
       targetPort: 4433
       protocol: TCP

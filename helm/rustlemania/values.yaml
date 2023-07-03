@@ -77,7 +77,7 @@ wtApi:
   tlsSecret: rustlemania-tls
   env:
     - name: RUST_LOG
-      value: trace,quinn=warn
+      value: trace
     - name: NATS_URL
       value: nats:4222
     - name: LISTEN_URL
@@ -93,6 +93,7 @@ wtApi:
   service:
     type: NodePort
     port: 4433
+    port2: 4434
   autoscaling:
     enabled: false
     minReplicas: 1
@@ -111,7 +112,9 @@ wtApi:
                 operator: Exists
           topologyKey: "kubernetes.io/hostname"
   # Used to configure cloud provider specific LB service type
-  # loadBalancerAnnotations:
+  loadBalancerAnnotations:
+    cloud.google.com/l4-rbs: "enabled"
+
 
 ui:
   replicaCount: 1

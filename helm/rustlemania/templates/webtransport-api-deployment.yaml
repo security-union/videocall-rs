@@ -40,6 +40,9 @@ spec:
             - name: wt-api
               containerPort: {{ .Values.wtApi.service.port }}
               protocol: UDP
+            - name: wt-api-debug
+              containerPort: {{ .Values.wtApi.service.port2 }}
+              protocol: UDP
             - name: wt-api-health
               containerPort: {{ .Values.wtApi.service.port }}
               protocol: TCP

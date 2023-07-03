@@ -67,7 +67,7 @@ wsApi:
   affinity: {}
 
 wtApi:
-  replicaCount: 3
+  replicaCount: 1
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
@@ -77,7 +77,7 @@ wtApi:
   tlsSecret: rustlemania-tls
   env:
     - name: RUST_LOG
-      value: debug,quinn=warn
+      value: trace,quinn=warn
     - name: NATS_URL
       value: nats:4222
     - name: LISTEN_URL

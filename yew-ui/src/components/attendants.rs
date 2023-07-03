@@ -2,10 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::constants::WEBTRANSPORT_ENABLED;
-use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_CODEC;
-use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::constants::VIDEO_CODEC;
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::decode::{AudioPeerDecoder, VideoPeerDecoder};
 use crate::model::MediaPacketWrapper;

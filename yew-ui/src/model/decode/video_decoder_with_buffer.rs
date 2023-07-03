@@ -4,8 +4,7 @@ use js_sys::Uint8Array;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::{
-    CodecState, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType,
-    VideoDecoderConfig, VideoDecoderInit,
+    CodecState, EncodedVideoChunk, EncodedVideoChunkType, VideoDecoderConfig, VideoDecoderInit,
 };
 
 use crate::model::EncodedVideoChunkTypeWrapper;
@@ -110,13 +109,7 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
     }
 
     fn internal_decode(&self, image: Arc<MediaPacket>) {
-        let chunk_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
-        let video_data = Uint8Array::new_with_length(image.data.len().try_into().unwrap());
-        video_data.copy_from(&image.data);
-        let mut video_chunk = EncodedVideoChunkInit::new(&video_data, image.timestamp, chunk_type);
-        video_chunk.duration(image.duration);
-        let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
-        self.video_decoder.decode(&encoded_video_chunk);
+        self.video_decoder.decode(image);
     }
 
     fn play_queued_follow_up_frames(&mut self) {
@@ -142,5 +135,171 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
 
     pub fn state(&self) -> CodecState {
         self.video_decoder.state()
+    }
+}
+
+// Create a test suite for the decoder
+#[cfg(test)]
+mod test {
+
+    use std::sync::Mutex;
+
+    use types::protos::media_packet::VideoMetadata;
+    use wasm_bindgen::prelude::*;
+
+    use super::*;
+    pub struct MockVideoDecoder {
+        chunks: Arc<Mutex<Vec<Arc<MediaPacket>>>>,
+        pub state: CodecState,
+    }
+
+    impl VideoDecoderTrait for MockVideoDecoder {
+        fn configure(&self, _config: &VideoDecoderConfig) {
+            // Mock implementation, possibly do nothing
+        }
+
+        fn decode(&self, image: Arc<MediaPacket>) {
+            let mut chunks = self.chunks.lock().unwrap();
+            chunks.push(image.clone());
+        }
+
+        fn state(&self) -> CodecState {
+            // Mock implementation, return some state
+            self.state.clone()
+        }
+
+        fn new(init: &VideoDecoderInit) -> Result<Self, JsValue>
+        where
+            Self: Sized,
+        {
+            Ok(MockVideoDecoder {
+                chunks: Arc::new(Mutex::new(Vec::new())),
+                state: CodecState::Configured,
+            })
+        }
+    }
+
+    fn create_mock_packet(sequence: u64, frame_type: &str, data: Vec<u8>) -> Arc<MediaPacket> {
+        let video_metadata = VideoMetadata {
+            sequence: sequence,
+            ..Default::default()
+        };
+        // This function creates a mock MediaPacket.
+        Arc::new(MediaPacket {
+            media_type: Default::default(), // Put an appropriate default or value here
+            email: "test@example.com".to_string(),
+            data: data,
+            frame_type: frame_type.to_string(),
+            timestamp: 0.0,
+            duration: 0.0,
+            audio_metadata: Default::default(), // Put an appropriate default or value here
+            video_metadata: Some(video_metadata).into(), // Assuming sequence is a field in VideoMetadata
+            special_fields: Default::default(),          // Put an appropriate default or value here
+        })
+    }
+
+    fn create_video_decoder() -> VideoDecoderWithBuffer<MockVideoDecoder> {
+        let error = Closure::wrap(Box::new(move |e: JsValue| {}) as Box<dyn FnMut(JsValue)>);
+        let output =
+            Closure::wrap(Box::new(move |original_chunk: JsValue| {}) as Box<dyn FnMut(JsValue)>);
+        let init = VideoDecoderInit::new(
+            error.as_ref().unchecked_ref(),
+            output.as_ref().unchecked_ref(),
+        );
+        let video_decoder_with_buffer: VideoDecoderWithBuffer<MockVideoDecoder> =
+            VideoDecoderWithBuffer::new(&init).unwrap();
+        video_decoder_with_buffer
+    }
+    #[test]
+    fn test_in_order_frames() {
+        let mut video_decoder_with_buffer = create_video_decoder();
+
+        // Generate in-order frames
+        let packets = vec![
+            create_mock_packet(1, "Key", vec![1, 2, 3]),
+            create_mock_packet(2, "Key", vec![4, 5, 6]),
+            create_mock_packet(3, "Key", vec![7, 8, 9]),
+        ];
+
+        // Feed frames into video_decoder_with_buffer
+        for packet in packets {
+            video_decoder_with_buffer.decode(packet);
+        }
+
+        // Assertions to verify that mock_decoder has received and processed frames in order
+        let processed_sequences: Vec<u64> = video_decoder_with_buffer
+            .video_decoder
+            .chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|chunk| {
+                // Extract sequence number from chunk; assuming a method to do this
+                chunk.video_metadata.sequence
+            })
+            .collect();
+        assert_eq!(processed_sequences, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_out_of_order_frames() {
+        let mut video_decoder_with_buffer = create_video_decoder();
+
+        // Generate out-of-order frames
+        let packets = vec![
+            create_mock_packet(3, "Key", vec![7, 8, 9]),
+            create_mock_packet(1, "Key", vec![1, 2, 3]),
+            create_mock_packet(2, "Key", vec![4, 5, 6]),
+        ];
+
+        // Feed frames into video_decoder_with_buffer
+        for packet in packets {
+            video_decoder_with_buffer.decode(packet);
+        }
+
+        // Assertions to verify that frames were buffered and ordered correctly before decoding
+        let processed_sequences: Vec<u64> = video_decoder_with_buffer
+            .video_decoder
+            .chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|chunk| {
+                chunk.video_metadata.sequence // Extract sequence number from chunk; assuming a method to do this
+            })
+            .collect();
+        assert_eq!(processed_sequences, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_extremely_out_of_order_frames() {
+        let mut video_decoder_with_buffer = create_video_decoder();
+
+        // Generate extremely out-of-order frames
+        let packets = vec![
+            create_mock_packet(5, "Key", vec![10, 11, 12]),
+            create_mock_packet(3, "Key", vec![7, 8, 9]),
+            create_mock_packet(1, "Key", vec![1, 2, 3]),
+            create_mock_packet(6, "Key", vec![13, 14, 15]),
+            create_mock_packet(2, "Key", vec![4, 5, 6]),
+        ];
+
+        // Feed frames into video_decoder_with_buffer
+        for packet in packets {
+            video_decoder_with_buffer.decode(packet);
+        }
+
+        // Assertions to verify that older frames were dropped and it tried to catch up
+        let processed_sequences: Vec<u64> = video_decoder_with_buffer
+            .video_decoder
+            .chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|chunk| {
+                chunk.video_metadata.sequence // Extract sequence number from chunk; assuming a method to do this
+            })
+            .collect();
+        assert!(processed_sequences == vec![1, 2, 3, 5, 6] || processed_sequences == vec![5, 6]);
     }
 }

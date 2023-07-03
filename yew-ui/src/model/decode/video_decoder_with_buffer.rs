@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use gloo_console::log;
 use js_sys::Uint8Array;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
@@ -35,19 +36,22 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
     }
 
     pub fn decode(&mut self, image: Arc<MediaPacket>) {
+        log!("calling decode");
         let new_sequence_number = image.video_metadata.sequence;
         let frame_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
         let cache_size = self.cache.len();
-        if self.sequence.is_none() && frame_type == EncodedVideoChunkType::Key {
-            self.internal_decode(image);
+        // If we get a keyframe, play it immediately, then prune all packets before it
+        if frame_type == EncodedVideoChunkType::Key {
+            self.video_decoder.decode(image);
             self.sequence = Some(new_sequence_number);
+            self.prune_older_frames_from_buffer(new_sequence_number);
         } else if let Some(sequence) = self.sequence {
             let is_future_frame = new_sequence_number > sequence;
             let is_future_i_frame = is_future_frame && frame_type == EncodedVideoChunkType::Key;
             let is_next_frame = new_sequence_number == sequence + 1;
             let next_frame_already_cached = self.cache.get(&(sequence + 1)).is_some();
             if is_future_i_frame || is_next_frame {
-                self.internal_decode(image);
+                self.video_decoder.decode(image);
                 self.sequence = Some(new_sequence_number);
                 self.play_queued_follow_up_frames();
                 self.prune_older_frames_from_buffer(sequence);
@@ -87,7 +91,7 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
             if let Some(next_sequence) = next_sequence {
                 if !should_skip {
                     let next_image = self.cache.get(&next_sequence).unwrap();
-                    self.internal_decode(next_image.clone());
+                    self.video_decoder.decode(next_image.clone());
                     self.sequence = Some(next_sequence);
                     to_remove.push(next_sequence); // Instead of removing here, we add it to the remove list
                 }
@@ -108,10 +112,6 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
             .retain(|sequence, _| *sequence >= sequence_number)
     }
 
-    fn internal_decode(&self, image: Arc<MediaPacket>) {
-        self.video_decoder.decode(image);
-    }
-
     fn play_queued_follow_up_frames(&mut self) {
         let sorted_frames = self.cache.keys().collect::<Vec<_>>();
         if self.sequence.is_none() || sorted_frames.is_empty() {
@@ -124,7 +124,7 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
                 continue;
             } else if *current_sequence == next_sequence {
                 if let Some(next_image) = self.cache.get(current_sequence) {
-                    self.internal_decode(next_image.clone());
+                    self.video_decoder.decode(next_image.clone());
                     self.sequence = Some(next_sequence);
                 }
             } else {
@@ -146,6 +146,9 @@ mod test {
 
     use types::protos::media_packet::VideoMetadata;
     use wasm_bindgen::prelude::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use crate::model::EncodedAudioChunkTypeWrapper;
 
     use super::*;
     pub struct MockVideoDecoder {
@@ -159,6 +162,7 @@ mod test {
         }
 
         fn decode(&self, image: Arc<MediaPacket>) {
+            log!("Decoding image");
             let mut chunks = self.chunks.lock().unwrap();
             chunks.push(image.clone());
         }
@@ -179,7 +183,11 @@ mod test {
         }
     }
 
-    fn create_mock_packet(sequence: u64, frame_type: &str, data: Vec<u8>) -> Arc<MediaPacket> {
+    fn create_mock_packet(
+        sequence: u64,
+        chunk_type: EncodedVideoChunkType,
+        data: Vec<u8>,
+    ) -> Arc<MediaPacket> {
         let video_metadata = VideoMetadata {
             sequence: sequence,
             ..Default::default()
@@ -189,7 +197,7 @@ mod test {
             media_type: Default::default(), // Put an appropriate default or value here
             email: "test@example.com".to_string(),
             data: data,
-            frame_type: frame_type.to_string(),
+            frame_type: EncodedVideoChunkTypeWrapper(chunk_type).to_string(),
             timestamp: 0.0,
             duration: 0.0,
             audio_metadata: Default::default(), // Put an appropriate default or value here
@@ -210,15 +218,15 @@ mod test {
             VideoDecoderWithBuffer::new(&init).unwrap();
         video_decoder_with_buffer
     }
-    #[test]
-    fn test_in_order_frames() {
+    #[wasm_bindgen_test]
+    fn test_in_order_frames_happy_path() {
         let mut video_decoder_with_buffer = create_video_decoder();
 
         // Generate in-order frames
         let packets = vec![
-            create_mock_packet(1, "Key", vec![1, 2, 3]),
-            create_mock_packet(2, "Key", vec![4, 5, 6]),
-            create_mock_packet(3, "Key", vec![7, 8, 9]),
+            create_mock_packet(1, EncodedVideoChunkType::Key, vec![1, 2, 3]),
+            create_mock_packet(2, EncodedVideoChunkType::Delta, vec![4, 5, 6]),
+            create_mock_packet(3, EncodedVideoChunkType::Delta, vec![7, 8, 9]),
         ];
 
         // Feed frames into video_decoder_with_buffer
@@ -241,15 +249,15 @@ mod test {
         assert_eq!(processed_sequences, vec![1, 2, 3]);
     }
 
-    #[test]
-    fn test_out_of_order_frames() {
+    #[wasm_bindgen_test]
+    fn test_out_of_order_key_frames() {
         let mut video_decoder_with_buffer = create_video_decoder();
 
         // Generate out-of-order frames
         let packets = vec![
-            create_mock_packet(3, "Key", vec![7, 8, 9]),
-            create_mock_packet(1, "Key", vec![1, 2, 3]),
-            create_mock_packet(2, "Key", vec![4, 5, 6]),
+            create_mock_packet(3, EncodedVideoChunkType::Key, vec![7, 8, 9]),
+            create_mock_packet(1, EncodedVideoChunkType::Key, vec![1, 2, 3]),
+            create_mock_packet(2, EncodedVideoChunkType::Key, vec![4, 5, 6]),
         ];
 
         // Feed frames into video_decoder_with_buffer
@@ -268,20 +276,20 @@ mod test {
                 chunk.video_metadata.sequence // Extract sequence number from chunk; assuming a method to do this
             })
             .collect();
-        assert_eq!(processed_sequences, vec![1, 2, 3]);
+        assert_eq!(processed_sequences, vec![3, 1, 2]);
     }
 
-    #[test]
+    #[wasm_bindgen_test]
     fn test_extremely_out_of_order_frames() {
         let mut video_decoder_with_buffer = create_video_decoder();
 
         // Generate extremely out-of-order frames
         let packets = vec![
-            create_mock_packet(5, "Key", vec![10, 11, 12]),
-            create_mock_packet(3, "Key", vec![7, 8, 9]),
-            create_mock_packet(1, "Key", vec![1, 2, 3]),
-            create_mock_packet(6, "Key", vec![13, 14, 15]),
-            create_mock_packet(2, "Key", vec![4, 5, 6]),
+            create_mock_packet(5, EncodedVideoChunkType::Key, vec![10, 11, 12]),
+            create_mock_packet(3, EncodedVideoChunkType::Delta, vec![7, 8, 9]),
+            create_mock_packet(1, EncodedVideoChunkType::Delta, vec![1, 2, 3]),
+            create_mock_packet(6, EncodedVideoChunkType::Delta, vec![13, 14, 15]),
+            create_mock_packet(2, EncodedVideoChunkType::Delta, vec![4, 5, 6]),
         ];
 
         // Feed frames into video_decoder_with_buffer
@@ -300,6 +308,6 @@ mod test {
                 chunk.video_metadata.sequence // Extract sequence number from chunk; assuming a method to do this
             })
             .collect();
-        assert!(processed_sequences == vec![1, 2, 3, 5, 6] || processed_sequences == vec![5, 6]);
+        assert!(processed_sequences == vec![5, 6] || processed_sequences == vec![5, 6]);
     }
 }

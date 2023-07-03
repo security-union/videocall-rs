@@ -96,7 +96,9 @@ macro_rules! opt_ref {
 pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue>;
 
 impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
-    pub fn new(canvas_id: &String) -> PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
+    pub fn new(
+        canvas_id: &String,
+    ) -> PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
         let id = canvas_id.clone();
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);

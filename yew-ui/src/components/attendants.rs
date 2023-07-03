@@ -1,11 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-
-
-
-
-
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::decode::{AudioPeerDecoder, VideoPeerDecoder};
 use crate::model::MediaPacketWrapper;
@@ -209,11 +204,11 @@ impl Component for AttendantsComponent {
                             self.connection = Some(Connection::WebSocket(task));
                         }
                     } else {
-                        let task= connect_webtransport(ctx, &email, &id);
+                        let task = connect_webtransport(ctx, &email, &id);
                         match task {
                             Ok(task) => {
                                 self.connection = Some(Connection::WebTransport(task));
-                            },
+                            }
                             Err(_e) => {
                                 log!("WebTransport connect failed:");
                                 ctx.link().send_message(WsAction::Connect(false));
@@ -237,9 +232,7 @@ impl Component for AttendantsComponent {
                     log!("Disconnect");
                     if let Some(connection) = self.connection.take() {
                         match connection {
-                            Connection::WebSocket(_task) => {
-
-                            }
+                            Connection::WebSocket(_task) => {}
                             Connection::WebTransport(task) => {
                                 log!("close webtransport");
                                 task.transport.close();
@@ -270,7 +263,7 @@ impl Component for AttendantsComponent {
                         ));
                     }
                     self.connection.take();
-                    if let Some(heartbeat ) = self.heartbeat.take() {
+                    if let Some(heartbeat) = self.heartbeat.take() {
                         heartbeat.cancel();
                     };
                     self.connected = false;

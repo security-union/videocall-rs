@@ -16,7 +16,7 @@ const MAX_BUFFER_SIZE: usize = 10;
 
 // This is a wrapper of the web-sys VideoDecoder which handles
 // frames being out of order and other issues.
-pub struct VideoDecoderWithBuffer<A:VideoDecoderTrait> {
+pub struct VideoDecoderWithBuffer<A: VideoDecoderTrait> {
     video_decoder: A,
     cache: BTreeMap<u64, Arc<MediaPacket>>,
     sequence: Option<u64>,

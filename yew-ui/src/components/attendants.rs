@@ -568,7 +568,7 @@ impl Component for AttendantsComponent {
                     }
                     <h4 class="floating-name">{email}</h4>
                     {if !self.connected {
-                        html! {<h4>{"Not Connected"}</h4>}
+                        html! {<h4>{"Connecting"}</h4>}
                     } else {
                         html! {<h4>{"Connected"}</h4>}
                     }}

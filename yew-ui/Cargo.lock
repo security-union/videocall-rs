@@ -1118,9 +1118,9 @@ dependencies = [
 
 [[package]]
 name = "yew-websocket"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "184a8cd8390995cc4b0b803b4acd0bd98d79d508f7eee911372ccf75ea87a07d"
+checksum = "a94d6ed7dbb3ad43b39dc849bd8ab3f635f847c03387f110727e86e0affc6234"
 dependencies = [
  "anyhow",
  "futures",

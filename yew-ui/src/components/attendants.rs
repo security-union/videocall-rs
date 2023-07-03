@@ -24,9 +24,7 @@ use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
-use yew_webtransport::webtransport::{
-    WebTransportService, WebTransportStatus, WebTransportTask,
-};
+use yew_webtransport::webtransport::{WebTransportService, WebTransportStatus, WebTransportTask};
 
 use super::device_permissions::request_permissions;
 
@@ -330,9 +328,10 @@ impl Component for AttendantsComponent {
                 }
             }
             Msg::OnOutboundPacket(media) => {
-                if let Some(connection) = self.connection.take() {
+                log!("on outbound packet");
+                if let Some(connection) = &self.connection {
                     match connection {
-                        Connection::WebSocket(mut ws) => {
+                        Connection::WebSocket(ws) => {
                             if self.connected {
                                 match media
                                     .write_to_bytes()
@@ -350,7 +349,6 @@ impl Component for AttendantsComponent {
                                         );
                                     }
                                 }
-                                self.connection = Some(Connection::WebSocket(ws));
                             }
                         }
                         Connection::WebTransport(wt) => {
@@ -382,7 +380,6 @@ impl Component for AttendantsComponent {
                                         );
                                     }
                                 }
-                                self.connection = Some(Connection::WebTransport(wt));
                             }
                         }
                     }
@@ -441,12 +438,13 @@ impl Component for AttendantsComponent {
                                     .unwrap()
                                     .unchecked_into::<Boolean>();
 
-                                let value = Reflect::get(&result, &JsString::from("value")).unwrap();
+                                let value =
+                                    Reflect::get(&result, &JsString::from("value")).unwrap();
                                 if !value.is_undefined() {
                                     let value: Uint8Array = value.unchecked_into();
                                     append_uint8_array_to_vec(&mut buffer, &value);
                                 }
-                                
+
                                 if done.is_truthy() {
                                     process_binary(buffer, &callback);
                                     break;
@@ -486,7 +484,8 @@ impl Component for AttendantsComponent {
                                 let done = Reflect::get(&result, &JsString::from("done"))
                                     .unwrap()
                                     .unchecked_into::<Boolean>();
-                                let value = Reflect::get(&result, &JsString::from("value")).unwrap();
+                                let value =
+                                    Reflect::get(&result, &JsString::from("value")).unwrap();
                                 if !value.is_undefined() {
                                     let value: Uint8Array = value.unchecked_into();
                                     append_uint8_array_to_vec(&mut buffer, &value);
@@ -641,7 +640,6 @@ fn user_video(props: &UserVideoProps) -> Html {
         <canvas ref={(*video_ref).clone()} id={props.id.clone()}></canvas>
     }
 }
-
 
 pub fn append_uint8_array_to_vec(rust_vec: &mut Vec<u8>, js_array: &Uint8Array) {
     // Convert the Uint8Array into a Vec<u8>

@@ -1,3 +1,4 @@
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use http::Method;
@@ -288,17 +289,21 @@ where
                     continue;
                 }
                 let session = session.read().await;
-                let stream = session.open_uni(session_id).await;
-                tokio::spawn(async move {
-                    match stream {
-                        Ok(mut uni_stream) => {
-                            uni_stream.write_all(&msg.data).await;
+                if msg.data.len() > 400 {
+                    let stream = session.open_uni(session_id).await;
+                    tokio::spawn(async move {
+                        match stream {
+                            Ok(mut uni_stream) => {
+                                uni_stream.write_all(&msg.data).await;
+                            }
+                            Err(e) => {
+                                error!("Error opening unidirectional stream: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            error!("Error opening unidirectional stream: {}", e);
-                        }
-                    }
-                });
+                    });
+                } else {
+                    session.send_datagram(msg.data.into());
+                }
             }
         })
     };

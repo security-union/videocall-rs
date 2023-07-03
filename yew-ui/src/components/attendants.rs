@@ -38,7 +38,6 @@ use super::device_permissions::request_permissions;
 pub enum WsAction {
     Connect(bool),
     Connected,
-    Disconnect,
     Lost(Option<JsValue>),
     RequestMediaPermissions,
     MediaPermissionsGranted,
@@ -154,6 +153,7 @@ pub fn connect_webtransport(
         }
     });
     let url = format!("{}/{}/{}", WEBTRANSPORT_HOST, email, id);
+    log!("Connecting to ", &url);
     let task = WebTransportService::connect(
         &url,
         on_datagram,
@@ -188,6 +188,12 @@ impl Component for AttendantsComponent {
         }
     }
 
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render {
+            ctx.link().send_message(WsAction::RequestMediaPermissions);
+        }
+    }
+
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::WsAction(action) => match action {
@@ -205,13 +211,13 @@ impl Component for AttendantsComponent {
                             self.connection = Some(Connection::WebSocket(task));
                         }
                     } else {
-                        let task= connect_webtransport(ctx, &email, &id);
+                        let task = connect_webtransport(ctx, &email, &id);
                         match task {
                             Ok(task) => {
                                 self.connection = Some(Connection::WebTransport(task));
-                            },
+                            }
                             Err(e) => {
-                                log!("WebTransport connect failed:");
+                                log!("WebTransport connect failed, falling back to WebSocket");
                                 ctx.link().send_message(WsAction::Connect(false));
                             }
                         }
@@ -229,25 +235,6 @@ impl Component for AttendantsComponent {
                     }));
                     true
                 }
-                WsAction::Disconnect => {
-                    log!("Disconnect");
-                    if let Some(connection) = self.connection.take() {
-                        match connection {
-                            Connection::WebSocket(task) => {
-
-                            }
-                            Connection::WebTransport(task) => {
-                                log!("close webtransport");
-                                task.transport.close();
-                            }
-                        }
-                    }
-                    if let Some(heartbeat) = self.heartbeat.take() {
-                        heartbeat.cancel();
-                    }
-                    self.connected = false;
-                    true
-                }
                 WsAction::Connected => {
                     log!("Connected");
                     self.connected = true;
@@ -259,17 +246,13 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Lost(reason) => {
                     log!("Lost");
-                    if let Some(window) = window() {
-                        let _ = window.alert_with_message(&format!(
-                            "Connection lost. Please reconnect. Reason: {:?}",
-                            reason
-                        ));
-                    }
+                    self.connected = false;
                     self.connection.take();
-                    if let Some(heartbeat ) = self.heartbeat.take() {
+                    if let Some(heartbeat) = self.heartbeat.take() {
                         heartbeat.cancel();
                     };
-                    self.connected = false;
+                    ctx.link()
+                        .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
                 }
                 WsAction::RequestMediaPermissions => {
@@ -571,23 +554,6 @@ impl Component for AttendantsComponent {
                             onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
                             { if !self.mic_enabled { "Unmute"} else { "Mute"} }
                             </button>
-                        {if self.connection.is_none() {
-                            html! {<button
-                                class="bg-yew-blue p-2 rounded-md text-white"
-                                disabled={self.connection.is_some() }
-                                onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}>
-                                { "Connect" }
-                            </button>
-                            }
-                        } else {
-                            html! {}
-                        }}
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            disabled={self.connection.is_none() }
-                                onclick={ctx.link().callback(|_| WsAction::Disconnect)}>
-                            { "Close" }
-                        </button>
                     </div>
                     {
                         if media_access_granted {
@@ -597,6 +563,11 @@ impl Component for AttendantsComponent {
                         }
                     }
                     <h4 class="floating-name">{email}</h4>
+                    {if !self.connected {
+                        html! {<h4>{"Connecting"}</h4>}
+                    } else {
+                        html! {<h4>{"Connected"}</h4>}
+                    }}
                 </nav>
             </div>
         }

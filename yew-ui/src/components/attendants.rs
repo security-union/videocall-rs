@@ -25,7 +25,7 @@ use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
 use yew_webtransport::webtransport::{
-    process_binary, WebTransportService, WebTransportStatus, WebTransportTask,
+    WebTransportService, WebTransportStatus, WebTransportTask,
 };
 
 use super::device_permissions::request_permissions;
@@ -390,11 +390,16 @@ impl Component for AttendantsComponent {
                 false
             }
             Msg::OnDatagram(bytes) => {
-                let media_packet = MediaPacket::parse_from_bytes(&bytes)
-                    .map_err(|e| JsValue::from(format!("{:?}", e)));
-                if let Ok(media_packet) = media_packet {
-                    ctx.link()
-                        .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
+                let media_packet = MediaPacket::parse_from_bytes(&bytes);
+                match media_packet {
+                    Ok(media_packet) => {
+                        ctx.link()
+                            .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
+                    }
+                    Err(e) => {
+                        let e = JsValue::from(format!("{:?}", e));
+                        log!("error parsing datagram: {:?}", e);
+                    }
                 }
                 false
             }
@@ -414,19 +419,20 @@ impl Component for AttendantsComponent {
                     log!("stream is undefined");
                     return true;
                 }
-                let incoming_datagrams: ReadableStreamDefaultReader =
+                let incoming_unistreams: ReadableStreamDefaultReader =
                     stream.get_reader().unchecked_into();
                 let callback = ctx
                     .link()
-                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::Datagram));
+                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::UnidirectionalStream));
                 wasm_bindgen_futures::spawn_local(async move {
+                    let mut buffer: Vec<u8> = vec![];
                     loop {
-                        let read_result = JsFuture::from(incoming_datagrams.read()).await;
+                        let read_result = JsFuture::from(incoming_unistreams.read()).await;
                         match read_result {
                             Err(e) => {
                                 let mut reason = WebTransportCloseInfo::default();
                                 reason.reason(
-                                    format!("Failed to read incoming datagrams {e:?}").as_str(),
+                                    format!("Failed to read incoming unistream {e:?}").as_str(),
                                 );
                                 break;
                             }
@@ -434,14 +440,17 @@ impl Component for AttendantsComponent {
                                 let done = Reflect::get(&result, &JsString::from("done"))
                                     .unwrap()
                                     .unchecked_into::<Boolean>();
+
+                                let value = Reflect::get(&result, &JsString::from("value")).unwrap();
+                                if !value.is_undefined() {
+                                    let value: Uint8Array = value.unchecked_into();
+                                    append_uint8_array_to_vec(&mut buffer, &value);
+                                }
+                                
                                 if done.is_truthy() {
+                                    process_binary(buffer, &callback);
                                     break;
                                 }
-                                let value: Uint8Array =
-                                    Reflect::get(&result, &JsString::from("value"))
-                                        .unwrap()
-                                        .unchecked_into();
-                                process_binary(&value, &callback);
                             }
                         }
                     }
@@ -460,14 +469,16 @@ impl Component for AttendantsComponent {
                     .link()
                     .callback(|d| Msg::OnMessage(d, WebTransportMessageType::BidirectionalStream));
                 wasm_bindgen_futures::spawn_local(async move {
+                    let mut buffer: Vec<u8> = vec![];
                     loop {
                         log!("reading from stream");
                         let read_result = JsFuture::from(readable.read()).await;
+
                         match read_result {
                             Err(e) => {
                                 let mut reason = WebTransportCloseInfo::default();
                                 reason.reason(
-                                    format!("Failed to read incoming datagrams {e:?}").as_str(),
+                                    format!("Failed to read incoming bidistream {e:?}").as_str(),
                                 );
                                 break;
                             }
@@ -475,14 +486,15 @@ impl Component for AttendantsComponent {
                                 let done = Reflect::get(&result, &JsString::from("done"))
                                     .unwrap()
                                     .unchecked_into::<Boolean>();
+                                let value = Reflect::get(&result, &JsString::from("value")).unwrap();
+                                if !value.is_undefined() {
+                                    let value: Uint8Array = value.unchecked_into();
+                                    append_uint8_array_to_vec(&mut buffer, &value);
+                                }
                                 if done.is_truthy() {
+                                    process_binary(buffer, &callback);
                                     break;
                                 }
-                                let value: Uint8Array =
-                                    Reflect::get(&result, &JsString::from("value"))
-                                        .unwrap()
-                                        .unchecked_into();
-                                process_binary(&value, &callback);
                             }
                         }
                     }
@@ -628,4 +640,18 @@ fn user_video(props: &UserVideoProps) -> Html {
     html! {
         <canvas ref={(*video_ref).clone()} id={props.id.clone()}></canvas>
     }
+}
+
+
+pub fn append_uint8_array_to_vec(rust_vec: &mut Vec<u8>, js_array: &Uint8Array) {
+    // Convert the Uint8Array into a Vec<u8>
+    let mut temp_vec = vec![0; js_array.length() as usize];
+    js_array.copy_to(&mut temp_vec);
+
+    // Append it to the existing Rust Vec<u8>
+    rust_vec.append(&mut temp_vec);
+}
+
+pub fn process_binary(bytes: Vec<u8>, callback: &Callback<Vec<u8>>) {
+    callback.emit(bytes);
 }

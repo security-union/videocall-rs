@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
-use crate::constants::WEBTRANSPORT_ENABLED;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::constants::WEBTRANSPORT_ENABLED;
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::decode::{AudioPeerDecoder, VideoPeerDecoder};
 use crate::model::MediaPacketWrapper;
@@ -220,7 +219,7 @@ impl Component for AttendantsComponent {
                         match task {
                             Ok(task) => {
                                 self.connection = Some(Connection::WebTransport(task));
-                            },
+                            }
                             Err(e) => {
                                 log!("WebTransport connect failed, falling back to WebSocket");
                                 ctx.link().send_message(WsAction::Connect(false));
@@ -253,12 +252,11 @@ impl Component for AttendantsComponent {
                     log!("Lost");
                     self.connected = false;
                     self.connection.take();
-                    if let Some(heartbeat ) = self.heartbeat.take() {
+                    if let Some(heartbeat) = self.heartbeat.take() {
                         heartbeat.cancel();
                     };
-                    ctx.link().send_message(WsAction::Connect(
-                        self.webtransport_enabled,
-                    ));
+                    ctx.link()
+                        .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
                 }
                 WsAction::RequestMediaPermissions => {
@@ -279,9 +277,8 @@ impl Component for AttendantsComponent {
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
                     self.media_access_granted = true;
-                    ctx.link().send_message(WsAction::Connect(
-                        self.webtransport_enabled,
-                    ));
+                    ctx.link()
+                        .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
                 }
                 WsAction::MediaPermissionsError(error) => {
@@ -575,7 +572,6 @@ impl Component for AttendantsComponent {
                     } else {
                         html! {<h4>{"Connected"}</h4>}
                     }}
-
                 </nav>
             </div>
         }

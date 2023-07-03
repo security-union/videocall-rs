@@ -40,7 +40,6 @@ use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 pub struct PeerDecoder<WebDecoder, Chunk> {
     decoder: WebDecoder,
     waiting_for_keyframe: bool,
-    last_sequence: u64,
     _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
     _output: Closure<dyn FnMut(Chunk)>, // member exists to keep the closure in scope for the life of the struct
 }
@@ -62,13 +61,10 @@ macro_rules! impl_decode {
         if !$self.waiting_for_keyframe || chunk_type == <$ChunkType>::Key {
             match $self.decoder.state() {
                 CodecState::Configured => {
-                    if $self.last_sequence < $packet.video_metadata.sequence {
-                        $self
-                            .decoder
-                            .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
-                        $self.waiting_for_keyframe = false;
-                        $self.last_sequence = $packet.video_metadata.sequence;
-                    }
+                    $self
+                        .decoder
+                        .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
+                    $self.waiting_for_keyframe = false;
                 }
                 CodecState::Closed => {
                     return Err(());
@@ -138,7 +134,6 @@ impl PeerDecoder<VideoDecoderWithBuffer, JsValue> {
         PeerDecoder {
             decoder,
             waiting_for_keyframe: true,
-            last_sequence: 0,
             _error: error,
             _output: output,
         }
@@ -206,7 +201,6 @@ impl PeerDecoder<AudioDecoder, AudioData> {
         PeerDecoder {
             decoder,
             waiting_for_keyframe: true,
-            last_sequence: 0,
             _error: error,
             _output: output,
         }

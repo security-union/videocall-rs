@@ -1,4 +1,5 @@
 mod config;
+mod video_encoder_wrapper;
 mod peer_decoder;
 mod video_decoder_with_buffer;
 

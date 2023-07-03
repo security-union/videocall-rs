@@ -1,4 +1,5 @@
 use crate::model::EncodedVideoChunkTypeWrapper;
+use gloo_console::log;
 use js_sys::Uint8Array;
 use std::sync::Arc;
 use types::protos::media_packet::MediaPacket;

@@ -5,7 +5,7 @@ use web_sys::MediaStreamConstraints;
 
 pub async fn request_permissions() -> anyhow::Result<(), JsValue> {
     let navigator = window().navigator();
-    let media_devices = navigator.media_devices().unwrap();
+    let media_devices = navigator.media_devices()?;
 
     let mut constraints = MediaStreamConstraints::new();
 

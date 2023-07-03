@@ -286,8 +286,8 @@ impl Component for AttendantsComponent {
                 let email = packet.email.clone();
                 let screen_canvas_id = { format!("screen-share-{}", &email) };
                 if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
-                    match packet.media_type.unwrap() {
-                        media_packet::MediaType::VIDEO => {
+                    match packet.media_type.enum_value() {
+                        Ok(media_packet::MediaType::VIDEO) => {
                             if let Err(()) = peer.video.decode(&packet) {
                                 // Codec crashed, reconfigure it...
                                 self.connected_peers.remove(&email);
@@ -302,12 +302,12 @@ impl Component for AttendantsComponent {
                                 self.insert_peer(email.clone(), screen_canvas_id);
                             }
                         }
-                        media_packet::MediaType::AUDIO => {
+                        Ok(media_packet::MediaType::AUDIO) => {
                             if let Err(()) = peer.audio.decode(&packet) {
                                 self.connected_peers.remove(&email);
                             }
                         }
-                        media_packet::MediaType::SCREEN => {
+                        Ok(media_packet::MediaType::SCREEN) => {
                             if let Err(()) = peer.screen.decode(&packet) {
                                 // Codec crashed, reconfigure it...
                                 self.connected_peers.remove(&email);
@@ -315,7 +315,11 @@ impl Component for AttendantsComponent {
                             // TOFIX: due to a bug, we need to refresh the screen to ensure that the canvas is created.
                             return true;
                         }
-                        media_packet::MediaType::HEARTBEAT => {
+                        Ok(media_packet::MediaType::HEARTBEAT) => {
+                            return false;
+                        }
+                        Err(e) => {
+                            log!("error decoding packet: {:?}", e);
                             return false;
                         }
                     }
@@ -335,11 +339,10 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        // log!("sending video packet: ", bytes.len(), " bytes");
                                         ws.send_binary(bytes);
                                     }
                                     Err(e) => {
-                                        let packet_type = media.media_type.enum_value().unwrap();
+                                        let packet_type = media.media_type.enum_value_or_default();
                                         log!(
                                             "error sending {} packet: {:?}",
                                             JsValue::from(format!("{}", packet_type)),
@@ -371,7 +374,7 @@ impl Component for AttendantsComponent {
                                         }
                                     }
                                     Err(e) => {
-                                        let packet_type = media.media_type.enum_value().unwrap();
+                                        let packet_type = media.media_type.enum_value_or_default();
                                         log!(
                                             "error sending {} packet: {:?}",
                                             JsValue::from(format!("{}", packet_type)),
@@ -395,13 +398,14 @@ impl Component for AttendantsComponent {
                 }
                 false
             }
-            Msg::OnMessage(response, _message_type) => {
+            Msg::OnMessage(response, message_type) => {
                 let res = MediaPacket::parse_from_bytes(&response);
                 if let Ok(media_packet) = res {
                     ctx.link()
                         .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
                 } else {
-                    log!("failed to parse media packet");
+                    let message_type = format!("{:?}", message_type);
+                    log!("failed to parse media packet ", message_type);
                 }
                 false
             }
@@ -414,7 +418,7 @@ impl Component for AttendantsComponent {
                     stream.get_reader().unchecked_into();
                 let callback = ctx
                     .link()
-                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::UnidirectionalStream));
+                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::Datagram));
                 wasm_bindgen_futures::spawn_local(async move {
                     loop {
                         let read_result = JsFuture::from(incoming_datagrams.read()).await;
@@ -511,7 +515,11 @@ impl Component for AttendantsComponent {
             .sorted_connected_peers_keys
             .iter()
             .map(|key| {
-                let peer = self.connected_peers.get(key).unwrap();
+                let peer = match self.connected_peers.get(key) {
+                    Some(peer) => peer,
+                    None => return html! {},
+                };
+
                 let screen_share_css = if peer.screen.is_waiting_for_keyframe() {
                     "grid-item hidden"
                 } else {

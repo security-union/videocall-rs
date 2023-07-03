@@ -288,21 +288,17 @@ where
                     continue;
                 }
                 let session = session.read().await;
-                if msg.data.len() > 400 {
-                    let stream = session.open_uni(session_id).await;
-                    tokio::spawn(async move {
-                        match stream {
-                            Ok(mut uni_stream) => {
-                                uni_stream.write_all(&msg.data).await;
-                            }
-                            Err(e) => {
-                                error!("Error opening unidirectional stream: {}", e);
-                            }
+                let stream = session.open_uni(session_id).await;
+                tokio::spawn(async move {
+                    match stream {
+                        Ok(mut uni_stream) => {
+                            uni_stream.write_all(&msg.data).await;
                         }
-                    });
-                } else {
-                    session.send_datagram(msg.data.into());
-                }
+                        Err(e) => {
+                            error!("Error opening unidirectional stream: {}", e);
+                        }
+                    }
+                });
             }
         })
     };

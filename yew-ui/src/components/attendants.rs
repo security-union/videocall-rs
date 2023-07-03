@@ -333,8 +333,9 @@ impl Component for AttendantsComponent {
                             if let Err(()) = peer.screen.decode(&packet) {
                                 // Codec crashed, reconfigure it...
                                 self.connected_peers.remove(&email);
-                                return true;
                             }
+                            // TOFIX: this is a hack to make sure the screen canvas is created
+                            return true;
                         }
                         media_packet::MediaType::HEARTBEAT => {
                             return false;

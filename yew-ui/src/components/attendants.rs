@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::constants::WEBTRANSPORT_ENABLED;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::WEBTRANSPORT_HOST;
-use crate::model::configure_audio_context;
-use crate::model::EncodedVideoChunkTypeWrapper;
+use crate::model::decode::{AudioPeerDecoder, VideoPeerDecoder};
 use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo::timers::callback::Interval;
@@ -20,7 +20,6 @@ use protobuf::Message;
 use types::protos::media_packet::media_packet;
 use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
-use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
@@ -35,7 +34,6 @@ use yew_webtransport::webtransport::{
 };
 
 use super::device_permissions::request_permissions;
-use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
 
 // This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 // https://github.com/WebAudio/web-audio-api-v2/issues/133
@@ -124,21 +122,9 @@ pub struct AttendantsComponent {
 }
 
 pub struct ClientSubscription {
-    pub video_decoder: VideoDecoderWithBuffer,
-    pub screen_decoder: VideoDecoderWithBuffer,
-    pub audio_decoder: AudioDecoder,
-    pub waiting_for_video_keyframe: bool,
-    pub waiting_for_audio_keyframe: bool,
-    pub waiting_for_screen_keyframe: bool,
-    pub last_video_sequence: u64,
-    pub last_audio_sequence: u64,
-    pub last_screen_sequence: u64,
-    pub error_audio: Closure<dyn FnMut(JsValue)>,
-    pub error_video: Closure<dyn FnMut(JsValue)>,
-    pub error_screen: Closure<dyn FnMut(JsValue)>,
-    pub audio_output: Closure<dyn FnMut(web_sys::AudioData)>,
-    pub video_output: Closure<dyn FnMut(JsValue)>,
-    pub screen_output: Closure<dyn FnMut(JsValue)>,
+    pub audio: AudioPeerDecoder,
+    pub video: VideoPeerDecoder,
+    pub screen: VideoPeerDecoder,
 }
 
 pub fn connect_websocket(
@@ -321,84 +307,33 @@ impl Component for AttendantsComponent {
                 let packet = Arc::new(response.0);
                 let email = packet.email.clone();
                 let screen_canvas_id = { format!("screen-share-{}", &email) };
-                let frame_type = packet.frame_type.clone();
                 if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
                     match packet.media_type.unwrap() {
                         media_packet::MediaType::VIDEO => {
-                            let chunk_type =
-                                EncodedVideoChunkTypeWrapper::from(frame_type.as_str()).0;
-                            if !peer.waiting_for_video_keyframe
-                                || chunk_type == EncodedVideoChunkType::Key
-                            {
-                                if peer.video_decoder.state() == CodecState::Configured
-                                    && peer.last_video_sequence < packet.video_metadata.sequence
+                            if let Err(()) = peer.video.decode(&packet) {
+                                // Codec crashed, reconfigure it...
+                                self.connected_peers.remove(&email);
+                                // remove email from connected_peers_keys
+                                if let Some(index) = self
+                                    .sorted_connected_peers_keys
+                                    .iter()
+                                    .position(|x| *x == email)
                                 {
-                                    peer.video_decoder.decode(packet.clone());
-                                    peer.waiting_for_video_keyframe = false;
-                                    peer.last_video_sequence = packet.video_metadata.sequence;
-                                } else if peer.video_decoder.state() == CodecState::Closed {
-                                    // Codec crashed, reconfigure it...
-                                    self.connected_peers.remove(&email);
-                                    // remove email from connected_peers_keys
-                                    if let Some(index) = self
-                                        .sorted_connected_peers_keys
-                                        .iter()
-                                        .position(|x| *x == email)
-                                    {
-                                        self.sorted_connected_peers_keys.remove(index);
-                                    }
-                                    self.insert_peer(email.clone(), screen_canvas_id);
+                                    self.sorted_connected_peers_keys.remove(index);
                                 }
+                                self.insert_peer(email.clone(), screen_canvas_id);
                             }
                         }
                         media_packet::MediaType::AUDIO => {
-                            let audio_data = &packet.data;
-                            let audio_data_js: js_sys::Uint8Array =
-                                js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
-                            audio_data_js.copy_from(audio_data.as_slice());
-                            let chunk_type =
-                                EncodedAudioChunkType::from_js_value(&JsValue::from(frame_type))
-                                    .unwrap();
-                            let mut audio_chunk = EncodedAudioChunkInit::new(
-                                &audio_data_js.into(),
-                                packet.timestamp,
-                                chunk_type,
-                            );
-                            audio_chunk.duration(packet.duration);
-                            let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
-                            if !peer.waiting_for_audio_keyframe
-                                || chunk_type == EncodedAudioChunkType::Key
-                            {
-                                if peer.audio_decoder.state() == CodecState::Configured
-                                    && peer.last_audio_sequence < packet.video_metadata.sequence
-                                {
-                                    peer.audio_decoder.decode(&encoded_audio_chunk);
-                                    peer.waiting_for_audio_keyframe = false;
-                                    peer.last_audio_sequence = packet.video_metadata.sequence;
-                                } else if peer.audio_decoder.state() == CodecState::Closed {
-                                    // Codec crashed, reconfigure it...
-                                    self.connected_peers.remove(&email);
-                                }
+                            if let Err(()) = peer.audio.decode(&packet) {
+                                self.connected_peers.remove(&email);
                             }
                         }
                         media_packet::MediaType::SCREEN => {
-                            let chunk_type =
-                                EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0;
-                            if !peer.waiting_for_screen_keyframe
-                                || chunk_type == EncodedVideoChunkType::Key
-                            {
-                                if peer.screen_decoder.state() == CodecState::Configured
-                                    && peer.last_screen_sequence < packet.video_metadata.sequence
-                                {
-                                    peer.screen_decoder.decode(packet.clone());
-                                    peer.waiting_for_screen_keyframe = false;
-                                    peer.last_screen_sequence = packet.video_metadata.sequence;
-                                    return true;
-                                } else if peer.screen_decoder.state() == CodecState::Closed {
-                                    // Codec crashed, reconfigure it...
-                                    self.connected_peers.remove(&email);
-                                    return true;
-                                }
+                            if let Err(()) = peer.screen.decode(&packet) {
+                                // Codec crashed, reconfigure it...
+                                self.connected_peers.remove(&email);
+                                return true;
                             }
                         }
                         media_packet::MediaType::HEARTBEAT => {
@@ -597,8 +532,8 @@ impl Component for AttendantsComponent {
             .sorted_connected_peers_keys
             .iter()
             .map(|key| {
-                let value = self.connected_peers.get(key).unwrap();
-                let screen_share_css = if value.waiting_for_screen_keyframe {
+                let peer = self.connected_peers.get(key).unwrap();
+                let screen_share_css = if peer.screen.is_waiting_for_keyframe() {
                     "grid-item hidden"
                 } else {
                     "grid-item"
@@ -674,132 +609,12 @@ impl Component for AttendantsComponent {
 
 impl AttendantsComponent {
     fn insert_peer(&mut self, email: String, screen_canvas_id: String) {
-        let error_video = Closure::wrap(Box::new(move |e: JsValue| {
-            log!(&e);
-        }) as Box<dyn FnMut(JsValue)>);
-        let error_audio = Closure::wrap(Box::new(move |e: JsValue| {
-            log!(&e);
-        }) as Box<dyn FnMut(JsValue)>);
-        let audio_stream_generator =
-            MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
-        // The audio context is used to reproduce audio.
-        let _audio_context = configure_audio_context(&audio_stream_generator).unwrap();
-
-        let audio_output = Closure::wrap(Box::new(move |audio_data: AudioData| {
-            let writable = audio_stream_generator.writable();
-            if writable.locked() {
-                return;
-            }
-            if let Err(e) = writable.get_writer().map(|writer| {
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) = JsFuture::from(writer.ready()).await {
-                        log!("write chunk error ", e);
-                    }
-                    if let Err(e) = JsFuture::from(writer.write_with_chunk(&audio_data)).await {
-                        log!("write chunk error ", e);
-                    };
-                    writer.release_lock();
-                });
-            }) {
-                log!("error", e);
-            }
-        }) as Box<dyn FnMut(AudioData)>);
-        let audio_decoder = AudioDecoder::new(&AudioDecoderInit::new(
-            error_audio.as_ref().unchecked_ref(),
-            audio_output.as_ref().unchecked_ref(),
-        ))
-        .unwrap();
-        audio_decoder.configure(&AudioDecoderConfig::new(
-            AUDIO_CODEC,
-            AUDIO_CHANNELS,
-            AUDIO_SAMPLE_RATE,
-        ));
-        let canvas_email = email.clone();
-        let document = window().unwrap().document().unwrap();
-        let video_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
-            let chunk = Box::new(original_chunk);
-            let video_chunk = chunk.unchecked_into::<VideoFrame>();
-            let width = video_chunk.coded_width();
-            let height = video_chunk.coded_height();
-            let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
-            let render_canvas = document
-                .get_element_by_id(&canvas_email)
-                .unwrap()
-                .unchecked_into::<HtmlCanvasElement>();
-            let ctx = render_canvas
-                .get_context("2d")
-                .unwrap()
-                .unwrap()
-                .unchecked_into::<CanvasRenderingContext2d>();
-            render_canvas.set_width(width);
-            render_canvas.set_height(height);
-            if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
-                log!("error ", e);
-            }
-            video_chunk.unchecked_into::<VideoFrame>().close();
-        }) as Box<dyn FnMut(JsValue)>);
-        let video_decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
-            error_video.as_ref().unchecked_ref(),
-            video_output.as_ref().unchecked_ref(),
-        ))
-        .unwrap();
-        video_decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC));
-        let screen_output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
-            let chunk = Box::new(original_chunk);
-            let video_chunk = chunk.unchecked_into::<VideoFrame>();
-            let width = video_chunk.coded_width();
-            let height = video_chunk.coded_height();
-            let render_canvas = window()
-                .unwrap()
-                .document()
-                .unwrap()
-                .get_element_by_id(&screen_canvas_id.clone())
-                .unwrap()
-                .unchecked_into::<HtmlCanvasElement>();
-            render_canvas.set_width(width);
-            render_canvas.set_height(height);
-            let ctx = render_canvas
-                .get_context("2d")
-                .unwrap()
-                .unwrap()
-                .unchecked_into::<CanvasRenderingContext2d>();
-            let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
-
-            if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
-                log!("error ", e);
-            }
-            video_chunk.unchecked_into::<VideoFrame>().close();
-        }) as Box<dyn FnMut(JsValue)>);
-
-        let error_screen = Closure::wrap(Box::new(move |e: JsValue| {
-            log!(&e);
-        }) as Box<dyn FnMut(JsValue)>);
-
-        let screen_decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
-            error_screen.as_ref().unchecked_ref(),
-            screen_output.as_ref().unchecked_ref(),
-        ))
-        .unwrap();
-        screen_decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC));
-
         self.connected_peers.insert(
             email.clone(),
             ClientSubscription {
-                video_decoder,
-                audio_decoder,
-                screen_decoder,
-                last_audio_sequence: 0,
-                last_video_sequence: 0,
-                last_screen_sequence: 0,
-                waiting_for_video_keyframe: true,
-                waiting_for_audio_keyframe: true,
-                waiting_for_screen_keyframe: true,
-                error_audio,
-                error_video,
-                error_screen,
-                audio_output,
-                video_output,
-                screen_output,
+                audio: AudioPeerDecoder::new(),
+                video: VideoPeerDecoder::new(&email),
+                screen: VideoPeerDecoder::new(&screen_canvas_id),
             },
         );
         self.sorted_connected_peers_keys.push(email);

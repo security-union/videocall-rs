@@ -26,6 +26,6 @@ impl VideoDecoderTrait for VideoDecoderWrapper {
         self.0.state()
     }
     fn new(init: &VideoDecoderInit) -> Result<Self, JsValue> where Self: Sized {
-        VideoDecoder::new(init).map(|video_decoder| VideoDecoderWrapper(video_decoder))
+        VideoDecoder::new(init).map(VideoDecoderWrapper)
     }
 }

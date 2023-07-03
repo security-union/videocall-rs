@@ -4,7 +4,7 @@ use js_sys::Uint8Array;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::{
-    CodecState, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, VideoDecoder,
+    CodecState, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType,
     VideoDecoderConfig, VideoDecoderInit,
 };
 

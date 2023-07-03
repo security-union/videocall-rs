@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::constants::WEBTRANSPORT_ENABLED;
-use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_CODEC;
-use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::constants::VIDEO_CODEC;
+
+
+
+
+
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::decode::{AudioPeerDecoder, VideoPeerDecoder};
 use crate::model::MediaPacketWrapper;
@@ -214,7 +214,7 @@ impl Component for AttendantsComponent {
                             Ok(task) => {
                                 self.connection = Some(Connection::WebTransport(task));
                             },
-                            Err(e) => {
+                            Err(_e) => {
                                 log!("WebTransport connect failed:");
                                 ctx.link().send_message(WsAction::Connect(false));
                             }
@@ -237,7 +237,7 @@ impl Component for AttendantsComponent {
                     log!("Disconnect");
                     if let Some(connection) = self.connection.take() {
                         match connection {
-                            Connection::WebSocket(task) => {
+                            Connection::WebSocket(_task) => {
 
                             }
                             Connection::WebTransport(task) => {

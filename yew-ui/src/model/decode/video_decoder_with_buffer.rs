@@ -36,7 +36,6 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
     }
 
     pub fn decode(&mut self, image: Arc<MediaPacket>) {
-        log!("calling decode");
         let new_sequence_number = image.video_metadata.sequence;
         let frame_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
         let cache_size = self.cache.len();
@@ -162,7 +161,6 @@ mod test {
         }
 
         fn decode(&self, image: Arc<MediaPacket>) {
-            log!("Decoding image");
             let mut chunks = self.chunks.lock().unwrap();
             chunks.push(image.clone());
         }

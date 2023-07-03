@@ -10,19 +10,21 @@ use web_sys::{
 
 use crate::model::EncodedVideoChunkTypeWrapper;
 
+use super::video_encoder_wrapper::VideoDecoderTrait;
+
 const MAX_BUFFER_SIZE: usize = 10;
 
 // This is a wrapper of the web-sys VideoDecoder which handles
 // frames being out of order and other issues.
-pub struct VideoDecoderWithBuffer {
-    video_decoder: VideoDecoder,
+pub struct VideoDecoderWithBuffer<A:VideoDecoderTrait> {
+    video_decoder: A,
     cache: BTreeMap<u64, Arc<MediaPacket>>,
     sequence: Option<u64>,
 }
 
-impl VideoDecoderWithBuffer {
+impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
     pub fn new(init: &VideoDecoderInit) -> Result<Self, JsValue> {
-        VideoDecoder::new(init).map(|video_decoder| VideoDecoderWithBuffer {
+        T::new(init).map(|video_decoder| VideoDecoderWithBuffer {
             video_decoder,
             cache: BTreeMap::new(),
             sequence: None,

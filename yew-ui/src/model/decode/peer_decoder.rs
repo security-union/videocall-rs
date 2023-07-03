@@ -12,6 +12,7 @@
 
 use super::config::configure_audio_context;
 use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
+use super::video_encoder_wrapper::VideoDecoderWrapper;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
@@ -92,10 +93,10 @@ macro_rules! opt_ref {
 /// rendered. The size of the canvas is set at decode time to match the image size from the media
 /// data.
 ///
-pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer, JsValue>;
+pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue>;
 
-impl PeerDecoder<VideoDecoderWithBuffer, JsValue> {
-    pub fn new(canvas_id: &String) -> PeerDecoder<VideoDecoderWithBuffer, JsValue> {
+impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
+    pub fn new(canvas_id: &String) -> PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
         let id = canvas_id.clone();
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);

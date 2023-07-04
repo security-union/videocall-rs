@@ -101,6 +101,7 @@ pub struct AttendantsComponent {
     pub connection: Option<Connection>,
     pub media_packet: MediaPacket,
     pub connected: bool,
+    pub connecting: bool,
     pub connected_peers: HashMap<String, ClientSubscription>,
     pub sorted_connected_peers_keys: Vec<String>,
     pub outbound_audio_buffer: [u8; 2000],
@@ -171,6 +172,7 @@ impl Component for AttendantsComponent {
         Self {
             connection: None,
             connected: false,
+            connecting: false,
             media_packet: MediaPacket::default(),
             connected_peers,
             sorted_connected_peers_keys: vec![],
@@ -195,6 +197,10 @@ impl Component for AttendantsComponent {
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect(webtransport) => {
+                    if self.connecting {
+                        return false;
+                    }
+                    self.connecting = true;
                     log!("webtransport connect = {}", webtransport);
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
@@ -234,6 +240,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log!("Connected");
+                    self.connecting = false;
                     self.connected = true;
                     true
                 }
@@ -244,6 +251,7 @@ impl Component for AttendantsComponent {
                 WsAction::Lost(reason) => {
                     log!("Lost");
                     self.connected = false;
+                    self.connecting = false;
                     self.connection.take();
                     if let Some(heartbeat) = self.heartbeat.take() {
                         heartbeat.cancel();
@@ -357,18 +365,10 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        // TODO: Investigate why using datagrams causes issues
-                                        if bytes.len() > 100 {
-                                            WebTransportTask::send_unidirectional_stream(
-                                                wt.transport.clone(),
-                                                bytes,
-                                            );
-                                        } else {
-                                            WebTransportTask::send_datagram(
-                                                wt.transport.clone(),
-                                                bytes,
-                                            );
-                                        }
+                                        WebTransportTask::send_unidirectional_stream(
+                                            wt.transport.clone(),
+                                            bytes,
+                                        );
                                     }
                                     Err(e) => {
                                         let packet_type = media.media_type.enum_value_or_default();

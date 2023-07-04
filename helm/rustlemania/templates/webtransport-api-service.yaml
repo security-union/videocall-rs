@@ -8,11 +8,11 @@ spec:
   type: {{ .Values.wtApi.service.type }}
   ports:
     - port: {{ .Values.wtApi.service.port }}
-      targetPort: 4433
+      targetPort: 443
       protocol: UDP
       name: wt-api
     - port: {{ .Values.wtApi.service.port }}
-      targetPort: 4433
+      targetPort: 443
       protocol: TCP
       name: wt-api-health
   selector:

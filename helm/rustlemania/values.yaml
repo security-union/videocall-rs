@@ -81,7 +81,7 @@ wtApi:
     - name: NATS_URL
       value: nats:4222
     - name: LISTEN_URL
-      value: 0.0.0.0:4433
+      value: 0.0.0.0:443
     - name: CERT_PATH
       value: /certs/tls.crt
     - name: KEY_PATH
@@ -92,7 +92,7 @@ wtApi:
   securityContext: {}
   service:
     type: NodePort
-    port: 4433
+    port: 443
   autoscaling:
     enabled: false
     minReplicas: 1
@@ -118,7 +118,7 @@ ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: a0c57eed9e075d63dd13540a6e79828ce261dcb9
+    tag: 080116aa477c2d156d62414340f25706d2abb142
   resources: {}
   podAnnotations: {}
   podSecurityContext: {}

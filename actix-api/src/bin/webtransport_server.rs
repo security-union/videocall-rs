@@ -35,7 +35,7 @@ async fn main() {
         },
     };
 
-    let listen = opt.listen.clone();
+    let listen = opt.listen;
     actix_rt::spawn(async move {
         info!("Starting http server: {:?}", listen);
         let server =

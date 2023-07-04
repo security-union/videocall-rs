@@ -9,7 +9,7 @@ wsApi:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: 90bce3103416b7ae22edca4bc228d5f98937ff14
+    tag: a0c57eed9e075d63dd13540a6e79828ce261dcb9
   env:
     - name: RUST_LOG
       value: info
@@ -71,7 +71,7 @@ wtApi:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: 90bce3103416b7ae22edca4bc228d5f98937ff14
+    tag: a0c57eed9e075d63dd13540a6e79828ce261dcb9
   command: ['webtransport_server']
   args: []
   tlsSecret: rustlemania-tls
@@ -118,7 +118,7 @@ ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: 90bce3103416b7ae22edca4bc228d5f98937ff14
+    tag: a0c57eed9e075d63dd13540a6e79828ce261dcb9
   resources: {}
   podAnnotations: {}
   podSecurityContext: {}

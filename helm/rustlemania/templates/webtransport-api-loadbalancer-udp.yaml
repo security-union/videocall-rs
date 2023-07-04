@@ -16,6 +16,6 @@ spec:
     {{- include "rustlemania.selectorLabels" . | nindent 4 }}
   ports:
     - protocol: UDP
-      port: 4433
-      targetPort: 4433
+      port: 443
+      targetPort: 443
       name: wt-api

@@ -328,7 +328,6 @@ impl Component for AttendantsComponent {
                 }
             }
             Msg::OnOutboundPacket(media) => {
-                log!("on outbound packet");
                 if let Some(connection) = &self.connection {
                     match connection {
                         Connection::WebSocket(ws) => {

@@ -4,3 +4,6 @@ rustflags = [ "--cfg=web_sys_unstable_apis" ]
 
 [net]
 git-fetch-with-cli = true
+
+[target.wasm32-unknown-unknown]
+runner = 'wasm-bindgen-test-runner'

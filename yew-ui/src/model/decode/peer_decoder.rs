@@ -12,6 +12,7 @@
 
 use super::config::configure_audio_context;
 use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
+use super::video_encoder_wrapper::VideoDecoderWrapper;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
@@ -40,7 +41,6 @@ use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 pub struct PeerDecoder<WebDecoder, Chunk> {
     decoder: WebDecoder,
     waiting_for_keyframe: bool,
-    last_sequence: u64,
     _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
     _output: Closure<dyn FnMut(Chunk)>, // member exists to keep the closure in scope for the life of the struct
 }
@@ -62,13 +62,10 @@ macro_rules! impl_decode {
         if !$self.waiting_for_keyframe || chunk_type == <$ChunkType>::Key {
             match $self.decoder.state() {
                 CodecState::Configured => {
-                    if $self.last_sequence < $packet.video_metadata.sequence {
-                        $self
-                            .decoder
-                            .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
-                        $self.waiting_for_keyframe = false;
-                        $self.last_sequence = $packet.video_metadata.sequence;
-                    }
+                    $self
+                        .decoder
+                        .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
+                    $self.waiting_for_keyframe = false;
                 }
                 CodecState::Closed => {
                     return Err(());
@@ -96,10 +93,12 @@ macro_rules! opt_ref {
 /// rendered. The size of the canvas is set at decode time to match the image size from the media
 /// data.
 ///
-pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer, JsValue>;
+pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue>;
 
-impl PeerDecoder<VideoDecoderWithBuffer, JsValue> {
-    pub fn new(canvas_id: &String) -> PeerDecoder<VideoDecoderWithBuffer, JsValue> {
+impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
+    pub fn new(
+        canvas_id: &String,
+    ) -> PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
         let id = canvas_id.clone();
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
@@ -138,7 +137,6 @@ impl PeerDecoder<VideoDecoderWithBuffer, JsValue> {
         PeerDecoder {
             decoder,
             waiting_for_keyframe: true,
-            last_sequence: 0,
             _error: error,
             _output: output,
         }
@@ -206,7 +204,6 @@ impl PeerDecoder<AudioDecoder, AudioData> {
         PeerDecoder {
             decoder,
             waiting_for_keyframe: true,
-            last_sequence: 0,
             _error: error,
             _output: output,
         }

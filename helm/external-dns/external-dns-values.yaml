@@ -1,0 +1,12 @@
+provider: digitalocean
+
+digitalocean:
+  apiToken: your_api_token
+
+interval: "1m"
+
+policy: sync # or upsert-only
+
+txtOwnerId: rustlemania
+
+domainFilters: [ 'rustlemania.com' ]

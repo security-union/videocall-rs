@@ -1,8 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use crate::constants::WEBTRANSPORT_HOST;
-use crate::model::decode::{AudioPeerDecoder, VideoPeerDecoder};
+use crate::model::decode::PeerDecodeManager;
 use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo::timers::callback::Interval;
@@ -12,7 +9,6 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use js_sys::Uint8Array;
 use protobuf::Message;
-use types::protos::media_packet::media_packet;
 use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsCast;
@@ -64,6 +60,8 @@ pub enum Msg {
     OnUniStream(WebTransportReceiveStream),
     OnBidiStream(WebTransportBidirectionalStream),
     OnMessage(Vec<u8>, WebTransportMessageType),
+    OnPeerAdded(String),
+    OnFirstFrame((String, MediaType)),
 }
 
 impl From<WsAction> for Msg {
@@ -102,8 +100,7 @@ pub struct AttendantsComponent {
     pub media_packet: MediaPacket,
     pub connected: bool,
     pub connecting: bool,
-    pub connected_peers: HashMap<String, ClientSubscription>,
-    pub sorted_connected_peers_keys: Vec<String>,
+    pub peer_decode_manager: PeerDecodeManager,
     pub outbound_audio_buffer: [u8; 2000],
     pub share_screen: bool,
     pub webtransport_enabled: bool,
@@ -112,12 +109,6 @@ pub struct AttendantsComponent {
     pub heartbeat: Option<Interval>,
     pub error: Option<String>,
     pub media_access_granted: bool,
-}
-
-pub struct ClientSubscription {
-    pub audio: AudioPeerDecoder,
-    pub video: VideoPeerDecoder,
-    pub screen: VideoPeerDecoder,
 }
 
 pub fn connect_websocket(
@@ -167,15 +158,28 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let connected_peers: HashMap<String, ClientSubscription> = HashMap::new();
         let webtransport_enabled = ctx.props().webtransport_enabled;
+        let mut peer_decode_manager = PeerDecodeManager::new();
+        let link = ctx.link().clone();
+        peer_decode_manager.on_peer_added.set(move |email| {
+            link.send_message(Msg::OnPeerAdded(email));
+        });
+        let link = ctx.link().clone();
+        peer_decode_manager
+            .on_first_frame
+            .set(move |(email, media_type)| {
+                link.send_message(Msg::OnFirstFrame((email, media_type)));
+            });
+        peer_decode_manager.get_video_canvas_id.set(|email| email);
+        peer_decode_manager
+            .get_screen_canvas_id
+            .set(|email| format!("screen-share-{}", &email));
         Self {
             connection: None,
             connected: false,
             connecting: false,
             media_packet: MediaPacket::default(),
-            connected_peers,
-            sorted_connected_peers_keys: vec![],
+            peer_decode_manager,
             outbound_audio_buffer: [0; 2000],
             share_screen: false,
             mic_enabled: false,
@@ -219,7 +223,7 @@ impl Component for AttendantsComponent {
                             Ok(task) => {
                                 self.connection = Some(Connection::WebTransport(task));
                             }
-                            Err(e) => {
+                            Err(_e) => {
                                 log!("WebTransport connect failed, falling back to WebSocket");
                                 ctx.link().send_message(WsAction::Connect(false));
                             }
@@ -248,7 +252,7 @@ impl Component for AttendantsComponent {
                     log!("{}", msg);
                     false
                 }
-                WsAction::Lost(reason) => {
+                WsAction::Lost(_reason) => {
                     log!("Lost");
                     self.connected = false;
                     self.connecting = false;
@@ -287,53 +291,16 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
+            Msg::OnPeerAdded(_email) => true,
+            Msg::OnFirstFrame((_email, media_type)) => match media_type {
+                MediaType::SCREEN => true,
+                _ => false,
+            },
             Msg::OnInboundMedia(response) => {
-                let packet = Arc::new(response.0);
-                let email = packet.email.clone();
-                let screen_canvas_id = { format!("screen-share-{}", &email) };
-                if let Some(peer) = self.connected_peers.get_mut(&email.clone()) {
-                    match packet.media_type.enum_value() {
-                        Ok(media_packet::MediaType::VIDEO) => {
-                            if let Err(()) = peer.video.decode(&packet) {
-                                // Codec crashed, reconfigure it...
-                                self.connected_peers.remove(&email);
-                                // remove email from connected_peers_keys
-                                if let Some(index) = self
-                                    .sorted_connected_peers_keys
-                                    .iter()
-                                    .position(|x| *x == email)
-                                {
-                                    self.sorted_connected_peers_keys.remove(index);
-                                }
-                                self.insert_peer(email.clone(), screen_canvas_id);
-                            }
-                        }
-                        Ok(media_packet::MediaType::AUDIO) => {
-                            if let Err(()) = peer.audio.decode(&packet) {
-                                self.connected_peers.remove(&email);
-                            }
-                        }
-                        Ok(media_packet::MediaType::SCREEN) => {
-                            if let Err(()) = peer.screen.decode(&packet) {
-                                // Codec crashed, reconfigure it...
-                                self.connected_peers.remove(&email);
-                            }
-                            // TOFIX: due to a bug, we need to refresh the screen to ensure that the canvas is created.
-                            return true;
-                        }
-                        Ok(media_packet::MediaType::HEARTBEAT) => {
-                            return false;
-                        }
-                        Err(e) => {
-                            log!("error decoding packet: {:?}", e);
-                            return false;
-                        }
-                    }
-                    false
-                } else {
-                    self.insert_peer(email.clone(), screen_canvas_id);
-                    true
+                if let Err(e) = self.peer_decode_manager.decode(response) {
+                    log!("error decoding packet: {:?}", e);
                 }
+                return false;
             }
             Msg::OnOutboundPacket(media) => {
                 if let Some(connection) = &self.connection {
@@ -522,10 +489,11 @@ impl Component for AttendantsComponent {
         let on_packet = ctx.link().callback(Msg::OnOutboundPacket);
         let media_access_granted = self.media_access_granted;
         let rows: Vec<VNode> = self
-            .sorted_connected_peers_keys
+            .peer_decode_manager
+            .sorted_keys()
             .iter()
             .map(|key| {
-                let peer = match self.connected_peers.get(key) {
+                let peer = match self.peer_decode_manager.get(key) {
                     Some(peer) => peer,
                     None => return html! {},
                 };
@@ -589,21 +557,6 @@ impl Component for AttendantsComponent {
                 </nav>
             </div>
         }
-    }
-}
-
-impl AttendantsComponent {
-    fn insert_peer(&mut self, email: String, screen_canvas_id: String) {
-        self.connected_peers.insert(
-            email.clone(),
-            ClientSubscription {
-                audio: AudioPeerDecoder::new(),
-                video: VideoPeerDecoder::new(&email),
-                screen: VideoPeerDecoder::new(&screen_canvas_id),
-            },
-        );
-        self.sorted_connected_peers_keys.push(email);
-        self.sorted_connected_peers_keys.sort();
     }
 }
 

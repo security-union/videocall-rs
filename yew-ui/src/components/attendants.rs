@@ -27,6 +27,7 @@ use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask}
 use yew_webtransport::webtransport::{WebTransportService, WebTransportStatus, WebTransportTask};
 
 use super::device_permissions::request_permissions;
+use super::top_bar::TopBar;
 
 // This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 // https://github.com/WebAudio/web-audio-api-v2/issues/133

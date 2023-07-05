@@ -13,6 +13,7 @@ body {
   color: white;
   background-color: #111;
   display: flex;
+  flex-direction: column;
 }
 
 input {
@@ -93,4 +94,14 @@ canvas {
 
 select {
   color: black;
+}
+
+.top-bar {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  background-color: black;
+  color: white;
+  padding: 8px;
 }

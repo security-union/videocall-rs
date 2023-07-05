@@ -12,7 +12,7 @@
 
 use super::config::configure_audio_context;
 use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
-use super::video_encoder_wrapper::VideoDecoderWrapper;
+use super::video_decoder_wrapper::VideoDecoderWrapper;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;

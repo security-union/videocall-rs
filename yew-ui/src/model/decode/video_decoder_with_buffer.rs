@@ -1,16 +1,14 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use gloo_console::log;
-use js_sys::Uint8Array;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::{
-    CodecState, EncodedVideoChunk, EncodedVideoChunkType, VideoDecoderConfig, VideoDecoderInit,
+    CodecState, EncodedVideoChunkType, VideoDecoderConfig, VideoDecoderInit,
 };
 
 use crate::model::EncodedVideoChunkTypeWrapper;
 
-use super::video_encoder_wrapper::VideoDecoderTrait;
+use super::video_decoder_wrapper::VideoDecoderTrait;
 
 const MAX_BUFFER_SIZE: usize = 10;
 

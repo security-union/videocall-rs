@@ -41,6 +41,7 @@ use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 pub struct PeerDecoder<WebDecoder, Chunk> {
     decoder: WebDecoder,
     waiting_for_keyframe: bool,
+    decoded: bool,
     _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
     _output: Closure<dyn FnMut(Chunk)>, // member exists to keep the closure in scope for the life of the struct
 }
@@ -52,12 +53,18 @@ impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
 }
 
 ///
-/// Core decoding logic.
+/// Implementation of decode(packet) -> Result<bool, ()>
+///
+/// Result is:
+///     Ok(true) on first frame,
+///     Ok(false) on other frames
+///     Err() something went wrong
 ///
 /// (Defined as a macro rather than a trait because traits can't refer to members.)
 ///
 macro_rules! impl_decode {
     ($self: expr, $packet: expr, $ChunkType: ty, $ref: tt) => {{
+        let first_frame = !$self.decoded;
         let chunk_type = $self.get_chunk_type(&$packet);
         if !$self.waiting_for_keyframe || chunk_type == <$ChunkType>::Key {
             match $self.decoder.state() {
@@ -66,6 +73,7 @@ macro_rules! impl_decode {
                         .decoder
                         .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
                     $self.waiting_for_keyframe = false;
+                    $self.decoded = true;
                 }
                 CodecState::Closed => {
                     return Err(());
@@ -73,7 +81,7 @@ macro_rules! impl_decode {
                 _ => {}
             }
         }
-        Ok(())
+        Ok(first_frame)
     }};
 }
 
@@ -96,9 +104,7 @@ macro_rules! opt_ref {
 pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue>;
 
 impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
-    pub fn new(
-        canvas_id: &String,
-    ) -> PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
+    pub fn new(canvas_id: &String) -> Self {
         let id = canvas_id.clone();
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
@@ -134,15 +140,16 @@ impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
         ))
         .unwrap();
         decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC));
-        PeerDecoder {
+        Self {
             decoder,
             waiting_for_keyframe: true,
+            decoded: false,
             _error: error,
             _output: output,
         }
     }
 
-    pub fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<(), ()> {
+    pub fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<bool, ()> {
         impl_decode!(self, packet, EncodedVideoChunkType, "")
     }
 
@@ -163,7 +170,7 @@ impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
 pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
 
 impl PeerDecoder<AudioDecoder, AudioData> {
-    pub fn new() -> PeerDecoder<AudioDecoder, AudioData> {
+    pub fn new() -> Self {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
         }) as Box<dyn FnMut(JsValue)>);
@@ -201,15 +208,16 @@ impl PeerDecoder<AudioDecoder, AudioData> {
             AUDIO_CHANNELS,
             AUDIO_SAMPLE_RATE,
         ));
-        PeerDecoder {
+        Self {
             decoder,
             waiting_for_keyframe: true,
+            decoded: false,
             _error: error,
             _output: output,
         }
     }
 
-    pub fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<(), ()> {
+    pub fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<bool, ()> {
         impl_decode!(self, packet, EncodedAudioChunkType, "ref")
     }
 

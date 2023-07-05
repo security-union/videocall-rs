@@ -42,12 +42,18 @@ impl MultiDecoder {
         }
     }
 
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<Option<()>, i32> {
-        match packet.media_type.enum_value()? {
-            MediaType::VIDEO => Ok(self.video.decode(packet).ok()),
-            MediaType::AUDIO => Ok(self.audio.decode(packet).ok()),
-            MediaType::SCREEN => Ok(self.screen.decode(packet).ok()),
-            MediaType::HEARTBEAT => Ok(Some(())),
+    /// Result is:
+    ///     Ok(media_type, Some(true)) on first frame,
+    ///     Ok(media_type, Some(false)) on other frames
+    ///     Ok(media_type, None) on failure to render
+    ///     Err(e) problem with the packet
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<(MediaType, Option<bool>), i32> {
+        let media_type = packet.media_type.enum_value()?;
+        match media_type {
+            MediaType::VIDEO => Ok((media_type, self.video.decode(packet).ok())),
+            MediaType::AUDIO => Ok((media_type, self.audio.decode(packet).ok())),
+            MediaType::SCREEN => Ok((media_type, self.screen.decode(packet).ok())),
+            MediaType::HEARTBEAT => Ok((media_type, Some(false))),
         }
     }
 }
@@ -88,8 +94,16 @@ impl PeerDecodeManager {
             self.add_peer(&email);
         }
         let peer = self.connected_peers.get_mut(&email).unwrap();
-        if let None = peer.decode(&packet)? {
-            self.reset_peer(&email);
+        let (media_type, decoded) = peer.decode(&packet)?;
+        match decoded {
+            Some(first_frame) => {
+                if first_frame {
+                    self.on_first_frame.call((email.clone(), media_type));
+                }
+            }
+            None => {
+                self.reset_peer(&email);
+            }
         }
         Ok(())
     }

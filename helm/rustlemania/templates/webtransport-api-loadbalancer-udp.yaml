@@ -15,6 +15,10 @@ spec:
   selector:
     {{- include "rustlemania.selectorLabels" . | nindent 4 }}
   ports:
+    - protocol: TCP
+      port: 443
+      targetPort: 443
+      name: wt-api-health
     - protocol: UDP
       port: 443
       targetPort: 443

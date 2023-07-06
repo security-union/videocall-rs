@@ -112,14 +112,15 @@ wtApi:
           topologyKey: "kubernetes.io/hostname"
   # Used to configure cloud provider specific LB service type
   loadBalancerAnnotations:
-    service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "443"
-    service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+    external-dns.alpha.kubernetes.io/hostname: "transport.rustlemania.com"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
-    service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
-    service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "8"
-    service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "3"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "4"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "5"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "443"
+    service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
 
 ui:
   replicaCount: 1

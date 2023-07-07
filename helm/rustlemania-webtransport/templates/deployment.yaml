@@ -1,50 +1,50 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "rustlemania.fullname" . }}-wt-api
+  name: {{ include "rustlemania.fullname" . }}
   labels:
     {{- include "rustlemania.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.wtApi.autoscaling.enabled }}
-  replicas: {{ .Values.wtApi.replicaCount }}
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
   {{- end }}
   selector:
     matchLabels:
       {{- include "rustlemania.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.wtApi.podAnnotations }}
+      {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
         {{- include "rustlemania.selectorLabels" . | nindent 8 }}
     spec:
-      {{- with .Values.wtApi.imagePullSecrets }}
+      {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
-        {{- toYaml .Values.wtApi.podSecurityContext | nindent 8 }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: {{ include "rustlemania.fullname" . }}-wt-api
+        - name: {{ include "rustlemania.fullname" . }}
           securityContext:
-            {{- toYaml .Values.wtApi.securityContext | nindent 12 }}
-          image: "{{ .Values.wtApi.image.repository }}:{{ .Values.wtApi.image.tag }}"
-          command: {{ .Values.wtApi.command }}
-          args: {{ .Values.wtApi.args }}
-          imagePullPolicy: {{ .Values.wtApi.image.pullPolicy }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: {{ .Values.command }}
+          args: {{ .Values.args }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
-            {{- toYaml .Values.wtApi.env | nindent 12 }}
+            {{- toYaml .Values.env | nindent 12 }}
           ports:
             - name: wt-api
-              containerPort: {{ .Values.wtApi.service.port }}
+              containerPort: {{ .Values.service.port }}
               protocol: UDP
             - name: wt-api-health
-              containerPort: {{ .Values.wtApi.service.port }}
+              containerPort: {{ .Values.service.healthPort }}
               protocol: TCP
           resources:
-            {{- toYaml .Values.wtApi.resources | nindent 12 }}
+            {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - name: tls
               mountPath: "/certs"
@@ -52,17 +52,17 @@ spec:
       volumes:
         - name: tls
           secret:
-            secretName: {{ .Values.wtApi.tlsSecret }}
+            secretName: {{ .Values.tlsSecret }}
             optional: true
-      {{- with .Values.wtApi.nodeSelector }}
+      {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.wtApi.affinity }}
+      {{- with .Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.wtApi.tolerations }}
+      {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

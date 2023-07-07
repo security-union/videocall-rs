@@ -1,0 +1,63 @@
+# Default values for rustlemania.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 3
+image:
+  repository: securityunion/rustlemania-api
+  pullPolicy: Always
+  tag: 4e7481d196b28e384ce5747af2d0e880fa963377
+command: ['webtransport_server']
+args: []
+tlsSecret: rustlemania-ui-tls
+env:
+  - name: RUST_LOG
+    value: debug,quinn=warn
+  - name: NATS_URL
+    value: nats:4222
+  - name: LISTEN_URL
+    value: 0.0.0.0:443
+  - name: HEALTH_LISTEN_URL
+    value: 0.0.0.0:444
+  - name: CERT_PATH
+    value: /certs/tls.crt
+  - name: KEY_PATH
+    value: /certs/tls.key
+resources: {}
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: NodePort
+  port: 443
+  healthPort: 444
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+nodeSelector:
+  node-role: worker
+tolerations: []
+affinity:
+  podAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app
+              operator: Exists
+        topologyKey: "kubernetes.io/hostname"
+# Used to configure cloud provider specific LB service type
+loadBalancerAnnotations:
+  external-dns.alpha.kubernetes.io/hostname: "transport.rustlemania.com"
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "3"
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "4"
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "5"
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
+  service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+  service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"

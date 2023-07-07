@@ -41,7 +41,7 @@ spec:
               containerPort: {{ .Values.wtApi.service.port }}
               protocol: UDP
             - name: wt-api-health
-              containerPort: {{ .Values.wtApi.service.port }}
+              containerPort: {{ .Values.wtApi.service.healthPort }}
               protocol: TCP
           resources:
             {{- toYaml .Values.wtApi.resources | nindent 12 }}

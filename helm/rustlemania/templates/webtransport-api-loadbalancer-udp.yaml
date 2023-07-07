@@ -16,10 +16,10 @@ spec:
     {{- include "rustlemania.selectorLabels" . | nindent 4 }}
   ports:
     - protocol: TCP
-      port: 443
-      targetPort: 443
+      port: {{ .Values.wtApi.service.healthPort }}
+      targetPort: {{ .Values.wtApi.service.healthPort }}
       name: wt-api-health
     - protocol: UDP
-      port: 443
-      targetPort: 443
+      port: {{ .Values.wtApi.service.port }}
+      targetPort: {{ .Values.wtApi.service.port }}
       name: wt-api

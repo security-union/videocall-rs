@@ -18,6 +18,13 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    let health_listen = std::env::var("HEALTH_LISTEN_URL")
+        .expect("expected HEALTH_LISTEN_URL to be set")
+        .to_socket_addrs()
+        .expect("expected HEALTH_LISTEN_URL to be a valid socket address")
+        .next()
+        .expect("expected HEALTH_LISTEN_URL to be a valid socket address");
+
     let opt = webtransport::WebTransportOpt {
         listen: std::env::var("LISTEN_URL")
             .expect("expected LISTEN_URL to be set")
@@ -40,7 +47,7 @@ async fn main() {
         info!("Starting http server: {:?}", listen);
         let server =
             HttpServer::new(|| App::new().route("/healthz", web::get().to(health_responder)))
-                .bind(&listen)
+                .bind(&health_listen)
                 .unwrap();
         if let Err(e) = server.run().await {
             error!("http server error: {}", e);

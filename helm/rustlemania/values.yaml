@@ -71,7 +71,7 @@ wtApi:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: a0c57eed9e075d63dd13540a6e79828ce261dcb9
+    tag: 4e7481d196b28e384ce5747af2d0e880fa963377
   command: ['webtransport_server']
   args: []
   tlsSecret: rustlemania-tls
@@ -82,6 +82,8 @@ wtApi:
       value: nats:4222
     - name: LISTEN_URL
       value: 0.0.0.0:443
+    - name: HEALTH_LISTEN_URL
+      value: 0.0.0.0:444
     - name: CERT_PATH
       value: /certs/tls.crt
     - name: KEY_PATH
@@ -93,6 +95,7 @@ wtApi:
   service:
     type: NodePort
     port: 443
+    healthPort: 444
   autoscaling:
     enabled: false
     minReplicas: 1
@@ -118,7 +121,7 @@ wtApi:
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "4"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "5"
-    service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "443"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
     service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
     service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
 

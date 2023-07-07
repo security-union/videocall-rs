@@ -1,54 +1,54 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "rustlemania.fullname" . }}-ui
+  name: {{ include "rustlemania.fullname" . }}
   labels:
     {{- include "rustlemania.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.ui.autoscaling.enabled }}
-  replicas: {{ .Values.ui.replicaCount }}
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
   {{- end }}
   selector:
     matchLabels:
       {{- include "rustlemania.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.ui.podAnnotations }}
+      {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
         {{- include "rustlemania.selectorLabels" . | nindent 8 }}
     spec:
-      {{- with .Values.ui.imagePullSecrets }}
+      {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
-        {{- toYaml .Values.ui.podSecurityContext | nindent 8 }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: {{ include "rustlemania.fullname" . }}-ui
+        - name: {{ include "rustlemania.fullname" . }}
           securityContext:
-            {{- toYaml .Values.ui.securityContext | nindent 12 }}
-          image: "{{ .Values.ui.image.repository }}:{{ .Values.ui.image.tag }}"
-          imagePullPolicy: {{ .Values.ui.image.pullPolicy }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
-            {{- toYaml .Values.ui.env | nindent 12 }}
+            {{- toYaml .Values.env | nindent 12 }}
           ports:
             - name: http
-              containerPort: {{ .Values.ui.service.port }}
+              containerPort: {{ .Values.service.port }}
               protocol: TCP
           resources:
-            {{- toYaml .Values.ui.resources | nindent 12 }}
-      {{- with .Values.ui.nodeSelector }}
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.ui.affinity }}
+      {{- with .Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.ui.tolerations }}
+      {{- with .Values.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

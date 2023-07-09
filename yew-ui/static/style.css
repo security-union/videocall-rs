@@ -22,6 +22,10 @@ input {
   /* nice thing of auto margin if display:flex; it center both horizontal and vertical :) */
 }
 
+canvas {
+  margin: auto;
+}
+
 .grid-container {
   width: 100%;
   margin: 16px 16px;

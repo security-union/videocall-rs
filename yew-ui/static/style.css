@@ -23,11 +23,14 @@ input {
 }
 
 canvas {
+  width: 100%;
+  height: auto;
   margin: auto;
 }
 
 .grid-container {
   width: 100%;
+  height: 100%;
   margin: 16px 16px;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));

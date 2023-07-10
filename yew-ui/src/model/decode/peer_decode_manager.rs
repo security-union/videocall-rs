@@ -3,29 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
+use yew::prelude::Callback;
 
 use super::{AudioPeerDecoder, VideoPeerDecoder};
-
-pub struct Callback<IN, OUT = ()> {
-    func: Option<Box<dyn FnMut(IN) -> OUT + 'static>>,
-}
-
-impl<IN, OUT: std::default::Default> Callback<IN, OUT> {
-    fn new() -> Self {
-        Self { func: None }
-    }
-
-    pub fn set(&mut self, func: impl FnMut(IN) -> OUT + 'static) {
-        self.func = Some(Box::new(func));
-    }
-
-    fn call(&mut self, arg: IN) -> OUT {
-        match &mut self.func {
-            Some(func) => func(arg),
-            None => Default::default(),
-        }
-    }
-}
 
 pub struct MultiDecoder {
     pub audio: AudioPeerDecoder,
@@ -72,10 +52,10 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMap::new(),
             sorted_connected_peers_keys: vec![],
-            on_peer_added: Callback::new(),
-            on_first_frame: Callback::new(),
-            get_video_canvas_id: Callback::new(),
-            get_screen_canvas_id: Callback::new(),
+            on_peer_added: Callback::noop(),
+            on_first_frame: Callback::noop(),
+            get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
+            get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
         }
     }
 
@@ -98,7 +78,7 @@ impl PeerDecodeManager {
         match decoded {
             Some(first_frame) => {
                 if first_frame {
-                    self.on_first_frame.call((email.clone(), media_type));
+                    self.on_first_frame.emit((email.clone(), media_type));
                 }
             }
             None => {
@@ -110,15 +90,15 @@ impl PeerDecodeManager {
 
     fn add_peer(&mut self, email: &String) {
         self.insert_peer(&email);
-        self.on_peer_added.call(email.clone())
+        self.on_peer_added.emit(email.clone())
     }
 
     fn insert_peer(&mut self, email: &String) {
         self.connected_peers.insert(
             email.clone(),
             MultiDecoder::new(
-                self.get_video_canvas_id.call(email.clone()),
-                self.get_screen_canvas_id.call(email.clone()),
+                self.get_video_canvas_id.emit(email.clone()),
+                self.get_screen_canvas_id.emit(email.clone()),
             ),
         );
         self.sorted_connected_peers_keys.push(email.clone());

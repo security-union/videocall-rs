@@ -161,19 +161,16 @@ impl Component for AttendantsComponent {
         let webtransport_enabled = ctx.props().webtransport_enabled;
         let mut peer_decode_manager = PeerDecodeManager::new();
         let link = ctx.link().clone();
-        peer_decode_manager.on_peer_added.set(move |email| {
+        peer_decode_manager.on_peer_added = Callback::from(move |email| {
             link.send_message(Msg::OnPeerAdded(email));
         });
         let link = ctx.link().clone();
-        peer_decode_manager
-            .on_first_frame
-            .set(move |(email, media_type)| {
-                link.send_message(Msg::OnFirstFrame((email, media_type)));
-            });
-        peer_decode_manager.get_video_canvas_id.set(|email| email);
-        peer_decode_manager
-            .get_screen_canvas_id
-            .set(|email| format!("screen-share-{}", &email));
+        peer_decode_manager.on_first_frame = Callback::from(move |(email, media_type)| {
+            link.send_message(Msg::OnFirstFrame((email, media_type)));
+        });
+        peer_decode_manager.get_video_canvas_id = Callback::from(|email| email);
+        peer_decode_manager.get_screen_canvas_id =
+            Callback::from(|email| format!("screen-share-{}", &email));
         Self {
             connection: None,
             connected: false,

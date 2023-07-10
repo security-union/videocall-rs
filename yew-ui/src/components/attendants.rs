@@ -27,6 +27,7 @@ use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask}
 use yew_webtransport::webtransport::{WebTransportService, WebTransportStatus, WebTransportTask};
 
 use super::device_permissions::request_permissions;
+use super::top_bar::TopBar;
 
 // This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 // https://github.com/WebAudio/web-audio-api-v2/issues/133
@@ -365,10 +366,17 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        WebTransportTask::send_unidirectional_stream(
-                                            wt.transport.clone(),
-                                            bytes,
-                                        );
+                                        if bytes.len() > 100 {
+                                            WebTransportTask::send_unidirectional_stream(
+                                                wt.transport.clone(),
+                                                bytes,
+                                            );
+                                        } else {
+                                            WebTransportTask::send_datagram(
+                                                wt.transport.clone(),
+                                                bytes,
+                                            );
+                                        }
                                     }
                                     Err(e) => {
                                         let packet_type = media.media_type.enum_value_or_default();

@@ -10,7 +10,7 @@ use constants::{truthy, LOGIN_URL, WEBTRANSPORT_ENABLED};
 use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
-use components::attendants::AttendantsComponent;
+use components::{attendants::AttendantsComponent, top_bar::TopBar};
 use gloo_console::log;
 use gloo_utils::window;
 use yew_router::prelude::*;
@@ -44,6 +44,7 @@ fn switch(routes: Route) -> Html {
         Route::Login => html! { <Login/> },
         Route::Meeting { email, id } => html! {
             <>
+                <TopBar/>
                 <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} />
             </>
         },
@@ -53,6 +54,7 @@ fn switch(routes: Route) -> Html {
             webtransport_enabled,
         } => html! {
             <>
+                <TopBar/>
                 <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(webtransport_enabled)} />
             </>
         },

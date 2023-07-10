@@ -9,10 +9,12 @@ body {
 }
 
 body {
+  overflow: hidden;
   height: 100vh;
   color: white;
   background-color: #111;
   display: flex;
+  flex-direction: column;
 }
 
 input {
@@ -20,8 +22,15 @@ input {
   /* nice thing of auto margin if display:flex; it center both horizontal and vertical :) */
 }
 
+canvas {
+  width: 100%;
+  height: auto;
+  margin: auto;
+}
+
 .grid-container {
   width: 100%;
+  height: 100%;
   margin: 16px 16px;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -48,11 +57,6 @@ input {
 
 .hidden {
   display: none
-}
-
-canvas {
-  width: 100%;
-  height: 100%;
 }
 
 .self-camera {
@@ -93,4 +97,14 @@ canvas {
 
 select {
   color: black;
+}
+
+.top-bar {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  background-color: black;
+  color: white;
+  padding: 8px;
 }

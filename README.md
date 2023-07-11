@@ -2,6 +2,10 @@
 
 https://www.rustlemania.com/
 
+## News 
+
+https://www.reddit.com/r/rust/comments/14vwxfh/we_just_released_our_rust_webtransport/
+
 ## ▶️ YouTube Videos
 
 Here's how we scaled it to support 1000 user per call

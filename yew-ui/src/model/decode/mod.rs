@@ -5,4 +5,3 @@ mod video_decoder_with_buffer;
 mod video_decoder_wrapper;
 
 pub use peer_decode_manager::{MultiDecoder, PeerDecodeManager};
-pub use peer_decoder::{AudioPeerDecoder, VideoPeerDecoder};

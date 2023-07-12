@@ -5,7 +5,7 @@ use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
 use yew::prelude::Callback;
 
-use super::{AudioPeerDecoder, VideoPeerDecoder};
+use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
 
 pub struct MultiDecoder {
     pub audio: AudioPeerDecoder,
@@ -22,18 +22,20 @@ impl MultiDecoder {
         }
     }
 
-    /// Result is:
-    ///     Ok(media_type, Some(true)) on first frame,
-    ///     Ok(media_type, Some(false)) on other frames
-    ///     Ok(media_type, None) on failure to render
-    ///     Err(e) problem with the packet
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<(MediaType, Option<bool>), i32> {
+    // Note: arbitrarily using error code 0 for decoder failure, since it doesn't provide any error value
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<(MediaType, DecodeStatus), i32> {
         let media_type = packet.media_type.enum_value()?;
         match media_type {
-            MediaType::VIDEO => Ok((media_type, self.video.decode(packet).ok())),
-            MediaType::AUDIO => Ok((media_type, self.audio.decode(packet).ok())),
-            MediaType::SCREEN => Ok((media_type, self.screen.decode(packet).ok())),
-            MediaType::HEARTBEAT => Ok((media_type, Some(false))),
+            MediaType::VIDEO => Ok((media_type, self.video.decode(packet).map_err(|_| 0)?)),
+            MediaType::AUDIO => Ok((media_type, self.audio.decode(packet).map_err(|_| 0)?)),
+            MediaType::SCREEN => Ok((media_type, self.screen.decode(packet).map_err(|_| 0)?)),
+            MediaType::HEARTBEAT => Ok((
+                media_type,
+                DecodeStatus {
+                    rendered: false,
+                    first_frame: false,
+                },
+            )),
         }
     }
 }
@@ -74,18 +76,18 @@ impl PeerDecodeManager {
             self.add_peer(&email);
         }
         let peer = self.connected_peers.get_mut(&email).unwrap();
-        let (media_type, decoded) = peer.decode(&packet)?;
-        match decoded {
-            Some(first_frame) => {
-                if first_frame {
+        match peer.decode(&packet) {
+            Ok((media_type, decode_status)) => {
+                if decode_status.first_frame {
                     self.on_first_frame.emit((email.clone(), media_type));
                 }
+                Ok(())
             }
-            None => {
+            Err(e) => {
                 self.reset_peer(&email);
+                Err(e)
             }
         }
-        Ok(())
     }
 
     fn add_peer(&mut self, email: &String) {

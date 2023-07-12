@@ -35,6 +35,11 @@ use web_sys::{HtmlCanvasElement, HtmlImageElement};
 use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 
+pub struct DecodeStatus {
+    pub rendered: bool,
+    pub first_frame: bool,
+}
+
 //
 // Generic type for decoders captures common functionality.
 //
@@ -52,13 +57,12 @@ impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
     }
 }
 
+pub trait PeerDecode {
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()>;
+}
+
 ///
-/// Implementation of decode(packet) -> Result<bool, ()>
-///
-/// Result is:
-///     Ok(true) on first frame,
-///     Ok(false) on other frames
-///     Err() something went wrong
+/// Implementation of decode(packet) -> Result<DecodeStatus, ()>
 ///
 /// (Defined as a macro rather than a trait because traits can't refer to members.)
 ///
@@ -81,7 +85,10 @@ macro_rules! impl_decode {
                 _ => {}
             }
         }
-        Ok(first_frame)
+        Ok(DecodeStatus {
+            rendered: true,
+            first_frame,
+        })
     }};
 }
 
@@ -103,7 +110,7 @@ macro_rules! opt_ref {
 ///
 pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue>;
 
-impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
+impl VideoPeerDecoder {
     pub fn new(canvas_id: &String) -> Self {
         let id = canvas_id.clone();
         let error = Closure::wrap(Box::new(move |e: JsValue| {
@@ -149,16 +156,18 @@ impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
         }
     }
 
-    pub fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<bool, ()> {
-        impl_decode!(self, packet, EncodedVideoChunkType, "")
-    }
-
     fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedVideoChunkType {
         EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0
     }
 
     fn get_chunk(&self, packet: &Arc<MediaPacket>, _: EncodedVideoChunkType) -> Arc<MediaPacket> {
         packet.clone()
+    }
+}
+
+impl PeerDecode for VideoPeerDecoder {
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
+        impl_decode!(self, packet, EncodedVideoChunkType, "")
     }
 }
 
@@ -172,7 +181,7 @@ impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
 
 pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
 
-impl PeerDecoder<AudioDecoder, AudioData> {
+impl AudioPeerDecoder {
     pub fn new() -> Self {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             log!(&e);
@@ -220,10 +229,6 @@ impl PeerDecoder<AudioDecoder, AudioData> {
         }
     }
 
-    pub fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<bool, ()> {
-        impl_decode!(self, packet, EncodedAudioChunkType, "ref")
-    }
-
     fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedAudioChunkType {
         EncodedAudioChunkType::from_js_value(&JsValue::from(packet.frame_type.clone())).unwrap()
     }
@@ -241,5 +246,11 @@ impl PeerDecoder<AudioDecoder, AudioData> {
             EncodedAudioChunkInit::new(&audio_data_js.into(), packet.timestamp, chunk_type);
         audio_chunk.duration(packet.duration);
         EncodedAudioChunk::new(&audio_chunk).unwrap()
+    }
+}
+
+impl PeerDecode for AudioPeerDecoder {
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
+        impl_decode!(self, packet, EncodedAudioChunkType, "ref")
     }
 }

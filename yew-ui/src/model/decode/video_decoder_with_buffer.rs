@@ -2,9 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
-use web_sys::{
-    CodecState, EncodedVideoChunkType, VideoDecoderConfig, VideoDecoderInit,
-};
+use web_sys::{CodecState, EncodedVideoChunkType, VideoDecoderConfig, VideoDecoderInit};
 
 use crate::model::EncodedVideoChunkTypeWrapper;
 

@@ -167,6 +167,9 @@ impl PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue> {
 ///
 /// Plays audio to the standard audio stream.
 ///
+/// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
+/// https://github.com/WebAudio/web-audio-api-v2/issues/133
+
 pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
 
 impl PeerDecoder<AudioDecoder, AudioData> {

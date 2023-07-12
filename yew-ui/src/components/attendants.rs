@@ -24,9 +24,6 @@ use yew_webtransport::webtransport::{WebTransportService, WebTransportStatus, We
 
 use super::device_permissions::request_permissions;
 
-// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
-// https://github.com/WebAudio/web-audio-api-v2/issues/133
-
 #[derive(Debug)]
 pub enum WsAction {
     Connect(bool),

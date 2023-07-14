@@ -55,7 +55,7 @@ jobs:
         with:
           profile: minimal
           target: wasm32-unknown-unknown
-          toolchain: stable
+          toolchain: nightly
           override: true
 
       - uses: jetli/wasm-bindgen-action@v0.2.0

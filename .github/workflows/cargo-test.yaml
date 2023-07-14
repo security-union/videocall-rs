@@ -6,6 +6,7 @@ name: cargo test
 
 env:
   ACTIX_PORT: 8080
+  ACTIX_UI_BACKEND_URL: yeet
   UI_ENDPOINT: localhost:80
   OAUTH_CLIENT_ID: blah
   OAUTH_AUTH_URL: blah
@@ -63,8 +64,6 @@ jobs:
           version: 'latest'
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        continue-on-error: false  # WARNING: only for this example, remove it!
-        with:
-          command: test
-          args: --manifest-path ./yew-ui/Cargo.toml
+        run: |
+          cd yew-ui
+          cargo test

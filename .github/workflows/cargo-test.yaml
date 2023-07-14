@@ -6,7 +6,6 @@ name: cargo test
 
 env:
   ACTIX_PORT: 8080
-  ACTIX_UI_BACKEND_URL: yeet
   UI_ENDPOINT: localhost:80
   OAUTH_CLIENT_ID: blah
   OAUTH_AUTH_URL: blah
@@ -15,6 +14,11 @@ env:
   OAUTH_REDIRECT_URL: http://localhost:8080/login/callback
   RUST_LOG: info
   DATABASE_URL: postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+  ACTIX_UI_BACKEND_URL: yeet
+  LOGIN_URL: yeet
+  WEBTRANSPORT_HOST: yeet
+  ENABLE_OAUTH: false
+  WEBTRANSPORT_ENABLED: true
 
 jobs:
 
@@ -51,7 +55,7 @@ jobs:
         with:
           working-directory: ./yew-ui
 
-      - name: Install stable toolchain
+      - name: Install nightly toolchain and wasm32-unknown-unknown
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -59,7 +63,8 @@ jobs:
           toolchain: nightly-2022-10-21
           override: true
 
-      - uses: jetli/wasm-bindgen-action@v0.2.0
+      - name: Install wasm-bindgen-cli
+        uses: jetli/wasm-bindgen-action@v0.2.0
         with:
           version: 'latest'
 

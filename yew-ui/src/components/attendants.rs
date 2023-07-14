@@ -1,6 +1,7 @@
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::connection::{ConnectOptions, Connection};
 use crate::model::decode::PeerDecodeManager;
+use crate::model::media_devices::MediaDeviceAccess;
 use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_console::log;
@@ -13,8 +14,6 @@ use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
-
-use super::device_permissions::request_permissions;
 
 #[derive(Debug)]
 pub enum WsAction {
@@ -69,13 +68,55 @@ pub struct AttendantsComponentProps {
 pub struct AttendantsComponent {
     pub connection: Option<Connection>,
     pub peer_decode_manager: PeerDecodeManager,
+    pub media_device_access: MediaDeviceAccess,
     pub outbound_audio_buffer: [u8; 2000],
     pub share_screen: bool,
     pub webtransport_enabled: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub error: Option<String>,
-    pub media_access_granted: bool,
+}
+
+impl AttendantsComponent {
+    fn is_connected(&self) -> bool {
+        match &self.connection {
+            Some(connection) => connection.is_connected(),
+            None => false,
+        }
+    }
+
+    fn create_peer_decoder_manager(ctx: &Context<Self>) -> PeerDecodeManager {
+        let mut peer_decode_manager = PeerDecodeManager::new();
+        peer_decode_manager.on_peer_added = {
+            let link = ctx.link().clone();
+            Callback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
+        };
+        peer_decode_manager.on_first_frame = {
+            let link = ctx.link().clone();
+            Callback::from(move |(email, media_type)| {
+                link.send_message(Msg::OnFirstFrame((email, media_type)))
+            })
+        };
+        peer_decode_manager.get_video_canvas_id = Callback::from(|email| email);
+        peer_decode_manager.get_screen_canvas_id =
+            Callback::from(|email| format!("screen-share-{}", &email));
+        peer_decode_manager
+    }
+
+    fn create_media_device_access(ctx: &Context<Self>) -> MediaDeviceAccess {
+        let mut media_device_access = MediaDeviceAccess::new();
+        media_device_access.on_granted = {
+            let link = ctx.link().clone();
+            Callback::from(move |_| link.send_message(WsAction::MediaPermissionsGranted))
+        };
+        media_device_access.on_denied = {
+            let link = ctx.link().clone();
+            Callback::from(move |_| {
+                link.send_message(WsAction::MediaPermissionsError("Error requesting permissions. Please make sure to allow access to both camera and microphone.".to_string()))
+            })
+        };
+        media_device_access
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -83,29 +124,16 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let webtransport_enabled = ctx.props().webtransport_enabled;
-        let mut peer_decode_manager = PeerDecodeManager::new();
-        let link = ctx.link().clone();
-        peer_decode_manager.on_peer_added = Callback::from(move |email| {
-            link.send_message(Msg::OnPeerAdded(email));
-        });
-        let link = ctx.link().clone();
-        peer_decode_manager.on_first_frame = Callback::from(move |(email, media_type)| {
-            link.send_message(Msg::OnFirstFrame((email, media_type)));
-        });
-        peer_decode_manager.get_video_canvas_id = Callback::from(|email| email);
-        peer_decode_manager.get_screen_canvas_id =
-            Callback::from(|email| format!("screen-share-{}", &email));
         Self {
             connection: None,
-            peer_decode_manager,
+            peer_decode_manager: Self::create_peer_decoder_manager(ctx),
+            media_device_access: Self::create_media_device_access(ctx),
             outbound_audio_buffer: [0; 2000],
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
-            webtransport_enabled,
+            webtransport_enabled: ctx.props().webtransport_enabled,
             error: None,
-            media_access_granted: false,
         }
     }
 
@@ -165,23 +193,11 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::RequestMediaPermissions => {
-                    let future = request_permissions();
-                    let link = ctx.link().clone();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        match future.await {
-                            Ok(_) => {
-                                link.send_message(WsAction::MediaPermissionsGranted);
-                            }
-                            Err(_) => {
-                                link.send_message(WsAction::MediaPermissionsError("Error requesting permissions. Please make sure to allow access to both camera and microphone.".to_string()));
-                            }
-                        }
-                    });
+                    self.media_device_access.request();
                     false
                 }
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
-                    self.media_access_granted = true;
                     ctx.link()
                         .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
@@ -228,7 +244,7 @@ impl Component for AttendantsComponent {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let email = ctx.props().email.clone();
         let on_packet = ctx.link().callback(Msg::OnOutboundPacket);
-        let media_access_granted = self.media_access_granted;
+        let media_access_granted = self.media_device_access.is_granted();
         let rows: Vec<VNode> = self
             .peer_decode_manager
             .sorted_keys()
@@ -298,15 +314,6 @@ impl Component for AttendantsComponent {
                     }}
                 </nav>
             </div>
-        }
-    }
-}
-
-impl AttendantsComponent {
-    fn is_connected(&self) -> bool {
-        match &self.connection {
-            Some(connection) => connection.is_connected(),
-            None => false,
         }
     }
 }

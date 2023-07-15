@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use std::cell::Cell;
 use gloo_utils::window;
+use std::cell::Cell;
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::MediaStreamConstraints;

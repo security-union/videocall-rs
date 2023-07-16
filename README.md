@@ -14,13 +14,9 @@ https://youtu.be/LWwOSZJwEJI
 The initial POC from 2022
 https://www.youtube.com/watch?v=kZ9isFw1TQ8
 
-# Rust Zoom Research Project
-
-![rust](https://user-images.githubusercontent.com/1176339/197537597-2e9147dc-5892-47c9-9a7d-d5b0102800db.png)
+# video-call.rs
 
 MVP of a teleconferencing system written in rust, both the backend and the UI.
-
-Security Union LLC is not associated with Zoom Video Communications, we are big fans of their products!!
 
 # How to test?
 
@@ -89,11 +85,3 @@ The Actix websocket implementation contains fragments from https://github.com/Ja
 ## Show your support
 
 Give a ⭐️ if this project helped you!
-
-# Legal Notice
-
-ZOOM is a trademark of Zoom Video Communications, Inc.
-
-Security Union LLC is not associated with Zoom Video Communications, but we are big fans of their product!!
-
-This project was created to learn about video + audio streaming using only RUST (with some html + css).

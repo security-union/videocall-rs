@@ -6,8 +6,8 @@ pub fn top_bar() -> Html {
     html! {
         <div class="top-bar">
             <div class="flex space-x-2 align-middle">
-                <a href="https://github.com/security-union/zoom-rs" class="m-auto" target="_blank">
-                    <img src="https://img.shields.io/github/stars/security-union/zoom-rs?style=social" class="w-16" alt="GitHub stars" />
+                <a href="https://github.com/security-union/videocall-rs-rs" class="m-auto" target="_blank">
+                    <img src="https://img.shields.io/github/stars/security-union/videocall-rs-rs?style=social" class="w-16" alt="GitHub stars" />
                 </a>
                 <a href="https://www.youtube.com/@SecurityUnion" class="m-auto" target="_blank">
                     <div class="w-8">

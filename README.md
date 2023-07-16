@@ -14,7 +14,7 @@ https://youtu.be/LWwOSZJwEJI
 The initial POC from 2022
 https://www.youtube.com/watch?v=kZ9isFw1TQ8
 
-# Video Call rs
+# video-call.rs
 
 MVP of a teleconferencing system written in rust, both the backend and the UI.
 

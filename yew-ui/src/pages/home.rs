@@ -27,7 +27,7 @@ pub fn home() -> Html {
     html! {
         <div class="flex justify-center items-center content-center flex-col m-auto">
             <div class="flex items-center flex-col">
-                <h1 class="text-xl">{ "Welcome on videocall-rs-rs !" }</h1>
+                <h1 class="text-xl">{ "Welcome on videocall-rs !" }</h1>
                 <p class="text-xs">{ "This is a web app to manage your videocall-rs meetings." }</p>
             </div>
             <form {onsubmit}>

@@ -14,11 +14,16 @@ env:
   OAUTH_REDIRECT_URL: http://localhost:8080/login/callback
   RUST_LOG: info
   DATABASE_URL: postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+  ACTIX_UI_BACKEND_URL: yeet
+  LOGIN_URL: yeet
+  WEBTRANSPORT_HOST: yeet
+  ENABLE_OAUTH: false
+  WEBTRANSPORT_ENABLED: true
 
 jobs:
 
-  test:
-    name: Test Suite
+  test-api:
+    name: API Test Suite
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
@@ -39,3 +44,31 @@ jobs:
         with:
           command: test
           args: --manifest-path ./actix-api/Cargo.toml
+
+
+  test-ui:
+    name: UI Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+        with:
+          working-directory: ./yew-ui
+
+      - name: Install nightly toolchain and wasm32-unknown-unknown
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          target: wasm32-unknown-unknown
+          toolchain: nightly-2022-10-21
+          override: true
+
+      - name: Install wasm-bindgen-cli
+        uses: jetli/wasm-bindgen-action@v0.2.0
+        with:
+          version: 'latest'
+
+      - name: Run cargo test
+        run: |
+          cd yew-ui
+          cargo test

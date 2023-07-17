@@ -1,8 +1,8 @@
 [package]
 name = "tauri-app"
 version = "0.1.0"
-description = "Zoom tauri app"
-authors = ["@zoom-rs contributors"]
+description = "videocall-rs tauri app"
+authors = ["@videocall-rs-rs contributors"]
 license = ""
 repository = ""
 edition = "2021"

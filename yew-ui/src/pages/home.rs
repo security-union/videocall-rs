@@ -27,8 +27,8 @@ pub fn home() -> Html {
     html! {
         <div class="flex justify-center items-center content-center flex-col m-auto">
             <div class="flex items-center flex-col">
-                <h1 class="text-xl">{ "Welcome on zoom-rs !" }</h1>
-                <p class="text-xs">{ "This is a web app to manage your zoom meetings." }</p>
+                <h1 class="text-xl">{ "videocall-rs" }</h1>
+                <p class="text-xs">{ "Create your videocall by creating a user and meeting id." }</p>
             </div>
             <form {onsubmit}>
                 <div class="py-4">

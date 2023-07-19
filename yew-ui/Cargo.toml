@@ -29,6 +29,10 @@ yew-webtransport = "0.3.2"
 aes = "0.8.3"
 cbc = { version = "0.1.2", features = ["alloc"] }
 getrandom = { version = "0.2.10", features = ["js"] }
+rsa = "0.9.2"
+num-bigint = "0.4.3"
+rand = { version = "0.8.5", features = ["std_rng", "small_rng"] }
+num-prime = "0.4.3"
 
 [dependencies.web-sys]
 version = "0.3.60"

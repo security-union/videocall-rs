@@ -1,5 +1,6 @@
 #![feature(future_join)]
 
+mod crypto;
 mod components;
 mod constants;
 mod model;
@@ -72,13 +73,29 @@ fn login() -> Html {
     </>}
 }
 
-#[function_component(App)]
-fn app_component() -> Html {
-    log!("OAuth enabled: {}", *ENABLE_OAUTH);
-    html! {
-        <BrowserRouter>
-            <Switch<Route> render={switch} />
-        </BrowserRouter>
+struct App {}
+
+impl Component for App {
+    type Message = ();
+    type Properties = ();
+
+    fn create(_: &Context<Self>) -> Self {
+        App {}
+    }
+
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render {
+            ctx.link().send_message(());
+        }
+    }
+
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        log!("OAuth enabled: {}", *ENABLE_OAUTH);
+        html! {
+            <BrowserRouter>
+                <Switch<Route> render={switch} />
+            </BrowserRouter>
+        }
     }
 }
 

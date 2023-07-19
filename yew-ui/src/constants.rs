@@ -25,6 +25,8 @@ pub const VIDEO_WIDTH: i32 = 1280i32;
 pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
 pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lobby");
 
+pub const RSA_BITS: usize = 2048;
+
 pub fn truthy(s: String) -> bool {
     ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())
 }

@@ -1,10 +1,11 @@
-use crate::messages;
-use crate::messages::server::MediaPacketUpdate;
+use std::sync::Arc;
+use crate::messages::server::{MediaPacketUpdate, ClientMessage};
+use crate::messages::session::Message;
 use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
 
 use crate::{
     constants::HEARTBEAT_INTERVAL,
-    messages::server::{ClientMessage, Connect, Disconnect, JoinRoom},
+    messages::server::{Connect, Disconnect, JoinRoom},
 };
 use actix::ActorFutureExt;
 use actix::{
@@ -13,9 +14,7 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use protobuf::Message;
 use tracing::{error, info, trace};
-use types::protos::media_packet::MediaPacket;
 use uuid::Uuid;
 
 pub type RoomId = String;
@@ -95,14 +94,34 @@ impl Actor for WsChatSession {
     }
 }
 
-impl Handler<messages::session::Message> for WsChatSession {
+impl Handler<Message> for WsChatSession {
     type Result = ();
 
-    fn handle(&mut self, msg: messages::session::Message, ctx: &mut Self::Context) -> Self::Result {
-        let media_packet = msg.msg.write_to_bytes().unwrap();
-        ctx.binary(media_packet);
+    fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
+        ctx.binary(msg.msg);
     }
 }
+
+impl Handler<MediaPacketUpdate> for WsChatSession {
+    type Result = ();
+
+    fn handle(&mut self, msg: MediaPacketUpdate, _ctx: &mut Self::Context) -> Self::Result {
+        let room_id = self.room.clone();
+        trace!(
+            "got message and sending to chat session {} email {} room {}",
+            self.id.clone(),
+            self.email.clone(),
+            room_id
+        );
+        self.addr.do_send(ClientMessage {
+            session: self.id.clone(),
+            user: self.email.clone(),
+            room: room_id,
+            msg,
+        });
+    }
+}
+
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
     fn handle(&mut self, item: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
@@ -118,18 +137,9 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 
         match msg {
             ws::Message::Binary(msg) => {
-                let message: protobuf::Result<MediaPacket> =
-                    protobuf::Message::parse_from_bytes(&msg);
-                match message {
-                    Ok(media_packet) => {
-                        ctx.notify(MediaPacketUpdate {
-                            media_packet: media_packet.into(),
-                        });
-                    }
-                    Err(err) => {
-                        error!("error {:?}", err);
-                    }
-                }
+                ctx.notify(MediaPacketUpdate {
+                    media_packet: Arc::new(msg.to_vec()),
+                });
             }
             ws::Message::Ping(msg) => {
                 self.heartbeat = Instant::now();
@@ -181,22 +191,3 @@ impl WsChatSession {
     }
 }
 
-impl Handler<MediaPacketUpdate> for WsChatSession {
-    type Result = ();
-
-    fn handle(&mut self, msg: MediaPacketUpdate, _ctx: &mut Self::Context) -> Self::Result {
-        let room_id = self.room.clone();
-        trace!(
-            "got message and sending to chat session {} email {} room {}",
-            self.id.clone(),
-            self.email.clone(),
-            room_id
-        );
-        self.addr.do_send(ClientMessage {
-            session: self.id.clone(),
-            user: self.email.clone(),
-            room: room_id,
-            msg,
-        });
-    }
-}

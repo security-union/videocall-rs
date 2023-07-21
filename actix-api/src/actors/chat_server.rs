@@ -98,6 +98,7 @@ impl Handler<ClientMessage> for ChatServer {
     }
 }
 
+
 impl Handler<JoinRoom> for ChatServer {
     type Result = MessageResult<JoinRoom>;
     fn handle(
@@ -171,7 +172,9 @@ fn build_handler(
             return Ok(());
         }
 
-        let message = Message { msg: msg.data };
+        let message = Message {
+            msg: msg.data,
+        };
 
         session_recipient.try_send(message).map_err(|e| {
             error!("error sending message to session {}: {}", session, e);

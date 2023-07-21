@@ -58,7 +58,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
                 options.on_connection_lost.emit(())
             }
         });
-        log!("Connecting to ", &options.webtransport_url);
+        log!("WebTransport connecting to ", &options.webtransport_url);
         let task = WebTransportService::connect(
             &options.webtransport_url,
             on_datagram,
@@ -66,6 +66,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             on_bidirectional_stream,
             notification,
         )?;
+        log!("WebTransport connection success");
         Ok(task)
     }
 

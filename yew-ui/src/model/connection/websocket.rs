@@ -12,12 +12,13 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
             WebSocketStatus::Opened => options.on_connected.emit(()),
             WebSocketStatus::Closed | WebSocketStatus::Error => options.on_connection_lost.emit(()),
         });
-        log!("Connecting to ", &options.websocket_url);
+        log!("WebSocket connecting to ", &options.websocket_url);
         let task = WebSocketService::connect(
             &options.websocket_url,
             options.on_inbound_media,
             notification,
         )?;
+        log!("WebSocket connection success");
         Ok(task)
     }
 

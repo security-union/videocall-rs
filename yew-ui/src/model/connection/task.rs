@@ -18,11 +18,13 @@ pub(super) enum Task {
 impl Task {
     pub fn connect(webtransport: bool, options: ConnectOptions) -> anyhow::Result<Self> {
         if webtransport {
+            log!("Task::connect trying WebTransport");
             match WebTransportTask::connect(options.clone()) {
                 Ok(task) => return Ok(Task::WebTransport(task)),
                 Err(_e) => log!("WebTransport connect failed, falling back to WebSocket"),
             }
         }
+        log!("Task::connect trying WebSocket");
         WebSocketTask::connect(options.clone()).map(|task| Task::WebSocket(task))
     }
 

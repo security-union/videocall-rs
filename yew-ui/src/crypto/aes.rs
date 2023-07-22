@@ -32,6 +32,7 @@ impl Aes128State {
     }
 }
 
+#[cfg(test)]
 mod test {
     use wasm_bindgen_test::*;
     use super::*;

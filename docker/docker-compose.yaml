@@ -58,8 +58,8 @@ services:
     environment:
       - RUST_LOG=info
       - NATS_URL=nats:4222
-      - LISTEN_URL=0.0.0.0:4434
       - LISTEN_URL=0.0.0.0:4433
+      - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
       - KEY_PATH=certs/localhost.key
     ports:

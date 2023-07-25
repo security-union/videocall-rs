@@ -1,5 +1,4 @@
 use crate::constants::WEBTRANSPORT_HOST;
-use crate::crypto::aes::Aes128State;
 use crate::model::decode::PeerDecodeManager;
 use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
@@ -107,8 +106,6 @@ pub struct AttendantsComponent {
     pub heartbeat: Option<Interval>,
     pub error: Option<String>,
     pub media_access_granted: bool,
-    aes: Aes128State,
-
 }
 
 pub fn connect_websocket(
@@ -185,11 +182,6 @@ impl Component for AttendantsComponent {
             heartbeat: None,
             error: None,
             media_access_granted: false,
-            aes: Aes128State {
-                // Hardcoded key and iv for now until we have a way to share them securely
-                key: [68, 43, 23, 12, 34, 56, 78, 90, 12, 34, 56, 78, 90, 12, 34, 56],
-                iv: [200, 43, 23, 12, 34, 56, 78, 90, 12, 34, 56, 78, 90, 12, 34, 56],
-            },
         }
     }
 
@@ -299,10 +291,7 @@ impl Component for AttendantsComponent {
                 _ => false,
             },
             Msg::OnInboundMedia(response) => {
-                // TODO: Don't unwrap
-                let bytes = self.aes.decrypt(&response.0).unwrap();
-                let media_packet = MediaPacket::parse_from_bytes(&bytes).unwrap();
-                if let Err(e) = self.peer_decode_manager.decode(media_packet) {
+                if let Err(e) = self.peer_decode_manager.decode(response) {
                     log!("error decoding packet: {:?}", e);
                 }
                 return false;
@@ -317,8 +306,7 @@ impl Component for AttendantsComponent {
                                     .map_err(|w| JsValue::from(format!("{:?}", w)))
                                 {
                                     Ok(bytes) => {
-                                        // TODO: Don't unwrap
-                                        ws.send_binary(self.aes.encrypt(&bytes).unwrap());
+                                        ws.send_binary(bytes);
                                     }
                                     Err(e) => {
                                         let packet_type = media.media_type.enum_value_or_default();
@@ -366,13 +354,28 @@ impl Component for AttendantsComponent {
                 false
             }
             Msg::OnDatagram(bytes) => {
-                ctx.link()
-                    .send_message(Msg::OnInboundMedia(MediaPacketWrapper(bytes)));
+                let media_packet = MediaPacket::parse_from_bytes(&bytes);
+                match media_packet {
+                    Ok(media_packet) => {
+                        ctx.link()
+                            .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
+                    }
+                    Err(e) => {
+                        let e = JsValue::from(format!("{:?}", e));
+                        log!("error parsing datagram: {:?}", e);
+                    }
+                }
                 false
             }
             Msg::OnMessage(response, message_type) => {
-                ctx.link()
-                    .send_message(Msg::OnInboundMedia(MediaPacketWrapper(response)));
+                let res = MediaPacket::parse_from_bytes(&response);
+                if let Ok(media_packet) = res {
+                    ctx.link()
+                        .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
+                } else {
+                    let message_type = format!("{:?}", message_type);
+                    log!("failed to parse media packet ", message_type);
+                }
                 false
             }
             Msg::OnUniStream(stream) => {

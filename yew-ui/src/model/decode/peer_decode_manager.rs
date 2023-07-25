@@ -1,3 +1,4 @@
+use crate::model::MediaPacketWrapper;
 use std::collections::HashMap;
 use std::sync::Arc;
 use types::protos::media_packet::media_packet::MediaType;
@@ -68,8 +69,8 @@ impl PeerDecodeManager {
         self.connected_peers.get(key)
     }
 
-    pub fn decode(&mut self, response: MediaPacket) -> Result<(), i32> {
-        let packet = Arc::new(response);
+    pub fn decode(&mut self, response: MediaPacketWrapper) -> Result<(), i32> {
+        let packet = Arc::new(response.0);
         let email = packet.email.clone();
         if !self.connected_peers.contains_key(&email) {
             self.add_peer(&email);

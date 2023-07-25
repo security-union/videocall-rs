@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use rand::RngCore;
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
@@ -10,17 +11,16 @@ pub struct Aes128State {
     iv: [u8; 16],
 }
 
-impl Default for Aes128State {
-    fn default() -> Self {
+impl Aes128State {
+    pub fn new() -> Self {
+        let mut rng = rand::thread_rng();
         let mut key = [0u8; 16];
-        getrandom::getrandom(&mut key).unwrap();
         let mut iv = [0u8; 16];
-        getrandom::getrandom(&mut iv).unwrap();
+        rng.fill_bytes(&mut key);
+        rng.fill_bytes(&mut iv);
         Aes128State { key, iv }
     }
-}
 
-impl Aes128State {
     pub fn encrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         let cipher = Aes128CbcEnc::new_from_slices(&self.key, &self.iv)
             .map_err(|e| anyhow!("{}", e.to_string()))?;
@@ -43,9 +43,21 @@ mod test {
 
     #[wasm_bindgen_test]
     fn test_aes() {
-        let aes = Aes128State::default();
+        let aes = Aes128State::new();
         let data = aes.encrypt(b"hello world").unwrap();
         let data2 = aes.decrypt(&data).unwrap();
         assert_eq!(data2, b"hello world");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_aes_large_payload() {
+        let aes = Aes128State::new();
+        let mut data = Vec::new();
+        for _ in 0..1000 {
+            data.extend_from_slice(b"hello world");
+        }
+        let enc_data = aes.encrypt(&data).unwrap();
+        let data2 = aes.decrypt(&enc_data).unwrap();
+        assert_eq!(data2, data);
     }
 }

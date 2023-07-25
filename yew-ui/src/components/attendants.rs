@@ -3,9 +3,10 @@ use std::rc::Rc;
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::connection::{ConnectOptions, Connection};
 use crate::crypto::aes::Aes128State;
+use crate::crypto::rsa::RsaWrapper;
 use crate::model::decode::PeerDecodeManager;
 use crate::model::media_devices::MediaDeviceAccess;
-use crate::model::MediaPacketWrapper;
+use crate::model::EncryptedMediaPacket;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_console::log;
 use types::protos::media_packet::media_packet::MediaType;
@@ -40,7 +41,7 @@ pub enum MeetingAction {
 pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
-    OnInboundMedia(MediaPacketWrapper),
+    OnInboundMedia(EncryptedMediaPacket),
     OnOutboundPacket(MediaPacket),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
@@ -80,6 +81,7 @@ pub struct AttendantsComponent {
     pub video_enabled: bool,
     pub error: Option<String>,
     aes: Aes128State,
+    rsa: RsaWrapper,
 }
 
 impl AttendantsComponent {
@@ -139,11 +141,9 @@ impl Component for AttendantsComponent {
             video_enabled: false,
             webtransport_enabled: ctx.props().webtransport_enabled,
             error: None,
-            aes: Aes128State {
-                // Hardcoded key and iv for now until we have a way to share them securely
-                key: [68, 43, 23, 12, 34, 56, 78, 90, 12, 34, 56, 78, 90, 12, 34, 56],
-                iv: [200, 43, 23, 12, 34, 56, 78, 90, 12, 34, 56, 78, 90, 12, 34, 56],
-            },
+            aes: Aes128State::new(),
+            // TODO: Don't unwrap
+            rsa: RsaWrapper::new().unwrap(),
         }
     }
 

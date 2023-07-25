@@ -4,7 +4,6 @@ use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 pub struct RsaWrapper {
     pub_key: RsaPublicKey,
     key: RsaPrivateKey,
-    rng: rand::rngs::ThreadRng,
 }
 
 impl RsaWrapper {
@@ -12,7 +11,7 @@ impl RsaWrapper {
         let mut rng = rand::thread_rng();
         let key = RsaPrivateKey::new(&mut rng, RSA_BITS)?;
         let pub_key = key.to_public_key();
-        Ok(Self { key, pub_key, rng })
+        Ok(Self { key, pub_key })
     }
 
     pub fn encrypt(&mut self, data: &[u8]) -> anyhow::Result<Vec<u8>> {

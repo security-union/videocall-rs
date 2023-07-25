@@ -1,0 +1,6 @@
+syntax = "proto3";
+
+message AesPacket {
+  bytes key = 1;
+  bytes iv = 2;
+}

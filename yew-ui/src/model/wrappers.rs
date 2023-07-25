@@ -2,17 +2,17 @@ use std::fmt;
 use web_sys::*;
 use yew_websocket::websocket::{Binary, Text};
 
-pub struct MediaPacketWrapper(pub Vec<u8>);
+pub struct EncryptedMediaPacket(pub Vec<u8>);
 
-impl From<Text> for MediaPacketWrapper {
+impl From<Text> for EncryptedMediaPacket {
     fn from(t: Text) -> Self {
-        MediaPacketWrapper(t.unwrap().into_bytes())
+        EncryptedMediaPacket(t.unwrap().into_bytes())
     }
 }
 
-impl From<Binary> for MediaPacketWrapper {
+impl From<Binary> for EncryptedMediaPacket {
     fn from(bin: Binary) -> Self {
-        MediaPacketWrapper(bin.unwrap())
+        EncryptedMediaPacket(bin.unwrap())
     }
 }
 

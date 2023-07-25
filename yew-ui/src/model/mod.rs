@@ -6,5 +6,5 @@ pub mod wrappers;
 
 pub use wrappers::{
     AudioSampleFormatWrapper, EncodedAudioChunkTypeWrapper, EncodedVideoChunkTypeWrapper,
-    MediaPacketWrapper,
+    EncryptedMediaPacket,
 };

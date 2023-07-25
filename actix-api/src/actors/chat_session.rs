@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use crate::messages::server::{MediaPacketUpdate, ClientMessage};
+use crate::messages::server::{ClientMessage, MediaPacketUpdate};
 use crate::messages::session::Message;
 use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
+use std::sync::Arc;
 
 use crate::{
     constants::HEARTBEAT_INTERVAL,
@@ -122,7 +122,6 @@ impl Handler<MediaPacketUpdate> for WsChatSession {
     }
 }
 
-
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
     fn handle(&mut self, item: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
         let msg = match item {
@@ -190,4 +189,3 @@ impl WsChatSession {
             .wait(ctx);
     }
 }
-

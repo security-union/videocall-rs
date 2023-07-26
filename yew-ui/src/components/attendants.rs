@@ -141,7 +141,7 @@ impl Component for AttendantsComponent {
                         }
                         Err(e) => {
                             ctx.link().send_message(WsAction::Log(format!(
-                                "WebSocket connect failed: {}",
+                                "Connection failed: {}",
                                 e
                             )));
                         }

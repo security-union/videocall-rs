@@ -248,13 +248,19 @@ impl Component for AttendantsComponent {
                     <>
                         <div class={screen_share_css}>
                             // Canvas for Screen share.
-                            <canvas id={format!("screen-share-{}", &key)}></canvas>
-                            <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                            <div class="canvas-container">
+                                <canvas id={format!("screen-share-{}", &key)}></canvas>
+                                <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                                <div class="pin-icon">{"📌"}</div>
+                            </div>
                         </div>
                         <div class="grid-item">
                             // One canvas for the User Video
-                            <UserVideo id={key.clone()}></UserVideo>
-                            <h4 class="floating-name">{key.clone()}</h4>
+                            <div class="canvas-container">
+                                <UserVideo id={key.clone()}></UserVideo>
+                                <h4 class="floating-name">{key.clone()}</h4>
+                                <div class="pin-icon">{"📌"}</div>
+                            </div>
                         </div>
                     </>
                 }

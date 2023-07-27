@@ -13,8 +13,6 @@ export $(cut -d= -f1 config.toml)
 
 #-
 # Return to original script
-export TRUNK_SERVE_PORT=8081
-export ACTIX_PORT=8086
 
 children=()
 

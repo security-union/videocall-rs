@@ -1,6 +1,10 @@
-LOGIN_URL = "https://example.com/login"
-ACTIX_UI_BACKEND_URL = "https://example.com/"
-WEBTRANSPORT_HOST = "https://example.com/"
-NATS_URL = "https://example.com/"
+LOGIN_URL = "https://127.0.0.59/login"
+ACTIX_UI_BACKEND_URL = "https://127.0.0.59"
+WEBTRANSPORT_HOST = "https://127.0.0.59"
+NATS_URL = "127.0.0.59"
+
 ENABLE_OAUTH = true
-WEBTRANSPORT_ENABLED = true
+WEBTRANSPORT_ENABLED = false
+
+TRUNK_SERVE_PORT=8088
+ACTIX_PORT=8086

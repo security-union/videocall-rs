@@ -4411,7 +4411,6 @@ dependencies = [
  "nats",
  "oauth2",
  "octets",
- "protobuf",
  "quinn",
  "r2d2",
  "r2d2_postgres",
@@ -4428,7 +4427,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-tree",
- "types",
  "uuid 0.8.2",
 ]
 
@@ -5689,7 +5687,6 @@ dependencies = [
  "protobuf",
  "serde",
  "serde_json",
- "yew-websocket",
 ]
 
 [[package]]

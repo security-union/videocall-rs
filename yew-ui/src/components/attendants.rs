@@ -140,10 +140,8 @@ impl Component for AttendantsComponent {
                             self.connection = Some(connection);
                         }
                         Err(e) => {
-                            ctx.link().send_message(WsAction::Log(format!(
-                                "Connection failed: {}",
-                                e
-                            )));
+                            ctx.link()
+                                .send_message(WsAction::Log(format!("Connection failed: {}", e)));
                         }
                     }
 

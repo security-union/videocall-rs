@@ -95,9 +95,8 @@ impl Component for Host {
             Msg::EnableScreenShare => {
                 let on_frame = ctx.props().on_packet.clone();
                 let email = ctx.props().email.clone();
-                self.screen.start(email, move |packet: PacketWrapper| {
-                    on_frame.emit(packet)
-                });
+                self.screen
+                    .start(email, move |packet: PacketWrapper| on_frame.emit(packet));
                 true
             }
             Msg::Start => true,
@@ -108,9 +107,7 @@ impl Component for Host {
                 let on_audio = ctx.props().on_packet.clone();
                 let email = ctx.props().email.clone();
                 self.microphone
-                    .start(email, move |packet: PacketWrapper| {
-                        on_audio.emit(packet)
-                    });
+                    .start(email, move |packet: PacketWrapper| on_audio.emit(packet));
                 true
             }
             Msg::EnableVideo(should_enable) => {

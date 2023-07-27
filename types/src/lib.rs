@@ -18,7 +18,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             protos::packet_wrapper::packet_wrapper::PacketType::AES_KEY => write!(f, "AES_KEY"),
-            protos::packet_wrapper::packet_wrapper::PacketType::RSA_PUB_KEY => write!(f, "RSA_PUB_KEY"),
+            protos::packet_wrapper::packet_wrapper::PacketType::RSA_PUB_KEY => {
+                write!(f, "RSA_PUB_KEY")
+            }
             protos::packet_wrapper::packet_wrapper::PacketType::MEDIA => write!(f, "MEDIA"),
         }
     }

@@ -1,6 +1,9 @@
 use super::super::wrappers::{EncodedAudioChunkTypeWrapper, EncodedVideoChunkTypeWrapper};
 use protobuf::Message;
-use types::protos::{media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata}, packet_wrapper::{PacketWrapper, packet_wrapper::PacketType}};
+use types::protos::{
+    media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
+    packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
+};
 use web_sys::{EncodedAudioChunk, EncodedVideoChunk};
 
 pub fn transform_video_chunk(

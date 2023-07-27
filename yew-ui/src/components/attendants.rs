@@ -1,9 +1,9 @@
 use std::rc::Rc;
 
 use crate::constants::WEBTRANSPORT_HOST;
-use crate::model::connection::{ConnectOptions, Connection};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
+use crate::model::connection::{ConnectOptions, Connection};
 use crate::model::decode::PeerDecodeManager;
 use crate::model::media_devices::MediaDeviceAccess;
 use crate::model::EncryptedMediaPacket;

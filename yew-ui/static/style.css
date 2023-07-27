@@ -46,7 +46,7 @@ canvas {
   position: relative;
 }
 
-.grid-item-selected {
+.grid-item-pinned {
   position: absolute;
   top: 0;
   left: 0;
@@ -125,13 +125,21 @@ select {
 }
 
 .pin-icon {
+  visibility: hidden;
   position: absolute;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
   font-size: 2em;
-  color: red;
   opacity: 0.6;
-  z-index: 2;
-  width: 50px;
+  background-color: black;
+  border-radius: 50%;
+  padding: 10px;
+  text-align: center;
+  line-height: 1; /* Adjust as needed */
+}
+
+
+.grid-item:hover .pin-icon {
+  visibility: visible;
 }

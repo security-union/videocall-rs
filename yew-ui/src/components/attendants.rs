@@ -364,10 +364,8 @@ fn user_video(props: &UserVideoProps) -> Html {
 
 fn toggle_pinned_div(div_id: &str) {
     if let Some(div) = window()
-        .map(|w| w.document())
-        .flatten()
-        .map(|doc| doc.get_element_by_id(&div_id))
-        .flatten()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.get_element_by_id(&div_id))
     {
         // if the div does not have the grid-item-pinned css class, add it to it
         if !div.class_list().contains("grid-item-pinned") {

@@ -1,0 +1,6 @@
+LOGIN_URL = "https://example.com/login"
+ACTIX_UI_BACKEND_URL = "https://example.com/"
+WEBTRANSPORT_HOST = "https://example.com/"
+NATS_URL = "https://example.com/"
+ENABLE_OAUTH = true
+WEBTRANSPORT_ENABLED = true

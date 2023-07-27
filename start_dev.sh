@@ -2,7 +2,17 @@
 
 # WARNING!! use this script while running without docker.
 
+#- 
+# Pull configuration info from /config.toml
+#
+# Read the values from the config.toml file
+source <(grep = config.toml | sed -E 's/ *= */=/g')
 
+# Set the values as environment variables
+export $(cut -d= -f1 config.toml)
+
+#-
+# Return to original script
 export TRUNK_SERVE_PORT=8081
 export ACTIX_PORT=8086
 
@@ -26,7 +36,7 @@ trap _term SIGTERM
 trap _int SIGINT
 
 pushd actix-api;
-cargo watch -x "run" &
+cargo watch -x "run --bin websocket_server" &
 ACTIX_PROC=$!
 children+=($ACTIX_PROC)
 popd;

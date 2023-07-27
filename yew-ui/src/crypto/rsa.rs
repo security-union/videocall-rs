@@ -1,6 +1,7 @@
 use crate::constants::RSA_BITS;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct RsaWrapper {
     pub_key: RsaPublicKey,
     key: RsaPrivateKey,

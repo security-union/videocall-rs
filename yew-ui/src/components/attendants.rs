@@ -9,8 +9,10 @@ use crate::model::media_devices::MediaDeviceAccess;
 use crate::model::EncryptedMediaPacket;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_console::log;
+use protobuf::Message;
 use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
+use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
@@ -41,8 +43,8 @@ pub enum MeetingAction {
 pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
-    OnInboundMedia(EncryptedMediaPacket),
-    OnOutboundPacket(MediaPacket),
+    OnInboundMedia(PacketWrapper),
+    OnOutboundPacket(PacketWrapper),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
 }
@@ -221,8 +223,9 @@ impl Component for AttendantsComponent {
                 _ => false,
             },
             Msg::OnInboundMedia(response) => {
+                // TODO: Need to use the correct key for the peer.
                 // TODO: Don't unwrap
-                let bytes = self.aes.decrypt(&response.0).unwrap();
+                let bytes = self.aes.decrypt(&response.data).unwrap();
                 let media_packet = MediaPacket::parse_from_bytes(&bytes).unwrap();
                 if let Err(e) = self.peer_decode_manager.decode(media_packet) {
                     log!("error decoding packet: {:?}", e);
@@ -328,7 +331,7 @@ impl Component for AttendantsComponent {
                     </div>
                     {
                         if media_access_granted {
-                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>}
+                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes} rsa={self.rsa.clone()} />}
                         } else {
                             html! {<></>}
                         }

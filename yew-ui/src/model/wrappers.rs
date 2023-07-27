@@ -1,20 +1,5 @@
 use std::fmt;
 use web_sys::*;
-use yew_websocket::websocket::{Binary, Text};
-
-pub struct EncryptedMediaPacket(pub Vec<u8>);
-
-impl From<Text> for EncryptedMediaPacket {
-    fn from(t: Text) -> Self {
-        EncryptedMediaPacket(t.unwrap().into_bytes())
-    }
-}
-
-impl From<Binary> for EncryptedMediaPacket {
-    fn from(bin: Binary) -> Self {
-        EncryptedMediaPacket(bin.unwrap())
-    }
-}
 
 pub struct EncodedVideoChunkTypeWrapper(pub EncodedVideoChunkType);
 

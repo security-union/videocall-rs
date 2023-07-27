@@ -4,14 +4,13 @@
 // on_inbound_media
 //
 use super::webmedia::{ConnectOptions, WebMedia};
-use crate::model::MediaPacketWrapper;
 use gloo_console::log;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use js_sys::Uint8Array;
 use protobuf::Message;
-use types::protos::media_packet::MediaPacket;
+use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::ReadableStreamDefaultReader;
@@ -77,7 +76,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
 
 fn handle_unidirectional_stream(
     stream: WebTransportReceiveStream,
-    on_inbound_media: Callback<MediaPacketWrapper>,
+    on_inbound_media: Callback<PacketWrapper>,
 ) {
     if stream.is_undefined() {
         log!("stream is undefined");
@@ -124,7 +123,7 @@ fn handle_unidirectional_stream(
 
 fn handle_bidirectional_stream(
     stream: WebTransportBidirectionalStream,
-    on_inbound_media: Callback<MediaPacketWrapper>,
+    on_inbound_media: Callback<PacketWrapper>,
 ) {
     log!("OnBidiStream: ", &stream);
     if stream.is_undefined() {
@@ -171,9 +170,9 @@ fn handle_bidirectional_stream(
     });
 }
 
-fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<MediaPacketWrapper>) {
-    match MediaPacket::parse_from_bytes(&bytes) {
-        Ok(media_packet) => callback.emit(MediaPacketWrapper(media_packet)),
+fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<PacketWrapper>) {
+    match PacketWrapper::parse_from_bytes(&bytes) {
+        Ok(media_packet) => callback.emit(media_packet),
         Err(_) => {
             let message_type = format!("{message_type:?}");
             log!("failed to parse media packet ", message_type);

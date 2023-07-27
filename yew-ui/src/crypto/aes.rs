@@ -6,6 +6,7 @@ use rand::RngCore;
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Aes128State {
     key: [u8; 16],
     iv: [u8; 16],

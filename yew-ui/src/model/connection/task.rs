@@ -4,7 +4,7 @@
 // Handles rollover of connection from WebTransport to WebSocket
 //
 use gloo_console::log;
-use types::protos::media_packet::MediaPacket;
+use types::protos::packet_wrapper::PacketWrapper;
 use yew_websocket::websocket::WebSocketTask;
 use yew_webtransport::webtransport::WebTransportTask;
 
@@ -28,7 +28,7 @@ impl Task {
         WebSocketTask::connect(options).map(Task::WebSocket)
     }
 
-    pub fn send_packet(&self, packet: MediaPacket) {
+    pub fn send_packet(&self, packet: PacketWrapper) {
         match self {
             Task::WebSocket(ws) => ws.send_packet(packet),
             Task::WebTransport(wt) => wt.send_packet(packet),

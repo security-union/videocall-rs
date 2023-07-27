@@ -5,10 +5,13 @@
 use super::task::Task;
 use super::ConnectOptions;
 use gloo::timers::callback::Interval;
+use protobuf::Message;
+use types::protos::media_packet::MediaPacket;
+use types::protos::packet_wrapper::PacketWrapper;
+use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use std::cell::Cell;
 use std::sync::Arc;
 use types::protos::media_packet::media_packet::MediaType;
-use types::protos::media_packet::MediaPacket;
 use yew::prelude::Callback;
 
 #[derive(Clone, Copy)]
@@ -69,6 +72,7 @@ impl Connection {
                 timestamp: js_sys::Date::now(),
                 ..Default::default()
             };
+            let packet = PacketWrapper { data: packet.write_to_bytes().unwrap(),  email: userid.clone(), packet_type: PacketType::MEDIA.into(), ..Default::default() };
             if let Status::Connected = status.get() {
                 task.send_packet(packet);
             }
@@ -81,7 +85,7 @@ impl Connection {
         }
     }
 
-    pub fn send_packet(&self, packet: MediaPacket) {
+    pub fn send_packet(&self, packet: PacketWrapper) {
         if let Status::Connected = self.status.get() {
             self.task.send_packet(packet);
         }

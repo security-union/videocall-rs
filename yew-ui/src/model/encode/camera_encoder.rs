@@ -4,6 +4,7 @@ use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
+use types::protos::packet_wrapper::PacketWrapper;
 use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -26,19 +27,21 @@ use web_sys::VideoTrack;
 
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
-use types::protos::media_packet::MediaPacket;
 
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
+use crate::crypto::aes::Aes128State;
 
 pub struct CameraEncoder {
+    aes: Aes128State,
     state: EncoderState,
 }
 
 impl CameraEncoder {
-    pub fn new() -> Self {
+    pub fn new(aes: Aes128State) -> Self {
         Self {
+            aes,
             state: EncoderState::new(),
         }
     }
@@ -57,7 +60,7 @@ impl CameraEncoder {
     pub fn start(
         &mut self,
         userid: String,
-        on_frame: impl Fn(MediaPacket) + 'static,
+        on_frame: impl Fn(PacketWrapper) + 'static,
         video_elem_id: &str,
     ) {
         // 1. Query the first device with a camera and a mic attached.
@@ -79,9 +82,9 @@ impl CameraEncoder {
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                let media_packet: MediaPacket =
+                let packet: PacketWrapper =
                     transform_video_chunk(chunk, sequence_number, &mut buffer, userid.clone());
-                on_frame(media_packet);
+                on_frame(packet);
                 sequence_number += 1;
             })
         };

@@ -1,11 +1,13 @@
 use gloo_console::log;
 use gloo_timers::callback::Timeout;
+use types::protos::packet_wrapper::PacketWrapper;
 
 use std::fmt::Debug;
-use types::protos::media_packet::MediaPacket;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
+use crate::crypto::aes::Aes128State;
+use crate::crypto::rsa::RsaWrapper;
 use crate::model::encode::CameraEncoder;
 use crate::model::encode::MicrophoneEncoder;
 use crate::model::encode::ScreenEncoder;
@@ -25,6 +27,8 @@ pub struct Host {
     pub camera: CameraEncoder,
     pub microphone: MicrophoneEncoder,
     pub screen: ScreenEncoder,
+    aes: Aes128State,
+    rsa: RsaWrapper,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -33,7 +37,7 @@ pub struct MeetingProps {
     pub id: String,
 
     #[prop_or_default]
-    pub on_packet: Callback<MediaPacket>,
+    pub on_packet: Callback<PacketWrapper>,
 
     #[prop_or_default]
     pub email: String,
@@ -43,17 +47,25 @@ pub struct MeetingProps {
     pub mic_enabled: bool,
 
     pub video_enabled: bool,
+
+    pub aes: Aes128State,
+
+    pub rsa: RsaWrapper,
 }
 
 impl Component for Host {
     type Message = Msg;
     type Properties = MeetingProps;
 
-    fn create(_ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self {
+        let aes = ctx.props().aes;
+        let rsa = ctx.props().rsa.clone();
         Self {
-            camera: CameraEncoder::new(),
+            camera: CameraEncoder::new(aes),
             microphone: MicrophoneEncoder::new(),
             screen: ScreenEncoder::new(),
+            aes,
+            rsa,
         }
     }
 
@@ -83,8 +95,8 @@ impl Component for Host {
             Msg::EnableScreenShare => {
                 let on_frame = ctx.props().on_packet.clone();
                 let email = ctx.props().email.clone();
-                self.screen.start(email, move |media_packet: MediaPacket| {
-                    on_frame.emit(media_packet)
+                self.screen.start(email, move |packet: PacketWrapper| {
+                    on_frame.emit(packet)
                 });
                 true
             }
@@ -96,8 +108,8 @@ impl Component for Host {
                 let on_audio = ctx.props().on_packet.clone();
                 let email = ctx.props().email.clone();
                 self.microphone
-                    .start(email, move |media_packet: MediaPacket| {
-                        on_audio.emit(media_packet)
+                    .start(email, move |packet: PacketWrapper| {
+                        on_audio.emit(packet)
                     });
                 true
             }
@@ -110,7 +122,7 @@ impl Component for Host {
                 let email = ctx.props().email.clone();
                 self.camera.start(
                     email,
-                    move |media_packet: MediaPacket| on_packet.emit(media_packet),
+                    move |packet: PacketWrapper| on_packet.emit(packet),
                     VIDEO_ELEMENT_ID,
                 );
                 true

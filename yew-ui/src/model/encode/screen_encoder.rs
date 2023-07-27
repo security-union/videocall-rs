@@ -3,6 +3,7 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::JsString;
 use js_sys::Reflect;
+use types::protos::packet_wrapper::PacketWrapper;
 use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -23,7 +24,6 @@ use web_sys::VideoTrack;
 
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
-use types::protos::media_packet::MediaPacket;
 
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
@@ -48,7 +48,7 @@ impl ScreenEncoder {
         self.state.stop()
     }
 
-    pub fn start(&mut self, userid: String, on_frame: impl Fn(MediaPacket) + 'static) {
+    pub fn start(&mut self, userid: String, on_frame: impl Fn(PacketWrapper) + 'static) {
         let EncoderState {
             enabled, destroy, ..
         } = self.state.clone();
@@ -61,9 +61,9 @@ impl ScreenEncoder {
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                let media_packet: MediaPacket =
+                let packet: PacketWrapper =
                     transform_screen_chunk(chunk, sequence_number, &mut buffer, userid.clone());
-                on_frame(media_packet);
+                on_frame(packet);
                 sequence_number += 1;
             })
         };

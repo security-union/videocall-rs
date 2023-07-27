@@ -4,6 +4,7 @@ use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
+use types::protos::packet_wrapper::PacketWrapper;
 use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -23,7 +24,6 @@ use web_sys::ReadableStreamDefaultReader;
 
 use super::encoder_state::EncoderState;
 use super::transform::transform_audio_chunk;
-use types::protos::media_packet::MediaPacket;
 
 use crate::constants::AUDIO_BITRATE;
 use crate::constants::AUDIO_CHANNELS;
@@ -52,7 +52,7 @@ impl MicrophoneEncoder {
         self.state.stop()
     }
 
-    pub fn start(&mut self, userid: String, on_audio: impl Fn(MediaPacket) + 'static) {
+    pub fn start(&mut self, userid: String, on_audio: impl Fn(PacketWrapper) + 'static) {
         let device_id = if let Some(mic) = &self.state.selected {
             mic.to_string()
         } else {
@@ -66,9 +66,9 @@ impl MicrophoneEncoder {
             let mut sequence = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
-                let media_packet: MediaPacket =
+                let packet: PacketWrapper =
                     transform_audio_chunk(&chunk, &mut buffer, &email, sequence);
-                on_audio(media_packet);
+                on_audio(packet);
                 sequence += 1;
             })
         };

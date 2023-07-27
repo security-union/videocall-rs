@@ -1628,26 +1628,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "protobuf"
-version = "3.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b55bad9126f378a853655831eb7363b7b01b81d19f8cb1218861086ca4a1a61e"
-dependencies = [
- "once_cell",
- "protobuf-support",
- "thiserror",
-]
-
-[[package]]
-name = "protobuf-support"
-version = "3.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5d4d7b8601c814cfb36bcebb79f0e61e45e1e93640cf778837833bbed05c372"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "quinn"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2067,7 +2047,6 @@ dependencies = [
  "nats",
  "oauth2",
  "octets",
- "protobuf",
  "quinn",
  "r2d2",
  "r2d2_postgres",
@@ -2084,7 +2063,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-tree",
- "types",
  "uuid",
 ]
 
@@ -2649,15 +2627,6 @@ name = "typenum"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dcf81ac59edc17cc8697ff311e8f5ef2d99fcbd9817b34cec66f90b6c3dfd987"
-
-[[package]]
-name = "types"
-version = "0.1.0"
-dependencies = [
- "protobuf",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "unicode-bidi"

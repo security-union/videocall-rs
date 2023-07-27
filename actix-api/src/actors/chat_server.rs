@@ -4,10 +4,8 @@ use crate::messages::{
 };
 
 use actix::{Actor, Context, Handler, MessageResult, Recipient};
-use protobuf::Message as ProtobufMessage;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 use tracing::{debug, error, info, trace};
-use types::protos::media_packet::MediaPacket;
 
 use super::chat_session::{RoomId, SessionId};
 
@@ -30,13 +28,11 @@ impl ChatServer {
         }
     }
 
-    pub fn send_message(&self, room: &RoomId, message: Arc<MediaPacket>, session_id: SessionId) {
+    pub fn send_message(&self, room: &RoomId, message: &Vec<u8>, session_id: SessionId) {
         let subject = format!("room.{}.{}", room, session_id);
-        if let Ok(message) = message.write_to_bytes() {
-            match self.nats_connection.publish(&subject, message) {
-                Ok(_) => trace!("published message to {}", subject),
-                Err(e) => error!("error publishing message to {}: {}", subject, e),
-            }
+        match self.nats_connection.publish(&subject, message) {
+            Ok(_) => trace!("published message to {}", subject),
+            Err(e) => error!("error publishing message to {}: {}", subject, e),
         }
     }
 
@@ -92,7 +88,7 @@ impl Handler<ClientMessage> for ChatServer {
             user: _,
         } = msg;
         trace!("got message in server room {} session {}", room, session);
-        self.send_message(&room, msg.media_packet, session);
+        self.send_message(&room, &msg.media_packet, session);
     }
 }
 
@@ -162,25 +158,14 @@ fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String
 fn build_handler(
     session_recipient: Recipient<Message>, // Assuming Recipient is a type
     room: String,
-    session: String,
+    session: SessionId,
 ) -> impl Fn(nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
         if msg.subject == format!("room.{}.{}", room, session) {
             return Ok(());
         }
 
-        let media_packet = match MediaPacket::parse_from_bytes(&msg.data) {
-            Ok(media_packet) => media_packet,
-            Err(e) => {
-                error!("error parsing message: {}", e);
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-            }
-        };
-
-        let message = Message {
-            nickname: Arc::new(Some(media_packet.email.clone())),
-            msg: Arc::new(media_packet),
-        };
+        let message = Message { msg: msg.data };
 
         session_recipient.try_send(message).map_err(|e| {
             error!("error sending message to session {}: {}", session, e);

@@ -22,20 +22,24 @@ impl Default for Aes128State {
 
 impl Aes128State {
     pub fn encrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let cipher = Aes128CbcEnc::new_from_slices(&self.key, &self.iv).map_err(|e| anyhow!("{}", e.to_string()))?;
+        let cipher = Aes128CbcEnc::new_from_slices(&self.key, &self.iv)
+            .map_err(|e| anyhow!("{}", e.to_string()))?;
         Ok(cipher.encrypt_padded_vec_mut::<Pkcs7>(&data))
     }
 
     pub fn decrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let decipher = Aes128CbcDec::new_from_slices(&self.key, &self.iv).map_err(|e| anyhow!("Decryptor Initialization error! {}", e.to_string()))?;
-        Ok(decipher.decrypt_padded_vec_mut::<Pkcs7>(&data).map_err(|e| anyhow!("Decrypt error! {}", e.to_string()))?)
+        let decipher = Aes128CbcDec::new_from_slices(&self.key, &self.iv)
+            .map_err(|e| anyhow!("Decryptor Initialization error! {}", e.to_string()))?;
+        Ok(decipher
+            .decrypt_padded_vec_mut::<Pkcs7>(&data)
+            .map_err(|e| anyhow!("Decrypt error! {}", e.to_string()))?)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use wasm_bindgen_test::*;
     use super::*;
+    use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
     fn test_aes() {

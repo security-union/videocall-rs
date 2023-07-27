@@ -1,10 +1,16 @@
-LOGIN_URL = "https://127.0.0.59/login"
-ACTIX_UI_BACKEND_URL = "https://127.0.0.59"
-WEBTRANSPORT_HOST = "https://127.0.0.59"
-NATS_URL = "127.0.0.59"
+LOGIN_URL="https://127.0.0.1"
+ACTIX_UI_BACKEND_URL="https://127.0.0.1"
+WEBTRANSPORT_HOST="https://127.0.0.1"
+NATS_URL="nats:4222"
 
-ENABLE_OAUTH = true
-WEBTRANSPORT_ENABLED = false
+ENABLE_OAUTH=false
+WEBTRANSPORT_ENABLED=false
 
-TRUNK_SERVE_PORT=8088
+TRUNK_SERVE_PORT=8080
 ACTIX_PORT=8086
+
+OAUTH_CLIENT_ID=""
+OAUTH_AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth"
+OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
+OAUTH_CLIENT_SECRET=" "
+OAUTH_REDIRECT_URL="http://localhost:${ACTIX_PORT}/login/callback"

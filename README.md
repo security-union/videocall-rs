@@ -41,6 +41,17 @@ Technically you could test this with a single computer, but it is more fun if yo
 
 ![Oct-24-2022 08-37-09](https://user-images.githubusercontent.com/1176339/197853024-171e0dcc-2098-4780-b3be-bfc3cb5adb43.gif)
 
+# Compiling Cargo Workspace
+
+## Ubuntu
+
+Some system dependencies are required for the workspace to compile
+
+```sh
+sudo apt-get update
+sudo apt-get install libglib2.0-dev libgtk-3-dev libsoup2.4 libjavascriptcoregtk-4.0-dev libwebkit2gtk-4.0-dev
+```
+
 
 ## ▶️ YouTube Channel
 https://www.youtube.com/@securityunion

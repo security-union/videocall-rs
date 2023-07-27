@@ -5688,6 +5688,7 @@ dependencies = [
  "protobuf",
  "serde",
  "serde_json",
+ "yew-websocket",
 ]
 
 [[package]]

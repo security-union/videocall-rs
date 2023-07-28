@@ -4,7 +4,7 @@ use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -32,12 +32,12 @@ use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
 
 pub struct MicrophoneEncoder {
-    aes: Aes128State,
+    aes: Arc<Aes128State>,
     state: EncoderState,
 }
 
 impl MicrophoneEncoder {
-    pub fn new(aes: Aes128State) -> Self {
+    pub fn new(aes: Arc<Aes128State>) -> Self {
         Self {
             aes,
             state: EncoderState::new(),
@@ -70,7 +70,7 @@ impl MicrophoneEncoder {
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
                 let packet: PacketWrapper =
-                    transform_audio_chunk(&chunk, &mut buffer, &email, sequence, aes);
+                    transform_audio_chunk(&chunk, &mut buffer, &email, sequence, aes.clone());
                 on_audio(packet);
                 sequence += 1;
             })

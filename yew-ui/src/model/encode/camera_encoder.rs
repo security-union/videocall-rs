@@ -4,7 +4,7 @@ use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -34,12 +34,12 @@ use crate::constants::VIDEO_WIDTH;
 use crate::crypto::aes::Aes128State;
 
 pub struct CameraEncoder {
-    aes: Aes128State,
+    aes: Arc<Aes128State>,
     state: EncoderState,
 }
 
 impl CameraEncoder {
-    pub fn new(aes: Aes128State) -> Self {
+    pub fn new(aes: Arc<Aes128State>) -> Self {
         Self {
             aes,
             state: EncoderState::new(),
@@ -84,7 +84,7 @@ impl CameraEncoder {
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
                 let packet: PacketWrapper =
-                    transform_video_chunk(chunk, sequence_number, &mut buffer, userid.clone(), aes);
+                    transform_video_chunk(chunk, sequence_number, &mut buffer, userid.clone(), aes.clone());
                 on_frame(packet);
                 sequence_number += 1;
             })

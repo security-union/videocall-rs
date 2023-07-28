@@ -3,6 +3,7 @@ use gloo_timers::callback::Timeout;
 use types::protos::packet_wrapper::PacketWrapper;
 
 use std::fmt::Debug;
+use std::sync::Arc;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
@@ -45,7 +46,7 @@ pub struct MeetingProps {
 
     pub video_enabled: bool,
 
-    pub aes: Aes128State,
+    pub aes: Arc<Aes128State>,
 }
 
 impl Component for Host {
@@ -53,10 +54,10 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let aes = ctx.props().aes;
+        let aes = ctx.props().aes.clone();
         Self {
-            camera: CameraEncoder::new(aes),
-            microphone: MicrophoneEncoder::new(aes),
+            camera: CameraEncoder::new(aes.clone()),
+            microphone: MicrophoneEncoder::new(aes.clone()),
             screen: ScreenEncoder::new(aes),
         }
     }

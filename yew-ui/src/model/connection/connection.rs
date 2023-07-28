@@ -1,3 +1,5 @@
+use crate::crypto::aes::Aes128State;
+
 //
 // Connection struct wraps the lower-level "Task" (task.rs), providing a heartbeat and keeping
 // track of connection status.
@@ -25,10 +27,11 @@ pub struct Connection {
     task: Arc<Task>,
     heartbeat: Option<Interval>,
     status: Arc<Cell<Status>>,
+    aes: Arc<Aes128State>,
 }
 
 impl Connection {
-    pub fn connect(webtransport: bool, options: ConnectOptions) -> anyhow::Result<Self> {
+    pub fn connect(webtransport: bool, options: ConnectOptions, aes: Arc<Aes128State>) -> anyhow::Result<Self> {
         let mut options = options;
         let userid = options.userid.clone();
         let status = Arc::new(Cell::new(Status::Connecting));
@@ -50,6 +53,7 @@ impl Connection {
             task: Arc::new(Task::connect(webtransport, options)?),
             heartbeat: None,
             status,
+            aes
         };
         connection.start_heartbeat(userid);
         Ok(connection)
@@ -65,6 +69,8 @@ impl Connection {
     fn start_heartbeat(&mut self, userid: String) {
         let task = Arc::clone(&self.task);
         let status = Arc::clone(&self.status);
+        let aes = Arc::clone(&self.aes);
+
         self.heartbeat = Some(Interval::new(1000, move || {
             let packet = MediaPacket {
                 media_type: MediaType::HEARTBEAT.into(),
@@ -73,7 +79,7 @@ impl Connection {
                 ..Default::default()
             };
             let packet = PacketWrapper {
-                data: packet.write_to_bytes().unwrap(),
+                data: aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap(),
                 email: userid.clone(),
                 packet_type: PacketType::MEDIA.into(),
                 ..Default::default()

@@ -3,7 +3,7 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::JsString;
 use js_sys::Reflect;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -31,12 +31,12 @@ use crate::constants::VIDEO_WIDTH;
 use crate::crypto::aes::Aes128State;
 
 pub struct ScreenEncoder {
-    aes: Aes128State,
+    aes: Arc<Aes128State>,
     state: EncoderState,
 }
 
 impl ScreenEncoder {
-    pub fn new(aes: Aes128State) -> Self {
+    pub fn new(aes: Arc<Aes128State>) -> Self {
         Self {
             aes,
             state: EncoderState::new(),
@@ -70,7 +70,7 @@ impl ScreenEncoder {
                     sequence_number,
                     &mut buffer,
                     userid.clone(),
-                    aes,
+                    aes.clone(),
                 );
                 on_frame(packet);
                 sequence_number += 1;

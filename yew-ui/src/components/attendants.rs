@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::crypto::aes::Aes128State;
@@ -88,8 +89,8 @@ pub struct AttendantsComponent {
     pub video_enabled: bool,
     pub error: Option<String>,
     pub peer_keys: HashMap<String, Aes128State>,
-    aes: Aes128State,
-    rsa: RsaWrapper,
+    aes: Arc<Aes128State>,
+    rsa: Arc<RsaWrapper>,
 }
 
 impl AttendantsComponent {
@@ -169,9 +170,9 @@ impl Component for AttendantsComponent {
             webtransport_enabled: ctx.props().webtransport_enabled,
             error: None,
             peer_keys: HashMap::new(),
-            aes: Aes128State::new(),
+            aes: Arc::new(Aes128State::new()),
             // TODO: Don't unwrap
-            rsa: RsaWrapper::new().unwrap(),
+            rsa: Arc::new(RsaWrapper::new().unwrap()),
         }
     }
 
@@ -201,7 +202,7 @@ impl Component for AttendantsComponent {
                             .link()
                             .callback(|_| Msg::from(WsAction::Lost(None))),
                     };
-                    match Connection::connect(webtransport, options) {
+                    match Connection::connect(webtransport, options, self.aes.clone()) {
                         Ok(connection) => {
                             self.connection = Some(connection);
                         }
@@ -401,7 +402,7 @@ impl Component for AttendantsComponent {
                     </div>
                     {
                         if media_access_granted {
-                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes} />}
+                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes.clone()} />}
                         } else {
                             html! {<></>}
                         }

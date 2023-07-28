@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use gloo_console::log;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,15 +16,17 @@ pub struct MultiDecoder {
     pub audio: AudioPeerDecoder,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
+    pub email: String,
     pub aes: Aes128State,
 }
 
 impl MultiDecoder {
-    fn new(video_canvas_id: String, screen_canvas_id: String, aes: Aes128State) -> Self {
+    fn new(video_canvas_id: String, screen_canvas_id: String, email: String, aes: Aes128State) -> Self {
         Self {
             audio: AudioPeerDecoder::new(),
             video: VideoPeerDecoder::new(&video_canvas_id),
             screen: VideoPeerDecoder::new(&screen_canvas_id),
+            email,
             aes,
         }
     }
@@ -38,6 +41,7 @@ impl MultiDecoder {
         {
             return Err(anyhow!("Incorrect packet type"));
         }
+        log!("Decoding media packet for email ", &self.email);
         let packet = self
             .aes
             .decrypt(&packet.data)
@@ -133,8 +137,8 @@ impl PeerDecodeManager {
         }
     }
 
-    fn add_peer(&mut self, email: &String) {
-        self.insert_peer(email);
+    fn add_peer(&mut self, email: &String, aes: &Aes128State) {
+        self.insert_peer(email, aes);
         self.on_peer_added.emit(email.clone())
     }
 
@@ -144,7 +148,8 @@ impl PeerDecodeManager {
             MultiDecoder::new(
                 self.get_video_canvas_id.emit(email.clone()),
                 self.get_screen_canvas_id.emit(email.clone()),
-                aes.clone(),
+                email.clone(),
+                *aes,
             ),
         );
         self.sorted_connected_peers_keys.push(email.clone());
@@ -159,7 +164,7 @@ impl PeerDecodeManager {
     }
 
     fn reset_peer(&mut self, email: &String, aes: &Aes128State) {
-        self.delete_peer(&email);
-        self.insert_peer(&email, aes);
+        self.delete_peer(email);
+        self.insert_peer(email, aes);
     }
 }

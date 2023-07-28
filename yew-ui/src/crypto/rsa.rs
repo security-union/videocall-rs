@@ -17,7 +17,7 @@ impl RsaWrapper {
 
     pub fn encrypt(&mut self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut rng = rand::thread_rng();
-        Ok(self.pub_key.encrypt(&mut rng, Pkcs1v15Encrypt, &data)?)
+        Ok(self.pub_key.encrypt(&mut rng, Pkcs1v15Encrypt, data)?)
     }
 
     pub fn decrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -26,7 +26,7 @@ impl RsaWrapper {
 
     pub fn encrypt_with_key(&self, data: &[u8], key: &RsaPublicKey) -> anyhow::Result<Vec<u8>> {
         let mut rng = rand::thread_rng();
-        Ok(key.encrypt(&mut rng, Pkcs1v15Encrypt, &data)?)
+        Ok(key.encrypt(&mut rng, Pkcs1v15Encrypt, data)?)
     }
 }
 

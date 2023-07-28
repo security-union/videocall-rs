@@ -29,14 +29,17 @@ use crate::constants::AUDIO_BITRATE;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
+use crate::crypto::aes::Aes128State;
 
 pub struct MicrophoneEncoder {
+    aes: Aes128State,
     state: EncoderState,
 }
 
 impl MicrophoneEncoder {
-    pub fn new() -> Self {
+    pub fn new(aes: Aes128State) -> Self {
         Self {
+            aes,
             state: EncoderState::new(),
         }
     }
@@ -58,7 +61,7 @@ impl MicrophoneEncoder {
         } else {
             return;
         };
-
+        let aes = self.aes.clone();
         let audio_output_handler = {
             let email = userid;
             let on_audio = on_audio;
@@ -67,7 +70,7 @@ impl MicrophoneEncoder {
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
                 let packet: PacketWrapper =
-                    transform_audio_chunk(&chunk, &mut buffer, &email, sequence);
+                    transform_audio_chunk(&chunk, &mut buffer, &email, sequence, aes);
                 on_audio(packet);
                 sequence += 1;
             })

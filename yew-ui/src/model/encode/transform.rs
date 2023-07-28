@@ -1,3 +1,5 @@
+use crate::crypto::aes::Aes128State;
+
 use super::super::wrappers::{EncodedAudioChunkTypeWrapper, EncodedVideoChunkTypeWrapper};
 use protobuf::Message;
 use types::protos::{
@@ -11,6 +13,7 @@ pub fn transform_video_chunk(
     sequence: u64,
     buffer: &mut [u8],
     email: Box<String>,
+    aes: Aes128State,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
@@ -28,8 +31,10 @@ pub fn transform_video_chunk(
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
+    let data = media_packet.write_to_bytes().unwrap();
+    let data = aes.encrypt(&data).unwrap();
     let mut packet: PacketWrapper = PacketWrapper::default();
-    packet.data = media_packet.write_to_bytes().unwrap();
+    packet.data = data;
     packet.email = media_packet.email;
     packet.packet_type = PacketType::MEDIA.into();
     packet
@@ -40,6 +45,7 @@ pub fn transform_screen_chunk(
     sequence: u64,
     buffer: &mut [u8],
     email: Box<String>,
+    aes: Aes128State,
 ) -> PacketWrapper {
     let mut media_packet: MediaPacket = MediaPacket::default();
     media_packet.email = *email;
@@ -55,8 +61,10 @@ pub fn transform_screen_chunk(
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
+    let data = media_packet.write_to_bytes().unwrap();
+    let data = aes.encrypt(&data).unwrap();
     let mut packet: PacketWrapper = PacketWrapper::default();
-    packet.data = media_packet.write_to_bytes().unwrap();
+    packet.data = data;
     packet.email = media_packet.email;
     packet.packet_type = PacketType::MEDIA.into();
     packet
@@ -67,6 +75,7 @@ pub fn transform_audio_chunk(
     buffer: &mut [u8],
     email: &String,
     sequence: u64,
+    aes: Aes128State,
 ) -> PacketWrapper {
     chunk.copy_to_with_u8_array(buffer);
     let mut media_packet: MediaPacket = MediaPacket::default();
@@ -81,8 +90,10 @@ pub fn transform_audio_chunk(
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
+    let data = media_packet.write_to_bytes().unwrap();
+    let data = aes.encrypt(&data).unwrap();
     let mut packet: PacketWrapper = PacketWrapper::default();
-    packet.data = media_packet.write_to_bytes().unwrap();
+    packet.data = data;
     packet.email = media_packet.email;
     packet.packet_type = PacketType::MEDIA.into();
     packet

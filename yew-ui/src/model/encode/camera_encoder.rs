@@ -75,6 +75,7 @@ impl CameraEncoder {
             switching,
             ..
         } = self.state.clone();
+        let aes = self.aes.clone();
         let video_output_handler = {
             let userid = userid;
             let on_frame = on_frame;
@@ -83,7 +84,7 @@ impl CameraEncoder {
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
                 let packet: PacketWrapper =
-                    transform_video_chunk(chunk, sequence_number, &mut buffer, userid.clone());
+                    transform_video_chunk(chunk, sequence_number, &mut buffer, userid.clone(), aes);
                 on_frame(packet);
                 sequence_number += 1;
             })

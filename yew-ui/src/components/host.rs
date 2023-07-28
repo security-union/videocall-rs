@@ -7,7 +7,6 @@ use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
 use crate::crypto::aes::Aes128State;
-use crate::crypto::rsa::RsaWrapper;
 use crate::model::encode::CameraEncoder;
 use crate::model::encode::MicrophoneEncoder;
 use crate::model::encode::ScreenEncoder;
@@ -27,8 +26,6 @@ pub struct Host {
     pub camera: CameraEncoder,
     pub microphone: MicrophoneEncoder,
     pub screen: ScreenEncoder,
-    aes: Aes128State,
-    rsa: RsaWrapper,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -49,8 +46,6 @@ pub struct MeetingProps {
     pub video_enabled: bool,
 
     pub aes: Aes128State,
-
-    pub rsa: RsaWrapper,
 }
 
 impl Component for Host {
@@ -59,13 +54,10 @@ impl Component for Host {
 
     fn create(ctx: &Context<Self>) -> Self {
         let aes = ctx.props().aes;
-        let rsa = ctx.props().rsa.clone();
         Self {
             camera: CameraEncoder::new(aes),
-            microphone: MicrophoneEncoder::new(),
-            screen: ScreenEncoder::new(),
-            aes,
-            rsa,
+            microphone: MicrophoneEncoder::new(aes),
+            screen: ScreenEncoder::new(aes),
         }
     }
 

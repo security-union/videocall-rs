@@ -28,14 +28,17 @@ use super::transform::transform_screen_chunk;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
+use crate::crypto::aes::Aes128State;
 
 pub struct ScreenEncoder {
+    aes: Aes128State,
     state: EncoderState,
 }
 
 impl ScreenEncoder {
-    pub fn new() -> Self {
+    pub fn new(aes: Aes128State) -> Self {
         Self {
+            aes,
             state: EncoderState::new(),
         }
     }
@@ -54,6 +57,7 @@ impl ScreenEncoder {
         } = self.state.clone();
         let on_frame = Box::new(on_frame);
         let userid = Box::new(userid);
+        let aes = self.aes.clone();
         let screen_output_handler = {
             let userid = userid;
             let on_frame = on_frame;
@@ -61,8 +65,13 @@ impl ScreenEncoder {
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                let packet: PacketWrapper =
-                    transform_screen_chunk(chunk, sequence_number, &mut buffer, userid.clone());
+                let packet: PacketWrapper = transform_screen_chunk(
+                    chunk,
+                    sequence_number,
+                    &mut buffer,
+                    userid.clone(),
+                    aes,
+                );
                 on_frame(packet);
                 sequence_number += 1;
             })

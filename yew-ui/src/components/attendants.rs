@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::constants::WEBTRANSPORT_HOST;
@@ -86,6 +87,7 @@ pub struct AttendantsComponent {
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub error: Option<String>,
+    pub peer_keys: HashMap<String, Aes128State>,
     aes: Aes128State,
     rsa: RsaWrapper,
 }
@@ -166,6 +168,7 @@ impl Component for AttendantsComponent {
             video_enabled: false,
             webtransport_enabled: ctx.props().webtransport_enabled,
             error: None,
+            peer_keys: HashMap::new(),
             aes: Aes128State::new(),
             // TODO: Don't unwrap
             rsa: RsaWrapper::new().unwrap(),
@@ -257,9 +260,12 @@ impl Component for AttendantsComponent {
                         log!("Received AES_KEY ", &response.email);
                         if let Ok(bytes) = self.rsa.decrypt(&response.data) {
                             let aes_packet = AesPacket::parse_from_bytes(&bytes).unwrap();
-                            self.peer_decode_manager
-                                .set_aes_key(&response.email, aes_packet)
-                                .unwrap();
+                            self.peer_keys.insert(
+                                response.email,
+                                Aes128State::from_vecs(aes_packet.key, aes_packet.iv),
+                            );
+                        } else {
+                            log!("Failed to decrypt AES_KEY");
                         }
                         return false;
                     }
@@ -286,8 +292,10 @@ impl Component for AttendantsComponent {
                             }));
                     }
                     Ok(PacketType::MEDIA) => {
-                        if let Err(e) = self.peer_decode_manager.decode(response) {
-                            log!("error decoding packet:", JsValue::from_str(&e.to_string()));
+                        if let Some(key) = self.peer_keys.get(&response.email) {
+                            if let Err(e) = self.peer_decode_manager.decode(response, key) {
+                                log!("error decoding packet:", JsValue::from_str(&e.to_string()));
+                            }
                         }
                     }
                     Err(_) => {}
@@ -393,7 +401,7 @@ impl Component for AttendantsComponent {
                     </div>
                     {
                         if media_access_granted {
-                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes} rsa={self.rsa.clone()} />}
+                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes} />}
                         } else {
                             html! {<></>}
                         }

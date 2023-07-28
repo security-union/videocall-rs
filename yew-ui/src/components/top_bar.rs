@@ -1,5 +1,5 @@
-use yew::prelude::*;
 use crate::components::icons::{discord::DiscordIcon, youtube::YoutubeIcon};
+use yew::prelude::*;
 
 #[function_component(TopBar)]
 pub fn top_bar() -> Html {

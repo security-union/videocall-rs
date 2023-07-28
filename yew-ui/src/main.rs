@@ -1,8 +1,8 @@
 #![feature(future_join)]
 
-mod crypto;
 mod components;
 mod constants;
+mod crypto;
 mod model;
 mod pages;
 

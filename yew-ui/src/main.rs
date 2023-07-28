@@ -1,7 +1,6 @@
 #![feature(future_join)]
 #![feature(once_cell)]
 #[allow(non_camel_case_types)]
-
 mod components;
 mod constants;
 mod crypto;

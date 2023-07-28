@@ -4,7 +4,7 @@ use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{atomic::Ordering, Arc};
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -83,8 +83,13 @@ impl CameraEncoder {
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                let packet: PacketWrapper =
-                    transform_video_chunk(chunk, sequence_number, &mut buffer, userid.clone(), aes.clone());
+                let packet: PacketWrapper = transform_video_chunk(
+                    chunk,
+                    sequence_number,
+                    &mut buffer,
+                    userid.clone(),
+                    aes.clone(),
+                );
                 on_frame(packet);
                 sequence_number += 1;
             })

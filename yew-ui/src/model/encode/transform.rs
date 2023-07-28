@@ -1,7 +1,7 @@
-use crate::crypto::aes::Aes128State;
-use std::sync::Arc;
 use super::super::wrappers::{EncodedAudioChunkTypeWrapper, EncodedVideoChunkTypeWrapper};
+use crate::crypto::aes::Aes128State;
 use protobuf::Message;
+use std::sync::Arc;
 use types::protos::{
     media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},

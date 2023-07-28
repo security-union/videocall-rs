@@ -21,7 +21,12 @@ pub struct MultiDecoder {
 }
 
 impl MultiDecoder {
-    fn new(video_canvas_id: String, screen_canvas_id: String, email: String, aes: Aes128State) -> Self {
+    fn new(
+        video_canvas_id: String,
+        screen_canvas_id: String,
+        email: String,
+        aes: Aes128State,
+    ) -> Self {
         Self {
             audio: AudioPeerDecoder::new(),
             video: VideoPeerDecoder::new(&video_canvas_id),

@@ -31,7 +31,11 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn connect(webtransport: bool, options: ConnectOptions, aes: Arc<Aes128State>) -> anyhow::Result<Self> {
+    pub fn connect(
+        webtransport: bool,
+        options: ConnectOptions,
+        aes: Arc<Aes128State>,
+    ) -> anyhow::Result<Self> {
         let mut options = options;
         let userid = options.userid.clone();
         let status = Arc::new(Cell::new(Status::Connecting));
@@ -53,7 +57,7 @@ impl Connection {
             task: Arc::new(Task::connect(webtransport, options)?),
             heartbeat: None,
             status,
-            aes
+            aes,
         };
         connection.start_heartbeat(userid);
         Ok(connection)

@@ -3,7 +3,7 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::JsString;
 use js_sys::Reflect;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{atomic::Ordering, Arc};
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;

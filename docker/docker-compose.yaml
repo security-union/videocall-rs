@@ -6,7 +6,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - /app/yew-ui/target
+      - /app/target
     build:
       dockerfile: ../docker/Dockerfile.yew
     working_dir: /app/yew-ui
@@ -45,7 +45,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - /app/actix-api/target
+      - /app/target
     depends_on:
       - postgres
       - nats
@@ -68,7 +68,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - /app/actix-api/target
+      - /app/target
     depends_on:
       - nats
 

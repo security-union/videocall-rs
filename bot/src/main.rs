@@ -1,16 +1,15 @@
+use chrono::Utc;
+use futures::stream::FuturesUnordered;
 use futures::SinkExt;
 use futures::StreamExt;
-use futures::stream::FuturesUnordered;
+use protobuf::Message as ProtoMessage;
 use rand::Rng;
-use types::protos::media_packet::MediaPacket;
-use types::protos::media_packet::media_packet::MediaType;
 use std::env;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use types::protos::media_packet::media_packet::MediaType;
+use types::protos::media_packet::MediaPacket;
 use url::Url;
-use protobuf::Message as ProtoMessage;
-use chrono::Utc;
-
 
 #[tokio::main]
 async fn main() {
@@ -23,13 +22,22 @@ async fn main() {
     let email_prefix = env::var("EMAIL_PREFIX").unwrap_or_else(|_| "".to_string());
 
     (0..n_clients)
-    .into_iter().map(|_| async {
-        let handle = create_client(&endpoint, &room, &echo_user, &email_prefix).await;
-        let _ = handle.await;
-    }).collect::<FuturesUnordered<_>>().collect::<Vec<_>>().await;
+        .into_iter()
+        .map(|_| async {
+            let handle = create_client(&endpoint, &room, &echo_user, &email_prefix).await;
+            let _ = handle.await;
+        })
+        .collect::<FuturesUnordered<_>>()
+        .collect::<Vec<_>>()
+        .await;
 }
 
-async fn create_client(endpoint: &str, room: &str, echo_user: &str, email_prefix: &str) -> JoinHandle<()> {
+async fn create_client(
+    endpoint: &str,
+    room: &str,
+    echo_user: &str,
+    email_prefix: &str,
+) -> JoinHandle<()> {
     let email = generate_email(email_prefix);
     let url = format!("{}/lobby/{}/{}", endpoint, email, room);
     let (mut ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
@@ -52,10 +60,11 @@ async fn create_client(endpoint: &str, room: &str, echo_user: &str, email_prefix
                     if text == "Hello" {
                         ws_stream.send("Hello".into()).await.unwrap();
                     }
-                },
+                }
                 Message::Binary(bin) => {
                     // decode bin as protobuf
-                    let mut media_packet = MediaPacket::parse_from_bytes(&bin.into_boxed_slice()).unwrap();
+                    let mut media_packet =
+                        MediaPacket::parse_from_bytes(&bin.into_boxed_slice()).unwrap();
 
                     // rewrite whatever is in the protobuf so that it seems like it is coming from this bot
                     if media_packet.email == echo_user {

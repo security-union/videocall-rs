@@ -10,9 +10,13 @@ use crate::model::EncryptedMediaPacket;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_console::log;
 use protobuf::Message;
+use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+use rsa::RsaPublicKey;
+use types::protos::aes_packet::AesPacket;
 use types::protos::media_packet::media_packet::MediaType;
-use types::protos::media_packet::MediaPacket;
+use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use types::protos::packet_wrapper::PacketWrapper;
+use types::protos::rsa_packet::RsaPacket;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
@@ -92,6 +96,25 @@ impl AttendantsComponent {
             Some(connection) => connection.is_connected(),
             None => false,
         }
+    }
+
+    fn send_public_key(&self, ctx: &Context<Self>) {
+        let email = ctx.props().email.clone();
+        let public_key_pkcs1 = self.rsa.pub_key.to_public_key_der().unwrap().into_vec();
+        let data = RsaPacket {
+            username: email.clone(),
+            public_key_pkcs1,
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+        ctx.link()
+            .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                packet_type: PacketType::RSA_PUB_KEY.into(),
+                email,
+                data,
+                ..Default::default()
+            }));
     }
 
     fn create_peer_decoder_manager(ctx: &Context<Self>) -> PeerDecodeManager {
@@ -189,6 +212,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log!("Connected");
+                    self.send_public_key(ctx);
                     true
                 }
                 WsAction::Log(msg) => {
@@ -217,7 +241,10 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(_email) => true,
+            Msg::OnPeerAdded(_email) => {
+                self.send_public_key(ctx);
+                true
+            }
             Msg::OnFirstFrame((_email, media_type)) => match media_type {
                 MediaType::SCREEN => true,
                 _ => false,
@@ -225,10 +252,45 @@ impl Component for AttendantsComponent {
             Msg::OnInboundMedia(response) => {
                 // TODO: Need to use the correct key for the peer.
                 // TODO: Don't unwrap
-                let bytes = self.aes.decrypt(&response.data).unwrap();
-                let media_packet = MediaPacket::parse_from_bytes(&bytes).unwrap();
-                if let Err(e) = self.peer_decode_manager.decode(media_packet) {
-                    log!("error decoding packet: {:?}", e);
+                match response.packet_type.enum_value() {
+                    Ok(PacketType::AES_KEY) => {
+                        log!("Received AES_KEY ", &response.email);
+                        if let Ok(bytes) = self.rsa.decrypt(&response.data) {
+                            let aes_packet = AesPacket::parse_from_bytes(&bytes).unwrap();
+                            self.peer_decode_manager
+                                .set_aes_key(&response.email, aes_packet)
+                                .unwrap();
+                        }
+                        return false;
+                    }
+                    Ok(PacketType::RSA_PUB_KEY) => {
+                        log!("Received RSA_PUB_KEY");
+                        let rsa_packet = RsaPacket::parse_from_bytes(&response.data).unwrap();
+                        let pub_key =
+                            RsaPublicKey::from_public_key_der(&rsa_packet.public_key_pkcs1)
+                                .unwrap();
+                        // Send AES key to the host
+                        let aes_packet = AesPacket {
+                            key: self.aes.key.to_vec(),
+                            iv: self.aes.iv.to_vec(),
+                            ..Default::default()
+                        }
+                        .write_to_bytes()
+                        .unwrap();
+                        ctx.link()
+                            .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                                packet_type: PacketType::AES_KEY.into(),
+                                email: ctx.props().email.clone(),
+                                data: self.rsa.encrypt_with_key(&aes_packet, &pub_key).unwrap(),
+                                ..Default::default()
+                            }));
+                    }
+                    Ok(PacketType::MEDIA) => {
+                        if let Err(e) = self.peer_decode_manager.decode(response) {
+                            log!("error decoding packet:", JsValue::from_str(&e.to_string()));
+                        }
+                    }
+                    Err(_) => {}
                 }
                 false
             }

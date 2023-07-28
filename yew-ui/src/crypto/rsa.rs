@@ -3,7 +3,7 @@ use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RsaWrapper {
-    pub_key: RsaPublicKey,
+    pub pub_key: RsaPublicKey,
     key: RsaPrivateKey,
 }
 
@@ -22,6 +22,11 @@ impl RsaWrapper {
 
     pub fn decrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         Ok(self.key.decrypt(Pkcs1v15Encrypt, data)?)
+    }
+
+    pub fn encrypt_with_key(&self, data: &[u8], key: &RsaPublicKey) -> anyhow::Result<Vec<u8>> {
+        let mut rng = rand::thread_rng();
+        Ok(key.encrypt(&mut rng, Pkcs1v15Encrypt, &data)?)
     }
 }
 

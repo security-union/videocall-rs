@@ -8,8 +8,8 @@ type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Aes128State {
-    key: [u8; 16],
-    iv: [u8; 16],
+    pub key: [u8; 16],
+    pub iv: [u8; 16],
 }
 
 impl Aes128State {
@@ -20,6 +20,17 @@ impl Aes128State {
         rng.fill_bytes(&mut key);
         rng.fill_bytes(&mut iv);
         Aes128State { key, iv }
+    }
+
+    pub fn from_vecs(key: Vec<u8>, iv: Vec<u8>) -> Self {
+        let mut key_arr = [0u8; 16];
+        let mut iv_arr = [0u8; 16];
+        key_arr.copy_from_slice(&key);
+        iv_arr.copy_from_slice(&iv);
+        Aes128State {
+            key: key_arr,
+            iv: iv_arr,
+        }
     }
 
     pub fn encrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {

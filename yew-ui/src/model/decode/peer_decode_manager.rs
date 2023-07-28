@@ -1,8 +1,15 @@
+use anyhow::anyhow;
+use gloo_console::log;
+use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
-use types::protos::media_packet::media_packet::MediaType;
+use types::protos::aes_packet::AesPacket;
 use types::protos::media_packet::MediaPacket;
+use types::protos::packet_wrapper::packet_wrapper::PacketType;
+use types::protos::{media_packet::media_packet::MediaType, packet_wrapper::PacketWrapper};
 use yew::prelude::Callback;
+
+use crate::crypto::aes::Aes128State;
 
 use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
 
@@ -10,24 +17,64 @@ pub struct MultiDecoder {
     pub audio: AudioPeerDecoder,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
+    pub aes: Option<Aes128State>,
 }
 
 impl MultiDecoder {
-    fn new(video_canvas_id: String, screen_canvas_id: String) -> Self {
+    fn new(video_canvas_id: String, screen_canvas_id: String, aes: Option<Aes128State>) -> Self {
         Self {
             audio: AudioPeerDecoder::new(),
             video: VideoPeerDecoder::new(&video_canvas_id),
             screen: VideoPeerDecoder::new(&screen_canvas_id),
+            aes,
         }
     }
 
     // Note: arbitrarily using error code 0 for decoder failure, since it doesn't provide any error value
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<(MediaType, DecodeStatus), i32> {
-        let media_type = packet.media_type.enum_value()?;
+    fn decode(&mut self, packet: &Arc<PacketWrapper>) -> anyhow::Result<(MediaType, DecodeStatus)> {
+        if packet
+            .packet_type
+            .enum_value()
+            .map_err(|e| anyhow!("No packet_type"))?
+            != PacketType::MEDIA
+        {
+            return Err(anyhow!("Incorrect packet type"));
+        }
+        if let None = self.aes {
+            return Err(anyhow!("No aes key"));
+        }
+        let packet = self
+            .aes
+            .unwrap()
+            .decrypt(&packet.data)
+            .map_err(|e| anyhow!("Failed to decrypt with aes"))?;
+        let packet = Arc::new(
+            MediaPacket::parse_from_bytes(&packet)
+                .map_err(|e| anyhow!("Failed to parse to protobuf MediaPacket"))?,
+        );
+        let media_type = packet
+            .media_type
+            .enum_value()
+            .map_err(|e| anyhow!("No media_type"))?;
         match media_type {
-            MediaType::VIDEO => Ok((media_type, self.video.decode(packet).map_err(|_| 0)?)),
-            MediaType::AUDIO => Ok((media_type, self.audio.decode(packet).map_err(|_| 0)?)),
-            MediaType::SCREEN => Ok((media_type, self.screen.decode(packet).map_err(|_| 0)?)),
+            MediaType::VIDEO => Ok((
+                media_type,
+                self.video
+                    .decode(&packet)
+                    .map_err(|e| anyhow!("Failed to decode video"))?,
+            )),
+            MediaType::AUDIO => Ok((
+                media_type,
+                self.audio
+                    .decode(&packet)
+                    .map_err(|e| anyhow!("Failed to decode audio"))?,
+            )),
+            MediaType::SCREEN => Ok((
+                media_type,
+                self.screen
+                    .decode(&packet)
+                    .map_err(|e| anyhow!("Failed to decode screen"))?,
+            )),
             MediaType::HEARTBEAT => Ok((
                 media_type,
                 DecodeStatus {
@@ -68,7 +115,16 @@ impl PeerDecodeManager {
         self.connected_peers.get(key)
     }
 
-    pub fn decode(&mut self, response: MediaPacket) -> Result<(), i32> {
+    pub fn set_aes_key(&mut self, email: &String, aes_packet: AesPacket) -> Result<(), i32> {
+        let aes = Aes128State::from_vecs(aes_packet.key, aes_packet.iv);
+        if let Some(peer) = self.connected_peers.get_mut(email) {
+            log!("Setting key for ", email);
+            peer.aes = Some(aes);
+        }
+        Ok(())
+    }
+
+    pub fn decode(&mut self, response: PacketWrapper) -> anyhow::Result<()> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if !self.connected_peers.contains_key(&email) {
@@ -100,6 +156,7 @@ impl PeerDecodeManager {
             MultiDecoder::new(
                 self.get_video_canvas_id.emit(email.clone()),
                 self.get_screen_canvas_id.emit(email.clone()),
+                None,
             ),
         );
         self.sorted_connected_peers_keys.push(email.clone());

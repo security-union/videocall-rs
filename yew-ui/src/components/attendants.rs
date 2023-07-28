@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::connection::{ConnectOptions, Connection};
 use crate::model::decode::PeerDecodeManager;
@@ -15,6 +17,7 @@ use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 
 use super::device_permissions::request_permissions;
+use super::icons::push_pin::PushPinIcon;
 
 #[derive(Debug)]
 pub enum WsAction {
@@ -140,10 +143,8 @@ impl Component for AttendantsComponent {
                             self.connection = Some(connection);
                         }
                         Err(e) => {
-                            ctx.link().send_message(WsAction::Log(format!(
-                                "Connection failed: {}",
-                                e
-                            )));
+                            ctx.link()
+                                .send_message(WsAction::Log(format!("Connection failed: {}", e)));
                         }
                     }
 
@@ -244,17 +245,34 @@ impl Component for AttendantsComponent {
                 } else {
                     "grid-item"
                 };
+                let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
+                let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
                 html! {
                     <>
-                        <div class={screen_share_css}>
+                        <div class={screen_share_css} id={(*screen_share_div_id).clone()}>
                             // Canvas for Screen share.
-                            <canvas id={format!("screen-share-{}", &key)}></canvas>
-                            <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                            <div class="canvas-container">
+                                <canvas id={format!("screen-share-{}", &key)}></canvas>
+                                <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                                <button onclick={Callback::from(move |_| {
+                                    toggle_pinned_div(&(*screen_share_div_id).clone());
+                                })} class="pin-icon">
+                                    <PushPinIcon/>
+                                </button>
+                            </div>
                         </div>
-                        <div class="grid-item">
+                        <div class="grid-item" id={(*peer_video_div_id).clone()}>
                             // One canvas for the User Video
-                            <UserVideo id={key.clone()}></UserVideo>
-                            <h4 class="floating-name">{key.clone()}</h4>
+                            <div class="canvas-container">
+                                <UserVideo id={key.clone()}></UserVideo>
+                                <h4 class="floating-name">{key.clone()}</h4>
+                                <button onclick={
+                                    Callback::from(move |_| {
+                                    toggle_pinned_div(&(*peer_video_div_id).clone());
+                                })} class="pin-icon">
+                                    <PushPinIcon/>
+                                </button>
+                            </div>
                         </div>
                     </>
                 }
@@ -341,5 +359,20 @@ fn user_video(props: &UserVideoProps) -> Html {
 
     html! {
         <canvas ref={(*video_ref).clone()} id={props.id.clone()}></canvas>
+    }
+}
+
+fn toggle_pinned_div(div_id: &str) {
+    if let Some(div) = window()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.get_element_by_id(&div_id))
+    {
+        // if the div does not have the grid-item-pinned css class, add it to it
+        if !div.class_list().contains("grid-item-pinned") {
+            div.class_list().add_1("grid-item-pinned").unwrap();
+        } else {
+            // else remove it
+            div.class_list().remove_1("grid-item-pinned").unwrap();
+        }
     }
 }

@@ -22,6 +22,7 @@ pub const AUDIO_BITRATE: f64 = 50000f64;
 
 pub const VIDEO_HEIGHT: i32 = 720i32;
 pub const VIDEO_WIDTH: i32 = 1280i32;
+pub const VIDEO_FPS: f64 = 30.0;
 pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
 pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lobby");
 

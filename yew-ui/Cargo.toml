@@ -87,6 +87,7 @@ features = [
     "VideoEncoderConfig",
     "VideoEncoderEncodeOptions",
     "VideoFrame",
+    "VideoFrameInit",
     "VideoTrack",
     "VideoDecoder",
     "VideoDecoderConfig",

@@ -22,7 +22,6 @@ async fn main() {
     let email_prefix = env::var("EMAIL_PREFIX").unwrap_or_else(|_| "".to_string());
 
     (0..n_clients)
-        .into_iter()
         .map(|_| async {
             let handle = create_client(&endpoint, &room, &echo_user, &email_prefix).await;
             let _ = handle.await;

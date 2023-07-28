@@ -99,7 +99,11 @@ features = [
     "MediaDeviceInfo",
     "MediaDeviceKind",
     "MediaTrackConstraints",
-    "CanvasRenderingContext2d"
+    "CanvasRenderingContext2d",
+    "OffscreenCanvas",
+    "OffscreenCanvasRenderingContext2d",
+    "ImageData",
+    "VideoFrameInit"
 ]
 
 [dev-dependencies]

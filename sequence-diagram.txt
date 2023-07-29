@@ -1,0 +1,55 @@
+title videocall-rs e2ee sequence diagram
+
+participant Alice
+participant Bob
+participant Server
+participant Casey
+
+
+Alice->Server:Alice joins room 1
+Alice->Server:Alice starts sending encrypted heartbeats
+Alice->Server:Alice sends RSA pub key message
+
+Bob->Server:Bob joins room 1
+Bob->Server:Bob starts sending encrypted heartbeats
+Bob->Server:Bob sends RSA pub key message
+
+Server->Alice:Server sends Bob's RSA pub key message to Alice
+Alice-->Server:Responding to Bob's RSA pub key msg, Alice encrypts their AES key with Bob's RSA pub key and sends it to the server
+Server-->Bob:Bob receives the AES msg from Alice and decrypts it with Bob's RSA private key
+
+Alice->Server:Alice notices that Bob is a new peer and sends the RSA pub key message again
+Server->Bob:Server sends Alice's RSA pub key message to Bob
+Bob-->Server:Responding to Alices's RSA pub key msg, Bob encrypts their AES key with Alice's RSA pub key and sends it to the server
+Server-->Alice:Alice receives the AES msg from Bob and decrypts it with Alice's RSA private key
+
+Casey->Server:Casey joins room 1
+Casey->Server:Casey starts sending encrypted heartbeats
+Casey->Server:Casey sends RSA pub key message
+
+Server->Alice:Server sends Casey's RSA pub key message to Alice
+Alice-->Server:Responding to Casey's RSA pub key msg, Alice encrypts their AES key with Casey's RSA pub key and sends it to the server
+Server-->Casey:Casey receives the AES msg from Alice and decrypts it with Casey's RSA private key
+
+Server->Bob:Server sends Casey's RSA pub key message to Bob
+Bob-->Server:Responding to Casey's RSA pub key msg, Bob encrypts their AES key with Casey's RSA pub key and sends it to the server
+Server-->Casey:Casey receives the AES msg from Bob and decrypts it with Casey's RSA private key
+
+Alice->Server:Alice notices that Casey is a new peer and sends the RSA pub key message again
+Server->Casey:Server sends Alice's RSA pub key message to Casey
+Casey-->Server:Responding to Alices's RSA pub key msg, Casey encrypts their AES key with Alice's RSA pub key and sends it to the server
+Server-->Alice:Alice receives the AES msg from Casey and decrypts it with Alice's RSA private key
+
+Server->Bob:Server sends Alice's RSA pub key message to Bob
+Bob-->Server:Responding to Alices's RSA pub key msg, Bob encrypts their AES key with Alice's RSA pub key and sends it to the server
+Server-->Alice:Alice receives the AES msg from Bob and decrypts it with Alice's RSA private key
+
+Bob->Server:Bob notices that Casey is a new peer and sends the RSA pub key message again
+Server->Casey:Server sends Bob's RSA pub key message to Casey
+Casey-->Server:Responding to Bob's RSA pub key msg, Casey encrypts their AES key with Bob's RSA pub key and sends it to the server
+Server-->Bob:Bob receives the AES msg from Casey and decrypts it with Bob's RSA private key
+
+Server->Alice:Server sends Bob's RSA pub key message to Alice
+Alice-->Server:Responding to Bob's RSA pub key msg, Alice encrypts their AES key with Bob's RSA pub key and sends it to the server
+Server-->Bob:Bob receives the AES msg from Alice and decrypts it with Bob's RSA private key
+

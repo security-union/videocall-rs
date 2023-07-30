@@ -3,6 +3,8 @@ FROM --platform=linux/amd64 securityunion/rustlemania-api-base:push-images-to-do
 COPY . /app
 WORKDIR /app/actix-api
 RUN cargo build --release
+RUN ls /app/actix-api/target/release
+RUN ls /app/actix-api/target
 
 FROM --platform=linux/amd64 debian:bullseye-slim as production
 

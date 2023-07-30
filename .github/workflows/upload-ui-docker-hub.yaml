@@ -2,8 +2,8 @@ name: Publish UI to Docker image
 
 on:
   push:
-    branches:
-      - main
+    # branches:
+    #   - main
     paths:
       - 'yew-ui/**'
       - 'types/**'
@@ -12,7 +12,7 @@ on:
 
 jobs:
   push_to_registry:
-    name: Push Docker image to Docker Hub
+    name: Push UI Docker image to Docker Hub
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo

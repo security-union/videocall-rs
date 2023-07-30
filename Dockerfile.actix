@@ -1,5 +1,6 @@
 FROM --platform=linux/amd64 securityunion/rustlemania-api-base:push-images-to-dockerhub-304d6434 as build
 
+ENV CARGO_TARGET_DIR=/app/actix-api/target
 COPY . /app
 WORKDIR /app/actix-api
 RUN cargo build --release

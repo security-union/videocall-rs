@@ -1,7 +1,7 @@
 name: Publish Base API to Docker image
 
 on:
-  # push:
+  push:
   #   paths:
   #     - docker/base_images/Dockerfile.actix
 

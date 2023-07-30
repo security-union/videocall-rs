@@ -35,4 +35,4 @@ jobs:
           context: .
           file: Dockerfile.yew
           push: true
-          tags: securityunion/rustlemania-ui:${{GITHUB_REF_NAME}}-${{ steps.extract_sha.outputs.sha8 }}
+          tags: securityunion/rustlemania-ui:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}

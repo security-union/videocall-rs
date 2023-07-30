@@ -1,4 +1,4 @@
-FROM securityunion/rustlemania-api-base:push-images-to-dockerhub-304d6434 as build
+FROM --platform=linux/amd64 securityunion/rustlemania-api-base:push-images-to-dockerhub-304d6434 as build
 
 COPY . /app
 WORKDIR /app/actix-api

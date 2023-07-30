@@ -1,9 +1,9 @@
 name: Publish Base API to Docker image
 
 on:
-  push:
-    paths:
-      - docker/base_images/Dockerfile.actix
+  # push:
+  #   paths:
+  #     - docker/base_images/Dockerfile.actix
 
 jobs:
   push_to_registry:

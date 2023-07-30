@@ -4,9 +4,6 @@ ENV CARGO_TARGET_DIR=/app/actix-api/target
 COPY . /app
 WORKDIR /app/actix-api
 RUN cargo build --release
-RUN pwd
-RUN ls /app/actix-api
-RUN ls /app/actix-api/target
 
 FROM --platform=linux/amd64 debian:bullseye-slim as production
 

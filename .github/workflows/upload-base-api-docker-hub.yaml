@@ -30,4 +30,4 @@ jobs:
           context: .
           file: ./docker/base_images/Dockerfile.actix
           push: true
-          tags: securityunion/rustlemania-api-base:${{ steps.extract_sha.outputs.sha8 }}
+          tags: securityunion/rustlemania-api-base:${{GITHUB_REF_NAME}}-${{ steps.extract_sha.outputs.sha8 }}

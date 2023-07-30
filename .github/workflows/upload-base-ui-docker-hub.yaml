@@ -30,4 +30,4 @@ jobs:
           context: .
           file: ./docker/base_images/Dockerfile.yew
           push: true
-          tags: securityunion/yew:${{GITHUB_REF_NAME}}-${{ steps.extract_sha.outputs.sha8 }}
+          tags: securityunion/yew:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}

@@ -35,5 +35,3 @@ jobs:
           file: Dockerfile.actix
           push: true
           tags: securityunion/rustlemania-api:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

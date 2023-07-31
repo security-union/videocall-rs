@@ -1,1 +1,10 @@
-FROM securityunion/yew:fix-ui-9ca15cac
+FROM rust:1.64-slim-bullseye
+
+RUN rustup default nightly-2022-10-21
+
+RUN apt-get --yes update && apt-get --yes install git pkg-config libssl-dev
+RUN cargo install wasm-bindgen-cli --version 0.2.78
+RUN cargo install trunk --version 0.16.0
+RUN rustup target add wasm32-unknown-unknown
+RUN rustup component add clippy-preview
+RUN rustup component add rustfmt

@@ -12,11 +12,11 @@ use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
+use super::icons::push_pin::PushPinIcon;
 use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
-use super::icons::push_pin::PushPinIcon;
 
 #[derive(Debug)]
 pub enum WsAction {

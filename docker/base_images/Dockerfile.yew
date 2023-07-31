@@ -1,6 +1,6 @@
 FROM rust:1.67-slim-bullseye
 
-RUN rustup default nightly-2022-10-21
+RUN rustup default nightly-2023-02-21
 
 RUN apt-get --yes update && apt-get --yes install git pkg-config libssl-dev
 RUN cargo install wasm-bindgen-cli --version 0.2.78

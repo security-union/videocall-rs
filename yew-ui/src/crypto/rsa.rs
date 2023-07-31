@@ -1,5 +1,5 @@
 use crate::constants::RSA_BITS;
-use rsa::{RsaPrivateKey, RsaPublicKey, Pkcs1v15Encrypt};
+use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
 
 pub struct RsaWrapper {
     pub_key: RsaPublicKey,
@@ -16,7 +16,9 @@ impl RsaWrapper {
     }
 
     pub fn encrypt(&mut self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        Ok(self.pub_key.encrypt(&mut self.rng, Pkcs1v15Encrypt,&data,)?)
+        Ok(self
+            .pub_key
+            .encrypt(&mut self.rng, Pkcs1v15Encrypt, &data)?)
     }
 
     pub fn decrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -26,8 +28,8 @@ impl RsaWrapper {
 
 #[cfg(test)]
 mod test {
-    use wasm_bindgen_test::*;
     use super::*;
+    use wasm_bindgen_test::*;
 
     #[wasm_bindgen_test]
     fn test_rsa_thread_rng() {

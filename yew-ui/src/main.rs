@@ -1,9 +1,9 @@
 #![feature(future_join)]
 #![feature(once_cell)]
 
-mod crypto;
 mod components;
 mod constants;
+mod crypto;
 mod model;
 mod pages;
 

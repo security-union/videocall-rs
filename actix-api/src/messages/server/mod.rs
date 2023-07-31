@@ -4,7 +4,6 @@ use crate::actors::chat_session::{RoomId, SessionId};
 
 use super::session::Message;
 use actix::{Message as ActixMessage, Recipient};
-use types::protos::media_packet::MediaPacket;
 
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
@@ -32,7 +31,7 @@ pub struct Connect {
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct MediaPacketUpdate {
-    pub media_packet: Arc<MediaPacket>,
+    pub media_packet: Arc<Vec<u8>>,
 }
 
 #[derive(ActixMessage)]

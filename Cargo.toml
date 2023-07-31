@@ -1,0 +1,9 @@
+[workspace]
+
+members = [
+    "actix-api",
+    "bot",
+    "src-tauri",
+    "types",
+    "yew-ui"
+]

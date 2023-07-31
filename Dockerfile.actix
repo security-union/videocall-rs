@@ -1,11 +1,11 @@
-FROM --platform=linux/amd64 securityunion/rustlemania-api-base:push-images-to-dockerhub-304d6434 as build
+FROM securityunion/rustlemania-api-base:push-images-to-dockerhub-304d6434 as build
 
 ENV CARGO_TARGET_DIR=/app/actix-api/target
 COPY . /app
 WORKDIR /app/actix-api
 RUN cargo build --release
 
-FROM --platform=linux/amd64 debian:bullseye-slim as production
+FROM debian:bullseye-slim as production
 
 COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
 COPY --from=build /app/actix-api/target/release/websocket_server /usr/bin/websocket_server

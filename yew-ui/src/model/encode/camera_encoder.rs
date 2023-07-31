@@ -12,12 +12,12 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::CanvasRenderingContext2d;
-use web_sys::HtmlCanvasElement;
 use web_sys::HtmlVideoElement;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
+use web_sys::OffscreenCanvas;
 use web_sys::VideoEncoder;
 use web_sys::VideoEncoderConfig;
 use web_sys::VideoEncoderEncodeOptions;
@@ -115,7 +115,7 @@ impl CameraEncoder {
                 .unwrap()
                 .create_element(&"canvas")
                 .unwrap()
-                .unchecked_into::<HtmlCanvasElement>();
+                .unchecked_into::<OffscreenCanvas>();
             let ctx = canvas_element
                 .get_context("2d")
                 .unwrap()

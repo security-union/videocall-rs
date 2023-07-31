@@ -1,4 +1,4 @@
-FROM rust:1.64-slim-bullseye
+FROM rust:1.65-slim-bullseye
 
 RUN rustup default nightly-2022-10-21
 

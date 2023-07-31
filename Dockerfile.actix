@@ -1,13 +1,6 @@
-FROM rust:1.70-slim-bullseye as development
+FROM --platform=linux/amd64 securityunion/rustlemania-api-base:push-images-to-dockerhub-304d6434 as build
 
-RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev
-RUN curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate && chmod +x /usr/bin/dbmate
-RUN cargo install cargo-watch
-RUN rustup component add clippy-preview
-RUN rustup component add rustfmt
-
-FROM development as build
-
+ENV CARGO_TARGET_DIR=/app/actix-api/target
 COPY . /app
 WORKDIR /app/actix-api
 RUN cargo build --release

@@ -1,0 +1,37 @@
+name: Publish API to Docker image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'actix-api/**'
+      - 'types/**'
+      - Dockerfile.actix
+
+jobs:
+  push_to_registry:
+    name: Push API Docker image to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v3
+        id: checkout
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Extract SHA
+        id: extract_sha
+        run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA::8})"
+
+      - name: Build and push API Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.actix
+          push: true
+          tags: securityunion/rustlemania-api:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}

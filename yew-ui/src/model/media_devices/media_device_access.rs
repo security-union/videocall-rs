@@ -1,13 +1,13 @@
 use gloo_utils::window;
-use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool,Ordering};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::MediaStreamConstraints;
 use yew::prelude::Callback;
 
 pub struct MediaDeviceAccess {
-    granted: Arc<Cell<bool>>,
+    granted: Arc<AtomicBool>,
     pub on_granted: Callback<()>,
     pub on_denied: Callback<()>,
 }
@@ -15,14 +15,14 @@ pub struct MediaDeviceAccess {
 impl MediaDeviceAccess {
     pub fn new() -> Self {
         Self {
-            granted: Arc::new(Cell::new(false)),
+            granted: Arc::new(AtomicBool::new(false)),
             on_granted: Callback::noop(),
             on_denied: Callback::noop(),
         }
     }
 
     pub fn is_granted(&self) -> bool {
-        self.granted.get()
+        self.granted.load(Ordering::Acquire)
     }
 
     pub fn request(&self) {
@@ -33,7 +33,7 @@ impl MediaDeviceAccess {
         wasm_bindgen_futures::spawn_local(async move {
             match future.await {
                 Ok(_) => {
-                    granted.set(true);
+                    granted.store(true, Ordering::Release);
                     on_granted.emit(());
                 }
                 Err(_) => on_denied.emit(()),

@@ -1,1 +1,1 @@
-FROM securityunion/yew:15154629
+FROM securityunion/yew:fix-ui-9ca15cac

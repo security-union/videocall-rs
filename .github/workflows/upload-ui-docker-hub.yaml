@@ -2,13 +2,13 @@ name: Publish UI to Docker image
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'yew-ui/**'
-      - 'types/**'
-      - Dockerfile.yew
-      - nginx.conf
+    # branches:
+    #   - main
+    # paths:
+    #   - 'yew-ui/**'
+    #   - 'types/**'
+    #   - Dockerfile.yew
+    #   - nginx.conf
 
 jobs:
   push_to_registry:

@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v3
       - uses: dtolnay/rust-toolchain@1.65
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, wasm-pack
           toolchain: nightly-2023-01-27
       - run: rustup target add wasm32-unknown-unknown
       - run: cd yew-ui && cargo fmt --check

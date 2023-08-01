@@ -1,23 +1,14 @@
-use gloo_utils::window;
-use js_sys::Array;
-use js_sys::Promise;
+use crate::model::media_devices::MediaDeviceList;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::EventTarget;
 use web_sys::HtmlSelectElement;
-use web_sys::MediaDeviceInfo;
-use web_sys::MediaDeviceKind;
 use yew::prelude::*;
 
 pub struct DeviceSelector {
-    audio_devices: Vec<MediaDeviceInfo>,
-    video_devices: Vec<MediaDeviceInfo>,
-    video_selected: Option<String>,
-    audio_selected: Option<String>,
+    media_devices: MediaDeviceList,
 }
 
 pub enum Msg {
-    DevicesLoaded(Vec<MediaDeviceInfo>),
+    DevicesLoaded,
     OnCameraSelect(String),
     OnMicSelect(String),
     LoadDevices(),
@@ -27,6 +18,21 @@ pub enum Msg {
 pub struct DeviceSelectorProps {
     pub on_camera_select: Callback<String>,
     pub on_microphone_select: Callback<String>,
+}
+
+impl DeviceSelector {
+    fn create_media_device_list(ctx: &Context<DeviceSelector>) -> MediaDeviceList {
+        let mut media_devices = MediaDeviceList::new();
+        let link = ctx.link().clone();
+        let on_microphone_select = ctx.props().on_microphone_select.clone();
+        let on_camera_select = ctx.props().on_camera_select.clone();
+        media_devices.on_loaded = Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
+        media_devices.audio_inputs.on_selected =
+            Callback::from(move |device_id| on_microphone_select.emit(device_id));
+        media_devices.video_inputs.on_selected =
+            Callback::from(move |device_id| on_camera_select.emit(device_id));
+        media_devices
+    }
 }
 
 impl Component for DeviceSelector {
@@ -39,10 +45,7 @@ impl Component for DeviceSelector {
             link.send_message(Msg::LoadDevices());
         });
         Self {
-            audio_devices: Vec::new(),
-            video_devices: Vec::new(),
-            audio_selected: None,
-            video_selected: None,
+            media_devices: Self::create_media_device_list(ctx),
         }
     }
 
@@ -52,79 +55,44 @@ impl Component for DeviceSelector {
         }
     }
 
-    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
+    fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::LoadDevices() => {
-                let link = ctx.link().clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let navigator = window().navigator();
-                    let media_devices = navigator.media_devices().unwrap();
-
-                    let promise: Promise = media_devices
-                        .enumerate_devices()
-                        .expect("enumerate devices");
-                    let future = JsFuture::from(promise);
-                    let devices = future
-                        .await
-                        .expect("await devices")
-                        .unchecked_into::<Array>();
-                    let devices = devices.to_vec();
-                    let devices = devices
-                        .into_iter()
-                        .map(|d| d.unchecked_into::<MediaDeviceInfo>())
-                        .collect::<Vec<MediaDeviceInfo>>();
-                    link.send_message(Msg::DevicesLoaded(devices));
-                });
+                self.media_devices.load();
                 false
             }
-            Msg::DevicesLoaded(devices) => {
-                self.audio_devices = devices
-                    .clone()
-                    .into_iter()
-                    .filter(|device| device.kind() == MediaDeviceKind::Audioinput)
-                    .collect();
-                self.video_devices = devices
-                    .into_iter()
-                    .filter(|device| device.kind() == MediaDeviceKind::Videoinput)
-                    .collect();
-                ctx.props()
-                    .on_camera_select
-                    .emit(self.video_devices[0].device_id());
-                ctx.props()
-                    .on_microphone_select
-                    .emit(self.audio_devices[0].device_id());
-                self.video_selected = Some(self.video_devices[0].device_id());
-                self.audio_selected = Some(self.audio_devices[0].device_id());
-                true
-            }
+            Msg::DevicesLoaded => true,
             Msg::OnCameraSelect(camera) => {
-                ctx.props().on_camera_select.emit(camera.clone());
-                self.video_selected = Some(camera);
+                self.media_devices.video_inputs.select(&camera);
                 true
             }
             Msg::OnMicSelect(mic) => {
-                ctx.props().on_microphone_select.emit(mic.clone());
-                self.audio_selected = Some(mic);
+                self.media_devices.audio_inputs.select(&mic);
                 true
             }
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let selected_mic = self.audio_selected.clone().unwrap_or_default();
-        let selected_camera = self.video_selected.clone().unwrap_or_default();
+        let mics = self.media_devices.audio_inputs.devices();
+        let cameras = self.media_devices.video_inputs.devices();
+        let selected_mic = self.media_devices.audio_inputs.selected();
+        let selected_camera = self.media_devices.video_inputs.selected();
+        fn selection(event: Event) -> String {
+            event
+                .target()
+                .expect("Event should have a target when dispatched")
+                .unchecked_into::<HtmlSelectElement>()
+                .value()
+        }
+
         html! {
             <div class={"device-selector-wrapper"}>
                 <label for={"audio-select"}>{ "Audio:" }</label>
                 <select id={"audio-select"} class={"device-selector"}
-                onchange={ctx.link().callback(|e: Event| {
-                    let target: EventTarget = e
-                    .target()
-                    .expect("Event should have a target when dispatched");
-                    let new_audio = target.unchecked_into::<HtmlSelectElement>().value();
-                    Msg::OnMicSelect(new_audio)
-                })}>
-                    { for self.audio_devices.iter().map(|device| html! {
+                        onchange={ctx.link().callback(|e: Event| Msg::OnMicSelect(selection(e)))}
+                >
+                    { for mics.iter().map(|device| html! {
                         <option value={device.device_id()} selected={selected_mic == device.device_id()}>
                             { device.label() }
                         </option>
@@ -132,14 +100,10 @@ impl Component for DeviceSelector {
                 </select>
                 <br/>
                 <label for={"video-select"}>{ "Video:" }</label>
-                <select id={"video-select"} class={"device-selector"} onchange={ctx.link().callback(|e:Event| {
-                    let target: EventTarget = e
-                    .target()
-                    .expect("Event should have a target when dispatched");
-                    let new_audio = target.unchecked_into::<HtmlSelectElement>().value();
-                    Msg::OnCameraSelect(new_audio)
-                })}>
-                    { for self.video_devices.iter().map(|device| html! {
+                <select id={"video-select"} class={"device-selector"}
+                        onchange={ctx.link().callback(|e:Event| Msg::OnCameraSelect(selection(e))) }
+                >
+                    { for cameras.iter().map(|device| html! {
                         <option value={device.device_id()} selected={selected_camera == device.device_id()}>
                             { device.label() }
                         </option>

@@ -4,9 +4,11 @@
 
 ## A. Purpose of the Request for Comment (RFC) 
 
-`videocall-rs` aims to provide a world-class video conferencing system. The video conferencing software should always be open-source and MIT licensed. Also a key feature of this system is that all calls will be end-to-end encrypted between the peers in the call. 
+Define our roadmap for Q3 and Q4 of 2023
 
 ## B. Overview of the Organization 
+
+Ronen Barzel: ronen@barzel.org Core contributor
 
 Griffin Obeid: griffobeid@securityunion.dev Co-founder and developer
 
@@ -15,6 +17,8 @@ Dario Lencina: dario@securityunion.dev  Co-founder and developer
 # II. Current Video Conferencing System 
 
 ## A. Description of the existing video conferencing system
+
+`videocall-rs` aims to provide a world-class video conferencing system. The video conferencing software should always be open-source and MIT licensed. Also a key feature of this system is that all calls will be end-to-end encrypted between the peers in the call. 
 
 The current videocall-rs exists at [https://github.com/security-union/videocall-rs](https://github.com/security-union/videocall-rs) and is hosted at [https://rustlemania.com](https://rustlemania.com). The primary connection mechanism is using WebSockets, but the system does also support WebTransport. Everything is written in Rust with the UI being a WASM based web application built through the Yew Web Framework. The UI is very barebones at this point. The backend is highly scalable by using a pub/sub architecture with NATS we can run as many instances of the server as we want. 
 

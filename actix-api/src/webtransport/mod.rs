@@ -294,10 +294,8 @@ where
                             }
                         }
                     });
-                } else {
-                    if let Err(e) = session.send_datagram(msg.data.into()) {
-                        error!("Error sending datagram: {}", e);
-                    }
+                } else if let Err(e) = session.send_datagram(msg.data.into()) {
+                    error!("Error sending datagram: {}", e);
                 }
             }
         })
@@ -334,7 +332,7 @@ where
                 if let Some((_id, buf)) = datagram {
                     let nc = nc.clone();
                     let specific_subject_clone = specific_subject.clone();
-                    if let Err(e) = nc.publish(&specific_subject_clone, buf) {
+                    if let Err(e) = nc.publish(&specific_subject_clone, buf).await {
                         error!(
                             "Error publishing to subject {}: {}",
                             specific_subject_clone, e

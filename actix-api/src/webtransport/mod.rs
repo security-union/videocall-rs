@@ -213,14 +213,6 @@ async fn handle_connection(
     Ok(())
 }
 
-macro_rules! log_result {
-    ($expr:expr) => {
-        if let Err(err) = $expr {
-            tracing::error!("{err:?}");
-        }
-    };
-}
-
 #[tracing::instrument(level = "trace", skip(session))]
 async fn handle_session<C>(
     session: WebTransportSession<C, Bytes>,
@@ -293,7 +285,9 @@ where
                     tokio::spawn(async move {
                         match stream {
                             Ok(mut uni_stream) => {
-                                uni_stream.write_all(&msg.data).await;
+                                if let Err(e) = uni_stream.write_all(&msg.data).await {
+                                    error!("Error writing to unidirectional stream: {}", e);
+                                }
                             }
                             Err(e) => {
                                 error!("Error opening unidirectional stream: {}", e);
@@ -301,7 +295,9 @@ where
                         }
                     });
                 } else {
-                    session.send_datagram(msg.data.into());
+                    if let Err(e) = session.send_datagram(msg.data.into()) {
+                        error!("Error sending datagram: {}", e);
+                    }
                 }
             }
         })
@@ -319,8 +315,12 @@ where
                     let specific_subject = specific_subject.clone();
                     tokio::spawn(async move {
                         let mut buf = Vec::new();
-                        uni_stream.read_to_end(&mut buf).await;
-                        nc.publish(&specific_subject, buf).await;
+                        if let Err(e) = uni_stream.read_to_end(&mut buf).await {
+                            error!("Error reading from unidirectional stream: {}", e);
+                        }
+                        if let Err(e) = nc.publish(&specific_subject, buf).await {
+                            error!("Error publishing to subject {}: {}", specific_subject, e);
+                        }
                     });
                 }
             }
@@ -334,7 +334,12 @@ where
                 if let Some((_id, buf)) = datagram {
                     let nc = nc.clone();
                     let specific_subject_clone = specific_subject.clone();
-                    nc.publish(&specific_subject_clone, buf);
+                    if let Err(e) = nc.publish(&specific_subject_clone, buf) {
+                        error!(
+                            "Error publishing to subject {}: {}",
+                            specific_subject_clone, e
+                        );
+                    }
                 }
             }
         })

@@ -91,7 +91,7 @@ impl PeerDecodeManager {
     }
 
     fn add_peer(&mut self, email: &String) {
-        self.insert_peer(&email);
+        self.insert_peer(email);
         self.on_peer_added.emit(email.clone())
     }
 
@@ -109,14 +109,14 @@ impl PeerDecodeManager {
 
     fn delete_peer(&mut self, email: &String) {
         self.connected_peers.remove(email);
-        if let Ok(index) = self.sorted_connected_peers_keys.binary_search(&email) {
+        if let Ok(index) = self.sorted_connected_peers_keys.binary_search(email) {
             self.sorted_connected_peers_keys.remove(index);
         }
-        self.insert_peer(&email);
+        self.insert_peer(email);
     }
 
     fn reset_peer(&mut self, email: &String) {
-        self.delete_peer(&email);
-        self.insert_peer(&email);
+        self.delete_peer(email);
+        self.insert_peer(email);
     }
 }

@@ -175,7 +175,7 @@ fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<Med
     match MediaPacket::parse_from_bytes(&bytes) {
         Ok(media_packet) => callback.emit(MediaPacketWrapper(media_packet)),
         Err(_) => {
-            let message_type = format!("{:?}", message_type);
+            let message_type = format!("{message_type:?}");
             log!("failed to parse media packet ", message_type);
         }
     }

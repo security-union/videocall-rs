@@ -59,10 +59,8 @@ impl Component for Host {
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         // Determine if we should start/stop screen share.
-        if self.screen.set_enabled(ctx.props().share_screen) {
-            if ctx.props().share_screen {
-                ctx.link().send_message(Msg::EnableScreenShare);
-            }
+        if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
+            ctx.link().send_message(Msg::EnableScreenShare);
         }
         // Determine if we should start/stop microphone.
         if self.microphone.set_enabled(ctx.props().mic_enabled) {

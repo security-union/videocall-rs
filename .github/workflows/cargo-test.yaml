@@ -23,28 +23,29 @@ env:
 jobs:
 
   test-api:
-    name: API Test Suite
+    name: cargo test and lint api
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@1.70
         with:
-          working-directory: ./actix-api
+          components: clippy, rustfmt
+      - run: cd actix-api && cargo clippy -- --deny warnings
+      - run: cd actix-api && cargo fmt --check
+      - run: cd actix-api && cargo test 
 
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+
+  lint-ui:
+    name: cargo lint ui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@1.65
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        continue-on-error: false  # WARNING: only for this example, remove it!
-        with:
-          command: test
-          args: --manifest-path ./actix-api/Cargo.toml
-
+          components: clippy, rustfmt
+          toolchain: nightly-2023-01-27
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cd yew-ui && cargo fmt --check
 
   test-ui:
     name: UI Test Suite
@@ -60,7 +61,7 @@ jobs:
         with:
           profile: minimal
           target: wasm32-unknown-unknown
-          toolchain: nightly-2022-10-21
+          toolchain: nightly-2023-01-27
           override: true
 
       - name: Install wasm-bindgen-cli

@@ -90,7 +90,7 @@ impl Component for App {
         }
     }
 
-    fn view(&self, ctx: &Context<Self>) -> Html {
+    fn view(&self, _ctx: &Context<Self>) -> Html {
         log!("OAuth enabled: {}", *ENABLE_OAUTH);
         html! {
             <BrowserRouter>

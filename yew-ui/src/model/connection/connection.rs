@@ -26,7 +26,7 @@ pub struct Connection {
 
 impl Connection {
     pub fn connect(webtransport: bool, options: ConnectOptions) -> anyhow::Result<Self> {
-        let mut options = options.clone();
+        let mut options = options;
         let userid = options.userid.clone();
         let status = Arc::new(Cell::new(Status::Connecting));
         {

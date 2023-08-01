@@ -7,6 +7,8 @@ services:
         source: ../
         target: /app
       - /app/target
+      - rustlemania-yew-ui-cargo-registry-cache:/usr/local/cargo/registry
+
     build:
       dockerfile: ../docker/Dockerfile.yew
     working_dir: /app/yew-ui
@@ -46,6 +48,8 @@ services:
         source: ../
         target: /app
       - /app/target
+      - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
+
     depends_on:
       - postgres
       - nats
@@ -69,6 +73,8 @@ services:
         source: ../
         target: /app
       - /app/target
+      - rustlemania-actix-webtransport-cargo-registry-cache:/usr/local/cargo/registry
+
     depends_on:
       - nats
 
@@ -97,3 +103,8 @@ services:
       - type: bind
         source: ../
         target: /app
+
+volumes:
+  rustlemania-actix-web-cargo-registry-cache:
+  rustlemania-actix-webtransport-cargo-registry-cache:
+  rustlemania-yew-ui-cargo-registry-cache:

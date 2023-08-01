@@ -158,8 +158,8 @@ impl Component for AttendantsComponent {
                     let email = ctx.props().email.clone();
                     let options = ConnectOptions {
                         userid: email.clone(),
-                        websocket_url: format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id),
-                        webtransport_url: format!("{}/{}/{}", WEBTRANSPORT_HOST, email, id),
+                        websocket_url: format!("{ACTIX_WEBSOCKET}/{email}/{id}"),
+                        webtransport_url: format!("{WEBTRANSPORT_HOST}/{email}/{id}"),
                         on_inbound_media: ctx.link().callback(Msg::OnInboundMedia),
                         on_connected: ctx.link().callback(|_| Msg::from(WsAction::Connected)),
                         on_connection_lost: ctx
@@ -172,7 +172,7 @@ impl Component for AttendantsComponent {
                         }
                         Err(e) => {
                             ctx.link()
-                                .send_message(WsAction::Log(format!("Connection failed: {}", e)));
+                                .send_message(WsAction::Log(format!("Connection failed: {e}")));
                         }
                     }
 
@@ -217,7 +217,7 @@ impl Component for AttendantsComponent {
                 if let Err(e) = self.peer_decode_manager.decode(response) {
                     log!("error decoding packet: {:?}", e);
                 }
-                return false;
+                false
             }
             Msg::OnOutboundPacket(media) => {
                 if let Some(connection) = &self.connection {
@@ -372,7 +372,7 @@ fn user_video(props: &UserVideoProps) -> Html {
 fn toggle_pinned_div(div_id: &str) {
     if let Some(div) = window()
         .and_then(|w| w.document())
-        .and_then(|doc| doc.get_element_by_id(&div_id))
+        .and_then(|doc| doc.get_element_by_id(div_id))
     {
         // if the div does not have the grid-item-pinned css class, add it to it
         if !div.class_list().contains("grid-item-pinned") {

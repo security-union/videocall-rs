@@ -143,8 +143,6 @@ mod test {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    
-
     use super::*;
     pub struct MockVideoDecoder {
         chunks: Arc<Mutex<Vec<Arc<MediaPacket>>>>,

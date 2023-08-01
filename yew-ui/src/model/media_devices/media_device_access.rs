@@ -28,7 +28,7 @@ impl MediaDeviceAccess {
     pub fn request(&self) {
         let future = Self::request_permissions();
         let on_granted = self.on_granted.clone();
-        let on_denied = self.on_granted.clone();
+        let on_denied = self.on_denied.clone();
         let granted = Arc::clone(&self.granted);
         wasm_bindgen_futures::spawn_local(async move {
             match future.await {

@@ -40,9 +40,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@nightly-2023-01-27
+      - uses: dtolnay/rust-toolchain@1.65
         with:
           components: clippy, rustfmt
+          toolchain: nightly-2023-01-27
       - run: rustup target add wasm32-unknown-unknown
       - run: cd yew-ui && cargo fmt --check
       - run: cd yew-ui && cargo test 

@@ -27,14 +27,14 @@ pub(super) trait WebMedia<TASK> {
     fn send_packet(&self, packet: MediaPacket) {
         match packet
             .write_to_bytes()
-            .map_err(|w| JsValue::from(format!("{:?}", w)))
+            .map_err(|w| JsValue::from(format!("{w:?}")))
         {
             Ok(bytes) => self.send_bytes(bytes),
             Err(e) => {
                 let packet_type = packet.media_type.enum_value_or_default();
                 log!(
                     "error sending {} packet: {:?}",
-                    JsValue::from(format!("{}", packet_type)),
+                    JsValue::from(format!("{packet_type}")),
                     e
                 );
             }

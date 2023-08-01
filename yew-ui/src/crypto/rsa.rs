@@ -18,11 +18,11 @@ impl RsaWrapper {
     pub fn encrypt(&mut self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         Ok(self
             .pub_key
-            .encrypt(&mut self.rng, Pkcs1v15Encrypt, &data)?)
+            .encrypt(&mut self.rng, Pkcs1v15Encrypt, data)?)
     }
 
     pub fn decrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        Ok(self.key.decrypt(Pkcs1v15Encrypt, &data)?)
+        Ok(self.key.decrypt(Pkcs1v15Encrypt, data)?)
     }
 }
 

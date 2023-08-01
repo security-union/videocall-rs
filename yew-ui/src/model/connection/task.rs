@@ -25,7 +25,7 @@ impl Task {
             }
         }
         log!("Task::connect trying WebSocket");
-        WebSocketTask::connect(options.clone()).map(|task| Task::WebSocket(task))
+        WebSocketTask::connect(options).map(Task::WebSocket)
     }
 
     pub fn send_packet(&self, packet: MediaPacket) {

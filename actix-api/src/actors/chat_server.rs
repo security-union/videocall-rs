@@ -15,6 +15,12 @@ pub struct ChatServer {
     active_subs: HashMap<SessionId, nats::Handler>,
 }
 
+impl Default for ChatServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChatServer {
     pub fn new() -> Self {
         let nc = nats::Options::new()

@@ -1,4 +1,5 @@
 #![feature(future_join)]
+#![feature(once_cell)]
 
 mod components;
 mod constants;

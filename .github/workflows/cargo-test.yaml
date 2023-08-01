@@ -23,11 +23,11 @@ env:
 jobs:
 
   test-api:
-    name: cargo test
+    name: cargo test and lint api
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@1.66
+      - uses: dtolnay/rust-toolchain@1.70
         with:
           components: clippy, rustfmt
       - run: cd actix-api && cargo clippy -- --deny warnings
@@ -36,15 +36,13 @@ jobs:
 
 
   test-ui:
-    name: cargo test
+    name: cargo test and lint ui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@1.66
+      - uses: dtolnay/rust-toolchain@nightly-2023-01-27
         with:
           components: clippy, rustfmt
-      # - run: cd yew-ui && cargo clippy -- --deny warnings
-      - run: rustup default nightly-2023-01-27
       - run: rustup target add wasm32-unknown-unknown
       - run: cd yew-ui && cargo fmt --check
       - run: cd yew-ui && cargo test 

@@ -7,10 +7,12 @@ services:
         source: ../
         target: /app
       - /app/target
+      - yew-ui-cargo-registry-cache:/usr/local/cargo/registry
+
     build:
       dockerfile: ../docker/Dockerfile.yew
     working_dir: /app/yew-ui
-    command: bash -c "trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
+    command: bash -c "rustup target add wasm32-unknown-unknown && trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
     environment:
       - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
       - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
@@ -46,6 +48,8 @@ services:
         source: ../
         target: /app
       - /app/target
+      - actix-web-cargo-registry-cache:/usr/local/cargo/registry
+
     depends_on:
       - postgres
       - nats
@@ -69,6 +73,8 @@ services:
         source: ../
         target: /app
       - /app/target
+      - actix-web-cargo-registry-cache:/usr/local/cargo/registry
+
     depends_on:
       - nats
 
@@ -97,3 +103,7 @@ services:
       - type: bind
         source: ../
         target: /app
+
+volumes:
+  actix-web-cargo-registry-cache:
+  yew-ui-cargo-registry-cache:

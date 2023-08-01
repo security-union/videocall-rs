@@ -2,21 +2,29 @@
 
 # I Executive Summary 
 
-## A. Purpose of the Request for Comment (RFC) 
+## A. Goal of the System
+
+Creating an open video conferencing ecosystem — i.e. open source definitions and building blocks that would support video conferencing that could be embedded in various apps — as well of course as the video conferencing system itself.
+
+For possible applications, imagine things like telemedicine apps or face-to-face customer service portals, where the video chat would be integrated rather than requiring a participant to say the equivalent of “I’ll send you a zoom link”.
+
+The Rustlemania website is a sample implementation of this system.
+
+## B. Purpose of the Request for Comment (RFC) 
 
 Define our roadmap for Q3 and Q4 of 2023
 
-## B. Overview of the Organization 
-
-Ronen Barzel: ronen@barzel.org Core contributor
+## C. Overview of the Organization 
 
 Griffin Obeid: griffobeid@securityunion.dev Co-founder and developer
 
+Ronen Barzel: ronen@barzel.org Core Contributor
+
 Dario Lencina: dario@securityunion.dev  Co-founder and developer
 
-# II. Current Video Conferencing System 
+# II. Current System 
 
-## A. Description of the existing video conferencing system
+## A. Description of the existing system
 
 `videocall-rs` aims to provide a world-class video conferencing system. The video conferencing software should always be open-source and MIT licensed. Also a key feature of this system is that all calls will be end-to-end encrypted between the peers in the call. 
 
@@ -34,7 +42,7 @@ The current videocall-rs exists at [https://github.com/security-union/videocall-
 **Limitations**
 - Only works on Chrome or Chromium based browsers
 
-# III. Proposed Video Conferencing System Roadmap 
+# III. Proposed System Roadmap 
 
 ## A. Roadmap
 
@@ -42,7 +50,7 @@ The current videocall-rs exists at [https://github.com/security-union/videocall-
 | ------- | -------- | ----------- | ------------ | ------- |
 | Q3 2023 | E2EE | 2023-08-02 | 2023-08-05 | 2 - <pick a band> |
 | Q3 2023 | Safari support | 2023-08-15 | 2023-08-20 | 3 |
-| Q3 2023 | ROS Library Beta | 2023-09-01 | 2023-09-05 | 4 |
+| Q3 2023 | ROS Library Beta, Conference recording | 2023-09-01 | 2023-09-05 | 4 |
 | Q3 2023 | Firefox support, Screen sharing v2 | 2023-09-15 | 2023-09-20 | - |
 | Q4 2023 | ROS Library Beta V2 | 2023-10-01 | 2023-10-05 | 5 |
 | Q4 2023 | Landing page? | 2023-10-10 | 2023-10-15 | 6 |

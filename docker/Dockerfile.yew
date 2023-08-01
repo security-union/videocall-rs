@@ -1,5 +1,4 @@
 FROM securityunion/yew:fix-image-no-cigar-c4770e96
 
-RUN rustup target add wasm32-unknown-unknown
 RUN rustup component add clippy-preview
 RUN rustup component add rustfmt

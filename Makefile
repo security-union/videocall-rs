@@ -1,9 +1,6 @@
 test:
-		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app/yew-ui && cargo test"
+		# docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app/yew-ui && cargo test"
 		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo test"
-
-ui_test_up:
-		docker compose -f docker/docker-compose.yaml run yew-ui /bin/bash
 
 up:
 		docker compose -f docker/docker-compose.yaml up

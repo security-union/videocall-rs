@@ -1,9 +1,9 @@
-use super::task::Task;
-use super::ConnectOptions;
 ///
 /// Connection struct wraps the lower-level "Task" (task.rs), providing a heartbeat and keeping
 /// track of connection status.
 ///
+use super::task::Task;
+use super::ConnectOptions;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use protobuf::Message;
@@ -81,8 +81,9 @@ impl Connection {
                 timestamp: js_sys::Date::now(),
                 ..Default::default()
             };
+            let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();
             let packet = PacketWrapper {
-                data: aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap(),
+                data,
                 email: userid.clone(),
                 packet_type: PacketType::MEDIA.into(),
                 ..Default::default()

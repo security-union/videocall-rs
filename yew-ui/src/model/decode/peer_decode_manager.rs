@@ -73,15 +73,23 @@ impl MultiDecoder {
 
         let packet = {
             if let Some(aes) = self.aes {
-                aes.decrypt(&packet.data)
-                    .map_err(|_e| MultiDecoderError::AesDecryptError)?
+                let data = aes
+                    .decrypt(&packet.data)
+                    .map_err(|_e| MultiDecoderError::AesDecryptError)?;
+                Arc::new(MediaPacket::parse_from_bytes(&data).map_err(|_e| {
+                    MultiDecoderError::Other(String::from(
+                        "Failed to parse to protobuf MediaPacket",
+                    ))
+                })?)
             } else {
-                packet.data.clone()
+                Arc::new(MediaPacket::parse_from_bytes(&packet.data).map_err(|_e| {
+                    MultiDecoderError::Other(String::from(
+                        "Failed to parse to protobuf MediaPacket",
+                    ))
+                })?)
             }
         };
-        let packet = Arc::new(MediaPacket::parse_from_bytes(&packet).map_err(|_e| {
-            MultiDecoderError::Other(String::from("Failed to parse to protobuf MediaPacket"))
-        })?);
+
         let media_type = packet
             .media_type
             .enum_value()

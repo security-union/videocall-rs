@@ -7,7 +7,7 @@ mod crypto;
 mod model;
 mod pages;
 
-use constants::{truthy, LOGIN_URL, WEBTRANSPORT_ENABLED};
+use constants::{truthy, E2EE_ENABLED, LOGIN_URL, WEBTRANSPORT_ENABLED};
 
 use yew::prelude::*;
 #[macro_use]
@@ -47,7 +47,7 @@ fn switch(routes: Route) -> Html {
         Route::Meeting { email, id } => html! {
             <>
                 <TopBar/>
-                <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} />
+                <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} e2ee_enabled={*E2EE_ENABLED} />
             </>
         },
         Route::Meeting2 {
@@ -57,7 +57,7 @@ fn switch(routes: Route) -> Html {
         } => html! {
             <>
                 <TopBar/>
-                <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(webtransport_enabled)} />
+                <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(webtransport_enabled)} e2ee_enabled={*E2EE_ENABLED} />
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },

@@ -36,4 +36,5 @@ lazy_static! {
     pub static ref ENABLE_OAUTH: bool = truthy(std::env!("ENABLE_OAUTH").to_string());
     pub static ref WEBTRANSPORT_ENABLED: bool =
         truthy(std::env!("WEBTRANSPORT_ENABLED").to_string());
+    pub static ref E2EE_ENABLED: bool = truthy(std::env!("E2EE_ENABLED").to_string());
 }

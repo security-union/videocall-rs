@@ -15,11 +15,6 @@ impl RsaWrapper {
         Ok(Self { key, pub_key })
     }
 
-    pub fn encrypt(&mut self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let mut rng = rand::thread_rng();
-        Ok(self.pub_key.encrypt(&mut rng, Pkcs1v15Encrypt, data)?)
-    }
-
     pub fn decrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         Ok(self.key.decrypt(Pkcs1v15Encrypt, data)?)
     }
@@ -37,9 +32,9 @@ mod test {
 
     #[wasm_bindgen_test]
     fn test_rsa_thread_rng() {
-        let mut key = RsaWrapper::new().unwrap();
+        let key = RsaWrapper::new().unwrap();
         let data = b"hello world";
-        let encrypted = key.encrypt(data).unwrap();
+        let encrypted = key.encrypt_with_key(data, &key.pub_key).unwrap();
         let decrypted = key.decrypt(&encrypted).unwrap();
         assert_eq!(data, decrypted.as_slice());
     }

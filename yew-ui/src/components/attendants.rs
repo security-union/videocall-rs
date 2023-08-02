@@ -246,6 +246,7 @@ impl Component for AttendantsComponent {
                 }
             },
             Msg::OnPeerAdded(_email) => {
+                log!("New peer arrived.");
                 self.send_public_key(ctx);
                 true
             }
@@ -258,7 +259,7 @@ impl Component for AttendantsComponent {
                 // TODO: Don't unwrap
                 match response.packet_type.enum_value() {
                     Ok(PacketType::AES_KEY) => {
-                        log!("Received AES_KEY ", &response.email);
+                        log!("Received AES_KEY", &response.email);
                         if let Ok(bytes) = self.rsa.decrypt(&response.data) {
                             let aes_packet = AesPacket::parse_from_bytes(&bytes).unwrap();
                             self.peer_keys.insert(
@@ -297,6 +298,9 @@ impl Component for AttendantsComponent {
                             if let Err(e) = self.peer_decode_manager.decode(response, key) {
                                 log!("error decoding packet:", JsValue::from_str(&e.to_string()));
                             }
+                        } else {
+                            log!("No key found for peer");
+                            self.send_public_key(ctx)
                         }
                     }
                     Err(_) => {}

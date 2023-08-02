@@ -1,8 +1,7 @@
-use anyhow::anyhow;
 use gloo_console::log;
 use protobuf::Message;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 use types::protos::media_packet::MediaPacket;
 use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use types::protos::{media_packet::media_packet::MediaType, packet_wrapper::PacketWrapper};
@@ -11,6 +10,29 @@ use yew::prelude::Callback;
 use crate::crypto::aes::Aes128State;
 
 use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
+
+#[derive(Debug)]
+pub enum MultiDecoderError {
+    AesDecryptError,
+    IncorrectPacketType,
+    AudioDecodeError,
+    ScreenDecodeError,
+    VideoDecodeError,
+    Other(String),
+}
+
+impl Display for MultiDecoderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MultiDecoderError::AesDecryptError => write!(f, "AesDecryptError"),
+            MultiDecoderError::IncorrectPacketType => write!(f, "IncorrectPacketType"),
+            MultiDecoderError::AudioDecodeError => write!(f, "AudioDecodeError"),
+            MultiDecoderError::ScreenDecodeError => write!(f, "ScreenDecodeError"),
+            MultiDecoderError::VideoDecodeError => write!(f, "VideoDecodeError"),
+            MultiDecoderError::Other(s) => write!(f, "Other: {}", s),
+        }
+    }
+}
 
 pub struct MultiDecoder {
     pub audio: AudioPeerDecoder,
@@ -37,46 +59,47 @@ impl MultiDecoder {
     }
 
     // Note: arbitrarily using error code 0 for decoder failure, since it doesn't provide any error value
-    fn decode(&mut self, packet: &Arc<PacketWrapper>) -> anyhow::Result<(MediaType, DecodeStatus)> {
+    fn decode(
+        &mut self,
+        packet: &Arc<PacketWrapper>,
+    ) -> Result<(MediaType, DecodeStatus), MultiDecoderError> {
         if packet
             .packet_type
             .enum_value()
-            .map_err(|_e| anyhow!("No packet_type"))?
+            .map_err(|_e| MultiDecoderError::Other(String::from("No packet_type")))?
             != PacketType::MEDIA
         {
-            return Err(anyhow!("Incorrect packet type"));
+            return Err(MultiDecoderError::IncorrectPacketType);
         }
-        log!("Decoding media packet for email ", &self.email);
         let packet = self
             .aes
             .decrypt(&packet.data)
-            .map_err(|_e| anyhow!("Failed to decrypt with aes"))?;
-        let packet = Arc::new(
-            MediaPacket::parse_from_bytes(&packet)
-                .map_err(|_e| anyhow!("Failed to parse to protobuf MediaPacket"))?,
-        );
+            .map_err(|_e| MultiDecoderError::AesDecryptError)?;
+        let packet = Arc::new(MediaPacket::parse_from_bytes(&packet).map_err(|_e| {
+            MultiDecoderError::Other(String::from("Failed to parse to protobuf MediaPacket"))
+        })?);
         let media_type = packet
             .media_type
             .enum_value()
-            .map_err(|_e| anyhow!("No media_type"))?;
+            .map_err(|_e| MultiDecoderError::Other(String::from("No media_type")))?;
         match media_type {
             MediaType::VIDEO => Ok((
                 media_type,
                 self.video
                     .decode(&packet)
-                    .map_err(|_e| anyhow!("Failed to decode video"))?,
+                    .map_err(|_e| MultiDecoderError::VideoDecodeError)?,
             )),
             MediaType::AUDIO => Ok((
                 media_type,
                 self.audio
                     .decode(&packet)
-                    .map_err(|_e| anyhow!("Failed to decode audio"))?,
+                    .map_err(|_e| MultiDecoderError::AudioDecodeError)?,
             )),
             MediaType::SCREEN => Ok((
                 media_type,
                 self.screen
                     .decode(&packet)
-                    .map_err(|_e| anyhow!("Failed to decode screen"))?,
+                    .map_err(|_e| MultiDecoderError::ScreenDecodeError)?,
             )),
             MediaType::HEARTBEAT => Ok((
                 media_type,
@@ -118,7 +141,11 @@ impl PeerDecodeManager {
         self.connected_peers.get(key)
     }
 
-    pub fn decode(&mut self, response: PacketWrapper, aes: &Aes128State) -> anyhow::Result<()> {
+    pub fn decode(
+        &mut self,
+        response: PacketWrapper,
+        aes: &Aes128State,
+    ) -> Result<(), MultiDecoderError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if !self.connected_peers.contains_key(&email) {
@@ -138,11 +165,12 @@ impl PeerDecodeManager {
                 }
             }
         } else {
-            Err(anyhow!("No peer found"))
+            Err(MultiDecoderError::Other(String::from("No peer found")))
         }
     }
 
     fn add_peer(&mut self, email: &String, aes: &Aes128State) {
+        log!("Adding peer", email);
         self.insert_peer(email, aes);
         self.on_peer_added.emit(email.clone())
     }

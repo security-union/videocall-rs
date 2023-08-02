@@ -50,6 +50,8 @@ The current videocall-rs exists at [https://github.com/security-union/videocall-
 | ------- | -------- | ----------- | ------------ | ------- |
 | Q3 2023 | E2EE | 2023-08-02 | 2023-08-05 | 2 - <pick a band> |
 | Q3 2023 | Safari support | 2023-08-15 | 2023-08-20 | 3 |
+| Q3 2023 | Improved docs | 2023-08-15 | 2023-08-20 | 3 |
+| Q3 2023 | Release crate | 2023-08-15 | 2023-08-20 | 3 |
 | Q3 2023 | ROS Library Beta, Conference recording | 2023-09-01 | 2023-09-05 | 4 |
 | Q3 2023 | Firefox support, Screen sharing v2 | 2023-09-15 | 2023-09-20 | - |
 | Q4 2023 | ROS Library Beta V2 | 2023-10-01 | 2023-10-05 | 5 |

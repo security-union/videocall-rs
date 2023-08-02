@@ -39,7 +39,7 @@ pub struct MultiDecoder {
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
     pub email: String,
-    pub aes: Aes128State,
+    pub aes: Option<Aes128State>,
 }
 
 impl MultiDecoder {
@@ -47,7 +47,7 @@ impl MultiDecoder {
         video_canvas_id: String,
         screen_canvas_id: String,
         email: String,
-        aes: Aes128State,
+        aes: Option<Aes128State>,
     ) -> Self {
         Self {
             audio: AudioPeerDecoder::new(),
@@ -58,7 +58,6 @@ impl MultiDecoder {
         }
     }
 
-    // Note: arbitrarily using error code 0 for decoder failure, since it doesn't provide any error value
     fn decode(
         &mut self,
         packet: &Arc<PacketWrapper>,
@@ -71,10 +70,16 @@ impl MultiDecoder {
         {
             return Err(MultiDecoderError::IncorrectPacketType);
         }
-        let packet = self
-            .aes
-            .decrypt(&packet.data)
-            .map_err(|_e| MultiDecoderError::AesDecryptError)?;
+
+        let packet = {
+            if let Some(aes) = self.aes {
+                aes
+                    .decrypt(&packet.data)
+                    .map_err(|_e| MultiDecoderError::AesDecryptError)?
+            } else {
+                packet.data.clone()
+            }
+        };
         let packet = Arc::new(MediaPacket::parse_from_bytes(&packet).map_err(|_e| {
             MultiDecoderError::Other(String::from("Failed to parse to protobuf MediaPacket"))
         })?);
@@ -144,7 +149,7 @@ impl PeerDecodeManager {
     pub fn decode(
         &mut self,
         response: PacketWrapper,
-        aes: &Aes128State,
+        aes: Option<Aes128State>,
     ) -> Result<(), MultiDecoderError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
@@ -169,34 +174,34 @@ impl PeerDecodeManager {
         }
     }
 
-    fn add_peer(&mut self, email: &String, aes: &Aes128State) {
+    fn add_peer(&mut self, email: &String, aes: Option<Aes128State>) {
         log!("Adding peer", email);
         self.insert_peer(email, aes);
         self.on_peer_added.emit(email.clone())
     }
 
-    fn insert_peer(&mut self, email: &String, aes: &Aes128State) {
+    fn insert_peer(&mut self, email: &String, aes: Option<Aes128State>) {
         self.connected_peers.insert(
             email.clone(),
             MultiDecoder::new(
                 self.get_video_canvas_id.emit(email.clone()),
                 self.get_screen_canvas_id.emit(email.clone()),
                 email.clone(),
-                *aes,
+                aes,
             ),
         );
         self.sorted_connected_peers_keys.push(email.clone());
         self.sorted_connected_peers_keys.sort();
     }
 
-    fn delete_peer(&mut self, email: &String) {
+    pub fn delete_peer(&mut self, email: &String) {
         self.connected_peers.remove(email);
         if let Ok(index) = self.sorted_connected_peers_keys.binary_search(email) {
             self.sorted_connected_peers_keys.remove(index);
         }
     }
 
-    fn reset_peer(&mut self, email: &String, aes: &Aes128State) {
+    fn reset_peer(&mut self, email: &String, aes: Option<Aes128State>) {
         self.delete_peer(email);
         self.insert_peer(email, aes);
     }

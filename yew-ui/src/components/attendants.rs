@@ -8,7 +8,6 @@ use crate::crypto::rsa::RsaWrapper;
 use crate::model::connection::{ConnectOptions, Connection};
 use crate::model::decode::PeerDecodeManager;
 use crate::model::media_devices::MediaDeviceAccess;
-use crate::model::EncryptedMediaPacket;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_console::log;
 use protobuf::Message;
@@ -255,8 +254,6 @@ impl Component for AttendantsComponent {
                 _ => false,
             },
             Msg::OnInboundMedia(response) => {
-                // TODO: Need to use the correct key for the peer.
-                // TODO: Don't unwrap
                 match response.packet_type.enum_value() {
                     Ok(PacketType::AES_KEY) => {
                         log!("Received AES_KEY", &response.email);
@@ -266,8 +263,6 @@ impl Component for AttendantsComponent {
                                 response.email,
                                 Aes128State::from_vecs(aes_packet.key, aes_packet.iv),
                             );
-                        } else {
-                            log!("Failed to decrypt AES_KEY");
                         }
                         return false;
                     }
@@ -275,7 +270,7 @@ impl Component for AttendantsComponent {
                         log!("Received RSA_PUB_KEY");
                         let rsa_packet = RsaPacket::parse_from_bytes(&response.data).unwrap();
                         let pub_key =
-                            RsaPublicKey::from_public_key_der(&rsa_packet.public_key_pkcs1)
+                            RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
                                 .unwrap();
                         // Send AES key to the host
                         let aes_packet = AesPacket {
@@ -294,9 +289,12 @@ impl Component for AttendantsComponent {
                             }));
                     }
                     Ok(PacketType::MEDIA) => {
-                        if let Some(key) = self.peer_keys.get(&response.email) {
-                            if let Err(e) = self.peer_decode_manager.decode(response, key) {
+                        let email = response.email.clone();
+                        if let Some(key) = self.peer_keys.get(&email) {
+                            if let Err(e) = self.peer_decode_manager.decode(response, Some(*key)) {
                                 log!("error decoding packet:", JsValue::from_str(&e.to_string()));
+                                self.peer_decode_manager.delete_peer(&email);
+                                self.peer_keys.remove(&email);
                             }
                         } else {
                             log!("No key found for peer");

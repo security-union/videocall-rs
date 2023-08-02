@@ -73,8 +73,7 @@ impl MultiDecoder {
 
         let packet = {
             if let Some(aes) = self.aes {
-                aes
-                    .decrypt(&packet.data)
+                aes.decrypt(&packet.data)
                     .map_err(|_e| MultiDecoderError::AesDecryptError)?
             } else {
                 packet.data.clone()

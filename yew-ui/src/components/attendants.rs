@@ -270,8 +270,7 @@ impl Component for AttendantsComponent {
                         log!("Received RSA_PUB_KEY");
                         let rsa_packet = RsaPacket::parse_from_bytes(&response.data).unwrap();
                         let pub_key =
-                            RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
-                                .unwrap();
+                            RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der).unwrap();
                         // Send AES key to the host
                         let aes_packet = AesPacket {
                             key: self.aes.key.to_vec(),

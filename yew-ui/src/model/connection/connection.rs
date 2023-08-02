@@ -1,11 +1,10 @@
-use crate::crypto::aes::Aes128State;
-
-//
-// Connection struct wraps the lower-level "Task" (task.rs), providing a heartbeat and keeping
-// track of connection status.
-//
 use super::task::Task;
 use super::ConnectOptions;
+///
+/// Connection struct wraps the lower-level "Task" (task.rs), providing a heartbeat and keeping
+/// track of connection status.
+///
+use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use protobuf::Message;
 use std::cell::Cell;

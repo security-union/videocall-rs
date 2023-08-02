@@ -103,10 +103,10 @@ impl AttendantsComponent {
 
     fn send_public_key(&self, ctx: &Context<Self>) {
         let email = ctx.props().email.clone();
-        let public_key_pkcs1 = self.rsa.pub_key.to_public_key_der().unwrap().into_vec();
+        let public_key_der = self.rsa.pub_key.to_public_key_der().unwrap().into_vec();
         let data = RsaPacket {
             username: email.clone(),
-            public_key_pkcs1,
+            public_key_der,
             ..Default::default()
         }
         .write_to_bytes()

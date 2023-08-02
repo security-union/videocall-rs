@@ -29,8 +29,8 @@ const _PROTOBUF_VERSION_CHECK: () = ::protobuf::VERSION_3_2_0;
 // @@protoc_insertion_point(message:RsaPacket)
 pub struct RsaPacket {
     // message fields
-    // @@protoc_insertion_point(field:RsaPacket.public_key_pkcs1)
-    pub public_key_pkcs1: ::std::vec::Vec<u8>,
+    // @@protoc_insertion_point(field:RsaPacket.public_key_der)
+    pub public_key_der: ::std::vec::Vec<u8>,
     // @@protoc_insertion_point(field:RsaPacket.username)
     pub username: ::std::string::String,
     // special fields
@@ -53,9 +53,9 @@ impl RsaPacket {
         let mut fields = ::std::vec::Vec::with_capacity(2);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "public_key_pkcs1",
-            |m: &RsaPacket| { &m.public_key_pkcs1 },
-            |m: &mut RsaPacket| { &mut m.public_key_pkcs1 },
+            "public_key_der",
+            |m: &RsaPacket| { &m.public_key_der },
+            |m: &mut RsaPacket| { &mut m.public_key_der },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "username",
@@ -81,7 +81,7 @@ impl ::protobuf::Message for RsaPacket {
         while let Some(tag) = is.read_raw_tag_or_eof()? {
             match tag {
                 10 => {
-                    self.public_key_pkcs1 = is.read_bytes()?;
+                    self.public_key_der = is.read_bytes()?;
                 },
                 18 => {
                     self.username = is.read_string()?;
@@ -98,8 +98,8 @@ impl ::protobuf::Message for RsaPacket {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if !self.public_key_pkcs1.is_empty() {
-            my_size += ::protobuf::rt::bytes_size(1, &self.public_key_pkcs1);
+        if !self.public_key_der.is_empty() {
+            my_size += ::protobuf::rt::bytes_size(1, &self.public_key_der);
         }
         if !self.username.is_empty() {
             my_size += ::protobuf::rt::string_size(2, &self.username);
@@ -110,8 +110,8 @@ impl ::protobuf::Message for RsaPacket {
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if !self.public_key_pkcs1.is_empty() {
-            os.write_bytes(1, &self.public_key_pkcs1)?;
+        if !self.public_key_der.is_empty() {
+            os.write_bytes(1, &self.public_key_der)?;
         }
         if !self.username.is_empty() {
             os.write_string(2, &self.username)?;
@@ -133,14 +133,14 @@ impl ::protobuf::Message for RsaPacket {
     }
 
     fn clear(&mut self) {
-        self.public_key_pkcs1.clear();
+        self.public_key_der.clear();
         self.username.clear();
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static RsaPacket {
         static instance: RsaPacket = RsaPacket {
-            public_key_pkcs1: ::std::vec::Vec::new(),
+            public_key_der: ::std::vec::Vec::new(),
             username: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
@@ -166,13 +166,13 @@ impl ::protobuf::reflect::ProtobufValue for RsaPacket {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x16types/rsa_packet.proto\"Q\n\tRsaPacket\x12(\n\x10public_key_pkcs1\
-    \x18\x01\x20\x01(\x0cR\x0epublicKeyPkcs1\x12\x1a\n\x08username\x18\x02\
-    \x20\x01(\tR\x08usernameJ\x98\x01\n\x06\x12\x04\0\0\x05\x01\n\x08\n\x01\
-    \x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x05\x01\n\n\n\x03\x04\
-    \0\x01\x12\x03\x02\x08\x11\n\x0b\n\x04\x04\0\x02\0\x12\x03\x03\x02\x1d\n\
+    \n\x16types/rsa_packet.proto\"M\n\tRsaPacket\x12$\n\x0epublic_key_der\
+    \x18\x01\x20\x01(\x0cR\x0cpublicKeyDer\x12\x1a\n\x08username\x18\x02\x20\
+    \x01(\tR\x08usernameJ\x98\x01\n\x06\x12\x04\0\0\x05\x01\n\x08\n\x01\x0c\
+    \x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x05\x01\n\n\n\x03\x04\0\
+    \x01\x12\x03\x02\x08\x11\n\x0b\n\x04\x04\0\x02\0\x12\x03\x03\x02\x1b\n\
     \x0c\n\x05\x04\0\x02\0\x05\x12\x03\x03\x02\x07\n\x0c\n\x05\x04\0\x02\0\
-    \x01\x12\x03\x03\x08\x18\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x03\x1b\x1c\
+    \x01\x12\x03\x03\x08\x16\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x03\x19\x1a\
     \n\x0b\n\x04\x04\0\x02\x01\x12\x03\x04\x02\x16\n\x0c\n\x05\x04\0\x02\x01\
     \x05\x12\x03\x04\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x04\t\x11\
     \n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x04\x14\x15b\x06proto3\

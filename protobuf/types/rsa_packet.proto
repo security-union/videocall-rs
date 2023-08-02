@@ -1,6 +1,6 @@
 syntax = "proto3";
 
 message RsaPacket {
-  bytes public_key_pkcs1 = 1;
+  bytes public_key_der = 1;
   string username = 2;
 }

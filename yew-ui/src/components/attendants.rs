@@ -328,12 +328,10 @@ impl Component for AttendantsComponent {
                                 log!("No key found for peer");
                                 self.send_public_key(ctx)
                             }
-                        } else {
-                            if let Err(e) = self.peer_decode_manager.decode(response, None) {
-                                log!("error decoding packet:", JsValue::from_str(&e.to_string()));
-                                self.peer_decode_manager.delete_peer(&email);
-                                self.peer_keys.remove(&email);
-                            }
+                        } else if let Err(e) = self.peer_decode_manager.decode(response, None) {
+                            log!("error decoding packet:", JsValue::from_str(&e.to_string()));
+                            self.peer_decode_manager.delete_peer(&email);
+                            self.peer_keys.remove(&email);
                         }
                     }
                     Err(_) => {}

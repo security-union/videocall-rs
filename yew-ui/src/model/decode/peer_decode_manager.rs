@@ -29,7 +29,7 @@ impl Display for MultiDecoderError {
             MultiDecoderError::AudioDecodeError => write!(f, "AudioDecodeError"),
             MultiDecoderError::ScreenDecodeError => write!(f, "ScreenDecodeError"),
             MultiDecoderError::VideoDecodeError => write!(f, "VideoDecodeError"),
-            MultiDecoderError::Other(s) => write!(f, "Other: {}", s),
+            MultiDecoderError::Other(s) => write!(f, "Other: {s}"),
         }
     }
 }

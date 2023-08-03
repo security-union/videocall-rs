@@ -1,5 +1,5 @@
-use gloo_console::log;
 use gloo_timers::callback::Timeout;
+use log::debug;
 use types::protos::packet_wrapper::PacketWrapper;
 
 use std::fmt::Debug;
@@ -152,7 +152,7 @@ impl Component for Host {
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {
-        log!("destroying");
+        debug!("destroying");
         self.camera.stop();
         self.microphone.stop();
         self.screen.stop();

@@ -9,7 +9,7 @@ use crate::model::connection::{ConnectOptions, Connection};
 use crate::model::decode::PeerDecodeManager;
 use crate::model::media_devices::MediaDeviceAccess;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use gloo_console::log;
+use log::{debug, error, info, warn};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
@@ -111,7 +111,7 @@ impl AttendantsComponent {
         let rsa = &*self.rsa;
         rsa.pub_key
             .to_public_key_der()
-            .map_err(|e| log!("Failed to export rsa public key to der:", e.to_string()))
+            .map_err(|e| error!("Failed to export rsa public key to der: {}", e.to_string()))
             .and_then(|public_key_der| {
                 let data = RsaPacket {
                     username: email.clone(),
@@ -119,7 +119,7 @@ impl AttendantsComponent {
                     ..Default::default()
                 }
                 .write_to_bytes()
-                .map_err(|e| log!("Failed to serialize rsa packet:", e.to_string()))
+                .map_err(|e| error!("Failed to serialize rsa packet: {}", e.to_string()))
                 .and_then(|data| {
                     ctx.link()
                         .send_message(Msg::OnOutboundPacket(PacketWrapper {
@@ -203,8 +203,8 @@ impl Component for AttendantsComponent {
                     if self.connection.is_some() {
                         return false;
                     }
-                    log!("webtransport connect =", webtransport);
-                    log!("end to end encryption enabled =", self.e2ee_enabled);
+                    info!("webtransport connect = {}", webtransport);
+                    info!("end to end encryption enabled = {}", self.e2ee_enabled);
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
                     let options = ConnectOptions {
@@ -230,18 +230,18 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::Connected => {
-                    log!("Connected");
+                    info!("Connected");
                     if self.e2ee_enabled {
                         self.send_public_key(ctx);
                     }
                     true
                 }
                 WsAction::Log(msg) => {
-                    log!("{}", msg);
+                    warn!("{}", msg);
                     false
                 }
                 WsAction::Lost(_reason) => {
-                    log!("Lost");
+                    warn!("Lost");
                     self.connection = None;
                     ctx.link()
                         .send_message(WsAction::Connect(self.webtransport_enabled));
@@ -263,7 +263,7 @@ impl Component for AttendantsComponent {
                 }
             },
             Msg::OnPeerAdded(_email) => {
-                log!("New peer arrived.");
+                debug!("New peer arrived.");
                 if self.e2ee_enabled {
                     self.send_public_key(ctx);
                 }
@@ -279,10 +279,12 @@ impl Component for AttendantsComponent {
                         if !self.e2ee_enabled {
                             return false;
                         }
-                        log!("Received AES_KEY", &response.email);
+                        debug!("Received AES_KEY {}", &response.email);
                         if let Ok(bytes) = self.rsa.decrypt(&response.data) {
                             let aes_packet = AesPacket::parse_from_bytes(&bytes)
-                                .map_err(|e| log!("Failed to parse aes packet:", e.to_string()))
+                                .map_err(|e| {
+                                    error!("Failed to parse aes packet: {}", e.to_string())
+                                })
                                 .and_then(|aes_packet| {
                                     self.peer_keys.insert(
                                         response.email,
@@ -301,53 +303,58 @@ impl Component for AttendantsComponent {
                         if !self.e2ee_enabled {
                             return false;
                         }
-                        log!("Received RSA_PUB_KEY");
-                        let rsa_packet =
-                            RsaPacket::parse_from_bytes(&response.data)
-                                .map_err(|e| log!("Failed to parse rsa packet:", e.to_string()))
-                                .and_then(|rsa_packey| {
-                                    let pub_key = RsaPublicKey::from_public_key_der(
-                                        &rsa_packey.public_key_der,
-                                    )
-                                    .map_err(|e| {
-                                        log!("Failed to parse rsa public key:", e.to_string())
-                                    })
-                                    .and_then(|pub_key| {
-                                        let aes_packet = AesPacket {
-                                            key: self.aes.key.to_vec(),
-                                            iv: self.aes.iv.to_vec(),
-                                            ..Default::default()
-                                        }
-                                        .write_to_bytes()
+                        debug!("Received RSA_PUB_KEY");
+                        let rsa_packet = RsaPacket::parse_from_bytes(&response.data)
+                            .map_err(|e| error!("Failed to parse rsa packet: {}", e.to_string()))
+                            .and_then(|rsa_packey| {
+                                let pub_key =
+                                    RsaPublicKey::from_public_key_der(&rsa_packey.public_key_der)
                                         .map_err(|e| {
-                                            log!("Failed to serialize aes packet:", e.to_string())
+                                            error!(
+                                                "Failed to parse rsa public key: {}",
+                                                e.to_string()
+                                            )
                                         })
-                                        .and_then(|aes_packet| {
-                                            self.rsa
-                                                .encrypt_with_key(&aes_packet, &pub_key)
-                                                .map_err(|e| {
-                                                    log!(
-                                                        "Failed to encrypt aes packet:",
-                                                        e.to_string()
-                                                    )
-                                                })
-                                                .and_then(|data| {
-                                                    ctx.link().send_message(Msg::OnOutboundPacket(
-                                                        PacketWrapper {
-                                                            packet_type: PacketType::AES_KEY.into(),
-                                                            email: ctx.props().email.clone(),
-                                                            data,
-                                                            ..Default::default()
-                                                        },
-                                                    ));
-                                                    Ok(())
-                                                });
+                                        .and_then(|pub_key| {
+                                            let aes_packet = AesPacket {
+                                                key: self.aes.key.to_vec(),
+                                                iv: self.aes.iv.to_vec(),
+                                                ..Default::default()
+                                            }
+                                            .write_to_bytes()
+                                            .map_err(|e| {
+                                                error!(
+                                                    "Failed to serialize aes packet: {}",
+                                                    e.to_string()
+                                                )
+                                            })
+                                            .and_then(|aes_packet| {
+                                                self.rsa
+                                                    .encrypt_with_key(&aes_packet, &pub_key)
+                                                    .map_err(|e| {
+                                                        error!(
+                                                            "Failed to encrypt aes packet: {}",
+                                                            e.to_string()
+                                                        )
+                                                    })
+                                                    .and_then(|data| {
+                                                        ctx.link().send_message(
+                                                            Msg::OnOutboundPacket(PacketWrapper {
+                                                                packet_type: PacketType::AES_KEY
+                                                                    .into(),
+                                                                email: ctx.props().email.clone(),
+                                                                data,
+                                                                ..Default::default()
+                                                            }),
+                                                        );
+                                                        Ok(())
+                                                    });
+                                                Ok(())
+                                            });
                                             Ok(())
                                         });
-                                        Ok(())
-                                    });
-                                    Ok(())
-                                });
+                                Ok(())
+                            });
                     }
                     Ok(PacketType::MEDIA) => {
                         let email = response.email.clone();
@@ -356,19 +363,16 @@ impl Component for AttendantsComponent {
                                 if let Err(e) =
                                     self.peer_decode_manager.decode(response, Some(*key))
                                 {
-                                    log!(
-                                        "error decoding packet:",
-                                        JsValue::from_str(&e.to_string())
-                                    );
+                                    error!("error decoding packet: {}", e.to_string());
                                     self.peer_decode_manager.delete_peer(&email);
                                     self.peer_keys.remove(&email);
                                 }
                             } else {
-                                log!("No key found for peer");
+                                debug!("No key found for peer");
                                 self.send_public_key(ctx)
                             }
                         } else if let Err(e) = self.peer_decode_manager.decode(response, None) {
-                            log!("error decoding packet:", JsValue::from_str(&e.to_string()));
+                            error!("error decoding packet: {}", e.to_string());
                             self.peer_decode_manager.delete_peer(&email);
                             self.peer_keys.remove(&email);
                         }

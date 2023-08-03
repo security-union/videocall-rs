@@ -9,11 +9,11 @@ mod pages;
 
 use constants::{truthy, E2EE_ENABLED, LOGIN_URL, WEBTRANSPORT_ENABLED};
 
+use log::info;
 use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
 use components::{attendants::AttendantsComponent, top_bar::TopBar};
-use gloo_console::log;
 use gloo_utils::window;
 use yew_router::prelude::*;
 
@@ -91,7 +91,7 @@ impl Component for App {
     }
 
     fn view(&self, _ctx: &Context<Self>) -> Html {
-        log!("OAuth enabled: {}", *ENABLE_OAUTH);
+        info!("OAuth enabled: {}", *ENABLE_OAUTH);
         html! {
             <BrowserRouter>
                 <Switch<Route> render={switch} />
@@ -101,5 +101,15 @@ impl Component for App {
 }
 
 fn main() {
+    #[cfg(feature = "debugAssertions")]
+    {
+        _ = console_log::init_with_level(log::Level::Trace);
+    }
+    #[cfg(not(feature = "debugAssertions"))]
+    {
+        _ = console_log::init_with_level(log::Level::Info);
+    }
+
+    console_error_panic_hook::set_once();
     yew::Renderer::<App>::new().render();
 }

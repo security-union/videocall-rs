@@ -9,7 +9,7 @@ pub struct RsaWrapper {
 }
 
 impl RsaWrapper {
-    pub fn new(enabled: bool) -> anyhow::Result<Self> {
+    pub fn new(enabled: bool) -> Self {
         if enabled {
             Self::new_random()
         } else {
@@ -20,23 +20,23 @@ impl RsaWrapper {
                 [13u32.into(), 257u32.into()].to_vec(),
             )
             .unwrap();
-            Ok(Self {
+            Self {
                 enabled,
                 pub_key: dummy_key.to_public_key(),
                 key: dummy_key,
-            })
+            }
         }
     }
 
-    fn new_random() -> anyhow::Result<Self> {
+    fn new_random() -> Self {
         let mut rng = rand::thread_rng();
-        let key = RsaPrivateKey::new(&mut rng, RSA_BITS)?;
+        let key = RsaPrivateKey::new(&mut rng, RSA_BITS).unwrap();
         let pub_key = key.to_public_key();
-        Ok(Self {
+        Self {
             enabled: true,
             key,
             pub_key,
-        })
+        }
     }
 
     pub fn decrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
@@ -64,7 +64,7 @@ mod test {
 
     #[wasm_bindgen_test]
     fn test_rsa_thread_rng() {
-        let key = RsaWrapper::new(true).unwrap();
+        let key = RsaWrapper::new(true);
         let data = b"hello world";
         let encrypted = key.encrypt_with_key(data, &key.pub_key).unwrap();
         let decrypted = key.decrypt(&encrypted).unwrap();
@@ -73,7 +73,7 @@ mod test {
 
     #[wasm_bindgen_test]
     fn test_rsa_disabled() {
-        let key = RsaWrapper::new(false).unwrap();
+        let key = RsaWrapper::new(false);
         let data = b"hello world";
         let encrypted = key.encrypt_with_key(data, &key.pub_key).unwrap();
         let decrypted = key.decrypt(&encrypted).unwrap();

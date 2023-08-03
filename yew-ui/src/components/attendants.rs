@@ -109,21 +109,29 @@ impl AttendantsComponent {
         }
         let email = ctx.props().email.clone();
         let rsa = &*self.rsa;
-        let public_key_der = rsa.pub_key.to_public_key_der().unwrap().to_vec();
-        let data = RsaPacket {
-            username: email.clone(),
-            public_key_der,
-            ..Default::default()
-        }
-        .write_to_bytes()
-        .unwrap();
-        ctx.link()
-            .send_message(Msg::OnOutboundPacket(PacketWrapper {
-                packet_type: PacketType::RSA_PUB_KEY.into(),
-                email,
-                data,
-                ..Default::default()
-            }));
+        rsa.pub_key
+            .to_public_key_der()
+            .map_err(|e| log!("Failed to export rsa public key to der:", e.to_string()))
+            .and_then(|public_key_der| {
+                let data = RsaPacket {
+                    username: email.clone(),
+                    public_key_der: public_key_der.to_vec(),
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .map_err(|e| log!("Failed to serialize rsa packet:", e.to_string()))
+                .and_then(|data| {
+                    ctx.link()
+                        .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                            packet_type: PacketType::RSA_PUB_KEY.into(),
+                            email,
+                            data,
+                            ..Default::default()
+                        }));
+                    Ok(())
+                });
+                Ok(())
+            });
     }
 
     fn create_peer_decoder_manager(ctx: &Context<Self>) -> PeerDecodeManager {
@@ -178,8 +186,7 @@ impl Component for AttendantsComponent {
             error: None,
             peer_keys: HashMap::new(),
             aes: Arc::new(Aes128State::new(ctx.props().e2ee_enabled)),
-            // TODO: Don't unwrap
-            rsa: Arc::new(RsaWrapper::new(ctx.props().e2ee_enabled).unwrap()),
+            rsa: Arc::new(RsaWrapper::new(ctx.props().e2ee_enabled)),
         }
     }
 
@@ -274,15 +281,19 @@ impl Component for AttendantsComponent {
                         }
                         log!("Received AES_KEY", &response.email);
                         if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                            let aes_packet = AesPacket::parse_from_bytes(&bytes).unwrap();
-                            self.peer_keys.insert(
-                                response.email,
-                                Aes128State::from_vecs(
-                                    aes_packet.key,
-                                    aes_packet.iv,
-                                    self.e2ee_enabled,
-                                ),
-                            );
+                            let aes_packet = AesPacket::parse_from_bytes(&bytes)
+                                .map_err(|e| log!("Failed to parse aes packet:", e.to_string()))
+                                .and_then(|aes_packet| {
+                                    self.peer_keys.insert(
+                                        response.email,
+                                        Aes128State::from_vecs(
+                                            aes_packet.key,
+                                            aes_packet.iv,
+                                            self.e2ee_enabled,
+                                        ),
+                                    );
+                                    Ok(())
+                                });
                         }
                         return false;
                     }
@@ -291,24 +302,52 @@ impl Component for AttendantsComponent {
                             return false;
                         }
                         log!("Received RSA_PUB_KEY");
-                        let rsa_packet = RsaPacket::parse_from_bytes(&response.data).unwrap();
-                        let pub_key =
-                            RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der).unwrap();
-                        // Send AES key to the host
-                        let aes_packet = AesPacket {
-                            key: self.aes.key.to_vec(),
-                            iv: self.aes.iv.to_vec(),
-                            ..Default::default()
-                        }
-                        .write_to_bytes()
-                        .unwrap();
-                        ctx.link()
-                            .send_message(Msg::OnOutboundPacket(PacketWrapper {
-                                packet_type: PacketType::AES_KEY.into(),
-                                email: ctx.props().email.clone(),
-                                data: self.rsa.encrypt_with_key(&aes_packet, &pub_key).unwrap(),
-                                ..Default::default()
-                            }));
+                        let rsa_packet =
+                            RsaPacket::parse_from_bytes(&response.data)
+                                .map_err(|e| log!("Failed to parse rsa packet:", e.to_string()))
+                                .and_then(|rsa_packey| {
+                                    let pub_key = RsaPublicKey::from_public_key_der(
+                                        &rsa_packey.public_key_der,
+                                    )
+                                    .map_err(|e| {
+                                        log!("Failed to parse rsa public key:", e.to_string())
+                                    })
+                                    .and_then(|pub_key| {
+                                        let aes_packet = AesPacket {
+                                            key: self.aes.key.to_vec(),
+                                            iv: self.aes.iv.to_vec(),
+                                            ..Default::default()
+                                        }
+                                        .write_to_bytes()
+                                        .map_err(|e| {
+                                            log!("Failed to serialize aes packet:", e.to_string())
+                                        })
+                                        .and_then(|aes_packet| {
+                                            self.rsa
+                                                .encrypt_with_key(&aes_packet, &pub_key)
+                                                .map_err(|e| {
+                                                    log!(
+                                                        "Failed to encrypt aes packet:",
+                                                        e.to_string()
+                                                    )
+                                                })
+                                                .and_then(|data| {
+                                                    ctx.link().send_message(Msg::OnOutboundPacket(
+                                                        PacketWrapper {
+                                                            packet_type: PacketType::AES_KEY.into(),
+                                                            email: ctx.props().email.clone(),
+                                                            data,
+                                                            ..Default::default()
+                                                        },
+                                                    ));
+                                                    Ok(())
+                                                });
+                                            Ok(())
+                                        });
+                                        Ok(())
+                                    });
+                                    Ok(())
+                                });
                     }
                     Ok(PacketType::MEDIA) => {
                         let email = response.email.clone();

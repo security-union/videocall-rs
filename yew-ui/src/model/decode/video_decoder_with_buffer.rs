@@ -72,11 +72,10 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
         for (index, sequence) in sorted_frames.iter().enumerate() {
             let image = self.cache.get(sequence).unwrap();
             let frame_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
-            let next_sequence = if index == 0 || *sequence == sorted_frames[index - 1] + 1 {
-                Some(*sequence)
-            } else if self.sequence.is_some()
-                && *sequence > self.sequence.unwrap()
-                && frame_type == EncodedVideoChunkType::Key
+            let next_sequence = if (index == 0 || *sequence == sorted_frames[index - 1] + 1)
+                || (self.sequence.is_some()
+                    && *sequence > self.sequence.unwrap()
+                    && frame_type == EncodedVideoChunkType::Key)
             {
                 Some(*sequence)
             } else {

@@ -1,10 +1,12 @@
-use gloo_console::log;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
-use std::sync::atomic::Ordering;
+use log::debug;
+use log::error;
+use std::sync::{atomic::Ordering, Arc};
+use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -26,19 +28,21 @@ use web_sys::VideoTrack;
 
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
-use types::protos::media_packet::MediaPacket;
 
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
+use crate::crypto::aes::Aes128State;
 
 pub struct CameraEncoder {
+    aes: Arc<Aes128State>,
     state: EncoderState,
 }
 
 impl CameraEncoder {
-    pub fn new() -> Self {
+    pub fn new(aes: Arc<Aes128State>) -> Self {
         Self {
+            aes,
             state: EncoderState::new(),
         }
     }
@@ -57,7 +61,7 @@ impl CameraEncoder {
     pub fn start(
         &mut self,
         userid: String,
-        on_frame: impl Fn(MediaPacket) + 'static,
+        on_frame: impl Fn(PacketWrapper) + 'static,
         video_elem_id: &str,
     ) {
         // 1. Query the first device with a camera and a mic attached.
@@ -72,6 +76,7 @@ impl CameraEncoder {
             switching,
             ..
         } = self.state.clone();
+        let aes = self.aes.clone();
         let video_output_handler = {
             let userid = userid;
             let on_frame = on_frame;
@@ -79,9 +84,14 @@ impl CameraEncoder {
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                let media_packet: MediaPacket =
-                    transform_video_chunk(chunk, sequence_number, &mut buffer, userid.clone());
-                on_frame(media_packet);
+                let packet: PacketWrapper = transform_video_chunk(
+                    chunk,
+                    sequence_number,
+                    &mut buffer,
+                    userid.clone(),
+                    aes.clone(),
+                );
+                on_frame(packet);
                 sequence_number += 1;
             })
         };
@@ -127,7 +137,7 @@ impl CameraEncoder {
             // Setup video encoder
 
             let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                log!("error_handler error", e);
+                error!("error_handler error {:?}", e);
             }) as Box<dyn FnMut(JsValue)>);
 
             let video_output_handler =
@@ -192,13 +202,13 @@ impl CameraEncoder {
                             video_frame.close();
                         }
                         Err(e) => {
-                            log!("error", e);
+                            error!("error {:?}", e);
                         }
                     }
                 }
             };
             poll_video.await;
-            log!("Killing video streamer");
+            debug!("Killing video streamer");
         });
     }
 }

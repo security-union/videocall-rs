@@ -1,4 +1,4 @@
-use gloo_console::log;
+use log::debug;
 use protobuf::Message;
 use std::collections::HashMap;
 use std::{fmt::Display, sync::Arc};
@@ -182,7 +182,7 @@ impl PeerDecodeManager {
     }
 
     fn add_peer(&mut self, email: &String, aes: Option<Aes128State>) {
-        log!("Adding peer", email);
+        debug!("Adding peer {}", email);
         self.insert_peer(email, aes);
         self.on_peer_added.emit(email.clone())
     }

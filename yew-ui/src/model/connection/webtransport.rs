@@ -4,11 +4,12 @@
 // on_inbound_media
 //
 use super::webmedia::{ConnectOptions, WebMedia};
-use gloo_console::log;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use js_sys::Uint8Array;
+use log::debug;
+use log::error;
 use protobuf::Message;
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsCast;
@@ -57,7 +58,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
                 options.on_connection_lost.emit(())
             }
         });
-        log!("WebTransport connecting to ", &options.webtransport_url);
+        debug!("WebTransport connecting to {}", &options.webtransport_url);
         let task = WebTransportService::connect(
             &options.webtransport_url,
             on_datagram,
@@ -65,7 +66,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             on_bidirectional_stream,
             notification,
         )?;
-        log!("WebTransport connection success");
+        debug!("WebTransport connection success");
         Ok(task)
     }
 
@@ -79,7 +80,7 @@ fn handle_unidirectional_stream(
     on_inbound_media: Callback<PacketWrapper>,
 ) {
     if stream.is_undefined() {
-        log!("stream is undefined");
+        debug!("stream is undefined");
         return;
     }
     let incoming_unistreams: ReadableStreamDefaultReader = stream.get_reader().unchecked_into();
@@ -125,9 +126,9 @@ fn handle_bidirectional_stream(
     stream: WebTransportBidirectionalStream,
     on_inbound_media: Callback<PacketWrapper>,
 ) {
-    log!("OnBidiStream: ", &stream);
+    debug!("OnBidiStream: {:?}", &stream);
     if stream.is_undefined() {
-        log!("stream is undefined");
+        debug!("stream is undefined");
         return;
     }
     let readable: ReadableStreamDefaultReader = stream.readable().get_reader().unchecked_into();
@@ -141,7 +142,7 @@ fn handle_bidirectional_stream(
     wasm_bindgen_futures::spawn_local(async move {
         let mut buffer: Vec<u8> = vec![];
         loop {
-            log!("reading from stream");
+            debug!("reading from stream");
             let read_result = JsFuture::from(readable.read()).await;
 
             match read_result {
@@ -166,7 +167,7 @@ fn handle_bidirectional_stream(
                 }
             }
         }
-        log!("readable stream closed");
+        debug!("readable stream closed");
     });
 }
 
@@ -175,7 +176,7 @@ fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<Pac
         Ok(media_packet) => callback.emit(media_packet),
         Err(_) => {
             let message_type = format!("{message_type:?}");
-            log!("failed to parse media packet ", message_type);
+            error!("failed to parse media packet {}", message_type);
         }
     }
 }

@@ -3,7 +3,7 @@
 //
 // Implemented both for WebSockets (websocket.rs) and WebTransport (webtransport.rs)
 //
-use gloo_console::log;
+use log::error;
 use protobuf::Message;
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsValue;
@@ -31,9 +31,9 @@ pub(super) trait WebMedia<TASK> {
             Ok(bytes) => self.send_bytes(bytes),
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();
-                log!(
+                error!(
                     "error sending {} packet: {:?}",
-                    JsValue::from(format!("{packet_type}")),
+                    format!("{packet_type}"),
                     e
                 );
             }

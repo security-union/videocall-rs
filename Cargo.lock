@@ -6538,7 +6538,6 @@ dependencies = [
  "const_format",
  "getrandom 0.2.10",
  "gloo 0.8.1",
- "gloo-console",
  "gloo-timers",
  "gloo-utils",
  "js-sys",

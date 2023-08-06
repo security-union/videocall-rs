@@ -1,9 +1,9 @@
-use gloo_console::log;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
+use log::error;
 use std::sync::{atomic::Ordering, Arc};
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -103,7 +103,7 @@ impl MicrophoneEncoder {
             // Setup audio encoder.
 
             let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                log!("error_handler error", e);
+                error!("error_handler error {:?}", e);
             }) as Box<dyn FnMut(JsValue)>);
 
             let audio_output_handler =
@@ -157,7 +157,7 @@ impl MicrophoneEncoder {
                             audio_frame.close();
                         }
                         Err(e) => {
-                            log!("error", e);
+                            error!("error {:?}", e);
                         }
                     }
                 }

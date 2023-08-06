@@ -103,7 +103,7 @@ impl Component for App {
 fn main() {
     #[cfg(feature = "debugAssertions")]
     {
-        _ = console_log::init_with_level(log::Level::Trace);
+        _ = console_log::init_with_level(log::Level::Debug);
     }
     #[cfg(not(feature = "debugAssertions"))]
     {

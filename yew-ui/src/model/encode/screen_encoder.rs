@@ -1,8 +1,8 @@
-use gloo_console::log;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::JsString;
 use js_sys::Reflect;
+use log::error;
 use std::sync::{atomic::Ordering, Arc};
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -93,7 +93,7 @@ impl ScreenEncoder {
             );
 
             let screen_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                log!("error_handler error", e);
+                error!("error_handler error {:?}", e);
             }) as Box<dyn FnMut(JsValue)>);
 
             let screen_output_handler =
@@ -134,7 +134,6 @@ impl ScreenEncoder {
                     }
                     match JsFuture::from(screen_reader.read()).await {
                         Ok(js_frame) => {
-                            log!("");
                             let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
                                 .unwrap()
                                 .unchecked_into::<VideoFrame>();
@@ -145,7 +144,7 @@ impl ScreenEncoder {
                             video_frame.close();
                         }
                         Err(e) => {
-                            log!("error", e);
+                            error!("error {:?}", e);
                         }
                     }
                 }

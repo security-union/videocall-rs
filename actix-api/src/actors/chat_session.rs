@@ -1,4 +1,4 @@
-use crate::messages::server::{ClientMessage, MediaPacketUpdate};
+use crate::messages::server::{ClientMessage, Packet};
 use crate::messages::session::Message;
 use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
 use std::sync::Arc;
@@ -102,10 +102,10 @@ impl Handler<Message> for WsChatSession {
     }
 }
 
-impl Handler<MediaPacketUpdate> for WsChatSession {
+impl Handler<Packet> for WsChatSession {
     type Result = ();
 
-    fn handle(&mut self, msg: MediaPacketUpdate, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: Packet, _ctx: &mut Self::Context) -> Self::Result {
         let room_id = self.room.clone();
         trace!(
             "got message and sending to chat session {} email {} room {}",
@@ -136,8 +136,8 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 
         match msg {
             ws::Message::Binary(msg) => {
-                ctx.notify(MediaPacketUpdate {
-                    media_packet: Arc::new(msg.to_vec()),
+                ctx.notify(Packet {
+                    data: Arc::new(msg.to_vec()),
                 });
             }
             ws::Message::Ping(msg) => {

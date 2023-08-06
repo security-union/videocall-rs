@@ -1,14 +1,23 @@
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::constants::WEBTRANSPORT_HOST;
+use crate::crypto::aes::Aes128State;
+use crate::crypto::rsa::RsaWrapper;
 use crate::model::connection::{ConnectOptions, Connection};
 use crate::model::decode::PeerDecodeManager;
 use crate::model::media_devices::MediaDeviceAccess;
-use crate::model::MediaPacketWrapper;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use gloo_console::log;
+use log::{debug, error, info, warn};
+use protobuf::Message;
+use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+use rsa::RsaPublicKey;
+use types::protos::aes_packet::AesPacket;
 use types::protos::media_packet::media_packet::MediaType;
-use types::protos::media_packet::MediaPacket;
+use types::protos::packet_wrapper::packet_wrapper::PacketType;
+use types::protos::packet_wrapper::PacketWrapper;
+use types::protos::rsa_packet::RsaPacket;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 
@@ -39,8 +48,8 @@ pub enum MeetingAction {
 pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
-    OnInboundMedia(MediaPacketWrapper),
-    OnOutboundPacket(MediaPacket),
+    OnInboundMedia(PacketWrapper),
+    OnOutboundPacket(PacketWrapper),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
 }
@@ -65,6 +74,8 @@ pub struct AttendantsComponentProps {
     #[prop_or_default]
     pub email: String,
 
+    pub e2ee_enabled: bool,
+
     pub webtransport_enabled: bool,
 }
 
@@ -74,10 +85,14 @@ pub struct AttendantsComponent {
     pub media_device_access: MediaDeviceAccess,
     pub outbound_audio_buffer: [u8; 2000],
     pub share_screen: bool,
+    pub e2ee_enabled: bool,
     pub webtransport_enabled: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub error: Option<String>,
+    pub peer_keys: HashMap<String, Aes128State>,
+    aes: Arc<Aes128State>,
+    rsa: Arc<RsaWrapper>,
 }
 
 impl AttendantsComponent {
@@ -86,6 +101,37 @@ impl AttendantsComponent {
             Some(connection) => connection.is_connected(),
             None => false,
         }
+    }
+
+    fn send_public_key(&self, ctx: &Context<Self>) {
+        if !self.e2ee_enabled {
+            return;
+        }
+        let email = ctx.props().email.clone();
+        let rsa = &*self.rsa;
+        rsa.pub_key
+            .to_public_key_der()
+            .map_err(|e| error!("Failed to export rsa public key to der: {}", e.to_string()))
+            .and_then(|public_key_der| {
+                let data = RsaPacket {
+                    username: email.clone(),
+                    public_key_der: public_key_der.to_vec(),
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .map_err(|e| error!("Failed to serialize rsa packet: {}", e.to_string()))
+                .and_then(|data| {
+                    ctx.link()
+                        .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                            packet_type: PacketType::RSA_PUB_KEY.into(),
+                            email,
+                            data,
+                            ..Default::default()
+                        }));
+                    Ok(())
+                });
+                Ok(())
+            });
     }
 
     fn create_peer_decoder_manager(ctx: &Context<Self>) -> PeerDecodeManager {
@@ -135,8 +181,12 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
+            e2ee_enabled: ctx.props().e2ee_enabled,
             webtransport_enabled: ctx.props().webtransport_enabled,
             error: None,
+            peer_keys: HashMap::new(),
+            aes: Arc::new(Aes128State::new(ctx.props().e2ee_enabled)),
+            rsa: Arc::new(RsaWrapper::new(ctx.props().e2ee_enabled)),
         }
     }
 
@@ -153,7 +203,8 @@ impl Component for AttendantsComponent {
                     if self.connection.is_some() {
                         return false;
                     }
-                    log!("webtransport connect = {}", webtransport);
+                    info!("webtransport connect = {}", webtransport);
+                    info!("end to end encryption enabled = {}", self.e2ee_enabled);
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
                     let options = ConnectOptions {
@@ -166,7 +217,7 @@ impl Component for AttendantsComponent {
                             .link()
                             .callback(|_| Msg::from(WsAction::Lost(None))),
                     };
-                    match Connection::connect(webtransport, options) {
+                    match Connection::connect(webtransport, options, self.aes.clone()) {
                         Ok(connection) => {
                             self.connection = Some(connection);
                         }
@@ -179,15 +230,18 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::Connected => {
-                    log!("Connected");
+                    info!("Connected");
+                    if self.e2ee_enabled {
+                        self.send_public_key(ctx);
+                    }
                     true
                 }
                 WsAction::Log(msg) => {
-                    log!("{}", msg);
+                    warn!("{}", msg);
                     false
                 }
                 WsAction::Lost(_reason) => {
-                    log!("Lost");
+                    warn!("Lost");
                     self.connection = None;
                     ctx.link()
                         .send_message(WsAction::Connect(self.webtransport_enabled));
@@ -208,14 +262,122 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(_email) => true,
+            Msg::OnPeerAdded(_email) => {
+                debug!("New peer arrived.");
+                if self.e2ee_enabled {
+                    self.send_public_key(ctx);
+                }
+                true
+            }
             Msg::OnFirstFrame((_email, media_type)) => match media_type {
                 MediaType::SCREEN => true,
                 _ => false,
             },
             Msg::OnInboundMedia(response) => {
-                if let Err(e) = self.peer_decode_manager.decode(response) {
-                    log!("error decoding packet: {:?}", e);
+                match response.packet_type.enum_value() {
+                    Ok(PacketType::AES_KEY) => {
+                        if !self.e2ee_enabled {
+                            return false;
+                        }
+                        debug!("Received AES_KEY {}", &response.email);
+                        if let Ok(bytes) = self.rsa.decrypt(&response.data) {
+                            let aes_packet = AesPacket::parse_from_bytes(&bytes)
+                                .map_err(|e| {
+                                    error!("Failed to parse aes packet: {}", e.to_string())
+                                })
+                                .and_then(|aes_packet| {
+                                    self.peer_keys.insert(
+                                        response.email,
+                                        Aes128State::from_vecs(
+                                            aes_packet.key,
+                                            aes_packet.iv,
+                                            self.e2ee_enabled,
+                                        ),
+                                    );
+                                    Ok(())
+                                });
+                        }
+                        return false;
+                    }
+                    Ok(PacketType::RSA_PUB_KEY) => {
+                        if !self.e2ee_enabled {
+                            return false;
+                        }
+                        debug!("Received RSA_PUB_KEY");
+                        let rsa_packet = RsaPacket::parse_from_bytes(&response.data)
+                            .map_err(|e| error!("Failed to parse rsa packet: {}", e.to_string()))
+                            .and_then(|rsa_packey| {
+                                let pub_key =
+                                    RsaPublicKey::from_public_key_der(&rsa_packey.public_key_der)
+                                        .map_err(|e| {
+                                            error!(
+                                                "Failed to parse rsa public key: {}",
+                                                e.to_string()
+                                            )
+                                        })
+                                        .and_then(|pub_key| {
+                                            let aes_packet = AesPacket {
+                                                key: self.aes.key.to_vec(),
+                                                iv: self.aes.iv.to_vec(),
+                                                ..Default::default()
+                                            }
+                                            .write_to_bytes()
+                                            .map_err(|e| {
+                                                error!(
+                                                    "Failed to serialize aes packet: {}",
+                                                    e.to_string()
+                                                )
+                                            })
+                                            .and_then(|aes_packet| {
+                                                self.rsa
+                                                    .encrypt_with_key(&aes_packet, &pub_key)
+                                                    .map_err(|e| {
+                                                        error!(
+                                                            "Failed to encrypt aes packet: {}",
+                                                            e.to_string()
+                                                        )
+                                                    })
+                                                    .and_then(|data| {
+                                                        ctx.link().send_message(
+                                                            Msg::OnOutboundPacket(PacketWrapper {
+                                                                packet_type: PacketType::AES_KEY
+                                                                    .into(),
+                                                                email: ctx.props().email.clone(),
+                                                                data,
+                                                                ..Default::default()
+                                                            }),
+                                                        );
+                                                        Ok(())
+                                                    });
+                                                Ok(())
+                                            });
+                                            Ok(())
+                                        });
+                                Ok(())
+                            });
+                    }
+                    Ok(PacketType::MEDIA) => {
+                        let email = response.email.clone();
+                        if self.e2ee_enabled {
+                            if let Some(key) = self.peer_keys.get(&email) {
+                                if let Err(e) =
+                                    self.peer_decode_manager.decode(response, Some(*key))
+                                {
+                                    error!("error decoding packet: {}", e.to_string());
+                                    self.peer_decode_manager.delete_peer(&email);
+                                    self.peer_keys.remove(&email);
+                                }
+                            } else {
+                                debug!("No key found for peer");
+                                self.send_public_key(ctx)
+                            }
+                        } else if let Err(e) = self.peer_decode_manager.decode(response, None) {
+                            error!("error decoding packet: {}", e.to_string());
+                            self.peer_decode_manager.delete_peer(&email);
+                            self.peer_keys.remove(&email);
+                        }
+                    }
+                    Err(_) => {}
                 }
                 false
             }
@@ -318,7 +480,7 @@ impl Component for AttendantsComponent {
                     </div>
                     {
                         if media_access_granted {
-                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>}
+                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes.clone()} />}
                         } else {
                             html! {<></>}
                         }

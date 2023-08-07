@@ -1,25 +1,5 @@
-use protobuf::Message;
 use std::fmt;
-use types::protos::media_packet::MediaPacket;
 use web_sys::*;
-use yew_websocket::websocket::{Binary, Text};
-
-pub struct MediaPacketWrapper(pub MediaPacket);
-
-impl From<Text> for MediaPacketWrapper {
-    fn from(_: Text) -> Self {
-        MediaPacketWrapper(MediaPacket::default())
-    }
-}
-
-impl From<Binary> for MediaPacketWrapper {
-    fn from(bin: Binary) -> Self {
-        let media_packet: MediaPacket = bin
-            .map(|data| MediaPacket::parse_from_bytes(&data.into_boxed_slice()).unwrap())
-            .unwrap_or_default();
-        MediaPacketWrapper(media_packet)
-    }
-}
 
 pub struct EncodedVideoChunkTypeWrapper(pub EncodedVideoChunkType);
 

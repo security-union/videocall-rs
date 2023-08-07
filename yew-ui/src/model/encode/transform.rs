@@ -1,5 +1,11 @@
 use super::super::wrappers::{EncodedAudioChunkTypeWrapper, EncodedVideoChunkTypeWrapper};
-use types::protos::media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata};
+use crate::crypto::aes::Aes128State;
+use protobuf::Message;
+use std::sync::Arc;
+use types::protos::{
+    media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
+    packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
+};
 use web_sys::{EncodedAudioChunk, EncodedVideoChunk};
 
 pub fn transform_video_chunk(
@@ -7,7 +13,8 @@ pub fn transform_video_chunk(
     sequence: u64,
     buffer: &mut [u8],
     email: Box<String>,
-) -> MediaPacket {
+    aes: Arc<Aes128State>,
+) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
     let mut media_packet: MediaPacket = MediaPacket {
@@ -24,7 +31,13 @@ pub fn transform_video_chunk(
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
-    media_packet
+    let data = media_packet.write_to_bytes().unwrap();
+    let data = aes.encrypt(&data).unwrap();
+    let mut packet: PacketWrapper = PacketWrapper::default();
+    packet.data = data;
+    packet.email = media_packet.email;
+    packet.packet_type = PacketType::MEDIA.into();
+    packet
 }
 
 pub fn transform_screen_chunk(
@@ -32,7 +45,8 @@ pub fn transform_screen_chunk(
     sequence: u64,
     buffer: &mut [u8],
     email: Box<String>,
-) -> MediaPacket {
+    aes: Arc<Aes128State>,
+) -> PacketWrapper {
     let mut media_packet: MediaPacket = MediaPacket::default();
     media_packet.email = *email;
     let byte_length = chunk.byte_length() as usize;
@@ -47,7 +61,13 @@ pub fn transform_screen_chunk(
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
-    media_packet
+    let data = media_packet.write_to_bytes().unwrap();
+    let data = aes.encrypt(&data).unwrap();
+    let mut packet: PacketWrapper = PacketWrapper::default();
+    packet.data = data;
+    packet.email = media_packet.email;
+    packet.packet_type = PacketType::MEDIA.into();
+    packet
 }
 
 pub fn transform_audio_chunk(
@@ -55,19 +75,26 @@ pub fn transform_audio_chunk(
     buffer: &mut [u8],
     email: &String,
     sequence: u64,
-) -> MediaPacket {
+    aes: Arc<Aes128State>,
+) -> PacketWrapper {
     chunk.copy_to_with_u8_array(buffer);
-    let mut packet: MediaPacket = MediaPacket::default();
-    packet.email = email.clone();
-    packet.media_type = MediaType::AUDIO.into();
-    packet.data = buffer[0..chunk.byte_length() as usize].to_vec();
-    packet.frame_type = EncodedAudioChunkTypeWrapper(chunk.type_()).to_string();
-    packet.timestamp = chunk.timestamp();
+    let mut media_packet: MediaPacket = MediaPacket::default();
+    media_packet.email = email.clone();
+    media_packet.media_type = MediaType::AUDIO.into();
+    media_packet.data = buffer[0..chunk.byte_length() as usize].to_vec();
+    media_packet.frame_type = EncodedAudioChunkTypeWrapper(chunk.type_()).to_string();
+    media_packet.timestamp = chunk.timestamp();
     let mut video_metadata = VideoMetadata::default();
     video_metadata.sequence = sequence;
-    packet.video_metadata = Some(video_metadata).into();
+    media_packet.video_metadata = Some(video_metadata).into();
     if let Some(duration0) = chunk.duration() {
-        packet.duration = duration0;
+        media_packet.duration = duration0;
     }
+    let data = media_packet.write_to_bytes().unwrap();
+    let data = aes.encrypt(&data).unwrap();
+    let mut packet: PacketWrapper = PacketWrapper::default();
+    packet.data = data;
+    packet.email = media_packet.email;
+    packet.packet_type = PacketType::MEDIA.into();
     packet
 }

@@ -1,4 +1,4 @@
-FROM rust:1.62-slim
+FROM rust:1.71-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ARG USER
 ARG UID

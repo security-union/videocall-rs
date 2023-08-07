@@ -1,10 +1,11 @@
-use gloo_console::log;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
-use std::sync::atomic::Ordering;
+use log::error;
+use std::sync::{atomic::Ordering, Arc};
+use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -23,20 +24,22 @@ use web_sys::ReadableStreamDefaultReader;
 
 use super::encoder_state::EncoderState;
 use super::transform::transform_audio_chunk;
-use types::protos::media_packet::MediaPacket;
 
 use crate::constants::AUDIO_BITRATE;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
+use crate::crypto::aes::Aes128State;
 
 pub struct MicrophoneEncoder {
+    aes: Arc<Aes128State>,
     state: EncoderState,
 }
 
 impl MicrophoneEncoder {
-    pub fn new() -> Self {
+    pub fn new(aes: Arc<Aes128State>) -> Self {
         Self {
+            aes,
             state: EncoderState::new(),
         }
     }
@@ -52,13 +55,13 @@ impl MicrophoneEncoder {
         self.state.stop()
     }
 
-    pub fn start(&mut self, userid: String, on_audio: impl Fn(MediaPacket) + 'static) {
+    pub fn start(&mut self, userid: String, on_audio: impl Fn(PacketWrapper) + 'static) {
         let device_id = if let Some(mic) = &self.state.selected {
             mic.to_string()
         } else {
             return;
         };
-
+        let aes = self.aes.clone();
         let audio_output_handler = {
             let email = userid;
             let on_audio = on_audio;
@@ -66,9 +69,9 @@ impl MicrophoneEncoder {
             let mut sequence = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
-                let media_packet: MediaPacket =
-                    transform_audio_chunk(&chunk, &mut buffer, &email, sequence);
-                on_audio(media_packet);
+                let packet: PacketWrapper =
+                    transform_audio_chunk(&chunk, &mut buffer, &email, sequence, aes.clone());
+                on_audio(packet);
                 sequence += 1;
             })
         };
@@ -100,7 +103,7 @@ impl MicrophoneEncoder {
             // Setup audio encoder.
 
             let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                log!("error_handler error", e);
+                error!("error_handler error {:?}", e);
             }) as Box<dyn FnMut(JsValue)>);
 
             let audio_output_handler =
@@ -154,7 +157,7 @@ impl MicrophoneEncoder {
                             audio_frame.close();
                         }
                         Err(e) => {
-                            log!("error", e);
+                            error!("error {:?}", e);
                         }
                     }
                 }

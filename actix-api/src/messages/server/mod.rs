@@ -11,7 +11,7 @@ pub struct ClientMessage {
     pub session: SessionId,
     pub user: String,
     pub room: RoomId,
-    pub msg: MediaPacketUpdate,
+    pub msg: Packet,
 }
 
 #[derive(ActixMessage)]
@@ -30,8 +30,8 @@ pub struct Connect {
 
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
-pub struct MediaPacketUpdate {
-    pub media_packet: Arc<Vec<u8>>,
+pub struct Packet {
+    pub data: Arc<Vec<u8>>,
 }
 
 #[derive(ActixMessage)]

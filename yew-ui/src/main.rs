@@ -1,19 +1,19 @@
 #![feature(future_join)]
 #![feature(once_cell)]
-
+#[allow(non_camel_case_types)]
 mod components;
 mod constants;
 mod crypto;
 mod model;
 mod pages;
 
-use constants::{truthy, LOGIN_URL, WEBTRANSPORT_ENABLED};
+use constants::{truthy, E2EE_ENABLED, LOGIN_URL, WEBTRANSPORT_ENABLED};
 
+use log::info;
 use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
 use components::{attendants::AttendantsComponent, top_bar::TopBar};
-use gloo_console::log;
 use gloo_utils::window;
 use yew_router::prelude::*;
 
@@ -47,7 +47,7 @@ fn switch(routes: Route) -> Html {
         Route::Meeting { email, id } => html! {
             <>
                 <TopBar/>
-                <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} />
+                <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} e2ee_enabled={*E2EE_ENABLED} />
             </>
         },
         Route::Meeting2 {
@@ -57,7 +57,7 @@ fn switch(routes: Route) -> Html {
         } => html! {
             <>
                 <TopBar/>
-                <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(webtransport_enabled)} />
+                <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(webtransport_enabled)} e2ee_enabled={*E2EE_ENABLED} />
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },
@@ -91,7 +91,7 @@ impl Component for App {
     }
 
     fn view(&self, _ctx: &Context<Self>) -> Html {
-        log!("OAuth enabled: {}", *ENABLE_OAUTH);
+        info!("OAuth enabled: {}", *ENABLE_OAUTH);
         html! {
             <BrowserRouter>
                 <Switch<Route> render={switch} />
@@ -101,5 +101,15 @@ impl Component for App {
 }
 
 fn main() {
+    #[cfg(feature = "debugAssertions")]
+    {
+        _ = console_log::init_with_level(log::Level::Debug);
+    }
+    #[cfg(not(feature = "debugAssertions"))]
+    {
+        _ = console_log::init_with_level(log::Level::Info);
+    }
+
+    console_error_panic_hook::set_once();
     yew::Renderer::<App>::new().render();
 }

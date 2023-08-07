@@ -19,6 +19,7 @@ env:
   WEBTRANSPORT_HOST: yeet
   ENABLE_OAUTH: false
   WEBTRANSPORT_ENABLED: true
+  E2EE_ENABLED: true
 
 jobs:
 
@@ -32,7 +33,7 @@ jobs:
           components: clippy, rustfmt
       - run: cd actix-api && cargo clippy -- --deny warnings
       - run: cd actix-api && cargo fmt --check
-      - run: cd actix-api && cargo test 
+      - run: cd actix-api && cargo test
 
 
   lint-ui:

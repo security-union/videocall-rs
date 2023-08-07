@@ -94,7 +94,7 @@ impl Handler<ClientMessage> for ChatServer {
             user: _,
         } = msg;
         trace!("got message in server room {} session {}", room, session);
-        self.send_message(&room, &msg.media_packet, session);
+        self.send_message(&room, &msg.data, session);
     }
 }
 

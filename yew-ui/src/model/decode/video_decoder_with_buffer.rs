@@ -72,11 +72,10 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
         for (index, sequence) in sorted_frames.iter().enumerate() {
             let image = self.cache.get(sequence).unwrap();
             let frame_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
-            let next_sequence = if index == 0 || *sequence == sorted_frames[index - 1] + 1 {
-                Some(*sequence)
-            } else if self.sequence.is_some()
-                && *sequence > self.sequence.unwrap()
-                && frame_type == EncodedVideoChunkType::Key
+            let next_sequence = if (index == 0 || *sequence == sorted_frames[index - 1] + 1)
+                || (self.sequence.is_some()
+                    && *sequence > self.sequence.unwrap()
+                    && frame_type == EncodedVideoChunkType::Key)
             {
                 Some(*sequence)
             } else {
@@ -143,8 +142,6 @@ mod test {
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    use crate::model::EncodedAudioChunkTypeWrapper;
-
     use super::*;
     pub struct MockVideoDecoder {
         chunks: Arc<Mutex<Vec<Arc<MediaPacket>>>>,
@@ -158,15 +155,15 @@ mod test {
 
         fn decode(&self, image: Arc<MediaPacket>) {
             let mut chunks = self.chunks.lock().unwrap();
-            chunks.push(image.clone());
+            chunks.push(image);
         }
 
         fn state(&self) -> CodecState {
             // Mock implementation, return some state
-            self.state.clone()
+            self.state
         }
 
-        fn new(init: &VideoDecoderInit) -> Result<Self, JsValue>
+        fn new(_init: &VideoDecoderInit) -> Result<Self, JsValue>
         where
             Self: Sized,
         {
@@ -183,14 +180,14 @@ mod test {
         data: Vec<u8>,
     ) -> Arc<MediaPacket> {
         let video_metadata = VideoMetadata {
-            sequence: sequence,
+            sequence,
             ..Default::default()
         };
         // This function creates a mock MediaPacket.
         Arc::new(MediaPacket {
             media_type: Default::default(), // Put an appropriate default or value here
             email: "test@example.com".to_string(),
-            data: data,
+            data,
             frame_type: EncodedVideoChunkTypeWrapper(chunk_type).to_string(),
             timestamp: 0.0,
             duration: 0.0,
@@ -201,9 +198,9 @@ mod test {
     }
 
     fn create_video_decoder() -> VideoDecoderWithBuffer<MockVideoDecoder> {
-        let error = Closure::wrap(Box::new(move |e: JsValue| {}) as Box<dyn FnMut(JsValue)>);
+        let error = Closure::wrap(Box::new(move |_e: JsValue| {}) as Box<dyn FnMut(JsValue)>);
         let output =
-            Closure::wrap(Box::new(move |original_chunk: JsValue| {}) as Box<dyn FnMut(JsValue)>);
+            Closure::wrap(Box::new(move |_original_chunk: JsValue| {}) as Box<dyn FnMut(JsValue)>);
         let init = VideoDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),

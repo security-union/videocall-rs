@@ -1,28 +1,31 @@
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+
 use crate::constants::WEBTRANSPORT_HOST;
+use crate::crypto::aes::Aes128State;
+use crate::crypto::rsa::RsaWrapper;
+use crate::model::connection::{ConnectOptions, Connection};
 use crate::model::decode::PeerDecodeManager;
-use crate::model::MediaPacketWrapper;
+use crate::model::media_devices::MediaDeviceAccess;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use gloo::timers::callback::Interval;
-use gloo_console::log;
-use js_sys::Boolean;
-use js_sys::JsString;
-use js_sys::Reflect;
-use js_sys::Uint8Array;
+use log::{debug, error, info, warn};
 use protobuf::Message;
+use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+use rsa::RsaPublicKey;
+use types::protos::aes_packet::AesPacket;
 use types::protos::media_packet::media_packet::MediaType;
-use types::protos::media_packet::MediaPacket;
+use types::protos::packet_wrapper::packet_wrapper::PacketType;
+use types::protos::packet_wrapper::PacketWrapper;
+use types::protos::rsa_packet::RsaPacket;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::JsFuture;
 
+use super::icons::push_pin::PushPinIcon;
 use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
-use yew_websocket::websocket::{WebSocketService, WebSocketStatus, WebSocketTask};
-use yew_webtransport::webtransport::{WebTransportService, WebTransportStatus, WebTransportTask};
-
-use super::device_permissions::request_permissions;
 
 #[derive(Debug)]
 pub enum WsAction {
@@ -36,12 +39,6 @@ pub enum WsAction {
 }
 
 #[derive(Debug)]
-pub enum Connection {
-    WebSocket(WebSocketTask),
-    WebTransport(WebTransportTask),
-}
-
-#[derive(Debug)]
 pub enum MeetingAction {
     ToggleScreenShare,
     ToggleMicMute,
@@ -51,12 +48,8 @@ pub enum MeetingAction {
 pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
-    OnInboundMedia(MediaPacketWrapper),
-    OnOutboundPacket(MediaPacket),
-    OnDatagram(Vec<u8>),
-    OnUniStream(WebTransportReceiveStream),
-    OnBidiStream(WebTransportBidirectionalStream),
-    OnMessage(Vec<u8>, WebTransportMessageType),
+    OnInboundMedia(PacketWrapper),
+    OnOutboundPacket(PacketWrapper),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
 }
@@ -81,73 +74,98 @@ pub struct AttendantsComponentProps {
     #[prop_or_default]
     pub email: String,
 
-    pub webtransport_enabled: bool,
-}
+    pub e2ee_enabled: bool,
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WebTransportMessageType {
-    Datagram,
-    UnidirectionalStream,
-    BidirectionalStream,
-    Unknown,
+    pub webtransport_enabled: bool,
 }
 
 pub struct AttendantsComponent {
     pub connection: Option<Connection>,
-    pub media_packet: MediaPacket,
-    pub connected: bool,
-    pub connecting: bool,
     pub peer_decode_manager: PeerDecodeManager,
+    pub media_device_access: MediaDeviceAccess,
     pub outbound_audio_buffer: [u8; 2000],
     pub share_screen: bool,
+    pub e2ee_enabled: bool,
     pub webtransport_enabled: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
-    pub heartbeat: Option<Interval>,
     pub error: Option<String>,
-    pub media_access_granted: bool,
+    pub peer_keys: HashMap<String, Aes128State>,
+    aes: Arc<Aes128State>,
+    rsa: Arc<RsaWrapper>,
 }
 
-pub fn connect_websocket(
-    ctx: &Context<AttendantsComponent>,
-    email: &str,
-    id: &str,
-) -> anyhow::Result<WebSocketTask> {
-    let callback = ctx.link().callback(Msg::OnInboundMedia);
-    let notification = ctx.link().batch_callback(|status| match status {
-        WebSocketStatus::Opened => Some(WsAction::Connected.into()),
-        WebSocketStatus::Closed | WebSocketStatus::Error => Some(WsAction::Lost(None).into()),
-    });
-    let url = format!("{}/{}/{}", ACTIX_WEBSOCKET, email, id);
-    log!("Connecting to ", &url);
-    let task = WebSocketService::connect(&url, callback, notification)?;
-    Ok(task)
-}
-
-pub fn connect_webtransport(
-    ctx: &Context<AttendantsComponent>,
-    email: &str,
-    id: &str,
-) -> anyhow::Result<WebTransportTask> {
-    let on_datagram = ctx.link().callback(Msg::OnDatagram);
-    let on_unidirectional_stream = ctx.link().callback(Msg::OnUniStream);
-    let on_bidirectional_stream = ctx.link().callback(Msg::OnBidiStream);
-    let notification = ctx.link().batch_callback(|status| match status {
-        WebTransportStatus::Opened => Some(WsAction::Connected.into()),
-        WebTransportStatus::Closed(error) | WebTransportStatus::Error(error) => {
-            Some(WsAction::Lost(Some(error)).into())
+impl AttendantsComponent {
+    fn is_connected(&self) -> bool {
+        match &self.connection {
+            Some(connection) => connection.is_connected(),
+            None => false,
         }
-    });
-    let url = format!("{}/{}/{}", WEBTRANSPORT_HOST, email, id);
-    log!("Connecting to ", &url);
-    let task = WebTransportService::connect(
-        &url,
-        on_datagram,
-        on_unidirectional_stream,
-        on_bidirectional_stream,
-        notification,
-    )?;
-    Ok(task)
+    }
+
+    fn send_public_key(&self, ctx: &Context<Self>) {
+        if !self.e2ee_enabled {
+            return;
+        }
+        let email = ctx.props().email.clone();
+        let rsa = &*self.rsa;
+        rsa.pub_key
+            .to_public_key_der()
+            .map_err(|e| error!("Failed to export rsa public key to der: {}", e.to_string()))
+            .and_then(|public_key_der| {
+                let data = RsaPacket {
+                    username: email.clone(),
+                    public_key_der: public_key_der.to_vec(),
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .map_err(|e| error!("Failed to serialize rsa packet: {}", e.to_string()))
+                .and_then(|data| {
+                    ctx.link()
+                        .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                            packet_type: PacketType::RSA_PUB_KEY.into(),
+                            email,
+                            data,
+                            ..Default::default()
+                        }));
+                    Ok(())
+                });
+                Ok(())
+            });
+    }
+
+    fn create_peer_decoder_manager(ctx: &Context<Self>) -> PeerDecodeManager {
+        let mut peer_decode_manager = PeerDecodeManager::new();
+        peer_decode_manager.on_peer_added = {
+            let link = ctx.link().clone();
+            Callback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
+        };
+        peer_decode_manager.on_first_frame = {
+            let link = ctx.link().clone();
+            Callback::from(move |(email, media_type)| {
+                link.send_message(Msg::OnFirstFrame((email, media_type)))
+            })
+        };
+        peer_decode_manager.get_video_canvas_id = Callback::from(|email| email);
+        peer_decode_manager.get_screen_canvas_id =
+            Callback::from(|email| format!("screen-share-{}", &email));
+        peer_decode_manager
+    }
+
+    fn create_media_device_access(ctx: &Context<Self>) -> MediaDeviceAccess {
+        let mut media_device_access = MediaDeviceAccess::new();
+        media_device_access.on_granted = {
+            let link = ctx.link().clone();
+            Callback::from(move |_| link.send_message(WsAction::MediaPermissionsGranted))
+        };
+        media_device_access.on_denied = {
+            let link = ctx.link().clone();
+            Callback::from(move |_| {
+                link.send_message(WsAction::MediaPermissionsError("Error requesting permissions. Please make sure to allow access to both camera and microphone.".to_string()))
+            })
+        };
+        media_device_access
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -155,33 +173,20 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let webtransport_enabled = ctx.props().webtransport_enabled;
-        let mut peer_decode_manager = PeerDecodeManager::new();
-        let link = ctx.link().clone();
-        peer_decode_manager.on_peer_added = Callback::from(move |email| {
-            link.send_message(Msg::OnPeerAdded(email));
-        });
-        let link = ctx.link().clone();
-        peer_decode_manager.on_first_frame = Callback::from(move |(email, media_type)| {
-            link.send_message(Msg::OnFirstFrame((email, media_type)));
-        });
-        peer_decode_manager.get_video_canvas_id = Callback::from(|email| email);
-        peer_decode_manager.get_screen_canvas_id =
-            Callback::from(|email| format!("screen-share-{}", &email));
         Self {
             connection: None,
-            connected: false,
-            connecting: false,
-            media_packet: MediaPacket::default(),
-            peer_decode_manager,
+            peer_decode_manager: Self::create_peer_decoder_manager(ctx),
+            media_device_access: Self::create_media_device_access(ctx),
             outbound_audio_buffer: [0; 2000],
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
-            webtransport_enabled,
-            heartbeat: None,
+            e2ee_enabled: ctx.props().e2ee_enabled,
+            webtransport_enabled: ctx.props().webtransport_enabled,
             error: None,
-            media_access_granted: false,
+            peer_keys: HashMap::new(),
+            aes: Arc::new(Aes128State::new(ctx.props().e2ee_enabled)),
+            rsa: Arc::new(RsaWrapper::new(ctx.props().e2ee_enabled)),
         }
     }
 
@@ -195,87 +200,59 @@ impl Component for AttendantsComponent {
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect(webtransport) => {
-                    if self.connecting {
+                    if self.connection.is_some() {
                         return false;
                     }
-                    self.connecting = true;
-                    log!("webtransport connect = {}", webtransport);
+                    info!("webtransport connect = {}", webtransport);
+                    info!("end to end encryption enabled = {}", self.e2ee_enabled);
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
-                    if !webtransport {
-                        if let Ok(task) = connect_websocket(ctx, &email, &id).map_err(|e| {
-                            ctx.link().send_message(WsAction::Log(format!(
-                                "WebSocket connect failed: {}",
-                                e
-                            )));
-                        }) {
-                            self.connection = Some(Connection::WebSocket(task));
+                    let options = ConnectOptions {
+                        userid: email.clone(),
+                        websocket_url: format!("{ACTIX_WEBSOCKET}/{email}/{id}"),
+                        webtransport_url: format!("{WEBTRANSPORT_HOST}/{email}/{id}"),
+                        on_inbound_media: ctx.link().callback(Msg::OnInboundMedia),
+                        on_connected: ctx.link().callback(|_| Msg::from(WsAction::Connected)),
+                        on_connection_lost: ctx
+                            .link()
+                            .callback(|_| Msg::from(WsAction::Lost(None))),
+                    };
+                    match Connection::connect(webtransport, options, self.aes.clone()) {
+                        Ok(connection) => {
+                            self.connection = Some(connection);
                         }
-                    } else {
-                        let task = connect_webtransport(ctx, &email, &id);
-                        match task {
-                            Ok(task) => {
-                                self.connection = Some(Connection::WebTransport(task));
-                            }
-                            Err(_e) => {
-                                log!("WebTransport connect failed, falling back to WebSocket");
-                                ctx.link().send_message(WsAction::Connect(false));
-                            }
+                        Err(e) => {
+                            ctx.link()
+                                .send_message(WsAction::Log(format!("Connection failed: {e}")));
                         }
                     }
 
-                    let link = ctx.link().clone();
-                    self.heartbeat = Some(Interval::new(1000, move || {
-                        let media_packet = MediaPacket {
-                            media_type: MediaType::HEARTBEAT.into(),
-                            email: email.clone(),
-                            timestamp: js_sys::Date::now(),
-                            ..Default::default()
-                        };
-                        link.send_message(Msg::OnOutboundPacket(media_packet));
-                    }));
                     true
                 }
                 WsAction::Connected => {
-                    log!("Connected");
-                    self.connecting = false;
-                    self.connected = true;
+                    info!("Connected");
+                    if self.e2ee_enabled {
+                        self.send_public_key(ctx);
+                    }
                     true
                 }
                 WsAction::Log(msg) => {
-                    log!("{}", msg);
+                    warn!("{}", msg);
                     false
                 }
                 WsAction::Lost(_reason) => {
-                    log!("Lost");
-                    self.connected = false;
-                    self.connecting = false;
-                    self.connection.take();
-                    if let Some(heartbeat) = self.heartbeat.take() {
-                        heartbeat.cancel();
-                    };
+                    warn!("Lost");
+                    self.connection = None;
                     ctx.link()
                         .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
                 }
                 WsAction::RequestMediaPermissions => {
-                    let future = request_permissions();
-                    let link = ctx.link().clone();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        match future.await {
-                            Ok(_) => {
-                                link.send_message(WsAction::MediaPermissionsGranted);
-                            }
-                            Err(_) => {
-                                link.send_message(WsAction::MediaPermissionsError("Error requesting permissions. Please make sure to allow access to both camera and microphone.".to_string()));
-                            }
-                        }
-                    });
+                    self.media_device_access.request();
                     false
                 }
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
-                    self.media_access_granted = true;
                     ctx.link()
                         .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
@@ -285,187 +262,129 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(_email) => true,
+            Msg::OnPeerAdded(_email) => {
+                debug!("New peer arrived.");
+                if self.e2ee_enabled {
+                    self.send_public_key(ctx);
+                }
+                true
+            }
             Msg::OnFirstFrame((_email, media_type)) => match media_type {
                 MediaType::SCREEN => true,
                 _ => false,
             },
             Msg::OnInboundMedia(response) => {
-                if let Err(e) = self.peer_decode_manager.decode(response) {
-                    log!("error decoding packet: {:?}", e);
+                match response.packet_type.enum_value() {
+                    Ok(PacketType::AES_KEY) => {
+                        if !self.e2ee_enabled {
+                            return false;
+                        }
+                        debug!("Received AES_KEY {}", &response.email);
+                        if let Ok(bytes) = self.rsa.decrypt(&response.data) {
+                            let aes_packet = AesPacket::parse_from_bytes(&bytes)
+                                .map_err(|e| {
+                                    error!("Failed to parse aes packet: {}", e.to_string())
+                                })
+                                .and_then(|aes_packet| {
+                                    self.peer_keys.insert(
+                                        response.email,
+                                        Aes128State::from_vecs(
+                                            aes_packet.key,
+                                            aes_packet.iv,
+                                            self.e2ee_enabled,
+                                        ),
+                                    );
+                                    Ok(())
+                                });
+                        }
+                        return false;
+                    }
+                    Ok(PacketType::RSA_PUB_KEY) => {
+                        if !self.e2ee_enabled {
+                            return false;
+                        }
+                        debug!("Received RSA_PUB_KEY");
+                        let rsa_packet = RsaPacket::parse_from_bytes(&response.data)
+                            .map_err(|e| error!("Failed to parse rsa packet: {}", e.to_string()))
+                            .and_then(|rsa_packey| {
+                                let pub_key =
+                                    RsaPublicKey::from_public_key_der(&rsa_packey.public_key_der)
+                                        .map_err(|e| {
+                                            error!(
+                                                "Failed to parse rsa public key: {}",
+                                                e.to_string()
+                                            )
+                                        })
+                                        .and_then(|pub_key| {
+                                            let aes_packet = AesPacket {
+                                                key: self.aes.key.to_vec(),
+                                                iv: self.aes.iv.to_vec(),
+                                                ..Default::default()
+                                            }
+                                            .write_to_bytes()
+                                            .map_err(|e| {
+                                                error!(
+                                                    "Failed to serialize aes packet: {}",
+                                                    e.to_string()
+                                                )
+                                            })
+                                            .and_then(|aes_packet| {
+                                                self.rsa
+                                                    .encrypt_with_key(&aes_packet, &pub_key)
+                                                    .map_err(|e| {
+                                                        error!(
+                                                            "Failed to encrypt aes packet: {}",
+                                                            e.to_string()
+                                                        )
+                                                    })
+                                                    .and_then(|data| {
+                                                        ctx.link().send_message(
+                                                            Msg::OnOutboundPacket(PacketWrapper {
+                                                                packet_type: PacketType::AES_KEY
+                                                                    .into(),
+                                                                email: ctx.props().email.clone(),
+                                                                data,
+                                                                ..Default::default()
+                                                            }),
+                                                        );
+                                                        Ok(())
+                                                    });
+                                                Ok(())
+                                            });
+                                            Ok(())
+                                        });
+                                Ok(())
+                            });
+                    }
+                    Ok(PacketType::MEDIA) => {
+                        let email = response.email.clone();
+                        if self.e2ee_enabled {
+                            if let Some(key) = self.peer_keys.get(&email) {
+                                if let Err(e) =
+                                    self.peer_decode_manager.decode(response, Some(*key))
+                                {
+                                    error!("error decoding packet: {}", e.to_string());
+                                    self.peer_decode_manager.delete_peer(&email);
+                                    self.peer_keys.remove(&email);
+                                }
+                            } else {
+                                debug!("No key found for peer");
+                                self.send_public_key(ctx)
+                            }
+                        } else if let Err(e) = self.peer_decode_manager.decode(response, None) {
+                            error!("error decoding packet: {}", e.to_string());
+                            self.peer_decode_manager.delete_peer(&email);
+                            self.peer_keys.remove(&email);
+                        }
+                    }
+                    Err(_) => {}
                 }
-                return false;
+                false
             }
             Msg::OnOutboundPacket(media) => {
                 if let Some(connection) = &self.connection {
-                    match connection {
-                        Connection::WebSocket(ws) => {
-                            if self.connected {
-                                match media
-                                    .write_to_bytes()
-                                    .map_err(|w| JsValue::from(format!("{:?}", w)))
-                                {
-                                    Ok(bytes) => {
-                                        ws.send_binary(bytes);
-                                    }
-                                    Err(e) => {
-                                        let packet_type = media.media_type.enum_value_or_default();
-                                        log!(
-                                            "error sending {} packet: {:?}",
-                                            JsValue::from(format!("{}", packet_type)),
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Connection::WebTransport(wt) => {
-                            if self.connected {
-                                match media
-                                    .write_to_bytes()
-                                    .map_err(|w| JsValue::from(format!("{:?}", w)))
-                                {
-                                    Ok(bytes) => {
-                                        if bytes.len() > 100 {
-                                            WebTransportTask::send_unidirectional_stream(
-                                                wt.transport.clone(),
-                                                bytes,
-                                            );
-                                        } else {
-                                            WebTransportTask::send_datagram(
-                                                wt.transport.clone(),
-                                                bytes,
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let packet_type = media.media_type.enum_value_or_default();
-                                        log!(
-                                            "error sending {} packet: {:?}",
-                                            JsValue::from(format!("{}", packet_type)),
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    connection.send_packet(media);
                 }
-                false
-            }
-            Msg::OnDatagram(bytes) => {
-                let media_packet = MediaPacket::parse_from_bytes(&bytes);
-                match media_packet {
-                    Ok(media_packet) => {
-                        ctx.link()
-                            .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
-                    }
-                    Err(e) => {
-                        let e = JsValue::from(format!("{:?}", e));
-                        log!("error parsing datagram: {:?}", e);
-                    }
-                }
-                false
-            }
-            Msg::OnMessage(response, message_type) => {
-                let res = MediaPacket::parse_from_bytes(&response);
-                if let Ok(media_packet) = res {
-                    ctx.link()
-                        .send_message(Msg::OnInboundMedia(MediaPacketWrapper(media_packet)));
-                } else {
-                    let message_type = format!("{:?}", message_type);
-                    log!("failed to parse media packet ", message_type);
-                }
-                false
-            }
-            Msg::OnUniStream(stream) => {
-                if stream.is_undefined() {
-                    log!("stream is undefined");
-                    return true;
-                }
-                let incoming_unistreams: ReadableStreamDefaultReader =
-                    stream.get_reader().unchecked_into();
-                let callback = ctx
-                    .link()
-                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::UnidirectionalStream));
-                wasm_bindgen_futures::spawn_local(async move {
-                    let mut buffer: Vec<u8> = vec![];
-                    loop {
-                        let read_result = JsFuture::from(incoming_unistreams.read()).await;
-                        match read_result {
-                            Err(e) => {
-                                let mut reason = WebTransportCloseInfo::default();
-                                reason.reason(
-                                    format!("Failed to read incoming unistream {e:?}").as_str(),
-                                );
-                                break;
-                            }
-                            Ok(result) => {
-                                let done = Reflect::get(&result, &JsString::from("done"))
-                                    .unwrap()
-                                    .unchecked_into::<Boolean>();
-
-                                let value =
-                                    Reflect::get(&result, &JsString::from("value")).unwrap();
-                                if !value.is_undefined() {
-                                    let value: Uint8Array = value.unchecked_into();
-                                    append_uint8_array_to_vec(&mut buffer, &value);
-                                }
-
-                                if done.is_truthy() {
-                                    process_binary(buffer, &callback);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-                false
-            }
-            Msg::OnBidiStream(stream) => {
-                log!("OnBidiStream: ", &stream);
-                if stream.is_undefined() {
-                    log!("stream is undefined");
-                    return true;
-                }
-                let readable: ReadableStreamDefaultReader =
-                    stream.readable().get_reader().unchecked_into();
-                let callback = ctx
-                    .link()
-                    .callback(|d| Msg::OnMessage(d, WebTransportMessageType::BidirectionalStream));
-                wasm_bindgen_futures::spawn_local(async move {
-                    let mut buffer: Vec<u8> = vec![];
-                    loop {
-                        log!("reading from stream");
-                        let read_result = JsFuture::from(readable.read()).await;
-
-                        match read_result {
-                            Err(e) => {
-                                let mut reason = WebTransportCloseInfo::default();
-                                reason.reason(
-                                    format!("Failed to read incoming bidistream {e:?}").as_str(),
-                                );
-                                break;
-                            }
-                            Ok(result) => {
-                                let done = Reflect::get(&result, &JsString::from("done"))
-                                    .unwrap()
-                                    .unchecked_into::<Boolean>();
-                                let value =
-                                    Reflect::get(&result, &JsString::from("value")).unwrap();
-                                if !value.is_undefined() {
-                                    let value: Uint8Array = value.unchecked_into();
-                                    append_uint8_array_to_vec(&mut buffer, &value);
-                                }
-                                if done.is_truthy() {
-                                    process_binary(buffer, &callback);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    log!("readable stream closed");
-                });
                 false
             }
             Msg::MeetingAction(action) => {
@@ -488,7 +407,7 @@ impl Component for AttendantsComponent {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let email = ctx.props().email.clone();
         let on_packet = ctx.link().callback(Msg::OnOutboundPacket);
-        let media_access_granted = self.media_access_granted;
+        let media_access_granted = self.media_device_access.is_granted();
         let rows: Vec<VNode> = self
             .peer_decode_manager
             .sorted_keys()
@@ -504,17 +423,34 @@ impl Component for AttendantsComponent {
                 } else {
                     "grid-item"
                 };
+                let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
+                let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
                 html! {
                     <>
-                        <div class={screen_share_css}>
+                        <div class={screen_share_css} id={(*screen_share_div_id).clone()}>
                             // Canvas for Screen share.
-                            <canvas id={format!("screen-share-{}", &key)}></canvas>
-                            <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                            <div class="canvas-container">
+                                <canvas id={format!("screen-share-{}", &key)}></canvas>
+                                <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                                <button onclick={Callback::from(move |_| {
+                                    toggle_pinned_div(&(*screen_share_div_id).clone());
+                                })} class="pin-icon">
+                                    <PushPinIcon/>
+                                </button>
+                            </div>
                         </div>
-                        <div class="grid-item">
+                        <div class="grid-item" id={(*peer_video_div_id).clone()}>
                             // One canvas for the User Video
-                            <UserVideo id={key.clone()}></UserVideo>
-                            <h4 class="floating-name">{key.clone()}</h4>
+                            <div class="canvas-container">
+                                <UserVideo id={key.clone()}></UserVideo>
+                                <h4 class="floating-name">{key.clone()}</h4>
+                                <button onclick={
+                                    Callback::from(move |_| {
+                                    toggle_pinned_div(&(*peer_video_div_id).clone());
+                                })} class="pin-icon">
+                                    <PushPinIcon/>
+                                </button>
+                            </div>
                         </div>
                     </>
                 }
@@ -544,13 +480,14 @@ impl Component for AttendantsComponent {
                     </div>
                     {
                         if media_access_granted {
-                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled}/>}
+                            html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes.clone()} />}
                         } else {
                             html! {<></>}
                         }
                     }
                     <h4 class="floating-name">{email}</h4>
-                    {if !self.connected {
+
+                    {if !self.is_connected() {
                         html! {<h4>{"Connecting"}</h4>}
                     } else {
                         html! {<h4>{"Connected"}</h4>}
@@ -594,15 +531,17 @@ fn user_video(props: &UserVideoProps) -> Html {
     }
 }
 
-pub fn append_uint8_array_to_vec(rust_vec: &mut Vec<u8>, js_array: &Uint8Array) {
-    // Convert the Uint8Array into a Vec<u8>
-    let mut temp_vec = vec![0; js_array.length() as usize];
-    js_array.copy_to(&mut temp_vec);
-
-    // Append it to the existing Rust Vec<u8>
-    rust_vec.append(&mut temp_vec);
-}
-
-pub fn process_binary(bytes: Vec<u8>, callback: &Callback<Vec<u8>>) {
-    callback.emit(bytes);
+fn toggle_pinned_div(div_id: &str) {
+    if let Some(div) = window()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.get_element_by_id(div_id))
+    {
+        // if the div does not have the grid-item-pinned css class, add it to it
+        if !div.class_list().contains("grid-item-pinned") {
+            div.class_list().add_1("grid-item-pinned").unwrap();
+        } else {
+            // else remove it
+            div.class_list().remove_1("grid-item-pinned").unwrap();
+        }
+    }
 }

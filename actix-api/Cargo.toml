@@ -33,7 +33,6 @@ jsonwebtoken= "8.1.1"
 nats = "0.24.0"
 oauth2 = { version = "4" }
 octets = "0.2.0"
-protobuf = "3.2.0"
 quinn = { version = "0.10.1", features = ["runtime-tokio", "tls-rustls", "ring"] }
 r2d2 = "0.8.10"
 r2d2_postgres = "0.18.1"
@@ -43,12 +42,11 @@ reqwest = { version = "0.11.11", features = ["json"]}
 rustls = { version = "0.21.2", features = ["dangerous_configuration"] }
 rustls-native-certs = "0.6.3"
 rustls-pemfile = "1.0.3"
-sec-http3 = { git= "https://github.com/security-union/sec-http3.git", rev = "4c505a86b98da2aaa21cd17f37908e4ce9b64f3a" }
+sec-http3 = "0.1.2"
 serde = "1.0.140"
 serde_json = "1.0.82"
 tokio = { version = "1.28.2", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["fmt", "ansi", "env-filter", "time", "tracing-log"] }
 tracing-tree = "0.2.3"
-types = { path= "../types"}
 uuid = { version = "0.8", features = ["serde", "v4"] }

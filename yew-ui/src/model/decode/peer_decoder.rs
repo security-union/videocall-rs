@@ -18,7 +18,7 @@ use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use crate::model::EncodedVideoChunkTypeWrapper;
-use gloo_console::log;
+use log::error;
 use std::sync::Arc;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
@@ -114,7 +114,7 @@ impl VideoPeerDecoder {
     pub fn new(canvas_id: &String) -> Self {
         let id = canvas_id.clone();
         let error = Closure::wrap(Box::new(move |e: JsValue| {
-            log!(&e);
+            error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
         let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
             let chunk = Box::new(original_chunk);
@@ -137,7 +137,7 @@ impl VideoPeerDecoder {
             render_canvas.set_width(width);
             render_canvas.set_height(height);
             if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
-                log!("error ", e);
+                error!("error {:?}", e);
             }
             video_chunk.unchecked_into::<VideoFrame>().close();
         }) as Box<dyn FnMut(JsValue)>);
@@ -184,7 +184,7 @@ pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
 impl AudioPeerDecoder {
     pub fn new() -> Self {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
-            log!(&e);
+            error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
         let audio_stream_generator =
             MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
@@ -199,15 +199,15 @@ impl AudioPeerDecoder {
             if let Err(e) = writable.get_writer().map(|writer| {
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Err(e) = JsFuture::from(writer.ready()).await {
-                        log!("write chunk error ", e);
+                        error!("write chunk error {:?}", e);
                     }
                     if let Err(e) = JsFuture::from(writer.write_with_chunk(&audio_data)).await {
-                        log!("write chunk error ", e);
+                        error!("write chunk error {:?}", e);
                     };
                     writer.release_lock();
                 });
             }) {
-                log!("error", e);
+                error!("error {:?}", e);
             }
         }) as Box<dyn FnMut(AudioData)>);
         let decoder = AudioDecoder::new(&AudioDecoderInit::new(

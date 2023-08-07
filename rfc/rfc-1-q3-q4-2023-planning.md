@@ -48,12 +48,10 @@ The current videocall-rs exists at [https://github.com/security-union/videocall-
 
 | Quarter | Features | Freeze Date | Release Date | Release |
 | ------- | -------- | ----------- | ------------ | ------- |
-| Q3 2023 | E2EE | 2023-08-02 | 2023-08-05 | 2 - <pick a band> |
-| Q3 2023 | Safari support | 2023-08-15 | 2023-08-20 | 3 |
-| Q3 2023 | ROS Library Beta, Conference recording | 2023-09-01 | 2023-09-05 | 4 |
-| Q3 2023 | Firefox support, Screen sharing v2 | 2023-09-15 | 2023-09-20 | - |
-| Q4 2023 | ROS Library Beta V2 | 2023-10-01 | 2023-10-05 | 5 |
-| Q4 2023 | Landing page? | 2023-10-10 | 2023-10-15 | 6 |
+| Q3 2023 | E2EE | 2023-08-06 | 2023-08-08 | 2 - Alice in Chains |
+| Q3 2023 | Build medical appointment react demo | 2023-08-27 | 2023-08-30 | 4 - The Alan Parsons Project |
+| Q3 2023 | Safari support | 2023-09-01 | 2023-09-05 | 3 - Polyphia |
+| Q3 2023 | Iggy | 2023-09-15 | 2023-09-20 | 4 - Iggy Pop |
 
 ## C. Expected outcomes and benefits
 

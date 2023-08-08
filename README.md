@@ -59,6 +59,9 @@ https://www.youtube.com/@securityunion
 ## 👉 Join our Discord Community
 You can join our Discord Community, here is the [invite link](https://discord.gg/JP38NRe4CJ).
 
+## 🫵 We need your haaalp!
+We take pride on being community driven, there are many ways to collaborate, from filing an issue or, if you want to dive deeper,
+being part of our [RFC Process](/rfc)
 
 ## 👨‍💻 Project Structure
 

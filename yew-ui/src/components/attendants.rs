@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -166,6 +167,22 @@ impl AttendantsComponent {
         };
         media_device_access
     }
+
+    fn serialize_aes_packet(&self) -> Result<Vec<u8>> {
+        AesPacket {
+            key: self.aes.key.to_vec(),
+            iv: self.aes.iv.to_vec(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .map_err(|e| anyhow!("Failed to serialize aes packet: {}", e.to_string()))
+    }
+
+    fn encrypt_aes_packet(&self, aes_packet: &[u8], pub_key: &RsaPublicKey) -> Result<Vec<u8>> {
+        self.rsa
+            .encrypt_with_key(aes_packet, pub_key)
+            .map_err(|e| anyhow!("Failed to encrypt aes packet: {}", e.to_string()))
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -304,57 +321,30 @@ impl Component for AttendantsComponent {
                             return false;
                         }
                         debug!("Received RSA_PUB_KEY");
-                        let rsa_packet = RsaPacket::parse_from_bytes(&response.data)
-                            .map_err(|e| error!("Failed to parse rsa packet: {}", e.to_string()))
-                            .and_then(|rsa_packey| {
-                                let pub_key =
-                                    RsaPublicKey::from_public_key_der(&rsa_packey.public_key_der)
-                                        .map_err(|e| {
-                                            error!(
-                                                "Failed to parse rsa public key: {}",
-                                                e.to_string()
-                                            )
-                                        })
-                                        .and_then(|pub_key| {
-                                            let aes_packet = AesPacket {
-                                                key: self.aes.key.to_vec(),
-                                                iv: self.aes.iv.to_vec(),
-                                                ..Default::default()
-                                            }
-                                            .write_to_bytes()
-                                            .map_err(|e| {
-                                                error!(
-                                                    "Failed to serialize aes packet: {}",
-                                                    e.to_string()
-                                                )
-                                            })
-                                            .and_then(|aes_packet| {
-                                                self.rsa
-                                                    .encrypt_with_key(&aes_packet, &pub_key)
-                                                    .map_err(|e| {
-                                                        error!(
-                                                            "Failed to encrypt aes packet: {}",
-                                                            e.to_string()
-                                                        )
-                                                    })
-                                                    .and_then(|data| {
-                                                        ctx.link().send_message(
-                                                            Msg::OnOutboundPacket(PacketWrapper {
-                                                                packet_type: PacketType::AES_KEY
-                                                                    .into(),
-                                                                email: ctx.props().email.clone(),
-                                                                data,
-                                                                ..Default::default()
-                                                            }),
-                                                        );
-                                                        Ok(())
-                                                    });
-                                                Ok(())
-                                            });
-                                            Ok(())
-                                        });
-                                Ok(())
+                        let encrypted_aes_packet = parse_rsa_packet(&response.data)
+                            .and_then(parse_public_key)
+                            .and_then(|pub_key| {
+                                self.serialize_aes_packet()
+                                    .and_then(|aes_packet| Ok((aes_packet, pub_key)))
+                            })
+                            .and_then(|(aes_packet, pub_key)| {
+                                self.encrypt_aes_packet(&aes_packet, &pub_key)
                             });
+
+                        match encrypted_aes_packet {
+                            Ok(data) => {
+                                ctx.link()
+                                    .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                                        packet_type: PacketType::AES_KEY.into(),
+                                        email: ctx.props().email.clone(),
+                                        data,
+                                        ..Default::default()
+                                    }));
+                            }
+                            Err(e) => {
+                                error!("Failed to send AES_KEY to peer: {}", e.to_string());
+                            }
+                        }
                     }
                     Ok(PacketType::MEDIA) => {
                         let email = response.email.clone();
@@ -544,4 +534,14 @@ fn toggle_pinned_div(div_id: &str) {
             div.class_list().remove_1("grid-item-pinned").unwrap();
         }
     }
+}
+
+fn parse_rsa_packet(response_data: &[u8]) -> Result<RsaPacket> {
+    RsaPacket::parse_from_bytes(response_data)
+        .map_err(|e| anyhow!("Failed to parse rsa packet: {}", e.to_string()))
+}
+
+fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
+    RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
+        .map_err(|e| anyhow!("Failed to parse rsa public key: {}", e.to_string()))
 }

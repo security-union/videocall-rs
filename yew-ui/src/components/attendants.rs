@@ -113,7 +113,7 @@ impl AttendantsComponent {
         let _res = rsa.pub_key
             .to_public_key_der()
             .map_err(|e| error!("Failed to export rsa public key to der: {}", e.to_string()))
-            .and_then(|public_key_der| {
+            .map(|public_key_der| {
                 let _data = RsaPacket {
                     username: email.clone(),
                     public_key_der: public_key_der.to_vec(),
@@ -121,7 +121,7 @@ impl AttendantsComponent {
                 }
                 .write_to_bytes()
                 .map_err(|e| error!("Failed to serialize rsa packet: {}", e.to_string()))
-                .and_then(|data| {
+                .map(|data| {
                     ctx.link()
                         .send_message(Msg::OnOutboundPacket(PacketWrapper {
                             packet_type: PacketType::RSA_PUB_KEY.into(),
@@ -129,9 +129,7 @@ impl AttendantsComponent {
                             data,
                             ..Default::default()
                         }));
-                    Ok(())
                 });
-                Ok(())
             });
     }
 
@@ -286,10 +284,7 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
-            Msg::OnFirstFrame((_email, media_type)) => match media_type {
-                MediaType::SCREEN => true,
-                _ => false,
-            },
+            Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::OnInboundMedia(response) => {
                 match response.packet_type.enum_value() {
                     Ok(PacketType::AES_KEY) => {
@@ -302,7 +297,7 @@ impl Component for AttendantsComponent {
                                 .map_err(|e| {
                                     error!("Failed to parse aes packet: {}", e.to_string())
                                 })
-                                .and_then(|aes_packet| {
+                                .map(|aes_packet| {
                                     self.peer_keys.insert(
                                         response.email,
                                         Aes128State::from_vecs(
@@ -311,7 +306,6 @@ impl Component for AttendantsComponent {
                                             self.e2ee_enabled,
                                         ),
                                     );
-                                    Ok(())
                                 });
                         }
                         return false;
@@ -325,7 +319,7 @@ impl Component for AttendantsComponent {
                             .and_then(parse_public_key)
                             .and_then(|pub_key| {
                                 self.serialize_aes_packet()
-                                    .and_then(|aes_packet| Ok((aes_packet, pub_key)))
+                                    .map(|aes_packet| (aes_packet, pub_key))
                             })
                             .and_then(|(aes_packet, pub_key)| {
                                 self.encrypt_aes_packet(&aes_packet, &pub_key)

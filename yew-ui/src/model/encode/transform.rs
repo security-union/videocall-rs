@@ -12,7 +12,7 @@ pub fn transform_video_chunk(
     chunk: EncodedVideoChunk,
     sequence: u64,
     buffer: &mut [u8],
-    email: Box<String>,
+    email: &str,
     aes: Arc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
@@ -20,81 +20,90 @@ pub fn transform_video_chunk(
     let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
         frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
-        email: *email,
+        email: email.to_owned(),
         media_type: MediaType::VIDEO.into(),
         timestamp: chunk.timestamp(),
+        video_metadata: Some(VideoMetadata { sequence, ..Default::default() }).into(),
         ..Default::default()
     };
-    let mut video_metadata = VideoMetadata::default();
-    video_metadata.sequence = sequence;
-    media_packet.video_metadata = Some(video_metadata).into();
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
-    let mut packet: PacketWrapper = PacketWrapper::default();
-    packet.data = data;
-    packet.email = media_packet.email;
-    packet.packet_type = PacketType::MEDIA.into();
-    packet
+    PacketWrapper {
+        data,
+        email: media_packet.email,
+        packet_type: PacketType::MEDIA.into(),
+        ..Default::default()
+    }
 }
 
 pub fn transform_screen_chunk(
     chunk: EncodedVideoChunk,
     sequence: u64,
     buffer: &mut [u8],
-    email: Box<String>,
+    email: &str,
     aes: Arc<Aes128State>,
 ) -> PacketWrapper {
-    let mut media_packet: MediaPacket = MediaPacket::default();
-    media_packet.email = *email;
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
-    media_packet.data = buffer[0..byte_length].to_vec();
-    media_packet.frame_type = EncodedVideoChunkTypeWrapper(chunk.type_()).to_string();
-    media_packet.media_type = MediaType::SCREEN.into();
-    media_packet.timestamp = chunk.timestamp();
-    let mut video_metadata = VideoMetadata::default();
-    video_metadata.sequence = sequence;
-    media_packet.video_metadata = Some(video_metadata).into();
+    let mut media_packet: MediaPacket = MediaPacket {
+        email: email.to_owned(),
+        data: buffer[0..byte_length].to_vec(),
+        frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
+        media_type: MediaType::SCREEN.into(),
+        timestamp: chunk.timestamp(),
+        video_metadata: Some(VideoMetadata {
+            sequence,
+            ..Default::default()
+        })
+        .into(),
+        ..Default::default()
+    };
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
-    let mut packet: PacketWrapper = PacketWrapper::default();
-    packet.data = data;
-    packet.email = media_packet.email;
-    packet.packet_type = PacketType::MEDIA.into();
-    packet
+    PacketWrapper {
+        data,
+        email: media_packet.email,
+        packet_type: PacketType::MEDIA.into(),
+        ..Default::default()
+    }
 }
 
 pub fn transform_audio_chunk(
     chunk: &EncodedAudioChunk,
     buffer: &mut [u8],
-    email: &String,
+    email: &str,
     sequence: u64,
     aes: Arc<Aes128State>,
 ) -> PacketWrapper {
     chunk.copy_to_with_u8_array(buffer);
-    let mut media_packet: MediaPacket = MediaPacket::default();
-    media_packet.email = email.clone();
-    media_packet.media_type = MediaType::AUDIO.into();
-    media_packet.data = buffer[0..chunk.byte_length() as usize].to_vec();
-    media_packet.frame_type = EncodedAudioChunkTypeWrapper(chunk.type_()).to_string();
-    media_packet.timestamp = chunk.timestamp();
-    let mut video_metadata = VideoMetadata::default();
-    video_metadata.sequence = sequence;
-    media_packet.video_metadata = Some(video_metadata).into();
+    let mut media_packet: MediaPacket = MediaPacket {
+        email: email.to_owned(),
+        media_type: MediaType::AUDIO.into(),
+        data: buffer[0..chunk.byte_length() as usize].to_vec(),
+        frame_type: EncodedAudioChunkTypeWrapper(chunk.type_()).to_string(),
+        timestamp: chunk.timestamp(),
+        video_metadata: Some(VideoMetadata {
+            sequence,
+            ..Default::default()
+        })
+        .into(),
+        ..Default::default()
+    };
     if let Some(duration0) = chunk.duration() {
         media_packet.duration = duration0;
     }
     let data = media_packet.write_to_bytes().unwrap();
     let data = aes.encrypt(&data).unwrap();
-    let mut packet: PacketWrapper = PacketWrapper::default();
-    packet.data = data;
-    packet.email = media_packet.email;
-    packet.packet_type = PacketType::MEDIA.into();
-    packet
+    PacketWrapper {
+        data,
+        email: media_packet.email,
+        packet_type: PacketType::MEDIA.into(),
+        ..Default::default()
+    }
 }

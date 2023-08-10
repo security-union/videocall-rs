@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, cmp::Ordering};
 
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
@@ -111,18 +111,17 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
         if self.sequence.is_none() || sorted_frames.is_empty() {
             return;
         }
-        for index in 0..sorted_frames.len() {
-            let current_sequence = sorted_frames[index];
+        for current_sequence in sorted_frames {
             let next_sequence = self.sequence.unwrap() + 1;
-            if *current_sequence < next_sequence {
-                continue;
-            } else if *current_sequence == next_sequence {
-                if let Some(next_image) = self.cache.get(current_sequence) {
-                    self.video_decoder.decode(next_image.clone());
-                    self.sequence = Some(next_sequence);
+            match current_sequence.cmp(&next_sequence) {
+                Ordering::Less => continue,
+                Ordering::Equal => {
+                    if let Some(next_image) = self.cache.get(current_sequence) {
+                        self.video_decoder.decode(next_image.clone());
+                        self.sequence = Some(next_sequence);
+                    }
                 }
-            } else {
-                break;
+                Ordering::Greater => break,
             }
         }
     }

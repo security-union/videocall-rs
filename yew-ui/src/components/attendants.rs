@@ -110,11 +110,11 @@ impl AttendantsComponent {
         }
         let email = ctx.props().email.clone();
         let rsa = &*self.rsa;
-        rsa.pub_key
+        let _res = rsa.pub_key
             .to_public_key_der()
             .map_err(|e| error!("Failed to export rsa public key to der: {}", e.to_string()))
             .and_then(|public_key_der| {
-                let data = RsaPacket {
+                let _data = RsaPacket {
                     username: email.clone(),
                     public_key_der: public_key_der.to_vec(),
                     ..Default::default()
@@ -298,7 +298,7 @@ impl Component for AttendantsComponent {
                         }
                         debug!("Received AES_KEY {}", &response.email);
                         if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                            let aes_packet = AesPacket::parse_from_bytes(&bytes)
+                            let _aes_packet = AesPacket::parse_from_bytes(&bytes)
                                 .map_err(|e| {
                                     error!("Failed to parse aes packet: {}", e.to_string())
                                 })
@@ -481,6 +481,12 @@ impl Component for AttendantsComponent {
                         html! {<h4>{"Connecting"}</h4>}
                     } else {
                         html! {<h4>{"Connected"}</h4>}
+                    }}
+
+                    {if self.e2ee_enabled {
+                        html! {<h4>{"End to End Encryption Enabled"}</h4>}
+                    } else {
+                        html! {<h4>{"End to End Encryption Disabled"}</h4>}
                     }}
                 </nav>
             </div>

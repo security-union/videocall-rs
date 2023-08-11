@@ -23,7 +23,11 @@ pub fn transform_video_chunk(
         email: email.to_owned(),
         media_type: MediaType::VIDEO.into(),
         timestamp: chunk.timestamp(),
-        video_metadata: Some(VideoMetadata { sequence, ..Default::default() }).into(),
+        video_metadata: Some(VideoMetadata {
+            sequence,
+            ..Default::default()
+        })
+        .into(),
         ..Default::default()
     };
     if let Some(duration0) = chunk.duration() {

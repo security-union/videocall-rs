@@ -110,7 +110,8 @@ impl AttendantsComponent {
         }
         let email = ctx.props().email.clone();
         let rsa = &*self.rsa;
-        let _res = rsa.pub_key
+        let _res = rsa
+            .pub_key
             .to_public_key_der()
             .map_err(|e| error!("Failed to export rsa public key to der: {}", e.to_string()))
             .map(|public_key_der| {

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, cmp::Ordering};
+use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;

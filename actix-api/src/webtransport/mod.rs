@@ -255,7 +255,10 @@ where
 
     let subject = format!("room.{}.*", lobby_id);
     let specific_subject = format!("room.{}.{}", lobby_id, username);
-    let mut sub = match nc.queue_subscribe(subject.clone(), specific_subject.clone()).await {
+    let mut sub = match nc
+        .queue_subscribe(subject.clone(), specific_subject.clone())
+        .await
+    {
         Ok(sub) => {
             info!("Subscribed to subject {}", subject);
             sub
@@ -333,10 +336,7 @@ where
                 if let Some((_id, buf)) = datagram {
                     let nc = nc.clone();
                     if let Err(e) = nc.publish(specific_subject.clone(), buf).await {
-                        error!(
-                            "Error publishing to subject {}: {}",
-                            specific_subject, e
-                        );
+                        error!("Error publishing to subject {}: {}", specific_subject, e);
                     }
                 }
             }

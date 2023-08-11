@@ -5,8 +5,8 @@ use crate::messages::{
 
 use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
 use futures::StreamExt;
-use tokio::task::JoinHandle;
 use std::{collections::HashMap, sync::Arc};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace};
 
 use super::chat_session::SessionId;
@@ -21,11 +21,14 @@ impl ChatServer {
     pub async fn new() -> Self {
         let url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
         ChatServer {
-            nats_connection: Arc::new(async_nats::ConnectOptions::new()
-                .require_tls(false)
-                .ping_interval(std::time::Duration::from_secs(10))
-                .connect(&url)
-                .await.unwrap()),
+            nats_connection: Arc::new(
+                async_nats::ConnectOptions::new()
+                    .require_tls(false)
+                    .ping_interval(std::time::Duration::from_secs(10))
+                    .connect(&url)
+                    .await
+                    .unwrap(),
+            ),
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
         }
@@ -120,7 +123,9 @@ impl Handler<JoinRoom> for ChatServer {
         let nc = self.nats_connection.clone();
         let s = session.clone();
         let fut = async move {
-                match nc.queue_subscribe(subject.clone(), queue.clone()).await
+            match nc
+                .queue_subscribe(subject.clone(), queue.clone())
+                .await
                 .map_err(|e| handle_subscription_error(e, &subject))
             {
                 Ok(mut sub) => {
@@ -131,14 +136,16 @@ impl Handler<JoinRoom> for ChatServer {
                         s.trim(),
                     );
                     while let Some(msg) = sub.next().await {
-                        if let Err(e) = handle_msg(session_recipient.clone(), room.clone(), s.clone())(msg) {
+                        if let Err(e) =
+                            handle_msg(session_recipient.clone(), room.clone(), s.clone())(msg)
+                        {
                             error!("{}", e);
                         }
                     }
-                },
+                }
                 Err(e) => {
                     error!("{}", e);
-                },
+                }
             }
         };
         let task = actix::spawn(fut);
@@ -169,7 +176,9 @@ fn handle_msg(
             return Ok(());
         }
 
-        let message = Message { msg: msg.payload.to_vec() };
+        let message = Message {
+            msg: msg.payload.to_vec(),
+        };
 
         session_recipient.try_send(message).map_err(|e| {
             error!("error sending message to session {}: {}", session, e);

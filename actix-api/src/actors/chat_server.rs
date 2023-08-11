@@ -3,48 +3,37 @@ use crate::messages::{
     session::Message,
 };
 
-use actix::{Actor, Context, Handler, MessageResult, Recipient};
-use std::collections::HashMap;
+use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
+use futures::StreamExt;
+use tokio::task::JoinHandle;
+use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, info, trace};
 
-use super::chat_session::{RoomId, SessionId};
+use super::chat_session::SessionId;
 
 pub struct ChatServer {
-    nats_connection: nats::Connection,
+    nats_connection: Arc<async_nats::client::Client>,
     sessions: HashMap<SessionId, Recipient<Message>>,
-    active_subs: HashMap<SessionId, nats::Handler>,
-}
-
-impl Default for ChatServer {
-    fn default() -> Self {
-        Self::new()
-    }
+    active_subs: HashMap<SessionId, JoinHandle<()>>,
 }
 
 impl ChatServer {
-    pub fn new() -> Self {
-        let nc = nats::Options::new()
-            .with_name("websocket-api")
-            .connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
-            .unwrap();
+    pub async fn new() -> Self {
+        let url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
         ChatServer {
-            nats_connection: nc,
+            nats_connection: Arc::new(async_nats::ConnectOptions::new()
+                .require_tls(true)
+                .ping_interval(std::time::Duration::from_secs(10))
+                .connect(&url)
+                .await.unwrap()),
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
         }
     }
 
-    pub fn send_message(&self, room: &RoomId, message: &Vec<u8>, session_id: SessionId) {
-        let subject = format!("room.{}.{}", room, session_id);
-        match self.nats_connection.publish(&subject, message) {
-            Ok(_) => trace!("published message to {}", subject),
-            Err(e) => error!("error publishing message to {}: {}", subject, e),
-        }
-    }
-
     pub fn leave_rooms(&mut self, session_id: &SessionId) {
         if let Some(sub) = self.active_subs.remove(session_id) {
-            let _ = sub.unsubscribe();
+            let _ = sub.abort();
         }
     }
 }
@@ -86,7 +75,7 @@ impl Handler<Leave> for ChatServer {
 impl Handler<ClientMessage> for ChatServer {
     type Result = ();
 
-    fn handle(&mut self, msg: ClientMessage, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: ClientMessage, ctx: &mut Self::Context) -> Self::Result {
         let ClientMessage {
             session,
             room,
@@ -94,7 +83,18 @@ impl Handler<ClientMessage> for ChatServer {
             user: _,
         } = msg;
         trace!("got message in server room {} session {}", room, session);
-        self.send_message(&room, &msg.data, session);
+        let nc = self.nats_connection.clone();
+        let subject = format!("room.{}.{}", room, session);
+        let data = msg.data.clone();
+        let b = bytes::Bytes::from(data.to_vec());
+        let fut = async move {
+            match nc.publish(subject.clone(), b).await {
+                Ok(_) => trace!("published message to {}", subject),
+                Err(e) => error!("error publishing message to {}: {}", subject, e),
+            }
+        };
+        let fut = actix::fut::wrap_future::<_, Self>(fut);
+        ctx.spawn(fut);
     }
 }
 
@@ -117,37 +117,35 @@ impl Handler<JoinRoom> for ChatServer {
             }
         };
 
-        let sub = match self
-            .nats_connection
-            .queue_subscribe(&subject, &queue)
-            .map_err(|e| handle_subscription_error(e, &subject))
-        {
-            Ok(sub) => sub,
-            Err(e) => return MessageResult(Err(e)),
+        let nc = self.nats_connection.clone();
+        let s = session.clone();
+        let fut = async move {
+                match nc.queue_subscribe(subject.clone(), queue.clone()).await
+                .map_err(|e| handle_subscription_error(e, &subject))
+            {
+                Ok(mut sub) => {
+                    debug!("Subscribed to subject {} with queue {}", subject, queue);
+                    info!(
+                        "someone connected to room {} with session {}",
+                        room,
+                        s.trim(),
+                    );
+                    while let Some(msg) = sub.next().await {
+                        if let Err(e) = handle_msg(session_recipient.clone(), room.clone(), s.clone())(msg) {
+                            error!("{}", e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("{}", e);
+                },
+            }
         };
+        let task = actix::spawn(fut);
 
-        let handler = sub.with_handler(build_handler(
-            session_recipient,
-            room.clone(),
-            session.clone(),
-        ));
+        self.active_subs.insert(session, task);
 
-        debug!("Subscribed to subject {} with queue {}", subject, queue);
-
-        let result = self
-            .active_subs
-            .insert(session.clone(), handler)
-            .map(|_| ())
-            .ok_or("The session is already subscribed".into());
-
-        info!(
-            "someone connected to room {} with session {} result {:?}",
-            room,
-            session.trim(),
-            result
-        );
-
-        MessageResult(result)
+        MessageResult(Ok(()))
     }
 }
 
@@ -161,17 +159,17 @@ fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String
     err
 }
 
-fn build_handler(
+fn handle_msg(
     session_recipient: Recipient<Message>, // Assuming Recipient is a type
     room: String,
     session: SessionId,
-) -> impl Fn(nats::Message) -> Result<(), std::io::Error> {
+) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
         if msg.subject == format!("room.{}.{}", room, session) {
             return Ok(());
         }
 
-        let message = Message { msg: msg.data };
+        let message = Message { msg: msg.payload.to_vec() };
 
         session_recipient.try_send(message).map_err(|e| {
             error!("error sending message to session {}: {}", session, e);

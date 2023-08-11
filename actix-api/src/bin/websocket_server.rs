@@ -171,7 +171,7 @@ async fn main() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     info!("start");
-    let chat = ChatServer::new().start();
+    let chat = ChatServer::new().await.start();
     let oauth_client_id: String = std::env::var("OAUTH_CLIENT_ID").unwrap_or(String::from(""));
     let oauth_auth_url: String = std::env::var("OAUTH_AUTH_URL").unwrap_or(String::from(""));
     let oauth_token_url: String = std::env::var("OAUTH_TOKEN_URL").unwrap_or(String::from(""));

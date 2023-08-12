@@ -298,7 +298,7 @@ where
                             }
                         }
                     });
-                } else if let Err(e) = session.send_datagram(msg.payload.into()) {
+                } else if let Err(e) = session.send_datagram(msg.payload) {
                     error!("Error sending datagram: {}", e);
                 }
             }

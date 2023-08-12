@@ -35,8 +35,8 @@ impl ChatServer {
     }
 
     pub fn leave_rooms(&mut self, session_id: &SessionId) {
-        if let Some(sub) = self.active_subs.remove(session_id) {
-            let _ = sub.abort();
+        if let Some(task) = self.active_subs.remove(session_id) {
+            task.abort();
         }
     }
 }
@@ -88,8 +88,7 @@ impl Handler<ClientMessage> for ChatServer {
         trace!("got message in server room {} session {}", room, session);
         let nc = self.nats_connection.clone();
         let subject = format!("room.{}.{}", room, session);
-        let data = msg.data.clone();
-        let b = bytes::Bytes::from(data.to_vec());
+        let b = bytes::Bytes::from(msg.data.to_vec());
         let fut = async move {
             match nc.publish(subject.clone(), b).await {
                 Ok(_) => trace!("published message to {}", subject),

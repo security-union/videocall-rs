@@ -172,10 +172,14 @@ async fn main() -> std::io::Result<()> {
         .init();
     info!("start");
     let chat = ChatServer::new().await.start();
-    let oauth_client_id: String = std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
-    let oauth_auth_url: String = std::env::var("OAUTH_AUTH_URL").unwrap_or_else(|_| String::from(""));
-    let oauth_token_url: String = std::env::var("OAUTH_TOKEN_URL").unwrap_or_else(|_| String::from(""));
-    let oauth_secret: String = std::env::var("OAUTH_CLIENT_SECRET").unwrap_or_else(|_| String::from(""));
+    let oauth_client_id: String =
+        std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
+    let oauth_auth_url: String =
+        std::env::var("OAUTH_AUTH_URL").unwrap_or_else(|_| String::from(""));
+    let oauth_token_url: String =
+        std::env::var("OAUTH_TOKEN_URL").unwrap_or_else(|_| String::from(""));
+    let oauth_secret: String =
+        std::env::var("OAUTH_CLIENT_SECRET").unwrap_or_else(|_| String::from(""));
     let oauth_redirect_url: String =
         std::env::var("OAUTH_REDIRECT_URL").unwrap_or_else(|_| String::from(""));
     let after_login_url: String = std::env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from(""));

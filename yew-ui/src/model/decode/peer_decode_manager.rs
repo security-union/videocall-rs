@@ -34,6 +34,7 @@ impl Display for MultiDecoderError {
     }
 }
 
+#[derive(Debug)]
 pub struct MultiDecoder {
     pub audio: AudioPeerDecoder,
     pub video: VideoPeerDecoder,
@@ -124,6 +125,7 @@ impl MultiDecoder {
     }
 }
 
+#[derive(Debug)]
 pub struct PeerDecodeManager {
     connected_peers: HashMap<String, MultiDecoder>,
     sorted_connected_peers_keys: Vec<String>,
@@ -153,15 +155,11 @@ impl PeerDecodeManager {
         self.connected_peers.get(key)
     }
 
-    pub fn decode(
-        &mut self,
-        response: PacketWrapper,
-        aes: Option<Aes128State>,
-    ) -> Result<(), MultiDecoderError> {
+    pub fn decode(&mut self, response: PacketWrapper) -> Result<(), MultiDecoderError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if !self.connected_peers.contains_key(&email) {
-            self.add_peer(&email, aes);
+            self.add_peer(&email);
         }
         if let Some(peer) = self.connected_peers.get_mut(&email) {
             match peer.decode(&packet) {
@@ -172,7 +170,7 @@ impl PeerDecodeManager {
                     Ok(())
                 }
                 Err(e) => {
-                    self.reset_peer(&email, aes);
+                    self.reset_peer(&email);
                     Err(e)
                 }
             }
@@ -208,8 +206,18 @@ impl PeerDecodeManager {
         }
     }
 
-    fn reset_peer(&mut self, email: &String, aes: Option<Aes128State>) {
+    fn reset_peer(&mut self, email: &String) {
+        let aes = if let Some(peer) = self.get(email) {
+            peer.aes
+        } else {
+            None
+        };
         self.delete_peer(email);
         self.insert_peer(email, aes);
+    }
+
+    pub fn set_peer_aes(&mut self, email: &String, aes: Aes128State) {
+        self.delete_peer(email);
+        self.insert_peer(email, Some(aes));
     }
 }

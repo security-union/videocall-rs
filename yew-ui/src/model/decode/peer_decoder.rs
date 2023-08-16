@@ -10,6 +10,7 @@
 // and each one's new() contains the type-specific creation/configuration code.
 //
 
+use super::super::wrappers::EncodedVideoChunkTypeWrapper;
 use super::config::configure_audio_context;
 use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
 use super::video_decoder_wrapper::VideoDecoderWrapper;
@@ -17,8 +18,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
-use crate::model::EncodedVideoChunkTypeWrapper;
-use log::error;
+use gloo_console::log;
 use std::sync::Arc;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
@@ -43,6 +43,7 @@ pub struct DecodeStatus {
 //
 // Generic type for decoders captures common functionality.
 //
+#[derive(Debug)]
 pub struct PeerDecoder<WebDecoder, Chunk> {
     decoder: WebDecoder,
     waiting_for_keyframe: bool,

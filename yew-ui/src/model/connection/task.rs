@@ -10,6 +10,7 @@ use yew_webtransport::webtransport::WebTransportTask;
 
 use super::webmedia::{ConnectOptions, WebMedia};
 
+#[derive(Debug)]
 pub(super) enum Task {
     WebSocket(WebSocketTask),
     WebTransport(WebTransportTask),

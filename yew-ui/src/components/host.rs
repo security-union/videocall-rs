@@ -1,13 +1,12 @@
+use crate::model::client::VideoCallClient;
 use gloo_timers::callback::Timeout;
 use log::debug;
 use types::protos::packet_wrapper::PacketWrapper;
 
 use std::fmt::Debug;
-use std::sync::Arc;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
-use crate::crypto::aes::Aes128State;
 use crate::model::encode::CameraEncoder;
 use crate::model::encode::MicrophoneEncoder;
 use crate::model::encode::ScreenEncoder;
@@ -34,8 +33,7 @@ pub struct MeetingProps {
     #[prop_or_default]
     pub id: String,
 
-    #[prop_or_default]
-    pub on_packet: Callback<PacketWrapper>,
+    pub client: VideoCallClient,
 
     #[prop_or_default]
     pub email: String,
@@ -45,8 +43,6 @@ pub struct MeetingProps {
     pub mic_enabled: bool,
 
     pub video_enabled: bool,
-
-    pub aes: Arc<Aes128State>,
 }
 
 impl Component for Host {
@@ -54,7 +50,7 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let aes = ctx.props().aes.clone();
+        let aes = ctx.props().client.aes();
         Self {
             camera: CameraEncoder::new(aes.clone()),
             microphone: MicrophoneEncoder::new(aes.clone()),
@@ -86,10 +82,11 @@ impl Component for Host {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::EnableScreenShare => {
-                let on_frame = ctx.props().on_packet.clone();
+                let client = ctx.props().client.clone();
                 let email = ctx.props().email.clone();
-                self.screen
-                    .start(email, move |packet: PacketWrapper| on_frame.emit(packet));
+                self.screen.start(email, move |packet: PacketWrapper| {
+                    client.send_packet(packet)
+                });
                 true
             }
             Msg::Start => true,
@@ -97,10 +94,11 @@ impl Component for Host {
                 if !should_enable {
                     return true;
                 }
-                let on_audio = ctx.props().on_packet.clone();
+                let client = ctx.props().client.clone();
                 let email = ctx.props().email.clone();
-                self.microphone
-                    .start(email, move |packet: PacketWrapper| on_audio.emit(packet));
+                self.microphone.start(email, move |packet: PacketWrapper| {
+                    client.send_packet(packet)
+                });
                 true
             }
             Msg::EnableVideo(should_enable) => {
@@ -108,11 +106,11 @@ impl Component for Host {
                     return true;
                 }
 
-                let on_packet = ctx.props().on_packet.clone();
+                let client = ctx.props().client.clone();
                 let email = ctx.props().email.clone();
                 self.camera.start(
                     email,
-                    move |packet: PacketWrapper| on_packet.emit(packet),
+                    move |packet: PacketWrapper| client.send_packet(packet),
                     VIDEO_ELEMENT_ID,
                 );
                 true

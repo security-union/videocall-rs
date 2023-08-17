@@ -127,10 +127,14 @@ impl AttendantsComponent {
                                 ..Default::default()
                             }));
                     }
-                    Err(e) => { error!("Failed to serialize rsa packet: {}", e.to_string()) }
+                    Err(e) => {
+                        error!("Failed to serialize rsa packet: {}", e.to_string())
+                    }
                 };
             }
-            Err(e) =>  { error!("Failed to export rsa public key to der: {}", e.to_string()) }
+            Err(e) => {
+                error!("Failed to export rsa public key to der: {}", e.to_string())
+            }
         }
     }
 

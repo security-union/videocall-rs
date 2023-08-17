@@ -36,13 +36,15 @@ use crate::crypto::aes::Aes128State;
 
 pub struct CameraEncoder {
     aes: Arc<Aes128State>,
+    video_elem_id: String,
     state: EncoderState,
 }
 
 impl CameraEncoder {
-    pub fn new(aes: Arc<Aes128State>) -> Self {
+    pub fn new(aes: Arc<Aes128State>, video_elem_id: &str) -> Self {
         Self {
             aes,
+            video_elem_id: video_elem_id.to_string(),
             state: EncoderState::new(),
         }
     }
@@ -62,14 +64,13 @@ impl CameraEncoder {
         &mut self,
         userid: String,
         on_frame: impl Fn(PacketWrapper) + 'static,
-        video_elem_id: &str,
     ) {
         // 1. Query the first device with a camera and a mic attached.
         // 2. setup WebCodecs, in particular
         // 3. send encoded video frames and raw audio to the server.
         let on_frame = Box::new(on_frame);
         let userid = Box::new(userid);
-        let video_elem_id = video_elem_id.to_string();
+        let video_elem_id = self.video_elem_id.clone();
         let EncoderState {
             destroy,
             enabled,

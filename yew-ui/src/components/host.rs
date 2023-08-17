@@ -52,7 +52,7 @@ impl Component for Host {
     fn create(ctx: &Context<Self>) -> Self {
         let aes = ctx.props().client.aes();
         Self {
-            camera: CameraEncoder::new(aes.clone()),
+            camera: CameraEncoder::new(aes.clone(), VIDEO_ELEMENT_ID),
             microphone: MicrophoneEncoder::new(aes.clone()),
             screen: ScreenEncoder::new(aes),
         }
@@ -111,7 +111,6 @@ impl Component for Host {
                 self.camera.start(
                     email,
                     move |packet: PacketWrapper| client.send_packet(packet),
-                    VIDEO_ELEMENT_ID,
                 );
                 true
             }

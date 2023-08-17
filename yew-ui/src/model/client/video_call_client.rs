@@ -211,19 +211,17 @@ impl Inner {
                 }
                 debug!("Received AES_KEY {}", &response.email);
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                    let aes_packet = AesPacket::parse_from_bytes(&bytes)
-                        .map_err(|e| error!("Failed to parse aes packet: {}", e.to_string()))
-                        .and_then(|aes_packet| {
+                    match AesPacket::parse_from_bytes(&bytes) {
+                        Ok(aes_packet) => {
                             self.peer_decode_manager.set_peer_aes(
                                 &response.email,
-                                Aes128State::from_vecs(
-                                    aes_packet.key,
-                                    aes_packet.iv,
-                                    self.options.enable_e2ee,
-                                ),
-                            );
-                            Ok(())
-                        });
+                                Aes128State::from_vecs(aes_packet.key, aes_packet.iv, self.options.enable_e2ee),
+                                );
+                        }
+                        Err(e) => {
+                            error!("Failed to parse aes packet: {}", e.to_string());
+                        }
+                    }
                 }
                 return;
             }
@@ -273,28 +271,31 @@ impl Inner {
         }
         let userid = self.options.userid.clone();
         let rsa = &*self.rsa;
-        rsa.pub_key
-            .to_public_key_der()
-            .map_err(|e| error!("Failed to export rsa public key to der: {}", e.to_string()))
-            .and_then(|public_key_der| {
-                let data = RsaPacket {
+        match rsa.pub_key.to_public_key_der() {
+            Ok(public_key_der) => {
+                let packet = RsaPacket {
                     username: userid.clone(),
                     public_key_der: public_key_der.to_vec(),
                     ..Default::default()
+                };
+                match packet.write_to_bytes() {
+                    Ok(data) => {
+                        self.send_packet(PacketWrapper {
+                            packet_type: PacketType::RSA_PUB_KEY.into(),
+                            email: userid,
+                            data,
+                            ..Default::default()
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize rsa packet: {}", e.to_string());
+                    }
                 }
-                .write_to_bytes()
-                .map_err(|e| error!("Failed to serialize rsa packet: {}", e.to_string()))
-                .and_then(|data| {
-                    self.send_packet(PacketWrapper {
-                        packet_type: PacketType::RSA_PUB_KEY.into(),
-                        email: userid,
-                        data,
-                        ..Default::default()
-                    });
-                    Ok(())
-                });
-                Ok(())
-            });
+            }
+            Err(e) => {
+                error!("Failed to export rsa public key to der: {}", e.to_string());
+            }
+        }
     }
 
     fn serialize_aes_packet(&self) -> Result<Vec<u8>> {

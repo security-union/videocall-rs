@@ -132,7 +132,9 @@ pub async fn request_token(
     let response = client.post(oauth_token_url).form(&params).send().await?;
     let oauth_response: OAuthResponse = response.json().await?;
     let claims: Vec<&str> = oauth_response.id_token.split('.').collect();
-    let claims_chunk = claims.get(1).ok_or(anyhow!("Unable to parse jwt token"))?;
+    let claims_chunk = claims
+        .get(1)
+        .ok_or_else(|| anyhow!("Unable to parse jwt token"))?;
     let decoded_claims = DecodedJwtPartClaims::from_jwt_part_claims(claims_chunk)?;
     Ok((oauth_response, decoded_claims.deserialize()?))
 }

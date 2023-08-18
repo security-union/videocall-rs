@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use futures::StreamExt;
 use http::Method;
 use quinn::VarInt;
 use rustls::{Certificate, PrivateKey};
@@ -100,7 +101,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
     info!("listening on {}", opt.listen);
 
     let nc =
-        nats::asynk::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
+        async_nats::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
             .await
             .unwrap();
 
@@ -147,7 +148,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
 async fn handle_connection(
     mut conn: Connection<h3_quinn::Connection, Bytes>,
-    nc: nats::asynk::Connection,
+    nc: async_nats::client::Client,
 ) -> Result<()> {
     // 3. TODO: Conditionally, if the client indicated that this is a webtransport session, we should accept it here, else use regular h3.
     // if this is a webtransport session, then h3 needs to stop handing the datagrams, bidirectional streams, and unidirectional streams and give them
@@ -218,7 +219,7 @@ async fn handle_session<C>(
     session: WebTransportSession<C, Bytes>,
     username: &str,
     lobby_id: &str,
-    nc: nats::asynk::Connection,
+    nc: async_nats::client::Client,
 ) -> anyhow::Result<()>
 where
     // Use trait bounds to ensure we only happen to use implementation that are only for the quinn
@@ -254,7 +255,10 @@ where
 
     let subject = format!("room.{}.*", lobby_id);
     let specific_subject = format!("room.{}.{}", lobby_id, username);
-    let sub = match nc.queue_subscribe(&subject, &specific_subject).await {
+    let mut sub = match nc
+        .queue_subscribe(subject.clone(), specific_subject.clone())
+        .await
+    {
         Ok(sub) => {
             info!("Subscribed to subject {}", subject);
             sub
@@ -280,12 +284,12 @@ where
                     continue;
                 }
                 let session = session.read().await;
-                if msg.data.len() > 400 {
+                if msg.payload.len() > 400 {
                     let stream = session.open_uni(session_id).await;
                     tokio::spawn(async move {
                         match stream {
                             Ok(mut uni_stream) => {
-                                if let Err(e) = uni_stream.write_all(&msg.data).await {
+                                if let Err(e) = uni_stream.write_all(&msg.payload).await {
                                     error!("Error writing to unidirectional stream: {}", e);
                                 }
                             }
@@ -294,7 +298,7 @@ where
                             }
                         }
                     });
-                } else if let Err(e) = session.send_datagram(msg.data.into()) {
+                } else if let Err(e) = session.send_datagram(msg.payload) {
                     error!("Error sending datagram: {}", e);
                 }
             }
@@ -316,8 +320,8 @@ where
                         if let Err(e) = uni_stream.read_to_end(&mut buf).await {
                             error!("Error reading from unidirectional stream: {}", e);
                         }
-                        if let Err(e) = nc.publish(&specific_subject, buf).await {
-                            error!("Error publishing to subject {}: {}", specific_subject, e);
+                        if let Err(e) = nc.publish(specific_subject.clone(), buf.into()).await {
+                            error!("Error publishing to subject {}: {}", &specific_subject, e);
                         }
                     });
                 }
@@ -331,12 +335,8 @@ where
             while let Ok(datagram) = session.accept_datagram().await {
                 if let Some((_id, buf)) = datagram {
                     let nc = nc.clone();
-                    let specific_subject_clone = specific_subject.clone();
-                    if let Err(e) = nc.publish(&specific_subject_clone, buf).await {
-                        error!(
-                            "Error publishing to subject {}: {}",
-                            specific_subject_clone, e
-                        );
+                    if let Err(e) = nc.publish(specific_subject.clone(), buf).await {
+                        error!("Error publishing to subject {}: {}", specific_subject, e);
                     }
                 }
             }

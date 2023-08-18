@@ -171,14 +171,18 @@ async fn main() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     info!("start");
-    let chat = ChatServer::new().start();
-    let oauth_client_id: String = std::env::var("OAUTH_CLIENT_ID").unwrap_or(String::from(""));
-    let oauth_auth_url: String = std::env::var("OAUTH_AUTH_URL").unwrap_or(String::from(""));
-    let oauth_token_url: String = std::env::var("OAUTH_TOKEN_URL").unwrap_or(String::from(""));
-    let oauth_secret: String = std::env::var("OAUTH_CLIENT_SECRET").unwrap_or(String::from(""));
+    let chat = ChatServer::new().await.start();
+    let oauth_client_id: String =
+        std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
+    let oauth_auth_url: String =
+        std::env::var("OAUTH_AUTH_URL").unwrap_or_else(|_| String::from(""));
+    let oauth_token_url: String =
+        std::env::var("OAUTH_TOKEN_URL").unwrap_or_else(|_| String::from(""));
+    let oauth_secret: String =
+        std::env::var("OAUTH_CLIENT_SECRET").unwrap_or_else(|_| String::from(""));
     let oauth_redirect_url: String =
-        std::env::var("OAUTH_REDIRECT_URL").unwrap_or(String::from(""));
-    let after_login_url: String = std::env::var("UI_ENDPOINT").unwrap_or(String::from(""));
+        std::env::var("OAUTH_REDIRECT_URL").unwrap_or_else(|_| String::from(""));
+    let after_login_url: String = std::env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from(""));
 
     HttpServer::new(move || {
         let cors = Cors::permissive();
@@ -204,7 +208,7 @@ async fn main() -> std::io::Result<()> {
     .bind((
         "0.0.0.0",
         std::env::var("ACTIX_PORT")
-            .unwrap_or(String::from("8080"))
+            .unwrap_or_else(|_| String::from("8080"))
             .parse::<u16>()
             .unwrap(),
     ))?

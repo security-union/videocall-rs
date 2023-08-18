@@ -289,10 +289,7 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
-            Msg::OnFirstFrame((_email, media_type)) => match media_type {
-                MediaType::SCREEN => true,
-                _ => false,
-            },
+            Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::OnInboundMedia(response) => {
                 match response.packet_type.enum_value() {
                     Ok(PacketType::AES_KEY) => {
@@ -484,6 +481,12 @@ impl Component for AttendantsComponent {
                         html! {<h4>{"Connecting"}</h4>}
                     } else {
                         html! {<h4>{"Connected"}</h4>}
+                    }}
+
+                    {if self.e2ee_enabled {
+                        html! {<h4>{"End to End Encryption Enabled"}</h4>}
+                    } else {
+                        html! {<h4>{"End to End Encryption Disabled"}</h4>}
                     }}
                 </nav>
             </div>

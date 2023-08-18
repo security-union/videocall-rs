@@ -110,28 +110,32 @@ impl AttendantsComponent {
         }
         let email = ctx.props().email.clone();
         let rsa = &*self.rsa;
-        let _res = rsa
-            .pub_key
-            .to_public_key_der()
-            .map_err(|e| error!("Failed to export rsa public key to der: {}", e.to_string()))
-            .map(|public_key_der| {
-                let _data = RsaPacket {
+        match rsa.pub_key.to_public_key_der() {
+            Ok(public_key_der) => {
+                let packet = RsaPacket {
                     username: email.clone(),
                     public_key_der: public_key_der.to_vec(),
                     ..Default::default()
-                }
-                .write_to_bytes()
-                .map_err(|e| error!("Failed to serialize rsa packet: {}", e.to_string()))
-                .map(|data| {
-                    ctx.link()
-                        .send_message(Msg::OnOutboundPacket(PacketWrapper {
-                            packet_type: PacketType::RSA_PUB_KEY.into(),
-                            email,
-                            data,
-                            ..Default::default()
-                        }));
-                });
-            });
+                };
+                match packet.write_to_bytes() {
+                    Ok(data) => {
+                        ctx.link()
+                            .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                                packet_type: PacketType::RSA_PUB_KEY.into(),
+                                email,
+                                data,
+                                ..Default::default()
+                            }));
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize rsa packet: {}", e.to_string())
+                    }
+                };
+            }
+            Err(e) => {
+                error!("Failed to export rsa public key to der: {}", e.to_string())
+            }
+        }
     }
 
     fn create_peer_decoder_manager(ctx: &Context<Self>) -> PeerDecodeManager {
@@ -294,11 +298,8 @@ impl Component for AttendantsComponent {
                         }
                         debug!("Received AES_KEY {}", &response.email);
                         if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                            let _aes_packet = AesPacket::parse_from_bytes(&bytes)
-                                .map_err(|e| {
-                                    error!("Failed to parse aes packet: {}", e.to_string())
-                                })
-                                .map(|aes_packet| {
+                            match AesPacket::parse_from_bytes(&bytes) {
+                                Ok(aes_packet) => {
                                     self.peer_keys.insert(
                                         response.email,
                                         Aes128State::from_vecs(
@@ -307,7 +308,11 @@ impl Component for AttendantsComponent {
                                             self.e2ee_enabled,
                                         ),
                                     );
-                                });
+                                }
+                                Err(e) => {
+                                    error!("Failed to parse aes packet: {}", e.to_string())
+                                }
+                            }
                         }
                         return false;
                     }

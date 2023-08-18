@@ -321,7 +321,7 @@ where
                             error!("Error reading from unidirectional stream: {}", e);
                         }
                         if let Err(e) = nc.publish(specific_subject.clone(), buf.into()).await {
-                            error!("Error publishing to subject {}: {}", specific_subject, e);
+                            error!("Error publishing to subject {}: {}", &specific_subject, e);
                         }
                     });
                 }

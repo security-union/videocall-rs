@@ -118,8 +118,8 @@ impl Handler<JoinRoom> for ChatServer {
         };
 
         let nc = self.nats_connection.clone();
-        let s = session.clone();
-        let fut = async move {
+        let session_2 = session.clone();
+        let task = actix::spawn(async move {
             match nc
                 .queue_subscribe(subject.clone(), queue.clone())
                 .await
@@ -130,11 +130,13 @@ impl Handler<JoinRoom> for ChatServer {
                     info!(
                         "someone connected to room {} with session {}",
                         room,
-                        s.trim(),
+                        session_2.trim(),
                     );
                     while let Some(msg) = sub.next().await {
                         if let Err(e) =
-                            handle_msg(session_recipient.clone(), room.clone(), s.clone())(msg)
+                            handle_msg(session_recipient.clone(), room.clone(), session_2.clone())(
+                                msg,
+                            )
                         {
                             error!("{}", e);
                         }
@@ -144,8 +146,7 @@ impl Handler<JoinRoom> for ChatServer {
                     error!("{}", e);
                 }
             }
-        };
-        let task = actix::spawn(fut);
+        });
 
         self.active_subs.insert(session, task);
 

@@ -5,14 +5,14 @@ use crate::messages::{
 
 use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
 use futures::StreamExt;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace};
 
 use super::chat_session::SessionId;
 
 pub struct ChatServer {
-    nats_connection: Arc<async_nats::client::Client>,
+    nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
     active_subs: HashMap<SessionId, JoinHandle<()>>,
 }
@@ -21,14 +21,12 @@ impl ChatServer {
     pub async fn new() -> Self {
         let url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
         ChatServer {
-            nats_connection: Arc::new(
-                async_nats::ConnectOptions::new()
-                    .require_tls(false)
-                    .ping_interval(std::time::Duration::from_secs(10))
-                    .connect(&url)
-                    .await
-                    .unwrap(),
-            ),
+            nats_connection: async_nats::ConnectOptions::new()
+                .require_tls(false)
+                .ping_interval(std::time::Duration::from_secs(10))
+                .connect(&url)
+                .await
+                .unwrap(),
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
         }

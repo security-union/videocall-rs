@@ -6,7 +6,7 @@
 # Pull configuration info from /config.toml
 #
 # Read the values from the config.toml file
-source <(grep = config.toml | sed -E 's/ *= */=/g')
+source config.toml
 
 # Set the values as environment variables
 export $(cut -d= -f1 config.toml)

@@ -1,7 +1,7 @@
 LOGIN_URL="https://127.0.0.1"
 ACTIX_UI_BACKEND_URL="https://127.0.0.1"
 WEBTRANSPORT_HOST="https://127.0.0.1"
-NATS_URL="nats:4222"
+NATS_URL="nats.zoom.rs"
 
 ENABLE_OAUTH=false
 WEBTRANSPORT_ENABLED=false

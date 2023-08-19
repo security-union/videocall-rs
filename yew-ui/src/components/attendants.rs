@@ -1,13 +1,10 @@
-use anyhow::{anyhow, Result};
 use super::icons::push_pin::PushPinIcon;
 use crate::constants::WEBTRANSPORT_HOST;
 use crate::model::client::{VideoCallClient, VideoCallClientOptions};
 use crate::model::media_devices::MediaDeviceAccess;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::warn;
-use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 use types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -123,22 +120,6 @@ impl AttendantsComponent {
         };
         media_device_access
     }
-
-    fn serialize_aes_packet(&self) -> Result<Vec<u8>> {
-        AesPacket {
-            key: self.aes.key.to_vec(),
-            iv: self.aes.iv.to_vec(),
-            ..Default::default()
-        }
-        .write_to_bytes()
-        .map_err(|e| anyhow!("Failed to serialize aes packet: {}", e.to_string()))
-    }
-
-    fn encrypt_aes_packet(&self, aes_packet: &[u8], pub_key: &RsaPublicKey) -> Result<Vec<u8>> {
-        self.rsa
-            .encrypt_with_key(aes_packet, pub_key)
-            .map_err(|e| anyhow!("Failed to encrypt aes packet: {}", e.to_string()))
-    }
 }
 
 impl Component for AttendantsComponent {
@@ -147,8 +128,8 @@ impl Component for AttendantsComponent {
 
     fn create(ctx: &Context<Self>) -> Self {
         Self {
-            client: Self::create_video_call_client(&ctx),
-            media_device_access: Self::create_media_device_access(&ctx),
+            client: Self::create_video_call_client(ctx),
+            media_device_access: Self::create_media_device_access(ctx),
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
@@ -201,12 +182,6 @@ impl Component for AttendantsComponent {
             },
             Msg::OnPeerAdded(_email) => true,
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
-            Msg::OnOutboundPacket(media) => {
-                if let Some(connection) = &self.connection {
-                    connection.send_packet(media);
-                }
-                false
-            }
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
@@ -364,14 +339,4 @@ fn toggle_pinned_div(div_id: &str) {
             div.class_list().remove_1("grid-item-pinned").unwrap();
         }
     }
-}
-
-fn parse_rsa_packet(response_data: &[u8]) -> Result<RsaPacket> {
-    RsaPacket::parse_from_bytes(response_data)
-        .map_err(|e| anyhow!("Failed to parse rsa packet: {}", e.to_string()))
-}
-
-fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
-    RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
-        .map_err(|e| anyhow!("Failed to parse rsa public key: {}", e.to_string()))
 }

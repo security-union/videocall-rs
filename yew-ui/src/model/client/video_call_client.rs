@@ -116,18 +116,7 @@ impl VideoCallClient {
                     callback.emit(());
                 })
             },
-            on_connection_lost: {
-                let inner = Rc::downgrade(&self.inner);
-                let callback = self.options.on_connection_lost.clone();
-                Callback::from(move |_| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(mut inner) = inner.try_borrow_mut() {
-                            inner.disconnect()
-                        }
-                    }
-                    callback.emit(());
-                })
-            },
+            on_connection_lost: self.options.on_connection_lost.clone(),
         };
         info!(
             "webtransport connect = {}",
@@ -193,10 +182,6 @@ impl VideoCallClient {
 }
 
 impl Inner {
-    fn disconnect(&mut self) {
-        self.connection.take();
-    }
-
     fn send_packet(&self, media: PacketWrapper) {
         if let Some(connection) = &self.connection {
             connection.send_packet(media);
@@ -215,15 +200,18 @@ impl Inner {
                         Ok(aes_packet) => {
                             self.peer_decode_manager.set_peer_aes(
                                 &response.email,
-                                Aes128State::from_vecs(aes_packet.key, aes_packet.iv, self.options.enable_e2ee),
-                                );
+                                Aes128State::from_vecs(
+                                    aes_packet.key,
+                                    aes_packet.iv,
+                                    self.options.enable_e2ee,
+                                ),
+                            );
                         }
                         Err(e) => {
                             error!("Failed to parse aes packet: {}", e.to_string());
                         }
                     }
                 }
-                return;
             }
             Ok(PacketType::RSA_PUB_KEY) => {
                 if !self.options.enable_e2ee {
@@ -234,7 +222,7 @@ impl Inner {
                     .and_then(parse_public_key)
                     .and_then(|pub_key| {
                         self.serialize_aes_packet()
-                            .and_then(|aes_packet| Ok((aes_packet, pub_key)))
+                            .map(|aes_packet| (aes_packet, pub_key))
                     })
                     .and_then(|(aes_packet, pub_key)| {
                         self.encrypt_aes_packet(&aes_packet, &pub_key)

@@ -18,7 +18,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
-use gloo_console::log;
+use log::error;
 use std::sync::Arc;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;

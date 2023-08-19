@@ -108,10 +108,9 @@ impl Component for Host {
 
                 let client = ctx.props().client.clone();
                 let email = ctx.props().email.clone();
-                self.camera.start(
-                    email,
-                    move |packet: PacketWrapper| client.send_packet(packet),
-                );
+                self.camera.start(email, move |packet: PacketWrapper| {
+                    client.send_packet(packet)
+                });
                 true
             }
             Msg::AudioDeviceChanged(audio) => {

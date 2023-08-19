@@ -60,11 +60,7 @@ impl CameraEncoder {
         self.state.stop()
     }
 
-    pub fn start(
-        &mut self,
-        userid: String,
-        on_frame: impl Fn(PacketWrapper) + 'static,
-    ) {
+    pub fn start(&mut self, userid: String, on_frame: impl Fn(PacketWrapper) + 'static) {
         // 1. Query the first device with a camera and a mic attached.
         // 2. setup WebCodecs, in particular
         // 3. send encoded video frames and raw audio to the server.

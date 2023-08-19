@@ -159,7 +159,7 @@ impl PeerDecodeManager {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if !self.connected_peers.contains_key(&email) {
-            self.add_peer(&email);
+            self.add_peer(&email, None);
         }
         if let Some(peer) = self.connected_peers.get_mut(&email) {
             match peer.decode(&packet) {

@@ -1,7 +1,6 @@
 use crate::model::client::VideoCallClient;
 use gloo_timers::callback::Timeout;
 use log::debug;
-use types::protos::packet_wrapper::PacketWrapper;
 
 use std::fmt::Debug;
 use yew::prelude::*;
@@ -50,11 +49,11 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let aes = ctx.props().client.aes();
+        let client = &ctx.props().client;
         Self {
-            camera: CameraEncoder::new(aes.clone(), VIDEO_ELEMENT_ID),
-            microphone: MicrophoneEncoder::new(aes.clone()),
-            screen: ScreenEncoder::new(aes),
+            camera: CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID),
+            microphone: MicrophoneEncoder::new(client.clone()),
+            screen: ScreenEncoder::new(client.clone()),
         }
     }
 
@@ -82,11 +81,7 @@ impl Component for Host {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::EnableScreenShare => {
-                let client = ctx.props().client.clone();
-                let email = ctx.props().email.clone();
-                self.screen.start(email, move |packet: PacketWrapper| {
-                    client.send_packet(packet)
-                });
+                self.screen.start();
                 true
             }
             Msg::Start => true,
@@ -94,11 +89,7 @@ impl Component for Host {
                 if !should_enable {
                     return true;
                 }
-                let client = ctx.props().client.clone();
-                let email = ctx.props().email.clone();
-                self.microphone.start(email, move |packet: PacketWrapper| {
-                    client.send_packet(packet)
-                });
+                self.microphone.start();
                 true
             }
             Msg::EnableVideo(should_enable) => {
@@ -106,11 +97,7 @@ impl Component for Host {
                     return true;
                 }
 
-                let client = ctx.props().client.clone();
-                let email = ctx.props().email.clone();
-                self.camera.start(email, move |packet: PacketWrapper| {
-                    client.send_packet(packet)
-                });
+                self.camera.start();
                 true
             }
             Msg::AudioDeviceChanged(audio) => {

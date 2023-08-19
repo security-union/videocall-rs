@@ -179,6 +179,10 @@ impl VideoCallClient {
     pub fn aes(&self) -> Arc<Aes128State> {
         self.inner.borrow().aes.clone()
     }
+
+    pub fn userid(&self) -> &String {
+        &self.options.userid
+    }
 }
 
 impl Inner {

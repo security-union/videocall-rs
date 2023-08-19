@@ -89,7 +89,7 @@ impl CameraEncoder {
                     chunk,
                     sequence_number,
                     &mut buffer,
-                    userid.clone(),
+                    &userid,
                     aes.clone(),
                 );
                 on_frame(packet);

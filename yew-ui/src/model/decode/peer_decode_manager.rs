@@ -179,23 +179,23 @@ impl PeerDecodeManager {
         }
     }
 
-    fn add_peer(&mut self, email: &String, aes: Option<Aes128State>) {
+    fn add_peer(&mut self, email: &str, aes: Option<Aes128State>) {
         debug!("Adding peer {}", email);
         self.insert_peer(email, aes);
-        self.on_peer_added.emit(email.clone())
+        self.on_peer_added.emit(email.to_owned())
     }
 
-    fn insert_peer(&mut self, email: &String, aes: Option<Aes128State>) {
+    fn insert_peer(&mut self, email: &str, aes: Option<Aes128State>) {
         self.connected_peers.insert(
-            email.clone(),
+            email.to_owned(),
             MultiDecoder::new(
-                self.get_video_canvas_id.emit(email.clone()),
-                self.get_screen_canvas_id.emit(email.clone()),
-                email.clone(),
+                self.get_video_canvas_id.emit(email.to_owned()),
+                self.get_screen_canvas_id.emit(email.to_owned()),
+                email.to_owned(),
                 aes,
             ),
         );
-        self.sorted_connected_peers_keys.push(email.clone());
+        self.sorted_connected_peers_keys.push(email.to_owned());
         self.sorted_connected_peers_keys.sort();
     }
 

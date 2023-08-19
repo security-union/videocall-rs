@@ -64,10 +64,7 @@ impl Connection {
     }
 
     pub fn is_connected(&self) -> bool {
-        match self.status.get() {
-            Status::Connected => true,
-            _ => false,
-        }
+        matches!(self.status.get(), Status::Connected)
     }
 
     fn start_heartbeat(&mut self, userid: String) {

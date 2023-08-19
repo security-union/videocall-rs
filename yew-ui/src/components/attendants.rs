@@ -200,10 +200,13 @@ impl Component for AttendantsComponent {
                 }
             },
             Msg::OnPeerAdded(_email) => true,
-            Msg::OnFirstFrame((_email, media_type)) => match media_type {
-                MediaType::SCREEN => true,
-                _ => false,
-            },
+            Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
+            Msg::OnOutboundPacket(media) => {
+                if let Some(connection) = &self.connection {
+                    connection.send_packet(media);
+                }
+                false
+            }
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
@@ -302,6 +305,12 @@ impl Component for AttendantsComponent {
                         html! {<h4>{"Connecting"}</h4>}
                     } else {
                         html! {<h4>{"Connected"}</h4>}
+                    }}
+
+                    {if ctx.props().e2ee_enabled {
+                        html! {<h4>{"End to End Encryption Enabled"}</h4>}
+                    } else {
+                        html! {<h4>{"End to End Encryption Disabled"}</h4>}
                     }}
                 </nav>
             </div>

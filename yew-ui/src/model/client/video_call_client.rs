@@ -50,6 +50,7 @@ struct Inner {
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
+    aes: Arc<Aes128State>,
 }
 
 impl PartialEq for VideoCallClient {
@@ -60,13 +61,14 @@ impl PartialEq for VideoCallClient {
 
 impl VideoCallClient {
     pub fn new(options: VideoCallClientOptions) -> Self {
+        let aes = Arc::new(Aes128State::new(options.enable_e2ee));
         let inner = Rc::new(RefCell::new(Inner {
             options: InnerOptions {
                 enable_e2ee: options.enable_e2ee,
                 userid: options.userid.clone(),
             },
             connection: None,
-            aes: Arc::new(Aes128State::new(options.enable_e2ee)),
+            aes: aes.clone(),
             rsa: Arc::new(RsaWrapper::new(options.enable_e2ee)),
             peer_decode_manager: Self::create_peer_decoder_manager(&options),
         }));
@@ -86,7 +88,11 @@ impl VideoCallClient {
                 })
             };
         }
-        Self { options, inner }
+        Self {
+            options,
+            aes,
+            inner,
+        }
     }
 
     pub fn connect(&mut self) -> anyhow::Result<()> {
@@ -128,11 +134,10 @@ impl VideoCallClient {
         );
 
         let mut borrowed = self.inner.try_borrow_mut()?;
-        let aes = borrowed.aes.clone();
         borrowed.connection.replace(Connection::connect(
             self.options.enable_webtransport,
             options,
-            aes,
+            self.aes.clone(),
         )?);
         Ok(())
     }
@@ -177,7 +182,7 @@ impl VideoCallClient {
     }
 
     pub fn aes(&self) -> Arc<Aes128State> {
-        self.inner.borrow().aes.clone()
+        self.aes.clone()
     }
 
     pub fn userid(&self) -> &String {

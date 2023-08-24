@@ -16,13 +16,12 @@ console_log = "1.0.0"
 const_format="0.2.25"
 lazy_static = "1.4.0"
 log = "0.4.19"
-gloo-utils = "0.1"
+gloo-utils = { version = "0.1", features = ["serde"] }
 yew-router = "0.17"
 js-sys = "0.3"
 yew-websocket = "1.0.1"
 anyhow = "1"
-serde = "1"
-serde_derive = "1"
+serde = { version = "1", features = ["derive"] }
 protobuf = "3.2.0"
 gloo = "0.8.0"
 gloo-timers = "0.2.6"
@@ -37,7 +36,7 @@ rand = { version = "0.8.5", features = ["std_rng", "small_rng"] }
 [dependencies.web-sys]
 version = "0.3.60"
 features = [
-    "AudioTrack",
+    "AudioContext",
     "AudioData",
     "AudioEncoder",
     "AudioEncoderInit",
@@ -45,7 +44,9 @@ features = [
     "AudioDecoder",
     "AudioDecoderInit",
     "AudioDecoderConfig",
-    "AudioContext",
+    "AudioWorklet",
+    "AudioWorkletNode",
+    "AudioWorkletNodeOptions",
     "BaseAudioContext",
     "GainOptions",
     "GainNode",
@@ -74,6 +75,8 @@ features = [
     "MediaStreamTrackProcessorInit",
     "MediaStreamTrackGenerator",
     "MediaStreamTrackGeneratorInit",
+    "MessagePort",
+    "OffscreenCanvas",
     "WritableStream",
     "WritableStreamDefaultWriter",
     "MediaStreamAudioSourceNode",
@@ -87,6 +90,7 @@ features = [
     "VideoEncoderConfig",
     "VideoEncoderEncodeOptions",
     "VideoFrame",
+    "VideoFrameInit",
     "VideoTrack",
     "VideoDecoder",
     "VideoDecoderConfig",
@@ -99,7 +103,6 @@ features = [
     "MediaDeviceInfo",
     "MediaDeviceKind",
     "MediaTrackConstraints",
-    "CanvasRenderingContext2d"
 ]
 
 [dev-dependencies]

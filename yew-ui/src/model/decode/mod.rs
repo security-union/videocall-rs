@@ -1,4 +1,3 @@
-mod config;
 mod peer_decode_manager;
 mod peer_decoder;
 mod video_decoder_with_buffer;

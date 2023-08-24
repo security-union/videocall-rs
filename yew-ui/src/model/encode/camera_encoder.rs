@@ -1,8 +1,6 @@
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
-use js_sys::JsString;
-use js_sys::Reflect;
 use log::debug;
 use log::error;
 use std::sync::{atomic::Ordering, Arc};
@@ -139,7 +137,7 @@ impl CameraEncoder {
                 .unchecked_into::<MediaStream>();
             video_element.set_src_object(Some(&device));
             video_element.set_muted(true);
-            video_element.play();
+            let _ = video_element.play();
 
             let video_track = Box::new(
                 device
@@ -192,7 +190,6 @@ impl CameraEncoder {
                         .clone()
                         .unchecked_into::<MediaStreamTrack>()
                         .stop();
-                    video_encoder.close();
                     switching.store(false, Ordering::Release);
                     return;
                 }
@@ -200,21 +197,20 @@ impl CameraEncoder {
                     &video_element,
                     0.0,
                     0.0,
-                    VIDEO_WIDTH.into(),
-                    VIDEO_HEIGHT.into(),
+                    300.0,
+                    150.,
                 ) {
-                    log!("Error", e);
+                    debug!("Error {:?}", e);
                 } else {
                     let mut video_frame_init = VideoFrameInit::new();
                     video_frame_init.timestamp(timestamp);
                     video_frame_init.duration(1.0 / VIDEO_FPS);
 
-                    let video_frame =
-                        VideoFrame::new_with_html_canvas_element_and_video_frame_init(
-                            &canvas_element,
-                            &video_frame_init,
-                        )
-                        .unwrap();
+                    let video_frame = VideoFrame::new_with_offscreen_canvas_and_video_frame_init(
+                        &canvas_element,
+                        &video_frame_init,
+                    )
+                    .unwrap();
 
                     let mut opts: VideoEncoderEncodeOptions = VideoEncoderEncodeOptions::new();
                     video_frame_counter = (video_frame_counter + 1) % 50;
@@ -224,12 +220,12 @@ impl CameraEncoder {
                     timestamp += 1.0 / VIDEO_FPS;
                 }
             }) as Box<dyn FnMut()>);
-            window().set_interval_with_callback_and_timeout_and_arguments_0(
+            let _ = window().set_interval_with_callback_and_timeout_and_arguments_0(
                 process_frame.as_ref().unchecked_ref(),
                 1000 / VIDEO_FPS as i32,
             );
             process_frame.forget();
-            log!("Killing video streamer");
+            debug!("Killing video streamer");
         });
     }
 }

@@ -10,29 +10,29 @@
 // and each one's new() contains the type-specific creation/configuration code.
 //
 
-use super::config::configure_audio_context;
 use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
 use super::video_decoder_wrapper::VideoDecoderWrapper;
 use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::model::audio_worklet_codec::AudioWorkletCodec;
+use crate::model::audio_worklet_codec::DecoderInitOptions;
+use crate::model::audio_worklet_codec::DecoderMessages;
 use crate::model::EncodedVideoChunkTypeWrapper;
+use js_sys::Uint8Array;
 use log::error;
 use std::sync::Arc;
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
-use web_sys::{AudioData, AudioDecoder, AudioDecoderConfig, AudioDecoderInit};
+use web_sys::AudioContext;
+use web_sys::AudioContextOptions;
+use web_sys::AudioData;
+use web_sys::EncodedVideoChunkType;
+use web_sys::HtmlCanvasElement;
 use web_sys::{CanvasRenderingContext2d, CodecState};
-use web_sys::{
-    EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType, EncodedVideoChunkType,
-};
-use web_sys::{HtmlCanvasElement, HtmlImageElement};
-use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 
 pub struct DecodeStatus {
@@ -108,7 +108,7 @@ macro_rules! opt_ref {
 /// rendered. The size of the canvas is set at decode time to match the image size from the media
 /// data.
 ///
-pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue>;
+pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, VideoFrame>;
 
 impl VideoPeerDecoder {
     pub fn new(canvas_id: &str) -> Self {
@@ -116,12 +116,9 @@ impl VideoPeerDecoder {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
-        let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
-            let chunk = Box::new(original_chunk);
-            let video_chunk = chunk.unchecked_into::<VideoFrame>();
+        let output = Closure::wrap(Box::new(move |video_chunk: VideoFrame| {
             let width = video_chunk.coded_width();
             let height = video_chunk.coded_height();
-            let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
             let render_canvas = window()
                 .unwrap()
                 .document()
@@ -136,11 +133,18 @@ impl VideoPeerDecoder {
                 .unchecked_into::<CanvasRenderingContext2d>();
             render_canvas.set_width(width);
             render_canvas.set_height(height);
-            if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
+            ctx.clear_rect(0., 0., width as f64, height as f64);
+            if let Err(e) = ctx.draw_image_with_video_frame_and_dw_and_dh(
+                &video_chunk,
+                0.0,
+                0.0,
+                render_canvas.width() as f64,
+                render_canvas.height() as f64,
+            ) {
                 error!("error {:?}", e);
             }
-            video_chunk.unchecked_into::<VideoFrame>().close();
-        }) as Box<dyn FnMut(JsValue)>);
+            video_chunk.close();
+        }) as Box<dyn FnMut(VideoFrame)>);
         let decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
@@ -179,78 +183,89 @@ impl PeerDecode for VideoPeerDecoder {
 /// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
 
-pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
+pub type AudioPeerDecoder = PeerDecoder<AudioWorkletCodec, AudioData>;
 
 impl AudioPeerDecoder {
     pub fn new() -> Self {
+        let codec = AudioWorkletCodec::default();
+        {
+            let codec = codec.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut options = AudioContextOptions::new();
+                options.sample_rate(AUDIO_SAMPLE_RATE as f32);
+                let context = AudioContext::new_with_context_options(&options).unwrap();
+
+                let gain_node = context.create_gain().unwrap();
+
+                // Add the decoder audio worklet to the context
+                let worklet_node = codec
+                    .create_node(
+                        &context,
+                        "/decoderWorker.min.js",
+                        "decoder-worklet",
+                        AUDIO_CHANNELS,
+                    )
+                    .await
+                    .unwrap();
+
+                let _ = worklet_node
+                    .connect_with_audio_node(&gain_node)
+                    .unwrap()
+                    .connect_with_audio_node(&context.destination());
+
+                let _ = codec.send_message(DecoderMessages::Init {
+                    options: Some(DecoderInitOptions {
+                        output_buffer_sample_rate: Some(AUDIO_SAMPLE_RATE),
+                        ..Default::default()
+                    }),
+                });
+            })
+        }
+
+        // These aren't really used, but kept to ensure parity with video decoding
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
-        let audio_stream_generator =
-            MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
-        // The audio context is used to reproduce audio.
-        let _audio_context = configure_audio_context(&audio_stream_generator).unwrap();
 
-        let output = Closure::wrap(Box::new(move |audio_data: AudioData| {
-            let writable = audio_stream_generator.writable();
-            if writable.locked() {
-                return;
-            }
-            if let Err(e) = writable.get_writer().map(|writer| {
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) = JsFuture::from(writer.ready()).await {
-                        error!("write chunk error {:?}", e);
-                    }
-                    if let Err(e) = JsFuture::from(writer.write_with_chunk(&audio_data)).await {
-                        error!("write chunk error {:?}", e);
-                    };
-                    writer.release_lock();
-                });
-            }) {
-                error!("error {:?}", e);
-            }
-        }) as Box<dyn FnMut(AudioData)>);
-        let decoder = AudioDecoder::new(&AudioDecoderInit::new(
-            error.as_ref().unchecked_ref(),
-            output.as_ref().unchecked_ref(),
-        ))
-        .unwrap();
-        decoder.configure(&AudioDecoderConfig::new(
-            AUDIO_CODEC,
-            AUDIO_CHANNELS,
-            AUDIO_SAMPLE_RATE,
-        ));
+        let output = Closure::wrap(Box::new(move |_| {}) as Box<dyn FnMut(AudioData)>);
+
         Self {
-            decoder,
-            waiting_for_keyframe: true,
+            decoder: codec,
+            // There is no keyframe
+            waiting_for_keyframe: false,
             decoded: false,
             _error: error,
             _output: output,
         }
     }
 
-    fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedAudioChunkType {
-        EncodedAudioChunkType::from_js_value(&JsValue::from(packet.frame_type.clone())).unwrap()
-    }
-
-    fn get_chunk(
-        &self,
-        packet: &Arc<MediaPacket>,
-        chunk_type: EncodedAudioChunkType,
-    ) -> EncodedAudioChunk {
+    fn get_chunk(&self, packet: &Arc<MediaPacket>) -> Uint8Array {
         let audio_data = &packet.data;
         let audio_data_js: js_sys::Uint8Array =
             js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
         audio_data_js.copy_from(audio_data.as_slice());
-        let mut audio_chunk =
-            EncodedAudioChunkInit::new(&audio_data_js.into(), packet.timestamp, chunk_type);
-        audio_chunk.duration(packet.duration);
-        EncodedAudioChunk::new(&audio_chunk).unwrap()
+        audio_data_js
     }
 }
 
 impl PeerDecode for AudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
-        impl_decode!(self, packet, EncodedAudioChunkType, "ref")
+        let buffer = self.get_chunk(packet);
+        let first_frame = !self.decoded;
+
+        let rendered = if self.decoder.is_instantiated() {
+            let _ = self.decoder.send_message(&DecoderMessages::Decode {
+                pages: buffer.to_vec(),
+            });
+            self.decoded = true;
+            true
+        } else {
+            false
+        };
+
+        Ok(DecodeStatus {
+            rendered,
+            first_frame,
+        })
     }
 }

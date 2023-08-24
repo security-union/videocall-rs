@@ -1,3 +1,4 @@
+pub mod audio_worklet_codec;
 pub mod connection;
 pub mod decode;
 pub mod encode;

@@ -1,5 +1,5 @@
 use super::super::connection::{ConnectOptions, Connection};
-use super::super::decode::PeerDecodeManager;
+use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use anyhow::{anyhow, Result};
@@ -35,6 +35,7 @@ pub struct VideoCallClientOptions {
 struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
+    on_peer_added: Callback<String>,
 }
 
 #[derive(Debug)]
@@ -66,28 +67,13 @@ impl VideoCallClient {
             options: InnerOptions {
                 enable_e2ee: options.enable_e2ee,
                 userid: options.userid.clone(),
+                on_peer_added: options.on_peer_added.clone(),
             },
             connection: None,
             aes: aes.clone(),
             rsa: Arc::new(RsaWrapper::new(options.enable_e2ee)),
             peer_decode_manager: Self::create_peer_decoder_manager(&options),
         }));
-        {
-            let mut borrowed = inner.borrow_mut();
-            borrowed.peer_decode_manager.on_peer_added = {
-                let inner = Rc::downgrade(&inner);
-                let callback = options.on_peer_added.clone();
-                Callback::from(move |key| {
-                    debug!("New peer arrived.");
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(inner) = inner.try_borrow() {
-                            inner.send_public_key()
-                        }
-                    };
-                    callback.emit(key);
-                })
-            };
-        }
         Self {
             options,
             aes,
@@ -104,8 +90,14 @@ impl VideoCallClient {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
                     if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(mut inner) = inner.try_borrow_mut() {
-                            inner.on_inbound_media(packet)
+                        match inner.try_borrow_mut() {
+                            Ok(mut inner) => inner.on_inbound_media(packet),
+                            Err(_) => {
+                                error!(
+                                    "Unable to borrow inner -- dropping receive packet {:?}",
+                                    packet
+                                );
+                            }
                         }
                     }
                 })
@@ -115,8 +107,11 @@ impl VideoCallClient {
                 let callback = self.options.on_connected.clone();
                 Callback::from(move |_| {
                     if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(inner) = inner.try_borrow() {
-                            inner.send_public_key()
+                        match inner.try_borrow() {
+                            Ok(inner) => inner.send_public_key(),
+                            Err(_) => {
+                                error!("Unable to borrow inner -- not sending public key");
+                            }
                         }
                     }
                     callback.emit(());
@@ -151,8 +146,11 @@ impl VideoCallClient {
     }
 
     pub fn send_packet(&self, media: PacketWrapper) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.send_packet(media)
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.send_packet(media),
+            Err(_) => {
+                error!("Unable to borrow inner -- dropping send packet {:?}", media)
+            }
         }
     }
 
@@ -198,23 +196,31 @@ impl Inner {
     }
 
     fn on_inbound_media(&mut self, response: PacketWrapper) {
+        debug!(
+            "<< Received {:?} from {}",
+            response.packet_type.enum_value(),
+            response.email
+        );
+        let peer_status = self.peer_decode_manager.ensure_peer(&response.email);
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {
                     return;
                 }
-                debug!("Received AES_KEY {}", &response.email);
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
+                    debug!("Decrypted AES_KEY from {}", response.email);
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
-                            self.peer_decode_manager.set_peer_aes(
+                            if let Err(e) = self.peer_decode_manager.set_peer_aes(
                                 &response.email,
                                 Aes128State::from_vecs(
                                     aes_packet.key,
                                     aes_packet.iv,
                                     self.options.enable_e2ee,
                                 ),
-                            );
+                            ) {
+                                error!("Failed to set peer aes: {}", e.to_string());
+                            }
                         }
                         Err(e) => {
                             error!("Failed to parse aes packet: {}", e.to_string());
@@ -226,7 +232,6 @@ impl Inner {
                 if !self.options.enable_e2ee {
                     return;
                 }
-                debug!("Received RSA_PUB_KEY");
                 let encrypted_aes_packet = parse_rsa_packet(&response.data)
                     .and_then(parse_public_key)
                     .and_then(|pub_key| {
@@ -239,6 +244,7 @@ impl Inner {
 
                 match encrypted_aes_packet {
                     Ok(data) => {
+                        debug!(">> {} sending AES key", self.options.userid);
                         self.send_packet(PacketWrapper {
                             packet_type: PacketType::AES_KEY.into(),
                             email: self.options.userid.clone(),
@@ -260,6 +266,11 @@ impl Inner {
             }
             Err(_) => {}
         }
+        if let PeerStatus::Added(peer_userid) = peer_status {
+            debug!("added peer {}", peer_userid);
+            self.send_public_key();
+            self.options.on_peer_added.emit(peer_userid);
+        }
     }
 
     fn send_public_key(&self) {
@@ -277,6 +288,7 @@ impl Inner {
                 };
                 match packet.write_to_bytes() {
                     Ok(data) => {
+                        debug!(">> {} sending public key", userid);
                         self.send_packet(PacketWrapper {
                             packet_type: PacketType::RSA_PUB_KEY.into(),
                             email: userid,

@@ -18,7 +18,14 @@ pub enum MultiDecoderError {
     AudioDecodeError,
     ScreenDecodeError,
     VideoDecodeError,
+    NoSuchPeer(String),
     Other(String),
+}
+
+#[derive(Debug)]
+pub enum PeerStatus {
+    Added(String),
+    NoChange,
 }
 
 impl Display for MultiDecoderError {
@@ -29,6 +36,7 @@ impl Display for MultiDecoderError {
             MultiDecoderError::AudioDecodeError => write!(f, "AudioDecodeError"),
             MultiDecoderError::ScreenDecodeError => write!(f, "ScreenDecodeError"),
             MultiDecoderError::VideoDecodeError => write!(f, "VideoDecodeError"),
+            MultiDecoderError::NoSuchPeer(s) => write!(f, "Peer Not Found: {s}"),
             MultiDecoderError::Other(s) => write!(f, "Other: {s}"),
         }
     }
@@ -40,6 +48,8 @@ pub struct MultiDecoder {
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
     pub email: String,
+    pub video_canvas_id: String,
+    pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
 }
 
@@ -50,13 +60,35 @@ impl MultiDecoder {
         email: String,
         aes: Option<Aes128State>,
     ) -> Self {
+        let (audio, video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id);
         Self {
-            audio: AudioPeerDecoder::new(),
-            video: VideoPeerDecoder::new(&video_canvas_id),
-            screen: VideoPeerDecoder::new(&screen_canvas_id),
+            audio,
+            video,
+            screen,
             email,
+            video_canvas_id,
+            screen_canvas_id,
             aes,
         }
+    }
+
+    fn new_decoders(
+        video_canvas_id: &str,
+        screen_canvas_id: &str,
+    ) -> (AudioPeerDecoder, VideoPeerDecoder, VideoPeerDecoder) {
+        (
+            AudioPeerDecoder::new(),
+            VideoPeerDecoder::new(video_canvas_id),
+            VideoPeerDecoder::new(screen_canvas_id),
+        )
+    }
+
+    fn reset(&mut self) {
+        let (audio, video, screen) =
+            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id);
+        self.audio = audio;
+        self.video = video;
+        self.screen = screen;
     }
 
     fn decode(
@@ -129,7 +161,6 @@ impl MultiDecoder {
 pub struct PeerDecodeManager {
     connected_peers: HashMap<String, MultiDecoder>,
     sorted_connected_peers_keys: Vec<String>,
-    pub on_peer_added: Callback<String>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -140,7 +171,6 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMap::new(),
             sorted_connected_peers_keys: vec![],
-            on_peer_added: Callback::noop(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -158,9 +188,6 @@ impl PeerDecodeManager {
     pub fn decode(&mut self, response: PacketWrapper) -> Result<(), MultiDecoderError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
-        if !self.connected_peers.contains_key(&email) {
-            self.add_peer(&email, None);
-        }
         if let Some(peer) = self.connected_peers.get_mut(&email) {
             match peer.decode(&packet) {
                 Ok((media_type, decode_status)) => {
@@ -170,22 +197,17 @@ impl PeerDecodeManager {
                     Ok(())
                 }
                 Err(e) => {
-                    self.reset_peer(&email);
+                    peer.reset();
                     Err(e)
                 }
             }
         } else {
-            Err(MultiDecoderError::Other(String::from("No peer found")))
+            Err(MultiDecoderError::NoSuchPeer(email.clone()))
         }
     }
 
     fn add_peer(&mut self, email: &str, aes: Option<Aes128State>) {
         debug!("Adding peer {}", email);
-        self.insert_peer(email, aes);
-        self.on_peer_added.emit(email.to_owned())
-    }
-
-    fn insert_peer(&mut self, email: &str, aes: Option<Aes128State>) {
         self.connected_peers.insert(
             email.to_owned(),
             MultiDecoder::new(
@@ -206,18 +228,26 @@ impl PeerDecodeManager {
         }
     }
 
-    fn reset_peer(&mut self, email: &String) {
-        let aes = if let Some(peer) = self.get(email) {
-            peer.aes
+    pub fn ensure_peer(&mut self, email: &String) -> PeerStatus {
+        if self.connected_peers.contains_key(email) {
+            PeerStatus::NoChange
         } else {
-            None
-        };
-        self.delete_peer(email);
-        self.insert_peer(email, aes);
+            self.add_peer(email, None);
+            PeerStatus::Added(email.clone())
+        }
     }
 
-    pub fn set_peer_aes(&mut self, email: &String, aes: Aes128State) {
-        self.delete_peer(email);
-        self.insert_peer(email, Some(aes));
+    pub fn set_peer_aes(
+        &mut self,
+        email: &String,
+        aes: Aes128State,
+    ) -> Result<(), MultiDecoderError> {
+        match self.connected_peers.get_mut(email) {
+            Some(peer) => {
+                peer.aes = Some(aes);
+                Ok(())
+            }
+            None => Err(MultiDecoderError::NoSuchPeer(email.clone())),
+        }
     }
 }

@@ -12,7 +12,7 @@ use crate::crypto::aes::Aes128State;
 use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
 
 #[derive(Debug)]
-pub enum MultiDecoderError {
+pub enum PeerDecodeError {
     AesDecryptError,
     IncorrectPacketType,
     AudioDecodeError,
@@ -28,22 +28,22 @@ pub enum PeerStatus {
     NoChange,
 }
 
-impl Display for MultiDecoderError {
+impl Display for PeerDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MultiDecoderError::AesDecryptError => write!(f, "AesDecryptError"),
-            MultiDecoderError::IncorrectPacketType => write!(f, "IncorrectPacketType"),
-            MultiDecoderError::AudioDecodeError => write!(f, "AudioDecodeError"),
-            MultiDecoderError::ScreenDecodeError => write!(f, "ScreenDecodeError"),
-            MultiDecoderError::VideoDecodeError => write!(f, "VideoDecodeError"),
-            MultiDecoderError::NoSuchPeer(s) => write!(f, "Peer Not Found: {s}"),
-            MultiDecoderError::Other(s) => write!(f, "Other: {s}"),
+            PeerDecodeError::AesDecryptError => write!(f, "AesDecryptError"),
+            PeerDecodeError::IncorrectPacketType => write!(f, "IncorrectPacketType"),
+            PeerDecodeError::AudioDecodeError => write!(f, "AudioDecodeError"),
+            PeerDecodeError::ScreenDecodeError => write!(f, "ScreenDecodeError"),
+            PeerDecodeError::VideoDecodeError => write!(f, "VideoDecodeError"),
+            PeerDecodeError::NoSuchPeer(s) => write!(f, "Peer Not Found: {s}"),
+            PeerDecodeError::Other(s) => write!(f, "Other: {s}"),
         }
     }
 }
 
 #[derive(Debug)]
-pub struct MultiDecoder {
+pub struct Peer {
     pub audio: AudioPeerDecoder,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
@@ -53,7 +53,7 @@ pub struct MultiDecoder {
     pub aes: Option<Aes128State>,
 }
 
-impl MultiDecoder {
+impl Peer {
     fn new(
         video_canvas_id: String,
         screen_canvas_id: String,
@@ -94,31 +94,27 @@ impl MultiDecoder {
     fn decode(
         &mut self,
         packet: &Arc<PacketWrapper>,
-    ) -> Result<(MediaType, DecodeStatus), MultiDecoderError> {
+    ) -> Result<(MediaType, DecodeStatus), PeerDecodeError> {
         if packet
             .packet_type
             .enum_value()
-            .map_err(|_e| MultiDecoderError::Other(String::from("No packet_type")))?
+            .map_err(|_e| PeerDecodeError::Other(String::from("No packet_type")))?
             != PacketType::MEDIA
         {
-            return Err(MultiDecoderError::IncorrectPacketType);
+            return Err(PeerDecodeError::IncorrectPacketType);
         }
 
         let packet = {
             if let Some(aes) = self.aes {
                 let data = aes
                     .decrypt(&packet.data)
-                    .map_err(|_e| MultiDecoderError::AesDecryptError)?;
+                    .map_err(|_e| PeerDecodeError::AesDecryptError)?;
                 Arc::new(MediaPacket::parse_from_bytes(&data).map_err(|_e| {
-                    MultiDecoderError::Other(String::from(
-                        "Failed to parse to protobuf MediaPacket",
-                    ))
+                    PeerDecodeError::Other(String::from("Failed to parse to protobuf MediaPacket"))
                 })?)
             } else {
                 Arc::new(MediaPacket::parse_from_bytes(&packet.data).map_err(|_e| {
-                    MultiDecoderError::Other(String::from(
-                        "Failed to parse to protobuf MediaPacket",
-                    ))
+                    PeerDecodeError::Other(String::from("Failed to parse to protobuf MediaPacket"))
                 })?)
             }
         };
@@ -126,25 +122,25 @@ impl MultiDecoder {
         let media_type = packet
             .media_type
             .enum_value()
-            .map_err(|_e| MultiDecoderError::Other(String::from("No media_type")))?;
+            .map_err(|_e| PeerDecodeError::Other(String::from("No media_type")))?;
         match media_type {
             MediaType::VIDEO => Ok((
                 media_type,
                 self.video
                     .decode(&packet)
-                    .map_err(|_e| MultiDecoderError::VideoDecodeError)?,
+                    .map_err(|_e| PeerDecodeError::VideoDecodeError)?,
             )),
             MediaType::AUDIO => Ok((
                 media_type,
                 self.audio
                     .decode(&packet)
-                    .map_err(|_e| MultiDecoderError::AudioDecodeError)?,
+                    .map_err(|_e| PeerDecodeError::AudioDecodeError)?,
             )),
             MediaType::SCREEN => Ok((
                 media_type,
                 self.screen
                     .decode(&packet)
-                    .map_err(|_e| MultiDecoderError::ScreenDecodeError)?,
+                    .map_err(|_e| PeerDecodeError::ScreenDecodeError)?,
             )),
             MediaType::HEARTBEAT => Ok((
                 media_type,
@@ -159,7 +155,7 @@ impl MultiDecoder {
 
 #[derive(Debug)]
 pub struct PeerDecodeManager {
-    connected_peers: HashMap<String, MultiDecoder>,
+    connected_peers: HashMap<String, Peer>,
     sorted_connected_peers_keys: Vec<String>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
@@ -181,11 +177,11 @@ impl PeerDecodeManager {
         &self.sorted_connected_peers_keys
     }
 
-    pub fn get(&self, key: &String) -> Option<&MultiDecoder> {
+    pub fn get(&self, key: &String) -> Option<&Peer> {
         self.connected_peers.get(key)
     }
 
-    pub fn decode(&mut self, response: PacketWrapper) -> Result<(), MultiDecoderError> {
+    pub fn decode(&mut self, response: PacketWrapper) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if let Some(peer) = self.connected_peers.get_mut(&email) {
@@ -202,7 +198,7 @@ impl PeerDecodeManager {
                 }
             }
         } else {
-            Err(MultiDecoderError::NoSuchPeer(email.clone()))
+            Err(PeerDecodeError::NoSuchPeer(email.clone()))
         }
     }
 
@@ -210,7 +206,7 @@ impl PeerDecodeManager {
         debug!("Adding peer {}", email);
         self.connected_peers.insert(
             email.to_owned(),
-            MultiDecoder::new(
+            Peer::new(
                 self.get_video_canvas_id.emit(email.to_owned()),
                 self.get_screen_canvas_id.emit(email.to_owned()),
                 email.to_owned(),
@@ -241,13 +237,13 @@ impl PeerDecodeManager {
         &mut self,
         email: &String,
         aes: Aes128State,
-    ) -> Result<(), MultiDecoderError> {
+    ) -> Result<(), PeerDecodeError> {
         match self.connected_peers.get_mut(email) {
             Some(peer) => {
                 peer.aes = Some(aes);
                 Ok(())
             }
-            None => Err(MultiDecoderError::NoSuchPeer(email.clone())),
+            None => Err(PeerDecodeError::NoSuchPeer(email.clone())),
         }
     }
 }

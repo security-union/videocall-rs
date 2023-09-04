@@ -1,6 +1,6 @@
+use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use log::debug;
 use protobuf::Message;
-use std::collections::HashMap;
 use std::{fmt::Display, sync::Arc};
 use types::protos::media_packet::MediaPacket;
 use types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -162,8 +162,7 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
 
 #[derive(Debug)]
 pub struct PeerDecodeManager {
-    connected_peers: HashMap<String, Peer>,
-    sorted_connected_peers_keys: Vec<String>,
+    connected_peers: HashMapWithOrderedKeys<String, Peer>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -172,8 +171,7 @@ pub struct PeerDecodeManager {
 impl PeerDecodeManager {
     pub fn new() -> Self {
         Self {
-            connected_peers: HashMap::new(),
-            sorted_connected_peers_keys: vec![],
+            connected_peers: HashMapWithOrderedKeys::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -181,7 +179,7 @@ impl PeerDecodeManager {
     }
 
     pub fn sorted_keys(&self) -> &Vec<String> {
-        &self.sorted_connected_peers_keys
+        self.connected_peers.ordered_keys()
     }
 
     pub fn get(&self, key: &String) -> Option<&Peer> {
@@ -220,15 +218,10 @@ impl PeerDecodeManager {
                 aes,
             ),
         );
-        self.sorted_connected_peers_keys.push(email.to_owned());
-        self.sorted_connected_peers_keys.sort();
     }
 
     pub fn delete_peer(&mut self, email: &String) {
         self.connected_peers.remove(email);
-        if let Ok(index) = self.sorted_connected_peers_keys.binary_search(email) {
-            self.sorted_connected_peers_keys.remove(index);
-        }
     }
 
     pub fn ensure_peer(&mut self, email: &String) -> PeerStatus {

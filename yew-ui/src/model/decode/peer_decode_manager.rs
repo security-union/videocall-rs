@@ -19,7 +19,9 @@ pub enum PeerDecodeError {
     ScreenDecodeError,
     VideoDecodeError,
     NoSuchPeer(String),
-    Other(String),
+    NoMediaType,
+    NoPacketType,
+    PacketParseError,
 }
 
 #[derive(Debug)]
@@ -37,7 +39,11 @@ impl Display for PeerDecodeError {
             PeerDecodeError::ScreenDecodeError => write!(f, "ScreenDecodeError"),
             PeerDecodeError::VideoDecodeError => write!(f, "VideoDecodeError"),
             PeerDecodeError::NoSuchPeer(s) => write!(f, "Peer Not Found: {s}"),
-            PeerDecodeError::Other(s) => write!(f, "Other: {s}"),
+            PeerDecodeError::NoMediaType => write!(f, "No media_type"),
+            PeerDecodeError::NoPacketType => write!(f, "No packet_type"),
+            PeerDecodeError::PacketParseError => {
+                write!(f, "Failed to parse to protobuf MediaPacket")
+            }
         }
     }
 }
@@ -98,49 +104,44 @@ impl Peer {
         if packet
             .packet_type
             .enum_value()
-            .map_err(|_e| PeerDecodeError::Other(String::from("No packet_type")))?
+            .map_err(|_| PeerDecodeError::NoPacketType)?
             != PacketType::MEDIA
         {
             return Err(PeerDecodeError::IncorrectPacketType);
         }
 
-        let packet = {
-            if let Some(aes) = self.aes {
+        let packet = match self.aes {
+            Some(aes) => {
                 let data = aes
                     .decrypt(&packet.data)
-                    .map_err(|_e| PeerDecodeError::AesDecryptError)?;
-                Arc::new(MediaPacket::parse_from_bytes(&data).map_err(|_e| {
-                    PeerDecodeError::Other(String::from("Failed to parse to protobuf MediaPacket"))
-                })?)
-            } else {
-                Arc::new(MediaPacket::parse_from_bytes(&packet.data).map_err(|_e| {
-                    PeerDecodeError::Other(String::from("Failed to parse to protobuf MediaPacket"))
-                })?)
+                    .map_err(|_| PeerDecodeError::AesDecryptError)?;
+                parse_media_packet(&data)?
             }
+            None => parse_media_packet(&packet.data)?,
         };
 
         let media_type = packet
             .media_type
             .enum_value()
-            .map_err(|_e| PeerDecodeError::Other(String::from("No media_type")))?;
+            .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => Ok((
                 media_type,
                 self.video
                     .decode(&packet)
-                    .map_err(|_e| PeerDecodeError::VideoDecodeError)?,
+                    .map_err(|_| PeerDecodeError::VideoDecodeError)?,
             )),
             MediaType::AUDIO => Ok((
                 media_type,
                 self.audio
                     .decode(&packet)
-                    .map_err(|_e| PeerDecodeError::AudioDecodeError)?,
+                    .map_err(|_| PeerDecodeError::AudioDecodeError)?,
             )),
             MediaType::SCREEN => Ok((
                 media_type,
                 self.screen
                     .decode(&packet)
-                    .map_err(|_e| PeerDecodeError::ScreenDecodeError)?,
+                    .map_err(|_| PeerDecodeError::ScreenDecodeError)?,
             )),
             MediaType::HEARTBEAT => Ok((
                 media_type,
@@ -151,6 +152,12 @@ impl Peer {
             )),
         }
     }
+}
+
+fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> {
+    Ok(Arc::new(
+        MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?,
+    ))
 }
 
 #[derive(Debug)]

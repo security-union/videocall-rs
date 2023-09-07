@@ -227,6 +227,7 @@ impl Component for AttendantsComponent {
                     info!("end to end encryption enabled = {}", self.e2ee_enabled);
                     let id = ctx.props().id.clone();
                     let email = ctx.props().email.clone();
+                    info!("email = {}", email);
                     let options = ConnectOptions {
                         userid: email.clone(),
                         websocket_url: format!("{ACTIX_WEBSOCKET}/{email}/{id}"),

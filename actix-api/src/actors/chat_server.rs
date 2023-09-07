@@ -86,6 +86,7 @@ impl Handler<ClientMessage> for ChatServer {
         trace!("got message in server room {} session {}", room, session);
         let nc = self.nats_connection.clone();
         let subject = format!("room.{}.{}", room, session);
+        let subject = subject.replace(" ", "_");
         let b = bytes::Bytes::from(msg.data.to_vec());
         let fut = async move {
             match nc.publish(subject.clone(), b).await {
@@ -155,7 +156,10 @@ impl Handler<JoinRoom> for ChatServer {
 }
 
 fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {
-    (format!("room.{}.*", room), format!("{}-{}", session, room))
+    (
+        format!("room.{}.*", room).replace(" ", "_"),
+        format!("{}-{}", session, room).replace(" ", "_"),
+    )
 }
 
 fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {
@@ -170,7 +174,7 @@ fn handle_msg(
     session: SessionId,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
-        if msg.subject == format!("room.{}.{}", room, session) {
+        if msg.subject == format!("room.{}.{}", room, session).replace(" ", "_") {
             return Ok(());
         }
 

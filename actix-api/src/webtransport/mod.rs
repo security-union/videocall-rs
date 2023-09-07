@@ -162,10 +162,11 @@ async fn handle_connection(
                 match req.method() {
                     &Method::CONNECT if ext.get::<Protocol>() == Some(&Protocol::WEB_TRANSPORT) => {
                         let uri = req.uri().clone();
+                        let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
-                        info!("Got path : {} ", uri.path());
+                        info!("Got path : {} ", path);
 
-                        let parts = uri.path().split('/').collect::<Vec<&str>>();
+                        let parts = path.split('/').collect::<Vec<&str>>();
                         // filter out the empty strings
                         let parts = parts.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
                         info!("Parts {:?}", parts);
@@ -177,8 +178,13 @@ async fn handle_connection(
                             return Err(anyhow!("Invalid path wrong prefix"));
                         }
 
-                        let username = parts[1];
-                        let lobby_id = parts[2];
+                        let username = parts[1].replace(" ", "_");
+                        let lobby_id = parts[2].replace(" ", "_");
+                        let re = regex::Regex::new("^[a-zA-Z0-9_]*$").unwrap();
+                        if !re.is_match(&username) && !re.is_match(&lobby_id) {
+                            conn.close(Code::H3_REQUEST_REJECTED, "Invalid path input chars");
+                            return Err(anyhow!("Invalid path input chars"));
+                        }
 
                         info!("Peer wants to initiate a webtransport session");
 
@@ -188,7 +194,7 @@ async fn handle_connection(
                         info!("Established webtransport session");
                         // 4. Get datagrams, bidirectional streams, and unidirectional streams and wait for client requests here.
                         // h3_conn needs to handover the datagrams, bidirectional streams, and unidirectional streams to the webtransport session.
-                        handle_session(session, username, lobby_id, nc.clone()).await?;
+                        handle_session(session, &username, &lobby_id, nc.clone()).await?;
                         return Ok(());
                     }
                     _ => {
@@ -253,8 +259,8 @@ where
     let should_run = Arc::new(AtomicBool::new(true));
     info!("Connected to NATS");
 
-    let subject = format!("room.{}.*", lobby_id);
-    let specific_subject = format!("room.{}.{}", lobby_id, username);
+    let subject = format!("room.{}.*", lobby_id).replace(" ", "_");
+    let specific_subject = format!("room.{}.{}", lobby_id, username).replace(" ", "_");
     let mut sub = match nc
         .queue_subscribe(subject.clone(), specific_subject.clone())
         .await

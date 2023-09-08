@@ -22,4 +22,3 @@ pub const VIDEO_HEIGHT: i32 = 720i32;
 pub const VIDEO_WIDTH: i32 = 1280i32;
 
 pub const RSA_BITS: usize = 1024;
-

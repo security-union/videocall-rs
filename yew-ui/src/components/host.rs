@@ -1,6 +1,6 @@
 use gloo_timers::callback::Timeout;
 use log::debug;
-use videocall_client::{CameraEncoder,MicrophoneEncoder,ScreenEncoder,VideoCallClient};
+use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
 
 use std::fmt::Debug;
 use yew::prelude::*;

@@ -10,5 +10,5 @@ mod media_devices;
 mod wrappers;
 
 pub use client::{VideoCallClient, VideoCallClientOptions};
-pub use media_devices::{MediaDeviceAccess, MediaDeviceList};
 pub use encode::{CameraEncoder, MicrophoneEncoder, ScreenEncoder};
+pub use media_devices::{MediaDeviceAccess, MediaDeviceList};

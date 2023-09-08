@@ -178,8 +178,8 @@ async fn handle_connection(
                             return Err(anyhow!("Invalid path wrong prefix"));
                         }
 
-                        let username = parts[1].replace(" ", "_");
-                        let lobby_id = parts[2].replace(" ", "_");
+                        let username = parts[1].replace(' ', "_");
+                        let lobby_id = parts[2].replace(' ', "_");
                         let re = regex::Regex::new("^[a-zA-Z0-9_]*$").unwrap();
                         if !re.is_match(&username) && !re.is_match(&lobby_id) {
                             conn.close(Code::H3_REQUEST_REJECTED, "Invalid path input chars");
@@ -259,8 +259,8 @@ where
     let should_run = Arc::new(AtomicBool::new(true));
     info!("Connected to NATS");
 
-    let subject = format!("room.{}.*", lobby_id).replace(" ", "_");
-    let specific_subject = format!("room.{}.{}", lobby_id, username).replace(" ", "_");
+    let subject = format!("room.{}.*", lobby_id).replace(' ', "_");
+    let specific_subject = format!("room.{}.{}", lobby_id, username).replace(' ', "_");
     let mut sub = match nc
         .queue_subscribe(subject.clone(), specific_subject.clone())
         .await

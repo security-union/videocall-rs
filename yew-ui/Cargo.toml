@@ -8,98 +8,31 @@ edition = "2021"
 [dependencies]
 yew = { version = "0.20", features = ["csr"] }
 wasm-bindgen = "0.2.78"
-wasm-bindgen-futures = "0.4.30"
 reqwasm = "0.5.0"
 types = { path= "../types"}
+videocall-client = { path= "../videocall-client"}
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
 const_format="0.2.25"
 lazy_static = "1.4.0"
 log = "0.4.19"
+gloo-timers = "0.2.6"
 gloo-utils = "0.1"
 yew-router = "0.17"
-js-sys = "0.3"
-yew-websocket = "1.0.1"
-anyhow = "1"
 serde = "1"
 serde_derive = "1"
 protobuf = "3.2.0"
 gloo = "0.8.0"
-gloo-timers = "0.2.6"
 urlencoding = "2.1.2"
-yew-webtransport = "0.3.2"
-aes = "0.8.3"
-cbc = { version = "0.1.2", features = ["alloc"] }
-rsa = "0.9.2"
 getrandom = { version = "0.2.10", features = ["js"] }
-rand = { version = "0.8.5", features = ["std_rng", "small_rng"] }
+wasm-bindgen-futures = "0.4.30"
 
 [dependencies.web-sys]
 version = "0.3.60"
 features = [
-    "AudioTrack",
-    "AudioData",
-    "AudioEncoder",
-    "AudioEncoderInit",
-    "AudioEncoderConfig",
-    "AudioDecoder",
-    "AudioDecoderInit",
-    "AudioDecoderConfig",
-    "AudioContext",
-    "BaseAudioContext",
-    "GainOptions",
-    "GainNode",
     "HtmlDocument",
     "console",
-    "CodecState",
-    "CanvasRenderingContext2d",
-    "EncodedAudioChunk",
-    "EncodedAudioChunkInit",
-    "EncodedAudioChunkType",
-    "EncodedVideoChunk",
-    "EncodedVideoChunkInit",
-    "EncodedVideoChunkType",
-    "MediaStreamAudioDestinationNode",
-    "AudioDestinationNode",
-    "AudioContextOptions",
-    "AudioDataCopyToOptions",
-    "HtmlCanvasElement",
-    "HtmlImageElement",
     "Navigator",
-    "MediaDevices",
-    "MediaStream",
-    "MediaStreamTrack",
-    "MediaTrackSettings",
-    "MediaStreamTrackProcessor",
-    "MediaStreamTrackProcessorInit",
-    "MediaStreamTrackGenerator",
-    "MediaStreamTrackGeneratorInit",
-    "WritableStream",
-    "WritableStreamDefaultWriter",
-    "MediaStreamAudioSourceNode",
-    "HtmlVideoElement",
-    "MediaStreamConstraints",
-    "ReadableStream",
-    "ReadableStreamGetReaderOptions",
-    "ReadableStreamDefaultReader",
-    "VideoEncoder",
-    "VideoEncoderInit",
-    "VideoEncoderConfig",
-    "VideoEncoderEncodeOptions",
-    "VideoFrame",
-    "VideoTrack",
-    "VideoDecoder",
-    "VideoDecoderConfig",
-    "VideoDecoderInit",
-    "LatencyMode",
-    "HtmlAudioElement",
-    "AudioDataInit",
-    "AudioSampleFormat",
-    "TransformStream",
-    "MediaDeviceInfo",
-    "MediaDeviceKind",
-    "MediaTrackConstraints",
-    "CanvasRenderingContext2d"
 ]
 
 [dev-dependencies]

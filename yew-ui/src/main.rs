@@ -1,10 +1,7 @@
 #![feature(future_join)]
-#![feature(once_cell)]
 #[allow(non_camel_case_types)]
 mod components;
 mod constants;
-mod crypto;
-mod model;
 mod pages;
 
 use constants::{truthy, E2EE_ENABLED, LOGIN_URL, WEBTRANSPORT_ENABLED};

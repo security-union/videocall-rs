@@ -1,14 +1,11 @@
-use crate::model::client::VideoCallClient;
 use gloo_timers::callback::Timeout;
 use log::debug;
+use videocall_client::{CameraEncoder,MicrophoneEncoder,ScreenEncoder,VideoCallClient};
 
 use std::fmt::Debug;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
-use crate::model::encode::CameraEncoder;
-use crate::model::encode::MicrophoneEncoder;
-use crate::model::encode::ScreenEncoder;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 

@@ -1,4 +1,4 @@
-use crate::model::media_devices::MediaDeviceList;
+use videocall_client::MediaDeviceList;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlSelectElement;
 use yew::prelude::*;

@@ -60,6 +60,7 @@ pub struct MediaDeviceList {
     pub on_loaded: Callback<()>,
 }
 
+#[allow(clippy::new_without_default)]
 impl MediaDeviceList {
     pub fn new() -> Self {
         Self {

@@ -12,6 +12,7 @@ pub struct MediaDeviceAccess {
     pub on_denied: Callback<()>,
 }
 
+#[allow(clippy::new_without_default)]
 impl MediaDeviceAccess {
     pub fn new() -> Self {
         Self {

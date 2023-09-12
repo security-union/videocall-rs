@@ -38,3 +38,5 @@ lazy_static! {
         truthy(std::env!("WEBTRANSPORT_ENABLED").to_string());
     pub static ref E2EE_ENABLED: bool = truthy(std::env!("E2EE_ENABLED").to_string());
 }
+
+pub const USERS_ALLOWED_TO_STREAM: [&'static str; 3] = ["dario", "hamdy", "griffin"];

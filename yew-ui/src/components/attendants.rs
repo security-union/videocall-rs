@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::constants::WEBTRANSPORT_HOST;
+use crate::constants::{WEBTRANSPORT_HOST, USERS_ALLOWED_TO_STREAM};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::model::connection::{ConnectOptions, Connection};
@@ -212,6 +212,10 @@ impl Component for AttendantsComponent {
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         if first_render {
+            ctx.link().send_message(WsAction::Connect(self.webtransport_enabled));
+            if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &ctx.props().email) {
+                ctx.link().send_message(WsAction::RequestMediaPermissions);
+            }
             ctx.link().send_message(WsAction::RequestMediaPermissions);
         }
     }
@@ -273,8 +277,6 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
-                    ctx.link()
-                        .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
                 }
                 WsAction::MediaPermissionsError(error) => {
@@ -451,23 +453,31 @@ impl Component for AttendantsComponent {
                 { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
                 { rows }
                 <nav class="host">
-                    <div class="controls">
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
-                            { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
-                        </button>
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
-                            { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
-                        </button>
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
-                            { if !self.mic_enabled { "Unmute"} else { "Mute"} }
-                            </button>
-                    </div>
+                    {
+                        if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) {
+                            html! {
+                                <div class="controls">
+                                    <button
+                                        class="bg-yew-blue p-2 rounded-md text-white"
+                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
+                                        { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
+                                    </button>
+                                    <button
+                                        class="bg-yew-blue p-2 rounded-md text-white"
+                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
+                                        { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
+                                    </button>
+                                    <button
+                                        class="bg-yew-blue p-2 rounded-md text-white"
+                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
+                                        { if !self.mic_enabled { "Unmute"} else { "Mute"} }
+                                        </button>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }
+                    }
                     {
                         if media_access_granted {
                             html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes.clone()} />}

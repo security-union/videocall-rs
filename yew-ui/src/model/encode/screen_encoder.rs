@@ -85,6 +85,7 @@ impl ScreenEncoder {
                     .unwrap()
                     .unchecked_into::<MediaStream>();
 
+            // TODO: How can we determine the actual width and height of the screen to set the encoder config?
             let screen_track = Box::new(
                 screen_to_share
                     .get_video_tracks()

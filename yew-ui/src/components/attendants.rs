@@ -216,11 +216,10 @@ impl Component for AttendantsComponent {
                 .send_message(WsAction::Connect(self.webtransport_enabled));
             if USERS_ALLOWED_TO_STREAM
                 .iter()
-                .any(|host| host == &ctx.props().email)
+                .any(|host| host == &ctx.props().email) || USERS_ALLOWED_TO_STREAM.len() == 0
             {
                 ctx.link().send_message(WsAction::RequestMediaPermissions);
             }
-            ctx.link().send_message(WsAction::RequestMediaPermissions);
         }
     }
 

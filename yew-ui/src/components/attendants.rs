@@ -214,13 +214,6 @@ impl Component for AttendantsComponent {
         if first_render {
             ctx.link()
                 .send_message(WsAction::Connect(self.webtransport_enabled));
-            if USERS_ALLOWED_TO_STREAM
-                .iter()
-                .any(|host| host == &ctx.props().email)
-                || USERS_ALLOWED_TO_STREAM.len() == 0
-            {
-                ctx.link().send_message(WsAction::RequestMediaPermissions);
-            }
         }
     }
 
@@ -276,6 +269,9 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::RequestMediaPermissions => {
+                    if self.media_device_access.is_granted() {
+                        return true;
+                    }
                     self.media_device_access.request();
                     false
                 }
@@ -386,12 +382,15 @@ impl Component for AttendantsComponent {
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
+                        ctx.link().send_message(WsAction::RequestMediaPermissions);
                         self.share_screen = !self.share_screen;
                     }
                     MeetingAction::ToggleMicMute => {
+                        ctx.link().send_message(WsAction::RequestMediaPermissions);
                         self.mic_enabled = !self.mic_enabled;
                     }
                     MeetingAction::ToggleVideoOnOff => {
+                        ctx.link().send_message(WsAction::RequestMediaPermissions);
                         self.video_enabled = !self.video_enabled;
                     }
                 }

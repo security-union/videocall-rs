@@ -216,7 +216,8 @@ impl Component for AttendantsComponent {
                 .send_message(WsAction::Connect(self.webtransport_enabled));
             if USERS_ALLOWED_TO_STREAM
                 .iter()
-                .any(|host| host == &ctx.props().email) || USERS_ALLOWED_TO_STREAM.len() == 0
+                .any(|host| host == &ctx.props().email)
+                || USERS_ALLOWED_TO_STREAM.len() == 0
             {
                 ctx.link().send_message(WsAction::RequestMediaPermissions);
             }
@@ -408,8 +409,10 @@ impl Component for AttendantsComponent {
             .sorted_keys()
             .iter()
             .map(|key| {
-                if !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key) && USERS_ALLOWED_TO_STREAM.to_vec().len() != 0 {
-                    return html! {}
+                if !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
+                    && USERS_ALLOWED_TO_STREAM.to_vec().len() != 0
+                {
+                    return html! {};
                 }
                 let peer = match self.peer_decode_manager.get(key) {
                     Some(peer) => peer,

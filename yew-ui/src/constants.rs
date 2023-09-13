@@ -45,8 +45,8 @@ pub fn split_users(s: Option<&str>) -> Vec<String> {
 // few functions.
 lazy_static! {
     pub static ref ENABLE_OAUTH: bool = truthy(std::option_env!("ENABLE_OAUTH"));
-    pub static ref WEBTRANSPORT_ENABLED: bool =
-        truthy(std::option_env!("WEBTRANSPORT_ENABLED"));
+    pub static ref WEBTRANSPORT_ENABLED: bool = truthy(std::option_env!("WEBTRANSPORT_ENABLED"));
     pub static ref E2EE_ENABLED: bool = truthy(std::option_env!("E2EE_ENABLED"));
-    pub static ref USERS_ALLOWED_TO_STREAM: Vec<String> = split_users(std::option_env!("USERS_ALLOWED_TO_STREAM"));
+    pub static ref USERS_ALLOWED_TO_STREAM: Vec<String> =
+        split_users(std::option_env!("USERS_ALLOWED_TO_STREAM"));
 }

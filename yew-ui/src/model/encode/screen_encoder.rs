@@ -25,9 +25,9 @@ use web_sys::VideoTrack;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
+use crate::constants::SCREEN_HEIGHT;
+use crate::constants::SCREEN_WIDTH;
 use crate::constants::VIDEO_CODEC;
-use crate::constants::VIDEO_HEIGHT;
-use crate::constants::VIDEO_WIDTH;
 use crate::crypto::aes::Aes128State;
 
 pub struct ScreenEncoder {
@@ -61,7 +61,7 @@ impl ScreenEncoder {
         let screen_output_handler = {
             let userid = userid;
             let on_frame = on_frame;
-            let mut buffer: [u8; 100000] = [0; 100000];
+            let mut buffer: [u8; 150000] = [0; 150000];
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -106,8 +106,8 @@ impl ScreenEncoder {
 
             let screen_encoder = Box::new(VideoEncoder::new(&screen_encoder_init).unwrap());
             let mut screen_encoder_config =
-                VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
-            screen_encoder_config.bitrate(60_000f64);
+                VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
+            screen_encoder_config.bitrate(64_000f64);
             screen_encoder_config.latency_mode(LatencyMode::Realtime);
             screen_encoder.configure(&screen_encoder_config);
 

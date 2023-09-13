@@ -212,8 +212,7 @@ impl Component for AttendantsComponent {
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         if first_render {
-            ctx.link()
-                .send_message(WsAction::Connect(self.webtransport_enabled));
+            ctx.link().send_message(WsAction::RequestMediaPermissions);
         }
     }
 
@@ -269,10 +268,8 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::RequestMediaPermissions => {
-                    if self.media_device_access.is_granted() {
-                        return true;
-                    }
                     self.media_device_access.request();
+                    ctx.link().send_message(WsAction::Connect(self.webtransport_enabled));
                     false
                 }
                 WsAction::MediaPermissionsGranted => {
@@ -382,15 +379,12 @@ impl Component for AttendantsComponent {
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
-                        ctx.link().send_message(WsAction::RequestMediaPermissions);
                         self.share_screen = !self.share_screen;
                     }
                     MeetingAction::ToggleMicMute => {
-                        ctx.link().send_message(WsAction::RequestMediaPermissions);
                         self.mic_enabled = !self.mic_enabled;
                     }
                     MeetingAction::ToggleVideoOnOff => {
-                        ctx.link().send_message(WsAction::RequestMediaPermissions);
                         self.video_enabled = !self.video_enabled;
                     }
                 }

@@ -27,17 +27,26 @@ pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lo
 
 pub const RSA_BITS: usize = 1024;
 
-pub fn truthy(s: String) -> bool {
-    ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())
+pub fn truthy(s: Option<&str>) -> bool {
+    if let Some(s) = s {
+        ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())
+    } else {
+        false
+    }
+}
+pub fn split_users(s: Option<&str>) -> Vec<String> {
+    if let Some(s) = s {
+        s.split(',').map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    }
 }
 // We need a lazy static block because these vars need to call a
 // few functions.
 lazy_static! {
-    pub static ref ENABLE_OAUTH: bool = truthy(std::env!("ENABLE_OAUTH").to_string());
+    pub static ref ENABLE_OAUTH: bool = truthy(std::option_env!("ENABLE_OAUTH"));
     pub static ref WEBTRANSPORT_ENABLED: bool =
-        truthy(std::env!("WEBTRANSPORT_ENABLED").to_string());
-    pub static ref E2EE_ENABLED: bool = truthy(std::env!("E2EE_ENABLED").to_string());
+        truthy(std::option_env!("WEBTRANSPORT_ENABLED"));
+    pub static ref E2EE_ENABLED: bool = truthy(std::option_env!("E2EE_ENABLED"));
+    pub static ref USERS_ALLOWED_TO_STREAM: Vec<String> = split_users(std::option_env!("USERS_ALLOWED_TO_STREAM"));
 }
-
-// pub const USERS_ALLOWED_TO_STREAM: [&'static str; 3] = ["dario", "hamdy", "griffin"];
-pub const USERS_ALLOWED_TO_STREAM: [&'static str; 0] = [];

@@ -269,7 +269,8 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::RequestMediaPermissions => {
                     self.media_device_access.request();
-                    ctx.link().send_message(WsAction::Connect(self.webtransport_enabled));
+                    ctx.link()
+                        .send_message(WsAction::Connect(self.webtransport_enabled));
                     false
                 }
                 WsAction::MediaPermissionsGranted => {

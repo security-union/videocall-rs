@@ -10,7 +10,7 @@ fi
 IMAGE_URL=securityunion/rustlemania-ui:$TAG
 echo "Building image "$IMAGE_URL
 
-if ! docker build -t $IMAGE_URL . --file Dockerfile.yew; then
+if ! docker build -t $IMAGE_URL --build-arg USERS_ALLOWED_TO_STREAM="dario,griffin,hamdy" . --file Dockerfile.yew; then
     echo "Failed to build server_rust"
 else
     docker push $IMAGE_URL

@@ -23,6 +23,7 @@ services:
       - RUST_BACKTRACE=1
       - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
       - E2EE_ENABLED=${E2EE_ENABLED:-false}
+      - USERS_ALLOWED_TO_STREAM=dario,griffin,123,abc
     ports:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
 

@@ -7,7 +7,7 @@ ENV ACTIX_UI_BACKEND_URL="wss://api.rustlemania.com"
 ENV WEBTRANSPORT_HOST="https://transport.rustlemania.com"
 ENV WEBTRANSPORT_ENABLED="false"
 ENV E2EE_ENABLED="true"
-ARG USERS_ALLOWED_TO_STREAM
+ENV USERS_ALLOWED_TO_STREAM="dario,griffin,hamdy"
 WORKDIR /app
 COPY . .
 WORKDIR /app/yew-ui

@@ -1,3 +1,17 @@
+<!---  Do not manually edit README.md!   The file is created automatically using 'cargo readme'.
+
+    Changes should be made in:
+
+        * src/lib.rs
+        * README.tpl
+
+    Rebuilding:
+
+        $ cd videocall-client
+        $ cargo readme > README.md
+
+--->
+
 # videocall-client
 
 Version: 0.1.0
@@ -7,7 +21,7 @@ Version: 0.1.0
 This crate provides a client-side (browser) interface to the videocall protocol.  The purpose is to
 take care of the media I/O both for the encoding the current participant and for rendering the
 media from the remote peers.  It also provides tools for listing available media devices and
-granting access
+granting access.
 
 This crate intends to make no assumptions about the UI or the HTML of the client app.
 The only DOM data it needs is the ID of the `HtmlVideoElement` for the participant's own video
@@ -15,6 +29,8 @@ display and the ID's of the `HtmlCanvasElement`s into which remote peer video sh
 
 In addition to its use by Rust UI apps (e.g. via yew), it is intended that this crate be
 compiled to npm module that could be called from javascript, e.g. in an electron app.
+
+Currently, only the Chrome browser is supported, due to some of the Web APIs that are used.
 
 **NOTE:** This initial version is a slightly frankenstein result of piecemeal refactoring bits
 from the original app and stitching them together.   It could use cleaning up both the API the
@@ -54,6 +70,7 @@ screen.stop();
 let media_device_access = MediaDeviceAccess::new();
 media_device_access.on_granted = ...; // callback
 media_device_access.on_denied = ...; // callback
+media_device_access.request();
 ```
 
 #### Device query and listing:

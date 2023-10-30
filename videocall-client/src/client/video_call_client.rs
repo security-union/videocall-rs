@@ -122,7 +122,7 @@ impl VideoCallClient {
     /// Initiates a connection using WebTransport (to
     /// [`options.webtransport_url`](VideoCallClientOptions::webtransport_url)) or WebSocket (to
     /// [`options.websocket_url`](VideoCallClientOptions::websocket_url)), based on the value of
-    /// [`options.enable_websocket`](VideoCallClientOptions::enable_websocket).
+    /// [`options.enable_webtransport`](VideoCallClientOptions::enable_webtransport).
     ///
     /// Note that this method's success means only that it succesfully *attempted* initiation of the
     /// connection.  The connection cannot actually be considered to have been succesful until the
@@ -226,7 +226,7 @@ impl VideoCallClient {
     /// Hacky function that returns true if the given peer has yet to send a frame of screen share.
     ///
     /// No reason for this function to exist, it should be deducible from the
-    /// [`options.on_first_frame(key, MediaType::Screen)`](VideoCallClientOptions::on_first_frame)
+    /// [`options.on_peer_first_frame(key, MediaType::Screen)`](VideoCallClientOptions::on_peer_first_frame)
     /// callback.   Or if polling is really necessary, instead of being hardwired for screen, it'd
     /// be more elegant to at least pass a `MediaType`.
     ///

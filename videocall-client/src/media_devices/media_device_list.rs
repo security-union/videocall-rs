@@ -40,8 +40,8 @@ impl SelectableDevices {
     /// Does nothing if the device_id is not in [`devices()`](Self::devices).
     ///
     /// **Note**: Selecting a device here does *not* automatically perform the corresponding
-    /// call to [`CameraEncoder::select(device_id)`](CameraEncoder::select) or
-    /// [`MicrophoneEncoder::select(device_id)`](MicrophoneEncoder::select) -- the expectation is
+    /// call to [`CameraEncoder::select(device_id)`](crate::CameraEncoder::select) or
+    /// [`MicrophoneEncoder::select(device_id)`](crate::MicrophoneEncoder::select) -- the expectation is
     /// that the [`on_selected(device_id)`](Self::on_selected) callback will be set to a function
     /// that calls the `select` method of the appropriate encoder.
     pub fn select(&mut self, device_id: &str) {

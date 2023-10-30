@@ -22,7 +22,7 @@ pub struct MediaDeviceAccess {
 impl MediaDeviceAccess {
     /// Constructor for the device access struct.
     ///
-    /// After construction, set the callbacks, then call the [`request()`] method to request
+    /// After construction, set the callbacks, then call the [`request()`](Self::request) method to request
     /// access, e.g.:
     ///
     /// ```

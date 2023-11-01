@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use super::icons::push_pin::PushPinIcon;
 use crate::constants::{USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
@@ -21,8 +22,6 @@ use types::protos::packet_wrapper::PacketWrapper;
 use types::protos::rsa_packet::RsaPacket;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-
-use super::icons::push_pin::PushPinIcon;
 use web_sys::*;
 use yew::prelude::*;
 use yew::virtual_dom::VNode;
@@ -403,8 +402,8 @@ impl Component for AttendantsComponent {
             .sorted_keys()
             .iter()
             .map(|key| {
-                if !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
-                    && USERS_ALLOWED_TO_STREAM.to_vec().len() != 0
+                if !USERS_ALLOWED_TO_STREAM.is_empty()
+                    && !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
                 {
                     return html! {};
                 }
@@ -456,7 +455,7 @@ impl Component for AttendantsComponent {
                 { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
                 { rows }
                 {
-                    if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.to_vec().len() == 0 {
+                    if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
                         html! {
                             <nav class="host">
                                 <div class="controls">
@@ -499,6 +498,8 @@ impl Component for AttendantsComponent {
                             </nav>
                         }
                     } else {
+                        error!("User not allowed to stream");
+                        error!("allowed users {}", USERS_ALLOWED_TO_STREAM.join(", "));
                         html! {}
                     }
                 }

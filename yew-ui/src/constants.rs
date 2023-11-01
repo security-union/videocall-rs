@@ -38,7 +38,16 @@ pub fn truthy(s: Option<&str>) -> bool {
 }
 pub fn split_users(s: Option<&str>) -> Vec<String> {
     if let Some(s) = s {
-        s.split(',').map(|s| s.to_string()).collect()
+        s.split(',')
+            .filter_map(|s| {
+                let s = s.trim().to_string();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            })
+            .collect::<Vec<String>>()
     } else {
         Vec::new()
     }

@@ -1,4 +1,4 @@
-use crate::model::EncodedVideoChunkTypeWrapper;
+use super::super::wrappers::EncodedVideoChunkTypeWrapper;
 use js_sys::Uint8Array;
 use std::sync::Arc;
 use types::protos::media_packet::MediaPacket;
@@ -19,6 +19,7 @@ pub trait VideoDecoderTrait {
 }
 
 // Create a wrapper struct for the foreign struct
+#[derive(Debug)]
 pub struct VideoDecoderWrapper(web_sys::VideoDecoder);
 
 // Implement the trait for the wrapper struct

@@ -39,7 +39,8 @@ async fn create_client(
 ) -> JoinHandle<()> {
     let email = generate_email(email_prefix);
     let url = format!("{}/lobby/{}/{}", endpoint, email, room);
-    let (mut ws_stream, _) = connect_async(Url::parse(&url).unwrap()).await.unwrap();
+    let parsed_url = Url::parse(&url).unwrap();
+    let (mut ws_stream, _) = connect_async(parsed_url).await.unwrap();
     println!("Connected to {}", url);
     let echo_user = echo_user.to_string();
     // Send a single heartbeat just so that we show up on the ui

@@ -54,7 +54,7 @@ fn switch(routes: Route) -> Html {
         } => html! {
             <>
                 <TopBar/>
-                <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(webtransport_enabled)} e2ee_enabled={*E2EE_ENABLED} />
+                <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(Some(&webtransport_enabled))} e2ee_enabled={*E2EE_ENABLED} />
             </>
         },
         Route::NotFound => html! { <h1>{ "404" }</h1> },

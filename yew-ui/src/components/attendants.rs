@@ -1,7 +1,7 @@
 use super::icons::push_pin::PushPinIcon;
-use crate::constants::WEBTRANSPORT_HOST;
+use crate::constants::{USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use log::warn;
+use log::{error, warn};
 use std::rc::Rc;
 use types::protos::media_packet::media_packet::MediaType;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
@@ -167,6 +167,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::RequestMediaPermissions => {
                     self.media_device_access.request();
+                    ctx.link().send_message(WsAction::Connect);
                     false
                 }
                 WsAction::MediaPermissionsGranted => {
@@ -206,6 +207,11 @@ impl Component for AttendantsComponent {
             .sorted_peer_keys()
             .iter()
             .map(|key| {
+                if !USERS_ALLOWED_TO_STREAM.is_empty()
+                    && !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
+                {
+                    return html! {};
+                }
                 let screen_share_css = if self.client.is_awaiting_peer_screen_frame(key) {
                     "grid-item hidden"
                 } else {
@@ -248,45 +254,55 @@ impl Component for AttendantsComponent {
             <div class="grid-container">
                 { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
                 { rows }
-                <nav class="host">
-                    <div class="controls">
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
-                            { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
-                        </button>
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
-                            { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
-                        </button>
-                        <button
-                            class="bg-yew-blue p-2 rounded-md text-white"
-                            onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
-                            { if !self.mic_enabled { "Unmute"} else { "Mute"} }
-                            </button>
-                    </div>
-                    {
-                        if media_access_granted {
-                            html! {<Host client={self.client.clone()} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} />}
-                        } else {
-                            html! {<></>}
+                {
+                    if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
+                        html! {
+                            <nav class="host">
+                                <div class="controls">
+                                    <button
+                                        class="bg-yew-blue p-2 rounded-md text-white"
+                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
+                                        { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
+                                    </button>
+                                    <button
+                                        class="bg-yew-blue p-2 rounded-md text-white"
+                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
+                                        { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
+                                    </button>
+                                    <button
+                                        class="bg-yew-blue p-2 rounded-md text-white"
+                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
+                                        { if !self.mic_enabled { "Unmute"} else { "Mute"} }
+                                        </button>
+                                </div>
+                                {
+                                    if media_access_granted {
+                                        html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} />}
+                                    } else {
+                                        html! {<></>}
+                                    }
+                                }
+                                <h4 class="floating-name">{email}</h4>
+
+                                {if !self.client.is_connected() {
+                                    html! {<h4>{"Connecting"}</h4>}
+                                } else {
+                                    html! {<h4>{"Connected"}</h4>}
+                                }}
+
+                                {if ctx.props().e2ee_enabled {
+                                    html! {<h4>{"End to End Encryption Enabled"}</h4>}
+                                } else {
+                                    html! {<h4>{"End to End Encryption Disabled"}</h4>}
+                                }}
+                            </nav>
                         }
+                    } else {
+                        error!("User not allowed to stream");
+                        error!("allowed users {}", USERS_ALLOWED_TO_STREAM.join(", "));
+                        html! {}
                     }
-                    <h4 class="floating-name">{email}</h4>
-
-                    {if !self.client.is_connected() {
-                        html! {<h4>{"Connecting"}</h4>}
-                    } else {
-                        html! {<h4>{"Connected"}</h4>}
-                    }}
-
-                    {if ctx.props().e2ee_enabled {
-                        html! {<h4>{"End to End Encryption Enabled"}</h4>}
-                    } else {
-                        html! {<h4>{"End to End Encryption Disabled"}</h4>}
-                    }}
-                </nav>
+                }
             </div>
         }
     }

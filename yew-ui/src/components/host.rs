@@ -15,8 +15,11 @@ const VIDEO_ELEMENT_ID: &str = "webcam";
 pub enum Msg {
     Start,
     EnableScreenShare,
+    DisableScreenShare,
     EnableMicrophone(bool),
+    DisableMicrophone,
     EnableVideo(bool),
+    DisableVideo,
     AudioDeviceChanged(String),
     VideoDeviceChanged(String),
 }
@@ -25,6 +28,9 @@ pub struct Host {
     pub camera: CameraEncoder,
     pub microphone: MicrophoneEncoder,
     pub screen: ScreenEncoder,
+    pub share_screen: bool,
+    pub mic_enabled: bool,
+    pub video_enabled: bool,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -33,9 +39,6 @@ pub struct MeetingProps {
     pub id: String,
 
     pub client: VideoCallClient,
-
-    #[prop_or_default]
-    pub email: String,
 
     pub share_screen: bool,
 
@@ -54,23 +57,38 @@ impl Component for Host {
             camera: CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID),
             microphone: MicrophoneEncoder::new(client.clone()),
             screen: ScreenEncoder::new(client.clone()),
+            share_screen: ctx.props().share_screen,
+            mic_enabled: ctx.props().mic_enabled,
+            video_enabled: ctx.props().video_enabled,
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         // Determine if we should start/stop screen share.
         if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
+            self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::EnableScreenShare);
+        } else if self.share_screen != ctx.props().share_screen {
+            self.share_screen = ctx.props().share_screen;
+            ctx.link().send_message(Msg::DisableScreenShare);
         }
         // Determine if we should start/stop microphone.
         if self.microphone.set_enabled(ctx.props().mic_enabled) {
+            self.mic_enabled = ctx.props().mic_enabled;
             ctx.link()
                 .send_message(Msg::EnableMicrophone(ctx.props().mic_enabled));
+        } else if self.mic_enabled != ctx.props().mic_enabled {
+            self.mic_enabled = ctx.props().mic_enabled;
+            ctx.link().send_message(Msg::DisableMicrophone)
         }
         // Determine if we should start/stop video.
         if self.camera.set_enabled(ctx.props().video_enabled) {
+            self.video_enabled = ctx.props().video_enabled;
             ctx.link()
                 .send_message(Msg::EnableVideo(ctx.props().video_enabled));
+        } else if self.video_enabled != ctx.props().video_enabled {
+            self.video_enabled = ctx.props().video_enabled;
+            ctx.link().send_message(Msg::DisableVideo)
         }
 
         if first_render {
@@ -84,6 +102,10 @@ impl Component for Host {
                 self.screen.start();
                 true
             }
+            Msg::DisableScreenShare => {
+                self.screen.stop();
+                true
+            }
             Msg::Start => true,
             Msg::EnableMicrophone(should_enable) => {
                 if !should_enable {
@@ -92,12 +114,20 @@ impl Component for Host {
                 self.microphone.start();
                 true
             }
+            Msg::DisableMicrophone => {
+                self.microphone.stop();
+                true
+            }
             Msg::EnableVideo(should_enable) => {
                 if !should_enable {
                     return true;
                 }
 
                 self.camera.start();
+                true
+            }
+            Msg::DisableVideo => {
+                self.camera.stop();
                 true
             }
             Msg::AudioDeviceChanged(audio) => {

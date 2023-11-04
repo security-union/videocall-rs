@@ -26,9 +26,9 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
+use crate::constants::SCREEN_HEIGHT;
+use crate::constants::SCREEN_WIDTH;
 use crate::constants::VIDEO_CODEC;
-use crate::constants::VIDEO_HEIGHT;
-use crate::constants::VIDEO_WIDTH;
 
 pub struct ScreenEncoder {
     client: VideoCallClient,
@@ -59,7 +59,7 @@ impl ScreenEncoder {
         let userid = client.userid().clone();
         let aes = client.aes();
         let screen_output_handler = {
-            let mut buffer: [u8; 100000] = [0; 100000];
+            let mut buffer: [u8; 150000] = [0; 150000];
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
@@ -83,6 +83,7 @@ impl ScreenEncoder {
                     .unwrap()
                     .unchecked_into::<MediaStream>();
 
+            // TODO: How can we determine the actual width and height of the screen to set the encoder config?
             let screen_track = Box::new(
                 screen_to_share
                     .get_video_tracks()
@@ -104,8 +105,8 @@ impl ScreenEncoder {
 
             let screen_encoder = Box::new(VideoEncoder::new(&screen_encoder_init).unwrap());
             let mut screen_encoder_config =
-                VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
-            screen_encoder_config.bitrate(60_000f64);
+                VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
+            screen_encoder_config.bitrate(64_000f64);
             screen_encoder_config.latency_mode(LatencyMode::Realtime);
             screen_encoder.configure(&screen_encoder_config);
 

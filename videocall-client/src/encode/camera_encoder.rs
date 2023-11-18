@@ -34,6 +34,15 @@ use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
 
+/// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
+///
+/// To use this struct, the caller must first create an `HtmlVideoElement` DOM node, to which the
+/// camera will be connected.
+///
+/// See also:
+/// * [MicrophoneEncoder](crate::MicrophoneEncoder)
+/// * [ScreenEncoder](crate::ScreenEncoder)
+///
 pub struct CameraEncoder {
     client: VideoCallClient,
     video_elem_id: String,
@@ -41,6 +50,14 @@ pub struct CameraEncoder {
 }
 
 impl CameraEncoder {
+    /// Construct a camera encoder, with arguments:
+    ///
+    /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
+    ///
+    /// * `video_elem_id` - the the ID of an `HtmlVideoElement` to which the camera will be connected.  It does not need to currently exist.
+    ///
+    /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
+    /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
     pub fn new(client: VideoCallClient, video_elem_id: &str) -> Self {
         Self {
             client,
@@ -49,17 +66,38 @@ impl CameraEncoder {
         }
     }
 
-    // delegates to self.state
+    // The next three methods delegate to self.state
+
+    /// Enables/disables the encoder.   Returns true if the new value is different from the old value.
+    ///
+    /// The encoder starts disabled, [`encoder.set_enabled(true)`](Self::set_enabled) must be
+    /// called prior to starting encoding.
+    ///
+    /// Disabling encoding after it has started will cause it to stop.
     pub fn set_enabled(&mut self, value: bool) -> bool {
         self.state.set_enabled(value)
     }
-    pub fn select(&mut self, device: String) -> bool {
-        self.state.select(device)
+
+    /// Selects a camera:
+    ///
+    /// * `device_id` - The value of `entry.device_id` for some entry in
+    /// [`media_device_list.video_inputs.devices()`](crate::MediaDeviceList::video_inputs)
+    ///
+    /// The encoder starts without a camera associated,
+    /// [`encoder.selected(device_id)`](Self::select) must be called prior to starting encoding.
+    pub fn select(&mut self, device_id: String) -> bool {
+        self.state.select(device_id)
     }
+
+    /// Stops encoding after it has been started.
     pub fn stop(&mut self) {
         self.state.stop()
     }
 
+    /// Start encoding and sending the data to the client connection (if it's currently connected).
+    ///
+    /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
+    /// called, or if [`encoder.select(device_id)`](Self::select) has not been called.
     pub fn start(&mut self) {
         // 1. Query the first device with a camera and a mic attached.
         // 2. setup WebCodecs, in particular

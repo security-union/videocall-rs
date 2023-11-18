@@ -30,12 +30,23 @@ use crate::constants::SCREEN_HEIGHT;
 use crate::constants::SCREEN_WIDTH;
 use crate::constants::VIDEO_CODEC;
 
+/// [ScreenEncoder] encodes the user's screen and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
+///
+/// See also:
+/// * [CameraEncoder](crate::CameraEncoder)
+/// * [MicrophoneEncoder](crate::MicrophoneEncoder)
+///
 pub struct ScreenEncoder {
     client: VideoCallClient,
     state: EncoderState,
 }
 
 impl ScreenEncoder {
+    /// Construct a screen encoder:
+    ///
+    /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
+    ///
+    /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     pub fn new(client: VideoCallClient) -> Self {
         Self {
             client,
@@ -43,14 +54,28 @@ impl ScreenEncoder {
         }
     }
 
-    // delegates to self.state
+    // The next two methods delegate to self.state
+
+    /// Enables/disables the encoder.   Returns true if the new value is different from the old value.
+    ///
+    /// The encoder starts disabled, [`encoder.set_enabled(true)`](Self::set_enabled) must be
+    /// called prior to starting encoding.
+    ///
+    /// Disabling encoding after it has started will cause it to stop.
     pub fn set_enabled(&mut self, value: bool) -> bool {
         self.state.set_enabled(value)
     }
+
+    /// Stops encoding after it has been started.
     pub fn stop(&mut self) {
         self.state.stop()
     }
 
+    /// Start encoding and sending the data to the client connection (if it's currently connected).
+    /// The user is prompted by the browser to select which window or screen to encode.
+    ///
+    /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
+    /// called.
     pub fn start(&mut self) {
         let EncoderState {
             enabled, destroy, ..

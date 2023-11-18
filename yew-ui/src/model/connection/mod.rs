@@ -1,4 +1,3 @@
-#[allow(clippy::module_inception)]
 mod connection;
 mod task;
 mod webmedia;

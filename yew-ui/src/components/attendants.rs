@@ -1,10 +1,11 @@
 use super::icons::push_pin::PushPinIcon;
 use crate::constants::{USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
+use crate::model::client::{VideoCallClient, VideoCallClientOptions};
+use crate::model::media_devices::MediaDeviceAccess;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::{error, warn};
 use std::rc::Rc;
 use types::protos::media_packet::media_packet::MediaType;
-use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::*;

@@ -31,24 +31,12 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 
-/// [MicrophoneEncoder] encodes the audio from a microphone and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
-///
-/// See also:
-/// * [CameraEncoder](crate::CameraEncoder)
-/// * [ScreenEncoder](crate::ScreenEncoder)
-///
 pub struct MicrophoneEncoder {
     client: VideoCallClient,
     state: EncoderState,
 }
 
 impl MicrophoneEncoder {
-    /// Construct a microphone encoder:
-    ///
-    /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
-    ///
-    /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
-    /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
     pub fn new(client: VideoCallClient) -> Self {
         Self {
             client,
@@ -56,38 +44,17 @@ impl MicrophoneEncoder {
         }
     }
 
-    // The next three methods delegate to self.state
-
-    /// Enables/disables the encoder.   Returns true if the new value is different from the old value.
-    ///
-    /// The encoder starts disabled, [`encoder.set_enabled(true)`](Self::set_enabled) must be
-    /// called prior to starting encoding.
-    ///
-    /// Disabling encoding after it has started will cause it to stop.
+    // delegates to self.state
     pub fn set_enabled(&mut self, value: bool) -> bool {
         self.state.set_enabled(value)
     }
-
-    /// Selects a microphone:
-    ///
-    /// * `device_id` - The value of `entry.device_id` for some entry in
-    /// [`media_device_list.audio_inputs.devices()`](crate::MediaDeviceList::audio_inputs)
-    ///
-    /// The encoder starts without a microphone associated,
-    /// [`encoder.selected(device_id)`](Self::select) must be called prior to starting encoding.
     pub fn select(&mut self, device: String) -> bool {
         self.state.select(device)
     }
-
-    /// Stops encoding after it has been started.
     pub fn stop(&mut self) {
         self.state.stop()
     }
 
-    /// Start encoding and sending the data to the client connection (if it's currently connected).
-    ///
-    /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
-    /// called, or if [`encoder.select(device_id)`](Self::select) has not been called.
     pub fn start(&mut self) {
         let device_id = if let Some(mic) = &self.state.selected {
             mic.to_string()

@@ -16,44 +16,18 @@ use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use types::protos::packet_wrapper::PacketWrapper;
 use types::protos::rsa_packet::RsaPacket;
 use yew::prelude::Callback;
-
-/// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoCallClientOptions {
-    /// `true` to use end-to-end encription; `false` to send data unencrypted
     pub enable_e2ee: bool,
-
-    /// `true` to use webtransport, `false` to use websocket
     pub enable_webtransport: bool,
-
-    /// Callback will be called as `callback(peer_userid)` when a new peer is added
     pub on_peer_added: Callback<String>,
-
-    /// Callback will be called as `callback(peer_userid, media_type)` immediately after the first frame of a given peer & media type is decoded
     pub on_peer_first_frame: Callback<(String, MediaType)>,
-
-    /// Callback will be called as `callback(peer_userid)` and must return the DOM id of the
-    /// `HtmlCanvasElement` into which the peer video should be rendered
     pub get_peer_video_canvas_id: Callback<String, String>,
-
-    /// Callback will be called as `callback(peer_userid)` and must return the DOM id of the
-    /// `HtmlCanvasElement` into which the peer screen image should be rendered
     pub get_peer_screen_canvas_id: Callback<String, String>,
-
-    /// The current client's userid.  This userid will appear as this client's `peer_userid` in the
-    /// remote peers' clients.
     pub userid: String,
-
-    /// The url to which WebSocket connections should be made
     pub websocket_url: String,
-
-    /// The url to which WebTransport connections should be made
     pub webtransport_url: String,
-
-    /// Callback will be called as `callback(())` after a new connection is made
     pub on_connected: Callback<()>,
-
-    /// Callback will be called as `callback(())` if a connection gets dropped
     pub on_connection_lost: Callback<()>,
 }
 
@@ -73,12 +47,6 @@ struct Inner {
     peer_decode_manager: PeerDecodeManager,
 }
 
-/// The client struct for a video call connection.
-///
-/// To use it, first construct the struct using [new(options)][Self::new].  Then when/if desired,
-/// create the connection using [connect()][Self::connect].  Once connected, decoding of media from
-/// remote peers will start immediately.
-///
 #[derive(Clone, Debug)]
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
@@ -93,10 +61,6 @@ impl PartialEq for VideoCallClient {
 }
 
 impl VideoCallClient {
-    /// Constructor for the client struct.
-    ///
-    /// See [VideoCallClientOptions] for description of the options.
-    ///
     pub fn new(options: VideoCallClientOptions) -> Self {
         let aes = Arc::new(Aes128State::new(options.enable_e2ee));
         let inner = Rc::new(RefCell::new(Inner {
@@ -117,21 +81,6 @@ impl VideoCallClient {
         }
     }
 
-    /// Initiates a connection to a videocall server.
-    ///
-    /// Initiates a connection using WebTransport (to
-    /// [`options.webtransport_url`](VideoCallClientOptions::webtransport_url)) or WebSocket (to
-    /// [`options.websocket_url`](VideoCallClientOptions::websocket_url)), based on the value of
-    /// [`options.enable_webtransport`](VideoCallClientOptions::enable_webtransport).
-    ///
-    /// Note that this method's success means only that it succesfully *attempted* initiation of the
-    /// connection.  The connection cannot actually be considered to have been succesful until the
-    /// [`options.on_connected`](VideoCallClientOptions::on_connected) callback has been invoked.
-    ///
-    /// If the connection does not succeed, the
-    /// [`options.on_connection_lost`](VideoCallClientOptions::on_connection_lost) callback will be
-    /// invoked.
-    ///
     pub fn connect(&mut self) -> anyhow::Result<()> {
         let options = ConnectOptions {
             userid: self.options.userid.clone(),
@@ -196,7 +145,7 @@ impl VideoCallClient {
         peer_decode_manager
     }
 
-    pub(crate) fn send_packet(&self, media: PacketWrapper) {
+    pub fn send_packet(&self, media: PacketWrapper) {
         match self.inner.try_borrow() {
             Ok(inner) => inner.send_packet(media),
             Err(_) => {
@@ -205,7 +154,6 @@ impl VideoCallClient {
         }
     }
 
-    /// Returns `true` if the client is currently connected to a server.
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection) = &inner.connection {
@@ -215,7 +163,6 @@ impl VideoCallClient {
         false
     }
 
-    /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.
     pub fn sorted_peer_keys(&self) -> Vec<String> {
         match self.inner.try_borrow() {
             Ok(inner) => inner.peer_decode_manager.sorted_keys().to_vec(),
@@ -223,13 +170,6 @@ impl VideoCallClient {
         }
     }
 
-    /// Hacky function that returns true if the given peer has yet to send a frame of screen share.
-    ///
-    /// No reason for this function to exist, it should be deducible from the
-    /// [`options.on_peer_first_frame(key, MediaType::Screen)`](VideoCallClientOptions::on_peer_first_frame)
-    /// callback.   Or if polling is really necessary, instead of being hardwired for screen, it'd
-    /// be more elegant to at least pass a `MediaType`.
-    ///
     pub fn is_awaiting_peer_screen_frame(&self, key: &String) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(peer) = inner.peer_decode_manager.get(key) {
@@ -239,11 +179,10 @@ impl VideoCallClient {
         false
     }
 
-    pub(crate) fn aes(&self) -> Arc<Aes128State> {
+    pub fn aes(&self) -> Arc<Aes128State> {
         self.aes.clone()
     }
 
-    /// Returns a reference to a copy of [`options.userid`](VideoCallClientOptions::userid)
     pub fn userid(&self) -> &String {
         &self.options.userid
     }

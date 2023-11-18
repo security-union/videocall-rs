@@ -5,6 +5,5 @@ members = [
     "bot",
     "src-tauri",
     "types",
-    "videocall-client",
     "yew-ui"
 ]

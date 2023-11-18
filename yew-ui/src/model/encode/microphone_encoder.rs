@@ -4,7 +4,7 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::atomic::Ordering;
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -22,6 +22,7 @@ use web_sys::MediaStreamTrackProcessor;
 use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
 
+use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_audio_chunk;
 
@@ -29,17 +30,16 @@ use crate::constants::AUDIO_BITRATE;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::crypto::aes::Aes128State;
 
 pub struct MicrophoneEncoder {
-    aes: Arc<Aes128State>,
+    client: VideoCallClient,
     state: EncoderState,
 }
 
 impl MicrophoneEncoder {
-    pub fn new(aes: Arc<Aes128State>) -> Self {
+    pub fn new(client: VideoCallClient) -> Self {
         Self {
-            aes,
+            client,
             state: EncoderState::new(),
         }
     }
@@ -55,23 +55,23 @@ impl MicrophoneEncoder {
         self.state.stop()
     }
 
-    pub fn start(&mut self, userid: String, on_audio: impl Fn(PacketWrapper) + 'static) {
+    pub fn start(&mut self) {
         let device_id = if let Some(mic) = &self.state.selected {
             mic.to_string()
         } else {
             return;
         };
-        let aes = self.aes.clone();
+        let client = self.client.clone();
+        let userid = client.userid().clone();
+        let aes = client.aes();
         let audio_output_handler = {
-            let email = userid;
-            let on_audio = on_audio;
             let mut buffer: [u8; 100000] = [0; 100000];
             let mut sequence = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
                 let packet: PacketWrapper =
-                    transform_audio_chunk(&chunk, &mut buffer, &email, sequence, aes.clone());
-                on_audio(packet);
+                    transform_audio_chunk(&chunk, &mut buffer, &userid, sequence, aes.clone());
+                client.send_packet(packet);
                 sequence += 1;
             })
         };

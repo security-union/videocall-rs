@@ -3,7 +3,7 @@ use js_sys::Array;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::atomic::Ordering;
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -22,23 +22,23 @@ use web_sys::VideoEncoderInit;
 use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
+use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
 use crate::constants::SCREEN_HEIGHT;
 use crate::constants::SCREEN_WIDTH;
 use crate::constants::VIDEO_CODEC;
-use crate::crypto::aes::Aes128State;
 
 pub struct ScreenEncoder {
-    aes: Arc<Aes128State>,
+    client: VideoCallClient,
     state: EncoderState,
 }
 
 impl ScreenEncoder {
-    pub fn new(aes: Arc<Aes128State>) -> Self {
+    pub fn new(client: VideoCallClient) -> Self {
         Self {
-            aes,
+            client,
             state: EncoderState::new(),
         }
     }
@@ -51,16 +51,14 @@ impl ScreenEncoder {
         self.state.stop()
     }
 
-    pub fn start(&mut self, userid: String, on_frame: impl Fn(PacketWrapper) + 'static) {
+    pub fn start(&mut self) {
         let EncoderState {
             enabled, destroy, ..
         } = self.state.clone();
-        let on_frame = Box::new(on_frame);
-        let userid = Box::new(userid);
-        let aes = self.aes.clone();
+        let client = self.client.clone();
+        let userid = client.userid().clone();
+        let aes = client.aes();
         let screen_output_handler = {
-            let userid = userid;
-            let on_frame = on_frame;
             let mut buffer: [u8; 150000] = [0; 150000];
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
@@ -72,7 +70,7 @@ impl ScreenEncoder {
                     &userid,
                     aes.clone(),
                 );
-                on_frame(packet);
+                client.send_packet(packet);
                 sequence_number += 1;
             })
         };

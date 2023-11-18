@@ -1,17 +1,15 @@
+use super::super::wrappers::EncodedVideoChunkTypeWrapper;
+use super::video_decoder_wrapper::VideoDecoderTrait;
 use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
-
 use types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::{CodecState, EncodedVideoChunkType, VideoDecoderConfig, VideoDecoderInit};
-
-use crate::model::EncodedVideoChunkTypeWrapper;
-
-use super::video_decoder_wrapper::VideoDecoderTrait;
 
 const MAX_BUFFER_SIZE: usize = 10;
 
 // This is a wrapper of the web-sys VideoDecoder which handles
 // frames being out of order and other issues.
+#[derive(Debug)]
 pub struct VideoDecoderWithBuffer<A: VideoDecoderTrait> {
     video_decoder: A,
     cache: BTreeMap<u64, Arc<MediaPacket>>,

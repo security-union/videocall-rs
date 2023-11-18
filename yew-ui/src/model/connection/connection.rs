@@ -15,14 +15,13 @@ use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use types::protos::packet_wrapper::PacketWrapper;
 use yew::prelude::Callback;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 enum Status {
     Connecting,
     Connected,
     Closed,
 }
 
-#[derive(Debug)]
 pub struct Connection {
     task: Arc<Task>,
     heartbeat: Option<Interval>,

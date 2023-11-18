@@ -5,7 +5,7 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::debug;
 use log::error;
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Arc};
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -26,25 +26,23 @@ use web_sys::VideoEncoderInit;
 use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
-use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
+use crate::crypto::aes::Aes128State;
 
 pub struct CameraEncoder {
-    client: VideoCallClient,
-    video_elem_id: String,
+    aes: Arc<Aes128State>,
     state: EncoderState,
 }
 
 impl CameraEncoder {
-    pub fn new(client: VideoCallClient, video_elem_id: &str) -> Self {
+    pub fn new(aes: Arc<Aes128State>) -> Self {
         Self {
-            client,
-            video_elem_id: video_elem_id.to_string(),
+            aes,
             state: EncoderState::new(),
         }
     }
@@ -60,21 +58,28 @@ impl CameraEncoder {
         self.state.stop()
     }
 
-    pub fn start(&mut self) {
+    pub fn start(
+        &mut self,
+        userid: String,
+        on_frame: impl Fn(PacketWrapper) + 'static,
+        video_elem_id: &str,
+    ) {
         // 1. Query the first device with a camera and a mic attached.
         // 2. setup WebCodecs, in particular
         // 3. send encoded video frames and raw audio to the server.
-        let client = self.client.clone();
-        let userid = client.userid().clone();
-        let aes = client.aes();
-        let video_elem_id = self.video_elem_id.clone();
+        let on_frame = Box::new(on_frame);
+        let userid = Box::new(userid);
+        let video_elem_id = video_elem_id.to_string();
         let EncoderState {
             destroy,
             enabled,
             switching,
             ..
         } = self.state.clone();
+        let aes = self.aes.clone();
         let video_output_handler = {
+            let userid = userid;
+            let on_frame = on_frame;
             let mut buffer: [u8; 100000] = [0; 100000];
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
@@ -86,7 +91,7 @@ impl CameraEncoder {
                     &userid,
                     aes.clone(),
                 );
-                client.send_packet(packet);
+                on_frame(packet);
                 sequence_number += 1;
             })
         };

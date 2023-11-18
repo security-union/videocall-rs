@@ -32,36 +32,32 @@ enum MessageType {
 impl WebMedia<WebTransportTask> for WebTransportTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebTransportTask> {
         let on_datagram = {
-            let callback = options.on_inbound_media.clone();
+            let on_inbound_media = options.on_inbound_media.clone();
             Callback::from(move |bytes: Vec<u8>| {
-                emit_packet(bytes, MessageType::Datagram, callback.clone())
+                emit_packet(bytes, MessageType::Datagram, on_inbound_media.clone())
             })
         };
 
         let on_unidirectional_stream = {
-            let callback = options.on_inbound_media.clone();
+            let on_inbound_media = options.on_inbound_media.clone();
             Callback::from(move |stream: WebTransportReceiveStream| {
-                handle_unidirectional_stream(stream, callback.clone())
+                handle_unidirectional_stream(stream, on_inbound_media.clone())
             })
         };
 
         let on_bidirectional_stream = {
-            let callback = options.on_inbound_media.clone();
+            let on_inbound_media = options.on_inbound_media.clone();
             Callback::from(move |stream: WebTransportBidirectionalStream| {
-                handle_bidirectional_stream(stream, callback.clone())
+                handle_bidirectional_stream(stream, on_inbound_media.clone())
             })
         };
 
-        let notification = {
-            let connected_callback = options.on_connected.clone();
-            let connection_lost_callback = options.on_connection_lost.clone();
-            Callback::from(move |status| match status {
-                WebTransportStatus::Opened => connected_callback.emit(()),
-                WebTransportStatus::Closed(_error) | WebTransportStatus::Error(_error) => {
-                    connection_lost_callback.emit(())
-                }
-            })
-        };
+        let notification = Callback::from(move |status| match status {
+            WebTransportStatus::Opened => options.on_connected.emit(()),
+            WebTransportStatus::Closed(_error) | WebTransportStatus::Error(_error) => {
+                options.on_connection_lost.emit(())
+            }
+        });
         debug!("WebTransport connecting to {}", &options.webtransport_url);
         let task = WebTransportService::connect(
             &options.webtransport_url,

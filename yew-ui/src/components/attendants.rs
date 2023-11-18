@@ -1,11 +1,25 @@
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+
 use super::icons::push_pin::PushPinIcon;
 use crate::constants::{USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
-use crate::model::client::{VideoCallClient, VideoCallClientOptions};
+use crate::crypto::aes::Aes128State;
+use crate::crypto::rsa::RsaWrapper;
+use crate::model::connection::{ConnectOptions, Connection};
+use crate::model::decode::PeerDecodeManager;
 use crate::model::media_devices::MediaDeviceAccess;
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use log::{error, warn};
-use std::rc::Rc;
+use log::{debug, error, info, warn};
+use protobuf::Message;
+use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+use rsa::RsaPublicKey;
+use types::protos::aes_packet::AesPacket;
 use types::protos::media_packet::media_packet::MediaType;
+use types::protos::packet_wrapper::packet_wrapper::PacketType;
+use types::protos::packet_wrapper::PacketWrapper;
+use types::protos::rsa_packet::RsaPacket;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -15,7 +29,7 @@ use yew::{html, Component, Context, Html};
 
 #[derive(Debug)]
 pub enum WsAction {
-    Connect,
+    Connect(bool),
     Connected,
     Lost(Option<JsValue>),
     RequestMediaPermissions,
@@ -34,6 +48,8 @@ pub enum MeetingAction {
 pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
+    OnInboundMedia(PacketWrapper),
+    OnOutboundPacket(PacketWrapper),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
 }
@@ -64,46 +80,79 @@ pub struct AttendantsComponentProps {
 }
 
 pub struct AttendantsComponent {
-    pub client: VideoCallClient,
+    pub connection: Option<Connection>,
+    pub peer_decode_manager: PeerDecodeManager,
     pub media_device_access: MediaDeviceAccess,
+    pub outbound_audio_buffer: [u8; 2000],
     pub share_screen: bool,
+    pub e2ee_enabled: bool,
+    pub webtransport_enabled: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub error: Option<String>,
+    pub peer_keys: HashMap<String, Aes128State>,
+    aes: Arc<Aes128State>,
+    rsa: Arc<RsaWrapper>,
 }
 
 impl AttendantsComponent {
-    fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
+    fn is_connected(&self) -> bool {
+        match &self.connection {
+            Some(connection) => connection.is_connected(),
+            None => false,
+        }
+    }
+
+    fn send_public_key(&self, ctx: &Context<Self>) {
+        if !self.e2ee_enabled {
+            return;
+        }
         let email = ctx.props().email.clone();
-        let id = ctx.props().id.clone();
-        let opts = VideoCallClientOptions {
-            userid: email.clone(),
-            websocket_url: format!("{ACTIX_WEBSOCKET}/{email}/{id}"),
-            webtransport_url: format!("{WEBTRANSPORT_HOST}/{email}/{id}"),
-            enable_e2ee: ctx.props().e2ee_enabled,
-            enable_webtransport: ctx.props().webtransport_enabled,
-            on_connected: {
-                let link = ctx.link().clone();
-                Callback::from(move |_| link.send_message(Msg::from(WsAction::Connected)))
-            },
-            on_connection_lost: {
-                let link = ctx.link().clone();
-                Callback::from(move |_| link.send_message(Msg::from(WsAction::Lost(None))))
-            },
-            on_peer_added: {
-                let link = ctx.link().clone();
-                Callback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
-            },
-            on_peer_first_frame: {
-                let link = ctx.link().clone();
-                Callback::from(move |(email, media_type)| {
-                    link.send_message(Msg::OnFirstFrame((email, media_type)))
-                })
-            },
-            get_peer_video_canvas_id: Callback::from(|email| email),
-            get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
+        let rsa = &*self.rsa;
+        match rsa.pub_key.to_public_key_der() {
+            Ok(public_key_der) => {
+                let packet = RsaPacket {
+                    username: email.clone(),
+                    public_key_der: public_key_der.to_vec(),
+                    ..Default::default()
+                };
+                match packet.write_to_bytes() {
+                    Ok(data) => {
+                        ctx.link()
+                            .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                                packet_type: PacketType::RSA_PUB_KEY.into(),
+                                email,
+                                data,
+                                ..Default::default()
+                            }));
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize rsa packet: {}", e.to_string())
+                    }
+                };
+            }
+            Err(e) => {
+                error!("Failed to export rsa public key to der: {}", e.to_string())
+            }
+        }
+    }
+
+    fn create_peer_decoder_manager(ctx: &Context<Self>) -> PeerDecodeManager {
+        let mut peer_decode_manager = PeerDecodeManager::new();
+        peer_decode_manager.on_peer_added = {
+            let link = ctx.link().clone();
+            Callback::from(move |email| link.send_message(Msg::OnPeerAdded(email)))
         };
-        VideoCallClient::new(opts)
+        peer_decode_manager.on_first_frame = {
+            let link = ctx.link().clone();
+            Callback::from(move |(email, media_type)| {
+                link.send_message(Msg::OnFirstFrame((email, media_type)))
+            })
+        };
+        peer_decode_manager.get_video_canvas_id = Callback::from(|email| email);
+        peer_decode_manager.get_screen_canvas_id =
+            Callback::from(|email| format!("screen-share-{}", &email));
+        peer_decode_manager
     }
 
     fn create_media_device_access(ctx: &Context<Self>) -> MediaDeviceAccess {
@@ -120,6 +169,22 @@ impl AttendantsComponent {
         };
         media_device_access
     }
+
+    fn serialize_aes_packet(&self) -> Result<Vec<u8>> {
+        AesPacket {
+            key: self.aes.key.to_vec(),
+            iv: self.aes.iv.to_vec(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .map_err(|e| anyhow!("Failed to serialize aes packet: {}", e.to_string()))
+    }
+
+    fn encrypt_aes_packet(&self, aes_packet: &[u8], pub_key: &RsaPublicKey) -> Result<Vec<u8>> {
+        self.rsa
+            .encrypt_with_key(aes_packet, pub_key)
+            .map_err(|e| anyhow!("Failed to encrypt aes packet: {}", e.to_string()))
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -128,12 +193,19 @@ impl Component for AttendantsComponent {
 
     fn create(ctx: &Context<Self>) -> Self {
         Self {
-            client: Self::create_video_call_client(ctx),
+            connection: None,
+            peer_decode_manager: Self::create_peer_decoder_manager(ctx),
             media_device_access: Self::create_media_device_access(ctx),
+            outbound_audio_buffer: [0; 2000],
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
+            e2ee_enabled: ctx.props().e2ee_enabled,
+            webtransport_enabled: ctx.props().webtransport_enabled,
             error: None,
+            peer_keys: HashMap::new(),
+            aes: Arc::new(Aes128State::new(ctx.props().e2ee_enabled)),
+            rsa: Arc::new(RsaWrapper::new(ctx.props().e2ee_enabled)),
         }
     }
 
@@ -146,34 +218,62 @@ impl Component for AttendantsComponent {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::WsAction(action) => match action {
-                WsAction::Connect => {
-                    if self.client.is_connected() {
+                WsAction::Connect(webtransport) => {
+                    if self.connection.is_some() {
                         return false;
                     }
-                    if let Err(e) = self.client.connect() {
-                        ctx.link()
-                            .send_message(WsAction::Log(format!("Connection failed: {e}")));
+                    info!("webtransport connect = {}", webtransport);
+                    info!("end to end encryption enabled = {}", self.e2ee_enabled);
+                    let id = ctx.props().id.clone();
+                    let email = ctx.props().email.clone();
+                    let options = ConnectOptions {
+                        userid: email.clone(),
+                        websocket_url: format!("{ACTIX_WEBSOCKET}/{email}/{id}"),
+                        webtransport_url: format!("{WEBTRANSPORT_HOST}/{email}/{id}"),
+                        on_inbound_media: ctx.link().callback(Msg::OnInboundMedia),
+                        on_connected: ctx.link().callback(|_| Msg::from(WsAction::Connected)),
+                        on_connection_lost: ctx
+                            .link()
+                            .callback(|_| Msg::from(WsAction::Lost(None))),
+                    };
+                    match Connection::connect(webtransport, options, self.aes.clone()) {
+                        Ok(connection) => {
+                            self.connection = Some(connection);
+                        }
+                        Err(e) => {
+                            ctx.link()
+                                .send_message(WsAction::Log(format!("Connection failed: {e}")));
+                        }
+                    }
+
+                    true
+                }
+                WsAction::Connected => {
+                    info!("Connected");
+                    if self.e2ee_enabled {
+                        self.send_public_key(ctx);
                     }
                     true
                 }
-                WsAction::Connected => true,
                 WsAction::Log(msg) => {
                     warn!("{}", msg);
                     false
                 }
                 WsAction::Lost(_reason) => {
                     warn!("Lost");
-                    ctx.link().send_message(WsAction::Connect);
+                    self.connection = None;
+                    ctx.link()
+                        .send_message(WsAction::Connect(self.webtransport_enabled));
                     true
                 }
                 WsAction::RequestMediaPermissions => {
                     self.media_device_access.request();
-                    ctx.link().send_message(WsAction::Connect);
+                    ctx.link()
+                        .send_message(WsAction::Connect(self.webtransport_enabled));
                     false
                 }
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
-                    ctx.link().send_message(WsAction::Connect);
                     true
                 }
                 WsAction::MediaPermissionsError(error) => {
@@ -181,8 +281,101 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(_email) => true,
+            Msg::OnPeerAdded(_email) => {
+                debug!("New peer arrived.");
+                if self.e2ee_enabled {
+                    self.send_public_key(ctx);
+                }
+                true
+            }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
+            Msg::OnInboundMedia(response) => {
+                match response.packet_type.enum_value() {
+                    Ok(PacketType::AES_KEY) => {
+                        if !self.e2ee_enabled {
+                            return false;
+                        }
+                        debug!("Received AES_KEY {}", &response.email);
+                        if let Ok(bytes) = self.rsa.decrypt(&response.data) {
+                            match AesPacket::parse_from_bytes(&bytes) {
+                                Ok(aes_packet) => {
+                                    self.peer_keys.insert(
+                                        response.email,
+                                        Aes128State::from_vecs(
+                                            aes_packet.key,
+                                            aes_packet.iv,
+                                            self.e2ee_enabled,
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    error!("Failed to parse aes packet: {}", e.to_string())
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    Ok(PacketType::RSA_PUB_KEY) => {
+                        if !self.e2ee_enabled {
+                            return false;
+                        }
+                        debug!("Received RSA_PUB_KEY");
+                        let encrypted_aes_packet = parse_rsa_packet(&response.data)
+                            .and_then(parse_public_key)
+                            .and_then(|pub_key| {
+                                self.serialize_aes_packet()
+                                    .map(|aes_packet| (aes_packet, pub_key))
+                            })
+                            .and_then(|(aes_packet, pub_key)| {
+                                self.encrypt_aes_packet(&aes_packet, &pub_key)
+                            });
+
+                        match encrypted_aes_packet {
+                            Ok(data) => {
+                                ctx.link()
+                                    .send_message(Msg::OnOutboundPacket(PacketWrapper {
+                                        packet_type: PacketType::AES_KEY.into(),
+                                        email: ctx.props().email.clone(),
+                                        data,
+                                        ..Default::default()
+                                    }));
+                            }
+                            Err(e) => {
+                                error!("Failed to send AES_KEY to peer: {}", e.to_string());
+                            }
+                        }
+                    }
+                    Ok(PacketType::MEDIA) => {
+                        let email = response.email.clone();
+                        if self.e2ee_enabled {
+                            if let Some(key) = self.peer_keys.get(&email) {
+                                if let Err(e) =
+                                    self.peer_decode_manager.decode(response, Some(*key))
+                                {
+                                    error!("error decoding packet: {}", e.to_string());
+                                    self.peer_decode_manager.delete_peer(&email);
+                                    self.peer_keys.remove(&email);
+                                }
+                            } else {
+                                debug!("No key found for peer");
+                                self.send_public_key(ctx)
+                            }
+                        } else if let Err(e) = self.peer_decode_manager.decode(response, None) {
+                            error!("error decoding packet: {}", e.to_string());
+                            self.peer_decode_manager.delete_peer(&email);
+                            self.peer_keys.remove(&email);
+                        }
+                    }
+                    Err(_) => {}
+                }
+                false
+            }
+            Msg::OnOutboundPacket(media) => {
+                if let Some(connection) = &self.connection {
+                    connection.send_packet(media);
+                }
+                false
+            }
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
@@ -202,10 +395,11 @@ impl Component for AttendantsComponent {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let email = ctx.props().email.clone();
+        let on_packet = ctx.link().callback(Msg::OnOutboundPacket);
         let media_access_granted = self.media_device_access.is_granted();
         let rows: Vec<VNode> = self
-            .client
-            .sorted_peer_keys()
+            .peer_decode_manager
+            .sorted_keys()
             .iter()
             .map(|key| {
                 if !USERS_ALLOWED_TO_STREAM.is_empty()
@@ -213,7 +407,12 @@ impl Component for AttendantsComponent {
                 {
                     return html! {};
                 }
-                let screen_share_css = if self.client.is_awaiting_peer_screen_frame(key) {
+                let peer = match self.peer_decode_manager.get(key) {
+                    Some(peer) => peer,
+                    None => return html! {},
+                };
+
+                let screen_share_css = if peer.screen.is_waiting_for_keyframe() {
                     "grid-item hidden"
                 } else {
                     "grid-item"
@@ -278,20 +477,20 @@ impl Component for AttendantsComponent {
                                 </div>
                                 {
                                     if media_access_granted {
-                                        html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} />}
+                                        html! {<Host on_packet={on_packet} email={email.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} aes={self.aes.clone()} />}
                                     } else {
                                         html! {<></>}
                                     }
                                 }
                                 <h4 class="floating-name">{email}</h4>
 
-                                {if !self.client.is_connected() {
+                                {if !self.is_connected() {
                                     html! {<h4>{"Connecting"}</h4>}
                                 } else {
                                     html! {<h4>{"Connected"}</h4>}
                                 }}
 
-                                {if ctx.props().e2ee_enabled {
+                                {if self.e2ee_enabled {
                                     html! {<h4>{"End to End Encryption Enabled"}</h4>}
                                 } else {
                                     html! {<h4>{"End to End Encryption Disabled"}</h4>}
@@ -355,4 +554,14 @@ fn toggle_pinned_div(div_id: &str) {
             div.class_list().remove_1("grid-item-pinned").unwrap();
         }
     }
+}
+
+fn parse_rsa_packet(response_data: &[u8]) -> Result<RsaPacket> {
+    RsaPacket::parse_from_bytes(response_data)
+        .map_err(|e| anyhow!("Failed to parse rsa packet: {}", e.to_string()))
+}
+
+fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
+    RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
+        .map_err(|e| anyhow!("Failed to parse rsa public key: {}", e.to_string()))
 }

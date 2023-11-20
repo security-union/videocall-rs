@@ -18,10 +18,10 @@ https://www.youtube.com/watch?v=kZ9isFw1TQ8
 
 MVP of a teleconferencing system written in rust, both the backend and the UI.
 
-# How to test?
+# How to try it out?
 
 ## Setup 
-Technically you could test this with a single computer, but it is more fun if you use 2+.
+Technically you could run this with a single computer, but it is more fun if you use 2+.
 
 ## Steps
 
@@ -41,18 +41,6 @@ Technically you could test this with a single computer, but it is more fun if yo
 
 ![Oct-24-2022 08-37-09](https://user-images.githubusercontent.com/1176339/197853024-171e0dcc-2098-4780-b3be-bfc3cb5adb43.gif)
 
-# Compiling Cargo Workspace
-
-## Ubuntu
-
-Some system dependencies are required for the workspace to compile
-
-```sh
-sudo apt-get update
-sudo apt-get install libglib2.0-dev libgtk-3-dev libsoup2.4 libjavascriptcoregtk-4.0-dev libwebkit2gtk-4.0-dev
-```
-
-
 ## ▶️ YouTube Channel
 https://www.youtube.com/@securityunion
 
@@ -71,7 +59,31 @@ Contains 3 sub-projects
 2. yew-ui: Yew frontend
 3. types: json serializable structures used to communicate the frontend and backend.
 
-# Dockerized workflow
+# Local Development
+
+## Without docker
+
+### Prerequisites
+
+1. Create a postgresql database that you can accessed without a password.  The default database name is `actix-api-db`, i.e. the default connection string is `postgresql://$USER@localhost/actix-api-db`
+
+2. Install [trurl](see https://github.com/curl/trurl) and [nats-server]((see https://docs.nats.io/running-a-nats-service/introduction/installation)
+
+### Starting up the servers
+
+1. Run the script `./start_dev.sh`.
+
+   It examines various environment variables to control the behavior; see the script itself for details.
+   By default it runs using websockets rather than webtransport (`WEBTRANSPORT_ENABLED=0`) and without encryption (`E2EE_ENABLED=0`).
+
+2. Connect your browser to `http://localhost:8081/meeting/<username>/<meeting-id>`
+
+   You can make multiple connections (with varying usernames) from multiple browser windows or tabs.
+
+   If you are using encryption (`E2EE_ENABLED=1`), you should lanuch Chrome with
+   the necessary options for it to accept the local certificate by running `./launch_chrome.sh`
+
+## Dockerized workflow
 
 1. Install docker
 2. Run one of the supported make commands

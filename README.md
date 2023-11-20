@@ -61,6 +61,11 @@ Contains 3 sub-projects
 
 # Local Development
 
+## Dockerized workflow
+
+1. Install docker https://docs.docker.com/engine/install/
+2. Run one of the supported make commands
+
 ## Without docker
 
 ### Prerequisites
@@ -82,11 +87,6 @@ Contains 3 sub-projects
 
    If you are using encryption (`E2EE_ENABLED=1`), you should lanuch Chrome with
    the necessary options for it to accept the local certificate by running `./launch_chrome.sh`
-
-## Dockerized workflow
-
-1. Install docker
-2. Run one of the supported make commands
 
 ```
 make test

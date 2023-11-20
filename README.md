@@ -65,6 +65,12 @@ Contains 3 sub-projects
 
 1. Install docker https://docs.docker.com/engine/install/
 2. Run one of the supported make commands
+```
+make test
+make up
+make down
+make build
+```
 
 ## Without docker
 
@@ -87,13 +93,6 @@ Contains 3 sub-projects
 
    If you are using encryption (`E2EE_ENABLED=1`), you should lanuch Chrome with
    the necessary options for it to accept the local certificate by running `./launch_chrome.sh`
-
-```
-make test
-make up
-make down
-make build
-```
 
 ## 👤 Contributors ✨
 

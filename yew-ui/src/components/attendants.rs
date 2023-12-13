@@ -255,7 +255,7 @@ impl Component for AttendantsComponent {
                 { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
                 { rows }
                 {
-                    if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
+                    if USERS_ALLOWED_TO_STREAM.len() == 0 || USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) {
                         html! {
                             <nav class="host">
                                 <div class="controls">

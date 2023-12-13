@@ -1,10 +1,13 @@
 [workspace]
-
+resolver = "2"
 members = [
     "actix-api",
     "bot",
-    "src-tauri",
     "types",
     "videocall-client",
+    "video-daemon",
+]
+exclude = [
+    "src-tauri",
     "yew-ui"
 ]

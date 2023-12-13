@@ -187,23 +187,29 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         let cors = Cors::permissive();
 
-        let pool = get_pool();
-
-        App::new()
-            .app_data(web::Data::new(pool))
-            .app_data(web::Data::new(AppState { chat: chat.clone() }))
-            .app_data(web::Data::new(AppConfig {
-                oauth_client_id: oauth_client_id.clone(),
-                oauth_auth_url: oauth_auth_url.clone(),
-                oauth_token_url: oauth_token_url.clone(),
-                oauth_secret: oauth_secret.clone(),
-                oauth_redirect_url: oauth_redirect_url.clone(),
-                after_login_url: after_login_url.clone(),
-            }))
-            .wrap(cors)
-            .service(handle_google_oauth_callback)
-            .service(login)
-            .service(ws_connect)
+        if oauth_client_id.is_empty() {
+            App::new()
+                .wrap(cors)
+                .app_data(web::Data::new(AppState { chat: chat.clone() }))
+                .service(ws_connect)
+        } else {
+            let pool = get_pool();
+            App::new()
+                .app_data(web::Data::new(pool))
+                .app_data(web::Data::new(AppState { chat: chat.clone() }))
+                .app_data(web::Data::new(AppConfig {
+                    oauth_client_id: oauth_client_id.clone(),
+                    oauth_auth_url: oauth_auth_url.clone(),
+                    oauth_token_url: oauth_token_url.clone(),
+                    oauth_secret: oauth_secret.clone(),
+                    oauth_redirect_url: oauth_redirect_url.clone(),
+                    after_login_url: after_login_url.clone(),
+                }))
+                .wrap(cors)
+                .service(handle_google_oauth_callback)
+                .service(login)
+                .service(ws_connect)
+        }
     })
     .bind((
         "0.0.0.0",

@@ -19,59 +19,52 @@
 #![allow(unused_results)]
 #![allow(unused_mut)]
 
-//! Generated file from `types/aes_packet.proto`
+//! Generated file from `types/connection_packet.proto`
 
 /// Generated files are compatible only with the same version
 /// of protobuf runtime.
 const _PROTOBUF_VERSION_CHECK: () = ::protobuf::VERSION_3_3_0;
 
-// @@protoc_insertion_point(message:AesPacket)
+// @@protoc_insertion_point(message:ConnectionPacket)
 #[derive(PartialEq,Clone,Default,Debug)]
-pub struct AesPacket {
+pub struct ConnectionPacket {
     // message fields
-    // @@protoc_insertion_point(field:AesPacket.key)
-    pub key: ::std::vec::Vec<u8>,
-    // @@protoc_insertion_point(field:AesPacket.iv)
-    pub iv: ::std::vec::Vec<u8>,
+    // @@protoc_insertion_point(field:ConnectionPacket.meeting_id)
+    pub meeting_id: ::std::string::String,
     // special fields
-    // @@protoc_insertion_point(special_field:AesPacket.special_fields)
+    // @@protoc_insertion_point(special_field:ConnectionPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
 }
 
-impl<'a> ::std::default::Default for &'a AesPacket {
-    fn default() -> &'a AesPacket {
-        <AesPacket as ::protobuf::Message>::default_instance()
+impl<'a> ::std::default::Default for &'a ConnectionPacket {
+    fn default() -> &'a ConnectionPacket {
+        <ConnectionPacket as ::protobuf::Message>::default_instance()
     }
 }
 
-impl AesPacket {
-    pub fn new() -> AesPacket {
+impl ConnectionPacket {
+    pub fn new() -> ConnectionPacket {
         ::std::default::Default::default()
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(2);
+        let mut fields = ::std::vec::Vec::with_capacity(1);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "key",
-            |m: &AesPacket| { &m.key },
-            |m: &mut AesPacket| { &mut m.key },
+            "meeting_id",
+            |m: &ConnectionPacket| { &m.meeting_id },
+            |m: &mut ConnectionPacket| { &mut m.meeting_id },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "iv",
-            |m: &AesPacket| { &m.iv },
-            |m: &mut AesPacket| { &mut m.iv },
-        ));
-        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<AesPacket>(
-            "AesPacket",
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<ConnectionPacket>(
+            "ConnectionPacket",
             fields,
             oneofs,
         )
     }
 }
 
-impl ::protobuf::Message for AesPacket {
-    const NAME: &'static str = "AesPacket";
+impl ::protobuf::Message for ConnectionPacket {
+    const NAME: &'static str = "ConnectionPacket";
 
     fn is_initialized(&self) -> bool {
         true
@@ -81,10 +74,7 @@ impl ::protobuf::Message for AesPacket {
         while let Some(tag) = is.read_raw_tag_or_eof()? {
             match tag {
                 10 => {
-                    self.key = is.read_bytes()?;
-                },
-                18 => {
-                    self.iv = is.read_bytes()?;
+                    self.meeting_id = is.read_string()?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -98,11 +88,8 @@ impl ::protobuf::Message for AesPacket {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if !self.key.is_empty() {
-            my_size += ::protobuf::rt::bytes_size(1, &self.key);
-        }
-        if !self.iv.is_empty() {
-            my_size += ::protobuf::rt::bytes_size(2, &self.iv);
+        if !self.meeting_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(1, &self.meeting_id);
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -110,11 +97,8 @@ impl ::protobuf::Message for AesPacket {
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if !self.key.is_empty() {
-            os.write_bytes(1, &self.key)?;
-        }
-        if !self.iv.is_empty() {
-            os.write_bytes(2, &self.iv)?;
+        if !self.meeting_id.is_empty() {
+            os.write_string(1, &self.meeting_id)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -128,54 +112,49 @@ impl ::protobuf::Message for AesPacket {
         &mut self.special_fields
     }
 
-    fn new() -> AesPacket {
-        AesPacket::new()
+    fn new() -> ConnectionPacket {
+        ConnectionPacket::new()
     }
 
     fn clear(&mut self) {
-        self.key.clear();
-        self.iv.clear();
+        self.meeting_id.clear();
         self.special_fields.clear();
     }
 
-    fn default_instance() -> &'static AesPacket {
-        static instance: AesPacket = AesPacket {
-            key: ::std::vec::Vec::new(),
-            iv: ::std::vec::Vec::new(),
+    fn default_instance() -> &'static ConnectionPacket {
+        static instance: ConnectionPacket = ConnectionPacket {
+            meeting_id: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
     }
 }
 
-impl ::protobuf::MessageFull for AesPacket {
+impl ::protobuf::MessageFull for ConnectionPacket {
     fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
         static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
-        descriptor.get(|| file_descriptor().message_by_package_relative_name("AesPacket").unwrap()).clone()
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("ConnectionPacket").unwrap()).clone()
     }
 }
 
-impl ::std::fmt::Display for AesPacket {
+impl ::std::fmt::Display for ConnectionPacket {
     fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
         ::protobuf::text_format::fmt(self, f)
     }
 }
 
-impl ::protobuf::reflect::ProtobufValue for AesPacket {
+impl ::protobuf::reflect::ProtobufValue for ConnectionPacket {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x16types/aes_packet.proto\"-\n\tAesPacket\x12\x10\n\x03key\x18\x01\
-    \x20\x01(\x0cR\x03key\x12\x0e\n\x02iv\x18\x02\x20\x01(\x0cR\x02ivJ\x98\
-    \x01\n\x06\x12\x04\0\0\x05\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\
-    \x04\0\x12\x04\x02\0\x05\x01\n\n\n\x03\x04\0\x01\x12\x03\x02\x08\x11\n\
-    \x0b\n\x04\x04\0\x02\0\x12\x03\x03\x02\x10\n\x0c\n\x05\x04\0\x02\0\x05\
-    \x12\x03\x03\x02\x07\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x03\x08\x0b\n\
-    \x0c\n\x05\x04\0\x02\0\x03\x12\x03\x03\x0e\x0f\n\x0b\n\x04\x04\0\x02\x01\
-    \x12\x03\x04\x02\x0f\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x04\x02\x07\n\
-    \x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x04\x08\n\n\x0c\n\x05\x04\0\x02\x01\
-    \x03\x12\x03\x04\r\x0eb\x06proto3\
+    \n\x1dtypes/connection_packet.proto\"1\n\x10ConnectionPacket\x12\x1d\n\n\
+    meeting_id\x18\x01\x20\x01(\tR\tmeetingIdJa\n\x06\x12\x04\0\0\x04\x01\n\
+    \x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x04\x01\n\n\
+    \n\x03\x04\0\x01\x12\x03\x02\x08\x18\n\x0b\n\x04\x04\0\x02\0\x12\x03\x03\
+    \x02\x18\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x03\x02\x08\n\x0c\n\x05\x04\
+    \0\x02\0\x01\x12\x03\x03\t\x13\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x03\
+    \x16\x17b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -194,7 +173,7 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
             let mut messages = ::std::vec::Vec::with_capacity(1);
-            messages.push(AesPacket::generated_message_descriptor_data());
+            messages.push(ConnectionPacket::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(0);
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),

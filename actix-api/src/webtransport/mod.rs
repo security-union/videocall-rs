@@ -380,7 +380,7 @@ async fn handle_quic_connection(
     conn: quinn::Connection,
     nc: async_nats::client::Client,
 ) -> Result<()> {
-    let session_id = conn.stable_id();
+    let _session_id = conn.stable_id();
     let session = Arc::new(RwLock::new(conn));
     let should_run = Arc::new(AtomicBool::new(true));
     // let lobby_id = 666;
@@ -389,7 +389,7 @@ async fn handle_quic_connection(
         lobby_id: String,
         session_id: String,
     }
-    let meeting_info = oneshot::channel::<MeetingInfo>();
+    let _meeting_info = oneshot::channel::<MeetingInfo>();
     let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<String>>(None);
 
     let nats_task = {

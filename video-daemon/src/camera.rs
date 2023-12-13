@@ -128,7 +128,7 @@ impl CameraDaemon {
             camera.open_stream().unwrap();
             while let Ok(frame) = camera.frame() {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
-                    return ();
+                    return;
                 }
                 let res = frame
                     .decode_image::<RgbFormat>()

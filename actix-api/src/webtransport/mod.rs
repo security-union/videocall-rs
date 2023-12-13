@@ -18,7 +18,7 @@ use sec_http3::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{oneshot, watch, RwLock};
+use tokio::sync::{watch, RwLock};
 use tracing::{error, info, trace_span};
 use types::protos::connection_packet::ConnectionPacket;
 use types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -385,13 +385,6 @@ async fn handle_quic_connection(
     let _session_id = conn.stable_id();
     let session = Arc::new(RwLock::new(conn));
     let should_run = Arc::new(AtomicBool::new(true));
-    // let lobby_id = 666;
-
-    struct MeetingInfo {
-        lobby_id: String,
-        session_id: String,
-    }
-    let _meeting_info = oneshot::channel::<MeetingInfo>();
     let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<String>>(None);
 
     let nats_task = {

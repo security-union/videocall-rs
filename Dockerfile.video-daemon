@@ -17,7 +17,7 @@ ENV ACTIX_UI_BACKEND_URL ""
 ENV WEBTRANSPORT_HOST ""
 
 # Build
-RUN rustup default nightly-2023-10-05
+RUN rustup default nightly-2023-12-13
 RUN cargo build --release
 
 FROM debian:bookworm-slim

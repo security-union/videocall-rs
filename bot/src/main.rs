@@ -44,10 +44,12 @@ async fn create_client(
     println!("Connected to {}", url);
     let echo_user = echo_user.to_string();
     // Send a single heartbeat just so that we show up on the ui
-    let mut media_packet = MediaPacket::default();
-    media_packet.media_type = MediaType::HEARTBEAT.into();
-    media_packet.email = email.clone();
-    media_packet.timestamp = Utc::now().timestamp_millis() as f64;
+    let media_packet = MediaPacket {
+        media_type: MediaType::HEARTBEAT.into(),
+        email: email.clone(),
+        timestamp: Utc::now().timestamp_millis() as f64,
+        ..Default::default()
+    };
     let mut buf = Vec::new();
     media_packet.write_to_vec(&mut buf).unwrap();
     ws_stream.send(Message::Binary(buf)).await.unwrap();

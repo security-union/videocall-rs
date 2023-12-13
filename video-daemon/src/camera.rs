@@ -79,7 +79,11 @@ pub struct CameraDaemon {
 }
 
 impl CameraDaemon {
-    pub fn from_config(config: CameraConfig, user_id: String, quic_tx: Sender<(Vec<u8>, bool)>) -> CameraDaemon {
+    pub fn from_config(
+        config: CameraConfig,
+        user_id: String,
+        quic_tx: Sender<(Vec<u8>, bool)>,
+    ) -> CameraDaemon {
         let (fps_tx, fps_rx) = mpsc::channel(5);
         let (cam_tx, cam_rx) = mpsc::channel(100);
         CameraDaemon {
@@ -106,8 +110,8 @@ impl CameraDaemon {
 
     fn camera_thread(&self) -> Result<JoinHandle<()>> {
         let devices = nokhwa::query(ApiBackend::Auto)?;
-        for i in 0..devices.len() {
-            info!("available device index {}: {:?}", i, devices[i]);
+        for (i, camera_info) in devices.iter().enumerate() {
+            info!("AVAILABLE CAMERA DEVICE INDEX {}: {:?}", i, camera_info);
         }
         let cam_tx = self.cam_tx.clone();
         let width = self.config.width;
@@ -160,7 +164,7 @@ impl CameraDaemon {
                 .unwrap();
             while let Some(data) = cam_rx.blocking_recv() {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
-                    return ();
+                    return;
                 }
                 let (image, age) = data.unwrap();
 
@@ -181,12 +185,12 @@ impl CameraDaemon {
                 debug!("encoding took {:?}", encoding_time.elapsed());
                 for frame in frames {
                     let packet_wrapper = transform_video_chunk(&frame, &user_id);
-                    if let Err(e) = quic_tx.try_send((packet_wrapper.write_to_bytes().unwrap(), frame.key)) {
+                    if let Err(e) =
+                        quic_tx.try_send((packet_wrapper.write_to_bytes().unwrap(), frame.key))
+                    {
                         error!("Unable to send packet: {:?}", e);
-                    } else {
-                        if let Err(e) = fps_tx.try_send(since_the_epoch().as_millis()) {
-                            error!("Unable to send fps: {:?}", e);
-                        }
+                    } else if let Err(e) = fps_tx.try_send(since_the_epoch().as_millis()) {
+                        error!("Unable to send fps: {:?}", e);
                     }
                 }
             }
@@ -202,7 +206,7 @@ impl CameraDaemon {
             warn!("Starting fps loop");
             while let Some(dur) = fps_rx.blocking_recv() {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
-                    return ();
+                    return;
                 }
                 if now_plus_1 < dur {
                     warn!("FPS: {:?}", num_frames);

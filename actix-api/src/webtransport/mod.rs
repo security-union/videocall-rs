@@ -467,7 +467,9 @@ async fn handle_quic_connection(
                                     )
                                     .replace(' ', "_");
                                     info!("Specific subject: {}", specific_subject);
-                                    specific_subject_tx_clone.send(Some(specific_subject.clone())).unwrap();
+                                    specific_subject_tx_clone
+                                        .send(Some(specific_subject.clone()))
+                                        .unwrap();
                                 }
                             }
                         } else {

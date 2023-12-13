@@ -2,7 +2,7 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Promise;
 use std::cell::OnceCell;
-use std::sync::Arc;
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::MediaDeviceInfo;
@@ -15,7 +15,7 @@ use yew::prelude::Callback;
 /// is triggered when a selection is made.
 ///
 pub struct SelectableDevices {
-    devices: Arc<OnceCell<Vec<MediaDeviceInfo>>>,
+    devices: Rc<OnceCell<Vec<MediaDeviceInfo>>>,
     selected: Option<String>,
 
     /// Callback that will be called as `callback(device_id)` whenever [`select(device_id)`](Self::select) is called with a valid `device_id`
@@ -25,7 +25,7 @@ pub struct SelectableDevices {
 impl SelectableDevices {
     fn new() -> Self {
         Self {
-            devices: Arc::new(OnceCell::new()),
+            devices: Rc::new(OnceCell::new()),
             selected: None,
             on_selected: Callback::noop(),
         }
@@ -144,8 +144,8 @@ impl MediaDeviceList {
         let on_loaded = self.on_loaded.clone();
         let on_audio_selected = self.audio_inputs.on_selected.clone();
         let on_video_selected = self.video_inputs.on_selected.clone();
-        let audio_input_devices = Arc::clone(&self.audio_inputs.devices);
-        let video_input_devices = Arc::clone(&self.video_inputs.devices);
+        let audio_input_devices = Rc::clone(&self.audio_inputs.devices);
+        let video_input_devices = Rc::clone(&self.video_inputs.devices);
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let media_devices = navigator.media_devices().unwrap();

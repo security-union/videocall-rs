@@ -8,7 +8,7 @@ use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use protobuf::Message;
 use std::cell::Cell;
-use std::sync::Arc;
+use std::rc::Rc;
 use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::MediaPacket;
 use types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -24,37 +24,37 @@ enum Status {
 
 #[derive(Debug)]
 pub struct Connection {
-    task: Arc<Task>,
+    task: Rc<Task>,
     heartbeat: Option<Interval>,
-    status: Arc<Cell<Status>>,
-    aes: Arc<Aes128State>,
+    status: Rc<Cell<Status>>,
+    aes: Rc<Aes128State>,
 }
 
 impl Connection {
     pub fn connect(
         webtransport: bool,
         options: ConnectOptions,
-        aes: Arc<Aes128State>,
+        aes: Rc<Aes128State>,
     ) -> anyhow::Result<Self> {
         let mut options = options;
         let userid = options.userid.clone();
-        let status = Arc::new(Cell::new(Status::Connecting));
+        let status = Rc::new(Cell::new(Status::Connecting));
         {
-            let status = Arc::clone(&status);
+            let status = Rc::clone(&status);
             options.on_connected = tap_callback(
                 options.on_connected,
                 Callback::from(move |_| status.set(Status::Connected)),
             );
         }
         {
-            let status = Arc::clone(&status);
+            let status = Rc::clone(&status);
             options.on_connection_lost = tap_callback(
                 options.on_connection_lost,
                 Callback::from(move |_| status.set(Status::Closed)),
             );
         }
         let mut connection = Self {
-            task: Arc::new(Task::connect(webtransport, options)?),
+            task: Rc::new(Task::connect(webtransport, options)?),
             heartbeat: None,
             status,
             aes,
@@ -68,9 +68,9 @@ impl Connection {
     }
 
     fn start_heartbeat(&mut self, userid: String) {
-        let task = Arc::clone(&self.task);
-        let status = Arc::clone(&self.status);
-        let aes = Arc::clone(&self.aes);
+        let task = Rc::clone(&self.task);
+        let status = Rc::clone(&self.status);
+        let aes = Rc::clone(&self.aes);
 
         self.heartbeat = Some(Interval::new(1000, move || {
             let packet = MediaPacket {

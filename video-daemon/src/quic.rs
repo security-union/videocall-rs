@@ -114,12 +114,16 @@ impl Client {
         self.connection = Some(conn);
 
         // Send connection message with meeting id
-        let mut packet = PacketWrapper::default();
-        packet.packet_type = PacketType::CONNECTION.into();
-        packet.email = self.options.user_id.clone();
-        let mut connection_packet = ConnectionPacket::default();
-        connection_packet.meeting_id = self.options.meeting_id.clone();
-        packet.data = connection_packet.write_to_bytes().unwrap();
+        let connection_packet = ConnectionPacket {
+            meeting_id: self.options.meeting_id.clone(),
+            ..Default::default()
+        };
+        let packet = PacketWrapper {
+            packet_type: PacketType::CONNECTION.into(),
+            email: self.options.user_id.clone(),
+            data: connection_packet.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
         let packet = packet.write_to_bytes().unwrap();
         self.send(packet, true).await?;
 

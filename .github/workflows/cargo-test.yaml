@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@1.70
+      - uses: dtolnay/rust-toolchain@1.72
         with:
           components: clippy, rustfmt
       - run: cd actix-api && cargo clippy -- --deny warnings
@@ -41,10 +41,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@1.65
+      - uses: dtolnay/rust-toolchain@1.72
         with:
           components: clippy, rustfmt
-          toolchain: nightly-2023-01-27
+          toolchain: nightly-2023-12-13
       - run: rustup target add wasm32-unknown-unknown
       - run: cd yew-ui && cargo fmt --check
 
@@ -62,7 +62,7 @@ jobs:
         with:
           profile: minimal
           target: wasm32-unknown-unknown
-          toolchain: nightly-2023-01-27
+          toolchain: nightly-2023-12-13
           override: true
 
       - name: Install wasm-bindgen-cli

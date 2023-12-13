@@ -14,6 +14,7 @@ async fn main() {
     )
     .unwrap();
     let opt = Opt::parse();
+    let user_id = opt.user_id.clone();
     let mut client = Client::new(opt).expect("failed to create client");
     client.connect().await.expect("failed to connect");
     let camera_config = CameraConfig {
@@ -24,7 +25,7 @@ async fn main() {
         video_device_index: 0,
     };
     let (quic_tx, mut quic_rx) = channel::<(Vec<u8>, bool)>(10);
-    let mut camera = CameraDaemon::from_config(camera_config, quic_tx);
+    let mut camera = CameraDaemon::from_config(camera_config, user_id, quic_tx);
     camera.start().expect("failed to start camera");
     while let Some((data, blocking)) = quic_rx.recv().await {
         if let Err(e) = client.send(data, blocking).await {

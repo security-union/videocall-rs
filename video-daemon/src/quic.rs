@@ -10,7 +10,7 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 use tracing::{debug, info};
 use url::Url;
 
-const DEFAULT_MAX_PACKET_SIZE: usize = 60_000;
+const DEFAULT_MAX_PACKET_SIZE: usize = 100_000;
 
 /// Connects to a QUIC server.
 ///
@@ -72,7 +72,7 @@ pub struct Opt {
     url: Url,
 
     #[clap(long = "user-id")]
-    user_id: String,
+    pub user_id: String,
 
     #[clap(long = "meeting-id")]
     meeting_id: String,
@@ -139,19 +139,19 @@ impl Client {
             .clone();
         async fn send(conn: quinn::Connection, data: Vec<u8>, packet_size: usize) -> Result<()> {
             debug!("sending {} bytes", packet_size);
-            if packet_size < 1350 {
-                conn.send_datagram(data.into()).unwrap();
-            } else {
-                let mut stream = conn.open_uni().await.unwrap();
-                stream.write_all(&data).await.unwrap();
-                stream.finish().await.unwrap();
-            }
+            let mut stream = conn.open_uni().await.unwrap();
+            stream.write_all(&data).await.unwrap();
+            stream.finish().await.unwrap();
             debug!("sent {} bytes", packet_size);
             Ok(())
         }
-        tokio::spawn(async move {
-            send(conn, data, packet_size).await.unwrap();
-        });
+        if blocking {
+            send(conn, data, packet_size).await?;
+        } else {
+            tokio::spawn(async move {
+                send(conn, data, packet_size).await.unwrap();
+            });
+        }
         Ok(())
     }
 }

@@ -28,6 +28,8 @@ pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", 
 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 
+const MAX_UNIDIRECTIONAL_STREAM_SIZE: usize = 100_000;
+
 #[derive(Debug)]
 pub struct WebTransportOpt {
     pub listen: SocketAddr,
@@ -458,10 +460,11 @@ async fn handle_quic_connection(
                 let specific_subject_tx_clone = specific_subject_tx.clone();
                 let specific_subject_rx = specific_subject_rx_clone.clone();
                 tokio::spawn(async move {
-                    if let Ok(d) = uni_stream.read_to_end(32000).await {
+                    if let Ok(d) = uni_stream.read_to_end(MAX_UNIDIRECTIONAL_STREAM_SIZE).await {
                         if specific_subject_rx.borrow().is_none() {
                             if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(&d) {
                                 if packet_wrapper.packet_type == PacketType::CONNECTION.into() {
+                                    info!("Got connection packet");
                                     let connection_packet =
                                         ConnectionPacket::parse_from_bytes(&packet_wrapper.data)
                                             .unwrap();
@@ -471,7 +474,7 @@ async fn handle_quic_connection(
                                     )
                                     .replace(' ', "_");
                                     info!("Specific subject: {}", specific_subject);
-                                    specific_subject_tx_clone.send(Some(specific_subject.clone()));
+                                    specific_subject_tx_clone.send(Some(specific_subject.clone())).unwrap();
                                 }
                             }
                         } else {

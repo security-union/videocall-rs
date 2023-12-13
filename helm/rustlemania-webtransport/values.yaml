@@ -8,7 +8,7 @@ replicaCount: 3
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always
-  tag: 568f002611b104acdfa35b9134d9d6e18b2d6944
+  tag: 60662c2faff325d5a507b78f226b20f108fcfaef
 command: ['webtransport_server']
 args: []
 tlsSecret: rustlemania-ui-tls

@@ -325,6 +325,9 @@ impl Inner {
                     self.peer_decode_manager.delete_peer(&email);
                 }
             }
+            Ok(PacketType::CONNECTION) => {
+                error!("Not implemented: CONNECTION packet type");
+            }
             Err(_) => {}
         }
         if let PeerStatus::Added(peer_userid) = peer_status {

@@ -1,0 +1,5 @@
+FROM securityunion/rustlemania-api-base:1.72-slim
+
+RUN apt-get install -y libssl-dev pkg-config libvpx-dev build-essential libglib2.0-dev libgtk-3-dev libsoup2.4 libjavascriptcoregtk-4.0-dev libclang-dev clang libwebkit2gtk-4.0-dev
+RUN rustup component add clippy-preview
+RUN rustup component add rustfmt

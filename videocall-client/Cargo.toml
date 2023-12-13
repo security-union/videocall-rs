@@ -90,3 +90,6 @@ features = [
     "MediaTrackConstraints",
     "CanvasRenderingContext2d"
 ]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.20"

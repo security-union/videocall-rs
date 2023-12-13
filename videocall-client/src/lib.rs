@@ -68,8 +68,6 @@
 //!
 //! ```
 
-#![feature(once_cell)]
-
 mod client;
 mod connection;
 mod constants;

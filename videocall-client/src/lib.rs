@@ -21,7 +21,7 @@
 //! For more detailed documentation see the doc for each struct.
 //!
 //! ## Client creation and connection:
-//! ```
+//! ```no_run
 //! let options = VideoCallClientOptions {...}; // set parameters and callbacks for various events
 //! let client = VideoCallClient::new(options);
 //!
@@ -29,7 +29,7 @@
 //! ```
 //!
 //! ## Encoder creation:
-//! ```
+//! ```no_run
 //! let camera = CameraEncoder.new(client, video_element_id);
 //! let microphone = MicrophoneEncoder.new(client);
 //! let screen = ScreenEncoder.new(client);
@@ -46,7 +46,7 @@
 //!
 //! ## Device access permission:
 //!
-//! ```
+//! ```no_run
 //! let media_device_access = MediaDeviceAccess::new();
 //! media_device_access.on_granted = ...; // callback
 //! media_device_access.on_denied = ...; // callback
@@ -54,7 +54,7 @@
 //! ```
 //!
 //! ### Device query and listing:
-//! ```
+//! ```no_run
 //! let media_device_list = MediaDeviceList::new();
 //! media_device_list.audio_inputs.on_selected = ...; // callback
 //! media_device_access.video_inputs.on_selected = ...; // callback

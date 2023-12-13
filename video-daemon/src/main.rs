@@ -23,11 +23,11 @@ async fn main() {
         frame_format: nokhwa::utils::FrameFormat::YUYV,
         video_device_index: 0,
     };
-    let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(1);
+    let (quic_tx, mut quic_rx) = channel::<(Vec<u8>, bool)>(10);
     let mut camera = CameraDaemon::from_config(camera_config, quic_tx);
     camera.start().expect("failed to start camera");
-    while let Some(data) = quic_rx.recv().await {
-        if let Err(e) = client.send(data).await {
+    while let Some((data, blocking)) = quic_rx.recv().await {
+        if let Err(e) = client.send(data, blocking).await {
             error!("failed to send data: {}", e);
         }
     }

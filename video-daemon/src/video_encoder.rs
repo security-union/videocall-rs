@@ -36,12 +36,12 @@ pub struct VideoEncoderBuilder {
 impl Default for VideoEncoderBuilder {
     fn default() -> Self {
         Self {
-            bitrate_kbps: 1,
+            bitrate_kbps: 2,
             max_quantizer: 63,
             min_quantizer: 63,
-            resolution: (0, 0),
+            resolution: (640, 480),
             timebase: (1, 1000),
-            cpu_used: 6,
+            cpu_used: 4,
         }
     }
 }
@@ -75,7 +75,7 @@ impl VideoEncoderBuilder {
         cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
         cfg.g_pass = vpx_enc_pass::VPX_RC_ONE_PASS;
         cfg.g_profile = 1;
-        cfg.rc_end_usage = vpx_rc_mode::VPX_VBR;
+        cfg.rc_end_usage = vpx_rc_mode::VPX_Q;
         // cfg.kf_max_dist = 150;
         // cfg.kf_min_dist = 150;
         // cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
@@ -106,11 +106,6 @@ impl VideoEncoderBuilder {
             &mut ctx,
             vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as _,
             4 as c_int
-        ));
-        vpx!(vpx_codec_control_(
-            &mut ctx,
-            vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as _,
-            50 as c_int
         ));
         Ok(VideoEncoder {
             ctx,

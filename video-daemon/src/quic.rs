@@ -10,6 +10,8 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 use tracing::{debug, info};
 use url::Url;
 
+const DEFAULT_MAX_PACKET_SIZE: usize = 60_000;
+
 /// Connects to a QUIC server.
 ///
 /// ## Args
@@ -82,11 +84,15 @@ pub struct Opt {
     /// Certificate authority to trust, in DER format
     #[clap(long = "ca")]
     ca: Option<PathBuf>,
+
+    #[clap(long = "max-packet-size")]
+    max_packet_size: Option<usize>,
 }
 
 pub struct Client {
     options: Opt,
     connection: Option<quinn::Connection>,
+    max_packet_size: usize,
 }
 
 impl Client {
@@ -97,6 +103,7 @@ impl Client {
     /// - options: command line options.
     pub fn new(options: Opt) -> Result<Client> {
         Ok(Client {
+            max_packet_size: options.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE),
             options,
             connection: None,
         })
@@ -114,14 +121,15 @@ impl Client {
         connection_packet.meeting_id = self.options.meeting_id.clone();
         packet.data = connection_packet.write_to_bytes().unwrap();
         let packet = packet.write_to_bytes().unwrap();
-        self.send(packet).await?;
+        self.send(packet, true).await?;
 
         debug!("connected to server {}", self.options.url);
         Ok(())
     }
 
-    pub async fn send(&mut self, data: Vec<u8>) -> Result<()> {
-        if data.len() > 30000 {
+    pub async fn send(&mut self, data: Vec<u8>, blocking: bool) -> Result<()> {
+        let packet_size = data.len();
+        if packet_size > self.max_packet_size {
             return Err(anyhow!("data too large {} bytes", data.len()));
         }
         let conn = self
@@ -129,11 +137,20 @@ impl Client {
             .as_mut()
             .ok_or_else(|| anyhow!("not connected"))?
             .clone();
+        async fn send(conn: quinn::Connection, data: Vec<u8>, packet_size: usize) -> Result<()> {
+            debug!("sending {} bytes", packet_size);
+            if packet_size < 1350 {
+                conn.send_datagram(data.into()).unwrap();
+            } else {
+                let mut stream = conn.open_uni().await.unwrap();
+                stream.write_all(&data).await.unwrap();
+                stream.finish().await.unwrap();
+            }
+            debug!("sent {} bytes", packet_size);
+            Ok(())
+        }
         tokio::spawn(async move {
-            let mut stream = conn.open_uni().await.unwrap();
-            stream.write_all(&data).await.unwrap();
-            stream.finish().await.unwrap();
-            debug!("sent {} bytes", data.len());
+            send(conn, data, packet_size).await.unwrap();
         });
         Ok(())
     }

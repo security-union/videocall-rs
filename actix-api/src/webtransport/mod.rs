@@ -123,11 +123,16 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
         tokio::spawn(async move {
             match new_conn.await {
                 Ok(conn) => {
-                    let data = conn.handshake_data();
-                    let http3 = data.and_then(|data| data.downcast_ref::<HandshakeData>())
-                        .and_then(|d| d.protocol.as_ref())
-                        .map(|alpn| WEB_TRANSPORT_ALPN.contains(&alpn.as_slice()))
-                        .unwrap_or(false);
+                    let mut http3 = false;
+                    if let Some(data) = conn.handshake_data() {
+                        if let Some(d) = data.downcast_ref::<HandshakeData>() {
+                            if let Some(alpn) = &d.protocol {
+                                if WEB_TRANSPORT_ALPN.contains(&alpn.as_slice()) {
+                                    http3 = true;
+                                }
+                            }
+                        }
+                    };
                     if http3 {
                         info!("new http3 established");
                         let h3_conn = sec_http3::server::builder()

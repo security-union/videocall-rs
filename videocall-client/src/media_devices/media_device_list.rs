@@ -68,7 +68,7 @@ impl SelectableDevices {
         match &self.selected {
             Some(selected) => selected.to_string(),
             // device 0 is the default selection
-            None => match self.devices().get(0) {
+            None => match self.devices().first() {
                 Some(device) => device.device_id(),
                 None => "".to_string(),
             },
@@ -177,10 +177,10 @@ impl MediaDeviceList {
                     .collect(),
             );
             on_loaded.emit(());
-            if let Some(device) = audio_input_devices.get().unwrap().get(0) {
+            if let Some(device) = audio_input_devices.get().unwrap().first() {
                 on_audio_selected.emit(device.device_id())
             }
-            if let Some(device) = video_input_devices.get().unwrap().get(0) {
+            if let Some(device) = video_input_devices.get().unwrap().first() {
                 on_video_selected.emit(device.device_id())
             }
         });

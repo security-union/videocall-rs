@@ -78,6 +78,19 @@ fn get_key_and_cert_chain(certs: Certs) -> anyhow::Result<(PrivateKey, Vec<Certi
     Ok((key, certs))
 }
 
+pub fn is_http3(conn: &quinn::Connection) -> bool {
+    if let Some(data) = conn.handshake_data() {
+        if let Some(d) = data.downcast_ref::<HandshakeData>() {
+            if let Some(alpn) = &d.protocol {
+                if WEB_TRANSPORT_ALPN.contains(&alpn.as_slice()) {
+                    return true;
+                }
+            }
+        }
+    };
+    false
+}
+
 pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
@@ -123,17 +136,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
         tokio::spawn(async move {
             match new_conn.await {
                 Ok(conn) => {
-                    let mut http3 = false;
-                    if let Some(data) = conn.handshake_data() {
-                        if let Some(d) = data.downcast_ref::<HandshakeData>() {
-                            if let Some(alpn) = &d.protocol {
-                                if WEB_TRANSPORT_ALPN.contains(&alpn.as_slice()) {
-                                    http3 = true;
-                                }
-                            }
-                        }
-                    };
-                    if http3 {
+                    if is_http3(&conn) {
                         info!("new http3 established");
                         let h3_conn = sec_http3::server::builder()
                             .enable_webtransport(true)

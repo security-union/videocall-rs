@@ -1,7 +1,6 @@
 use clap::Parser;
 
 use tokio::sync::mpsc::channel;
-use tracing::error;
 use video_daemon::camera::{CameraConfig, CameraDaemon};
 use video_daemon::quic::{Client, Opt};
 
@@ -29,7 +28,7 @@ async fn main() {
     camera.start().expect("failed to start camera");
     while let Some((data, blocking)) = quic_rx.recv().await {
         if let Err(e) = client.send(data, blocking).await {
-            error!("failed to send data: {}", e);
+            panic!("failed to send data: {}", e);
         }
     }
 }

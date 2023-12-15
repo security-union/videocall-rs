@@ -73,7 +73,7 @@ pub struct CameraDaemon {
     fps_tx: Arc<mpsc::Sender<u128>>,
     cam_rx: Option<mpsc::Receiver<Option<CameraPacket>>>,
     cam_tx: Arc<mpsc::Sender<Option<CameraPacket>>>,
-    quic_tx: Arc<Sender<(Vec<u8>, bool)>>,
+    quic_tx: Arc<Sender<Vec<u8>>>,
     quit: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -82,7 +82,7 @@ impl CameraDaemon {
     pub fn from_config(
         config: CameraConfig,
         user_id: String,
-        quic_tx: Sender<(Vec<u8>, bool)>,
+        quic_tx: Sender<Vec<u8>>,
     ) -> CameraDaemon {
         let (fps_tx, fps_rx) = mpsc::channel(5);
         let (cam_tx, cam_rx) = mpsc::channel(100);
@@ -153,8 +153,8 @@ impl CameraDaemon {
         let mut cam_rx = self.cam_rx.take().unwrap();
         let quic_tx = self.quic_tx.clone();
         let quit = self.quit.clone();
-        let width = self.config.width as usize;
-        let height = self.config.height as usize;
+        let width = self.config.width;
+        let height = self.config.height;
         let user_id = self.user_id.clone();
         std::thread::spawn(move || {
             let start = Instant::now();
@@ -186,7 +186,7 @@ impl CameraDaemon {
                 for frame in frames {
                     let packet_wrapper = transform_video_chunk(&frame, &user_id);
                     if let Err(e) =
-                        quic_tx.try_send((packet_wrapper.write_to_bytes().unwrap(), frame.key))
+                        quic_tx.try_send(packet_wrapper.write_to_bytes().unwrap())
                     {
                         error!("Unable to send packet: {:?}", e);
                     } else if let Err(e) = fps_tx.try_send(since_the_epoch().as_millis()) {

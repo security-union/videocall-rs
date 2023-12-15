@@ -29,25 +29,27 @@ pub struct VideoEncoderBuilder {
     pub max_quantizer: u32,
     pub bitrate_kbps: u32,
     pub timebase: (c_int, c_int),
-    pub resolution: (usize, usize),
+    pub resolution: (u32, u32),
     pub cpu_used: u32,
+    pub profile: u32,
 }
 
 impl Default for VideoEncoderBuilder {
     fn default() -> Self {
         Self {
-            bitrate_kbps: 2,
+            bitrate_kbps: 50,
             max_quantizer: 63,
-            min_quantizer: 63,
+            min_quantizer: 50,
             resolution: (640, 480),
             timebase: (1, 1000),
             cpu_used: 4,
+            profile: 1,
         }
     }
 }
 
 impl VideoEncoderBuilder {
-    pub fn set_resolution(mut self, width: usize, height: usize) -> Self {
+    pub fn set_resolution(mut self, width: u32, height: u32) -> Self {
         self.resolution = (width, height);
         self
     }
@@ -63,8 +65,8 @@ impl VideoEncoderBuilder {
         let mut cfg = unsafe { MaybeUninit::zeroed().assume_init() };
         vpx!(vpx_codec_enc_config_default(cfg_ptr, &mut cfg, 0));
 
-        cfg.g_w = self.resolution.0 as u32;
-        cfg.g_h = self.resolution.1 as u32;
+        cfg.g_w = self.resolution.0;
+        cfg.g_h = self.resolution.1;
         cfg.g_timebase.num = self.timebase.0;
         cfg.g_timebase.den = self.timebase.1;
         cfg.rc_target_bitrate = self.bitrate_kbps;
@@ -74,7 +76,7 @@ impl VideoEncoderBuilder {
         cfg.g_lag_in_frames = 0;
         cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
         cfg.g_pass = vpx_enc_pass::VPX_RC_ONE_PASS;
-        cfg.g_profile = 1;
+        cfg.g_profile = self.profile;
         cfg.rc_end_usage = vpx_rc_mode::VPX_Q;
         // cfg.kf_max_dist = 150;
         // cfg.kf_min_dist = 150;
@@ -107,6 +109,11 @@ impl VideoEncoderBuilder {
             vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as _,
             4 as c_int
         ));
+        vpx!(vpx_codec_control_(
+            &mut ctx,
+            vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as _,
+            50 as c_int
+        ));
         Ok(VideoEncoder {
             ctx,
             cfg,
@@ -119,8 +126,8 @@ impl VideoEncoderBuilder {
 pub struct VideoEncoder {
     ctx: vpx_codec_ctx_t,
     cfg: vpx_codec_enc_cfg_t,
-    width: usize,
-    height: usize,
+    width: u32,
+    height: u32,
 }
 
 impl VideoEncoder {
@@ -136,7 +143,7 @@ impl VideoEncoder {
 
         vpx_ptr!(vpx_img_wrap(
             &mut image,
-            vpx_img_fmt::VPX_IMG_FMT_I444,
+            vpx_img_fmt::VPX_IMG_FMT_I422,
             self.width as _,
             self.height as _,
             1,

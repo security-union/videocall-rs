@@ -28,7 +28,7 @@ pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", 
 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 
-const MAX_UNIDIRECTIONAL_STREAM_SIZE: usize = 100_000;
+const MAX_UNIDIRECTIONAL_STREAM_SIZE: usize = 500_000;
 
 #[derive(Debug)]
 pub struct WebTransportOpt {

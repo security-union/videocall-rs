@@ -10,7 +10,7 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 use tracing::{debug, info};
 use url::Url;
 
-const DEFAULT_MAX_PACKET_SIZE: usize = 100_000;
+const DEFAULT_MAX_PACKET_SIZE: usize = 500_000;
 
 /// Connects to a QUIC server.
 ///
@@ -125,13 +125,13 @@ impl Client {
             ..Default::default()
         };
         let packet = packet.write_to_bytes().unwrap();
-        self.send(packet, true).await?;
+        self.send(packet).await?;
 
         debug!("connected to server {}", self.options.url);
         Ok(())
     }
 
-    pub async fn send(&mut self, data: Vec<u8>, blocking: bool) -> Result<()> {
+    pub async fn send(&mut self, data: Vec<u8>) -> Result<()> {
         let packet_size = data.len();
         if packet_size > self.max_packet_size {
             return Err(anyhow!("data too large {} bytes", data.len()));
@@ -149,13 +149,9 @@ impl Client {
             debug!("sent {} bytes", packet_size);
             Ok(())
         }
-        if blocking {
-            send(conn, data, packet_size).await?;
-        } else {
-            tokio::spawn(async move {
-                send(conn, data, packet_size).await.unwrap();
-            });
-        }
+        tokio::spawn(async move {
+            send(conn, data, packet_size).await.unwrap();
+        });
         Ok(())
     }
 }

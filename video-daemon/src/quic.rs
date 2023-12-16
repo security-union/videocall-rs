@@ -10,6 +10,8 @@ use std::{path::PathBuf, sync::Arc, time::Instant};
 use tracing::{debug, info};
 use url::Url;
 
+use crate::fake_cert_verifier::NoVerification;
+
 const DEFAULT_MAX_PACKET_SIZE: usize = 500_000;
 
 /// Connects to a QUIC server.
@@ -36,6 +38,10 @@ pub async fn connect(opt: &Opt) -> Result<quinn::Connection> {
         .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
+    // do this only if we're not verifying the cert
+    client_crypto
+        .dangerous()
+        .set_certificate_verifier(Arc::new(NoVerification));
 
     let alpn = vec![b"hq-29".to_vec()];
     client_crypto.alpn_protocols = alpn;

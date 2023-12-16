@@ -2,7 +2,7 @@ use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Promise;
 use std::cell::OnceCell;
-use std::rc::Rc;
+use std::sync::Arc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::MediaDeviceInfo;
@@ -15,7 +15,7 @@ use yew::prelude::Callback;
 /// is triggered when a selection is made.
 ///
 pub struct SelectableDevices {
-    devices: Rc<OnceCell<Vec<MediaDeviceInfo>>>,
+    devices: Arc<OnceCell<Vec<MediaDeviceInfo>>>,
     selected: Option<String>,
 
     /// Callback that will be called as `callback(device_id)` whenever [`select(device_id)`](Self::select) is called with a valid `device_id`
@@ -25,7 +25,7 @@ pub struct SelectableDevices {
 impl SelectableDevices {
     fn new() -> Self {
         Self {
-            devices: Rc::new(OnceCell::new()),
+            devices: Arc::new(OnceCell::new()),
             selected: None,
             on_selected: Callback::noop(),
         }
@@ -68,7 +68,7 @@ impl SelectableDevices {
         match &self.selected {
             Some(selected) => selected.to_string(),
             // device 0 is the default selection
-            None => match self.devices().first() {
+            None => match self.devices().get(0) {
                 Some(device) => device.device_id(),
                 None => "".to_string(),
             },
@@ -144,8 +144,8 @@ impl MediaDeviceList {
         let on_loaded = self.on_loaded.clone();
         let on_audio_selected = self.audio_inputs.on_selected.clone();
         let on_video_selected = self.video_inputs.on_selected.clone();
-        let audio_input_devices = Rc::clone(&self.audio_inputs.devices);
-        let video_input_devices = Rc::clone(&self.video_inputs.devices);
+        let audio_input_devices = Arc::clone(&self.audio_inputs.devices);
+        let video_input_devices = Arc::clone(&self.video_inputs.devices);
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let media_devices = navigator.media_devices().unwrap();
@@ -177,10 +177,10 @@ impl MediaDeviceList {
                     .collect(),
             );
             on_loaded.emit(());
-            if let Some(device) = audio_input_devices.get().unwrap().first() {
+            if let Some(device) = audio_input_devices.get().unwrap().get(0) {
                 on_audio_selected.emit(device.device_id())
             }
-            if let Some(device) = video_input_devices.get().unwrap().first() {
+            if let Some(device) = video_input_devices.get().unwrap().get(0) {
                 on_video_selected.emit(device.device_id())
             }
         });

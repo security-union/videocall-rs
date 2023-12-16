@@ -1,7 +1,7 @@
 use super::super::wrappers::{EncodedAudioChunkTypeWrapper, EncodedVideoChunkTypeWrapper};
 use crate::crypto::aes::Aes128State;
 use protobuf::Message;
-use std::rc::Rc;
+use std::sync::Arc;
 use types::protos::{
     media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
@@ -13,7 +13,7 @@ pub fn transform_video_chunk(
     sequence: u64,
     buffer: &mut [u8],
     email: &str,
-    aes: Rc<Aes128State>,
+    aes: Arc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
@@ -48,7 +48,7 @@ pub fn transform_screen_chunk(
     sequence: u64,
     buffer: &mut [u8],
     email: &str,
-    aes: Rc<Aes128State>,
+    aes: Arc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
@@ -83,7 +83,7 @@ pub fn transform_audio_chunk(
     buffer: &mut [u8],
     email: &str,
     sequence: u64,
-    aes: Rc<Aes128State>,
+    aes: Arc<Aes128State>,
 ) -> PacketWrapper {
     chunk.copy_to_with_u8_array(buffer);
     let mut media_packet: MediaPacket = MediaPacket {

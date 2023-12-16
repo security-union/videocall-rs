@@ -161,6 +161,9 @@ impl CameraDaemon {
                 }
                 let (image, age) = data.unwrap();
 
+                // transform image to 420 format
+                let image = convert_422_to_420(image.buffer(), width as usize, height as usize);
+
                 // If age older than threshold, throw it away.
                 let image_age = since_the_epoch().as_millis() - age;
                 if image_age > THRESHOLD_MILLIS {
@@ -172,7 +175,7 @@ impl CameraDaemon {
                 let frames = video_encoder
                     .encode(
                         (time.as_millis() + time.subsec_millis() as u128) as i64,
-                        image.buffer(),
+                        &image,
                     )
                     .unwrap();
                 debug!("encoding took {:?}", encoding_time.elapsed());
@@ -217,4 +220,48 @@ impl CameraDaemon {
         }
         Ok(())
     }
+}
+
+fn convert_422_to_420(image: &[u8], width: usize, height: usize) -> Vec<u8> {
+    assert!(
+        width % 2 == 0 && height % 2 == 0,
+        "Width and height must be even numbers."
+    );
+
+    let y_size = width * height;
+    let uv_width = width / 2;
+    let uv_height = height;
+    let uv_size = uv_width * uv_height;
+
+    if image.len() != y_size + 2 * uv_size {
+        panic!("Invalid image size for YUV 4:2:2 format");
+    }
+
+    let mut result = Vec::with_capacity(y_size + 2 * (uv_width * uv_height / 4));
+
+    // Copy Y component directly
+    result.extend_from_slice(&image[0..y_size]);
+
+    // Downsample U and V components
+    for component in 0..2 {
+        let start = y_size + component * uv_size;
+        for y in (0..height).step_by(2) {
+            for x in (0..width).step_by(2) {
+                let idx1 = start + y * uv_width + x / 2;
+                let idx2 = idx1 + uv_width; // Index on the next line
+
+                // Ensure we do not go out of bounds
+                if idx2 + 1 < start + uv_size {
+                    let avg = (image[idx1] as u32
+                        + image[idx1 + 1] as u32
+                        + image[idx2] as u32
+                        + image[idx2 + 1] as u32)
+                        / 4;
+                    result.push(avg as u8);
+                }
+            }
+        }
+    }
+
+    result
 }

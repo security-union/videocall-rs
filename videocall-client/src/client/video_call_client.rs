@@ -9,6 +9,7 @@ use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use types::protos::aes_packet::AesPacket;
 use types::protos::media_packet::media_packet::MediaType;
 use types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -67,8 +68,8 @@ struct InnerOptions {
 struct Inner {
     options: InnerOptions,
     connection: Option<Connection>,
-    aes: Rc<Aes128State>,
-    rsa: Rc<RsaWrapper>,
+    aes: Arc<Aes128State>,
+    rsa: Arc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
 }
 
@@ -82,7 +83,7 @@ struct Inner {
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
-    aes: Rc<Aes128State>,
+    aes: Arc<Aes128State>,
 }
 
 impl PartialEq for VideoCallClient {
@@ -97,7 +98,7 @@ impl VideoCallClient {
     /// See [VideoCallClientOptions] for description of the options.
     ///
     pub fn new(options: VideoCallClientOptions) -> Self {
-        let aes = Rc::new(Aes128State::new(options.enable_e2ee));
+        let aes = Arc::new(Aes128State::new(options.enable_e2ee));
         let inner = Rc::new(RefCell::new(Inner {
             options: InnerOptions {
                 enable_e2ee: options.enable_e2ee,
@@ -106,7 +107,7 @@ impl VideoCallClient {
             },
             connection: None,
             aes: aes.clone(),
-            rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
+            rsa: Arc::new(RsaWrapper::new(options.enable_e2ee)),
             peer_decode_manager: Self::create_peer_decoder_manager(&options),
         }));
         Self {
@@ -238,7 +239,7 @@ impl VideoCallClient {
         false
     }
 
-    pub(crate) fn aes(&self) -> Rc<Aes128State> {
+    pub(crate) fn aes(&self) -> Arc<Aes128State> {
         self.aes.clone()
     }
 
@@ -325,7 +326,7 @@ impl Inner {
                 }
             }
             Ok(PacketType::CONNECTION) => {
-                error!("Not implemented: CONNECTION packet type");
+                
             }
             Err(_) => {}
         }

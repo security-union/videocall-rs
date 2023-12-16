@@ -43,7 +43,7 @@ impl Default for VideoEncoderBuilder {
             resolution: (640, 480),
             timebase: (1, 1000),
             cpu_used: 4,
-            profile: 1,
+            profile: 0,
         }
     }
 }
@@ -78,9 +78,9 @@ impl VideoEncoderBuilder {
         cfg.g_pass = vpx_enc_pass::VPX_RC_ONE_PASS;
         cfg.g_profile = self.profile;
         cfg.rc_end_usage = vpx_rc_mode::VPX_Q;
-        // cfg.kf_max_dist = 150;
-        // cfg.kf_min_dist = 150;
-        // cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
+        cfg.kf_max_dist = 150;
+        cfg.kf_min_dist = 150;
+        cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
 
         let ctx = MaybeUninit::zeroed();
         let mut ctx = unsafe { ctx.assume_init() };
@@ -143,7 +143,7 @@ impl VideoEncoder {
 
         vpx_ptr!(vpx_img_wrap(
             &mut image,
-            vpx_img_fmt::VPX_IMG_FMT_I422,
+            vpx_img_fmt::VPX_IMG_FMT_I420,
             self.width as _,
             self.height as _,
             1,

@@ -1,5 +1,5 @@
 pub static AUDIO_CODEC: &str = "opus"; // https://www.w3.org/TR/webcodecs-codec-registry/#audio-codec-registry
-pub static VIDEO_CODEC: &str = "vp09.01.10.08"; // profile 1,level 1.0, bit depth 8,
+pub static VIDEO_CODEC: &str = "vp09.00.10.08"; // profile 1,level 1.0, bit depth 8,
 
 // Commented out because it is not as fast as vp9.
 

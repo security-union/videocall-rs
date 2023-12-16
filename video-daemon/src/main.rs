@@ -17,7 +17,6 @@ async fn main() {
     let video_device_index = opt.video_device_index.clone();
     let mut client = Client::new(opt).expect("failed to create client");
     client.connect().await.expect("failed to connect");
-    
 
     let camera_config = CameraConfig {
         width: 640,

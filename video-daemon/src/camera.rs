@@ -1,8 +1,7 @@
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::{anyhow, Result};
-use image::RgbImage;
-use nokhwa::pixel_format::RgbFormat;
+use nokhwa::Buffer;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 use nokhwa::{
@@ -21,7 +20,7 @@ use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::{MediaPacket, VideoMetadata};
 use types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
-type CameraPacket = (RgbImage, u128);
+type CameraPacket = (Buffer, u128);
 
 pub fn transform_video_chunk(frame: &Frame, email: &str) -> PacketWrapper {
     let frame_type = if frame.key {
@@ -124,7 +123,7 @@ impl CameraDaemon {
             info!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
                 CameraIndex::Index(video_device_index),
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+                RequestedFormat::new::<YuvFormat>(RequestedFormatType::Closest(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
             )
@@ -134,16 +133,9 @@ impl CameraDaemon {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                let res = frame
-                    .decode_image::<RgbFormat>()
-                    .map_err(|e| anyhow! {format!("{}", e)})
-                    .and_then(|image| {
-                        cam_tx.try_send(Some((image, since_the_epoch().as_millis())))?;
-                        Ok(())
-                    });
-                if let Err(e) = res {
-                    error!("Unable to send camera frame: {:?}", e);
-                }
+                if let Err(e) = cam_tx.try_send(Some((frame, since_the_epoch().as_millis()))) {
+                    error!("error sending image {}", e);
+                }           
             }
         }))
     }
@@ -167,7 +159,7 @@ impl CameraDaemon {
                     return;
                 }
                 let (image, age) = data.unwrap();
-
+                
                 // If age older than threshold, throw it away.
                 let image_age = since_the_epoch().as_millis() - age;
                 if image_age > THRESHOLD_MILLIS {
@@ -179,7 +171,7 @@ impl CameraDaemon {
                 let frames = video_encoder
                     .encode(
                         (time.as_millis() + time.subsec_millis() as u128) as i64,
-                        &image.into_raw(),
+                        image.buffer(),
                     )
                     .unwrap();
                 debug!("encoding took {:?}", encoding_time.elapsed());

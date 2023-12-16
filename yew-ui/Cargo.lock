@@ -1288,6 +1288,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 
 [[package]]
+name = "videocall-client"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "anyhow",
+ "cbc",
+ "gloo 0.8.1",
+ "gloo-timers",
+ "gloo-utils",
+ "js-sys",
+ "log",
+ "protobuf",
+ "rand",
+ "rsa",
+ "types",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "yew",
+ "yew-websocket",
+ "yew-webtransport",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.0+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1468,9 +1492,6 @@ dependencies = [
 name = "yew-ui"
 version = "0.1.0"
 dependencies = [
- "aes",
- "anyhow",
- "cbc",
  "console_error_panic_hook",
  "console_log",
  "const_format",
@@ -1478,25 +1499,21 @@ dependencies = [
  "gloo 0.8.1",
  "gloo-timers",
  "gloo-utils",
- "js-sys",
  "lazy_static",
  "log",
  "protobuf",
- "rand",
  "reqwasm",
- "rsa",
  "serde",
  "serde_derive",
  "types",
  "urlencoding",
+ "videocall-client",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
  "yew",
  "yew-router",
- "yew-websocket",
- "yew-webtransport",
 ]
 
 [[package]]

@@ -87,6 +87,9 @@ pub struct Opt {
 
     #[clap(long = "max-packet-size")]
     max_packet_size: Option<usize>,
+
+    #[clap(long = "video-device-index")]
+    pub video_device_index: usize
 }
 
 pub struct Client {

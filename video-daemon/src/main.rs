@@ -14,14 +14,17 @@ async fn main() {
     .unwrap();
     let opt = Opt::parse();
     let user_id = opt.user_id.clone();
+    let video_device_index = opt.video_device_index.clone();
     let mut client = Client::new(opt).expect("failed to create client");
     client.connect().await.expect("failed to connect");
+    
+
     let camera_config = CameraConfig {
         width: 640,
         height: 480,
-        framerate: 30,
+        framerate: 15,
         frame_format: nokhwa::utils::FrameFormat::YUYV,
-        video_device_index: 0,
+        video_device_index,
     };
     let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);
     let mut camera = CameraDaemon::from_config(camera_config, user_id, quic_tx);

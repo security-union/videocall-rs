@@ -1,9 +1,10 @@
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use crate::yuyv_format::YuyvFormat;
-use anyhow::{Result};
+use anyhow::Result;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
+use nokhwa::utils::Resolution;
 use nokhwa::Buffer;
 use nokhwa::{
     utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
@@ -21,7 +22,7 @@ use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::{MediaPacket, VideoMetadata};
 use types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
-type CameraPacket = (Buffer, u128);
+type CameraPacket = (Vec<u8>, u128);
 
 pub fn transform_video_chunk(frame: &Frame, email: &str) -> PacketWrapper {
     let frame_type = if frame.key {
@@ -103,8 +104,8 @@ impl CameraDaemon {
         self.handles.push(self.camera_thread()?);
         let encoder = self.encoder_thread();
         self.handles.push(encoder);
-        let fps = self.fps_thread();
-        self.handles.push(fps);
+        // let fps = self.fps_thread();
+        // self.handles.push(fps);
         Ok(())
     }
 
@@ -120,6 +121,12 @@ impl CameraDaemon {
         let frame_format = self.config.frame_format;
         let video_device_index = self.config.video_device_index as u32;
         let quit = self.quit.clone();
+        let mut buffer_slice_i420 = vec![
+            0u8;
+            (width * height + 2 * (width / 2) * (height / 2))
+                .try_into()
+                .unwrap()
+        ];
         Ok(std::thread::spawn(move || {
             info!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
@@ -130,11 +137,17 @@ impl CameraDaemon {
             )
             .unwrap();
             camera.open_stream().unwrap();
-            while let Ok(frame) = camera.frame() {
+
+            // rewrite loop to use buffer
+
+            while let Ok(_) = camera.write_frame_to_buffer::<YuyvFormat>(&mut buffer_slice_i420) {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                if let Err(e) = cam_tx.try_send(Some((frame, since_the_epoch().as_millis()))) {
+                if let Err(e) = cam_tx.try_send(Some((
+                    buffer_slice_i420.to_vec(),
+                    since_the_epoch().as_millis(),
+                ))) {
                     error!("error sending image {}", e);
                 }
             }
@@ -156,6 +169,7 @@ impl CameraDaemon {
                 .build()
                 .unwrap();
             video_encoder.update_bitrate(50_000).unwrap();
+            let mut sequence = 0;
             while let Some(data) = cam_rx.blocking_recv() {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
@@ -163,7 +177,7 @@ impl CameraDaemon {
                 let (image, age) = data.unwrap();
 
                 // transform image to 420 format
-                let image = convert_yuyv_to_i420(image.buffer(), width as usize, height as usize);
+                // let image = convert_yuyv_to_i420(image.buffer(), width as usize, height as usize);
 
                 // If age older than threshold, throw it away.
                 let image_age = since_the_epoch().as_millis() - age;
@@ -171,21 +185,14 @@ impl CameraDaemon {
                     debug!("throwing away old image with age {} ms", image_age);
                     continue;
                 }
-                let time = start.elapsed();
                 let encoding_time = Instant::now();
-                let frames = video_encoder
-                    .encode(
-                        (time.as_millis() + time.subsec_millis() as u128) as i64,
-                        &image,
-                    )
-                    .unwrap();
+                let frames = video_encoder.encode(sequence, image.as_slice()).unwrap();
+                sequence = sequence + 1;
                 debug!("encoding took {:?}", encoding_time.elapsed());
                 for frame in frames {
                     let packet_wrapper = transform_video_chunk(&frame, &user_id);
                     if let Err(e) = quic_tx.try_send(packet_wrapper.write_to_bytes().unwrap()) {
                         error!("Unable to send packet: {:?}", e);
-                    } else if let Err(e) = fps_tx.try_send(since_the_epoch().as_millis()) {
-                        error!("Unable to send fps: {:?}", e);
                     }
                 }
             }
@@ -221,35 +228,4 @@ impl CameraDaemon {
         }
         Ok(())
     }
-}
-
-fn convert_yuyv_to_i420(yuyv: &[u8], width: usize, height: usize) -> Vec<u8> {
-    assert!(
-        width % 2 == 0 && height % 2 == 0,
-        "Width and height must be even numbers."
-    );
-
-    let mut i420 = vec![0u8; width * height + 2 * (width / 2) * (height / 2)];
-    let (y_plane, uv_plane) = i420.split_at_mut(width * height);
-    let (u_plane, v_plane) = uv_plane.split_at_mut(uv_plane.len() / 2);
-
-    for y in 0..height {
-        for x in (0..width).step_by(2) {
-            let base_index = (y * width + x) * 2;
-            let y0 = yuyv[base_index];
-            let u = yuyv[base_index + 1];
-            let y1 = yuyv[base_index + 2];
-            let v = yuyv[base_index + 3];
-
-            y_plane[y * width + x] = y0;
-            y_plane[y * width + x + 1] = y1;
-
-            if y % 2 == 0 {
-                u_plane[y / 2 * (width / 2) + x / 2] = u;
-                v_plane[y / 2 * (width / 2) + x / 2] = v;
-            }
-        }
-    }
-
-    i420
 }

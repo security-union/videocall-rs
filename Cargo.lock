@@ -4275,6 +4275,7 @@ dependencies = [
  "nokhwa",
  "protobuf",
  "quinn",
+ "rayon",
  "rustls",
  "serde",
  "serde_json",

@@ -44,11 +44,14 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
             let is_next_frame = new_sequence_number == sequence + 1;
             let next_frame_already_cached = self.cache.get(&(sequence + 1)).is_some();
             if is_future_i_frame || is_next_frame {
+                log::info!("Playing frame in order {}", &new_sequence_number);
                 self.video_decoder.decode(image);
                 self.sequence = Some(new_sequence_number);
                 self.play_queued_follow_up_frames();
                 self.prune_older_frames_from_buffer(sequence);
             } else {
+                log::info!("Buffering frame {}", &new_sequence_number);
+
                 if next_frame_already_cached {
                     self.play_queued_follow_up_frames();
                     self.prune_older_frames_from_buffer(sequence);

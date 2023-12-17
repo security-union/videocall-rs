@@ -14,7 +14,7 @@ async fn main() {
     .unwrap();
     let opt = Opt::parse();
     let user_id = opt.user_id.clone();
-    let video_device_index = opt.video_device_index.clone();
+    let video_device_index = opt.video_device_index;
     let mut client = Client::new(opt).expect("failed to create client");
     client.connect().await.expect("failed to connect");
 

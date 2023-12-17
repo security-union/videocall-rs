@@ -1,7 +1,7 @@
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use crate::yuyv_format::YuyvFormat;
-use anyhow::{anyhow, Result};
+use anyhow::{Result};
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 use nokhwa::Buffer;
@@ -129,7 +129,7 @@ impl CameraDaemon {
                 )),
             )
             .unwrap();
-            let _ = camera.open_stream().unwrap();
+            camera.open_stream().unwrap();
             while let Ok(frame) = camera.frame() {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;

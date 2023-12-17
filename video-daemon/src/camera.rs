@@ -155,6 +155,7 @@ impl CameraDaemon {
                 .set_resolution(width, height)
                 .build()
                 .unwrap();
+            video_encoder.update_bitrate(50_000).unwrap();
             while let Some(data) = cam_rx.blocking_recv() {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
@@ -162,7 +163,7 @@ impl CameraDaemon {
                 let (image, age) = data.unwrap();
 
                 // transform image to 420 format
-                let image = convert_422_to_420(image.buffer(), width as usize, height as usize);
+                let image = convert_yuyv_to_i420(image.buffer(), width as usize, height as usize);
 
                 // If age older than threshold, throw it away.
                 let image_age = since_the_epoch().as_millis() - age;
@@ -222,46 +223,33 @@ impl CameraDaemon {
     }
 }
 
-fn convert_422_to_420(image: &[u8], width: usize, height: usize) -> Vec<u8> {
+fn convert_yuyv_to_i420(yuyv: &[u8], width: usize, height: usize) -> Vec<u8> {
     assert!(
         width % 2 == 0 && height % 2 == 0,
         "Width and height must be even numbers."
     );
 
-    let y_size = width * height;
-    let uv_width = width / 2;
-    let uv_height = height;
-    let uv_size = uv_width * uv_height;
+    let mut i420 = vec![0u8; width * height + 2 * (width / 2) * (height / 2)];
+    let (y_plane, uv_plane) = i420.split_at_mut(width * height);
+    let (u_plane, v_plane) = uv_plane.split_at_mut(uv_plane.len() / 2);
 
-    if image.len() != y_size + 2 * uv_size {
-        panic!("Invalid image size for YUV 4:2:2 format");
-    }
+    for y in 0..height {
+        for x in (0..width).step_by(2) {
+            let base_index = (y * width + x) * 2;
+            let y0 = yuyv[base_index];
+            let u = yuyv[base_index + 1];
+            let y1 = yuyv[base_index + 2];
+            let v = yuyv[base_index + 3];
 
-    let mut result = Vec::with_capacity(y_size + 2 * (uv_width * uv_height / 4));
+            y_plane[y * width + x] = y0;
+            y_plane[y * width + x + 1] = y1;
 
-    // Copy Y component directly
-    result.extend_from_slice(&image[0..y_size]);
-
-    // Downsample U and V components
-    for component in 0..2 {
-        let start = y_size + component * uv_size;
-        for y in (0..height).step_by(2) {
-            for x in (0..width).step_by(2) {
-                let idx1 = start + y * uv_width + x / 2;
-                let idx2 = idx1 + uv_width; // Index on the next line
-
-                // Ensure we do not go out of bounds
-                if idx2 + 1 < start + uv_size {
-                    let avg = (image[idx1] as u32
-                        + image[idx1 + 1] as u32
-                        + image[idx2] as u32
-                        + image[idx2 + 1] as u32)
-                        / 4;
-                    result.push(avg as u8);
-                }
+            if y % 2 == 0 {
+                u_plane[y / 2 * (width / 2) + x / 2] = u;
+                v_plane[y / 2 * (width / 2) + x / 2] = v;
             }
         }
     }
 
-    result
+    i420
 }

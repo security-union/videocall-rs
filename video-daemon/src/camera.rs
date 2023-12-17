@@ -104,8 +104,8 @@ impl CameraDaemon {
         self.handles.push(self.camera_thread()?);
         let encoder = self.encoder_thread();
         self.handles.push(encoder);
-        // let fps = self.fps_thread();
-        // self.handles.push(fps);
+        let fps = self.fps_thread();
+        self.handles.push(fps);
         Ok(())
     }
 
@@ -137,8 +137,6 @@ impl CameraDaemon {
             )
             .unwrap();
             camera.open_stream().unwrap();
-
-            // rewrite loop to use buffer
 
             while let Ok(_) = camera.write_frame_to_buffer::<YuyvFormat>(&mut buffer_slice_i420) {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
@@ -176,9 +174,6 @@ impl CameraDaemon {
                 }
                 let (image, age) = data.unwrap();
 
-                // transform image to 420 format
-                // let image = convert_yuyv_to_i420(image.buffer(), width as usize, height as usize);
-
                 // If age older than threshold, throw it away.
                 let image_age = since_the_epoch().as_millis() - age;
                 if image_age > THRESHOLD_MILLIS {
@@ -193,6 +188,8 @@ impl CameraDaemon {
                     let packet_wrapper = transform_video_chunk(&frame, &user_id);
                     if let Err(e) = quic_tx.try_send(packet_wrapper.write_to_bytes().unwrap()) {
                         error!("Unable to send packet: {:?}", e);
+                    } else if let Err(e) = fps_tx.try_send(since_the_epoch().as_millis()) {
+                        error!("Unable to send fps: {:?}", e);
                     }
                 }
             }

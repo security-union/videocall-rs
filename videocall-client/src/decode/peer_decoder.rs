@@ -81,6 +81,7 @@ macro_rules! impl_decode {
                     $self.decoded = true;
                 }
                 CodecState::Closed => {
+                    log::error!("decoder closed");
                     return Err(());
                 }
                 _ => {}

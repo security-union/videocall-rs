@@ -1,5 +1,5 @@
 FROM rust:1.72-slim
 
-RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev build-essential
+RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev build-essential libclang-dev
 RUN curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate && chmod +x /usr/bin/dbmate
 RUN cargo install cargo-watch

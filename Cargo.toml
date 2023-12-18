@@ -5,9 +5,9 @@ members = [
     "bot",
     "types",
     "videocall-client",
-    "video-daemon",
 ]
 exclude = [
     "src-tauri",
+    "video-daemon",
     "yew-ui"
 ]

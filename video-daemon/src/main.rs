@@ -2,7 +2,7 @@ use clap::Parser;
 
 use tokio::sync::mpsc::channel;
 use video_daemon::camera::{CameraConfig, CameraDaemon};
-use video_daemon::quic::{Client, Opt};
+use video_daemon::quic::{Client, ClientError, Opt};
 
 #[tokio::main]
 async fn main() {
@@ -30,7 +30,18 @@ async fn main() {
     camera.start().expect("failed to start camera");
     while let Some(data) = quic_rx.recv().await {
         if let Err(e) = client.send(data).await {
-            panic!("failed to send data: {}", e);
+            match e {
+                ClientError::OversizedPacket(size) => {
+                    tracing::error!("packet size {} exceeds maximum packet size {}", size, client.max_packet_size);
+                }
+                ClientError::NotConnected => {
+                    tracing::error!("not connected, attempting to reconnect");
+                    client.connect().await.expect("failed to connect");
+                }
+                _ => {
+                    panic!("failed to send data: {}", e);
+                }
+            }
         }
     }
 }

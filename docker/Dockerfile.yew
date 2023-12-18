@@ -1,4 +1,4 @@
 FROM securityunion/yew:1.72-slim
 
-RUN rustup component add clippy-preview
+RUN rustup component add clippy
 RUN rustup component add rustfmt

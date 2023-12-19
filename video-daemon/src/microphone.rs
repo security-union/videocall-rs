@@ -123,7 +123,7 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
         };
         info!("Begin streaming audio...");
         stream.play().expect("failed to play stream");
-        
+
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
@@ -136,7 +136,6 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
 
 fn encode_and_send_i16(input: &[i16], encoder: &mut opus::Encoder, quic_tx: &Sender<Vec<u8>>, email: String) -> anyhow::Result<()>
 {
-    println!("Encoding {} samples", input.len());
     let output = encoder.encode_vec( input, 1024)?;
     let output = convert_to_media_packet(output, email, 0);
     let output = output.write_to_bytes()?;

@@ -89,7 +89,9 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config.into(),
                 move |data, _: &_| {
-                    // Chunk data into 1024 samples.
+                    // XXX TODO: We are dropping data here because OPUS requires the chunks to be
+                    // 960, but we are receiving 4096 from cpal stream
+                    // So we need to fix this to not drop any of the data
                     for chunk in data.chunks_exact(960) {
                         match encode_and_send_i16(chunk, &mut encoder, &quic_tx, email.clone()) {
                             Ok(_) => {}
@@ -105,6 +107,9 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config.into(),
                 move |data, _: &_| {
+                    // XXX TODO: We are dropping data here because OPUS requires the chunks to be
+                    // 960, but we are receiving 4096 from cpal stream
+                    // So we need to fix this to not drop any of the data
                     for chunk in data.chunks_exact(960) {
                         match encode_and_send_f32(chunk, &mut encoder, &quic_tx, email.clone()) {
                             Ok(_) => {}

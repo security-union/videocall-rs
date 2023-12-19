@@ -3,6 +3,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use opus::Channels;
 use protobuf::{MessageField, Message};
 use tokio::sync::mpsc::Sender;
+use types::protos::packet_wrapper::PacketWrapper;
+use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
@@ -137,8 +139,9 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
 fn encode_and_send_i16(input: &[i16], encoder: &mut opus::Encoder, quic_tx: &Sender<Vec<u8>>, email: String) -> anyhow::Result<()>
 {
     let output = encoder.encode_vec( input, 1024)?;
-    let output = convert_to_media_packet(output, email, 0);
-    let output = output.write_to_bytes()?;
+    info!("Encoded {} samples", output.len());
+    let output = transform_audio_chunk(output, email, 0);
+    let output = output?.write_to_bytes()?;
     quic_tx.try_send(output)?;
     Ok(())
 }
@@ -146,25 +149,37 @@ fn encode_and_send_i16(input: &[i16], encoder: &mut opus::Encoder, quic_tx: &Sen
 fn encode_and_send_f32(input: &[f32], encoder: &mut opus::Encoder, quic_tx: &Sender<Vec<u8>>, email: String) -> anyhow::Result<()>
 {
     let output = encoder.encode_vec_float(input, 1024)?;
-    let output = convert_to_media_packet(output, email, 0);
-    let output = output.write_to_bytes()?;
+    info!("Encoded {} samples", output.len());
+    let output = transform_audio_chunk(output, email, 0);
+    let output = output?.write_to_bytes()?;
     quic_tx.try_send(output)?;
     Ok(())
 }
 
-fn convert_to_media_packet(data: Vec<u8>, email: String, sequence: u64) -> MediaPacket {
-    MediaPacket {
-        media_type: MediaType::AUDIO.into(),
-        data,
-        email,
-        // TODO: Do we need to include the timestamp?
-        timestamp: 0.0,
-        // TODO: Do we need to include the duration?
-        duration: 0.0,
-        video_metadata: MessageField(Some(Box::new(VideoMetadata {
-            sequence,
+fn transform_audio_chunk(data: Vec<u8>, email: String, sequence: u64) -> anyhow::Result<PacketWrapper> {
+    Ok(PacketWrapper {
+        packet_type: PacketType::MEDIA.into(),
+        email: email.clone(),
+        data: MediaPacket {
+            media_type: MediaType::AUDIO.into(),
+            data,
+            email,
+            frame_type: String::from("key"),
+            timestamp: get_micros_now(),
+            // TODO: Duration of the audio in microseconds.
+            duration: 0.0,
+            video_metadata: MessageField(Some(Box::new(VideoMetadata {
+                sequence,
+                ..Default::default()
+            }))),
             ..Default::default()
-        }))),
+        }.write_to_bytes()?,
         ..Default::default()
-    }
+    })
+}
+
+fn get_micros_now() -> f64 {
+    let now = std::time::SystemTime::now();
+    let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+    duration.as_micros() as f64
 }

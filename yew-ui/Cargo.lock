@@ -1291,6 +1291,7 @@ dependencies = [
  "aes",
  "anyhow",
  "cbc",
+ "getrandom",
  "gloo 0.8.1",
  "gloo-timers",
  "gloo-utils",

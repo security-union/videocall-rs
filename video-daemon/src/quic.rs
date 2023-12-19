@@ -122,6 +122,9 @@ pub struct Opt {
 
     #[clap(long = "video-device-index")]
     pub video_device_index: usize,
+
+    #[clap(long = "audio-device", default_value = "default")]
+    pub audio_device: String,
 }
 
 pub struct Client {

@@ -2,6 +2,7 @@ use clap::Parser;
 
 use tokio::sync::mpsc::channel;
 use video_daemon::camera::{CameraConfig, CameraDaemon};
+use video_daemon::microphone::MicrophoneDaemon;
 use video_daemon::quic::{Client, ClientError, Opt};
 
 #[tokio::main]
@@ -15,6 +16,7 @@ async fn main() {
     let opt = Opt::parse();
     let user_id = opt.user_id.clone();
     let video_device_index = opt.video_device_index;
+    let audio_device = opt.audio_device.clone();
     let mut client = Client::new(opt).expect("failed to create client");
     client.connect().await.expect("failed to connect");
 
@@ -26,8 +28,10 @@ async fn main() {
         video_device_index,
     };
     let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);
-    let mut camera = CameraDaemon::from_config(camera_config, user_id, quic_tx);
+    let mut camera = CameraDaemon::from_config(camera_config, user_id.clone(), quic_tx.clone());
     camera.start().expect("failed to start camera");
+    let mut microphone = MicrophoneDaemon::default();
+    microphone.start(quic_tx, audio_device, user_id).expect("failed to start microphone");
     while let Some(data) = quic_rx.recv().await {
         if let Err(e) = client.send(data).await {
             match e {

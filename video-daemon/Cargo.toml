@@ -29,3 +29,5 @@ types = { path= "../types"}
 yuv = "0.1.5"
 rayon = "1.8.0"
 thiserror = "1.0.51"
+cpal = "0.15.2"
+opus = "0.3.0"

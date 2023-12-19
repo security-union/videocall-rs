@@ -5,7 +5,7 @@
 ### Dependencies
 
 ```sh
-sudo apt install build-essential pkg-config libclang-dev libvpx-dev
+sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-dev cmake
 ```
 
 ## Running locally

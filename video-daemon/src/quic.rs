@@ -48,7 +48,7 @@ pub async fn connect(opt: &Opt) -> Result<quinn::Connection> {
         .socket_addrs(|| Some(443))
         .expect("couldn't resolve the address provided")
         .first()
-        .ok_or_else(|| ClientError::UnresolvedAddress)?
+        .ok_or(ClientError::UnresolvedAddress)?
         .to_owned();
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
@@ -83,7 +83,7 @@ pub async fn connect(opt: &Opt) -> Result<quinn::Connection> {
         .host
         .as_ref()
         .map_or_else(|| opt.url.host_str(), |x| Some(x))
-        .ok_or_else(|| ClientError::UnspecifiedHostname)?;
+        .ok_or(ClientError::UnspecifiedHostname)?;
     info!("connecting to {host} at {remote}");
     let conn = endpoint
         .connect(remote, host)?
@@ -177,7 +177,7 @@ impl Client {
         let conn = self
             .connection
             .as_mut()
-            .ok_or_else(|| ClientError::NotConnected)?
+            .ok_or(ClientError::NotConnected)?
             .clone();
         async fn send(conn: quinn::Connection, data: Vec<u8>, packet_size: usize) -> Result<()> {
             debug!("sending {} bytes", packet_size);

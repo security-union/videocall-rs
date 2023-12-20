@@ -64,7 +64,7 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
     let mut config = device.default_input_config()?;
     info!("Default input config: {:?}", config);
     // Opus only supports 48kHz sample rate so find a compatible config.
-    for supported_config in device.supported_input_configs()?.filter_map(|x| Some(x.with_sample_rate(SampleRate(48000)))) {
+    for supported_config in device.supported_input_configs()?.map(|x: cpal::SupportedStreamConfigRange| x.with_sample_rate(SampleRate(48000))) {
         if supported_config.channels() != 1 {
             continue;
         }

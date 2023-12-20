@@ -4,8 +4,8 @@ use crate::yuyv_format::YuyvFormat;
 use anyhow::Result;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
-use nokhwa::utils::Resolution;
-use nokhwa::Buffer;
+
+
 use nokhwa::{
     utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
     Camera,
@@ -138,7 +138,7 @@ impl CameraDaemon {
             .unwrap();
             camera.open_stream().unwrap();
 
-            while let Ok(_) = camera.write_frame_to_buffer::<YuyvFormat>(&mut buffer_slice_i420) {
+            while camera.write_frame_to_buffer::<YuyvFormat>(&mut buffer_slice_i420).is_ok() {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
@@ -161,7 +161,7 @@ impl CameraDaemon {
         let height = self.config.height;
         let user_id = self.user_id.clone();
         std::thread::spawn(move || {
-            let start = Instant::now();
+            let _start = Instant::now();
             let mut video_encoder = VideoEncoderBuilder::default()
                 .set_resolution(width, height)
                 .build()
@@ -182,7 +182,7 @@ impl CameraDaemon {
                 }
                 let encoding_time = Instant::now();
                 let frames = video_encoder.encode(sequence, image.as_slice()).unwrap();
-                sequence = sequence + 1;
+                sequence += 1;
                 debug!("encoding took {:?}", encoding_time.elapsed());
                 for frame in frames {
                     let packet_wrapper = transform_video_chunk(&frame, &user_id);

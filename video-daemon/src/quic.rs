@@ -15,7 +15,6 @@ use crate::fake_cert_verifier::NoVerification;
 
 const DEFAULT_MAX_PACKET_SIZE: usize = 500_000;
 
-
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("failed to connect: {}", .0)]
@@ -74,9 +73,8 @@ pub async fn connect(opt: &Opt) -> Result<quinn::Connection> {
     }
     let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
 
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap()).map_err(|e| {
-        ClientError::FailedToConnect(format!("failed to create endpoint: {}", e))
-    })?;
+    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
+        .map_err(|e| ClientError::FailedToConnect(format!("failed to create endpoint: {}", e)))?;
     endpoint.set_default_client_config(client_config);
     let start = Instant::now();
     let host = opt

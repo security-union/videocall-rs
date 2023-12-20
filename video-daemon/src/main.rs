@@ -31,12 +31,18 @@ async fn main() {
     let mut camera = CameraDaemon::from_config(camera_config, user_id.clone(), quic_tx.clone());
     camera.start().expect("failed to start camera");
     let mut microphone = MicrophoneDaemon::default();
-    microphone.start(quic_tx, audio_device, user_id).expect("failed to start microphone");
+    microphone
+        .start(quic_tx, audio_device, user_id)
+        .expect("failed to start microphone");
     while let Some(data) = quic_rx.recv().await {
         if let Err(e) = client.send(data).await {
             match e {
                 ClientError::OversizedPacket(size) => {
-                    tracing::error!("packet size {} exceeds maximum packet size {}", size, client.max_packet_size);
+                    tracing::error!(
+                        "packet size {} exceeds maximum packet size {}",
+                        size,
+                        client.max_packet_size
+                    );
                 }
                 ClientError::NotConnected => {
                     tracing::error!("not connected, attempting to reconnect");

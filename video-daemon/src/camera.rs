@@ -5,7 +5,6 @@ use anyhow::Result;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 
-
 use nokhwa::{
     utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
     Camera,
@@ -138,7 +137,10 @@ impl CameraDaemon {
             .unwrap();
             camera.open_stream().unwrap();
 
-            while camera.write_frame_to_buffer::<YuyvFormat>(&mut buffer_slice_i420).is_ok() {
+            while camera
+                .write_frame_to_buffer::<YuyvFormat>(&mut buffer_slice_i420)
+                .is_ok()
+            {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }

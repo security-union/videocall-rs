@@ -1,21 +1,21 @@
-use cpal::SampleRate;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::SampleRate;
 use opus::Channels;
-use protobuf::{MessageField, Message};
-use tokio::sync::mpsc::Sender;
-use types::protos::packet_wrapper::PacketWrapper;
-use types::protos::packet_wrapper::packet_wrapper::PacketType;
-use std::sync::Arc;
+use protobuf::{Message, MessageField};
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tracing::{info, error};
-use types::protos::media_packet::{MediaPacket, VideoMetadata};
+use tokio::sync::mpsc::Sender;
+use tracing::{error, info};
 use types::protos::media_packet::media_packet::MediaType;
+use types::protos::media_packet::{MediaPacket, VideoMetadata};
+use types::protos::packet_wrapper::packet_wrapper::PacketType;
+use types::protos::packet_wrapper::PacketWrapper;
 
 pub struct MicrophoneDaemon {
     stop: Arc<AtomicBool>,
-    handles: Vec<JoinHandle<anyhow::Result<()>>>
+    handles: Vec<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl Default for MicrophoneDaemon {
@@ -28,12 +28,22 @@ impl MicrophoneDaemon {
     pub fn new() -> Self {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
-            handles: vec![]
+            handles: vec![],
         }
     }
 
-    pub fn start(&mut self, quic_tx: Sender<Vec<u8>>, device: String, email: String) -> anyhow::Result<()> {
-        self.handles.push(start_microphone(device.clone(), quic_tx.clone(), email, self.stop.clone())?);
+    pub fn start(
+        &mut self,
+        quic_tx: Sender<Vec<u8>>,
+        device: String,
+        email: String,
+    ) -> anyhow::Result<()> {
+        self.handles.push(start_microphone(
+            device.clone(),
+            quic_tx.clone(),
+            email,
+            self.stop.clone(),
+        )?);
         Ok(())
     }
 
@@ -47,7 +57,12 @@ impl MicrophoneDaemon {
     }
 }
 
-fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, stop: Arc<AtomicBool>) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
+fn start_microphone(
+    device: String,
+    quic_tx: Sender<Vec<u8>>,
+    email: String,
+    stop: Arc<AtomicBool>,
+) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
     let host = cpal::default_host();
 
     // Set up the input device and stream with the default input config.
@@ -64,12 +79,17 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
     let mut config = device.default_input_config()?;
     info!("Default input config: {:?}", config);
     // Opus only supports 48kHz sample rate so find a compatible config.
-    for supported_config in device.supported_input_configs()?.map(|x: cpal::SupportedStreamConfigRange| x.with_sample_rate(SampleRate(48000))) {
+    for supported_config in device
+        .supported_input_configs()?
+        .map(|x: cpal::SupportedStreamConfigRange| x.with_sample_rate(SampleRate(48000)))
+    {
         if supported_config.channels() != 1 {
             continue;
         }
         info!("Supported input config: {:?}", supported_config);
-        if supported_config.sample_format() == cpal::SampleFormat::F32 || supported_config.sample_format() == cpal::SampleFormat::I16 {
+        if supported_config.sample_format() == cpal::SampleFormat::F32
+            || supported_config.sample_format() == cpal::SampleFormat::I16
+        {
             info!("Using supported input config: {:?}", supported_config);
             config = supported_config;
             break;
@@ -135,17 +155,25 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
     }))
 }
 
-fn encode_and_send_i16(input: &[i16], encoder: &mut opus::Encoder, quic_tx: &Sender<Vec<u8>>, email: String) -> anyhow::Result<()>
-{
-    let output = encoder.encode_vec( input, 1024)?;
+fn encode_and_send_i16(
+    input: &[i16],
+    encoder: &mut opus::Encoder,
+    quic_tx: &Sender<Vec<u8>>,
+    email: String,
+) -> anyhow::Result<()> {
+    let output = encoder.encode_vec(input, 1024)?;
     let output = transform_audio_chunk(output, email, 0);
     let output = output?.write_to_bytes()?;
     quic_tx.try_send(output)?;
     Ok(())
 }
 
-fn encode_and_send_f32(input: &[f32], encoder: &mut opus::Encoder, quic_tx: &Sender<Vec<u8>>, email: String) -> anyhow::Result<()>
-{
+fn encode_and_send_f32(
+    input: &[f32],
+    encoder: &mut opus::Encoder,
+    quic_tx: &Sender<Vec<u8>>,
+    email: String,
+) -> anyhow::Result<()> {
     let output = encoder.encode_vec_float(input, 1024)?;
     let output = transform_audio_chunk(output, email, 0);
     let output = output?.write_to_bytes()?;
@@ -153,7 +181,11 @@ fn encode_and_send_f32(input: &[f32], encoder: &mut opus::Encoder, quic_tx: &Sen
     Ok(())
 }
 
-fn transform_audio_chunk(data: Vec<u8>, email: String, sequence: u64) -> anyhow::Result<PacketWrapper> {
+fn transform_audio_chunk(
+    data: Vec<u8>,
+    email: String,
+    sequence: u64,
+) -> anyhow::Result<PacketWrapper> {
     Ok(PacketWrapper {
         packet_type: PacketType::MEDIA.into(),
         email: email.clone(),
@@ -170,7 +202,8 @@ fn transform_audio_chunk(data: Vec<u8>, email: String, sequence: u64) -> anyhow:
                 ..Default::default()
             }))),
             ..Default::default()
-        }.write_to_bytes()?,
+        }
+        .write_to_bytes()?,
         ..Default::default()
     })
 }

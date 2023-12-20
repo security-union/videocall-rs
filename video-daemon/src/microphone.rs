@@ -65,7 +65,7 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
     info!("Default input config: {:?}", config);
     // Opus only supports 48kHz sample rate so find a compatible config.
     for supported_config in device.supported_input_configs()?.filter_map(|x| Some(x.with_sample_rate(SampleRate(48000)))) {
-        if supported_config.channels() != 2 {
+        if supported_config.channels() != 1 {
             continue;
         }
         info!("Supported input config: {:?}", supported_config);
@@ -76,7 +76,7 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
         }
     }
 
-    let mut encoder = opus::Encoder::new(config.sample_rate().0, Channels::Stereo, opus::Application::Voip)?;
+    let mut encoder = opus::Encoder::new(48000, Channels::Mono, opus::Application::Voip)?;
 
     info!("Opus encoder created {:?}", encoder);
 
@@ -89,10 +89,7 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config.into(),
                 move |data, _: &_| {
-                    // XXX TODO: We are dropping data here because OPUS requires the chunks to be
-                    // 960, but we are receiving 4096 from cpal stream
-                    // So we need to fix this to not drop any of the data
-                    for chunk in data.chunks_exact(960) {
+                    for chunk in data.chunks_exact(240) {
                         match encode_and_send_i16(chunk, &mut encoder, &quic_tx, email.clone()) {
                             Ok(_) => {}
                             Err(e) => {
@@ -107,10 +104,7 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config.into(),
                 move |data, _: &_| {
-                    // XXX TODO: We are dropping data here because OPUS requires the chunks to be
-                    // 960, but we are receiving 4096 from cpal stream
-                    // So we need to fix this to not drop any of the data
-                    for chunk in data.chunks_exact(960) {
+                    for chunk in data.chunks_exact(240) {
                         match encode_and_send_f32(chunk, &mut encoder, &quic_tx, email.clone()) {
                             Ok(_) => {}
                             Err(e) => {
@@ -144,7 +138,6 @@ fn start_microphone(device: String, quic_tx: Sender<Vec<u8>>, email: String, sto
 fn encode_and_send_i16(input: &[i16], encoder: &mut opus::Encoder, quic_tx: &Sender<Vec<u8>>, email: String) -> anyhow::Result<()>
 {
     let output = encoder.encode_vec( input, 1024)?;
-    info!("Encoded {} samples", output.len());
     let output = transform_audio_chunk(output, email, 0);
     let output = output?.write_to_bytes()?;
     quic_tx.try_send(output)?;
@@ -154,7 +147,6 @@ fn encode_and_send_i16(input: &[i16], encoder: &mut opus::Encoder, quic_tx: &Sen
 fn encode_and_send_f32(input: &[f32], encoder: &mut opus::Encoder, quic_tx: &Sender<Vec<u8>>, email: String) -> anyhow::Result<()>
 {
     let output = encoder.encode_vec_float(input, 1024)?;
-    info!("Encoded {} samples", output.len());
     let output = transform_audio_chunk(output, email, 0);
     let output = output?.write_to_bytes()?;
     quic_tx.try_send(output)?;

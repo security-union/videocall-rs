@@ -23,6 +23,7 @@ pub enum WsAction {
     Log(String),
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub enum MeetingAction {
     ToggleScreenShare,

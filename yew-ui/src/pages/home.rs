@@ -4,7 +4,7 @@ use yew_router::prelude::*;
 
 use crate::Route;
 
-const TEXT_INPUT_CLASSES: &'static str = "rounded-md mx-2 p-2 text-black required:ring-2 required:ring-red-500 required:valid:ring-2 required:valid:ring-green-500";
+const TEXT_INPUT_CLASSES: &str = "rounded-md mx-2 p-2 text-black required:ring-2 required:ring-red-500 required:valid:ring-2 required:valid:ring-green-500";
 
 #[function_component(Home)]
 pub fn home() -> Html {

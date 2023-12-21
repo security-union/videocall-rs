@@ -1,4 +1,4 @@
 FROM securityunion/yew:1.72-slim
 
-RUN rustup component add clippy --toolchain nightly-2023-12-13-x86_64-unknown-linux-gnu
-RUN rustup component add rustfmt --toolchain nightly-2023-12-13-x86_64-unknown-linux-gnu
+RUN rustup component add clippy
+RUN rustup component add rustfmt

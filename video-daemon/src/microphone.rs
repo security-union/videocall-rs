@@ -1,5 +1,4 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::SampleRate;
 use opus::Channels;
 use protobuf::{Message, MessageField};
 use std::sync::atomic::AtomicBool;
@@ -75,29 +74,13 @@ fn start_microphone(
     .expect("failed to find input device");
 
     info!("Input device: {}", device.name()?);
-
-    let mut config = device.default_input_config()?;
-    info!("Default input config: {:?}", config);
-    // Opus only supports 48kHz sample rate so find a compatible config.
-    for supported_config in device
-        .supported_input_configs()?
-        .map(|x: cpal::SupportedStreamConfigRange| x.with_sample_rate(SampleRate(48000)))
-    {
-        if supported_config.channels() != 1 {
-            continue;
-        }
-        info!("Supported input config: {:?}", supported_config);
-        if supported_config.sample_format() == cpal::SampleFormat::F32
-            || supported_config.sample_format() == cpal::SampleFormat::I16
-        {
-            info!("Using supported input config: {:?}", supported_config);
-            config = supported_config;
-            break;
-        }
-    }
+    let range = cpal::SupportedBufferSize::Range {
+        min: 960,
+        max: 960
+    };
+    let config = cpal::SupportedStreamConfig::new(1, cpal::SampleRate(48000), range, cpal::SampleFormat::I16);
 
     let mut encoder = opus::Encoder::new(48000, Channels::Mono, opus::Application::Voip)?;
-
     info!("Opus encoder created {:?}", encoder);
 
     let err_fn = move |err| {
@@ -109,23 +92,8 @@ fn start_microphone(
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &config.into(),
                 move |data, _: &_| {
-                    for chunk in data.chunks_exact(240) {
+                    for chunk in data.chunks_exact(960) {
                         match encode_and_send_i16(chunk, &mut encoder, &quic_tx, email.clone()) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!("Failed to encode and send audio: {}", e);
-                            }
-                        }
-                    }
-                },
-                err_fn,
-                None,
-            )?,
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &config.into(),
-                move |data, _: &_| {
-                    for chunk in data.chunks_exact(240) {
-                        match encode_and_send_f32(chunk, &mut encoder, &quic_tx, email.clone()) {
                             Ok(_) => {}
                             Err(e) => {
                                 error!("Failed to encode and send audio: {}", e);
@@ -161,20 +129,7 @@ fn encode_and_send_i16(
     quic_tx: &Sender<Vec<u8>>,
     email: String,
 ) -> anyhow::Result<()> {
-    let output = encoder.encode_vec(input, 1024)?;
-    let output = transform_audio_chunk(output, email, 0);
-    let output = output?.write_to_bytes()?;
-    quic_tx.try_send(output)?;
-    Ok(())
-}
-
-fn encode_and_send_f32(
-    input: &[f32],
-    encoder: &mut opus::Encoder,
-    quic_tx: &Sender<Vec<u8>>,
-    email: String,
-) -> anyhow::Result<()> {
-    let output = encoder.encode_vec_float(input, 1024)?;
+    let output = encoder.encode_vec(input, 960)?;
     let output = transform_audio_chunk(output, email, 0);
     let output = output?.write_to_bytes()?;
     quic_tx.try_send(output)?;

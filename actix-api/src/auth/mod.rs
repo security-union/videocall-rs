@@ -81,6 +81,7 @@ pub fn fetch_oauth_request(pool: web::Data<PostgresPool>, state: String) -> Anys
         "SELECT * FROM oauth_requests WHERE csrf_state=$1",
         &[&state],
     )?;
+    #[allow(clippy::manual_try_fold)]
     result
         .iter()
         .fold(Err(anyhow!("Unable to find request")), |_acc, row| {

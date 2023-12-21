@@ -1,4 +1,4 @@
-FROM rust:1.71-slim
+FROM rust:1.72-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ARG USER
 ARG UID
@@ -10,7 +10,7 @@ RUN apt-get update && \
         curl \
         protobuf-compiler
 
-RUN cargo install protobuf-codegen --vers 3.2.0
+RUN cargo install protobuf-codegen --vers 3.3.0
 
 RUN useradd --create-home $USER --uid $UID && \
         adduser $USER sudo && \

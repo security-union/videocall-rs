@@ -1,0 +1,5 @@
+syntax = "proto3";
+
+message ConnectionPacket {
+  string meeting_id = 1;
+}

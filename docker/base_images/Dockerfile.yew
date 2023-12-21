@@ -1,7 +1,7 @@
-FROM rust:1.65-slim-bullseye as development
+FROM rust:1.72-slim as development
 
-RUN rustup default nightly-2023-01-27
+RUN rustup default nightly-2023-12-13
 RUN apt-get --yes update && apt-get --yes install git pkg-config libssl-dev
-RUN cargo install wasm-bindgen-cli --version 0.2.78
-RUN cargo install trunk --version 0.16.0
+RUN cargo install wasm-bindgen-cli --version 0.2.87
+RUN cargo install trunk --version 0.17.5
 RUN rustup target add wasm32-unknown-unknown

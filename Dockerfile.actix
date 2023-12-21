@@ -1,11 +1,13 @@
-FROM securityunion/rustlemania-api-base:push-images-to-dockerhub-304d6434 as build
+FROM securityunion/rustlemania-api-base:1.72-slim as build
 
 ENV CARGO_TARGET_DIR=/app/actix-api/target
 COPY . /app
 WORKDIR /app/actix-api
 RUN cargo build --release
 
-FROM debian:bullseye-slim as production
+FROM debian:bookworm-slim as production
+
+RUN apt-get --yes update && apt-get --yes install libssl-dev
 
 COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
 COPY --from=build /app/actix-api/target/release/websocket_server /usr/bin/websocket_server

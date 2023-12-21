@@ -1,76 +1,42 @@
 # Based on https://github.com/actions-rs/meta/blob/master/recipes/quickstart.md
 
-on: [pull_request]
+on: 
+  pull_request:
+    paths:
+      - 'actix-api/**'
+      - 'types/**'
+      - 'yew-ui/**'
+      - 'docker/**'
 
-name: cargo test
-
-env:
-  ACTIX_PORT: 8080
-  UI_ENDPOINT: localhost:80
-  OAUTH_CLIENT_ID: blah
-  OAUTH_AUTH_URL: blah
-  OAUTH_TOKEN_URL: blah
-  OAUTH_CLIENT_SECRET: blah
-  OAUTH_REDIRECT_URL: http://localhost:8080/login/callback
-  RUST_LOG: info
-  DATABASE_URL: postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
-  ACTIX_UI_BACKEND_URL: yeet
-  LOGIN_URL: yeet
-  WEBTRANSPORT_HOST: yeet
-  ENABLE_OAUTH: false
-  WEBTRANSPORT_ENABLED: true
-  E2EE_ENABLED: true
-
+name: check backend
+  
 jobs:
-
-  test-api:
-    name: cargo test and lint api
+  test:
+    name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@1.70
+
+      # Cache Docker layers
+      - name: Cache Docker layers
+        uses: actions/cache@v2
         with:
-          components: clippy, rustfmt
-      - run: cd actix-api && cargo clippy -- --deny warnings
-      - run: cd actix-api && cargo fmt --check
-      - run: cd actix-api && cargo test
+          path: /tmp/.docker
+          key: ${{ runner.os }}-docker-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
 
-
-  lint-ui:
-    name: cargo lint ui
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@1.65
+      # Cache Rust build artifacts
+      - name: Cache Cargo Registry
+        uses: actions/cache@v2
         with:
-          components: clippy, rustfmt
-          toolchain: nightly-2023-01-27
-      - run: rustup target add wasm32-unknown-unknown
-      - run: cd yew-ui && cargo fmt --check
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-  test-ui:
-    name: UI Test Suite
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-        with:
-          working-directory: ./yew-ui
-
-      - name: Install nightly toolchain and wasm32-unknown-unknown
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          target: wasm32-unknown-unknown
-          toolchain: nightly-2023-01-27
-          override: true
-
-      - name: Install wasm-bindgen-cli
-        uses: jetli/wasm-bindgen-action@v0.2.0
-        with:
-          version: 'latest'
-
-      - name: Run cargo test
-        run: |
-          cd yew-ui
-          cargo test
+      - run: make check
+      - run: make test

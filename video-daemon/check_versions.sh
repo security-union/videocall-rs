@@ -8,6 +8,7 @@ packages=(
     "libvpx-dev"
     "libasound2-dev"
     "cmake"
+    "libv4l-dev"
 )
 
 # Function to check the version of a package

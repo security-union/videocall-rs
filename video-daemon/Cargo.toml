@@ -5,6 +5,12 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[package.metadata.deb]
+maintainer = "Your Name <dario@securityunion.dev>"
+description = "Stream audio and video to the videocall-rs backend"
+license-file = ["LICENSE", "4"]
+depends = "$auto"
+
 [dependencies]
 anyhow = "1.0.75"
 base64 = "0.21.4"

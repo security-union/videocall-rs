@@ -1,0 +1,40 @@
+name: Build and Package DEB
+
+on:
+  push:
+    branches:
+      - main
+      - add-debian-distribution
+    tags:
+      - '*'
+
+jobs:
+  build_and_package:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake
+
+
+    - name: Build and Create DEB Package
+      run: |
+        cargo install cargo-deb
+        cd video-daemon
+        cargo deb
+
+    - uses: actions/upload-artifact@v2
+      with:
+        name: video-daemon.deb
+        path: video-daemon/target/debian/*.deb

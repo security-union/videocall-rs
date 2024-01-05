@@ -2,8 +2,19 @@
 name = "video-daemon"
 version = "0.1.0"
 edition = "2021"
+description = "Stream audio and video to the videocall-rs backend"
+license = "MIT"
+authors = [
+    "Griffin Obeid <griffin@securityunion.dev>",
+    "Dario Lencina <dario@securityunion.dev>",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.deb]
+maintainer = "Dario Lencina <dario@securityunion.dev>"
+license-file = ["../LICENSE.md", "4"]
+depends = "libvpx7 (>= 1.11.0), libvpx-dev (>= 1.11.0), libc6 (>= 2.34), libasound2-dev (>=1.2.8), libv4l-dev (>=1.22.1)"
 
 [dependencies]
 anyhow = "1.0.75"

@@ -10,7 +10,7 @@ on:
 
 jobs:
   build_and_package:
-    runs-on: ubuntu-latest
+    runs-on: debian-latest
 
     steps:
     - uses: actions/checkout@v2

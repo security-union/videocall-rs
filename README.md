@@ -64,13 +64,17 @@ Contains 3 sub-projects
 ## Dockerized workflow
 
 1. Install docker https://docs.docker.com/engine/install/
-2. Run one of the supported make commands
+2. Install buildx https://github.com/docker/buildx?tab=readme-ov-file#installing
+3. Run one of the supported make commands
 ```
 make test
 make up
 make down
 make build
 ```
+
+> Currently the Dockerfile in the repositories root is different from the files in `docker/`.
+> This will be refactored shortly
 
 ## Without docker
 

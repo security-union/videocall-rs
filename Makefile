@@ -7,7 +7,7 @@ up:
 down:
 		docker compose -f docker/docker-compose.yaml down
 build:
-		docker compose -f docker/docker-compose.yaml build
+		docker docker buildx build --target rustlemania -t rustlemania --load .
 
 connect_to_db:
 		docker compose -f docker/docker-compose.yaml run postgres bash -c "psql -h postgres -d actix-api-db -U postgres"

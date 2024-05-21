@@ -1,0 +1,66 @@
+# Multi-Stage - Multi-Target Dockerfile.
+# The base is rather big, but only needed for build but makes caching a bit easier and faster.
+
+### Yew build stage ###
+# docker buildx build --target rustlemania-ui-build -t rustlemania-ui-build --load .
+ARG UI_BASE_FROM=rustlemania-ui-base
+ARG UI_BUILD_FROM=rustlemania-ui-build
+ARG ACTIX_UI_BACKEND_URL="wss://api.rustlemania.com"
+ARG WEBTRANSPORT_HOST="https://transport.rustlemania.com"
+ARG WEBTRANSPORT_ENABLED="false"
+ARG ENABLE_OAUTH="false"
+ARG LOGIN_URL=""
+ARG E2EE_ENABLED="false"
+ARG USERS_ALLOWED_TO_STREAM=""
+
+FROM rust:1.78-slim as rustlemania-ui-base
+# Build Args Scoping - Must be consumed from global.
+ARG UI_BASE_FROM
+ARG UI_BUILD_FROM
+ARG ACTIX_UI_BACKEND_URL
+ARG WEBTRANSPORT_HOST
+ARG WEBTRANSPORT_ENABLED
+ARG ENABLE_OAUTH
+ARG LOGIN_URL
+ARG E2EE_ENABLED
+ARG USERS_ALLOWED_TO_STREAM
+
+# TODO: Make yew-ui load a config for these values with defaults
+RUN apt-get --yes update && apt-get --yes install git pkg-config libssl-dev
+WORKDIR /usr/local/src
+COPY . .
+RUN rustup default nightly-2023-12-13
+RUN cargo install wasm-bindgen-cli --version 0.2.87
+RUN cargo install trunk --version 0.17.5
+RUN rustup target add wasm32-unknown-unknown 
+RUN rustup component add clippy
+RUN rustup component add rustfmt
+
+FROM ${UI_BASE_FROM} as rustlemania-ui-build
+# Theoretically the arguments should be available to the child stage, but in case of caching, we consume them again.
+ARG UI_BASE_FROM
+ARG UI_BUILD_FROM
+ARG ACTIX_UI_BACKEND_URL
+ARG WEBTRANSPORT_HOST
+ARG WEBTRANSPORT_ENABLED
+ARG ENABLE_OAUTH
+ARG LOGIN_URL
+ARG E2EE_ENABLED
+ARG USERS_ALLOWED_TO_STREAM
+
+ENV ENABLE_OAUTH=${ENABLE_OAUTH}
+ENV LOGIN_URL=${LOGIN_URL}
+ENV ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL}
+ENV WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST}
+ENV WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED}
+ENV E2EE_ENABLED=${E2EE_ENABLED}
+ENV USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM}
+
+WORKDIR /usr/local/src/yew-ui
+RUN trunk build --release
+
+FROM nginx:1.21.5-alpine as rustlemania-ui
+
+COPY nginx.conf /etc/nginx/nginx.conf
+COPY --from=rustlemania-ui-build /usr/local/src/yew-ui/dist /usr/share/nginx/html
+

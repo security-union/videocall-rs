@@ -1,0 +1,93 @@
+# Create a local .cargo_registry directory with the local user.
+# This allows to run the development environment as non-root and cargo caching
+# Also create yew-ui/.cache - This is required by wasm-bindgen
+
+services:
+
+  nats:
+    image: nats
+    command: "--http_port 8222"
+    ports:
+    - "4222:4222"
+    - "8222:8222"
+  #rm -rf ~/.cache/.wasm-pack
+  yew-ui-dev:
+    image: rustlemania-ui-build
+    build:
+      context: ./
+      dockerfile: Dockerfile.ui
+      target: rustlemania-ui-build
+    working_dir: /usr/local/src/yew-ui
+    user: ${UID:-1000}:${GID:-1000}
+    entrypoint:
+    - trunk
+    - serve
+    command: 
+    - --address
+    - 0.0.0.0
+    - --port 
+    - ${TRUNK_SERVE_PORT:-8000}
+    environment:
+    - HOME=/usr/local/src/yew-ui
+    - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
+    - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
+    - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-8000}
+    - ENABLE_OAUTH=false
+    - LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login
+    - RUSTFLAGS=--cfg=web_sys_unstable_apis
+    - RUST_BACKTRACE=1
+    - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
+    - E2EE_ENABLED=${E2EE_ENABLED:-false}
+    - USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM:-}
+    ports:
+    - "${TRUNK_SERVE_PORT:-8000}:${TRUNK_SERVE_PORT:-8000}"
+    volumes:
+    - type: bind
+      source: ./
+      target: /usr/local/src
+    - type: bind
+      source: /etc/passwd
+      read_only: true
+      target: /etc/passwd
+    - type: bind
+      source: .cargo_registry/
+      target: /usr/local/cargo/registry
+    - type: bind
+      source: .cache/
+      target: /usr/local/src/yew-ui/.cache
+
+  websocket-api:
+    image: rustlemania-base
+    build:
+      context: ./
+      dockerfile: Dockerfile
+      target: rustlemania-base
+    user: ${UID:-1000}:${GID:-1000}
+    working_dir: /usr/local/src/actix-api
+    command: bash -c "cargo watch -x \"run -r --bin websocket_server\""
+    environment:
+      - ACTIX_PORT=${ACTIX_PORT:-8080}
+      - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:8000}
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
+      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL}
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
+      - OAUTH_REDIRECT_URL=http://localhost:${ACTIX_PORT:-8080}/login/callback
+      - RUST_LOG=debug
+      #- DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - NATS_URL=nats:4222
+    ports:
+      - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
+    volumes:
+    - type: bind
+      source: ./
+      target: /usr/local/src
+    - type: bind
+      source: /etc/passwd
+      read_only: true
+      target: /etc/passwd
+    - type: bind
+      source: .cargo_registry/
+      target: /usr/local/cargo/registry
+    
+      #- cargo_cache:/usr/local/cargo/registry

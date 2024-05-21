@@ -3,3 +3,5 @@
 .mp4
 .env
 target/
+.cargo_registry
+.cache

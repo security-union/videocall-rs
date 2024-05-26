@@ -26,6 +26,7 @@ enum Status {
 pub struct Connection {
     task: Rc<Task>,
     heartbeat: Option<Interval>,
+    heartbeat_monitor: Option<Interval>,
     status: Rc<Cell<Status>>,
     aes: Rc<Aes128State>,
 }
@@ -53,13 +54,16 @@ impl Connection {
                 Callback::from(move |_| status.set(Status::Closed)),
             );
         }
+        let monitor = options.peer_monitor.clone();
         let mut connection = Self {
             task: Rc::new(Task::connect(webtransport, options)?),
             heartbeat: None,
+            heartbeat_monitor: Some(Interval::new(5000, move || {monitor.emit(());})),
             status,
             aes,
         };
         connection.start_heartbeat(userid);
+
         Ok(connection)
     }
 
@@ -95,6 +99,9 @@ impl Connection {
     fn stop_heartbeat(&mut self) {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.cancel();
+        }
+        if let Some(heartbeat_monitor) = self.heartbeat_monitor.take() {
+            heartbeat_monitor.cancel();
         }
     }
 

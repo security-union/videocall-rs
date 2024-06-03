@@ -1,16 +1,12 @@
-use super::icons::push_pin::PushPinIcon;
+use crate::components::{canvas_generator, peer_list::PeerList};
 use crate::constants::{USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use crate::components::peer_list::PeerList;
 use log::{error, warn};
-use std::rc::Rc;
 use types::protos::media_packet::media_packet::MediaType;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
-use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::*;
 use yew::prelude::*;
-use yew::virtual_dom::VNode;
 use yew::{html, Component, Context, Html};
 
 #[derive(Debug)]
@@ -226,58 +222,12 @@ impl Component for AttendantsComponent {
         let email = ctx.props().email.clone();
         let media_access_granted = self.media_device_access.is_granted();
 
-
         let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
         let dummy_peers: Vec<String> = vec!["Mark".to_owned(), "Stephen".to_owned(), "Rustling".to_owned(), "He owes me money".to_owned()];
 
-        let rows: Vec<VNode> = self
-            .client
-            .sorted_peer_keys()
-            .iter()
-            .map(|key| {
-                if !USERS_ALLOWED_TO_STREAM.is_empty()
-                    && !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
-                {
-                    return html! {};
-                }
-                let screen_share_css = if self.client.is_awaiting_peer_screen_frame(key) {
-                    "grid-item hidden"
-                } else {
-                    "grid-item"
-                };
-                let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
-                let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
-                html! {
-                    <>
-                        <div class={screen_share_css} id={(*screen_share_div_id).clone()}>
-                            // Canvas for Screen share.
-                            <div class="canvas-container">
-                                <canvas id={format!("screen-share-{}", &key)}></canvas>
-                                <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
-                                <button onclick={Callback::from(move |_| {
-                                    toggle_pinned_div(&(*screen_share_div_id).clone());
-                                })} class="pin-icon">
-                                    <PushPinIcon/>
-                                </button>
-                            </div>
-                        </div>
-                        <div class="grid-item" id={(*peer_video_div_id).clone()}>
-                            // One canvas for the User Video
-                            <div class="canvas-container">
-                                <UserVideo id={key.clone()}></UserVideo>
-                                <h4 class="floating-name">{key.clone()}</h4>
-                                <button onclick={
-                                    Callback::from(move |_| {
-                                    toggle_pinned_div(&(*peer_video_div_id).clone());
-                                })} class="pin-icon">
-                                    <PushPinIcon/>
-                                </button>
-                            </div>
-                        </div>
-                    </>
-                }
-            })
-            .collect();
+        let peers = self.client.sorted_peer_keys();
+        let rows = canvas_generator::generate(&self.client, peers);
+
         html! {
             <div id="main-container">
                 <div id="grid-container" style={if self.peer_list_open {"width: 80%;"} else {"width: 100%;"}}>
@@ -342,54 +292,6 @@ impl Component for AttendantsComponent {
                     <PeerList peers={dummy_peers} onclose={toggle_peer_list} />
                 </div>
             </div>
-        }
-    }
-}
-
-// props for the video component
-#[derive(Properties, Debug, PartialEq)]
-pub struct UserVideoProps {
-    pub id: String,
-}
-
-// user video functional component
-#[function_component(UserVideo)]
-fn user_video(props: &UserVideoProps) -> Html {
-    // create use_effect hook that gets called only once and sets a thumbnail
-    // for the user video
-    let video_ref = use_state(NodeRef::default);
-    let video_ref_clone = video_ref.clone();
-    use_effect_with_deps(
-        move |_| {
-            // Set thumbnail for the video
-            let video = (*video_ref_clone).cast::<HtmlCanvasElement>().unwrap();
-            let ctx = video
-                .get_context("2d")
-                .unwrap()
-                .unwrap()
-                .unchecked_into::<CanvasRenderingContext2d>();
-            ctx.clear_rect(0.0, 0.0, video.width() as f64, video.height() as f64);
-            || ()
-        },
-        vec![props.id.clone()],
-    );
-
-    html! {
-        <canvas ref={(*video_ref).clone()} id={props.id.clone()}></canvas>
-    }
-}
-
-fn toggle_pinned_div(div_id: &str) {
-    if let Some(div) = window()
-        .and_then(|w| w.document())
-        .and_then(|doc| doc.get_element_by_id(div_id))
-    {
-        // if the div does not have the grid-item-pinned css class, add it to it
-        if !div.class_list().contains("grid-item-pinned") {
-            div.class_list().add_1("grid-item-pinned").unwrap();
-        } else {
-            // else remove it
-            div.class_list().remove_1("grid-item-pinned").unwrap();
         }
     }
 }

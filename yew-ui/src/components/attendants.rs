@@ -1,6 +1,7 @@
 use super::icons::push_pin::PushPinIcon;
 use crate::constants::{USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
+use crate::components::peer_list::PeerList;
 use log::{error, warn};
 use std::rc::Rc;
 use types::protos::media_packet::media_packet::MediaType;
@@ -31,16 +32,27 @@ pub enum MeetingAction {
     ToggleVideoOnOff,
 }
 
+pub enum UserScreenAction {
+    TogglePeerList,
+}
+
 pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
+    UserScreenAction(UserScreenAction),
 }
 
 impl From<WsAction> for Msg {
     fn from(action: WsAction) -> Self {
         Msg::WsAction(action)
+    }
+}
+
+impl From<UserScreenAction> for Msg {
+    fn from(action: UserScreenAction) -> Self {
+        Msg::UserScreenAction(action)
     }
 }
 
@@ -69,6 +81,7 @@ pub struct AttendantsComponent {
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
+    pub peer_list_open: bool,
     pub error: Option<String>,
 }
 
@@ -133,6 +146,7 @@ impl Component for AttendantsComponent {
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
+            peer_list_open: false,
             error: None,
         }
     }
@@ -197,12 +211,25 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            Msg::UserScreenAction(action) => {
+                match action {
+                    UserScreenAction::TogglePeerList => {
+                        self.peer_list_open = !self.peer_list_open;
+                    }
+                }
+                true
+            }
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let email = ctx.props().email.clone();
         let media_access_granted = self.media_device_access.is_granted();
+
+
+        let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
+        let dummy_peers: Vec<String> = vec!["Mark".to_owned(), "Stephen".to_owned(), "Rustling".to_owned(), "He owes me money".to_owned()];
+
         let rows: Vec<VNode> = self
             .client
             .sorted_peer_keys()
@@ -252,58 +279,68 @@ impl Component for AttendantsComponent {
             })
             .collect();
         html! {
-            <div class="grid-container">
-                { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
-                { rows }
-                {
-                    if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
-                        html! {
-                            <nav class="host">
-                                <div class="controls">
-                                    <button
-                                        class="bg-yew-blue p-2 rounded-md text-white"
-                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
-                                        { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
-                                    </button>
-                                    <button
-                                        class="bg-yew-blue p-2 rounded-md text-white"
-                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
-                                        { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
-                                    </button>
-                                    <button
-                                        class="bg-yew-blue p-2 rounded-md text-white"
-                                        onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
-                                        { if !self.mic_enabled { "Unmute"} else { "Mute"} }
+            <div id="main-container">
+                <div id="grid-container" style={if self.peer_list_open {"width: 80%;"} else {"width: 100%;"}}>
+                    { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
+                    { rows }
+                    {
+                        if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
+                            html! {
+                                <nav class="host">
+                                    <div class="controls">
+                                        <button
+                                            class="bg-yew-blue p-2 rounded-md text-white"
+                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
+                                            { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
                                         </button>
-                                </div>
-                                {
-                                    if media_access_granted {
-                                        html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} />}
-                                    } else {
-                                        html! {<></>}
+                                        <button
+                                            class="bg-yew-blue p-2 rounded-md text-white"
+                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
+                                            { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
+                                        </button>
+                                        <button
+                                            class="bg-yew-blue p-2 rounded-md text-white"
+                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
+                                            { if !self.mic_enabled { "Unmute"} else { "Mute"} }
+                                        </button>
+                                        <button
+                                            class="bg-yew-blue p-2 rounded-md text-white"
+                                            onclick={toggle_peer_list.clone()}>
+                                            { if !self.peer_list_open { "Open Peers"} else { "Close Peers"} }
+                                        </button>
+                                    </div>
+                                    {
+                                        if media_access_granted {
+                                            html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} />}
+                                        } else {
+                                            html! {<></>}
+                                        }
                                     }
-                                }
-                                <h4 class="floating-name">{email}</h4>
+                                    <h4 class="floating-name">{email}</h4>
 
-                                {if !self.client.is_connected() {
-                                    html! {<h4>{"Connecting"}</h4>}
-                                } else {
-                                    html! {<h4>{"Connected"}</h4>}
-                                }}
+                                    {if !self.client.is_connected() {
+                                        html! {<h4>{"Connecting"}</h4>}
+                                    } else {
+                                        html! {<h4>{"Connected"}</h4>}
+                                    }}
 
-                                {if ctx.props().e2ee_enabled {
-                                    html! {<h4>{"End to End Encryption Enabled"}</h4>}
-                                } else {
-                                    html! {<h4>{"End to End Encryption Disabled"}</h4>}
-                                }}
-                            </nav>
+                                    {if ctx.props().e2ee_enabled {
+                                        html! {<h4>{"End to End Encryption Enabled"}</h4>}
+                                    } else {
+                                        html! {<h4>{"End to End Encryption Disabled"}</h4>}
+                                    }}
+                                </nav>
+                            }
+                        } else {
+                            error!("User not allowed to stream");
+                            error!("allowed users {}", USERS_ALLOWED_TO_STREAM.join(", "));
+                            html! {}
                         }
-                    } else {
-                        error!("User not allowed to stream");
-                        error!("allowed users {}", USERS_ALLOWED_TO_STREAM.join(", "));
-                        html! {}
                     }
-                }
+                </div>
+                <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
+                    <PeerList peers={dummy_peers} onclose={toggle_peer_list} />
+                </div>
             </div>
         }
     }

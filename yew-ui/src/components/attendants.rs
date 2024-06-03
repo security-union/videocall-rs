@@ -1,5 +1,5 @@
 use crate::components::{canvas_generator, peer_list::PeerList};
-use crate::constants::{USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
+use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::{error, warn};
 use types::protos::media_packet::media_packet::MediaType;
@@ -223,10 +223,12 @@ impl Component for AttendantsComponent {
         let media_access_granted = self.media_device_access.is_granted();
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
-        let dummy_peers: Vec<String> = vec!["Mark".to_owned(), "Stephen".to_owned(), "Rustling".to_owned(), "He owes me money".to_owned()];
 
         let peers = self.client.sorted_peer_keys();
-        let rows = canvas_generator::generate(&self.client, peers);
+        let rows = canvas_generator::generate(
+            &self.client,
+            peers.iter().take(CANVAS_LIMIT).cloned().collect(),
+        );
 
         html! {
             <div id="main-container">
@@ -289,7 +291,7 @@ impl Component for AttendantsComponent {
                     }
                 </div>
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
-                    <PeerList peers={dummy_peers} onclose={toggle_peer_list} />
+                    <PeerList peers={peers} onclose={toggle_peer_list} />
                 </div>
             </div>
         }

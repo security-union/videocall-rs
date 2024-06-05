@@ -1,3 +1,4 @@
+use crate::components::peer_list_item::PeerListItem;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew::{html, Component, Context};
@@ -44,7 +45,7 @@ impl Component for PeerList {
             .filter(|peer| {
                 peer.to_lowercase()
                     .contains(&self.search_query.to_lowercase())
-                })
+            })
             .cloned()
             .collect();
 
@@ -56,20 +57,25 @@ impl Component for PeerList {
         html! {
         <>
             <div id="peer-list-container-header">
-                <h1>{ "This is the Peer List." }</h1>
+                <p><b>{ "Attendants" }</b></p>
                 <button onclick={ctx.props().onclose.clone()}>{ "X" }</button>
             </div>
-            <div>
+            <div class="search-box">
                 <input
                     type="text"
                     placeholder="Search..."
                     value={self.search_query.clone()}
                     oninput={search_peers}
                 />
+            </div>
+            <div>
+                <p style="margin-top:20px"><b>{ "In call" }</b></p>
+            </div>
+            <div class="peer-list">
                 <ul>
                     { for filtered_peers.iter().map(|peer|
                         html!{
-                            <li>{ peer } </li>        
+                            <li><PeerListItem name={peer.clone()}/></li>
                         })
                     }
                 </ul>

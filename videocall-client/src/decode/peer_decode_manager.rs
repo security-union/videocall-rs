@@ -57,6 +57,7 @@ pub struct Peer {
     pub video_canvas_id: String,
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
+    heartbeat_count: u8,
 }
 
 impl Peer {
@@ -75,6 +76,7 @@ impl Peer {
             video_canvas_id,
             screen_canvas_id,
             aes,
+            heartbeat_count: 1
         }
     }
 
@@ -152,6 +154,19 @@ impl Peer {
             )),
         }
     }
+
+    fn on_heartbeat(&mut self) {
+        self.heartbeat_count += 1;
+    }
+
+    pub fn check_heartbeat(&mut self) -> bool {
+       if self.heartbeat_count != 0 {
+            self.heartbeat_count = 0;
+            return true;
+        }
+        debug!("---@@@--- detected heartbeat stop for {}", self.email.clone());
+        return false;
+    }
 }
 
 fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> {
@@ -186,11 +201,20 @@ impl PeerDecodeManager {
         self.connected_peers.get(key)
     }
 
+    pub fn run_peer_monitor(&mut self) {
+        let pred = |peer: &mut Peer| peer.check_heartbeat();
+        self.connected_peers.remove_if(pred);
+    }
+
     pub fn decode(&mut self, response: PacketWrapper) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if let Some(peer) = self.connected_peers.get_mut(&email) {
             match peer.decode(&packet) {
+                Ok((MediaType::HEARTBEAT, _)) => {
+                    peer.on_heartbeat();
+                    Ok(())
+                },
                 Ok((media_type, decode_status)) => {
                     if decode_status.first_frame {
                         self.on_first_frame.emit((email.clone(), media_type));

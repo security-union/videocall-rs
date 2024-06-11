@@ -74,4 +74,24 @@ impl<K: Ord + Hash + Clone, V> HashMapWithOrderedKeys<K, V> {
     pub fn ordered_keys(&self) -> &Vec<K> {
         &self.keys
     }
+
+    pub fn remove_if<F>(&mut self, predicate: F)
+    where
+        F: Fn(&mut V) -> bool
+    {
+        let mut keys_to_remove = Vec::new();
+
+        for key in &self.keys{
+            if let Some(value) = self.map.get_mut(key) {
+                if !predicate(value){
+                    keys_to_remove.push(key.clone());
+               }
+            }
+        }
+
+         for key in &keys_to_remove {
+            self.map.remove(&key);
+            self.keys.retain(|k| k != key);
+        }
+    }
 }

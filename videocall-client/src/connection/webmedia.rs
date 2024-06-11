@@ -17,6 +17,7 @@ pub struct ConnectOptions {
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_connected: Callback<()>,
     pub on_connection_lost: Callback<()>,
+    pub peer_monitor: Callback<()>,
 }
 
 pub(super) trait WebMedia<TASK> {

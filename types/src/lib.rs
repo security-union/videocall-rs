@@ -14,6 +14,22 @@ impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
     }
 }
 
+impl std::fmt::Display for protos::media_management_packet::media_management_packet::EventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            protos::media_management_packet::media_management_packet::EventType::SUBSCRIBE => {
+                write!(f, "SUBSCRIBE")
+            }
+            protos::media_management_packet::media_management_packet::EventType::UNSUBSCRIBE => {
+                write!(f, "UNSUBSCRIBE")
+            }
+            protos::media_management_packet::media_management_packet::EventType::ONGOING_STREAM => {
+                write!(f, "ONGOING_STREAM")
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {

@@ -177,7 +177,7 @@ impl VideoCallClient {
                             Ok(mut inner) => {
                                 inner.peer_decode_manager.run_peer_monitor();
                                 on_connection_lost.emit(());
-                            },
+                            }
                             Err(_) => {
                                 error!("Unable to borrow inner -- not starting peer monitor");
                             }
@@ -185,7 +185,6 @@ impl VideoCallClient {
                     }
                 })
             },
-
         };
         info!(
             "webtransport connect = {}",

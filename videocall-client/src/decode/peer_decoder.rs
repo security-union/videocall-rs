@@ -36,7 +36,7 @@ use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 
 pub struct DecodeStatus {
-    pub rendered: bool,
+    pub _rendered: bool,
     pub first_frame: bool,
 }
 
@@ -88,7 +88,7 @@ macro_rules! impl_decode {
             }
         }
         Ok(DecodeStatus {
-            rendered: true,
+            _rendered: true,
             first_frame,
         })
     }};

@@ -8,6 +8,8 @@ services:
         target: /app
       - /app/target
       - rustlemania-yew-ui-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-yew-ui-cache:/app/yew-ui/target
+
 
     build:
       dockerfile: ../docker/Dockerfile.yew
@@ -51,6 +53,7 @@ services:
         target: /app
       - /app/target
       - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-actix-web-target-cache:/app/actix-api/target
 
     depends_on:
       - postgres
@@ -76,6 +79,7 @@ services:
         target: /app
       - /app/target
       - rustlemania-actix-webtransport-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-actix-webtransport-cache:/app/actix-api/target
 
     depends_on:
       - nats
@@ -110,3 +114,6 @@ volumes:
   rustlemania-actix-web-cargo-registry-cache:
   rustlemania-actix-webtransport-cargo-registry-cache:
   rustlemania-yew-ui-cargo-registry-cache:
+  rustlemania-actix-web-target-cache:
+  rustlemania-actix-webtransport-cache:
+  rustlemania-yew-ui-cache:

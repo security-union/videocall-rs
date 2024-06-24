@@ -58,7 +58,9 @@ impl Connection {
         let mut connection = Self {
             task: Rc::new(Task::connect(webtransport, options)?),
             heartbeat: None,
-            heartbeat_monitor: Some(Interval::new(5000, move || {monitor.emit(());})),
+            heartbeat_monitor: Some(Interval::new(5000, move || {
+                monitor.emit(());
+            })),
             status,
             aes,
         };

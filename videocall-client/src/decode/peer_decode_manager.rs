@@ -76,7 +76,7 @@ impl Peer {
             video_canvas_id,
             screen_canvas_id,
             aes,
-            heartbeat_count: 1
+            heartbeat_count: 1,
         }
     }
 
@@ -160,11 +160,14 @@ impl Peer {
     }
 
     pub fn check_heartbeat(&mut self) -> bool {
-       if self.heartbeat_count != 0 {
+        if self.heartbeat_count != 0 {
             self.heartbeat_count = 0;
             return true;
         }
-        debug!("---@@@--- detected heartbeat stop for {}", self.email.clone());
+        debug!(
+            "---@@@--- detected heartbeat stop for {}",
+            self.email.clone()
+        );
         return false;
     }
 }
@@ -214,7 +217,7 @@ impl PeerDecodeManager {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();
                     Ok(())
-                },
+                }
                 Ok((media_type, decode_status)) => {
                     if decode_status.first_frame {
                         self.on_first_frame.emit((email.clone(), media_type));

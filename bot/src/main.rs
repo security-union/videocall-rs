@@ -70,7 +70,7 @@ async fn create_client(
 
                     // rewrite whatever is in the protobuf so that it seems like it is coming from this bot
                     if media_packet.email == echo_user {
-                        media_packet.email = email.clone();
+                        media_packet.email.clone_from(&email);
 
                         // send the protobuf back to the server
                         let mut buf = Vec::new();

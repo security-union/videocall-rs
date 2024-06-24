@@ -42,7 +42,7 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
             let is_future_frame = new_sequence_number > sequence;
             let is_future_i_frame = is_future_frame && frame_type == EncodedVideoChunkType::Key;
             let is_next_frame = new_sequence_number == sequence + 1;
-            let next_frame_already_cached = self.cache.get(&(sequence + 1)).is_some();
+            let next_frame_already_cached = self.cache.contains_key(&(sequence + 1));
             if is_future_i_frame || is_next_frame {
                 self.video_decoder.decode(image);
                 self.sequence = Some(new_sequence_number);

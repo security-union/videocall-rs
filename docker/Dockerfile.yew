@@ -1,4 +1,4 @@
-FROM securityunion/yew:1.72-slim
+FROM securityunion/yew:update-rust-7c189827
 
 RUN rustup component add clippy
 RUN rustup component add rustfmt

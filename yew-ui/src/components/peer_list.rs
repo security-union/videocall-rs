@@ -76,7 +76,6 @@ impl Component for PeerList {
                 </ul>
             </div>
             <div class="footer">
-                <p>{ "Some foot note" }</p>
             </div>
         </>
         }

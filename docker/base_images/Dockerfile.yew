@@ -1,4 +1,4 @@
-FROM rust:1.72-slim as development
+FROM rust:1.79-slim as development
 
 RUN rustup default nightly-2023-12-13
 RUN apt-get --yes update && apt-get --yes install git pkg-config libssl-dev

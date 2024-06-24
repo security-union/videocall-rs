@@ -168,6 +168,24 @@ impl VideoCallClient {
                 })
             },
             on_connection_lost: self.options.on_connection_lost.clone(),
+            peer_monitor: {
+                let inner = Rc::downgrade(&self.inner);
+                let on_connection_lost = self.options.on_connection_lost.clone();
+                Callback::from(move |_| {
+                    if let Some(inner) = Weak::upgrade(&inner) {
+                        match inner.try_borrow_mut() {
+                            Ok(mut inner) => {
+                                inner.peer_decode_manager.run_peer_monitor();
+                                on_connection_lost.emit(());
+                            },
+                            Err(_) => {
+                                error!("Unable to borrow inner -- not starting peer monitor");
+                            }
+                        }
+                    }
+                })
+            },
+
         };
         info!(
             "webtransport connect = {}",

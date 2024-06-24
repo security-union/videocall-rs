@@ -148,7 +148,7 @@ impl Peer {
             MediaType::HEARTBEAT => Ok((
                 media_type,
                 DecodeStatus {
-                    rendered: false,
+                    _rendered: false,
                     first_frame: false,
                 },
             )),

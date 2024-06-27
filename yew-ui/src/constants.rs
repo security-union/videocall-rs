@@ -2,6 +2,7 @@
 pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
 pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
 pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lobby");
+pub const CANVAS_LIMIT: usize = 20;
 
 pub fn truthy(s: Option<&str>) -> bool {
     if let Some(s) = s {

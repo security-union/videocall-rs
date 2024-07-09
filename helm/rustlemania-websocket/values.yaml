@@ -20,35 +20,8 @@ env:
   - name: NATS_URL
     value: nats:4222
   - name: DATABASE_URL
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: database_url
-  - name: OAUTH_CLIENT_ID
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_client_id
-  - name: OAUTH_AUTH_URL
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_auth_url
-  - name: OAUTH_TOKEN_URL
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_token_url
-  - name: OAUTH_CLIENT_SECRET
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_client_secret
-  - name: OAUTH_REDIRECT_URL
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_redirect_url
+    value: sdfsdf
+  
 resources: {}
 podAnnotations: {}
 podSecurityContext: {}

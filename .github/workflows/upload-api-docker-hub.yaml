@@ -29,7 +29,7 @@ jobs:
 
       - name: Extract branch name
         id: extract_branch
-        run: echo "::set-output branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+        run: echo "::set-output name=branch::${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
 
       - name: Build and push API Docker image
         uses: docker/build-push-action@v4

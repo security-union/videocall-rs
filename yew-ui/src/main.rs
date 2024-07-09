@@ -4,7 +4,8 @@ mod components;
 mod constants;
 mod pages;
 
-use constants::{truthy, E2EE_ENABLED, LOGIN_URL, WEBTRANSPORT_ENABLED};
+use constants::{E2EE_ENABLED, LOGIN_URL, WEBTRANSPORT_ENABLED};
+use types::truthy;
 
 use log::info;
 use yew::prelude::*;

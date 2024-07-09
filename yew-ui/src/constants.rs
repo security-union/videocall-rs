@@ -1,3 +1,5 @@
+use types::truthy;
+
 // This is read at compile time, please restart if you change this value.
 pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
 pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");

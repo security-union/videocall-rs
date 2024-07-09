@@ -27,10 +27,14 @@ jobs:
         id: extract_sha
         run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA::8})"
 
+      - name: Extract branch name
+        id: extract_branch
+        run: echo "::set-output branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+
       - name: Build and push API Docker image
         uses: docker/build-push-action@v4
         with:
           context: .
           file: Dockerfile.actix
           push: true
-          tags: securityunion/rustlemania-api:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}
+          tags: securityunion/rustlemania-api:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}

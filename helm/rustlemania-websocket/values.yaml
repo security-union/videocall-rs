@@ -5,11 +5,11 @@ nameOverride: ""
 fullnameOverride: ""
 
 
-replicaCount: 3
+replicaCount: 1
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always
-  tag: d5cc0ff1889c744f3231085bfa857e07ab16aa8a
+  tag: make-db-optional-5e55a818
 env:
   - name: RUST_LOG
     value: info
@@ -20,7 +20,9 @@ env:
   - name: NATS_URL
     value: nats:4222
   - name: DATABASE_ENABLED
-    value: false
+    value: "false"
+  - name: DATABASE_URL
+    value: abc
   
 resources: {}
 podAnnotations: {}

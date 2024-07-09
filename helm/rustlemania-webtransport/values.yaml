@@ -4,7 +4,7 @@
 nameOverride: ""
 fullnameOverride: ""
 
-replicaCount: 3
+replicaCount: 1
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always

@@ -55,3 +55,4 @@ ingress:
       hosts:
         - rustlemania.com
         - 'www.rustlemania.com'
+        - 'transport.rustlemania.com'

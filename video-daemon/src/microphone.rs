@@ -142,7 +142,7 @@ fn transform_audio_chunk(
     sequence: u64,
 ) -> anyhow::Result<PacketWrapper> {
     Ok(PacketWrapper {
-        packet_type: PacketType::MEDIA.into(),
+        packet_type: PacketType::MEDIA_MANDATORY.into(),
         email: email.clone(),
         data: MediaPacket {
             media_type: MediaType::AUDIO.into(),

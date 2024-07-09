@@ -21,7 +21,15 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::RSA_PUB_KEY => {
                 write!(f, "RSA_PUB_KEY")
             }
-            protos::packet_wrapper::packet_wrapper::PacketType::MEDIA => write!(f, "MEDIA"),
+            protos::packet_wrapper::packet_wrapper::PacketType::MEDIA_OPTIONAL => {
+                write!(f, "MEDIA_OPTIONAL")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::MEDIA_MANDATORY => {
+                write!(f, "MEDIA_MANDATORY")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::MEDIA_MANAGEMENT => {
+                write!(f, "MEDIA_MANAGEMENT")
+            }
             protos::packet_wrapper::packet_wrapper::PacketType::CONNECTION => {
                 write!(f, "CONNECTION")
             }

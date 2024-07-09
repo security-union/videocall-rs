@@ -89,7 +89,7 @@ impl Connection {
             let packet = PacketWrapper {
                 data,
                 email: userid.clone(),
-                packet_type: PacketType::MEDIA.into(),
+                packet_type: PacketType::MEDIA_MANDATORY.into(),
                 ..Default::default()
             };
             if let Status::Connected = status.get() {

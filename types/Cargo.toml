@@ -8,5 +8,5 @@ edition = "2021"
 [dependencies]
 serde_json = "1.0.81"
 serde = { version = "1.0.37", features = ["derive"]}
-protobuf = "3.2.0"
+protobuf = "3.4.0"
 yew-websocket = "1.0.1"

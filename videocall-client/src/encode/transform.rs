@@ -38,7 +38,7 @@ pub fn transform_video_chunk(
     PacketWrapper {
         data,
         email: media_packet.email,
-        packet_type: PacketType::MEDIA.into(),
+        packet_type: PacketType::MEDIA_OPTIONAL.into(),
         ..Default::default()
     }
 }
@@ -73,7 +73,7 @@ pub fn transform_screen_chunk(
     PacketWrapper {
         data,
         email: media_packet.email,
-        packet_type: PacketType::MEDIA.into(),
+        packet_type: PacketType::MEDIA_OPTIONAL.into(),
         ..Default::default()
     }
 }
@@ -107,7 +107,7 @@ pub fn transform_audio_chunk(
     PacketWrapper {
         data,
         email: media_packet.email,
-        packet_type: PacketType::MEDIA.into(),
+        packet_type: PacketType::MEDIA_MANDATORY.into(),
         ..Default::default()
     }
 }

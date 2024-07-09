@@ -46,7 +46,7 @@ pub fn transform_video_chunk(frame: &Frame, email: &str) -> PacketWrapper {
     PacketWrapper {
         data,
         email: media_packet.email,
-        packet_type: PacketType::MEDIA.into(),
+        packet_type: PacketType::MEDIA_OPTIONAL.into(),
         ..Default::default()
     }
 }

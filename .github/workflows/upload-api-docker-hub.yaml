@@ -1,21 +1,13 @@
 name: Publish API to Docker image
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'actix-api/**'
-      - 'types/**'
-      - Dockerfile.actix
   pull_request:
     paths:
       - 'actix-api/**'
       - 'types/**'
       - 'yew-ui/**'
-      - 'docker/**
+      - 'docker/**'
     
-
 jobs:
   push_to_registry:
     name: Push API Docker image to Docker Hub

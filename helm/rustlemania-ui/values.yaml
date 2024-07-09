@@ -54,4 +54,4 @@ ingress:
     - secretName: rustlemania-ui-tls
       hosts:
         - rustlemania.com
-        - '*.rustlemania.com'
+        - 'www.rustlemania.com'

@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: Secret
-metadata:
-  name: rustlemania
-type: Opaque
-data:
-  password: cGFzc3dvcmQ

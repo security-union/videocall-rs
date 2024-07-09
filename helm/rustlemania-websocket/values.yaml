@@ -19,8 +19,8 @@ env:
     value: https://rustlemania.com
   - name: NATS_URL
     value: nats:4222
-  - name: DATABASE_URL
-    value: sdfsdf
+  - name: DATABASE_ENABLED
+    value: false
   
 resources: {}
 podAnnotations: {}

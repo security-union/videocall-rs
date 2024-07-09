@@ -4,11 +4,17 @@ on:
   push:
     branches:
       - main
-      - make-db-optional
     paths:
       - 'actix-api/**'
       - 'types/**'
       - Dockerfile.actix
+  pull_request:
+    paths:
+      - 'actix-api/**'
+      - 'types/**'
+      - 'yew-ui/**'
+      - 'docker/**
+    
 
 jobs:
   push_to_registry:

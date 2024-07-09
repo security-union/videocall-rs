@@ -184,7 +184,9 @@ async fn main() -> std::io::Result<()> {
     let oauth_redirect_url: String =
         std::env::var("OAUTH_REDIRECT_URL").unwrap_or_else(|_| String::from(""));
     let after_login_url: String = std::env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from(""));
-    let db_enabled: bool = truthy(Some(&std::env::var("DATABASE_ENABLED").unwrap_or_else(|_| String::from("false"))));
+    let db_enabled: bool = truthy(Some(
+        &std::env::var("DATABASE_ENABLED").unwrap_or_else(|_| String::from("false")),
+    ));
 
     HttpServer::new(move || {
         let cors = Cors::permissive();
@@ -195,7 +197,7 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(AppState { chat: chat.clone() }))
                 .service(ws_connect)
         } else {
-            let pool = if db_enabled {Some(get_pool())} else { None };
+            let pool = if db_enabled { Some(get_pool()) } else { None };
             App::new()
                 .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(AppState { chat: chat.clone() }))

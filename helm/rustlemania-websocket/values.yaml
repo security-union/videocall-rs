@@ -5,11 +5,11 @@ nameOverride: ""
 fullnameOverride: ""
 
 
-replicaCount: 3
+replicaCount: 1
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always
-  tag: d5cc0ff1889c744f3231085bfa857e07ab16aa8a
+  tag: make-db-optional-5e55a818
 env:
   - name: RUST_LOG
     value: info
@@ -19,37 +19,17 @@ env:
     value: https://rustlemania.com
   - name: NATS_URL
     value: nats:4222
+  - name: DATABASE_ENABLED
+    value: "false"
   - name: DATABASE_URL
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: database_url
-  - name: OAUTH_CLIENT_ID
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_client_id
-  - name: OAUTH_AUTH_URL
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_auth_url
-  - name: OAUTH_TOKEN_URL
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_token_url
-  - name: OAUTH_CLIENT_SECRET
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_client_secret
-  - name: OAUTH_REDIRECT_URL
-    valueFrom:
-      secretKeyRef:
-        name: rustlemania
-        key: oauth_redirect_url
-resources: {}
+    value: abc
+resources:
+  limits:
+    cpu: "50m"
+    memory: "10Mi"
+  requests:
+    cpu: "20m"
+    memory: "10Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

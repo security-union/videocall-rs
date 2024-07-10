@@ -4,7 +4,7 @@
 nameOverride: ""
 fullnameOverride: ""
 
-replicaCount: 3
+replicaCount: 1
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always
@@ -25,7 +25,13 @@ env:
     value: /certs/tls.crt
   - name: KEY_PATH
     value: /certs/tls.key
-resources: {}
+resources:
+  limits:
+    cpu: "100m"
+    memory: "50Mi"
+  requests:
+    cpu: "100m"
+    memory: "50Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}
@@ -39,17 +45,9 @@ autoscaling:
   maxReplicas: 100
   targetCPUUtilizationPercentage: 80
   targetMemoryUtilizationPercentage: 80
-nodeSelector:
-  node-role: worker
+nodeSelector: {}
 tolerations: []
-affinity:
-  podAffinity:
-    requiredDuringSchedulingIgnoredDuringExecution:
-      - labelSelector:
-          matchExpressions:
-            - key: app
-              operator: Exists
-        topologyKey: "kubernetes.io/hostname"
+affinity: {}
 # Used to configure cloud provider specific LB service type
 loadBalancerAnnotations:
   external-dns.alpha.kubernetes.io/hostname: "transport.rustlemania.com"

@@ -15,7 +15,6 @@
     ```
 1. Deploy internal nats
 1. Create an opaque secret named "rusltemania" with the key postgres-password filled in with a random password
-1. Deploy internal postgres
 1. Deploy rustlemania without SSL
 1. Deploy cert-manager
 1. Create a cert-manager issuer

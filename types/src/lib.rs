@@ -64,3 +64,11 @@ impl From<Binary> for protos::packet_wrapper::PacketWrapper {
         protos::packet_wrapper::PacketWrapper::parse_from_bytes(&bin.unwrap()).unwrap()
     }
 }
+
+pub fn truthy(s: Option<&str>) -> bool {
+    if let Some(s) = s {
+        ["true".to_string(), "1".to_string()].contains(&s.to_lowercase())
+    } else {
+        false
+    }
+}

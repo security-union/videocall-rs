@@ -23,8 +23,13 @@ env:
     value: "false"
   - name: DATABASE_URL
     value: abc
-  
-resources: {}
+resources:
+  limits:
+    cpu: "50m"
+    memory: "10Mi"
+  requests:
+    cpu: "20m"
+    memory: "10Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

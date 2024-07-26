@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+message MediaManagementPacket {
+  enum EventType {
+    SUBSCRIBE = 0;
+    UNSUBSCRIBE = 1;
+    ONGOING_STREAM = 2;
+  }
+  EventType event_type = 1;
+  string email = 2;
+}
+

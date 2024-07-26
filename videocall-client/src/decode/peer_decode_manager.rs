@@ -103,12 +103,11 @@ impl Peer {
         &mut self,
         packet: &Arc<PacketWrapper>,
     ) -> Result<(MediaType, DecodeStatus), PeerDecodeError> {
-        if packet
+        let packet_type = packet
             .packet_type
             .enum_value()
-            .map_err(|_| PeerDecodeError::NoPacketType)?
-            != PacketType::MEDIA
-        {
+            .map_err(|_| PeerDecodeError::NoPacketType)?;
+        if packet_type != PacketType::MEDIA_OPTIONAL && packet_type != PacketType::MEDIA_MANDATORY {
             return Err(PeerDecodeError::IncorrectPacketType);
         }
 

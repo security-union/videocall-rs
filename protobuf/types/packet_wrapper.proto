@@ -4,8 +4,10 @@ message PacketWrapper {
   enum PacketType {
     RSA_PUB_KEY = 0;
     AES_KEY = 1;
-    MEDIA = 2;
+    MEDIA_MANDATORY = 2;
     CONNECTION = 3;
+    MEDIA_OPTIONAL = 4;
+    MEDIA_MANAGEMENT = 5;
   }
   PacketType packet_type = 1;
   string email = 2;

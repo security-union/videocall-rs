@@ -34,7 +34,7 @@ jsonwebtoken= "8.1.1"
 oauth2 = { version = "4" }
 octets = "0.2.0"
 quinn = { version = "0.10.1", features = ["runtime-tokio", "tls-rustls", "ring"] }
-protobuf = "3.3.0"
+protobuf = "3.4.0"
 r2d2 = "0.8.10"
 r2d2_postgres = "0.18.1"
 rand = "0.8.5"

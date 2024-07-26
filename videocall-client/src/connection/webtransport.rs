@@ -75,7 +75,9 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
     }
 
     fn send_bytes(&self, bytes: Vec<u8>) {
+        log::info!("before send_bytes");
         WebTransportTask::send_unidirectional_stream(self.transport.clone(), bytes);
+        log::info!("after send_bytes");
     }
 }
 

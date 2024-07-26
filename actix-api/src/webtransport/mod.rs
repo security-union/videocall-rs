@@ -116,6 +116,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
     transport_config.max_idle_timeout(Some(VarInt::from_u32(10_000).into()));
+    transport_config.max_concurrent_uni_streams(1000u32.into());
     server_config.transport = Arc::new(transport_config);
     let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
 

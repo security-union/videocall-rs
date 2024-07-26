@@ -171,8 +171,8 @@ impl Component for AttendantsComponent {
                     warn!("{}", msg);
                     false
                 }
-                WsAction::Lost(_reason) => {
-                    warn!("Lost");
+                WsAction::Lost(reason) => {
+                    warn!("Lost with reason {:?}", reason);
                     ctx.link().send_message(WsAction::Connect);
                     true
                 }

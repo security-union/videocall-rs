@@ -27,11 +27,11 @@ env:
     value: /certs/tls.key
 resources:
   limits:
-    cpu: "100m"
-    memory: "50Mi"
+    cpu: "300m"
+    memory: "300Mi"
   requests:
-    cpu: "100m"
-    memory: "50Mi"
+    cpu: "300m"
+    memory: "300Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

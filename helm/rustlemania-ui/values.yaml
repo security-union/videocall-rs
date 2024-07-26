@@ -8,7 +8,7 @@ replicaCount: 1
 image:
   repository: securityunion/rustlemania-ui
   pullPolicy: Always
-  tag: fix-webtransport-434d4ca8
+  tag: fix-webtransport-92cbac9c
 resources:
   limits:
     cpu: "50m" # 50% of a single CPU

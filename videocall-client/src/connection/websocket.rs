@@ -11,8 +11,12 @@ impl WebMedia<WebSocketTask> for WebSocketTask {
     fn connect(options: ConnectOptions) -> anyhow::Result<WebSocketTask> {
         let notification = Callback::from(move |status| match status {
             WebSocketStatus::Opened => options.on_connected.emit(()),
-            WebSocketStatus::Closed => options.on_connection_lost.emit(JsValue::from_str("WebSocket closed")), 
-            WebSocketStatus::Error => options.on_connection_lost.emit(JsValue::from_str("WebSocket error")),
+            WebSocketStatus::Closed => options
+                .on_connection_lost
+                .emit(JsValue::from_str("WebSocket closed")),
+            WebSocketStatus::Error => options
+                .on_connection_lost
+                .emit(JsValue::from_str("WebSocket error")),
         });
         debug!("WebSocket connecting to {}", &options.websocket_url);
         let task = WebSocketService::connect(

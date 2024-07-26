@@ -7,7 +7,6 @@ use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
-use wasm_bindgen::JsValue;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use types::protos::aes_packet::AesPacket;
@@ -15,6 +14,7 @@ use types::protos::media_packet::media_packet::MediaType;
 use types::protos::packet_wrapper::packet_wrapper::PacketType;
 use types::protos::packet_wrapper::PacketWrapper;
 use types::protos::rsa_packet::RsaPacket;
+use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
@@ -177,10 +177,11 @@ impl VideoCallClient {
                         match inner.try_borrow_mut() {
                             Ok(mut inner) => {
                                 inner.peer_decode_manager.run_peer_monitor();
-                                // on_connection_lost.emit(());
                             }
                             Err(_) => {
-                                error!("Unable to borrow inner -- not starting peer monitor");
+                                on_connection_lost.emit(JsValue::from_str(
+                                    "Unable to borrow inner -- not starting peer monitor",
+                                ));
                             }
                         }
                     }
@@ -202,6 +203,7 @@ impl VideoCallClient {
             options,
             self.aes.clone(),
         )?);
+        info!("Connected to server");
         Ok(())
     }
 

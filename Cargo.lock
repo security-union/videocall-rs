@@ -3961,7 +3961,7 @@ dependencies = [
 [[package]]
 name = "yew-webtransport"
 version = "0.21.0"
-source = "git+https://github.com/security-union/yew-webtransport.git?rev=96e21cae267c92ba3f5fa8169c1cb6f9b9dc3b1c#96e21cae267c92ba3f5fa8169c1cb6f9b9dc3b1c"
+source = "git+https://github.com/security-union/yew-webtransport.git?rev=ea5b757a483c4af524395cf24c468e85520b6e98#ea5b757a483c4af524395cf24c468e85520b6e98"
 dependencies = [
  "anyhow",
  "futures",

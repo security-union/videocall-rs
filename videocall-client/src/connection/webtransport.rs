@@ -10,6 +10,7 @@ use js_sys::Reflect;
 use js_sys::Uint8Array;
 use log::debug;
 use log::error;
+use log::info;
 use protobuf::Message;
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsCast;
@@ -57,15 +58,11 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             let connection_lost_callback = options.on_connection_lost.clone();
             Callback::from(move |status| match status {
                 WebTransportStatus::Opened => connected_callback.emit(()),
-                WebTransportStatus::Closed(error) => {
-                    connection_lost_callback.emit(error)
-                },
-                WebTransportStatus::Error(error) => {
-                    connection_lost_callback.emit(error)
-                }
+                WebTransportStatus::Closed(error) => connection_lost_callback.emit(error),
+                WebTransportStatus::Error(error) => connection_lost_callback.emit(error),
             })
         };
-        debug!("WebTransport connecting to {}", &options.webtransport_url);
+        info!("WebTransport connecting to {}", &options.webtransport_url);
         let task = WebTransportService::connect(
             &options.webtransport_url,
             on_datagram,
@@ -73,7 +70,7 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             on_bidirectional_stream,
             notification,
         )?;
-        debug!("WebTransport connection success");
+        info!("WebTransport connection success");
         Ok(task)
     }
 

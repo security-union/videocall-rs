@@ -28,10 +28,12 @@ pub enum MeetingAction {
     ToggleVideoOnOff,
 }
 
+#[derive(Debug)]
 pub enum UserScreenAction {
     TogglePeerList,
 }
 
+#[derive(Debug)]
 pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
@@ -153,7 +155,8 @@ impl Component for AttendantsComponent {
         }
     }
 
-    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
+    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool { 
+        log::info!("AttendantsComponent update: {:?}", msg);
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
@@ -164,6 +167,7 @@ impl Component for AttendantsComponent {
                         ctx.link()
                             .send_message(WsAction::Log(format!("Connection failed: {e}")));
                     }
+                    log::info!("Connected in attendants");
                     true
                 }
                 WsAction::Connected => true,

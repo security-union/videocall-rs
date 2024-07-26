@@ -303,7 +303,7 @@ where
 
     let specific_subject_clone = specific_subject.clone();
 
-    let nats_task = {
+    let nats_receive_task = {
         let session = session.clone();
         let should_run = should_run.clone();
         tokio::spawn(async move {
@@ -351,9 +351,11 @@ where
                         if let Err(e) = uni_stream.read_to_end(&mut buf).await {
                             error!("Error reading from unidirectional stream: {}", e);
                         }
-                        if let Err(e) = nc.publish(specific_subject.clone(), buf.into()).await {
-                            error!("Error publishing to subject {}: {}", &specific_subject, e);
-                        }
+                        tokio::spawn(async move {
+                            if let Err(e) = nc.publish(specific_subject.clone(), buf.into()).await {
+                                error!("Error publishing to subject {}: {}", &specific_subject, e);
+                            }
+                        });
                     });
                 }
             }
@@ -375,7 +377,7 @@ where
     };
     quic_task.await?;
     should_run.store(false, Ordering::SeqCst);
-    nats_task.abort();
+    nats_receive_task.abort();
     info!("Finished handling session");
     Ok(())
 }

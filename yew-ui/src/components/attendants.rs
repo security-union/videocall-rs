@@ -155,7 +155,7 @@ impl Component for AttendantsComponent {
         }
     }
 
-    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool { 
+    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         log::info!("AttendantsComponent update: {:?}", msg);
         match msg {
             Msg::WsAction(action) => match action {

@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Context, Result};
-use async_nats::rustls::PrivateKey;
 use futures::StreamExt;
 use protobuf::Message;
 use quinn::crypto::rustls::HandshakeData;
-use quinn::{crypto, VarInt};
+use quinn::VarInt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::{fs, io};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
 use tracing::{error, info, trace_span};
 use types::protos::connection_packet::ConnectionPacket;
@@ -96,7 +96,12 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
     // 1. create quinn server endpoint and bind UDP socket
     let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
-    let config = quinn::ServerConfig::with_crypto(Arc::new(config));
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
+    // configure pings
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
+    transport_config.max_idle_timeout(Some(VarInt::from_u32(10_000).into()));
+    config.transport = Arc::new(transport_config);
     let server = quinn::Endpoint::server(config, opt.listen)?;
 
     info!("listening on {}", opt.listen);

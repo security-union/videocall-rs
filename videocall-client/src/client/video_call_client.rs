@@ -7,6 +7,7 @@ use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
+use wasm_bindgen::JsValue;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use types::protos::aes_packet::AesPacket;
@@ -53,7 +54,7 @@ pub struct VideoCallClientOptions {
     pub on_connected: Callback<()>,
 
     /// Callback will be called as `callback(())` if a connection gets dropped
-    pub on_connection_lost: Callback<()>,
+    pub on_connection_lost: Callback<JsValue>,
 }
 
 #[derive(Debug)]
@@ -176,7 +177,7 @@ impl VideoCallClient {
                         match inner.try_borrow_mut() {
                             Ok(mut inner) => {
                                 inner.peer_decode_manager.run_peer_monitor();
-                                on_connection_lost.emit(());
+                                // on_connection_lost.emit(());
                             }
                             Err(_) => {
                                 error!("Unable to borrow inner -- not starting peer monitor");

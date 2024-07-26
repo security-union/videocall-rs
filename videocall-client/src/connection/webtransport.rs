@@ -57,9 +57,11 @@ impl WebMedia<WebTransportTask> for WebTransportTask {
             let connection_lost_callback = options.on_connection_lost.clone();
             Callback::from(move |status| match status {
                 WebTransportStatus::Opened => connected_callback.emit(()),
-                WebTransportStatus::Closed(error) | WebTransportStatus::Error(error) => {
-                    error!("WebTransport connection lost {:?}", error);
-                    connection_lost_callback.emit(())
+                WebTransportStatus::Closed(error) => {
+                    connection_lost_callback.emit(error)
+                },
+                WebTransportStatus::Error(error) => {
+                    connection_lost_callback.emit(error)
                 }
             })
         };

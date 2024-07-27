@@ -23,7 +23,7 @@ wasm-bindgen = "0.2.78"
 wasm-bindgen-futures = "0.4.30"
 yew = { version = "0.21" }
 yew-websocket = "1.21.0"
-yew-webtransport = {git = "https://github.com/security-union/yew-webtransport.git", rev = "ea5b757a483c4af524395cf24c468e85520b6e98" }
+yew-webtransport = "0.21.1"
 
 [dependencies.web-sys]
 version = "0.3.60"

@@ -16,7 +16,7 @@ pub struct ConnectOptions {
     pub webtransport_url: String,
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_connected: Callback<()>,
-    pub on_connection_lost: Callback<()>,
+    pub on_connection_lost: Callback<JsValue>,
     pub peer_monitor: Callback<()>,
 }
 

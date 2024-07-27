@@ -8,7 +8,7 @@ replicaCount: 1
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always
-  tag: main-22439075
+  tag: fix-webtransport-b8f0722d
 command: ['webtransport_server']
 args: []
 tlsSecret: rustlemania-ui-tls
@@ -27,11 +27,11 @@ env:
     value: /certs/tls.key
 resources:
   limits:
-    cpu: "100m"
-    memory: "50Mi"
+    cpu: "300m"
+    memory: "300Mi"
   requests:
-    cpu: "100m"
-    memory: "50Mi"
+    cpu: "300m"
+    memory: "300Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

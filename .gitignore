@@ -3,3 +3,4 @@
 .mp4
 .env
 target/
+helm/digital-ocean-secret

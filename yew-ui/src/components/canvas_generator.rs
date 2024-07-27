@@ -70,20 +70,17 @@ fn user_video(props: &UserVideoProps) -> Html {
     // for the user video
     let video_ref = use_state(NodeRef::default);
     let video_ref_clone = video_ref.clone();
-    use_effect_with_deps(
-        move |_| {
-            // Set thumbnail for the video
-            let video = (*video_ref_clone).cast::<HtmlCanvasElement>().unwrap();
-            let ctx = video
-                .get_context("2d")
-                .unwrap()
-                .unwrap()
-                .unchecked_into::<CanvasRenderingContext2d>();
-            ctx.clear_rect(0.0, 0.0, video.width() as f64, video.height() as f64);
-            || ()
-        },
-        vec![props.id.clone()],
-    );
+    use_effect_with(vec![props.id.clone()], move |_| {
+        // Set thumbnail for the video
+        let video = (*video_ref_clone).cast::<HtmlCanvasElement>().unwrap();
+        let ctx = video
+            .get_context("2d")
+            .unwrap()
+            .unwrap()
+            .unchecked_into::<CanvasRenderingContext2d>();
+        ctx.clear_rect(0.0, 0.0, video.width() as f64, video.height() as f64);
+        || ()
+    });
 
     html! {
         <canvas ref={(*video_ref).clone()} id={props.id.clone()}></canvas>

@@ -19,3 +19,6 @@
 1. Deploy cert-manager
 1. Create a cert-manager issuer
 1. Upgrade rustlemania to include SSL
+1. Install kubernetes dashboard through the digital ocean marketplace 
+1. Start the kubernetes dashboard locally 
+```kubectl -n kubernetes-dashboard port-forward svc/kubernetes-dashboard-kong-proxy 8443:443```

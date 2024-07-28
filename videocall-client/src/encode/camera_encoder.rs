@@ -5,6 +5,7 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::debug;
 use log::error;
+use log::info;
 use std::sync::atomic::Ordering;
 use types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -117,6 +118,8 @@ impl CameraEncoder {
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                // This says 0.0 when I tested it but must be where the data is so can be siphoned off and saved, hopefully before compression
+                info!("received chunk of duration {:?}", chunk.duration());
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
                     sequence_number,

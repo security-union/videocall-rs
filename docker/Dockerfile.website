@@ -6,6 +6,7 @@ RUN rustup target add wasm32-unknown-unknown
 RUN apt-get update && apt-get install -y \
     libssl-dev \
     pkg-config \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
 
 RUN cargo install cargo-leptos --version 0.2.20

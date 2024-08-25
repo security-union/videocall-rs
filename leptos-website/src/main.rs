@@ -16,13 +16,6 @@ cfg_if! {
         #[tokio::main]
         async fn main() {
             simple_logger::init_with_level(log::Level::Warn).expect("couldn't initialize logging");
-
-            /* sqlx::migrate!()
-                .run(&mut conn)
-                .await
-                .expect("could not run SQLx migrations"); */
-
-            // Setting this to None means we'll be using cargo-leptos and its env vars
             let conf = get_configuration(None).await.unwrap();
             let leptos_options = conf.leptos_options;
             let addr = leptos_options.site_addr;

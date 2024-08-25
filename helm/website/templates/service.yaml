@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "webtransport-rs.fullname" . }}
+  labels:
+    {{- include "webtransport-rs.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.appPort }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "webtransport-rs.selectorLabels" . | nindent 4 }}

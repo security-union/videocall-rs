@@ -1,6 +1,6 @@
-FROM --platform=linux/amd64 rust:1.74-slim-bookworm as builder
+FROM rust:1.80-slim-bookworm as builder
 
-RUN rustup default nightly-2024-04-04
+RUN rustup default nightly-2024-08-21
 RUN rustup target add wasm32-unknown-unknown
 
 RUN apt-get update && apt-get install -y \
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-leptos
+RUN cargo install cargo-leptos --version 0.2.20
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ COPY . .
 
 RUN cargo leptos build --release
 
-FROM --platform=linux/amd64 debian:bookworm-slim
+FROM debian:bookworm-slim
 
 # Copy the server binary to the /app directory
 COPY --from=builder /app/target/release/leptos-website /app/

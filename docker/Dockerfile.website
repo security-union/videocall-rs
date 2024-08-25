@@ -1,6 +1,6 @@
 FROM --platform=linux/amd64 rust:1.74-slim-bookworm as builder
 
-RUN rustup default nightly-2024-02-04
+RUN rustup default nightly-2024-04-04
 RUN rustup target add wasm32-unknown-unknown
 
 RUN apt-get update && apt-get install -y \

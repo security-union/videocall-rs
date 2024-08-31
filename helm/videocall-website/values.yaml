@@ -6,9 +6,9 @@ fullnameOverride: ""
 
 replicaCount: 1
 image:
-  repository: video-call-rs-website-api
+  repository: securityunion/video-call-rs-website
   pullPolicy: Always
-  tag: main-aaf1cf5a
+  tag: add-website-e303a7a9
 env:
   - name: RUST_LOG
     value: info
@@ -68,3 +68,4 @@ ingress:
     - secretName: videocall-website-tls
       hosts:
         - videocall.rs
+        - www.videocall.rs

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="1920"
+   height="1080"
+   viewBox="0 0 507.99998 285.75"
+   version="1.1"
+   id="svg720"
+   inkscape:version="1.2 (dc2aeda, 2022-05-15)"
+   sodipodi:docname="videocall_logo.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview722"
+     pagecolor="#505050"
+     bordercolor="#eeeeee"
+     borderopacity="1"
+     inkscape:showpageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#505050"
+     inkscape:document-units="mm"
+     showgrid="false"
+     inkscape:zoom="0.17046523"
+     inkscape:cx="1091.1316"
+     inkscape:cy="695.15643"
+     inkscape:window-width="1390"
+     inkscape:window-height="1027"
+     inkscape:window-x="304"
+     inkscape:window-y="506"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs717" />
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1">
+    <text
+       xml:space="preserve"
+       style="font-weight:bold;font-size:81.7204px;line-height:0;font-family:'Helvetica Neue';-inkscape-font-specification:'Helvetica Neue Bold';fill:#333333;stroke:none;stroke-width:4.59724;stroke-dasharray:none"
+       x="14.577497"
+       y="169.84549"
+       id="text19581-4-4-4-5-7"
+       inkscape:export-filename="videocall.png"
+       inkscape:export-xdpi="64"
+       inkscape:export-ydpi="64"><tspan
+         style="font-style:normal;font-variant:normal;font-weight:bold;font-stretch:normal;font-size:81.7204px;font-family:'Russo One';-inkscape-font-specification:'Russo One Bold';fill:#ffffff;stroke:none;stroke-width:4.59724;stroke-dasharray:none"
+         x="14.577497"
+         y="169.84549"
+         id="tspan19735-3-3-8-1-8"
+         sodipodi:role="line">videocall.rs</tspan></text>
+  </g>
+</svg>

@@ -40,15 +40,7 @@ ingress:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     kubernetes.io/tls-acme: "true"
   hosts:
-    - host: www.rustlemania.com
-      paths:
-        - path: /
-          pathType: Prefix
-          service:
-            name: rustlemania-ui
-            port:
-              number: 80
-    - host: rustlemania.com
+    - host: app.videocall.rs
       paths:
         - path: /
           pathType: Prefix
@@ -59,5 +51,5 @@ ingress:
   tls:
     - secretName: rustlemania-ui-tls
       hosts:
-        - rustlemania.com
-        - '*.rustlemania.com'
+        - app.videocall.rs
+        - transport.rustlemania.com

@@ -1,0 +1,9 @@
+.hero-header {
+	background-image: url("data: image/svg+xml, %3Csvg xmlns='http://www.w3.org/2000/svg' preserveAspectRatio='none' viewBox='0 0 960 251' %3E%3Cdefs%3E%3ClinearGradient id='a' x1='0' x2='491.198' y1='0' y2='0' gradientTransform='scale(1.9544 .51166)' gradientUnits='userSpaceOnUse' %3E%3Cstop offset='0%25' style='stop-color:%23190e38' /%3E%3Cstop offset='100%25' style='stop-color:%23ec373b' /%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath fill='url(%23a)' d='M3.875 228.26c514.543 63.604 506.767-41.918 952.431 21.072 1.758.73 3.693-.562 3.694-2.465V4a4 4 0 0 0-4-4H0v223.268c0 2.21 1.735 4.444 3.875 4.992z' style='fill:url(%23a)' /%3E%3C/svg%3E");
+}
+
+@media (min-width: 1024px) {
+	.hero-header {
+		background-image: url('/images/wave.svg');
+	}
+}

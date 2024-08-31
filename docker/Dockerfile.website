@@ -1,0 +1,34 @@
+FROM rust:1.80-slim-bookworm as builder
+
+RUN rustup default nightly-2024-08-21
+RUN rustup target add wasm32-unknown-unknown
+
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    pkg-config \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-leptos --version 0.2.20
+
+WORKDIR /app
+
+COPY . .
+
+RUN cargo leptos build --release
+
+FROM debian:bookworm-slim
+
+# Copy the server binary to the /app directory
+COPY --from=builder /app/target/release/leptos_website /app/
+# /target/site contains our JS/WASM/CSS, etc.
+COPY --from=builder /app/target/site /app/site
+# Copy Cargo.toml if it’s needed at runtime
+COPY --from=builder /app/Cargo.toml /app/
+WORKDIR /app
+ENV RUST_LOG="info"
+ENV LEPTOS_SITE_ADDR="0.0.0.0:8080"
+ENV LEPTOS_SITE_ROOT="site"
+EXPOSE 8080
+
+CMD ["/app/leptos_website"]

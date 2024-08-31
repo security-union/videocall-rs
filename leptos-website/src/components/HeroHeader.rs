@@ -57,7 +57,7 @@ pub fn HeroHeader() -> impl IntoView {
                                         href="https://crates.io/crates/yew-webtransport"
                                         class="font-bold transition-all  text-white  aria-[current]:bg-purple  hover:bg-purple hover:bg-opacity-50 px-4 py-2 rounded-md "
                                     >
-                                        "yew-webtransport" 
+                                        "yew-webtransport"
                                     </a>
                                 </div>
                             </div>
@@ -67,7 +67,7 @@ pub fn HeroHeader() -> impl IntoView {
                                 <div class="flex gap-12 justify-start xl:justify-between items-center pt-12 pb-24 md:py-24">
                                     <div class="md:mt-[-60px] lg:mt-[-60px]">
                                         <h1 class="font-bold text-4xl lg:text-5xl tracking-tight">
-                                            "Ultra-low latency videocalls" 
+                                            "Ultra-low latency videocalls"
                                         </h1>
                                         <p class="mt-2 opacity-90 max-w-[40ch] ">
                                             "Always open-source, always awesome, powered by Rust"

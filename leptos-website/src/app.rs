@@ -5,7 +5,7 @@ use leptos_router::*;
 
 #[component]
 pub fn App() -> impl IntoView {
-    let formatter = |text| format!("{text} - Leptos");
+    let formatter = |text| format!("{text} - VideoCall.rs");
     provide_meta_context();
 
     view! {

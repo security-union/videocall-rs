@@ -3,6 +3,7 @@ use js_sys::Array;
 use js_sys::Reflect;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
+use web_sys::js_sys;
 
 #[wasm_bindgen]
 extern "C" {

@@ -1,0 +1,70 @@
+# Default values for videocall-website.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+image:
+  repository: video-call-rs-website-api
+  pullPolicy: Always
+  tag: main-aaf1cf5a
+env:
+  - name: RUST_LOG
+    value: info
+  - name: LISTEN_URL
+    value: "0.0.0.0:80"
+  - name: LEPTOS_SITE_ADDR
+    value: "0.0.0.0:80"
+resources:
+  limits:
+    cpu: "50m"
+    memory: "10Mi"
+  requests:
+    cpu: "20m"
+    memory: "10Mi"
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  name: videocall-website
+  type: ClusterIP
+  port: 80
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: www.videocall.rs
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: videocall-website
+            port:
+              number: 80
+    - host: videocall.rs
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: videocall-website
+            port:
+              number: 80
+  tls:
+    - secretName: videocall-website-tls
+      hosts:
+        - videocall.rs

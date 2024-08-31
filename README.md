@@ -1,6 +1,13 @@
-## News 
+## 🚀 Try videocall.rs Today!
 
-https://www.reddit.com/r/rust/comments/14vwxfh/we_just_released_our_rust_webtransport/
+Experience seamless, real-time video communication with **[videocall.rs](https://videocall.rs)**, a cutting-edge platform built for developers by developers. Whether you're building the next big thing in robotics or just need reliable video calls, videocall.rs has got you covered.
+
+🔗 **[Get Started Now](https://videocall.rs)** and bring your ideas to life with crystal-clear video and audio. Perfect for remote collaboration, demos, and beyond!
+
+👨‍💻 **Why videocall.rs?**
+- Built with **Rust** for performance and safety.
+- Low latency, high-quality streaming.
+- Easy integration with your projects.
 
 ## ▶️ YouTube Videos
 

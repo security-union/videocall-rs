@@ -1,15 +1,15 @@
 name: Publish Website to Docker image
 
 on:
-  pull_request:
-    paths:
-      - '*'
-  # push:
-  #   branches:
-  #     - main
+  # pull_request:
   #   paths:
-  #     - 'website/**'
-  #     - docker/Dockerfile.website
+  #     - '*'
+  push:
+    branches:
+      - main
+    paths:
+      - 'website/**'
+      - docker/Dockerfile.website
       
 jobs:
   push_to_registry:

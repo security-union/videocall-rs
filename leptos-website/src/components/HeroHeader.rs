@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::components::SphereLogo::*;
 use leptos::*;
 use leptos_meta::Style;

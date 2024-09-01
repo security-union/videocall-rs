@@ -1,0 +1,16 @@
+FROM rust:1.80-slim-bookworm as builder
+
+RUN rustup default nightly-2024-08-21
+RUN rustup target add wasm32-unknown-unknown
+
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    pkg-config \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-leptos --version 0.2.20
+
+WORKDIR /app
+
+

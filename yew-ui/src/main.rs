@@ -12,10 +12,10 @@ use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
 use components::{attendants::AttendantsComponent, matomo::MatomoTracker, top_bar::TopBar};
-use gloo_utils::window;
-use yew_router::prelude::*;
 use enum_display::EnumDisplay;
+use gloo_utils::window;
 use pages::home::Home;
+use yew_router::prelude::*;
 
 use crate::constants::ENABLE_OAUTH;
 

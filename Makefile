@@ -23,4 +23,4 @@ fmt:
 check: 
 		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo clippy --all  -- --deny warnings && cargo fmt --check"
 		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app/yew-ui && cargo clippy --all  -- --deny warnings && cargo fmt --check"
-		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app/leptos-website && cargo clippy --features ssr --all -- --deny warnings"
+		docker compose -f docker/docker-compose.yaml run website bash -c "cd /app/leptos-website && cargo clippy --features ssr --all -- --deny warnings"

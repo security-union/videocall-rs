@@ -7,6 +7,8 @@ on:
       - add-debian-distribution
     tags:
       - '*'
+    paths:
+      - 'video-daemon/**'
 
 jobs:
   build_and_package:

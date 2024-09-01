@@ -8,7 +8,7 @@ replicaCount: 1
 image:
   repository: securityunion/video-call-rs-website
   pullPolicy: Always
-  tag: add-website-e303a7a9
+  tag: fix-leptos-website-eaa8be16
 env:
   - name: RUST_LOG
     value: info

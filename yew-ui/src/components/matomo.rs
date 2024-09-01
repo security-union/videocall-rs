@@ -1,3 +1,5 @@
+#![allow(non_upper_case_globals)]
+
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Reflect;

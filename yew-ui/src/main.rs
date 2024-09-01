@@ -11,15 +11,15 @@ use log::info;
 use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
-use components::{attendants::AttendantsComponent, top_bar::TopBar};
+use components::{attendants::AttendantsComponent, matomo::MatomoTracker, top_bar::TopBar};
+use enum_display::EnumDisplay;
 use gloo_utils::window;
-use yew_router::prelude::*;
-
 use pages::home::Home;
+use yew_router::prelude::*;
 
 use crate::constants::ENABLE_OAUTH;
 
-#[derive(Clone, Routable, PartialEq)]
+#[derive(Clone, Routable, PartialEq, Debug, EnumDisplay)]
 enum Route {
     #[at("/")]
     Home,
@@ -39,6 +39,8 @@ enum Route {
 }
 
 fn switch(routes: Route) -> Html {
+    let matomo = MatomoTracker::new();
+    matomo.track_page_view(&routes.to_string(), &routes.to_string());
     match routes {
         Route::Home => html! { <Home /> },
         Route::Login => html! { <Login/> },

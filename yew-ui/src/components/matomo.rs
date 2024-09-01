@@ -8,7 +8,7 @@ use web_sys::js_sys;
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = window)]
-    static _PAQ: Array;
+    static _paq: Array;
 }
 
 pub struct MatomoTracker {}
@@ -19,7 +19,7 @@ impl MatomoTracker {
     }
 
     pub fn push(&self, args: &JsValue) {
-        let method: js_sys::Function = js_sys::Reflect::get(&_PAQ, &"push".into()).unwrap().into();
+        let method: js_sys::Function = js_sys::Reflect::get(&_paq, &"push".into()).unwrap().into();
         let _ = method.call1(&JsValue::NULL, args);
     }
 

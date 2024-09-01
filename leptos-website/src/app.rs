@@ -21,7 +21,6 @@ pub fn App() -> impl IntoView {
                 <Route path="" view=Home ssr=SsrMode::Async/>
             </Routes>
         </Router>
-        <!-- Matomo -->
         <script>
             "var _paq = window._paq = window._paq || [];
             _paq.push([\"setDocumentTitle\", document.domain + \"/\" + document.title]);
@@ -36,6 +35,5 @@ pub fn App() -> impl IntoView {
                 g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
             })();"
         </script>
-        <!-- End Matomo Code -->
     }
 }

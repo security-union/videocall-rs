@@ -276,9 +276,9 @@ impl Inner {
     }
 
     fn on_inbound_media(&mut self, response: PacketWrapper) {
-        debug!(
+        log::warn!(
             "<< Received {:?} from {}",
-            response.packet_type.enum_value(),
+            response.packet_type,
             response.email
         );
         let peer_status = self.peer_decode_manager.ensure_peer(&response.email);

@@ -173,9 +173,10 @@ impl Peer {
 }
 
 fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> {
-    Ok(Arc::new(
-        MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?,
-    ))
+    let media_packet = MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?;
+    // print packet
+    debug!("MediaPacket: {:?}", media_packet);
+    Ok(Arc::new(media_packet))
 }
 
 #[derive(Debug)]

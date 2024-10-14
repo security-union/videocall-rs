@@ -1,7 +1,7 @@
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
-use crate::yuyv_format::YuyvFormat;
 use anyhow::Result;
+use nokhwa::pixel_format::YuyvFormat;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 

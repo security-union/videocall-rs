@@ -37,12 +37,12 @@ pub struct VideoEncoderBuilder {
 impl Default for VideoEncoderBuilder {
     fn default() -> Self {
         Self {
-            bitrate_kbps: 50,
+            bitrate_kbps: 200_000,
             max_quantizer: 63,
-            min_quantizer: 50,
+            min_quantizer: 25,
             resolution: (640, 480),
             timebase: (1, 1000),
-            cpu_used: 4,
+            cpu_used: 5,
             profile: 0,
         }
     }
@@ -72,8 +72,8 @@ impl VideoEncoderBuilder {
         cfg.rc_target_bitrate = self.bitrate_kbps;
         cfg.rc_min_quantizer = self.min_quantizer;
         cfg.rc_max_quantizer = self.max_quantizer;
-        cfg.g_threads = 8;
-        cfg.g_lag_in_frames = 0;
+        cfg.g_threads = 2;
+        cfg.g_lag_in_frames = 1;
         cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
         cfg.g_pass = vpx_enc_pass::VPX_RC_ONE_PASS;
         cfg.g_profile = self.profile;

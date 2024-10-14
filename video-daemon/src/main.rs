@@ -31,9 +31,11 @@ async fn main() {
     let mut camera = CameraDaemon::from_config(camera_config, user_id.clone(), quic_tx.clone());
     camera.start().expect("failed to start camera");
     let mut microphone = MicrophoneDaemon::default();
-    microphone
-        .start(quic_tx, audio_device, user_id)
-        .expect("failed to start microphone");
+    if let Some(audio_device) = audio_device { 
+        microphone
+            .start(quic_tx, audio_device, user_id)
+            .expect("failed to start microphone");
+    }
     while let Some(data) = quic_rx.recv().await {
         if let Err(e) = client.send(data).await {
             match e {

@@ -1,4 +1,4 @@
-use image::Rgb;
+use image::color::Rgb;
 use nokhwa::{
     utils::{color_frame_formats, FrameFormat, Resolution},
     FormatDecoder, NokhwaError,

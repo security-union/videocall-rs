@@ -160,15 +160,16 @@ impl Peer {
     }
 
     pub fn check_heartbeat(&mut self) -> bool {
-        if self.heartbeat_count != 0 {
-            self.heartbeat_count = 0;
-            return true;
-        }
-        debug!(
-            "---@@@--- detected heartbeat stop for {}",
-            self.email.clone()
-        );
-        false
+        return true;
+        // if self.heartbeat_count != 0 {
+        //     self.heartbeat_count = 0;
+        //     return true;
+        // }
+        // log::info!(
+        //     "---@@@--- detected heartbeat stop for {}",
+        //     self.email.clone()
+        // );
+        // false
     }
 }
 
@@ -235,7 +236,7 @@ impl PeerDecodeManager {
     }
 
     fn add_peer(&mut self, email: &str, aes: Option<Aes128State>) {
-        debug!("Adding peer {}", email);
+        log::info!("Adding peer {}", email);
         self.connected_peers.insert(
             email.to_owned(),
             Peer::new(

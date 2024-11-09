@@ -71,9 +71,11 @@ macro_rules! impl_decode {
     ($self: expr, $packet: expr, $ChunkType: ty, $ref: tt) => {{
         let first_frame = !$self.decoded;
         let chunk_type = $self.get_chunk_type(&$packet);
+        // log::info!("hit decode with state {:?}", $self.decoder.state());
         if !$self.waiting_for_keyframe || chunk_type == <$ChunkType>::Key {
             match $self.decoder.state() {
                 CodecState::Configured => {
+                    // log::info!("hit configured");
                     $self
                         .decoder
                         .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
@@ -84,7 +86,9 @@ macro_rules! impl_decode {
                     log::error!("decoder closed");
                     return Err(());
                 }
-                _ => {}
+                _ => {
+                    log::info!("hit empty");
+                }
             }
         }
         Ok(DecodeStatus {

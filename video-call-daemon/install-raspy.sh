@@ -6,4 +6,4 @@ TARGET=aarch64-unknown-linux-gnu
 
 # upload binary
 ssh-copy-id $USER@$PI_IP
-scp -r ./target/$TARGET/release/video-daemon $USER@$PI_IP:/tmp/
+scp -r ./target/$TARGET/release/video-call-daemon $USER@$PI_IP:/tmp/

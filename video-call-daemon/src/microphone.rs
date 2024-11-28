@@ -74,11 +74,13 @@ fn start_microphone(
     .expect("failed to find input device");
 
     info!("Input device: {}", device.name()?);
-    let range = cpal::SupportedBufferSize::Range {
-        min: 960,
-        max: 960
-    };
-    let config = cpal::SupportedStreamConfig::new(1, cpal::SampleRate(48000), range, cpal::SampleFormat::I16);
+    let range = cpal::SupportedBufferSize::Range { min: 960, max: 960 };
+    let config = cpal::SupportedStreamConfig::new(
+        1,
+        cpal::SampleRate(48000),
+        range,
+        cpal::SampleFormat::I16,
+    );
 
     let mut encoder = opus::Encoder::new(48000, Channels::Mono, opus::Application::Voip)?;
     info!("Opus encoder created {:?}", encoder);

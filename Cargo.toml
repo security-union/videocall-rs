@@ -8,8 +8,8 @@ members = [
 ]
 exclude = [
     "src-tauri",
-    "video-daemon",
+    "video-call-daemon",
     "yew-ui",
-    "leptos-website"
+    "leptos-website",
 ]
 

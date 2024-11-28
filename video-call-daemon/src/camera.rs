@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, Sender};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use types::protos::media_packet::media_packet::MediaType;
 use types::protos::media_packet::{MediaPacket, VideoMetadata};
@@ -69,8 +69,6 @@ pub struct CameraConfig {
 pub struct CameraDaemon {
     config: CameraConfig,
     user_id: String,
-    fps_rx: Option<mpsc::Receiver<u128>>,
-    fps_tx: Arc<mpsc::Sender<u128>>,
     cam_rx: Option<mpsc::Receiver<Option<CameraPacket>>>,
     cam_tx: Arc<mpsc::Sender<Option<CameraPacket>>>,
     quic_tx: Arc<Sender<Vec<u8>>>,
@@ -84,13 +82,10 @@ impl CameraDaemon {
         user_id: String,
         quic_tx: Sender<Vec<u8>>,
     ) -> CameraDaemon {
-        let (fps_tx, fps_rx) = mpsc::channel(5);
         let (cam_tx, cam_rx) = mpsc::channel(100);
         CameraDaemon {
             config,
             user_id,
-            fps_rx: Some(fps_rx),
-            fps_tx: Arc::new(fps_tx),
             cam_rx: Some(cam_rx),
             cam_tx: Arc::new(cam_tx),
             quit: Arc::new(AtomicBool::new(false)),
@@ -155,7 +150,6 @@ impl CameraDaemon {
     }
 
     fn encoder_thread(&mut self) -> JoinHandle<()> {
-        let fps_tx = self.fps_tx.clone();
         let mut cam_rx = self.cam_rx.take().unwrap();
         let quic_tx = self.quic_tx.clone();
         let quit = self.quit.clone();
@@ -190,32 +184,10 @@ impl CameraDaemon {
                     let packet_wrapper = transform_video_chunk(&frame, &user_id);
                     if let Err(e) = quic_tx.try_send(packet_wrapper.write_to_bytes().unwrap()) {
                         error!("Unable to send packet: {:?}", e);
-                    } 
+                    }
                     // else if let Err(e) = fps_tx.try_send(since_the_epoch().as_millis()) {
                     //     error!("Unable to send fps: {:?}", e);
                     // }
-                }
-            }
-        })
-    }
-
-    fn fps_thread(&mut self) -> JoinHandle<()> {
-        let mut fps_rx = self.fps_rx.take().unwrap();
-        let quit = self.quit.clone();
-        std::thread::spawn(move || {
-            let mut num_frames = 0;
-            let mut now_plus_1 = since_the_epoch().as_millis() + 1000;
-            warn!("Starting fps loop");
-            while let Some(dur) = fps_rx.blocking_recv() {
-                if quit.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                if now_plus_1 < dur {
-                    warn!("FPS: {:?}", num_frames);
-                    num_frames = 0;
-                    now_plus_1 = since_the_epoch().as_millis() + 1000;
-                } else {
-                    num_frames += 1;
                 }
             }
         })

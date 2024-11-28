@@ -27,7 +27,7 @@ RUN apt-get update && \
     apt-get install -y pkg-config libvpx-dev && \
     apt-get clean
 
-COPY --from=build /app/target/release/video-daemon /usr/bin/
+COPY --from=build /app/target/release/video-call-daemon /usr/bin/
 
-CMD ["video-daemon"]
+CMD ["video-call-daemon"]
 

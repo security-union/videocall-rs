@@ -1,9 +1,11 @@
 [package]
-name = "video-daemon"
+name = "video-call-daemon"
 version = "0.1.0"
 edition = "2021"
 description = "Stream audio and video to the videocall-rs backend"
 license = "MIT"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
 authors = [
     "Griffin Obeid <griffin@securityunion.dev>",
     "Dario Lencina <dario@securityunion.dev>",

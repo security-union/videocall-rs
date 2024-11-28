@@ -7,7 +7,7 @@ This is a rust application that can be used to connect to the video call daemon 
 ### Dependencies
 
 ```sh
-sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake
+sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake libssl-dev
 ```
 ## Running using cargo
 

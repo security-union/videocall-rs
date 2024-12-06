@@ -3,6 +3,10 @@
 
 `videocall-types` is a Rust library that provides the shared types and definitions for the [videocall.rs](https://videocall.rs) teleconferencing system. This crate contains essential data structures and type definitions used across the system, enabling seamless communication and interoperability between components.
 
+## Main Repo
+
+If you are new to videocall you should start at our repo [videocall](https://github.com/security-union/videocall-rs)
+
 ## Features
 
 - **Common Data Models**: Standardized types for messages, user sessions, room configurations, and more.

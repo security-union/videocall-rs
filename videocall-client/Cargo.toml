@@ -15,7 +15,7 @@ gloo-timers = "0.2.6"
 gloo-utils = "0.1"
 js-sys = "0.3"
 log = "0.4.19"
-protobuf = "=3.7.1"
+protobuf = "3.3.0"
 rand = { version = "0.8.5", features = ["std_rng", "small_rng"] }
 rsa = "0.9.2"
 videocall-types = { path= "../videocall-types"}

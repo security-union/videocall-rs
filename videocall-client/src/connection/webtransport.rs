@@ -12,7 +12,7 @@ use log::debug;
 use log::error;
 use log::info;
 use protobuf::Message;
-use types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::ReadableStreamDefaultReader;

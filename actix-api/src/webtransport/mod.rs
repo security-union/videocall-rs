@@ -11,9 +11,9 @@ use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
 use tracing::{error, info, trace_span};
-use types::protos::connection_packet::ConnectionPacket;
-use types::protos::packet_wrapper::packet_wrapper::PacketType;
-use types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::connection_packet::ConnectionPacket;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 use web_transport_quinn::Session;
 
 pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", b"h3-29"];

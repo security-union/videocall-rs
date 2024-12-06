@@ -7,10 +7,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info};
-use types::protos::media_packet::media_packet::MediaType;
-use types::protos::media_packet::{MediaPacket, VideoMetadata};
-use types::protos::packet_wrapper::packet_wrapper::PacketType;
-use types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub struct MicrophoneDaemon {
     stop: Arc<AtomicBool>,

@@ -2,9 +2,11 @@ use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use log::debug;
 use protobuf::Message;
 use std::{fmt::Display, sync::Arc};
-use types::protos::media_packet::MediaPacket;
-use types::protos::packet_wrapper::packet_wrapper::PacketType;
-use types::protos::{media_packet::media_packet::MediaType, packet_wrapper::PacketWrapper};
+use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::{
+    media_packet::media_packet::MediaType, packet_wrapper::PacketWrapper,
+};
 use yew::prelude::Callback;
 
 use crate::crypto::aes::Aes128State;

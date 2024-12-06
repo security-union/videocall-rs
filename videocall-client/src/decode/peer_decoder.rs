@@ -20,7 +20,7 @@ use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
 use log::error;
 use std::sync::Arc;
-use types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;

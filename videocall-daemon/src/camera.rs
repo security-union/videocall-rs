@@ -17,9 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, Sender};
 use tracing::{debug, error, info};
 
-use types::protos::media_packet::media_packet::MediaType;
-use types::protos::media_packet::{MediaPacket, VideoMetadata};
-use types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
+use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
 type CameraPacket = (Vec<u8>, u128);
 

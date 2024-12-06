@@ -2,7 +2,7 @@ use super::super::wrappers::{EncodedAudioChunkTypeWrapper, EncodedVideoChunkType
 use crate::crypto::aes::Aes128State;
 use protobuf::Message;
 use std::rc::Rc;
-use types::protos::{
+use videocall_types::protos::{
     media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };

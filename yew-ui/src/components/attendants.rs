@@ -2,7 +2,7 @@ use crate::components::{canvas_generator, peer_list::PeerList};
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::{error, warn};
-use types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use wasm_bindgen::JsValue;
 use web_sys::*;

@@ -1,7 +1,7 @@
 use super::super::wrappers::EncodedVideoChunkTypeWrapper;
 use super::video_decoder_wrapper::VideoDecoderTrait;
 use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
-use types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::{CodecState, EncodedVideoChunkType, VideoDecoderConfig, VideoDecoderInit};
 
@@ -135,7 +135,7 @@ mod test {
 
     use std::sync::Mutex;
 
-    use types::protos::media_packet::VideoMetadata;
+    use videocall_types::protos::media_packet::VideoMetadata;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 

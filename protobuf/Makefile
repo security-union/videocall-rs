@@ -20,7 +20,7 @@ build/rust:
 
 .PHONY: generate_rust
 generate_rust: build/rust
-	protoc --rust_out=build/rust types/*.proto
+	protoc --rs_out=build/rust types/*.proto
 
 .PHONY: build-env-rust
 build-env-rust:

@@ -21,7 +21,7 @@ gloo-utils = "0.1"
 yew-router = "0.18"
 serde = "1"
 serde_derive = "1"
-protobuf = "3.3.0"
+protobuf = "=3.7.1"
 gloo = "0.8.0"
 urlencoding = "2.1.2"
 getrandom = { version = "0.2.10", features = ["js"] }

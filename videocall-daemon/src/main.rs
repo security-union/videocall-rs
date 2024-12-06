@@ -1,9 +1,9 @@
 use clap::Parser;
 
 use tokio::sync::mpsc::channel;
-use video_call_daemon::camera::{CameraConfig, CameraDaemon};
-use video_call_daemon::microphone::MicrophoneDaemon;
-use video_call_daemon::quic::{Client, ClientError, Opt};
+use videocall_daemon::camera::{CameraConfig, CameraDaemon};
+use videocall_daemon::microphone::MicrophoneDaemon;
+use videocall_daemon::quic::{Client, ClientError, Opt};
 
 #[tokio::main]
 async fn main() {

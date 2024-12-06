@@ -30,7 +30,7 @@ build-env-rust:
 
 build-env-generate-rust:
 	$(DOCKER_RUN_RUST_CMD) make generate_rust
-	mv build/rust/* ../types/src/protos
+	mv build/rust/* ../videocall-types/src/protos
 
 .PHONY: build
 build:

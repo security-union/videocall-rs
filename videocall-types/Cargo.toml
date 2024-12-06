@@ -18,5 +18,5 @@ categories = ["network-programming", "video", "audio"]
 [dependencies]
 serde_json = "1.0.81"
 serde = { version = "1.0.37", features = ["derive"]}
-protobuf = "3.3.0"
+protobuf = "=3.7.1"
 yew-websocket = "1.0.1"

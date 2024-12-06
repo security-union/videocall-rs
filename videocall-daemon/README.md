@@ -12,7 +12,7 @@ sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-d
 ## Running using cargo
 
 ```
-cargo install video-call-daemon
+cargo install videocall-daemon
 ```
 
 ## Running locally
@@ -29,6 +29,6 @@ URL can be your local webtransport server or prod https://transport.rustlemania.
 # Compile deb
 
 1. Install `cargo-deb` with `cargo install cargo-deb`
-2. run `cargo deb` this  will generate the deb file at `target/debian/video-call-daemon...deb`
+2. run `cargo deb` this  will generate the deb file at `target/debian/videocall-daemon...deb`
 3. Verify dependencies: `dpkg-deb -I <path_to_deb_file>`
 4. Install deb file: `sudo dpkg -i <path_to_deb_file>`

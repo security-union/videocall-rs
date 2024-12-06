@@ -1516,7 +1516,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
 
 [[package]]
-name = "types"
+name = "videocall-types"
 version = "0.1.0"
 dependencies = [
  "protobuf",
@@ -1571,7 +1571,7 @@ dependencies = [
  "protobuf",
  "rand",
  "rsa",
- "types",
+ "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -1786,7 +1786,7 @@ dependencies = [
  "reqwasm",
  "serde",
  "serde_derive",
- "types",
+ "videocall-types",
  "urlencoding",
  "videocall-client",
  "wasm-bindgen",

@@ -10,7 +10,7 @@ authors = [
     "Dario Lencina <dario@securityunion.dev>"
 ]
 keywords = ["quic", "webtransport", "zoom"]
-categories = ["network-programming", "video", "audio"]
+categories = ["network-programming", "multimedia"]
 description = "types for the videocall streaming platform"
 
 

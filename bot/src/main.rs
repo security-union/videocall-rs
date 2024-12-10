@@ -7,9 +7,9 @@ use rand::Rng;
 use std::env;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use types::protos::media_packet::media_packet::MediaType;
-use types::protos::media_packet::MediaPacket;
 use url::Url;
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
 
 #[tokio::main]
 async fn main() {

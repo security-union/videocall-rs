@@ -1,0 +1,23 @@
+[package]
+name = "videocall-types"
+version = "0.1.0"
+edition = "2021"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+license = "MIT"
+readme = "README.md"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>"
+]
+keywords = ["quic", "webtransport", "zoom"]
+categories = ["network-programming", "multimedia"]
+description = "types for the videocall streaming platform"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serde_json = "1.0.81"
+serde = { version = "1.0.37", features = ["derive"]}
+protobuf = "=3.7.1"
+yew-websocket = "1.0.1"

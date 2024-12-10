@@ -5,7 +5,7 @@
 //
 use log::error;
 use protobuf::Message;
-use types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 

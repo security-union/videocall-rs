@@ -9,11 +9,11 @@ use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use types::protos::aes_packet::AesPacket;
-use types::protos::media_packet::media_packet::MediaType;
-use types::protos::packet_wrapper::packet_wrapper::PacketType;
-use types::protos::packet_wrapper::PacketWrapper;
-use types::protos::rsa_packet::RsaPacket;
+use videocall_types::protos::aes_packet::AesPacket;
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::rsa_packet::RsaPacket;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 

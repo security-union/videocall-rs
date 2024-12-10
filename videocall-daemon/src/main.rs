@@ -1,9 +1,9 @@
 use clap::Parser;
 
 use tokio::sync::mpsc::channel;
-use video_daemon::camera::{CameraConfig, CameraDaemon};
-use video_daemon::microphone::MicrophoneDaemon;
-use video_daemon::quic::{Client, ClientError, Opt};
+use videocall_daemon::camera::{CameraConfig, CameraDaemon};
+use videocall_daemon::microphone::MicrophoneDaemon;
+use videocall_daemon::quic::{Client, ClientError, Opt};
 
 #[tokio::main]
 async fn main() {
@@ -31,7 +31,7 @@ async fn main() {
     let mut camera = CameraDaemon::from_config(camera_config, user_id.clone(), quic_tx.clone());
     camera.start().expect("failed to start camera");
     let mut microphone = MicrophoneDaemon::default();
-    if let Some(audio_device) = audio_device { 
+    if let Some(audio_device) = audio_device {
         microphone
             .start(quic_tx, audio_device, user_id)
             .expect("failed to start microphone");

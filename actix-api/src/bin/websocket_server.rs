@@ -25,7 +25,7 @@ use sec_api::{
     models::{AppConfig, AppState},
 };
 use tracing::{debug, error, info};
-use types::truthy;
+use videocall_types::truthy;
 
 const SCOPE: &str = "email%20profile%20openid";
 /**

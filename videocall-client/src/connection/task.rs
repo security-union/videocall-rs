@@ -4,7 +4,7 @@
 // Handles rollover of connection from WebTransport to WebSocket
 //
 use log::{debug, error};
-use types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 use yew_websocket::websocket::WebSocketTask;
 use yew_webtransport::webtransport::WebTransportTask;
 

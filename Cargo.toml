@@ -3,13 +3,13 @@ resolver = "2"
 members = [
     "actix-api",
     "bot",
-    "types",
+    "videocall-types",
     "videocall-client"
 ]
 exclude = [
     "src-tauri",
-    "video-daemon",
+    "videocall-daemon",
     "yew-ui",
-    "leptos-website"
+    "leptos-website",
 ]
 

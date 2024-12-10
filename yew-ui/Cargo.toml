@@ -9,7 +9,7 @@ edition = "2021"
 yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = "0.2.78"
 reqwasm = "0.5.0"
-types = { path= "../types"}
+videocall-types = { path= "../videocall-types"}
 videocall-client = { path= "../videocall-client"}
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
@@ -21,7 +21,7 @@ gloo-utils = "0.1"
 yew-router = "0.18"
 serde = "1"
 serde_derive = "1"
-protobuf = "3.2.0"
+protobuf = "3.3.0"
 gloo = "0.8.0"
 urlencoding = "2.1.2"
 getrandom = { version = "0.2.10", features = ["js"] }

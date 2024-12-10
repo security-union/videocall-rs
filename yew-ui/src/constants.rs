@@ -1,4 +1,4 @@
-use types::truthy;
+use videocall_types::truthy;
 
 // This is read at compile time, please restart if you change this value.
 pub const LOGIN_URL: &str = std::env!("LOGIN_URL");

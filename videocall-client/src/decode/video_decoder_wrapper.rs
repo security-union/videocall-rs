@@ -1,7 +1,7 @@
 use super::super::wrappers::EncodedVideoChunkTypeWrapper;
 use js_sys::Uint8Array;
 use std::sync::Arc;
-use types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::{
     CodecState, EncodedVideoChunk, EncodedVideoChunkInit, VideoDecoder, VideoDecoderConfig,

@@ -1,7 +1,7 @@
 use clap::Parser;
 use protobuf::Message;
 use quinn::ConnectError;
-use types::protos::{
+use videocall_types::protos::{
     connection_packet::ConnectionPacket,
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };

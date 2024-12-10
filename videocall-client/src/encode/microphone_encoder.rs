@@ -5,7 +5,7 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
 use std::sync::atomic::Ordering;
-use types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;

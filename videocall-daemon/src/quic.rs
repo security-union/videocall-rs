@@ -4,6 +4,7 @@ use anyhow::Error;
 use clap::Parser;
 use protobuf::Message;
 use quinn::Connection;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     sync::mpsc::{self, Sender},
     time::{self, Duration},
@@ -12,6 +13,7 @@ use tracing::{debug, info};
 use url::Url;
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
+    media_packet::{media_packet::MediaType, MediaPacket},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
@@ -76,7 +78,7 @@ impl Client {
         });
 
         // Spawn a separate task for heartbeat
-        self.start_heartbeat(conn.clone()).await;
+        self.start_heartbeat(conn.clone(), &self.options).await;
 
         self.send_connection_packet().await?;
         Ok(())
@@ -121,17 +123,31 @@ impl Client {
         }
     }
 
-    async fn start_heartbeat(&self, conn: Connection) {
-        let interval = time::interval(Duration::from_secs(5));
+    async fn start_heartbeat(&self, conn: Connection, options: &Opt) {
+        let interval = time::interval(Duration::from_secs(1));
+        let email = options.user_id.clone();
         tokio::spawn(async move {
             let mut interval = interval;
             loop {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_millis(); // Get milliseconds since Unix epoch
                 interval.tick().await;
-                let heartbeat_packet = PacketWrapper {
-                    packet_type: PacketType::MEDIA.into(), // Correct PacketType based on your original code
+                let actual_heartbeat = MediaPacket {
+                    media_type: MediaType::HEARTBEAT.into(),
+                    email: email.clone(),
+                    timestamp: now_ms as f64,
                     ..Default::default()
                 };
-                let data = heartbeat_packet.write_to_bytes().unwrap();
+
+                let packet = PacketWrapper {
+                    email: email.clone(),
+                    packet_type: PacketType::MEDIA.into(),
+                    data: actual_heartbeat.write_to_bytes().unwrap(),
+                    ..Default::default()
+                };
+                let data = packet.write_to_bytes().unwrap();
                 if let Err(e) = Self::send(conn.clone(), data).await {
                     tracing::error!("Failed to send heartbeat: {}", e);
                 }

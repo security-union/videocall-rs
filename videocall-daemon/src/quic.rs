@@ -17,6 +17,14 @@ use videocall_types::protos::{
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
+
+
+/// Video Call Daemon
+///
+/// This daemon connects to the videocall.rs and streams audio and video tp tje specified meeting.
+/// 
+/// You can watch the video at https://videocall.rs/meeting/{user_id}/{meeting_id}
+
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
 pub struct Opt {
@@ -32,7 +40,7 @@ pub struct Opt {
     pub user_id: String,
 
     #[clap(long = "meeting-id")]
-    meeting_id: String,
+    pub meeting_id: String,
 
     #[clap(long = "video-device-index")]
     pub video_device_index: usize,

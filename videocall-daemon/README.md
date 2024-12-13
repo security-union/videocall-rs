@@ -4,6 +4,7 @@
 ## ✨ Features
 - Stream video effortlessly from your desktop/robot/rpi.
 - Works seamlessly with [videocall.rs](https://videocall.rs).
+- Currently Supports Chrome, Chromium and Edge.
 - Compatible with **local servers** or **production environments**.
 
 ---
@@ -37,7 +38,7 @@ videocall-daemon \
   --fps 30
 ```
 
-## 🌐 See Your Stream Live!
+## 🌐 See Your Stream Live! using Chrome
 This system integrates directly with [videocall.rs](https://videocall.rs). Simply navigate to the following URL to watch your stream live:
 
 ```

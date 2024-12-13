@@ -1,6 +1,7 @@
 use clap::Parser;
 
 use tokio::sync::mpsc::channel;
+use tracing::level_filters::LevelFilter;
 use videocall_daemon::camera::{CameraConfig, CameraDaemon};
 use videocall_daemon::microphone::MicrophoneDaemon;
 use videocall_daemon::quic::{Client, Opt};
@@ -9,7 +10,9 @@ use videocall_daemon::quic::{Client, Opt};
 async fn main() {
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_env_filter(tracing_subscriber::EnvFilter::builder()
+            .with_default_directive(LevelFilter::INFO.into())
+            .from_env_lossy())
             .finish(),
     )
     .unwrap();
@@ -28,6 +31,7 @@ async fn main() {
         panic!("invalid framerate: {}", framerate);
     }
     let user_id = opt.user_id.clone();
+    let meeting_id = opt.meeting_id.clone();
     let video_device_index = opt.video_device_index;
     let audio_device = opt.audio_device.clone();
     let mut client = Client::new(opt);
@@ -46,9 +50,15 @@ async fn main() {
     let mut microphone = MicrophoneDaemon::default();
     if let Some(audio_device) = audio_device {
         microphone
-            .start(quic_tx, audio_device, user_id)
+            .start(quic_tx, audio_device, user_id.clone())
             .expect("failed to start microphone");
     }
+
+    tracing::info!(
+    "If you used the default url, the stream is ready at https://app.videocall.rs with meeting id:{} \n** warning: use Chrome or Chromium \n** warning: do no reuse the username {}",
+        meeting_id,
+        user_id
+    );
     while let Some(data) = quic_rx.recv().await {
         if let Err(e) = client.send_packet(data).await {
             tracing::error!("Failed to send packet: {}", e);

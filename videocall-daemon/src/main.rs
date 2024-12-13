@@ -14,6 +14,19 @@ async fn main() {
     )
     .unwrap();
     let opt = Opt::parse();
+
+    // Parse resolution
+    let resolution: Vec<&str> = opt.resolution.split('x').collect();
+    if resolution.len() != 2 {
+        panic!("invalid resolution: {}", opt.resolution);
+    }
+    let width = resolution[0].parse::<u32>().expect("invalid width");
+    let height = resolution[1].parse::<u32>().expect("invalid height");
+    let framerate = opt.fps;
+    // validate framerate
+    if framerate != 10 && framerate != 15 && framerate != 30 && framerate != 60 {
+        panic!("invalid framerate: {}", framerate);
+    }
     let user_id = opt.user_id.clone();
     let video_device_index = opt.video_device_index;
     let audio_device = opt.audio_device.clone();
@@ -21,8 +34,8 @@ async fn main() {
     client.connect().await.expect("failed to connect");
 
     let camera_config = CameraConfig {
-        width: 640,
-        height: 480,
+        width,
+        height,
         framerate: 15,
         frame_format: nokhwa::utils::FrameFormat::YUYV,
         video_device_index,
@@ -39,13 +52,6 @@ async fn main() {
     while let Some(data) = quic_rx.recv().await {
         if let Err(e) = client.send(data).await {
             match e {
-                ClientError::OversizedPacket(size) => {
-                    tracing::error!(
-                        "packet size {} exceeds maximum packet size {}",
-                        size,
-                        client.max_packet_size
-                    );
-                }
                 ClientError::NotConnected => {
                     tracing::error!("not connected, attempting to reconnect");
                     client.connect().await.expect("failed to connect");

@@ -103,20 +103,24 @@ pub struct Opt {
     #[clap(long = "meeting-id")]
     meeting_id: String,
 
-    #[clap(long = "max-packet-size")]
-    max_packet_size: Option<usize>,
-
     #[clap(long = "video-device-index")]
     pub video_device_index: usize,
 
     #[clap(long = "audio-device")]
     pub audio_device: Option<String>,
+
+    /// Resolution in WIDTHxHEIGHT format (e.g., 1920x1080)
+    #[clap(long = "resolution")]
+    pub resolution: String,
+
+    /// Frames per second (e.g. 10, 30, 60)
+    #[clap(long = "fps")]
+    pub fps: u32
 }
 
 pub struct Client {
     options: Opt,
     connection: Option<quinn::Connection>,
-    pub max_packet_size: usize,
 }
 
 impl Client {
@@ -127,7 +131,6 @@ impl Client {
     /// - options: command line options.
     pub fn new(options: Opt) -> Result<Client> {
         Ok(Client {
-            max_packet_size: options.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE),
             options,
             connection: None,
         })
@@ -157,9 +160,6 @@ impl Client {
 
     pub async fn send(&mut self, data: Vec<u8>) -> Result<()> {
         let packet_size = data.len();
-        if packet_size > self.max_packet_size {
-            return Err(ClientError::OversizedPacket(data.len()));
-        }
         let conn = self
             .connection
             .as_mut()

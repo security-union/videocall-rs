@@ -49,18 +49,14 @@ pub struct Opt {
 
 pub struct Client {
     options: Opt,
-    connection: Option<Connection>,
     sender: Option<Sender<Vec<u8>>>,
-    heartbeat_interval: Duration,
 }
 
 impl Client {
     pub fn new(options: Opt) -> Self {
         Self {
             options,
-            connection: None,
             sender: None,
-            heartbeat_interval: Duration::from_secs(5), // Heartbeat every 5 seconds
         }
     }
 
@@ -68,22 +64,21 @@ impl Client {
         let conn = connect_to_server(&self.options).await?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
         self.sender = Some(tx);
-        self.connection = Some(conn.clone());
 
         // Spawn a task to handle sending messages via the connection
+        let cloned_conn = conn.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                if let Err(e) = Self::send(conn.clone(), message).await {
+                if let Err(e) = Self::send(cloned_conn.clone(), message).await {
                     tracing::error!("Failed to send message: {}", e);
                 }
             }
         });
 
-        self.send_connection_packet().await?;
+        // Spawn a separate task for heartbeat
+        self.start_heartbeat(conn.clone()).await;
 
-        // move the heartbeat to a separate task
-        
-        self.start_heartbeat().await;
+        self.send_connection_packet().await?;
         Ok(())
     }
 
@@ -102,7 +97,7 @@ impl Client {
         Ok(())
     }
 
-    async fn send(conn: Connection, data: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn send(conn: Connection, data: Vec<u8>) -> anyhow::Result<()> {
         debug!("Sending {} bytes", data.len());
         let mut stream = conn.open_uni().await?;
         stream.write_all(&data).await?;
@@ -111,7 +106,6 @@ impl Client {
         Ok(())
     }
 
-    // Add public method to queue a message
     pub async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
         self.queue_message(data).await
     }
@@ -127,27 +121,27 @@ impl Client {
         }
     }
 
-    async fn start_heartbeat(&self) {
-        let mut interval = time::interval(self.heartbeat_interval);
-        loop {
-            interval.tick().await;
-            let heartbeat_packet = PacketWrapper {
-                packet_type: PacketType::MEDIA.into(),
-                ..Default::default()
-            };
-            if let Err(e) = self
-                .queue_message(heartbeat_packet.write_to_bytes().unwrap())
-                .await
-            {
-                tracing::error!("Failed to queue heartbeat: {}", e);
+    async fn start_heartbeat(&self, conn: Connection) {
+        let interval = time::interval(Duration::from_secs(5));
+        tokio::spawn(async move {
+            let mut interval = interval;
+            loop {
+                interval.tick().await;
+                let heartbeat_packet = PacketWrapper {
+                    packet_type: PacketType::MEDIA.into(), // Correct PacketType based on your original code
+                    ..Default::default()
+                };
+                let data = heartbeat_packet.write_to_bytes().unwrap();
+                if let Err(e) = Self::send(conn.clone(), data).await {
+                    tracing::error!("Failed to send heartbeat: {}", e);
+                }
             }
-        }
+        });
     }
 }
 
 async fn connect_to_server(options: &Opt) -> anyhow::Result<Connection> {
     loop {
-        // Perform actual connection logic here
         info!("Attempting to connect to {}", options.url);
         let addrs = options
             .url

@@ -50,7 +50,6 @@ async fn main() {
             .expect("failed to start microphone");
     }
     while let Some(data) = quic_rx.recv().await {
-        tracing::info!("Sending packet");
         if let Err(e) = client.send_packet(data).await {
             tracing::error!("Failed to send packet: {}", e);
         }

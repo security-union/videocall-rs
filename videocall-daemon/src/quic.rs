@@ -21,7 +21,7 @@ use videocall_types::protos::{
 
 /// Video Call Daemon
 ///
-/// This daemon connects to the videocall.rs and streams audio and video tp tje specified meeting.
+/// This daemon connects to the videocall.rs and streams audio and video to the specified meeting.
 /// 
 /// You can watch the video at https://videocall.rs/meeting/{user_id}/{meeting_id}
 

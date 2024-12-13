@@ -11,8 +11,6 @@ use thiserror::Error;
 use tracing::{debug, info};
 use url::Url;
 
-use crate::fake_cert_verifier::NoVerification;
-
 const DEFAULT_MAX_PACKET_SIZE: usize = 500_000;
 
 #[derive(Debug, Error)]
@@ -61,10 +59,6 @@ pub async fn connect(opt: &Opt) -> Result<quinn::Connection> {
         .with_safe_defaults()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    // do this only if we're not verifying the cert
-    client_crypto
-        .dangerous()
-        .set_certificate_verifier(Arc::new(NoVerification));
 
     let alpn = vec![b"hq-29".to_vec()];
     client_crypto.alpn_protocols = alpn;
@@ -77,14 +71,14 @@ pub async fn connect(opt: &Opt) -> Result<quinn::Connection> {
         .map_err(|e| ClientError::FailedToConnect(format!("failed to create endpoint: {}", e)))?;
     endpoint.set_default_client_config(client_config);
     let start = Instant::now();
+    info!("connecting to {remote}");
     let host = opt
-        .host
-        .as_ref()
-        .map_or_else(|| opt.url.host_str(), |x| Some(x))
-        .ok_or(ClientError::UnspecifiedHostname)?;
-    info!("connecting to {host} at {remote}");
+        .url
+        .host_str()
+        .ok_or(ClientError::UnspecifiedHostname)?
+        .to_owned();
     let conn = endpoint
-        .connect(remote, host)?
+        .connect(remote, &host)?
         .await
         .map_err(|e| ClientError::FailedToConnect(e.to_string()))?;
     info!("connected at {:?}", start.elapsed());
@@ -99,6 +93,8 @@ pub struct Opt {
     #[clap(long = "keylog")]
     keylog: bool,
 
+    /// URL to connect to.
+    #[clap(long = "url", default_value = "https://transport.rustlemania.com")]
     url: Url,
 
     #[clap(long = "user-id")]
@@ -106,14 +102,6 @@ pub struct Opt {
 
     #[clap(long = "meeting-id")]
     meeting_id: String,
-
-    /// Override hostname used for certificate verification
-    #[clap(long = "host")]
-    host: Option<String>,
-
-    /// Certificate authority to trust, in DER format
-    #[clap(long = "ca")]
-    ca: Option<PathBuf>,
 
     #[clap(long = "max-packet-size")]
     max_packet_size: Option<usize>,

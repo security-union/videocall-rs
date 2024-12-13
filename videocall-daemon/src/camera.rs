@@ -122,7 +122,7 @@ impl CameraDaemon {
                 .unwrap()
         ];
         Ok(std::thread::spawn(move || {
-            info!("Camera opened... waiting for frames");
+            debug!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
                 CameraIndex::Index(video_device_index),
                 RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Closest(

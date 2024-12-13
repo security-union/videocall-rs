@@ -98,6 +98,8 @@ impl CameraDaemon {
         self.handles.push(self.camera_thread()?);
         let encoder = self.encoder_thread();
         self.handles.push(encoder);
+        // let fps = self.fps_thread();
+        // self.handles.push(fps);
         Ok(())
     }
 
@@ -123,11 +125,12 @@ impl CameraDaemon {
             info!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
                 CameraIndex::Index(video_device_index),
-                RequestedFormat::new::<YuyvFormat>(RequestedFormatType::AbsoluteHighestResolution)
+                RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Closest(
+                    CameraFormat::new_from(width, height, frame_format, framerate),
+                )),
             )
             .unwrap();
-            // Print the camera information
-            info!("{:?}", camera.info());
+            camera.open_stream().unwrap();
 
             while camera
                 .write_frame_to_buffer::<YuyvFormat>(&mut buffer_slice_i420)
@@ -139,7 +142,6 @@ impl CameraDaemon {
                 if let Err(e) = cam_tx.try_send(Some((
                     buffer_slice_i420.to_vec(),
                     since_the_epoch().as_millis(),
-                    
                 ))) {
                     error!("error sending image {}", e);
                 }

@@ -1,97 +1,22 @@
+use std::sync::Arc;
+
+use anyhow::Error;
 use clap::Parser;
 use protobuf::Message;
-use quinn::ConnectError;
+use quinn::Connection;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::{
+    sync::mpsc::{self, Sender},
+    time::{self, Duration},
+};
+use tracing::{debug, info};
+use url::Url;
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
+    media_packet::{media_packet::MediaType, MediaPacket},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
-use std::{path::PathBuf, sync::Arc, time::Instant};
-use thiserror::Error;
-use tracing::{debug, info};
-use url::Url;
-
-use crate::fake_cert_verifier::NoVerification;
-
-const DEFAULT_MAX_PACKET_SIZE: usize = 500_000;
-
-#[derive(Debug, Error)]
-pub enum ClientError {
-    #[error("failed to connect: {}", .0)]
-    FailedToConnect(String),
-    #[error("not connected")]
-    NotConnected,
-    #[error("oversized packet of {} bytes", .0)]
-    OversizedPacket(usize),
-    #[error("could not resolve address")]
-    UnresolvedAddress,
-    #[error("no hostname specified")]
-    UnspecifiedHostname,
-}
-
-impl From<ConnectError> for ClientError {
-    fn from(e: ConnectError) -> Self {
-        ClientError::FailedToConnect(e.to_string())
-    }
-}
-
-type Result<T> = std::result::Result<T, ClientError>;
-/// Connects to a QUIC server.
-///
-/// ## Args
-///
-/// - opt: command line options.
-pub async fn connect(opt: &Opt) -> Result<quinn::Connection> {
-    let remote = opt
-        .url
-        .socket_addrs(|| Some(443))
-        .expect("couldn't resolve the address provided")
-        .first()
-        .ok_or(ClientError::UnresolvedAddress)?
-        .to_owned();
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
-    let mut client_crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    // do this only if we're not verifying the cert
-    client_crypto
-        .dangerous()
-        .set_certificate_verifier(Arc::new(NoVerification));
-
-    let alpn = vec![b"hq-29".to_vec()];
-    client_crypto.alpn_protocols = alpn;
-    if opt.keylog {
-        client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
-    }
-    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
-
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
-        .map_err(|e| ClientError::FailedToConnect(format!("failed to create endpoint: {}", e)))?;
-    endpoint.set_default_client_config(client_config);
-    let start = Instant::now();
-    let host = opt
-        .host
-        .as_ref()
-        .map_or_else(|| opt.url.host_str(), |x| Some(x))
-        .ok_or(ClientError::UnspecifiedHostname)?;
-    info!("connecting to {host} at {remote}");
-    let conn = endpoint
-        .connect(remote, host)?
-        .await
-        .map_err(|e| ClientError::FailedToConnect(e.to_string()))?;
-    info!("connected at {:?}", start.elapsed());
-    Ok(conn)
-}
-
-/// HTTP/0.9 over QUIC client
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
 pub struct Opt {
@@ -99,6 +24,8 @@ pub struct Opt {
     #[clap(long = "keylog")]
     keylog: bool,
 
+    /// URL to connect to.
+    #[clap(long = "url", default_value = "https://transport.rustlemania.com")]
     url: Url,
 
     #[clap(long = "user-id")]
@@ -107,49 +34,57 @@ pub struct Opt {
     #[clap(long = "meeting-id")]
     meeting_id: String,
 
-    /// Override hostname used for certificate verification
-    #[clap(long = "host")]
-    host: Option<String>,
-
-    /// Certificate authority to trust, in DER format
-    #[clap(long = "ca")]
-    ca: Option<PathBuf>,
-
-    #[clap(long = "max-packet-size")]
-    max_packet_size: Option<usize>,
-
     #[clap(long = "video-device-index")]
     pub video_device_index: usize,
 
     #[clap(long = "audio-device")]
     pub audio_device: Option<String>,
+
+    /// Resolution in WIDTHxHEIGHT format (e.g., 1920x1080)
+    #[clap(long = "resolution")]
+    pub resolution: String,
+
+    /// Frames per second (e.g. 10, 30, 60)
+    #[clap(long = "fps")]
+    pub fps: u32,
 }
 
 pub struct Client {
     options: Opt,
-    connection: Option<quinn::Connection>,
-    pub max_packet_size: usize,
+    sender: Option<Sender<Vec<u8>>>,
 }
 
 impl Client {
-    /// Initialize a new QUIC client and load trusted certificates.
-    ///
-    /// ## Args
-    ///
-    /// - options: command line options.
-    pub fn new(options: Opt) -> Result<Client> {
-        Ok(Client {
-            max_packet_size: options.max_packet_size.unwrap_or(DEFAULT_MAX_PACKET_SIZE),
+    pub fn new(options: Opt) -> Self {
+        Self {
             options,
-            connection: None,
-        })
+            sender: None,
+        }
     }
 
-    pub async fn connect(&mut self) -> Result<()> {
-        let conn = connect(&self.options).await?;
-        self.connection = Some(conn);
+    pub async fn connect(&mut self) -> anyhow::Result<()> {
+        let conn = connect_to_server(&self.options).await?;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
+        self.sender = Some(tx);
 
-        // Send connection message with meeting id
+        // Spawn a task to handle sending messages via the connection
+        let cloned_conn = conn.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let Err(e) = Self::send(cloned_conn.clone(), message).await {
+                    tracing::error!("Failed to send message: {}", e);
+                }
+            }
+        });
+
+        // Spawn a separate task for heartbeat
+        self.start_heartbeat(conn.clone(), &self.options).await;
+
+        self.send_connection_packet().await?;
+        Ok(())
+    }
+
+    async fn send_connection_packet(&self) -> anyhow::Result<()> {
         let connection_packet = ConnectionPacket {
             meeting_id: self.options.meeting_id.clone(),
             ..Default::default()
@@ -157,37 +92,119 @@ impl Client {
         let packet = PacketWrapper {
             packet_type: PacketType::CONNECTION.into(),
             email: self.options.user_id.clone(),
-            data: connection_packet.write_to_bytes().unwrap(),
+            data: connection_packet.write_to_bytes()?,
             ..Default::default()
         };
-        let packet = packet.write_to_bytes().unwrap();
-        self.send(packet).await?;
-
-        debug!("connected to server {}", self.options.url);
+        self.queue_message(packet.write_to_bytes()?).await?;
         Ok(())
     }
 
-    pub async fn send(&mut self, data: Vec<u8>) -> Result<()> {
-        let packet_size = data.len();
-        if packet_size > self.max_packet_size {
-            return Err(ClientError::OversizedPacket(data.len()));
-        }
-        let conn = self
-            .connection
-            .as_mut()
-            .ok_or(ClientError::NotConnected)?
-            .clone();
-        async fn send(conn: quinn::Connection, data: Vec<u8>, packet_size: usize) -> Result<()> {
-            debug!("sending {} bytes", packet_size);
-            let mut stream = conn.open_uni().await.unwrap();
-            stream.write_all(&data).await.unwrap();
-            stream.finish().await.unwrap();
-            debug!("sent {} bytes", packet_size);
-            Ok(())
-        }
-        tokio::spawn(async move {
-            send(conn, data, packet_size).await.unwrap();
-        });
+    pub async fn send(conn: Connection, data: Vec<u8>) -> anyhow::Result<()> {
+        debug!("Sending {} bytes", data.len());
+        let mut stream = conn.open_uni().await?;
+        stream.write_all(&data).await?;
+        stream.finish().await?;
+        debug!("Sent {} bytes", data.len());
         Ok(())
+    }
+
+    pub async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
+        self.queue_message(data).await
+    }
+
+    async fn queue_message(&self, message: Vec<u8>) -> anyhow::Result<()> {
+        if let Some(sender) = &self.sender {
+            sender
+                .send(message)
+                .await
+                .map_err(|_| Error::msg("Failed to send message to queue"))
+        } else {
+            Err(Error::msg("No sender available"))
+        }
+    }
+
+    async fn start_heartbeat(&self, conn: Connection, options: &Opt) {
+        let interval = time::interval(Duration::from_secs(1));
+        let email = options.user_id.clone();
+        tokio::spawn(async move {
+            let mut interval = interval;
+            loop {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_millis(); // Get milliseconds since Unix epoch
+                interval.tick().await;
+                let actual_heartbeat = MediaPacket {
+                    media_type: MediaType::HEARTBEAT.into(),
+                    email: email.clone(),
+                    timestamp: now_ms as f64,
+                    ..Default::default()
+                };
+
+                let packet = PacketWrapper {
+                    email: email.clone(),
+                    packet_type: PacketType::MEDIA.into(),
+                    data: actual_heartbeat.write_to_bytes().unwrap(),
+                    ..Default::default()
+                };
+                let data = packet.write_to_bytes().unwrap();
+                if let Err(e) = Self::send(conn.clone(), data).await {
+                    tracing::error!("Failed to send heartbeat: {}", e);
+                }
+            }
+        });
+    }
+}
+
+async fn connect_to_server(options: &Opt) -> anyhow::Result<Connection> {
+    loop {
+        info!("Attempting to connect to {}", options.url);
+        let addrs = options
+            .url
+            .socket_addrs(|| Some(443))
+            .expect("couldn't resolve the address provided");
+        let remote = addrs.first().to_owned();
+        let remote = remote.unwrap();
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                ta.subject,
+                ta.spki,
+                ta.name_constraints,
+            )
+        }));
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let alpn = vec![b"hq-29".to_vec()];
+        client_crypto.alpn_protocols = alpn;
+        if options.keylog {
+            client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
+        let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+        let host = options.url.host_str();
+
+        match quinn::Endpoint::client("[::]:0".parse().unwrap()) {
+            Ok(mut endpoint) => {
+                endpoint.set_default_client_config(client_config);
+                match endpoint.connect(*remote, host.unwrap()) {
+                    Ok(conn) => {
+                        let conn = conn.await?;
+                        info!("Connected successfully");
+                        return Ok(conn);
+                    }
+                    Err(e) => {
+                        tracing::error!("Connection failed: {}. Retrying in 5 seconds...", e);
+                        time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Endpoint creation failed: {}. Retrying in 5 seconds...", e);
+                time::sleep(Duration::from_secs(5)).await;
+            }
+        }
     }
 }

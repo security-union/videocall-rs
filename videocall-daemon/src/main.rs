@@ -3,7 +3,7 @@ use clap::Parser;
 use tokio::sync::mpsc::channel;
 use videocall_daemon::camera::{CameraConfig, CameraDaemon};
 use videocall_daemon::microphone::MicrophoneDaemon;
-use videocall_daemon::quic::{Client, ClientError, Opt};
+use videocall_daemon::quic::{Client, Opt};
 
 #[tokio::main]
 async fn main() {
@@ -30,13 +30,13 @@ async fn main() {
     let user_id = opt.user_id.clone();
     let video_device_index = opt.video_device_index;
     let audio_device = opt.audio_device.clone();
-    let mut client = Client::new(opt).expect("failed to create client");
+    let mut client = Client::new(opt);
     client.connect().await.expect("failed to connect");
 
     let camera_config = CameraConfig {
         width,
         height,
-        framerate: 15,
+        framerate,
         frame_format: nokhwa::utils::FrameFormat::YUYV,
         video_device_index,
     };
@@ -50,16 +50,9 @@ async fn main() {
             .expect("failed to start microphone");
     }
     while let Some(data) = quic_rx.recv().await {
-        if let Err(e) = client.send(data).await {
-            match e {
-                ClientError::NotConnected => {
-                    tracing::error!("not connected, attempting to reconnect");
-                    client.connect().await.expect("failed to connect");
-                }
-                _ => {
-                    panic!("failed to send data: {}", e);
-                }
-            }
+        tracing::info!("Sending packet");
+        if let Err(e) = client.send_packet(data).await {
+            tracing::error!("Failed to send packet: {}", e);
         }
     }
 }

@@ -1,91 +1,20 @@
+use std::sync::Arc;
+
+use anyhow::Error;
 use clap::Parser;
 use protobuf::Message;
-use quinn::ConnectError;
+use quinn::Connection;
+use tokio::{
+    sync::mpsc::{self, Sender},
+    time::{self, Duration},
+};
+use tracing::{debug, info};
+use url::Url;
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
-use std::{path::PathBuf, sync::Arc, time::Instant};
-use thiserror::Error;
-use tracing::{debug, info};
-use url::Url;
-
-const DEFAULT_MAX_PACKET_SIZE: usize = 500_000;
-
-#[derive(Debug, Error)]
-pub enum ClientError {
-    #[error("failed to connect: {}", .0)]
-    FailedToConnect(String),
-    #[error("not connected")]
-    NotConnected,
-    #[error("oversized packet of {} bytes", .0)]
-    OversizedPacket(usize),
-    #[error("could not resolve address")]
-    UnresolvedAddress,
-    #[error("no hostname specified")]
-    UnspecifiedHostname,
-}
-
-impl From<ConnectError> for ClientError {
-    fn from(e: ConnectError) -> Self {
-        ClientError::FailedToConnect(e.to_string())
-    }
-}
-
-type Result<T> = std::result::Result<T, ClientError>;
-/// Connects to a QUIC server.
-///
-/// ## Args
-///
-/// - opt: command line options.
-pub async fn connect(opt: &Opt) -> Result<quinn::Connection> {
-    let remote = opt
-        .url
-        .socket_addrs(|| Some(443))
-        .expect("couldn't resolve the address provided")
-        .first()
-        .ok_or(ClientError::UnresolvedAddress)?
-        .to_owned();
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-        rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
-    let mut client_crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let alpn = vec![b"hq-29".to_vec()];
-    client_crypto.alpn_protocols = alpn;
-    if opt.keylog {
-        client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
-    }
-    let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
-
-    let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap())
-        .map_err(|e| ClientError::FailedToConnect(format!("failed to create endpoint: {}", e)))?;
-    endpoint.set_default_client_config(client_config);
-    let start = Instant::now();
-    info!("connecting to {remote}");
-    let host = opt
-        .url
-        .host_str()
-        .ok_or(ClientError::UnspecifiedHostname)?
-        .to_owned();
-    let conn = endpoint
-        .connect(remote, &host)?
-        .await
-        .map_err(|e| ClientError::FailedToConnect(e.to_string()))?;
-    info!("connected at {:?}", start.elapsed());
-    Ok(conn)
-}
-
-/// HTTP/0.9 over QUIC client
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
 pub struct Opt {
@@ -115,32 +44,50 @@ pub struct Opt {
 
     /// Frames per second (e.g. 10, 30, 60)
     #[clap(long = "fps")]
-    pub fps: u32
+    pub fps: u32,
 }
 
 pub struct Client {
     options: Opt,
-    connection: Option<quinn::Connection>,
+    connection: Option<Connection>,
+    sender: Option<Sender<Vec<u8>>>,
+    heartbeat_interval: Duration,
 }
 
 impl Client {
-    /// Initialize a new QUIC client and load trusted certificates.
-    ///
-    /// ## Args
-    ///
-    /// - options: command line options.
-    pub fn new(options: Opt) -> Result<Client> {
-        Ok(Client {
+    pub fn new(options: Opt) -> Self {
+        Self {
             options,
             connection: None,
-        })
+            sender: None,
+            heartbeat_interval: Duration::from_secs(5), // Heartbeat every 5 seconds
+        }
     }
 
-    pub async fn connect(&mut self) -> Result<()> {
-        let conn = connect(&self.options).await?;
-        self.connection = Some(conn);
+    pub async fn connect(&mut self) -> anyhow::Result<()> {
+        let conn = connect_to_server(&self.options).await?;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
+        self.sender = Some(tx);
+        self.connection = Some(conn.clone());
 
-        // Send connection message with meeting id
+        // Spawn a task to handle sending messages via the connection
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let Err(e) = Self::send(conn.clone(), message).await {
+                    tracing::error!("Failed to send message: {}", e);
+                }
+            }
+        });
+
+        self.send_connection_packet().await?;
+
+        // move the heartbeat to a separate task
+        
+        self.start_heartbeat().await;
+        Ok(())
+    }
+
+    async fn send_connection_packet(&self) -> anyhow::Result<()> {
         let connection_packet = ConnectionPacket {
             meeting_id: self.options.meeting_id.clone(),
             ..Default::default()
@@ -148,34 +95,106 @@ impl Client {
         let packet = PacketWrapper {
             packet_type: PacketType::CONNECTION.into(),
             email: self.options.user_id.clone(),
-            data: connection_packet.write_to_bytes().unwrap(),
+            data: connection_packet.write_to_bytes()?,
             ..Default::default()
         };
-        let packet = packet.write_to_bytes().unwrap();
-        self.send(packet).await?;
-
-        debug!("connected to server {}", self.options.url);
+        self.queue_message(packet.write_to_bytes()?).await?;
         Ok(())
     }
 
-    pub async fn send(&mut self, data: Vec<u8>) -> Result<()> {
-        let packet_size = data.len();
-        let conn = self
-            .connection
-            .as_mut()
-            .ok_or(ClientError::NotConnected)?
-            .clone();
-        async fn send(conn: quinn::Connection, data: Vec<u8>, packet_size: usize) -> Result<()> {
-            debug!("sending {} bytes", packet_size);
-            let mut stream = conn.open_uni().await.unwrap();
-            stream.write_all(&data).await.unwrap();
-            stream.finish().await.unwrap();
-            debug!("sent {} bytes", packet_size);
-            Ok(())
-        }
-        tokio::spawn(async move {
-            send(conn, data, packet_size).await.unwrap();
-        });
+    async fn send(conn: Connection, data: Vec<u8>) -> anyhow::Result<()> {
+        debug!("Sending {} bytes", data.len());
+        let mut stream = conn.open_uni().await?;
+        stream.write_all(&data).await?;
+        stream.finish().await?;
+        debug!("Sent {} bytes", data.len());
         Ok(())
+    }
+
+    // Add public method to queue a message
+    pub async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
+        self.queue_message(data).await
+    }
+
+    async fn queue_message(&self, message: Vec<u8>) -> anyhow::Result<()> {
+        if let Some(sender) = &self.sender {
+            sender
+                .send(message)
+                .await
+                .map_err(|_| Error::msg("Failed to send message to queue"))
+        } else {
+            Err(Error::msg("No sender available"))
+        }
+    }
+
+    async fn start_heartbeat(&self) {
+        let mut interval = time::interval(self.heartbeat_interval);
+        loop {
+            interval.tick().await;
+            let heartbeat_packet = PacketWrapper {
+                packet_type: PacketType::MEDIA.into(),
+                ..Default::default()
+            };
+            if let Err(e) = self
+                .queue_message(heartbeat_packet.write_to_bytes().unwrap())
+                .await
+            {
+                tracing::error!("Failed to queue heartbeat: {}", e);
+            }
+        }
+    }
+}
+
+async fn connect_to_server(options: &Opt) -> anyhow::Result<Connection> {
+    loop {
+        // Perform actual connection logic here
+        info!("Attempting to connect to {}", options.url);
+        let addrs = options
+            .url
+            .socket_addrs(|| Some(443))
+            .expect("couldn't resolve the address provided");
+        let remote = addrs.first().to_owned();
+        let remote = remote.unwrap();
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                ta.subject,
+                ta.spki,
+                ta.name_constraints,
+            )
+        }));
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let alpn = vec![b"hq-29".to_vec()];
+        client_crypto.alpn_protocols = alpn;
+        if options.keylog {
+            client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
+        let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
+        let host = options.url.host_str();
+
+        match quinn::Endpoint::client("[::]:0".parse().unwrap()) {
+            Ok(mut endpoint) => {
+                endpoint.set_default_client_config(client_config);
+                match endpoint.connect(*remote, host.unwrap()) {
+                    Ok(conn) => {
+                        let conn = conn.await?;
+                        info!("Connected successfully");
+                        return Ok(conn);
+                    }
+                    Err(e) => {
+                        tracing::error!("Connection failed: {}. Retrying in 5 seconds...", e);
+                        time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Endpoint creation failed: {}. Retrying in 5 seconds...", e);
+                time::sleep(Duration::from_secs(5)).await;
+            }
+        }
     }
 }

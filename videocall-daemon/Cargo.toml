@@ -1,6 +1,6 @@
 [package]
 name = "videocall-daemon"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
@@ -46,6 +46,7 @@ rayon = "1.8.0"
 thiserror = "1.0.51"
 cpal = "0.15.2"
 opus = "0.3.0"
+futures = "0.3.31"
 
 [dependencies.videocall-types]
 path = "../videocall-types"

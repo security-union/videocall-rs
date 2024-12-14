@@ -2,7 +2,7 @@
 # VideoCall Daemon Rust Client
 
 ## ✨ Features
-- Stream video effortlessly from your desktop/robot/rpi.
+- Stream video effortlessly from the CLI on your desktop, robot, or Raspberry Pi.
 - Works seamlessly with [videocall.rs](https://videocall.rs).
 - Currently Supports Chrome, Chromium and Edge.
 - Compatible with **local servers** or **production environments**.

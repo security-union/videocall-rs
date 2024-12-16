@@ -1,8 +1,9 @@
 use tokio::sync::mpsc::channel;
 use videocall_daemon::{
     camera::{CameraConfig, CameraDaemon},
+    cli_args::Streaming,
     microphone::MicrophoneDaemon,
-    quic::{Client, Streaming},
+    quic::Client,
 };
 
 pub async fn stream(opt: Streaming) {
@@ -19,7 +20,6 @@ pub async fn stream(opt: Streaming) {
         panic!("invalid framerate: {}", framerate);
     }
     let user_id = opt.user_id.clone();
-    let meeting_id = opt.meeting_id.clone();
     let video_device_index = opt.video_device_index;
     let audio_device = opt.audio_device.clone();
     let mut client = Client::new(opt);
@@ -42,11 +42,6 @@ pub async fn stream(opt: Streaming) {
             .expect("failed to start microphone");
     }
 
-    tracing::info!(
- "If you used the default url, the stream is ready at https://app.videocall.rs with meeting id:{} \n** warning: use Chrome or Chromium \n** warning: do no reuse the username {}",
-     meeting_id,
-     user_id
- );
     while let Some(data) = quic_rx.recv().await {
         if let Err(e) = client.send_packet(data).await {
             tracing::error!("Failed to send packet: {}", e);

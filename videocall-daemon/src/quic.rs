@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Error;
-use clap::{Args, Parser, Subcommand};
 use protobuf::Message;
 use quinn::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,79 +9,13 @@ use tokio::{
     time::{self, Duration},
 };
 use tracing::{debug, info};
-use url::Url;
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
     media_packet::{media_packet::MediaType, MediaPacket},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
-/// Video Call Daemon
-///
-/// This daemon connects to the videocall.rs and streams audio and video to the specified meeting.
-///
-/// You can watch the video at https://videocall.rs/meeting/{user_id}/{meeting_id}
-#[derive(Parser, Debug)]
-#[clap(name = "client")]
-pub struct Opt {
-    #[clap(subcommand)]
-    pub mode: Mode,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum Mode {
-    /// Streaming mode with all the current options.
-    Streaming(Streaming),
-
-    /// Information mode to list cameras, formats, and resolutions.
-    Info(Info),
-}
-
-#[derive(Args, Debug)]
-pub struct Streaming {
-    /// Perform NSS-compatible TLS key logging to the file specified in `SSLKEYLOGFILE`.
-    #[clap(long = "keylog")]
-    pub keylog: bool,
-
-    /// URL to connect to.
-    #[clap(long = "url", default_value = "https://transport.rustlemania.com")]
-    pub url: Url,
-
-    #[clap(long = "user-id")]
-    pub user_id: String,
-
-    #[clap(long = "meeting-id")]
-    pub meeting_id: String,
-
-    #[clap(long = "video-device-index")]
-    pub video_device_index: usize,
-
-    #[clap(long = "audio-device")]
-    pub audio_device: Option<String>,
-
-    /// Resolution in WIDTHxHEIGHT format (e.g., 1920x1080)
-    #[clap(long = "resolution")]
-    pub resolution: String,
-
-    /// Frames per second (e.g. 10, 30, 60)
-    #[clap(long = "fps")]
-    pub fps: u32,
-}
-
-#[derive(Args, Debug)]
-pub struct Info {
-    /// List available cameras.
-    #[clap(long = "list-cameras")]
-    pub list_cameras: bool,
-
-    /// List supported formats for a specific camera.
-    #[clap(long = "list-formats")]
-    pub list_formats: Option<usize>,
-
-    /// List supported resolutions for a specific camera and format.
-    #[clap(long = "list-resolutions")]
-    pub list_resolutions: Option<String>, // Camera index and format string
-}
+use crate::cli_args::Streaming;
 
 pub struct Client {
     options: Streaming,

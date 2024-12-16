@@ -55,3 +55,4 @@ version = "0.1.0"
 [dependencies.nokhwa]
 version = "0.10.6"
 features = ["input-native", "output-threaded"]
+path = "/Users/darioalessandro/Documents/nokhwa"

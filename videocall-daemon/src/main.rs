@@ -3,15 +3,15 @@ mod modes;
 
 use modes::info::get_info;
 use modes::stream::stream;
-use tracing::info;
+use tracing::debug;
 use tracing::level_filters::LevelFilter;
-use videocall_daemon::quic::{Mode, Opt};
+use videocall_daemon::cli_args::{Mode, Opt};
 
 async fn initialize() {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     // Wrap the sender in an Arc<Mutex<Option>> to allow mutable access in the closure.
     let sender_lock = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
-    info!("Asking for permission to camera");
+    debug!("Asking for permission to camera");
     nokhwa::nokhwa_initialize(move |x| {
         if let Ok(mut sender_option) = sender_lock.lock() {
             // Take the sender out of the Option and send the value
@@ -26,12 +26,12 @@ async fn initialize() {
     if !x {
         panic!("User denied permission to camera, can't stream without camera");
     } else {
-        info!("Permission granted to camera");
+        debug!("Permission granted to camera");
     }
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
             .with_env_filter(
@@ -52,7 +52,8 @@ async fn main() {
             stream(s).await;
         }
         Mode::Info(i) => {
-            get_info(i).await;
+            get_info(i).await?;
         }
     };
+    Ok(())
 }

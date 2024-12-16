@@ -136,13 +136,13 @@ impl CameraDaemon {
                     error!("Failed to write frame to buffer: {}", e);
                     break;
                 }
-            
+
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("Quit signal received, exiting frame loop.");
                     return;
                 }
-            
+
                 // Try sending the frame over the channel
                 if let Err(e) = cam_tx.try_send(Some((
                     buffer_slice_i420.to_vec(),

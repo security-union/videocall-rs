@@ -1,8 +1,7 @@
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
-use nokhwa::pixel_format::RgbFormat;
-use nokhwa::pixel_format::YuyvFormat;
+use nokhwa::pixel_format::I420Format;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 
@@ -21,6 +20,8 @@ use tracing::{debug, error, info};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
 use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+
+const TARGET_FPS: u64 = 15;
 
 struct CameraPacket {
     data: Vec<u8>,
@@ -124,17 +125,11 @@ impl CameraDaemon {
         let frame_format = self.config.frame_format;
         let video_device_index = self.config.video_device_index as u32;
         let quit = self.quit.clone();
-        let mut buffer_slice_i420 = vec![
-            0u8;
-            (width * height + 2 * (width / 2) * (height / 2))
-                .try_into()
-                .unwrap()
-        ];
         Ok(std::thread::spawn(move || {
             debug!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
                 CameraIndex::Index(video_device_index),
-                RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Closest(
+                RequestedFormat::new::<I420Format>(RequestedFormatType::Closest(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
             )
@@ -142,20 +137,75 @@ impl CameraDaemon {
                 error!("Failed to open camera with closest format: {}", e);
                 Camera::new(
                     CameraIndex::Index(video_device_index),
-                    RequestedFormat::new::<YuyvFormat>(
+                    RequestedFormat::new::<I420Format>(
                         RequestedFormatType::AbsoluteHighestFrameRate,
                     ),
                 )
             })
             .unwrap();
+            let actual_format = camera.camera_format();
+            let resolution = actual_format.resolution();
             camera.open_stream().unwrap();
 
+            // Allocate buffer for raw data based on actual format
+            let mut image_buffer = match actual_format.format() {
+                FrameFormat::YUYV => {
+                    let buffer_slice_yuyv = vec![
+                        0u8;
+                        (resolution.width() * resolution.height() * 2)
+                            .try_into()
+                            .unwrap()
+                    ];
+                    buffer_slice_yuyv
+                }
+                FrameFormat::BGRA => {
+                    let buffer_slice_bgra = vec![
+                        0u8;
+                        (resolution.width() * resolution.height() * 4)
+                            .try_into()
+                            .unwrap()
+                    ];
+                    buffer_slice_bgra
+                }
+                FrameFormat::RAWRGB => {
+                    let buffer_slice_rawrgb = vec![
+                        0u8;
+                        (resolution.width() * resolution.height() * 3)
+                            .try_into()
+                            .unwrap()
+                    ];
+                    buffer_slice_rawrgb
+                }
+                FrameFormat::NV12 => {
+                    let buffer_slice_nv12 = vec![
+                        0u8;
+                        (resolution.width() * resolution.height() * 3 / 2)
+                            .try_into()
+                            .unwrap()
+                    ];
+                    buffer_slice_nv12
+                }
+                _ => {
+                    panic!("Unsupported format: {:?}", actual_format.format());
+                }
+            };
+
+            // This loop should run at most at 30 fps, if actual fps is higher we should skip frames
+            let frame_time = Duration::from_millis(1000u64 / TARGET_FPS);
+            let mut last_frame_time = Instant::now();
             loop {
                 // Try writing a frame to the buffer
-                if let Err(e) = camera.write_frame_to_buffer::<YuyvFormat>(&mut buffer_slice_i420) {
+                if let Err(e) = camera.write_frame_to_buffer::<I420Format>(&mut image_buffer) {
                     error!("Failed to write frame to buffer: {}", e);
                     break;
                 }
+
+                // use last_frame_time to calculate if we should skip this frame
+                let elapsed = last_frame_time.elapsed();
+                if elapsed < frame_time {
+                    continue;
+                }
+                last_frame_time = Instant::now();
 
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
@@ -165,7 +215,7 @@ impl CameraDaemon {
 
                 // Try sending the frame over the channel
                 if let Err(e) = cam_tx.try_send(Some(CameraPacket::new(
-                    buffer_slice_i420.clone(),
+                    image_buffer.clone(),
                     frame_format,
                     since_the_epoch().as_millis(),
                 ))) {
@@ -189,11 +239,16 @@ impl CameraDaemon {
                 .unwrap();
             video_encoder.update_bitrate(50_000).unwrap();
             let mut sequence = 0;
+            // the video encoder only supports I420 format, so whatever the camera gives us, we need to convert it
             while let Some(data) = cam_rx.blocking_recv() {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                let CameraPacket { data, format, age } = data.unwrap();
+                let CameraPacket {
+                    data,
+                    format: _,
+                    age,
+                } = data.unwrap();
 
                 // If age older than threshold, throw it away.
                 let image_age = since_the_epoch().as_millis() - age;

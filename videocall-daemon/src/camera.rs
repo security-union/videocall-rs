@@ -179,9 +179,7 @@ impl CameraDaemon {
                 FrameFormat::NV12 => {
                     let buffer_slice_nv12 = vec![
                         0u8;
-                        (resolution.width() * resolution.height() * 3 / 2)
-                            .try_into()
-                            .unwrap()
+                        6225120
                     ];
                     buffer_slice_nv12
                 }
@@ -257,7 +255,13 @@ impl CameraDaemon {
                     continue;
                 }
                 let encoding_time = Instant::now();
-                let frames = video_encoder.encode(sequence, data.as_slice()).unwrap();
+                let frames = match video_encoder.encode(sequence, data.as_slice()) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        error!("Error encoding frame: {:?}", e);
+                        continue;
+                    }
+                };
                 sequence += 1;
                 debug!("encoding took {:?}", encoding_time.elapsed());
                 for frame in frames {

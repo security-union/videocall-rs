@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use serde_json::de;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_ulong};
 use vpx_sys::*;
@@ -56,17 +55,17 @@ impl VideoEncoderBuilder {
     }
 
     pub fn build(&self) -> Result<VideoEncoder> {
-        if self.resolution.0 % 2 != 0 || self.resolution.0 == 0 {
+        let (width, height) = self.resolution;
+        if width % 2 != 0 || width == 0 {
             return Err(anyhow!("Width must be divisible by 2"));
         }
-        if self.resolution.1 % 2 != 0 || self.resolution.1 == 0 {
+        if height % 2 != 0 || height == 0 {
             return Err(anyhow!("Height must be divisible by 2"));
         }
         let cfg_ptr = vpx_ptr!(vpx_codec_vp9_cx());
         let mut cfg = unsafe { MaybeUninit::zeroed().assume_init() };
         vpx!(vpx_codec_enc_config_default(cfg_ptr, &mut cfg, 0));
 
-        let (width, height) = self.resolution;
         let (num, den) = self.timebase;
 
         cfg.g_w = width;
@@ -83,7 +82,7 @@ impl VideoEncoderBuilder {
         cfg.g_profile = self.profile;
         cfg.rc_end_usage = vpx_rc_mode::VPX_Q;
         cfg.kf_max_dist = 150;
-        cfg.kf_min_dist = 150;
+        cfg.kf_min_dist = 30;
         cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
 
         let ctx = MaybeUninit::zeroed();
@@ -147,7 +146,7 @@ impl VideoEncoder {
 
         vpx_ptr!(vpx_img_wrap(
             &mut image,
-            vpx_img_fmt::VPX_IMG_FMT_I420,
+            vpx_img_fmt::VPX_IMG_FMT_NV12,
             self.width as _,
             self.height as _,
             1,

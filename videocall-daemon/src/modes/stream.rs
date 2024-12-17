@@ -29,7 +29,7 @@ pub async fn stream(opt: Streaming) {
         width,
         height,
         framerate,
-        frame_format: nokhwa::utils::FrameFormat::YUYV,
+        frame_format: nokhwa::utils::FrameFormat::BGRA,
         video_device_index,
     };
     let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);

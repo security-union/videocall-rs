@@ -1,6 +1,7 @@
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
+use nokhwa::pixel_format::RgbFormat;
 use nokhwa::pixel_format::YuyvFormat;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
@@ -125,7 +126,9 @@ impl CameraDaemon {
             debug!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
                 CameraIndex::Index(video_device_index),
-                RequestedFormat::new::<YuyvFormat>(RequestedFormatType::AbsoluteHighestFrameRate),
+                RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+                    CameraFormat::new_from(width, height, frame_format, framerate),
+                )),
             )
             .unwrap();
             camera.open_stream().unwrap();
@@ -136,13 +139,13 @@ impl CameraDaemon {
                     error!("Failed to write frame to buffer: {}", e);
                     break;
                 }
-
+            
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("Quit signal received, exiting frame loop.");
                     return;
                 }
-
+            
                 // Try sending the frame over the channel
                 if let Err(e) = cam_tx.try_send(Some((
                     buffer_slice_i420.to_vec(),

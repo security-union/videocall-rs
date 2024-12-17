@@ -22,7 +22,17 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
 use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
-type CameraPacket = (Vec<u8>, u128);
+struct CameraPacket {
+    data: Vec<u8>,
+    format: FrameFormat,
+    age: u128,
+}
+
+impl CameraPacket {
+    pub fn new(data: Vec<u8>, format: FrameFormat, age: u128) -> CameraPacket {
+        CameraPacket { data, format, age }
+    }
+}
 
 pub fn transform_video_chunk(frame: &Frame, email: &str) -> PacketWrapper {
     let frame_type = if frame.key {
@@ -99,8 +109,6 @@ impl CameraDaemon {
         self.handles.push(self.camera_thread()?);
         let encoder = self.encoder_thread();
         self.handles.push(encoder);
-        // let fps = self.fps_thread();
-        // self.handles.push(fps);
         Ok(())
     }
 
@@ -126,10 +134,19 @@ impl CameraDaemon {
             debug!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
                 CameraIndex::Index(video_device_index),
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+                RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Closest(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
             )
+            .or_else(|e| {
+                error!("Failed to open camera with closest format: {}", e);
+                Camera::new(
+                    CameraIndex::Index(video_device_index),
+                    RequestedFormat::new::<YuyvFormat>(
+                        RequestedFormatType::AbsoluteHighestFrameRate,
+                    ),
+                )
+            })
             .unwrap();
             camera.open_stream().unwrap();
 
@@ -139,16 +156,17 @@ impl CameraDaemon {
                     error!("Failed to write frame to buffer: {}", e);
                     break;
                 }
-            
+
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("Quit signal received, exiting frame loop.");
                     return;
                 }
-            
+
                 // Try sending the frame over the channel
-                if let Err(e) = cam_tx.try_send(Some((
-                    buffer_slice_i420.to_vec(),
+                if let Err(e) = cam_tx.try_send(Some(CameraPacket::new(
+                    buffer_slice_i420.clone(),
+                    frame_format,
                     since_the_epoch().as_millis(),
                 ))) {
                     error!("Error sending image: {}", e);
@@ -165,7 +183,6 @@ impl CameraDaemon {
         let height = self.config.height;
         let user_id = self.user_id.clone();
         std::thread::spawn(move || {
-            let _start = Instant::now();
             let mut video_encoder = VideoEncoderBuilder::default()
                 .set_resolution(width, height)
                 .build()
@@ -176,7 +193,7 @@ impl CameraDaemon {
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                let (image, age) = data.unwrap();
+                let CameraPacket { data, format, age } = data.unwrap();
 
                 // If age older than threshold, throw it away.
                 let image_age = since_the_epoch().as_millis() - age;
@@ -185,7 +202,7 @@ impl CameraDaemon {
                     continue;
                 }
                 let encoding_time = Instant::now();
-                let frames = video_encoder.encode(sequence, image.as_slice()).unwrap();
+                let frames = video_encoder.encode(sequence, data.as_slice()).unwrap();
                 sequence += 1;
                 debug!("encoding took {:?}", encoding_time.elapsed());
                 for frame in frames {
@@ -193,9 +210,6 @@ impl CameraDaemon {
                     if let Err(e) = quic_tx.try_send(packet_wrapper.write_to_bytes().unwrap()) {
                         error!("Unable to send packet: {:?}", e);
                     }
-                    // else if let Err(e) = fps_tx.try_send(since_the_epoch().as_millis()) {
-                    //     error!("Unable to send fps: {:?}", e);
-                    // }
                 }
             }
         })

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Error;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use protobuf::Message;
 use quinn::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,24 +17,36 @@ use videocall_types::protos::{
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
-
-
 /// Video Call Daemon
 ///
 /// This daemon connects to the videocall.rs and streams audio and video to the specified meeting.
-/// 
+///
 /// You can watch the video at https://videocall.rs/meeting/{user_id}/{meeting_id}
-
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
 pub struct Opt {
+    #[clap(subcommand)]
+    pub mode: Mode,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Mode {
+    /// Streaming mode with all the current options.
+    Streaming(Streaming),
+
+    /// Information mode to list cameras, formats, and resolutions.
+    Info(Info),
+}
+
+#[derive(Args, Debug)]
+pub struct Streaming {
     /// Perform NSS-compatible TLS key logging to the file specified in `SSLKEYLOGFILE`.
     #[clap(long = "keylog")]
-    keylog: bool,
+    pub keylog: bool,
 
     /// URL to connect to.
     #[clap(long = "url", default_value = "https://transport.rustlemania.com")]
-    url: Url,
+    pub url: Url,
 
     #[clap(long = "user-id")]
     pub user_id: String,
@@ -57,13 +69,28 @@ pub struct Opt {
     pub fps: u32,
 }
 
+#[derive(Args, Debug)]
+pub struct Info {
+    /// List available cameras.
+    #[clap(long = "list-cameras")]
+    pub list_cameras: bool,
+
+    /// List supported formats for a specific camera.
+    #[clap(long = "list-formats")]
+    pub list_formats: Option<usize>,
+
+    /// List supported resolutions for a specific camera and format.
+    #[clap(long = "list-resolutions")]
+    pub list_resolutions: Option<String>, // Camera index and format string
+}
+
 pub struct Client {
-    options: Opt,
+    options: Streaming,
     sender: Option<Sender<Vec<u8>>>,
 }
 
 impl Client {
-    pub fn new(options: Opt) -> Self {
+    pub fn new(options: Streaming) -> Self {
         Self {
             options,
             sender: None,
@@ -131,7 +158,7 @@ impl Client {
         }
     }
 
-    async fn start_heartbeat(&self, conn: Connection, options: &Opt) {
+    async fn start_heartbeat(&self, conn: Connection, options: &Streaming) {
         let interval = time::interval(Duration::from_secs(1));
         let email = options.user_id.clone();
         tokio::spawn(async move {
@@ -164,7 +191,7 @@ impl Client {
     }
 }
 
-async fn connect_to_server(options: &Opt) -> anyhow::Result<Connection> {
+async fn connect_to_server(options: &Streaming) -> anyhow::Result<Connection> {
     loop {
         info!("Attempting to connect to {}", options.url);
         let addrs = options

@@ -1,3 +1,4 @@
+use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
@@ -5,6 +6,7 @@ use nokhwa::pixel_format::I420Format;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 
+use nokhwa::utils::Resolution;
 use nokhwa::{
     utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
     Camera,
@@ -69,12 +71,12 @@ pub fn since_the_epoch() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct CameraConfig {
     pub width: u32,
     pub height: u32,
     pub framerate: u32,
-    pub video_device_index: usize,
+    pub video_device_index: IndexKind,
     pub frame_format: FrameFormat,
 }
 
@@ -123,12 +125,16 @@ impl CameraDaemon {
         let height = self.config.height;
         let framerate = self.config.framerate;
         let frame_format = self.config.frame_format;
-        let video_device_index = self.config.video_device_index as u32;
+        let video_device_index = match &self.config.video_device_index {
+            IndexKind::String(s) => CameraIndex::String(s.clone()),
+            IndexKind::Index(i) => CameraIndex::Index(*i),
+        };
+        let video_device_index_clone = video_device_index.clone();
         let quit = self.quit.clone();
         Ok(std::thread::spawn(move || {
             debug!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
-                CameraIndex::Index(video_device_index),
+                video_device_index,
                 RequestedFormat::new::<I420Format>(RequestedFormatType::Closest(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
@@ -136,7 +142,7 @@ impl CameraDaemon {
             .or_else(|e| {
                 error!("Failed to open camera with closest format: {}", e);
                 Camera::new(
-                    CameraIndex::Index(video_device_index),
+                    video_device_index_clone,
                     RequestedFormat::new::<I420Format>(
                         RequestedFormatType::AbsoluteHighestFrameRate,
                     ),
@@ -144,49 +150,10 @@ impl CameraDaemon {
             })
             .unwrap();
             let actual_format = camera.camera_format();
-            let resolution = actual_format.resolution();
             camera.open_stream().unwrap();
 
             // Allocate buffer for raw data based on actual format
-            let mut image_buffer = match actual_format.format() {
-                FrameFormat::YUYV => {
-                    let buffer_slice_yuyv = vec![
-                        0u8;
-                        (resolution.width() * resolution.height() * 2)
-                            .try_into()
-                            .unwrap()
-                    ];
-                    buffer_slice_yuyv
-                }
-                FrameFormat::BGRA => {
-                    let buffer_slice_bgra = vec![
-                        0u8;
-                        (resolution.width() * resolution.height() * 4)
-                            .try_into()
-                            .unwrap()
-                    ];
-                    buffer_slice_bgra
-                }
-                FrameFormat::RAWRGB => {
-                    let buffer_slice_rawrgb = vec![
-                        0u8;
-                        (resolution.width() * resolution.height() * 3)
-                            .try_into()
-                            .unwrap()
-                    ];
-                    buffer_slice_rawrgb
-                }
-                FrameFormat::NV12 => {
-                    let buffer_slice_nv12 = vec![
-                        0u8;
-                        6225120
-                    ];
-                    buffer_slice_nv12
-                }
-                _ => {
-                    panic!("Unsupported format: {:?}", actual_format.format());
-                }
-            };
+            let mut image_buffer = vec![0; buffer_size_i420(actual_format.resolution().width(), actual_format.resolution().height()) as usize];
 
             // This loop should run at most at 30 fps, if actual fps is higher we should skip frames
             let frame_time = Duration::from_millis(1000u64 / TARGET_FPS);
@@ -235,7 +202,7 @@ impl CameraDaemon {
                 .set_resolution(width, height)
                 .build()
                 .unwrap();
-            video_encoder.update_bitrate(50_000).unwrap();
+            video_encoder.update_bitrate(100_000).unwrap();
             let mut sequence = 0;
             // the video encoder only supports I420 format, so whatever the camera gives us, we need to convert it
             while let Some(data) = cam_rx.blocking_recv() {
@@ -282,3 +249,38 @@ impl CameraDaemon {
         Ok(())
     }
 }
+
+
+fn buffer_for_format(actual_format: &CameraFormat) -> Vec<u8> {
+    let resolution = actual_format.resolution();
+    let width = resolution.width();
+    let height = resolution.height();
+
+    // Calculate the required buffer size safely
+    let buffer_size: Option<u32> = match actual_format.format() {
+        FrameFormat::YUYV => width.checked_mul(height).unwrap().checked_mul(2),
+        FrameFormat::BGRA => width.checked_mul(height).unwrap().checked_mul(4),
+        FrameFormat::RAWRGB => width.checked_mul(height).unwrap().checked_mul(3),
+        FrameFormat::NV12 => width
+            .checked_mul(height).unwrap()
+            .checked_add(width.checked_mul(height).unwrap().checked_div(2).unwrap()),
+        _ => panic!("Unsupported format: {:?}", actual_format.format()),
+    };
+
+    // Handle potential overflow or other size calculation errors
+    let buffer_size = match buffer_size {
+        Some(size) => size,
+        None => panic!("Buffer size calculation overflowed or is invalid."),
+    };
+
+    // Allocate the buffer
+    vec![0u8; buffer_size as usize]
+}
+
+fn buffer_size_i420(width: u32, height: u32) -> u32 {
+    width
+        .checked_mul(height)
+        .and_then(|y_size| y_size.checked_add(y_size / 2)) // Total size = Y + U + V
+        .expect("Buffer size calculation overflowed")
+}
+

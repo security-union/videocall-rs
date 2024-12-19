@@ -49,7 +49,7 @@ pub enum Mode {
     Info(Info),
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct Streaming {
     /// Perform NSS-compatible TLS key logging to the file specified in `SSLKEYLOGFILE`.
     #[clap(long = "keylog")]
@@ -66,7 +66,7 @@ pub struct Streaming {
     pub meeting_id: String,
 
     #[clap(long = "video-device-index")]
-    pub video_device_index: usize,
+    pub video_device_index: IndexKind,
 
     #[clap(long = "audio-device")]
     pub audio_device: Option<String>,

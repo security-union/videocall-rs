@@ -20,7 +20,7 @@ pub async fn stream(opt: Streaming) {
         panic!("invalid framerate: {}", framerate);
     }
     let user_id = opt.user_id.clone();
-    let video_device_index = opt.video_device_index;
+    let video_device_index = opt.video_device_index.clone();
     let audio_device = opt.audio_device.clone();
     let mut client = Client::new(opt);
     client.connect().await.expect("failed to connect");

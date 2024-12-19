@@ -68,11 +68,9 @@ impl Client {
     }
 
     pub async fn send(conn: Connection, data: Vec<u8>) -> anyhow::Result<()> {
-        // debug!("Sending {} bytes", data.len());
         let mut stream = conn.open_uni().await?;
         stream.write_all(&data).await?;
         stream.finish().await?;
-        // debug!("Sent {} bytes", data.len());
         Ok(())
     }
 

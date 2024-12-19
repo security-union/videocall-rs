@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_ulong};
+use tracing::info;
 use vpx_sys::*;
 
 macro_rules! vpx {
@@ -50,6 +51,7 @@ impl Default for VideoEncoderBuilder {
 
 impl VideoEncoderBuilder {
     pub fn set_resolution(mut self, width: u32, height: u32) -> Self {
+        info!("Setting resolution to {}x{}", width, height);
         self.resolution = (width, height);
         self
     }
@@ -82,7 +84,7 @@ impl VideoEncoderBuilder {
         cfg.g_profile = self.profile;
         cfg.rc_end_usage = vpx_rc_mode::VPX_Q;
         cfg.kf_max_dist = 150;
-        cfg.kf_min_dist = 30;
+        cfg.kf_min_dist = 150;
         cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
 
         let ctx = MaybeUninit::zeroed();
@@ -146,7 +148,7 @@ impl VideoEncoder {
 
         vpx_ptr!(vpx_img_wrap(
             &mut image,
-            vpx_img_fmt::VPX_IMG_FMT_NV12,
+            vpx_img_fmt::VPX_IMG_FMT_I420,
             self.width as _,
             self.height as _,
             1,

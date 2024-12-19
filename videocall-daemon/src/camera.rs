@@ -32,7 +32,11 @@ struct CameraPacket {
 
 impl CameraPacket {
     pub fn new(data: Vec<u8>, format: FrameFormat, age: u128) -> CameraPacket {
-        CameraPacket { data, _format: format, age }
+        CameraPacket {
+            data,
+            _format: format,
+            age,
+        }
     }
 }
 

@@ -6,7 +6,6 @@ use nokhwa::pixel_format::I420Format;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 
-use nokhwa::utils::Resolution;
 use nokhwa::{
     utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
     Camera,
@@ -27,13 +26,13 @@ const TARGET_FPS: u64 = 15;
 
 struct CameraPacket {
     data: Vec<u8>,
-    format: FrameFormat,
+    _format: FrameFormat,
     age: u128,
 }
 
 impl CameraPacket {
     pub fn new(data: Vec<u8>, format: FrameFormat, age: u128) -> CameraPacket {
-        CameraPacket { data, format, age }
+        CameraPacket { data, _format: format, age }
     }
 }
 
@@ -153,7 +152,13 @@ impl CameraDaemon {
             camera.open_stream().unwrap();
 
             // Allocate buffer for raw data based on actual format
-            let mut image_buffer = vec![0; buffer_size_i420(actual_format.resolution().width(), actual_format.resolution().height()) as usize];
+            let mut image_buffer = vec![
+                0;
+                buffer_size_i420(
+                    actual_format.resolution().width(),
+                    actual_format.resolution().height()
+                ) as usize
+            ];
 
             // This loop should run at most at 30 fps, if actual fps is higher we should skip frames
             let frame_time = Duration::from_millis(1000u64 / TARGET_FPS);
@@ -211,7 +216,7 @@ impl CameraDaemon {
                 }
                 let CameraPacket {
                     data,
-                    format: _,
+                    _format: _,
                     age,
                 } = data.unwrap();
 
@@ -250,37 +255,9 @@ impl CameraDaemon {
     }
 }
 
-
-fn buffer_for_format(actual_format: &CameraFormat) -> Vec<u8> {
-    let resolution = actual_format.resolution();
-    let width = resolution.width();
-    let height = resolution.height();
-
-    // Calculate the required buffer size safely
-    let buffer_size: Option<u32> = match actual_format.format() {
-        FrameFormat::YUYV => width.checked_mul(height).unwrap().checked_mul(2),
-        FrameFormat::BGRA => width.checked_mul(height).unwrap().checked_mul(4),
-        FrameFormat::RAWRGB => width.checked_mul(height).unwrap().checked_mul(3),
-        FrameFormat::NV12 => width
-            .checked_mul(height).unwrap()
-            .checked_add(width.checked_mul(height).unwrap().checked_div(2).unwrap()),
-        _ => panic!("Unsupported format: {:?}", actual_format.format()),
-    };
-
-    // Handle potential overflow or other size calculation errors
-    let buffer_size = match buffer_size {
-        Some(size) => size,
-        None => panic!("Buffer size calculation overflowed or is invalid."),
-    };
-
-    // Allocate the buffer
-    vec![0u8; buffer_size as usize]
-}
-
 fn buffer_size_i420(width: u32, height: u32) -> u32 {
     width
         .checked_mul(height)
         .and_then(|y_size| y_size.checked_add(y_size / 2)) // Total size = Y + U + V
         .expect("Buffer size calculation overflowed")
 }
-

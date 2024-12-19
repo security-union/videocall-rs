@@ -17,6 +17,21 @@ use videocall_types::protos::{
 
 use crate::cli_args::Streaming;
 
+#[derive(Args, Debug)]
+pub struct Info {
+    /// List available cameras.
+    #[clap(long = "list-cameras")]
+    pub list_cameras: bool,
+
+    /// List supported formats for a specific camera.
+    #[clap(long = "list-formats")]
+    pub list_formats: Option<usize>,
+
+    /// List supported resolutions for a specific camera and format.
+    #[clap(long = "list-resolutions")]
+    pub list_resolutions: Option<String>, // Camera index and format string
+}
+
 pub struct Client {
     options: Streaming,
     sender: Option<Sender<Vec<u8>>>,

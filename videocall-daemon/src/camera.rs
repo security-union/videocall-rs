@@ -2,7 +2,7 @@ use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
-use nokhwa::pixel_format::YuyvFormat;
+use nokhwa::pixel_format::I420Format;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 
@@ -138,7 +138,7 @@ impl CameraDaemon {
             debug!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
                 video_device_index,
-                RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Closest(
+                RequestedFormat::new::<I420Format>(RequestedFormatType::Closest(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
             )
@@ -146,7 +146,7 @@ impl CameraDaemon {
                 error!("Failed to open camera with closest format: {}", e);
                 Camera::new(
                     video_device_index_clone,
-                    RequestedFormat::new::<YuyvFormat>(
+                    RequestedFormat::new::<I420Format>(
                         RequestedFormatType::AbsoluteHighestFrameRate,
                     ),
                 )
@@ -168,11 +168,13 @@ impl CameraDaemon {
             let frame_time = Duration::from_millis(1000u64 / TARGET_FPS);
             let mut last_frame_time = Instant::now();
             loop {
-                // Try writing a frame to the buffer
-                if let Err(e) = camera.write_frame_to_buffer::<YuyvFormat>(&mut image_buffer) {
-                    error!("Failed to write frame to buffer: {}", e);
-                    break;
-                }
+                // // Try writing a frame to the buffer
+                // if let Err(e) = camera.write_frame_to_buffer(&mut image_buffer) {
+                //     error!("Failed to write frame to buffer: {}", e);
+                //     break;
+                // }
+
+                let raw_frame = camera.frame().unwrap().buffer().to_vec();
 
                 // use last_frame_time to calculate if we should skip this frame
                 let elapsed = last_frame_time.elapsed();
@@ -189,7 +191,7 @@ impl CameraDaemon {
 
                 // Try sending the frame over the channel
                 if let Err(e) = cam_tx.try_send(Some(CameraPacket::new(
-                    image_buffer.clone(),
+                    raw_frame,
                     frame_format,
                     since_the_epoch().as_millis(),
                 ))) {

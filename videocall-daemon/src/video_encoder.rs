@@ -117,7 +117,7 @@ impl VideoEncoderBuilder {
         vpx!(vpx_codec_control_(
             &mut ctx,
             vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as _,
-            50 as c_int
+            25 as c_int
         ));
         Ok(VideoEncoder {
             ctx,
@@ -148,7 +148,7 @@ impl VideoEncoder {
 
         vpx_ptr!(vpx_img_wrap(
             &mut image,
-            vpx_img_fmt::VPX_IMG_FMT_I420,
+            vpx_img_fmt::VPX_IMG_FMT_NV12,
             self.width as _,
             self.height as _,
             1,

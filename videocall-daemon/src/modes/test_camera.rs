@@ -1,6 +1,3 @@
-use std::io::Read;
-
-use image::ImageBuffer;
 use nokhwa::{
     pixel_format::BgraFormat,
     utils::{CameraIndex, RequestedFormat, RequestedFormatType},
@@ -28,19 +25,19 @@ pub fn test_camera(info: TestCamera) {
     // Image dimensions
     let width = actual_format.resolution().width();
     let height = actual_format.resolution().height();
+    println!("Image dimensions: {}x{}", width, height);
+
     // Create window and event loop
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_title("BGRA Camera Feed")
+        .with_title("Camera Feed")
         .with_inner_size(LogicalSize::new(width as f64, height as f64))
         .build(&event_loop)
         .unwrap();
 
-    let window_scale = 1f64;
-    let scaled_width = (width as f64 * window_scale) as u32;
-    let scaled_height = (height as f64 * window_scale) as u32;
+
     let surface_texture = SurfaceTexture::new(width, height, &window);
-    let mut pixels: Pixels = Pixels::new(scaled_width, scaled_height, surface_texture).unwrap();
+    let mut pixels: Pixels = Pixels::new(width, height, surface_texture).unwrap();
     // print render format
     println!("Render format: {:?}", pixels.render_texture_format());
     println!("Texture format: {:?}", pixels.surface_texture_format());
@@ -49,33 +46,10 @@ pub fn test_camera(info: TestCamera) {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::RedrawRequested(_) => {
-                // On the first frame, we need to resize the window to match the camera resolution
-
-                // Grab a frame from the camera
-                let camera_buffer = camera.frame().unwrap();
-                // write to pixels
-                // Transform image from NV12 to BGRA
-                let pixels_frame = pixels.get_frame().len();
-                let camera_buffer = camera_buffer.decode_image::<BgraFormat>().unwrap();
-                let camera_buffer = camera_buffer.to_vec();
-                let camera_frame = camera_buffer.len();
-                // Write the frame to the pixels buffer, considering the format
-                if camera_frame == pixels_frame {
-                    pixels
-                        .get_frame_mut()
-                        .copy_from_slice(&camera_buffer);
-                } else {
-                    // only copy enough to fill the pixels buffer,
-                    pixels
-                        .get_frame_mut()
-                        .copy_from_slice(&camera_buffer[..pixels_frame]);
-
-                    eprintln!(
-                        "Frame sizes do not match: camera_frame: {}, pixels_frame: {}",
-                        camera_frame, pixels_frame
-                    );
-                }
-
+                
+                let frame_mut = pixels.get_frame_mut();
+                camera.write_frame_to_buffer::<BgraFormat>(frame_mut).unwrap();
+                
                 // Render the frame
                 if pixels.render().is_err() {
                     eprintln!("Pixels rendering failed!");

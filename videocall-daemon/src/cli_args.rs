@@ -47,6 +47,9 @@ pub enum Mode {
 
     /// Information mode to list cameras, formats, and resolutions.
     Info(Info),
+
+    /// Test the camera on a window
+    TestCamera(TestCamera),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -94,4 +97,10 @@ pub struct Info {
     /// List supported resolutions for a specific camera using the index from `list-cameras`
     #[clap(long = "list-resolutions", group = "info")]
     pub list_resolutions: Option<IndexKind>, // Camera index
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TestCamera {
+    #[clap(long = "video-device-index")]
+    pub video_device_index: IndexKind,
 }

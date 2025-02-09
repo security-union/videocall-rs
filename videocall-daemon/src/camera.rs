@@ -2,7 +2,7 @@ use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
-use nokhwa::pixel_format::I420Format;
+use nokhwa::pixel_format::YuyvFormat;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 
@@ -138,7 +138,7 @@ impl CameraDaemon {
             debug!("Camera opened... waiting for frames");
             let mut camera = Camera::new(
                 video_device_index,
-                RequestedFormat::new::<I420Format>(RequestedFormatType::Closest(
+                RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Closest(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
             )
@@ -146,7 +146,7 @@ impl CameraDaemon {
                 error!("Failed to open camera with closest format: {}", e);
                 Camera::new(
                     video_device_index_clone,
-                    RequestedFormat::new::<I420Format>(
+                    RequestedFormat::new::<YuyvFormat>(
                         RequestedFormatType::AbsoluteHighestFrameRate,
                     ),
                 )
@@ -169,7 +169,7 @@ impl CameraDaemon {
             let mut last_frame_time = Instant::now();
             loop {
                 // Try writing a frame to the buffer
-                if let Err(e) = camera.write_frame_to_buffer::<I420Format>(&mut image_buffer) {
+                if let Err(e) = camera.write_frame_to_buffer::<YuyvFormat>(&mut image_buffer) {
                     error!("Failed to write frame to buffer: {}", e);
                     break;
                 }
@@ -259,7 +259,7 @@ impl CameraDaemon {
     }
 }
 
-fn buffer_size_i420(width: u32, height: u32) -> u32 {
+pub fn buffer_size_i420(width: u32, height: u32) -> u32 {
     width
         .checked_mul(height)
         .and_then(|y_size| y_size.checked_add(y_size / 2)) // Total size = Y + U + V

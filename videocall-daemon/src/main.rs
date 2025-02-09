@@ -1,8 +1,8 @@
 use clap::Parser;
 mod modes;
 
-use modes::info::get_info;
 use modes::stream::stream;
+use modes::{info::get_info, test_camera::test_camera};
 use tracing::debug;
 use tracing::level_filters::LevelFilter;
 use videocall_daemon::cli_args::{Mode, Opt};
@@ -54,6 +54,8 @@ async fn main() -> anyhow::Result<()> {
         Mode::Info(i) => {
             get_info(i).await?;
         }
+        Mode::TestCamera(t) => test_camera(t),
     };
+
     Ok(())
 }

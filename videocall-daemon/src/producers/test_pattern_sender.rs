@@ -32,7 +32,7 @@ use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, Packet
 use super::camera::CameraConfig;
 use super::camera::CameraPacket;
 
-const TARGET_FPS: u64 = 30;
+const TARGET_FPS: u64 = 10;
 
 pub struct TestPatternSender {
     user_id: String,

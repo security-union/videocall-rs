@@ -18,8 +18,8 @@ pub async fn stream(opt: Streaming) {
     let height = resolution[1].parse::<u32>().expect("invalid height");
     let framerate = opt.fps;
     // validate framerate
-    if framerate != 10 && framerate != 15 && framerate != 30 && framerate != 60 {
-        panic!("invalid framerate: {}", framerate);
+    if framerate != 10 && framerate != 15 {
+        panic!("invalid framerate: {}, we currently support only [10, 15]", framerate);
     }
     let user_id = opt.user_id.clone();
     let video_device_index = opt.video_device_index.clone();

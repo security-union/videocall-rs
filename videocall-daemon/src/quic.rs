@@ -39,9 +39,12 @@ impl Client {
         let cloned_conn = conn.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                if let Err(e) = Self::send(cloned_conn.clone(), message).await {
-                    tracing::error!("Failed to send message: {}", e);
-                }
+                let cloned_conn = cloned_conn.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = Self::send(cloned_conn.clone(), message).await {
+                        tracing::error!("Failed to send message: {}", e);
+                    }
+                });
             }
         });
 

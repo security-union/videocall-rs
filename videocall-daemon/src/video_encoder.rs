@@ -117,7 +117,7 @@ impl VideoEncoderBuilder {
         vpx!(vpx_codec_control_(
             &mut ctx,
             vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as _,
-            30 as c_int
+            25 as c_int
         ));
         Ok(VideoEncoder {
             ctx,

@@ -2,6 +2,7 @@ use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
+use clap::error;
 use nokhwa::pixel_format::I420Format;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
@@ -180,13 +181,6 @@ impl CameraDaemon {
             let frame_time = Duration::from_millis(1000u64 / TARGET_FPS);
             let mut last_frame_time = Instant::now();
             loop {
-                // // Try writing a frame to the buffer
-                // if let Err(e) = camera.write_frame_to_buffer(&mut image_buffer) {
-                //     error!("Failed to write frame to buffer: {}", e);
-                //     break;
-                // }
-
-                let raw_frame = camera.frame().unwrap().buffer().to_vec();
 
                 // use last_frame_time to calculate if we should skip this frame
                 let elapsed = last_frame_time.elapsed();
@@ -194,7 +188,8 @@ impl CameraDaemon {
                     continue;
                 }
                 last_frame_time = Instant::now();
-
+                let frame = camera.frame().unwrap();
+                let frame = frame.buffer().to_vec();
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("Quit signal received, exiting frame loop.");
@@ -203,7 +198,7 @@ impl CameraDaemon {
 
                 // Try sending the frame over the channel
                 if let Err(e) = cam_tx.try_send(Some(CameraPacket::new(
-                    raw_frame,
+                    frame,
                     frame_format,
                     since_the_epoch().as_millis(),
                 ))) {

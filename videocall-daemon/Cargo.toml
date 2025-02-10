@@ -48,6 +48,7 @@ opus = "0.3.0"
 futures = "0.3.31"
 winit = "0.28"
 pixels = "0.11"
+image = "0.25.5"
 
 [dependencies.videocall-types]
 path = "../videocall-types"

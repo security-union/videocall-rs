@@ -36,9 +36,12 @@ pub async fn stream(opt: Streaming) {
     };
     let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);
     let mut video_producer: Box<dyn Producer> = if send_test_pattern {
-        Box::new(TestPatternSender::from_config(camera_config, user_id.clone(), quic_tx.clone()))
+        Box::new(TestPatternSender::from_config(
+            camera_config,
+            user_id.clone(),
+            quic_tx.clone(),
+        ))
     } else {
-        
         Box::new(CameraDaemon::from_config(
             camera_config,
             user_id.clone(),

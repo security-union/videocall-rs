@@ -39,8 +39,8 @@ impl Default for VideoEncoderBuilder {
     fn default() -> Self {
         Self {
             bitrate_kbps: 200_000,
-            max_quantizer: 63,
-            min_quantizer: 25,
+            max_quantizer: 60,
+            min_quantizer: 10,
             resolution: (640, 480),
             timebase: (1, 1000),
             cpu_used: 5,
@@ -117,7 +117,7 @@ impl VideoEncoderBuilder {
         vpx!(vpx_codec_control_(
             &mut ctx,
             vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as _,
-            25 as c_int
+            30 as c_int
         ));
         Ok(VideoEncoder {
             ctx,
@@ -148,7 +148,7 @@ impl VideoEncoder {
 
         vpx_ptr!(vpx_img_wrap(
             &mut image,
-            vpx_img_fmt::VPX_IMG_FMT_NV12,
+            vpx_img_fmt::VPX_IMG_FMT_I420,
             self.width as _,
             self.height as _,
             1,

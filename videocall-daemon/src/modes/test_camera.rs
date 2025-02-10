@@ -35,7 +35,6 @@ pub fn test_camera(info: TestCamera) {
         .build(&event_loop)
         .unwrap();
 
-
     let surface_texture = SurfaceTexture::new(width, height, &window);
     let mut pixels: Pixels = Pixels::new(width, height, surface_texture).unwrap();
     // print render format
@@ -46,10 +45,11 @@ pub fn test_camera(info: TestCamera) {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::RedrawRequested(_) => {
-                
                 let frame_mut = pixels.get_frame_mut();
-                camera.write_frame_to_buffer::<BgraFormat>(frame_mut).unwrap();
-                
+                camera
+                    .write_frame_to_buffer::<BgraFormat>(frame_mut)
+                    .unwrap();
+
                 // Render the frame
                 if pixels.render().is_err() {
                     eprintln!("Pixels rendering failed!");

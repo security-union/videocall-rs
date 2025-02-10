@@ -68,19 +68,23 @@ pub struct Streaming {
     #[clap(long = "meeting-id")]
     pub meeting_id: String,
 
-    #[clap(long = "video-device-index")]
+    #[clap(long = "video-device-index", short = 'v')]
     pub video_device_index: IndexKind,
 
-    #[clap(long = "audio-device")]
+    #[clap(long = "audio-device", short = 'a')]
     pub audio_device: Option<String>,
 
     /// Resolution in WIDTHxHEIGHT format (e.g., 1920x1080)
-    #[clap(long = "resolution")]
+    #[clap(long = "resolution", short = 'r')]
     pub resolution: String,
 
     /// Frames per second (e.g. 10, 30, 60)
     #[clap(long = "fps")]
     pub fps: u32,
+
+    /// Send test pattern instead of camera video.
+    #[clap(long = "send-test-pattern", short = 't')]
+    pub test_pattern: bool,
 }
 
 #[derive(Args, Debug)]

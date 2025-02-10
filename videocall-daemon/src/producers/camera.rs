@@ -22,12 +22,14 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
 use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
+use super::producer::Producer;
+
 const TARGET_FPS: u64 = 15;
 
-struct CameraPacket {
-    data: Vec<u8>,
-    _format: FrameFormat,
-    age: u128,
+pub struct CameraPacket {
+    pub data: Vec<u8>,
+    pub _format: FrameFormat,
+    pub age: u128,
 }
 
 impl CameraPacket {
@@ -68,7 +70,7 @@ pub fn transform_video_chunk(frame: &Frame, email: &str) -> PacketWrapper {
     }
 }
 
-static THRESHOLD_MILLIS: u128 = 1000;
+pub static THRESHOLD_MILLIS: u128 = 1000;
 
 pub fn since_the_epoch() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
@@ -93,6 +95,23 @@ pub struct CameraDaemon {
     handles: Vec<JoinHandle<()>>,
 }
 
+impl Producer for CameraDaemon {
+    fn start(&mut self) -> Result<()> {
+        self.handles.push(self.camera_thread()?);
+        let encoder = self.encoder_thread();
+        self.handles.push(encoder);
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.quit.store(true, std::sync::atomic::Ordering::Relaxed);
+        for handle in self.handles.drain(..) {
+            handle.join().unwrap();
+        }
+        Ok(())
+    }
+}
+
 impl CameraDaemon {
     pub fn from_config(
         config: CameraConfig,
@@ -109,13 +128,6 @@ impl CameraDaemon {
             handles: vec![],
             quic_tx: Arc::new(quic_tx),
         }
-    }
-
-    pub fn start(&mut self) -> Result<()> {
-        self.handles.push(self.camera_thread()?);
-        let encoder = self.encoder_thread();
-        self.handles.push(encoder);
-        Ok(())
     }
 
     fn camera_thread(&self) -> Result<JoinHandle<()>> {
@@ -250,14 +262,6 @@ impl CameraDaemon {
                 }
             }
         })
-    }
-
-    pub fn stop(&mut self) -> Result<()> {
-        self.quit.store(true, std::sync::atomic::Ordering::Relaxed);
-        for handle in self.handles.drain(..) {
-            handle.join().unwrap();
-        }
-        Ok(())
     }
 }
 

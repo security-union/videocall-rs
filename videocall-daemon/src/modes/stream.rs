@@ -1,10 +1,12 @@
 use tokio::sync::mpsc::channel;
-use videocall_daemon::{
+use videocall_daemon::producers::{
     camera::{CameraConfig, CameraDaemon},
-    cli_args::Streaming,
     microphone::MicrophoneDaemon,
-    quic::Client,
+    producer::Producer,
+    test_pattern_sender::TestPatternSender,
 };
+
+use videocall_daemon::{cli_args::Streaming, quic::Client};
 
 pub async fn stream(opt: Streaming) {
     // Parse resolution
@@ -21,10 +23,10 @@ pub async fn stream(opt: Streaming) {
     }
     let user_id = opt.user_id.clone();
     let video_device_index = opt.video_device_index.clone();
+    let send_test_pattern = opt.test_pattern;
     let audio_device = opt.audio_device.clone();
     let mut client = Client::new(opt);
     client.connect().await.expect("failed to connect");
-
     let camera_config = CameraConfig {
         width,
         height,
@@ -33,8 +35,17 @@ pub async fn stream(opt: Streaming) {
         video_device_index,
     };
     let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);
-    let mut camera = CameraDaemon::from_config(camera_config, user_id.clone(), quic_tx.clone());
-    camera.start().expect("failed to start camera");
+    let mut video_producer: Box<dyn Producer> = if send_test_pattern {
+        Box::new(TestPatternSender::from_config(camera_config, user_id.clone(), quic_tx.clone()))
+    } else {
+        
+        Box::new(CameraDaemon::from_config(
+            camera_config,
+            user_id.clone(),
+            quic_tx.clone(),
+        ))
+    };
+    video_producer.start().expect("failed to start camera");
     let mut microphone = MicrophoneDaemon::default();
     if let Some(audio_device) = audio_device {
         microphone

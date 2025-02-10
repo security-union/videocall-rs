@@ -3,31 +3,21 @@ use crate::producers::camera::since_the_epoch;
 use crate::producers::camera::transform_video_chunk;
 use crate::producers::camera::THRESHOLD_MILLIS;
 use crate::producers::producer::Producer;
-use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
 use image::ImageBuffer;
 use image::ImageReader;
 use image::Rgb;
-use nokhwa::pixel_format::I420Format;
-use nokhwa::utils::RequestedFormat;
-use nokhwa::utils::RequestedFormatType;
-use nokhwa::{
-    utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
-    Camera,
-};
+use nokhwa::utils::FrameFormat;
 use protobuf::Message;
 use std::fs::read;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info};
+use std::time::{Duration, Instant};
+use tracing::{debug, error};
 
 use tokio::sync::mpsc::{self, Sender};
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
-use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
 use super::camera::CameraConfig;
 use super::camera::CameraPacket;

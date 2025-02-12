@@ -68,6 +68,11 @@ pub struct Streaming {
     #[clap(long = "meeting-id")]
     pub meeting_id: String,
 
+    /// You can specify the video device index by index or by name.
+    ///
+    /// If you specify the index, it will be used directly.
+    ///
+    /// If you specify the name, it will be matched against the camera names.
     #[clap(long = "video-device-index", short = 'v')]
     pub video_device_index: IndexKind,
 

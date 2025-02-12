@@ -2,11 +2,11 @@ use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
-use clap::error;
 use nokhwa::pixel_format::I420Format;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 
+use nokhwa::utils::Resolution;
 use nokhwa::{
     utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
     Camera,
@@ -23,6 +23,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
 use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
+use super::encoder_thread::encoder_thread;
 use super::producer::Producer;
 
 const TARGET_FPS: u64 = 15;
@@ -99,7 +100,13 @@ pub struct CameraDaemon {
 impl Producer for CameraDaemon {
     fn start(&mut self) -> Result<()> {
         self.handles.push(self.camera_thread()?);
-        let encoder = self.encoder_thread();
+        let encoder = encoder_thread(
+            self.cam_rx.take().unwrap(),
+            self.quic_tx.clone(),
+            self.quit.clone(),
+            self.config.clone(),
+            self.user_id.clone(),
+        );
         self.handles.push(encoder);
         Ok(())
     }
@@ -181,7 +188,6 @@ impl CameraDaemon {
             let frame_time = Duration::from_millis(1000u64 / TARGET_FPS);
             let mut last_frame_time = Instant::now();
             loop {
-
                 // use last_frame_time to calculate if we should skip this frame
                 let elapsed = last_frame_time.elapsed();
                 if elapsed < frame_time {
@@ -190,6 +196,16 @@ impl CameraDaemon {
                 last_frame_time = Instant::now();
                 let frame = camera.frame().unwrap();
                 let frame = frame.buffer().to_vec();
+                // Assert that the frame is encoded in I420 format by reading the format property
+                assert_eq!(camera.camera_format().format(), FrameFormat::NV12);
+                // Assert that the size of the frame matches the requested size
+                assert_eq!(
+                    camera.camera_format().resolution(),
+                    Resolution::new(width, height),
+                    "Actual resolution: {:?}",
+                    camera.camera_format().resolution()
+                );
+
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("Quit signal received, exiting frame loop.");
@@ -206,57 +222,6 @@ impl CameraDaemon {
                 }
             }
         }))
-    }
-
-    fn encoder_thread(&mut self) -> JoinHandle<()> {
-        let mut cam_rx = self.cam_rx.take().unwrap();
-        let quic_tx = self.quic_tx.clone();
-        let quit = self.quit.clone();
-        let width = self.config.width;
-        let height = self.config.height;
-        let user_id = self.user_id.clone();
-        std::thread::spawn(move || {
-            let mut video_encoder = VideoEncoderBuilder::default()
-                .set_resolution(width, height)
-                .build()
-                .unwrap();
-            video_encoder.update_bitrate(100_000).unwrap();
-            let mut sequence = 0;
-            // the video encoder only supports I420 format, so whatever the camera gives us, we need to convert it
-            while let Some(data) = cam_rx.blocking_recv() {
-                if quit.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                let CameraPacket {
-                    data,
-                    _format: _,
-                    age,
-                } = data.unwrap();
-
-                // If age older than threshold, throw it away.
-                let image_age = since_the_epoch().as_millis() - age;
-                if image_age > THRESHOLD_MILLIS {
-                    debug!("throwing away old image with age {} ms", image_age);
-                    continue;
-                }
-                let encoding_time = Instant::now();
-                let frames = match video_encoder.encode(sequence, data.as_slice()) {
-                    Ok(frames) => frames,
-                    Err(e) => {
-                        error!("Error encoding frame: {:?}", e);
-                        continue;
-                    }
-                };
-                sequence += 1;
-                debug!("encoding took {:?}", encoding_time.elapsed());
-                for frame in frames {
-                    let packet_wrapper = transform_video_chunk(&frame, &user_id);
-                    if let Err(e) = quic_tx.try_send(packet_wrapper.write_to_bytes().unwrap()) {
-                        error!("Unable to send packet: {:?}", e);
-                    }
-                }
-            }
-        })
     }
 }
 

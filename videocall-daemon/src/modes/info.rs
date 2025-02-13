@@ -52,6 +52,7 @@ pub async fn get_info(info: Info) -> anyhow::Result<()> {
 }
 
 fn camera_compatible_formats(cam: &mut Camera) {
+    println!("{}", cam.info());
     for ffmt in frame_formats() {
         if let Ok(compatible) = cam.compatible_list_by_resolution(*ffmt) {
             println!("{ffmt}:");

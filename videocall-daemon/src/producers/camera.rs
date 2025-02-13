@@ -173,16 +173,16 @@ impl CameraDaemon {
             })
             .unwrap();
             let actual_format = camera.camera_format();
+            let actual_resolution = camera.resolution();
             camera.open_stream().unwrap();
 
             // Allocate buffer for raw data based on actual format
-            let mut image_buffer = vec![
-                0;
-                buffer_size_i420(
-                    actual_format.resolution().width(),
-                    actual_format.resolution().height()
-                ) as usize
-            ];
+            let mut image_buffer =
+                vec![
+                    0;
+                    actual_resolution.width() as usize * actual_resolution.height() as usize * 3
+                        / 2
+                ];
 
             // This loop should run at most at 30 fps, if actual fps is higher we should skip frames
             let frame_time = Duration::from_millis(1000u64 / TARGET_FPS);
@@ -195,17 +195,9 @@ impl CameraDaemon {
                 }
                 last_frame_time = Instant::now();
                 let frame = camera.frame().unwrap();
-                let frame = frame.buffer().to_vec();
-                // Assert that the frame is encoded in I420 format by reading the format property
-                assert_eq!(camera.camera_format().format(), FrameFormat::NV12);
-                // Assert that the size of the frame matches the requested size
-                assert_eq!(
-                    camera.camera_format().resolution(),
-                    Resolution::new(width, height),
-                    "Actual resolution: {:?}",
-                    camera.camera_format().resolution()
-                );
-
+                frame
+                    .decode_image_to_buffer::<I420Format>(&mut image_buffer)
+                    .unwrap();
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("Quit signal received, exiting frame loop.");
@@ -214,7 +206,7 @@ impl CameraDaemon {
 
                 // Try sending the frame over the channel
                 if let Err(e) = cam_tx.try_send(Some(CameraPacket::new(
-                    frame,
+                    image_buffer.clone(),
                     frame_format,
                     since_the_epoch().as_millis(),
                 ))) {

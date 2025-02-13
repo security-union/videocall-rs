@@ -20,7 +20,7 @@ pub fn test_camera(info: TestCamera) {
     )
     .unwrap();
     let actual_format = camera.camera_format();
-    println!("Actual format: {:?}", actual_format);
+
     camera.open_stream().unwrap();
     // Image dimensions
     let width = actual_format.resolution().width();
@@ -40,7 +40,7 @@ pub fn test_camera(info: TestCamera) {
     // print render format
     println!("Render format: {:?}", pixels.render_texture_format());
     println!("Texture format: {:?}", pixels.surface_texture_format());
-
+    println!("Camera format: {:?}", actual_format);
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {

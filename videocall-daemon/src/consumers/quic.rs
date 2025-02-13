@@ -17,6 +17,8 @@ use videocall_types::protos::{
 
 use crate::cli_args::Streaming;
 
+use super::camera_synk::CameraSynk;
+
 pub struct Client {
     options: Streaming,
     sender: Option<Sender<Vec<u8>>>,
@@ -28,31 +30,6 @@ impl Client {
             options,
             sender: None,
         }
-    }
-
-    pub async fn connect(&mut self) -> anyhow::Result<()> {
-        let conn = connect_to_server(&self.options).await?;
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
-        self.sender = Some(tx);
-
-        // Spawn a task to handle sending messages via the connection
-        let cloned_conn = conn.clone();
-        tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                let cloned_conn = cloned_conn.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = Self::send(cloned_conn.clone(), message).await {
-                        tracing::error!("Failed to send message: {}", e);
-                    }
-                });
-            }
-        });
-
-        // Spawn a separate task for heartbeat
-        self.start_heartbeat(conn.clone(), &self.options).await;
-
-        self.send_connection_packet().await?;
-        Ok(())
     }
 
     async fn send_connection_packet(&self) -> anyhow::Result<()> {
@@ -75,10 +52,6 @@ impl Client {
         stream.write_all(&data).await?;
         stream.finish().await?;
         Ok(())
-    }
-
-    pub async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
-        self.queue_message(data).await
     }
 
     async fn queue_message(&self, message: Vec<u8>) -> anyhow::Result<()> {
@@ -175,5 +148,36 @@ async fn connect_to_server(options: &Streaming) -> anyhow::Result<Connection> {
                 time::sleep(Duration::from_secs(5)).await;
             }
         }
+    }
+}
+
+impl CameraSynk for Client {
+    async fn connect(&mut self) -> anyhow::Result<()> {
+        let conn = connect_to_server(&self.options).await?;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
+        self.sender = Some(tx);
+
+        // Spawn a task to handle sending messages via the connection
+        let cloned_conn = conn.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let cloned_conn = cloned_conn.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = Self::send(cloned_conn.clone(), message).await {
+                        tracing::error!("Failed to send message: {}", e);
+                    }
+                });
+            }
+        });
+
+        // Spawn a separate task for heartbeat
+        self.start_heartbeat(conn.clone(), &self.options).await;
+
+        self.send_connection_packet().await?;
+        Ok(())
+    }
+
+    async fn send_packet(&self, data: Vec<u8>) -> anyhow::Result<()> {
+        self.queue_message(data).await
     }
 }

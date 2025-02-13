@@ -90,6 +90,10 @@ pub struct Streaming {
     /// Send test pattern instead of camera video.
     #[clap(long = "send-test-pattern", short = 't')]
     pub test_pattern: bool,
+
+    /// This is for ensuring that we can open the camera and encode video
+    #[clap(long = "offline-streaming-test")]
+    pub local_streaming_test: bool,
 }
 
 #[derive(Args, Debug)]

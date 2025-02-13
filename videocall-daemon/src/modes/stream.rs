@@ -1,12 +1,15 @@
 use tokio::sync::mpsc::channel;
+use videocall_daemon::cli_args::Streaming;
+use videocall_daemon::consumers::camera_synk::CameraSynk;
+use videocall_daemon::consumers::dead_synk::DeadSynk;
+use videocall_daemon::consumers::quic::Client;
+use videocall_daemon::consumers::CameraSynks;
 use videocall_daemon::producers::{
     camera::{CameraConfig, CameraDaemon},
     microphone::MicrophoneDaemon,
     producer::Producer,
     test_pattern_sender::TestPatternSender,
 };
-
-use videocall_daemon::{cli_args::Streaming, quic::Client};
 
 pub async fn stream(opt: Streaming) {
     // Parse resolution
@@ -16,6 +19,8 @@ pub async fn stream(opt: Streaming) {
     }
     let width = resolution[0].parse::<u32>().expect("invalid width");
     let height = resolution[1].parse::<u32>().expect("invalid height");
+
+    println!("User requested resolution {}x{}", width, height);
     let framerate = opt.fps;
     // validate framerate
     if framerate != 10 && framerate != 15 {
@@ -28,7 +33,12 @@ pub async fn stream(opt: Streaming) {
     let video_device_index = opt.video_device_index.clone();
     let send_test_pattern = opt.test_pattern;
     let audio_device = opt.audio_device.clone();
-    let mut client = Client::new(opt);
+    let local_streaming = opt.local_streaming_test;
+    let mut client: CameraSynks = if local_streaming {
+        CameraSynks::DeadSynk(DeadSynk::new(opt))
+    } else {
+        CameraSynks::CameraSynk(Client::new(opt))
+    };
     client.connect().await.expect("failed to connect");
     let camera_config = CameraConfig {
         width,

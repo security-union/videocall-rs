@@ -152,27 +152,20 @@ impl CameraDaemon {
             IndexKind::String(s) => CameraIndex::String(s.clone()),
             IndexKind::Index(i) => CameraIndex::Index(*i),
         };
-        let video_device_index_clone = video_device_index.clone();
         let quit = self.quit.clone();
         Ok(std::thread::spawn(move || {
             debug!("Camera opened... waiting for frames");
-            let mut camera = Camera::new(
+            let mut camera = match Camera::new(
                 video_device_index,
-                RequestedFormat::new::<I420Format>(RequestedFormatType::Closest(
+                RequestedFormat::new::<I420Format>(RequestedFormatType::Exact(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
-            )
-            .or_else(|e| {
-                error!("Failed to open camera with closest format: {}", e);
-                Camera::new(
-                    video_device_index_clone,
-                    RequestedFormat::new::<I420Format>(
-                        RequestedFormatType::AbsoluteHighestFrameRate,
-                    ),
-                )
-            })
-            .unwrap();
-            let actual_format = camera.camera_format();
+            ) {
+                Ok(camera) => camera,
+                Err(e) => {
+                    panic!("{}\n please run 'info --list-formats' to see the available resolutions and fps", e)
+                }
+            };
             let actual_resolution = camera.resolution();
             camera.open_stream().unwrap();
 

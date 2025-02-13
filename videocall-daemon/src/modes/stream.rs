@@ -23,10 +23,11 @@ pub async fn stream(opt: Streaming) {
     println!("User requested resolution {}x{}", width, height);
     let framerate = opt.fps;
     // validate framerate
-    if framerate != 10 && framerate != 15 {
+    let valid_framerates = [10u32, 15u32, 30u32, 60u32];
+    if !valid_framerates.contains(&framerate) {
         panic!(
-            "invalid framerate: {}, we currently support only [10, 15]",
-            framerate
+            "invalid framerate: {}, we currently support only {:?}",
+            framerate, valid_framerates
         );
     }
     let user_id = opt.user_id.clone();
@@ -44,7 +45,7 @@ pub async fn stream(opt: Streaming) {
         width,
         height,
         framerate,
-        frame_format: nokhwa::utils::FrameFormat::YUYV,
+        frame_format: nokhwa::utils::FrameFormat::NV12,
         video_device_index,
     };
     let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);

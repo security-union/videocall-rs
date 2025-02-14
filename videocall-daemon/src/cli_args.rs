@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
+use nokhwa::utils::FrameFormat;
 use thiserror::Error;
 use url::Url;
 
@@ -114,6 +115,21 @@ pub struct Streaming {
     /// videocall-daemon --cpu-used 0  # High-quality encoding, reasonable speed
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=15))]
     pub cpu_used: u8,
+
+    /// Frame format to use for the video stream.
+    /// Different cameras support different formats.
+    /// Please use the `info` subcommand to list supported formats for a specific camera.
+    #[arg(long, default_value_t = FrameFormat::NV12, value_parser = parse_frame_format)]
+    pub frame_format: FrameFormat,
+}
+
+fn parse_frame_format(s: &str) -> Result<FrameFormat, String> {
+    match s {
+        "NV12" => Ok(FrameFormat::NV12),
+        "BGRA" => Ok(FrameFormat::BGRA),
+        "YUYV" => Ok(FrameFormat::YUYV),
+        _ => Err("Invalid frame format, please use one of [NV12, BGRA, YUYV]".to_string()),
+    }
 }
 
 #[derive(Args, Debug)]

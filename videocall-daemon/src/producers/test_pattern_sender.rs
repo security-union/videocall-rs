@@ -53,8 +53,8 @@ impl TestPatternSender {
         let cam_tx = self.cam_tx.clone();
         let frame_format = FrameFormat::NV12;
         let interval = Duration::from_millis(1000 / self.config.framerate as u64);
-        // Read the first 10 images from directory: src/producers/sample_video
         let mut frames = vec![];
+
         for i in 100..200 {
             let path = format!("images/sample_video_save/output_{}.jpg", i);
             let img = read(path).unwrap();

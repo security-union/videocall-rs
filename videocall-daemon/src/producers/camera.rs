@@ -1,12 +1,9 @@
 use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
-use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
 use nokhwa::pixel_format::I420Format;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
-
-use nokhwa::utils::Resolution;
 use nokhwa::{
     utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
     Camera,
@@ -25,8 +22,6 @@ use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, Packet
 
 use super::encoder_thread::encoder_thread;
 use super::producer::Producer;
-
-const TARGET_FPS: u64 = 15;
 
 pub struct CameraPacket {
     pub data: Vec<u8>,
@@ -179,8 +174,7 @@ impl CameraDaemon {
                         / 2
                 ];
 
-            // This loop should run at most at 30 fps, if actual fps is higher we should skip frames
-            let frame_time = Duration::from_millis(1000u64 / TARGET_FPS);
+            let frame_time = Duration::from_millis(1000u64 / framerate as u64);
             let mut last_frame_time = Instant::now();
             loop {
                 // use last_frame_time to calculate if we should skip this frame

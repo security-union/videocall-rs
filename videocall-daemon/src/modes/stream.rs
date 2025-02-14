@@ -37,6 +37,7 @@ pub async fn stream(opt: Streaming) {
     let local_streaming = opt.local_streaming_test;
     let bitrate_kbps = opt.bitrate_kbps;
     let cpu_used = opt.cpu_used;
+    let frame_format = opt.frame_format;
     let mut client: CameraSynks = if local_streaming {
         CameraSynks::DeadSynk(DeadSynk::new(opt))
     } else {
@@ -47,7 +48,7 @@ pub async fn stream(opt: Streaming) {
         width,
         height,
         framerate,
-        frame_format: nokhwa::utils::FrameFormat::NV12,
+        frame_format,
         video_device_index,
         bitrate_kbps,
         cpu_used,

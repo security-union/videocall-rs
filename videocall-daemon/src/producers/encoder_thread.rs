@@ -24,11 +24,11 @@ pub fn encoder_thread(
     let width = camera_config.width;
     let height = camera_config.height;
     std::thread::spawn(move || {
-        let mut video_encoder = VideoEncoderBuilder::default()
+        let mut video_encoder = VideoEncoderBuilder::new(camera_config.framerate)
             .set_resolution(width, height)
             .build()
             .unwrap();
-        video_encoder.update_bitrate(200_000).unwrap();
+        video_encoder.update_bitrate_kbps(1_000).unwrap();
         let mut sequence = 0;
         // the video encoder only supports I420 format, so whatever the camera gives us, we need to convert it
         while let Some(data) = cam_rx.blocking_recv() {

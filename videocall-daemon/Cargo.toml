@@ -13,7 +13,7 @@ authors = [
 keywords = ["quic", "webtransport", "zoom"]
 categories = ["network-programming", "multimedia"]
 description = "Effortlessly stream video from the CLI with our native client, designed for your desktop, robot, or Raspberry Pi."
-
+exclude = ["images/"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

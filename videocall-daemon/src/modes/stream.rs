@@ -36,6 +36,7 @@ pub async fn stream(opt: Streaming) {
     let audio_device = opt.audio_device.clone();
     let local_streaming = opt.local_streaming_test;
     let bitrate_kbps = opt.bitrate_kbps;
+    let cpu_used = opt.cpu_used;
     let mut client: CameraSynks = if local_streaming {
         CameraSynks::DeadSynk(DeadSynk::new(opt))
     } else {
@@ -48,6 +49,8 @@ pub async fn stream(opt: Streaming) {
         framerate,
         frame_format: nokhwa::utils::FrameFormat::NV12,
         video_device_index,
+        bitrate_kbps,
+        cpu_used,
     };
     let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);
     let mut video_producer: Box<dyn Producer> = if send_test_pattern {

@@ -5,6 +5,7 @@ use crate::producers::camera::THRESHOLD_MILLIS;
 use crate::producers::producer::Producer;
 use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
+use image::imageops::FilterType;
 use image::ImageBuffer;
 use image::ImageReader;
 use image::Rgb;
@@ -23,8 +24,6 @@ use super::camera::CameraConfig;
 use super::camera::CameraPacket;
 use super::encoder_thread::encoder_thread;
 
-const TARGET_FPS: u64 = 10;
-
 pub struct TestPatternSender {
     user_id: String,
     cam_rx: Option<mpsc::Receiver<Option<CameraPacket>>>,
@@ -36,16 +35,8 @@ pub struct TestPatternSender {
 }
 
 impl TestPatternSender {
-    pub fn from_config(_config: CameraConfig, user_id: String, quic_tx: Sender<Vec<u8>>) -> Self {
+    pub fn from_config(config: CameraConfig, user_id: String, quic_tx: Sender<Vec<u8>>) -> Self {
         let (cam_tx, cam_rx) = mpsc::channel(100);
-        // rewrite res to 1280 × 680
-        let config = CameraConfig {
-            width: 640,
-            height: 480,
-            framerate: 15,
-            frame_format: FrameFormat::NV12,
-            video_device_index: IndexKind::Index(0),
-        };
         Self {
             config,
             user_id,
@@ -61,17 +52,19 @@ impl TestPatternSender {
         let quit = self.quit.clone();
         let cam_tx = self.cam_tx.clone();
         let frame_format = FrameFormat::NV12;
-        let interval = Duration::from_millis(1000 / TARGET_FPS);
+        let interval = Duration::from_millis(1000 / self.config.framerate as u64);
         // Read the first 10 images from directory: src/producers/sample_video
         let mut frames = vec![];
-        for i in 1..100 {
-            let path = format!("src/producers/sample_video_2/output_{}.jpg", i);
+        for i in 100..200 {
+            let path = format!("src/producers/sample_video_save/output_{}.jpg", i);
             let img = read(path).unwrap();
             let img = ImageReader::new(std::io::Cursor::new(img))
                 .with_guessed_format()
                 .unwrap();
             // Transform the image to NV12 format
             let img = img.decode().unwrap();
+            // Resize the image to value in config
+            let img = img.resize_exact(self.config.width, self.config.height, FilterType::Nearest);
             let img = rgb_to_nv12(&img.to_rgb8());
             frames.push(img);
         }

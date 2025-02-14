@@ -86,6 +86,7 @@ pub struct CameraConfig {
     pub video_device_index: IndexKind,
     pub frame_format: FrameFormat,
     pub bitrate_kbps: u32,
+    pub cpu_used: u8,
 }
 
 pub struct CameraDaemon {

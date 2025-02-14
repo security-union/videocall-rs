@@ -5,7 +5,7 @@ use super::camera_synk::CameraSynk;
 pub struct DeadSynk {}
 
 impl DeadSynk {
-    pub fn new(opts: Streaming) -> DeadSynk {
+    pub fn new(_opts: Streaming) -> DeadSynk {
         DeadSynk {}
     }
 }

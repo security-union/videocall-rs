@@ -24,7 +24,7 @@ pub fn encoder_thread(
     let width = camera_config.width;
     let height = camera_config.height;
     std::thread::spawn(move || {
-        let mut video_encoder = VideoEncoderBuilder::new(camera_config.framerate)
+        let mut video_encoder = VideoEncoderBuilder::new(camera_config.framerate, camera_config.cpu_used)
             .set_resolution(width, height)
             .build()
             .unwrap();

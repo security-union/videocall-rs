@@ -81,13 +81,16 @@ pub struct Streaming {
 
     /// Resolution in WIDTHxHEIGHT format (e.g., 1920x1080)
     #[clap(long = "resolution", short = 'r')]
+    #[clap(default_value = "1280x720")]
     pub resolution: String,
 
-    /// Frames per second (e.g. 10, 30, 60)
+    /// Frames per second (e.g. 10, 15, 30, 60)
     #[clap(long = "fps")]
+    #[clap(default_value = "15")]
     pub fps: u32,
 
     #[clap(long = "bitrate-kbps")]
+    #[clap(default_value = "500")]
     pub bitrate_kbps: u32,
 
     /// Send test pattern instead of camera video.
@@ -97,6 +100,20 @@ pub struct Streaming {
     /// This is for ensuring that we can open the camera and encode video
     #[clap(long = "offline-streaming-test")]
     pub local_streaming_test: bool,
+
+    /// Controls the speed vs. quality tradeoff for VP9 encoding.
+    ///
+    /// The value ranges from `0` (slowest, best quality) to `15` (fastest, lowest quality).
+    ///
+    /// ## Valid Values:
+    /// - `0` to `3`: **Balanced** speed and quality (recommended for file-based encoding, YouTube, VOD).
+    /// - `4` to `8`: **Fast encoding**, lower quality (good for real-time streaming, WebRTC, live video).
+    /// - `9` to `15`: **Very fast encoding**, lowest quality, largest files (for ultra-low-latency applications).
+    ///
+    /// videocall-daemon --cpu-used 5  # Fast encoding, good for live streaming
+    /// videocall-daemon --cpu-used 0  # High-quality encoding, reasonable speed
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=15))]
+    pub cpu_used: u8,
 }
 
 #[derive(Args, Debug)]

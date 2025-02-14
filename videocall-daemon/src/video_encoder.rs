@@ -36,14 +36,14 @@ pub struct VideoEncoderBuilder {
 }
 
 impl VideoEncoderBuilder {
-    pub fn new(fps: u32) -> Self {
+    pub fn new(fps: u32, cpu_used: u8) -> Self {
         Self {
             bitrate_kbps: 500,
             max_quantizer: 60,
             min_quantizer: 40,
             resolution: (640, 480),
             fps,
-            cpu_used: 5,
+            cpu_used: cpu_used as u32,
             profile: 0,
         }
     }
@@ -96,7 +96,7 @@ impl VideoEncoderBuilder {
             VPX_ENCODER_ABI_VERSION as i32
         ));
         unsafe {
-            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 7);
+            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 5);
             vpx_codec_control_(
                 &mut ctx,
                 vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int,
@@ -108,12 +108,7 @@ impl VideoEncoderBuilder {
                 vp8e_enc_control_id::VP9E_SET_FRAME_PARALLEL_DECODING as c_int,
                 1,
             );
-            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_AQ_MODE as c_int, 3);
-            vpx_codec_control_(
-                &mut ctx,
-                vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as c_int,
-                50,
-            );
+            // vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_AQ_MODE as c_int, 3);
         }
         Ok(VideoEncoder {
             ctx,

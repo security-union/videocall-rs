@@ -28,7 +28,9 @@ pub fn encoder_thread(
             .set_resolution(width, height)
             .build()
             .unwrap();
-        video_encoder.update_bitrate_kbps(1_000).unwrap();
+        video_encoder
+            .update_bitrate_kbps(camera_config.bitrate_kbps)
+            .unwrap();
         let mut sequence = 0;
         // the video encoder only supports I420 format, so whatever the camera gives us, we need to convert it
         while let Some(data) = cam_rx.blocking_recv() {

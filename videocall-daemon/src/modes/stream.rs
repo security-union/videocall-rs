@@ -35,6 +35,7 @@ pub async fn stream(opt: Streaming) {
     let send_test_pattern = opt.test_pattern;
     let audio_device = opt.audio_device.clone();
     let local_streaming = opt.local_streaming_test;
+    let bitrate_kbps = opt.bitrate_kbps;
     let mut client: CameraSynks = if local_streaming {
         CameraSynks::DeadSynk(DeadSynk::new(opt))
     } else {

@@ -87,6 +87,9 @@ pub struct Streaming {
     #[clap(long = "fps")]
     pub fps: u32,
 
+    #[clap(long = "bitrate-kbps")]
+    pub bitrate_kbps: u32,
+
     /// Send test pattern instead of camera video.
     #[clap(long = "send-test-pattern", short = 't')]
     pub test_pattern: bool,

@@ -68,7 +68,6 @@ impl VideoEncoderBuilder {
         let mut cfg = unsafe { MaybeUninit::zeroed().assume_init() };
         vpx!(vpx_codec_enc_config_default(cfg_ptr, &mut cfg, 0));
 
-
         cfg.g_w = width;
         cfg.g_h = height;
         cfg.g_timebase.num = 1;
@@ -98,34 +97,24 @@ impl VideoEncoderBuilder {
         ));
         unsafe {
             vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 7);
-            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int, 4);
+            vpx_codec_control_(
+                &mut ctx,
+                vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int,
+                4,
+            );
             vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int, 1);
-            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_FRAME_PARALLEL_DECODING as c_int, 1);
+            vpx_codec_control_(
+                &mut ctx,
+                vp8e_enc_control_id::VP9E_SET_FRAME_PARALLEL_DECODING as c_int,
+                1,
+            );
             vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_AQ_MODE as c_int, 3);
-            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as c_int, 50);
+            vpx_codec_control_(
+                &mut ctx,
+                vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as c_int,
+                50,
+            );
         }
-        // set encoder internal speed settings
-        // vpx!(vpx_codec_control_(
-        //     &mut ctx,
-        //     vp8e_enc_control_id::VP8E_SET_CPUUSED as _,
-        //     self.cpu_used as c_int
-        // ));
-        // // set row level multi-threading
-        // vpx!(vpx_codec_control_(
-        //     &mut ctx,
-        //     vp8e_enc_control_id::VP9E_SET_ROW_MT as _,
-        //     1 as c_int
-        // ));
-        // vpx!(vpx_codec_control_(
-        //     &mut ctx,
-        //     vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as _,
-        //     4 as c_int
-        // ));
-        // vpx!(vpx_codec_control_(
-        //     &mut ctx,
-        //     vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as _,
-        //     25 as c_int
-        // ));
         Ok(VideoEncoder {
             ctx,
             cfg,

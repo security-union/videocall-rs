@@ -168,12 +168,11 @@ impl CameraDaemon {
             camera.open_stream().unwrap();
 
             // Allocate buffer for raw data based on actual format
-            let mut image_buffer =
-                vec![
-                    0;
-                    actual_resolution.width() as usize * actual_resolution.height() as usize * 3
-                        / 2
-                ];
+            let mut i420_image_buffer = vec![
+                0u8;
+                buffer_size_i420(actual_resolution.width(), actual_resolution.height())
+                    as usize
+            ];
 
             let frame_time = Duration::from_millis(1000u64 / framerate as u64);
             let mut last_frame_time = Instant::now();
@@ -186,7 +185,7 @@ impl CameraDaemon {
                 last_frame_time = Instant::now();
                 let frame = camera.frame().unwrap();
                 frame
-                    .decode_image_to_buffer::<I420Format>(&mut image_buffer)
+                    .decode_image_to_buffer::<I420Format>(&mut i420_image_buffer)
                     .unwrap();
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
@@ -196,7 +195,7 @@ impl CameraDaemon {
 
                 // Try sending the frame over the channel
                 if let Err(e) = cam_tx.try_send(Some(CameraPacket::new(
-                    image_buffer.clone(),
+                    i420_image_buffer.clone(),
                     frame_format,
                     since_the_epoch().as_millis(),
                 ))) {

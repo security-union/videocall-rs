@@ -166,6 +166,8 @@ impl CameraDaemon {
             };
             let actual_resolution = camera.resolution();
             camera.open_stream().unwrap();
+            println!("Requested format: {:?}",frame_format);
+            println!("Actual stream format: {:?}", camera.frame_format());
 
             // Allocate buffer for raw data based on actual format
             let mut i420_image_buffer = vec![

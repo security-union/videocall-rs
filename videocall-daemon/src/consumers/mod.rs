@@ -1,6 +1,6 @@
 use camera_synk::CameraSynk;
 use dead_synk::DeadSynk;
-use quic::Client;
+use quic::QUICClient;
 
 pub mod camera_synk;
 pub mod dead_synk;
@@ -8,7 +8,7 @@ pub mod quic;
 
 pub enum CameraSynks {
     DeadSynk(DeadSynk),
-    CameraSynk(Client),
+    CameraSynk(QUICClient),
 }
 
 impl CameraSynk for CameraSynks {

@@ -2,7 +2,7 @@ use tokio::sync::mpsc::channel;
 use videocall_daemon::cli_args::Streaming;
 use videocall_daemon::consumers::camera_synk::CameraSynk;
 use videocall_daemon::consumers::dead_synk::DeadSynk;
-use videocall_daemon::consumers::quic::Client;
+use videocall_daemon::consumers::quic::QUICClient;
 use videocall_daemon::consumers::CameraSynks;
 use videocall_daemon::producers::{
     camera::{CameraConfig, CameraDaemon},
@@ -41,7 +41,7 @@ pub async fn stream(opt: Streaming) {
     let mut client: CameraSynks = if local_streaming {
         CameraSynks::DeadSynk(DeadSynk::new(opt))
     } else {
-        CameraSynks::CameraSynk(Client::new(opt))
+        CameraSynks::CameraSynk(QUICClient::new(opt))
     };
     client.connect().await.expect("failed to connect");
     let camera_config = CameraConfig {

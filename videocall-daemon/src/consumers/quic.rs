@@ -19,12 +19,12 @@ use crate::cli_args::Streaming;
 
 use super::camera_synk::CameraSynk;
 
-pub struct Client {
+pub struct QUICClient {
     options: Streaming,
     sender: Option<Sender<Vec<u8>>>,
 }
 
-impl Client {
+impl QUICClient {
     pub fn new(options: Streaming) -> Self {
         Self {
             options,
@@ -151,7 +151,7 @@ async fn connect_to_server(options: &Streaming) -> anyhow::Result<Connection> {
     }
 }
 
-impl CameraSynk for Client {
+impl CameraSynk for QUICClient {
     async fn connect(&mut self) -> anyhow::Result<()> {
         let conn = connect_to_server(&self.options).await?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);

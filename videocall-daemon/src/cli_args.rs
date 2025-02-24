@@ -56,7 +56,7 @@ pub enum Mode {
 #[derive(Args, Debug, Clone)]
 pub struct Streaming {
     /// Perform NSS-compatible TLS key logging to the file specified in `SSLKEYLOGFILE`.
-    #[clap(long = "keylog")]
+    #[clap(long = "debug-keylog")]
     pub keylog: bool,
 
     /// URL to connect to.
@@ -74,6 +74,8 @@ pub struct Streaming {
     /// If you specify the index, it will be used directly.
     ///
     /// If you specify the name, it will be matched against the camera names.
+    /// 
+    /// Note*: for MacOS users, oyu have to use the device uuid instead of the human readable name.
     #[clap(long = "video-device-index", short = 'v')]
     pub video_device_index: IndexKind,
 
@@ -85,7 +87,7 @@ pub struct Streaming {
     #[clap(default_value = "1280x720")]
     pub resolution: String,
 
-    /// Frames per second (e.g. 10, 15, 30, 60)
+    /// Frame rate for the video stream.
     #[clap(long = "fps")]
     #[clap(default_value = "15")]
     pub fps: u32,
@@ -95,11 +97,11 @@ pub struct Streaming {
     pub bitrate_kbps: u32,
 
     /// Send test pattern instead of camera video.
-    #[clap(long = "send-test-pattern", short = 't')]
-    pub test_pattern: bool,
+    #[clap(long = "debug-send-test-pattern")]
+    pub send_test_pattern: bool,
 
     /// This is for ensuring that we can open the camera and encode video
-    #[clap(long = "offline-streaming-test")]
+    #[clap(long = "debug-offline-streaming-test")]
     pub local_streaming_test: bool,
 
     /// Controls the speed vs. quality tradeoff for VP9 encoding.

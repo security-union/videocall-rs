@@ -51,7 +51,7 @@ impl TestPatternSender {
         let mut frames = vec![];
 
         for i in 100..200 {
-            let path = format!("images/sample_video_save/output_{}.jpg", i);
+            let path = format!("assets/images/sample_video_save/output_{}.jpg", i);
             let img = read(path).unwrap();
             let img = ImageReader::new(std::io::Cursor::new(img))
                 .with_guessed_format()

@@ -1,5 +1,5 @@
 use tokio::sync::mpsc::channel;
-use videocall_daemon::cli_args::Streaming;
+use videocall_daemon::cli_args::Stream;
 use videocall_daemon::consumers::camera_synk::CameraSynk;
 use videocall_daemon::consumers::dead_synk::DeadSynk;
 use videocall_daemon::consumers::quic::QUICClient;
@@ -11,7 +11,7 @@ use videocall_daemon::producers::{
     test_pattern_sender::TestPatternSender,
 };
 
-pub async fn stream(opt: Streaming) {
+pub async fn stream(opt: Stream) {
     // Parse resolution
     let resolution: Vec<&str> = opt.resolution.split('x').collect();
     if resolution.len() != 2 {
@@ -36,7 +36,7 @@ pub async fn stream(opt: Streaming) {
     let audio_device = opt.audio_device.clone();
     let local_streaming = opt.local_streaming_test;
     let bitrate_kbps = opt.bitrate_kbps;
-    let cpu_used = opt.cpu_used;
+    let cpu_used = opt.vp9_cpu_used;
     let frame_format = opt.frame_format;
     let mut client: CameraSynks = if local_streaming {
         CameraSynks::DeadSynk(DeadSynk::new(opt))

@@ -4,11 +4,13 @@ use quic::QUICClient;
 
 pub mod camera_synk;
 pub mod dead_synk;
+pub mod local_window_synk;
 pub mod quic;
 
 pub enum CameraSynks {
     DeadSynk(DeadSynk),
     CameraSynk(QUICClient),
+    // LocalWindowSynk(LocalWindowSynk)
 }
 
 impl CameraSynk for CameraSynks {

@@ -15,17 +15,17 @@ use videocall_types::protos::{
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
-use crate::cli_args::Streaming;
+use crate::cli_args::Stream;
 
 use super::camera_synk::CameraSynk;
 
 pub struct QUICClient {
-    options: Streaming,
+    options: Stream,
     sender: Option<Sender<Vec<u8>>>,
 }
 
 impl QUICClient {
-    pub fn new(options: Streaming) -> Self {
+    pub fn new(options: Stream) -> Self {
         Self {
             options,
             sender: None,
@@ -65,7 +65,7 @@ impl QUICClient {
         }
     }
 
-    async fn start_heartbeat(&self, conn: Connection, options: &Streaming) {
+    async fn start_heartbeat(&self, conn: Connection, options: &Stream) {
         let interval = time::interval(Duration::from_secs(1));
         let email = options.user_id.clone();
         tokio::spawn(async move {
@@ -98,7 +98,7 @@ impl QUICClient {
     }
 }
 
-async fn connect_to_server(options: &Streaming) -> anyhow::Result<Connection> {
+async fn connect_to_server(options: &Stream) -> anyhow::Result<Connection> {
     loop {
         info!("Attempting to connect to {}", options.url);
         let addrs = options

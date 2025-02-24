@@ -61,9 +61,7 @@ pub fn test_camera(info: TestCamera) {
                 let camera_frame = camera_buffer.len();
                 // Write the frame to the pixels buffer, considering the format
                 if camera_frame == pixels_frame {
-                    pixels
-                        .get_frame_mut()
-                        .copy_from_slice(&camera_buffer);
+                    pixels.get_frame_mut().copy_from_slice(&camera_buffer);
                 } else {
                     // only copy enough to fill the pixels buffer,
                     pixels

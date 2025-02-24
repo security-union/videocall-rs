@@ -74,7 +74,7 @@ pub struct Streaming {
     /// If you specify the index, it will be used directly.
     ///
     /// If you specify the name, it will be matched against the camera names.
-    /// 
+    ///
     /// Note*: for MacOS users, oyu have to use the device uuid instead of the human readable name.
     #[clap(long = "video-device-index", short = 'v')]
     pub video_device_index: IndexKind,

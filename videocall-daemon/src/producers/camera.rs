@@ -1,7 +1,6 @@
 use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use anyhow::Result;
-use nokhwa::pixel_format::BgraFormat;
 use nokhwa::pixel_format::I420Format;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;

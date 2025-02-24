@@ -33,19 +33,16 @@ pub async fn get_info(info: Info) -> anyhow::Result<()> {
         }
     }
 
-    match info.list_formats {
-        Some(index) => {
-            let index = match index {
-                IndexKind::String(s) => CameraIndex::String(s.clone()),
-                IndexKind::Index(i) => CameraIndex::Index(i),
-            };
-            let mut camera = Camera::new(
-                index,
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate),
-            )?;
-            camera_compatible_formats(&mut camera);
-        }
-        None => {}
+    if let Some(index) = info.list_formats {
+        let index = match index {
+            IndexKind::String(s) => CameraIndex::String(s.clone()),
+            IndexKind::Index(i) => CameraIndex::Index(i),
+        };
+        let mut camera = Camera::new(
+            index,
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate),
+        )?;
+        camera_compatible_formats(&mut camera);
     }
 
     Ok(())

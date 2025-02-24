@@ -1,21 +1,16 @@
-use crate::cli_args::IndexKind;
 use crate::producers::camera::since_the_epoch;
-use crate::producers::camera::transform_video_chunk;
-use crate::producers::camera::THRESHOLD_MILLIS;
 use crate::producers::producer::Producer;
-use crate::video_encoder::VideoEncoderBuilder;
 use anyhow::Result;
 use image::imageops::FilterType;
 use image::ImageBuffer;
 use image::ImageReader;
 use image::Rgb;
 use nokhwa::utils::FrameFormat;
-use protobuf::Message;
 use std::fs::read;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{debug, error};
 
 use tokio::sync::mpsc::{self, Sender};

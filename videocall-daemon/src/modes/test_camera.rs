@@ -1,6 +1,4 @@
-use std::io::Read;
 
-use image::ImageBuffer;
 use nokhwa::{
     pixel_format::BgraFormat,
     utils::{CameraIndex, RequestedFormat, RequestedFormatType},

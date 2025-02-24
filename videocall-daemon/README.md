@@ -31,11 +31,11 @@ Skip the hassle! Install the client directly with:
 ```sh
 cargo install videocall-daemon
 videocall-daemon \
+  stream \
   --user-id <your-user-id> \
   --video-device-index <your-camera-index> \
   --meeting-id <meeting-id> \
-  --resolution 1280x720 \
-  --fps 30
+  --resolution 1280x720
 ```
 
 ## 🌐 See Your Stream Live! using Chrome
@@ -53,15 +53,12 @@ Replace `<your-username>` and `<meeting-id>` with the appropriate values.
 
 | Platform          | Supported | Tested         |
 |--------------------|-----------|----------------|
-| macOS             | ❌        | ❌             |
+| MacOS 15.3.1+     | ✅ (exp)  | ✅             |
 | Ubuntu 24 (Linux) | ✅        | ✅             |
 | Ubuntu 22 (Linux) | ✅        | ✅             |
 | Debian            | ✅        | ❌             |
 | Alpine Linux      | ✅        | ❌             |
 | Windows           | ❌        | ❌             |
-
-### Note
-Only **Ubuntu 24** and **Ubuntu 22** have been fully tested. Other platforms may work, but support is not guaranteed.
 
 ---
 

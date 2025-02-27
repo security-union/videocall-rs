@@ -99,7 +99,7 @@ pub struct Stream {
     /// The value ranges from `0` (slowest, best quality) to `15` (fastest, lowest quality).
     ///
     /// The cli does not allow selecting values below 4 because they are useless for realtime streaming.
-    /// 
+    ///
     /// ## Valid Values:
     /// - `4` to `8`: **Fast encoding**, lower quality (good for real-time streaming, live video).
     /// - `9` to `15`: **Very fast encoding**, lowest quality, largest files (for ultra-low-latency applications).
@@ -130,7 +130,8 @@ pub struct Stream {
 fn parse_frame_format(s: &str) -> Result<FrameFormat, String> {
     match s {
         "NV12" => Ok(FrameFormat::NV12),
-        "BGRA" => Ok(FrameFormat::BGRA),
+        // TODO: Merge MR with MacOS BGRA support
+        // "BGRA" => Ok(FrameFormat::BGRA),
         "YUYV" => Ok(FrameFormat::YUYV),
         _ => Err("Invalid frame format, please use one of [NV12, BGRA, YUYV]".to_string()),
     }

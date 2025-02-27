@@ -57,10 +57,15 @@ async fn main() -> anyhow::Result<()> {
             match s.video_device_index.clone() {
                 None => {
                     println!("No camera selected. Available cameras:");
-                    get_info(Info { list_cameras: true, list_formats: None, list_resolutions: None }).await?;
+                    get_info(Info {
+                        list_cameras: true,
+                        list_formats: None,
+                        list_resolutions: None,
+                    })
+                    .await?;
                     println!("\nPlease run the command again with --video-device-index <INDEX>");
                     return Ok(());
-                },
+                }
                 Some(_index) => {
                     stream(s.clone()).await;
                 }

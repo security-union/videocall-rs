@@ -1,7 +1,7 @@
 use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use anyhow::Result;
-use nokhwa::pixel_format::I420Format;
+use nokhwa::pixel_format::YuyvFormat;
 use nokhwa::utils::RequestedFormat;
 use nokhwa::utils::RequestedFormatType;
 use nokhwa::{
@@ -154,7 +154,7 @@ impl CameraDaemon {
             debug!("Camera opened... waiting for frames");
             let mut camera = match Camera::new(
                 video_device_index,
-                RequestedFormat::new::<I420Format>(RequestedFormatType::Exact(
+                RequestedFormat::new::<YuyvFormat>(RequestedFormatType::Exact(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
             ) {
@@ -186,7 +186,7 @@ impl CameraDaemon {
                 last_frame_time = Instant::now();
                 let frame = camera.frame().unwrap();
                 frame
-                    .decode_image_to_buffer::<I420Format>(&mut i420_image_buffer)
+                    .decode_image_to_buffer::<YuyvFormat>(&mut i420_image_buffer)
                     .unwrap();
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {

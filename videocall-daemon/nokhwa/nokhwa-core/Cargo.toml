@@ -51,3 +51,6 @@ optional = true
 
 [package.metadata.docs.rs]
 features = ["docs-features"]
+
+[dev-dependencies]
+mozjpeg = "0.10.13"

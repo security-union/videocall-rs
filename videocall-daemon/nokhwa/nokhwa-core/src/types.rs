@@ -1735,6 +1735,37 @@ pub fn nv12_to_rgb(
     Ok(dest)
 }
 
+pub fn nv12_to_i420(nv12: &[u8], width: usize, height: usize, i420: &mut [u8]) {
+    // assert that the nv12 has the expected size
+    assert!(
+        width % 2 == 0 && height % 2 == 0,
+        "Width and height must be even numbers."
+    );
+
+    let y_plane_size = width * height;
+    let uv_plane_size = y_plane_size / 2; // Interleaved UV plane size
+    let u_plane_size = uv_plane_size / 2;
+
+    let (y_plane, uv_plane) = i420.split_at_mut(y_plane_size);
+    let (u_plane, v_plane) = uv_plane.split_at_mut(u_plane_size);
+
+    // Step 1: Copy Y plane
+    y_plane.copy_from_slice(&nv12[..y_plane_size]);
+
+    // Step 2: Process interleaved UV data
+    let nv12_uv = &nv12[y_plane_size..];
+
+    for row in 0..(height / 2) {
+        for col in 0..(width / 2) {
+            let nv12_index = row * width + col * 2; // Index in NV12 interleaved UV plane
+            let uv_index = row * (width / 2) + col; // Index in U and V planes
+
+            u_plane[uv_index] = nv12_uv[nv12_index]; // U value
+            v_plane[uv_index] = nv12_uv[nv12_index + 1]; // V value
+        }
+    }
+}
+
 // this depresses me
 // like, everytime i open this codebase all the life is sucked out of me
 // i hate it

@@ -15,8 +15,7 @@
  */
 use crate::error::NokhwaError;
 use crate::types::{
-    buf_bgr_to_rgb, buf_mjpeg_to_rgb, buf_nv12_to_rgb, buf_yuyv422_to_rgb, color_frame_formats, frame_formats,
-    mjpeg_to_rgb, nv12_to_rgb, yuyv422_to_rgb, FrameFormat, Resolution,
+    buf_bgr_to_rgb, buf_mjpeg_to_rgb, buf_nv12_to_rgb, buf_yuyv422_to_rgb, color_frame_formats, frame_formats, mjpeg_to_rgb, nv12_to_i420, nv12_to_rgb, yuyv422_to_rgb, FrameFormat, Resolution
 };
 use image::{Luma, LumaA, Pixel, Rgb, Rgba};
 use std::fmt::Debug;
@@ -445,12 +444,12 @@ impl FormatDecoder for LumaAFormat {
 
 
 
-/// let image: ImageBuffer<Rgb<u8>, Vec<u8>> = buffer.to_image::<YuyvFormat>();
+/// let image: ImageBuffer<Rgb<u8>, Vec<u8>> = buffer.to_image::<I420Format>();
 /// ```
 #[derive(Copy, Clone, Debug, Default, Hash, Ord, PartialOrd, Eq, PartialEq)]
-pub struct YuyvFormat;
+pub struct I420Format;
 
-impl FormatDecoder for YuyvFormat {
+impl FormatDecoder for I420Format {
     type Output = Rgb<u8>;
     const FORMATS: &'static [FrameFormat] = color_frame_formats();
 
@@ -468,7 +467,7 @@ impl FormatDecoder for YuyvFormat {
                     resolution.height() as usize,
                 );
                 Ok(i420)
-            }
+            },
             _ => Err(NokhwaError::GeneralError("Invalid FrameFormat".into())),
         }
     }
@@ -490,6 +489,15 @@ impl FormatDecoder for YuyvFormat {
                 )?;
                 Ok(())
             }
+            FrameFormat::NV12 => {
+                nv12_to_i420(
+                    data,
+                    resolution.width() as usize,
+                    resolution.height() as usize,
+                    dest,
+                );
+                Ok(())
+            },
             _ => Err(NokhwaError::GeneralError("Invalid FrameFormat".into())),
         }
     }

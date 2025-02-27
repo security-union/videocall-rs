@@ -1011,21 +1011,6 @@ mod internal {
                     error: "Not Found/Rejected/Unsupported".to_string(),
                 });
             }
-
-            let activefmtkey = str_to_nsstr("activeFormat");
-            let min_frame_duration = str_to_nsstr("minFrameDuration");
-            let active_video_min_frame_duration = str_to_nsstr("activeVideoMinFrameDuration");
-            let active_video_max_frame_duration = str_to_nsstr("activeVideoMaxFrameDuration");
-            let _: () =
-                unsafe { msg_send![self.inner, setValue:selected_format forKey:activefmtkey] };
-            let min_frame_duration: *mut Object =
-                unsafe { msg_send![selected_range, valueForKey: min_frame_duration] };
-            let _: () = unsafe {
-                msg_send![self.inner, setValue:min_frame_duration forKey:active_video_min_frame_duration]
-            };
-            let _: () = unsafe {
-                msg_send![self.inner, setValue:min_frame_duration forKey:active_video_max_frame_duration]
-            };
             self.unlock();
             Ok(())
         }

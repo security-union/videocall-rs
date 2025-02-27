@@ -2234,78 +2234,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
-name = "nokhwa"
-version = "0.10.7"
-dependencies = [
- "flume",
- "image",
- "js-sys",
- "nokhwa-bindings-linux",
- "nokhwa-bindings-macos",
- "nokhwa-bindings-windows",
- "nokhwa-core",
- "opencv",
- "parking_lot",
- "paste",
- "regex",
- "rgb",
- "serde",
- "thiserror 2.0.11",
- "usb_enumeration",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-rs-async-executor",
- "web-sys",
- "wgpu",
-]
-
-[[package]]
-name = "nokhwa-bindings-linux"
-version = "0.1.1"
-dependencies = [
- "nokhwa-core",
- "v4l",
-]
-
-[[package]]
-name = "nokhwa-bindings-macos"
-version = "0.2.2"
-dependencies = [
- "block",
- "cocoa-foundation",
- "core-foundation 0.9.4",
- "core-media-sys",
- "core-video-sys",
- "flume",
- "nokhwa-core",
- "objc",
- "once_cell",
-]
-
-[[package]]
-name = "nokhwa-bindings-windows"
-version = "0.4.2"
-dependencies = [
- "nokhwa-core",
- "once_cell",
- "windows 0.43.0",
-]
-
-[[package]]
-name = "nokhwa-core"
-version = "0.1.5"
-dependencies = [
- "bytemuck",
- "bytes",
- "image",
- "mozjpeg",
- "opencv",
- "serde",
- "thiserror 2.0.11",
- "wgpu",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3872,7 +3800,6 @@ dependencies = [
  "cpal",
  "env-libvpx-sys",
  "image",
- "nokhwa",
  "opus",
  "protobuf",
  "quinn",
@@ -3882,8 +3809,81 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "videocall-nokhwa",
  "videocall-types",
  "webpki-roots",
+]
+
+[[package]]
+name = "videocall-nokhwa"
+version = "0.10.7"
+dependencies = [
+ "flume",
+ "image",
+ "js-sys",
+ "opencv",
+ "parking_lot",
+ "paste",
+ "regex",
+ "rgb",
+ "serde",
+ "thiserror 2.0.11",
+ "usb_enumeration",
+ "videocall-nokhwa-bindings-linux",
+ "videocall-nokhwa-bindings-macos",
+ "videocall-nokhwa-bindings-windows",
+ "videocall-nokhwa-core",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-rs-async-executor",
+ "web-sys",
+ "wgpu",
+]
+
+[[package]]
+name = "videocall-nokhwa-bindings-linux"
+version = "0.1.1"
+dependencies = [
+ "v4l",
+ "videocall-nokhwa-core",
+]
+
+[[package]]
+name = "videocall-nokhwa-bindings-macos"
+version = "0.2.2"
+dependencies = [
+ "block",
+ "cocoa-foundation",
+ "core-foundation 0.9.4",
+ "core-media-sys",
+ "core-video-sys",
+ "flume",
+ "objc",
+ "once_cell",
+ "videocall-nokhwa-core",
+]
+
+[[package]]
+name = "videocall-nokhwa-bindings-windows"
+version = "0.4.2"
+dependencies = [
+ "once_cell",
+ "videocall-nokhwa-core",
+ "windows 0.43.0",
+]
+
+[[package]]
+name = "videocall-nokhwa-core"
+version = "0.1.5"
+dependencies = [
+ "bytemuck",
+ "bytes",
+ "image",
+ "mozjpeg",
+ "opencv",
+ "serde",
+ "thiserror 2.0.11",
+ "wgpu",
 ]
 
 [[package]]

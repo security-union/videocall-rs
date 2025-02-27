@@ -27,7 +27,7 @@ fn init_avfoundation(callback: impl Fn(bool) + Send + 'static) {
     any(target_os = "macos", target_os = "ios")
 ))]
 fn init_avfoundation(callback: impl Fn(bool) + Send + Sync + 'static) {
-    use nokhwa_bindings_macos::request_permission_with_callback;
+    use videocall_nokhwa_bindings_macos::request_permission_with_callback;
 
     request_permission_with_callback(callback);
 }
@@ -45,7 +45,7 @@ fn status_avfoundation() -> bool {
     any(target_os = "macos", target_os = "ios")
 ))]
 fn status_avfoundation() -> bool {
-    use nokhwa_bindings_macos::{current_authorization_status, AVAuthorizationStatus};
+    use videocall_nokhwa_bindings_macos::{current_authorization_status, AVAuthorizationStatus};
 
     matches!(
         current_authorization_status(),

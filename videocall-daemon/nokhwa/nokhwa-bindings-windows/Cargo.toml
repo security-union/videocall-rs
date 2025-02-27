@@ -1,10 +1,11 @@
 [package]
-name = "nokhwa-bindings-windows"
+name = "videocall-nokhwa-bindings-windows"
 version = "0.4.2"
-authors = ["l1npengtul"]
+authors = ["l1npengtul", "Dario Lencina <dario@securityunion.dev>"]
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/l1npengtul/nokhwa"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
 description = "The Windows Media Foundation bindings crate for `nokhwa`"
 keywords = ["media-foundation", "windows", "capture", "webcam"]
 
@@ -15,7 +16,7 @@ docs-only = []
 
 [dependencies]
 
-[dependencies.nokhwa-core]
+[dependencies.videocall-nokhwa-core]
 version = "0.1"
 path = "../nokhwa-core"
 

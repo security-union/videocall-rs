@@ -1,10 +1,10 @@
 use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use anyhow::Result;
-use nokhwa::pixel_format::YuyvFormat;
-use nokhwa::utils::RequestedFormat;
-use nokhwa::utils::RequestedFormatType;
-use nokhwa::{
+use videocall_nokhwa::utils::RequestedFormat;
+use videocall_nokhwa::pixel_format::YuyvFormat;
+use videocall_nokhwa::utils::RequestedFormatType;
+use videocall_nokhwa::{
     utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
     Camera,
 };
@@ -136,7 +136,7 @@ impl CameraDaemon {
     }
 
     fn camera_thread(&self) -> Result<JoinHandle<()>> {
-        let devices = nokhwa::query(ApiBackend::Auto)?;
+        let devices = videocall_nokhwa::query(ApiBackend::Auto)?;
         for (i, camera_info) in devices.iter().enumerate() {
             info!("AVAILABLE CAMERA DEVICE INDEX {}: {:?}", i, camera_info);
         }

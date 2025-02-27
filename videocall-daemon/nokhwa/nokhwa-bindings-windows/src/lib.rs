@@ -1231,8 +1231,8 @@ pub mod wmf {
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::must_use_candidate)]
 pub mod wmf {
-    use nokhwa_core::error::NokhwaError;
-    use nokhwa_core::types::{
+    use videocall_nokhwa_core::error::NokhwaError;
+    use videocall_nokhwa_core::types::{
         CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueSetter,
         KnownCameraControl,
     };

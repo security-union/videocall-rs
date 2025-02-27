@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use nokhwa::{
+use videocall_nokhwa::{
     native_api_backend,
     pixel_format::RgbFormat,
     query,

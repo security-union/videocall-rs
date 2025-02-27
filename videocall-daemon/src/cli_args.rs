@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use nokhwa::utils::FrameFormat;
+use videocall_nokhwa::utils::FrameFormat;
 use thiserror::Error;
 use url::Url;
 

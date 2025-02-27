@@ -12,7 +12,7 @@ async fn initialize() {
     // Wrap the sender in an Arc<Mutex<Option>> to allow mutable access in the closure.
     let sender_lock = std::sync::Arc::new(std::sync::Mutex::new(Some(sender)));
     debug!("Asking for permission to camera");
-    nokhwa::nokhwa_initialize(move |x| {
+    videocall_nokhwa::nokhwa_initialize(move |x| {
         if let Ok(mut sender_option) = sender_lock.lock() {
             // Take the sender out of the Option and send the value
             if let Some(sender) = sender_option.take() {

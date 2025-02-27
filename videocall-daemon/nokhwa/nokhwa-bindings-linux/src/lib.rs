@@ -933,10 +933,10 @@ mod internal {
 
 #[cfg(not(target_os = "linux"))]
 mod internal {
-    use nokhwa_core::buffer::Buffer;
-    use nokhwa_core::error::NokhwaError;
-    use nokhwa_core::traits::CaptureBackendTrait;
-    use nokhwa_core::types::{
+    use videocall_nokhwa_core::buffer::Buffer;
+    use videocall_nokhwa_core::error::NokhwaError;
+    use videocall_nokhwa_core::traits::CaptureBackendTrait;
+    use videocall_nokhwa_core::types::{
         ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueSetter,
         FrameFormat, KnownCameraControl, RequestedFormat, Resolution,
     };

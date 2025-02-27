@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-use nokhwa_core::types::RequestedFormatType;
-use nokhwa_core::{
+use videocall_nokhwa_core::types::RequestedFormatType;
+use videocall_nokhwa_core::{
     buffer::Buffer,
     error::NokhwaError,
     pixel_format::FormatDecoder,

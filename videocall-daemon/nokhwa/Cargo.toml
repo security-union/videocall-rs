@@ -1,13 +1,14 @@
 [package]
-name = "nokhwa"
+name = "videocall-nokhwa"
 version = "0.10.7"
-authors = ["l1npengtul <l1npengtul@protonmail.com>"]
+authors = ["l1npengtul <l1npengtul@protonmail.com>", "Dario Lencina <dario@securityunion.dev>"]
 edition = "2021"
 description = "A Simple-to-use, cross-platform Rust Webcam Capture Library"
 keywords = ["camera", "webcam", "capture", "cross-platform"]
 categories = ["api-bindings", "multimedia", "os", "web-programming"]
 license = "Apache-2.0"
-repository = "https://github.com/l1npengtul/nokhwa"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,28 +17,28 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["decoding"]
-serialize = ["serde", "nokhwa-core/serialize"]
-decoding = ["nokhwa-core/mjpeg"]
-input-avfoundation = ["nokhwa-bindings-macos"]
-input-msmf = ["nokhwa-bindings-windows"]
-input-v4l = ["nokhwa-bindings-linux"]
+serialize = ["serde", "videocall-nokhwa-core/serialize"]
+decoding = ["videocall-nokhwa-core/mjpeg"]
+input-avfoundation = ["videocall-nokhwa-bindings-macos"]
+input-msmf = ["videocall-nokhwa-bindings-windows"]
+input-v4l = ["videocall-nokhwa-bindings-linux"]
 # Disable arena buffer on v4l
 # This should fix crash on Raspberry Pi that have faulty v4l driver.
 # WARNING: This create a performance regression, half of the frames will be dropped
 # You shouldn't enable this unless you have to.
-input-v4l-no-arena-buffer = ["nokhwa-bindings-linux/no-arena-buffer"]
+input-v4l-no-arena-buffer = ["videocall-nokhwa-bindings-linux/no-arena-buffer"]
 input-native = ["input-avfoundation", "input-v4l", "input-msmf"]
 # Re-enable it once soundness has been proven + mozjpeg is updated to 0.9.x
 # input-uvc = ["uvc", "uvc/vendor", "usb_enumeration", "lazy_static"]
-input-opencv = ["opencv", "opencv/videoio", "opencv/rgb", "opencv/clang-runtime", "nokhwa-core/opencv-mat"]
+input-opencv = ["opencv", "opencv/videoio", "opencv/rgb", "opencv/clang-runtime", "videocall-nokhwa-core/opencv-mat"]
 input-jscam = ["web-sys", "js-sys", "wasm-bindgen-futures", "wasm-bindgen", "wasm-rs-async-executor"]
-output-wgpu = ["wgpu", "nokhwa-core/wgpu-types"]
+output-wgpu = ["wgpu", "videocall-nokhwa-core/wgpu-types"]
 #output-wasm = ["input-jscam"]
 output-threaded = ["parking_lot", "camera-sync-impl"]
 camera-sync-impl = []
 small-wasm = []
 docs-only = ["input-native", "input-opencv", "input-jscam","output-wgpu", "output-threaded", "serialize"]
-docs-nolink = ["nokhwa-core/docs-features"]
+docs-nolink = ["videocall-nokhwa-core/docs-features"]
 docs-features = []
 test-fail-warning = []
 
@@ -46,7 +47,7 @@ thiserror = "2.0"
 paste = "1.0"
 flume = "0.11"
 
-[dependencies.nokhwa-core]
+[dependencies.videocall-nokhwa-core]
 version = "0.1"
 path = "nokhwa-core"
 
@@ -75,17 +76,17 @@ optional = true
 version = "0.8"
 optional = true
 
-[dependencies.nokhwa-bindings-windows]
+[dependencies.videocall-nokhwa-bindings-windows]
 version = "0.4"
 path = "nokhwa-bindings-windows"
 optional = true
 
-[dependencies.nokhwa-bindings-macos]
+[dependencies.videocall-nokhwa-bindings-macos]
 version = "0.2"
 path = "nokhwa-bindings-macos"
 optional = true
 
-[dependencies.nokhwa-bindings-linux]
+[dependencies.videocall-nokhwa-bindings-linux]
 version = "0.1"
 path = "nokhwa-bindings-linux"
 optional = true

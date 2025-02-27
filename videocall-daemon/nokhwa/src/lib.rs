@@ -39,7 +39,7 @@ mod init;
 #[cfg_attr(feature = "docs-features", doc(cfg(feature = "input-jscam")))]
 pub mod js_camera;
 
-pub use nokhwa_core::pixel_format::FormatDecoder;
+pub use videocall_nokhwa_core::pixel_format::FormatDecoder;
 mod query;
 /// A camera that runs in a different thread and can call your code based on callbacks.
 #[cfg(feature = "output-threaded")]
@@ -48,29 +48,29 @@ pub mod threaded;
 
 pub use camera::Camera;
 pub use init::*;
-pub use nokhwa_core::buffer::Buffer;
-pub use nokhwa_core::error::NokhwaError;
+pub use videocall_nokhwa_core::buffer::Buffer;
+pub use videocall_nokhwa_core::error::NokhwaError;
 pub use query::*;
 #[cfg(feature = "output-threaded")]
 #[cfg_attr(feature = "docs-features", doc(cfg(feature = "output-threaded")))]
 pub use threaded::CallbackCamera;
 
 pub mod utils {
-    pub use nokhwa_core::types::*;
+    pub use videocall_nokhwa_core::types::*;
 }
 
 pub mod error {
-    pub use nokhwa_core::error::NokhwaError;
+    pub use videocall_nokhwa_core::error::NokhwaError;
 }
 
 pub mod camera_traits {
-    pub use nokhwa_core::traits::*;
+    pub use videocall_nokhwa_core::traits::*;
 }
 
 pub mod pixel_format {
-    pub use nokhwa_core::pixel_format::*;
+    pub use videocall_nokhwa_core::pixel_format::*;
 }
 
 pub mod buffer {
-    pub use nokhwa_core::buffer::*;
+    pub use videocall_nokhwa_core::buffer::*;
 }

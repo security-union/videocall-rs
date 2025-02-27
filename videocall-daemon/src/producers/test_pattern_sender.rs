@@ -5,7 +5,7 @@ use image::imageops::FilterType;
 use image::ImageBuffer;
 use image::ImageReader;
 use image::Rgb;
-use nokhwa::utils::FrameFormat;
+use videocall_nokhwa::utils::FrameFormat;
 use std::fs::read;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

@@ -1,12 +1,13 @@
 [package]
-name = "nokhwa-core"
+name = "videocall-nokhwa-core"
 version = "0.1.5"
-authors = ["l1npengtul <l1npengtul@protonmail.com>"]
+authors = ["l1npengtul <l1npengtul@protonmail.com>", "Dario Lencina <dario@securityunion.dev>"]
 edition = "2021"
 description = "Core type definitions for nokhwa"
 keywords = ["camera", "webcam", "capture", "cross-platform"]
 license = "Apache-2.0"
-repository = "https://github.com/l1npengtul/nokhwa"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]

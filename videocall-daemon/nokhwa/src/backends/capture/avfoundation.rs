@@ -16,11 +16,11 @@
 #[cfg(target_os = "macos")]
 use flume::{Receiver, Sender};
 #[cfg(target_os = "macos")]
-use nokhwa_bindings_macos::{
+use videocall_nokhwa_bindings_macos::{
     AVCaptureDevice, AVCaptureDeviceInput, AVCaptureSession, AVCaptureVideoCallback,
     AVCaptureVideoDataOutput,
 };
-use nokhwa_core::{
+use videocall_nokhwa_core::{
     buffer::Buffer,
     error::NokhwaError,
     pixel_format::RgbFormat,

@@ -225,7 +225,7 @@ mod internal {
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
     };
     use flume::{Receiver, Sender};
-    use nokhwa_core::{
+    use videocall_nokhwa_core::{
         error::NokhwaError,
         types::{
             ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo,
@@ -431,7 +431,7 @@ mod internal {
                 // AAAAAAAAAAAAAAAAAAAAAAAAA
                 // https://c.tenor.com/0e_zWtFLOzQAAAAC/needy-streamer-overload-needy-girl-overdose.gif
                 let bufferlck_cv: *const c_void = unsafe { msg_send![this, bufferPtr] };
-                let buffer_sndr = unsafe {
+                let buffer_sndr: Arc<Sender<(Vec<u8>, _)>> = unsafe {
                     let ptr = bufferlck_cv.cast::<Sender<(Vec<u8>, FrameFormat)>>();
                     Arc::from_raw(ptr)
                 };

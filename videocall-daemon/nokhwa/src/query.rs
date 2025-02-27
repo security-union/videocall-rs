@@ -106,7 +106,7 @@ pub fn query(api: ApiBackend) -> Result<Vec<CameraInfo>, NokhwaError> {
 
 #[cfg(all(feature = "input-v4l", target_os = "linux"))]
 fn query_v4l() -> Result<Vec<CameraInfo>, NokhwaError> {
-    nokhwa_bindings_linux::query()
+    videocall_nokhwa_bindings_linux::query()
 }
 
 #[cfg(any(not(feature = "input-v4l"), not(target_os = "linux")))]

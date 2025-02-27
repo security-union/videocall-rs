@@ -16,7 +16,7 @@
 
 #[cfg(target_os = "linux")]
 mod internal {
-    use nokhwa_core::{
+    use videocall_nokhwa_core::{
         buffer::Buffer,
         error::NokhwaError,
         traits::CaptureBackendTrait,

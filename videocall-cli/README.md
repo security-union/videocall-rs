@@ -84,9 +84,9 @@ Replace `<your-username>` and `<meeting-id>` with the appropriate values.
 
 | Platform          | Supported | Tested         |
 |--------------------|-----------|----------------|
-| MacOS 15.3.1+     | ✅ (exp)  | ✅             |
 | Ubuntu 24 (Linux) | ✅        | ✅             |
 | Ubuntu 22 (Linux) | ✅        | ✅             |
+| MacOS 15.3.1+     | ⚠️(exp)  | ✅             |
 | Debian            | ✅        | ❌             |
 | Alpine Linux      | ✅        | ❌             |
 | Windows           | ❌        | ❌             |

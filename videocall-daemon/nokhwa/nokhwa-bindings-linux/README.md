@@ -1,3 +1,6 @@
+# Disclaimer
+This is a fork of nokhwa, tailored to the videocall ecosystem needs.
+
 # nokhwa-bindings-linux
 This crate is the V4L2 bindings for the `nokhwa` crate.
 

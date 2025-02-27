@@ -1,3 +1,5 @@
+# Disclaimer
+This is a fork of nokhwa, tailored to the videocall ecosystem needs.
 
 # videocall-nokhwa-core
 This crate contains core type definitions for `videocall-nokhwa`. This is seperated so other crates may use it as well.

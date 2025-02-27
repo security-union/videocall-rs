@@ -1,3 +1,6 @@
+# Disclaimer
+This is a fork of nokhwa, tailored to the videocall ecosystem needs.
+
 # nokhwa-bindings-windows
 This crate is the MediaFoundation bindings for the `nokhwa` crate.
 

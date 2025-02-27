@@ -9,13 +9,16 @@ on:
       - '*'
     paths:
       - 'videocall-cli/**'
+  pull_request:
+    paths:
+      - 'videocall-cli/**'
 
 jobs:
   build_and_package:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
 
     - name: Install Rust
       uses: actions-rs/toolchain@v1
@@ -36,7 +39,8 @@ jobs:
         cd videocall-cli
         cargo deb
 
-    - uses: actions/upload-artifact@v2
+    - uses: actions/upload-artifact@v4
       with:
         name: videocall-cli.deb
         path: videocall-cli/target/debian/*.deb
+        retention-days: 90

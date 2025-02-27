@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_ulong};
-use tracing::info;
 use vpx_sys::*;
 
 macro_rules! vpx {
@@ -51,7 +50,6 @@ impl VideoEncoderBuilder {
 
 impl VideoEncoderBuilder {
     pub fn set_resolution(mut self, width: u32, height: u32) -> Self {
-        info!("Setting resolution to {}x{}", width, height);
         self.resolution = (width, height);
         self
     }

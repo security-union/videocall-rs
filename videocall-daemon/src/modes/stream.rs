@@ -1,11 +1,17 @@
 use tokio::sync::mpsc::channel;
-use videocall_daemon::{
+use videocall_daemon::cli_args::Stream;
+use videocall_daemon::consumers::camera_synk::CameraSynk;
+use videocall_daemon::consumers::dead_synk::DeadSynk;
+use videocall_daemon::consumers::quic::QUICClient;
+use videocall_daemon::consumers::CameraSynks;
+use videocall_daemon::producers::{
     camera::{CameraConfig, CameraDaemon},
     microphone::MicrophoneDaemon,
-    quic::{Client, Streaming},
+    producer::Producer,
+    test_pattern_sender::TestPatternSender,
 };
 
-pub async fn stream(opt: Streaming) {
+pub async fn stream(opt: Stream) {
     // Parse resolution
     let resolution: Vec<&str> = opt.resolution.split('x').collect();
     if resolution.len() != 2 {
@@ -13,28 +19,59 @@ pub async fn stream(opt: Streaming) {
     }
     let width = resolution[0].parse::<u32>().expect("invalid width");
     let height = resolution[1].parse::<u32>().expect("invalid height");
+    let format = opt.frame_format;
+
+    println!(
+        "User requested resolution {}x{} and format {}",
+        width, height, &format
+    );
     let framerate = opt.fps;
     // validate framerate
-    if framerate != 10 && framerate != 15 && framerate != 30 && framerate != 60 {
-        panic!("invalid framerate: {}", framerate);
+    let valid_framerates = [10u32, 15u32, 30u32, 60u32];
+    if !valid_framerates.contains(&framerate) {
+        panic!(
+            "invalid framerate: {}, we currently support only {:?}",
+            framerate, valid_framerates
+        );
     }
     let user_id = opt.user_id.clone();
-    let meeting_id = opt.meeting_id.clone();
-    let video_device_index = opt.video_device_index;
+    let video_device_index = opt.video_device_index.clone().unwrap();
+    let send_test_pattern = opt.send_test_pattern;
     let audio_device = opt.audio_device.clone();
-    let mut client = Client::new(opt);
+    let local_streaming = opt.local_streaming_test;
+    let bitrate_kbps = opt.bitrate_kbps;
+    let cpu_used = opt.vp9_cpu_used;
+    let frame_format = opt.frame_format;
+    let mut client: CameraSynks = if local_streaming {
+        CameraSynks::DeadSynk(DeadSynk::new(opt))
+    } else {
+        CameraSynks::CameraSynk(QUICClient::new(opt))
+    };
     client.connect().await.expect("failed to connect");
-
     let camera_config = CameraConfig {
         width,
         height,
         framerate,
-        frame_format: nokhwa::utils::FrameFormat::YUYV,
+        frame_format,
         video_device_index,
+        bitrate_kbps,
+        cpu_used,
     };
     let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);
-    let mut camera = CameraDaemon::from_config(camera_config, user_id.clone(), quic_tx.clone());
-    camera.start().expect("failed to start camera");
+    let mut video_producer: Box<dyn Producer> = if send_test_pattern {
+        Box::new(TestPatternSender::from_config(
+            camera_config,
+            user_id.clone(),
+            quic_tx.clone(),
+        ))
+    } else {
+        Box::new(CameraDaemon::from_config(
+            camera_config,
+            user_id.clone(),
+            quic_tx.clone(),
+        ))
+    };
+    video_producer.start().expect("failed to start camera");
     let mut microphone = MicrophoneDaemon::default();
     if let Some(audio_device) = audio_device {
         microphone
@@ -42,11 +79,6 @@ pub async fn stream(opt: Streaming) {
             .expect("failed to start microphone");
     }
 
-    tracing::info!(
- "If you used the default url, the stream is ready at https://app.videocall.rs with meeting id:{} \n** warning: use Chrome or Chromium \n** warning: do no reuse the username {}",
-     meeting_id,
-     user_id
- );
     while let Some(data) = quic_rx.recv().await {
         if let Err(e) = client.send_packet(data).await {
             tracing::error!("Failed to send packet: {}", e);

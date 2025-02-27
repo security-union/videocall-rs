@@ -28,21 +28,21 @@ pub struct VideoEncoderBuilder {
     pub min_quantizer: u32,
     pub max_quantizer: u32,
     pub bitrate_kbps: u32,
-    pub timebase: (c_int, c_int),
+    pub fps: u32,
     pub resolution: (u32, u32),
     pub cpu_used: u32,
     pub profile: u32,
 }
 
-impl Default for VideoEncoderBuilder {
-    fn default() -> Self {
+impl VideoEncoderBuilder {
+    pub fn new(fps: u32, cpu_used: u8) -> Self {
         Self {
-            bitrate_kbps: 200_000,
-            max_quantizer: 63,
-            min_quantizer: 25,
+            bitrate_kbps: 500,
+            max_quantizer: 60,
+            min_quantizer: 40,
             resolution: (640, 480),
-            timebase: (1, 1000),
-            cpu_used: 5,
+            fps,
+            cpu_used: cpu_used as u32,
             profile: 0,
         }
     }
@@ -55,20 +55,21 @@ impl VideoEncoderBuilder {
     }
 
     pub fn build(&self) -> Result<VideoEncoder> {
-        if self.resolution.0 % 2 != 0 || self.resolution.0 == 0 {
+        let (width, height) = self.resolution;
+        if width % 2 != 0 || width == 0 {
             return Err(anyhow!("Width must be divisible by 2"));
         }
-        if self.resolution.1 % 2 != 0 || self.resolution.1 == 0 {
+        if height % 2 != 0 || height == 0 {
             return Err(anyhow!("Height must be divisible by 2"));
         }
         let cfg_ptr = vpx_ptr!(vpx_codec_vp9_cx());
         let mut cfg = unsafe { MaybeUninit::zeroed().assume_init() };
         vpx!(vpx_codec_enc_config_default(cfg_ptr, &mut cfg, 0));
 
-        cfg.g_w = self.resolution.0;
-        cfg.g_h = self.resolution.1;
-        cfg.g_timebase.num = self.timebase.0;
-        cfg.g_timebase.den = self.timebase.1;
+        cfg.g_w = width;
+        cfg.g_h = height;
+        cfg.g_timebase.num = 1;
+        cfg.g_timebase.den = self.fps as c_int;
         cfg.rc_target_bitrate = self.bitrate_kbps;
         cfg.rc_min_quantizer = self.min_quantizer;
         cfg.rc_max_quantizer = self.max_quantizer;
@@ -77,7 +78,7 @@ impl VideoEncoderBuilder {
         cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
         cfg.g_pass = vpx_enc_pass::VPX_RC_ONE_PASS;
         cfg.g_profile = self.profile;
-        cfg.rc_end_usage = vpx_rc_mode::VPX_Q;
+        cfg.rc_end_usage = vpx_rc_mode::VPX_VBR;
         cfg.kf_max_dist = 150;
         cfg.kf_min_dist = 150;
         cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
@@ -92,28 +93,21 @@ impl VideoEncoderBuilder {
             0,
             VPX_ENCODER_ABI_VERSION as i32
         ));
-        // set encoder internal speed settings
-        vpx!(vpx_codec_control_(
-            &mut ctx,
-            vp8e_enc_control_id::VP8E_SET_CPUUSED as _,
-            self.cpu_used as c_int
-        ));
-        // set row level multi-threading
-        vpx!(vpx_codec_control_(
-            &mut ctx,
-            vp8e_enc_control_id::VP9E_SET_ROW_MT as _,
-            1 as c_int
-        ));
-        vpx!(vpx_codec_control_(
-            &mut ctx,
-            vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as _,
-            4 as c_int
-        ));
-        vpx!(vpx_codec_control_(
-            &mut ctx,
-            vp8e_enc_control_id::VP9E_SET_MAX_INTER_BITRATE_PCT as _,
-            50 as c_int
-        ));
+        unsafe {
+            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 5);
+            vpx_codec_control_(
+                &mut ctx,
+                vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int,
+                4,
+            );
+            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int, 1);
+            vpx_codec_control_(
+                &mut ctx,
+                vp8e_enc_control_id::VP9E_SET_FRAME_PARALLEL_DECODING as c_int,
+                1,
+            );
+            // vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_AQ_MODE as c_int, 3);
+        }
         Ok(VideoEncoder {
             ctx,
             cfg,
@@ -131,7 +125,7 @@ pub struct VideoEncoder {
 }
 
 impl VideoEncoder {
-    pub fn update_bitrate(&mut self, bitrate: u32) -> anyhow::Result<()> {
+    pub fn update_bitrate_kbps(&mut self, bitrate: u32) -> anyhow::Result<()> {
         self.cfg.rc_target_bitrate = bitrate;
         vpx!(vpx_codec_enc_config_set(&mut self.ctx, &self.cfg));
         Ok(())

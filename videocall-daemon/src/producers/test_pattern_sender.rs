@@ -50,7 +50,7 @@ impl TestPatternSender {
         let interval = Duration::from_millis(1000 / self.config.framerate as u64);
         let mut frames = vec![];
 
-        for i in 120..140 {
+        for i in 120..125 {
             let path = format!("assets/images/sample_video_save/output_{}.jpg", i);
             let img = read(path).unwrap();
             let img = ImageReader::new(std::io::Cursor::new(img))

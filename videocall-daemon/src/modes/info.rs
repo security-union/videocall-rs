@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use videocall_daemon::cli_args::{IndexKind, Info};
 use videocall_nokhwa::{
     native_api_backend,
     pixel_format::RgbFormat,
@@ -21,7 +22,6 @@ use videocall_nokhwa::{
     utils::{frame_formats, CameraIndex, RequestedFormat, RequestedFormatType},
     Camera,
 };
-use videocall_daemon::cli_args::{IndexKind, Info};
 
 pub async fn get_info(info: Info) -> anyhow::Result<()> {
     if info.list_cameras {

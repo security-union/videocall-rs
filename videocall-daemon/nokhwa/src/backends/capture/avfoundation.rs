@@ -16,6 +16,8 @@
 #[cfg(target_os = "macos")]
 use flume::{Receiver, Sender};
 #[cfg(target_os = "macos")]
+use std::{ffi::CString, sync::Arc};
+#[cfg(target_os = "macos")]
 use videocall_nokhwa_bindings_macos::{
     AVCaptureDevice, AVCaptureDeviceInput, AVCaptureSession, AVCaptureVideoCallback,
     AVCaptureVideoDataOutput,
@@ -30,8 +32,6 @@ use videocall_nokhwa_core::{
         FrameFormat, KnownCameraControl, RequestedFormat, RequestedFormatType, Resolution,
     },
 };
-#[cfg(target_os = "macos")]
-use std::{ffi::CString, sync::Arc};
 
 use std::{borrow::Cow, collections::HashMap};
 

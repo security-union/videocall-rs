@@ -117,9 +117,7 @@ impl Buffer {
     /// Most notably, the `data` **must** stay in scope for the duration of the [`Mat`](https://docs.rs/opencv/latest/opencv/core/struct.Mat.html) or bad, ***bad*** things happen.
     #[cfg(feature = "opencv-mat")]
     #[cfg_attr(feature = "docs-features", doc(cfg(feature = "opencv-mat")))]
-    pub fn decode_opencv_mat<F: FormatDecoder>(
-        &mut self,
-    ) -> Result<BoxedRef<Mat>, NokhwaError> {
+    pub fn decode_opencv_mat<F: FormatDecoder>(&mut self) -> Result<BoxedRef<Mat>, NokhwaError> {
         use crate::buffer::channel_defs::make_mat;
 
         make_mat::<F>(self.resolution, self.buffer())
@@ -137,11 +135,11 @@ impl Buffer {
         &mut self,
         dst: &mut Mat,
     ) -> Result<(), NokhwaError> {
+        use bytes::Buf;
         use image::Pixel;
         use opencv::core::{
             Mat, MatTraitConst, MatTraitManual, Scalar, CV_8UC1, CV_8UC2, CV_8UC3, CV_8UC4,
         };
-        use bytes::Buf;
 
         let array_type = match F::Output::CHANNEL_COUNT {
             1 => CV_8UC1,
@@ -221,23 +219,45 @@ impl Buffer {
 /// You (probably) shouldn't use this.
 #[cfg(feature = "opencv-mat")]
 pub mod channel_defs {
-    use bytemuck::{cast_slice, Pod, Zeroable};
-    use image::Pixel;
     use crate::error::NokhwaError;
     use crate::pixel_format::FormatDecoder;
     use crate::types::{FrameFormat, Resolution};
+    use bytemuck::{cast_slice, Pod, Zeroable};
+    use image::Pixel;
 
     #[cfg(feature = "opencv-mat")]
     #[cfg_attr(feature = "docs-features", doc(cfg(feature = "opencv-mat")))]
-    pub(crate) fn make_mat<F>(resolution: Resolution, data: &[u8]) -> Result<opencv::boxed_ref::BoxedRef<opencv::core::Mat>, NokhwaError> where F: FormatDecoder {
+    pub(crate) fn make_mat<F>(
+        resolution: Resolution,
+        data: &[u8],
+    ) -> Result<opencv::boxed_ref::BoxedRef<opencv::core::Mat>, NokhwaError>
+    where
+        F: FormatDecoder,
+    {
         use crate::buffer::channel_defs::*;
         use opencv::core::Mat;
 
         let mat = match F::Output::CHANNEL_COUNT {
-            1 => Mat::new_rows_cols_with_data::<G8>(resolution.width() as i32, resolution.height() as i32, cast_slice(data)),
-            2 => Mat::new_rows_cols_with_data::<GA8>(resolution.width() as i32, resolution.height() as i32, cast_slice(data)),
-            3 => Mat::new_rows_cols_with_data::<RGB8>(resolution.width() as i32, resolution.height() as i32, cast_slice(data)),
-            4 => Mat::new_rows_cols_with_data::<RGBA8>(resolution.width() as i32, resolution.height() as i32, cast_slice(data)),
+            1 => Mat::new_rows_cols_with_data::<G8>(
+                resolution.width() as i32,
+                resolution.height() as i32,
+                cast_slice(data),
+            ),
+            2 => Mat::new_rows_cols_with_data::<GA8>(
+                resolution.width() as i32,
+                resolution.height() as i32,
+                cast_slice(data),
+            ),
+            3 => Mat::new_rows_cols_with_data::<RGB8>(
+                resolution.width() as i32,
+                resolution.height() as i32,
+                cast_slice(data),
+            ),
+            4 => Mat::new_rows_cols_with_data::<RGBA8>(
+                resolution.width() as i32,
+                resolution.height() as i32,
+                cast_slice(data),
+            ),
             _ => {
                 return Err(NokhwaError::ProcessFrameError {
                     src: FrameFormat::RAWRGB,
@@ -253,16 +273,15 @@ pub mod channel_defs {
                 src: FrameFormat::RAWRGB,
                 destination: "OpenCV Mat".to_string(),
                 error: why.to_string(),
-            })
+            }),
         }
     }
-
 
     /// Three u8
     #[repr(transparent)]
     #[derive(Copy, Clone, Debug)]
     pub struct RGB8 {
-        pub data: [u8; 3]
+        pub data: [u8; 3],
     }
 
     unsafe impl opencv::core::DataType for RGB8 {
@@ -324,7 +343,7 @@ pub mod channel_defs {
     #[repr(transparent)]
     #[derive(Copy, Clone, Debug)]
     pub struct RGBA8 {
-        pub data: [u8; 4]
+        pub data: [u8; 4],
     }
 
     unsafe impl opencv::core::DataType for RGBA8 {

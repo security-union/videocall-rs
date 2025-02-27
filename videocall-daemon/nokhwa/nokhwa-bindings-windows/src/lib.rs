@@ -29,11 +29,6 @@
 
 #[cfg(all(windows, not(feature = "docs-only")))]
 pub mod wmf {
-    use videocall_nokhwa_core::error::NokhwaError;
-    use videocall_nokhwa_core::types::{
-        ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueDescription,
-        ControlValueSetter, FrameFormat, KnownCameraControl, KnownCameraControlFlag, Resolution,
-    };
     use once_cell::sync::Lazy;
     use std::ffi::c_void;
     use std::{
@@ -45,6 +40,11 @@ pub mod wmf {
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
+    };
+    use videocall_nokhwa_core::error::NokhwaError;
+    use videocall_nokhwa_core::types::{
+        ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueDescription,
+        ControlValueSetter, FrameFormat, KnownCameraControl, KnownCameraControlFlag, Resolution,
     };
     use windows::Win32::Media::DirectShow::{CameraControl_Flags_Auto, CameraControl_Flags_Manual};
     use windows::Win32::Media::MediaFoundation::{
@@ -65,10 +65,9 @@ pub mod wmf {
                 KernelStreaming::GUID_NULL,
                 MediaFoundation::{
                     IMFActivate, IMFAttributes, IMFMediaSource, IMFSample, IMFSourceReader,
-                    MFCreateAttributes, MFCreateSourceReaderFromMediaSource,
-                    MFEnumDeviceSources, MFShutdown, MFStartup,
-                    MFSTARTUP_NOSOCKET, MF_API_VERSION, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-                    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+                    MFCreateAttributes, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources,
+                    MFShutdown, MFStartup, MFSTARTUP_NOSOCKET, MF_API_VERSION,
+                    MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
                     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
                     MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_FRAME_RATE,
                     MF_MT_FRAME_RATE_RANGE_MAX, MF_MT_FRAME_RATE_RANGE_MIN, MF_MT_FRAME_SIZE,
@@ -990,7 +989,7 @@ pub mod wmf {
             // Otherwise, constructing IMFMediaType from scratch can sometimes fail due to not exactly matching.
             // Therefore, we search for the first media_type that matches and also works correctly.
 
-            let mut last_error : Option<NokhwaError> = None;
+            let mut last_error: Option<NokhwaError> = None;
 
             let mut index = 0;
             while let Ok(media_type) = unsafe {
@@ -1031,7 +1030,11 @@ pub mod wmf {
                     }
                 };
 
-                if (Resolution { width_x: width, height_y: height }) != format.resolution() {
+                if (Resolution {
+                    width_x: width,
+                    height_y: height,
+                }) != format.resolution()
+                {
                     continue;
                 }
 
@@ -1084,7 +1087,7 @@ pub mod wmf {
                                 self.device_format = format;
                                 self.format_refreshed()?;
                                 return Ok(());
-                            },
+                            }
                             Err(why) => {
                                 last_error = Some(NokhwaError::SetPropertyError {
                                     property: "MEDIA_FOUNDATION_FIRST_VIDEO_STREAM".to_string(),
@@ -1231,12 +1234,12 @@ pub mod wmf {
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::must_use_candidate)]
 pub mod wmf {
+    use std::borrow::Cow;
     use videocall_nokhwa_core::error::NokhwaError;
     use videocall_nokhwa_core::types::{
         CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueSetter,
         KnownCameraControl,
     };
-    use std::borrow::Cow;
 
     pub fn initialize_mf() -> Result<(), NokhwaError> {
         Err(NokhwaError::NotImplementedError(

@@ -16,20 +16,16 @@
 
 #[cfg(target_os = "linux")]
 mod internal {
-    use videocall_nokhwa_core::{
-        buffer::Buffer,
-        error::NokhwaError,
-        traits::CaptureBackendTrait,
-        types::{
-            ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo,
-            ControlValueDescription, ControlValueSetter, FrameFormat, KnownCameraControl,
-            KnownCameraControlFlag, RequestedFormat, RequestedFormatType, Resolution,
-        },
-    };
     use std::{
         borrow::Cow,
         collections::HashMap,
         io::{self, ErrorKind},
+    };
+    use v4l::v4l_sys::{
+        V4L2_CID_BACKLIGHT_COMPENSATION, V4L2_CID_BRIGHTNESS, V4L2_CID_CONTRAST, V4L2_CID_EXPOSURE,
+        V4L2_CID_FOCUS_RELATIVE, V4L2_CID_GAIN, V4L2_CID_GAMMA, V4L2_CID_HUE,
+        V4L2_CID_IRIS_RELATIVE, V4L2_CID_PAN_RELATIVE, V4L2_CID_SATURATION, V4L2_CID_SHARPNESS,
+        V4L2_CID_TILT_RELATIVE, V4L2_CID_WHITE_BALANCE_TEMPERATURE, V4L2_CID_ZOOM_RELATIVE,
     };
     use v4l::{
         control::{Control, Flags, Type, Value},
@@ -40,11 +36,15 @@ mod internal {
         video::{capture::Parameters, Capture},
         Device, Format, FourCC,
     };
-    use v4l::v4l_sys::{
-        V4L2_CID_BACKLIGHT_COMPENSATION, V4L2_CID_BRIGHTNESS, V4L2_CID_CONTRAST, V4L2_CID_EXPOSURE,
-        V4L2_CID_FOCUS_RELATIVE, V4L2_CID_GAIN, V4L2_CID_GAMMA, V4L2_CID_HUE,
-        V4L2_CID_IRIS_RELATIVE, V4L2_CID_PAN_RELATIVE, V4L2_CID_SATURATION, V4L2_CID_SHARPNESS,
-        V4L2_CID_TILT_RELATIVE, V4L2_CID_WHITE_BALANCE_TEMPERATURE, V4L2_CID_ZOOM_RELATIVE,
+    use videocall_nokhwa_core::{
+        buffer::Buffer,
+        error::NokhwaError,
+        traits::CaptureBackendTrait,
+        types::{
+            ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo,
+            ControlValueDescription, ControlValueSetter, FrameFormat, KnownCameraControl,
+            KnownCameraControlFlag, RequestedFormat, RequestedFormatType, Resolution,
+        },
     };
 
     /// Attempts to convert a [`KnownCameraControl`] into a V4L2 Control ID.
@@ -933,6 +933,9 @@ mod internal {
 
 #[cfg(not(target_os = "linux"))]
 mod internal {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::marker::PhantomData;
     use videocall_nokhwa_core::buffer::Buffer;
     use videocall_nokhwa_core::error::NokhwaError;
     use videocall_nokhwa_core::traits::CaptureBackendTrait;
@@ -940,9 +943,6 @@ mod internal {
         ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueSetter,
         FrameFormat, KnownCameraControl, RequestedFormat, Resolution,
     };
-    use std::borrow::Cow;
-    use std::collections::HashMap;
-    use std::marker::PhantomData;
 
     /// Attempts to convert a [`KnownCameraControl`] into a V4L2 Control ID.
     /// If the associated control is not found, this will return `None` (`ColorEnable`, `Roll`)

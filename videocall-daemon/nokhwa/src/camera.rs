@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+use std::{borrow::Cow, collections::HashMap};
 use videocall_nokhwa_core::types::RequestedFormatType;
 use videocall_nokhwa_core::{
     buffer::Buffer,
@@ -25,7 +26,6 @@ use videocall_nokhwa_core::{
         FrameFormat, KnownCameraControl, RequestedFormat, Resolution,
     },
 };
-use std::{borrow::Cow, collections::HashMap};
 #[cfg(feature = "output-wgpu")]
 use wgpu::{Device as WgpuDevice, Queue as WgpuQueue, Texture as WgpuTexture};
 

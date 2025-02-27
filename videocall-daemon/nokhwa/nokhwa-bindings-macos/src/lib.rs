@@ -225,14 +225,6 @@ mod internal {
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
     };
     use flume::{Receiver, Sender};
-    use videocall_nokhwa_core::{
-        error::NokhwaError,
-        types::{
-            ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo,
-            ControlValueDescription, ControlValueSetter, FrameFormat, KnownCameraControl,
-            KnownCameraControlFlag, Resolution,
-        },
-    };
     use objc::runtime::objc_getClass;
     use objc::{
         declare::ClassDecl,
@@ -248,6 +240,14 @@ mod internal {
         error::Error,
         ffi::{c_float, c_void, CStr},
         sync::Arc,
+    };
+    use videocall_nokhwa_core::{
+        error::NokhwaError,
+        types::{
+            ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo,
+            ControlValueDescription, ControlValueSetter, FrameFormat, KnownCameraControl,
+            KnownCameraControlFlag, Resolution,
+        },
     };
 
     const UTF8_ENCODING: usize = 4;
@@ -572,9 +572,7 @@ mod internal {
                 AVCaptureDeviceType::TrueDepth => {
                     str_to_nsstr("AVCaptureDeviceTypeBuiltInTrueDepthCamera")
                 }
-                AVCaptureDeviceType::External => {
-                    str_to_nsstr("AVCaptureDeviceTypeExternal")
-                }
+                AVCaptureDeviceType::External => str_to_nsstr("AVCaptureDeviceTypeExternal"),
             }
         }
     }

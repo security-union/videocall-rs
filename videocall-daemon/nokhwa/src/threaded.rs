@@ -15,20 +15,20 @@
  */
 
 use crate::Camera;
-use videocall_nokhwa_core::{
-    buffer::Buffer,
-    error::NokhwaError,
-    types::{
-        ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueSetter,
-        FrameFormat, KnownCameraControl, RequestedFormat, RequestedFormatType, Resolution,
-    },
-};
 use std::thread::JoinHandle;
 use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+    },
+};
+use videocall_nokhwa_core::{
+    buffer::Buffer,
+    error::NokhwaError,
+    types::{
+        ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueSetter,
+        FrameFormat, KnownCameraControl, RequestedFormat, RequestedFormatType, Resolution,
     },
 };
 

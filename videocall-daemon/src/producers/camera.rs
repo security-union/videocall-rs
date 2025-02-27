@@ -1,13 +1,6 @@
 use crate::cli_args::IndexKind;
 use crate::video_encoder::Frame;
 use anyhow::Result;
-use videocall_nokhwa::utils::RequestedFormat;
-use videocall_nokhwa::pixel_format::I420Format;
-use videocall_nokhwa::utils::RequestedFormatType;
-use videocall_nokhwa::{
-    utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
-    Camera,
-};
 use protobuf::Message;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -15,6 +8,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{self, Sender};
 use tracing::{debug, error, info};
+use videocall_nokhwa::pixel_format::I420Format;
+use videocall_nokhwa::utils::RequestedFormat;
+use videocall_nokhwa::utils::RequestedFormatType;
+use videocall_nokhwa::{
+    utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat},
+    Camera,
+};
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};

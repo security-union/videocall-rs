@@ -21,7 +21,10 @@ pub async fn stream(opt: Stream) {
     let height = resolution[1].parse::<u32>().expect("invalid height");
     let format = opt.frame_format;
 
-    println!("User requested resolution {}x{} and format {}", width, height, &format);
+    println!(
+        "User requested resolution {}x{} and format {}",
+        width, height, &format
+    );
     let framerate = opt.fps;
     // validate framerate
     let valid_framerates = [10u32, 15u32, 30u32, 60u32];

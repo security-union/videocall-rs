@@ -48,12 +48,12 @@ pub mod threaded;
 
 pub use camera::Camera;
 pub use init::*;
-pub use videocall_nokhwa_core::buffer::Buffer;
-pub use videocall_nokhwa_core::error::NokhwaError;
 pub use query::*;
 #[cfg(feature = "output-threaded")]
 #[cfg_attr(feature = "docs-features", doc(cfg(feature = "output-threaded")))]
 pub use threaded::CallbackCamera;
+pub use videocall_nokhwa_core::buffer::Buffer;
+pub use videocall_nokhwa_core::error::NokhwaError;
 
 pub mod utils {
     pub use videocall_nokhwa_core::types::*;

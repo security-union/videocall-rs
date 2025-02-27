@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
-use videocall_nokhwa::utils::FrameFormat;
 use thiserror::Error;
 use url::Url;
+use videocall_nokhwa::utils::FrameFormat;
 
 /// Video Call Daemon
 ///

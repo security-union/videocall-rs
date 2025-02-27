@@ -5,13 +5,13 @@ use image::imageops::FilterType;
 use image::ImageBuffer;
 use image::ImageReader;
 use image::Rgb;
-use videocall_nokhwa::utils::FrameFormat;
 use std::fs::read;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::{debug, error};
+use videocall_nokhwa::utils::FrameFormat;
 
 use tokio::sync::mpsc::{self, Sender};
 

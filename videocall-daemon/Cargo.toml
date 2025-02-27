@@ -56,6 +56,6 @@ path = "../videocall-types"
 version = "0.1.0"
 
 [dependencies.nokhwa]
-version = "0.10.6"
+version = "0.10.7"
 features = ["input-native", "output-threaded"]
 path = "/Users/darioalessandro/Documents/nokhwa"

@@ -62,15 +62,20 @@ pub struct Stream {
     #[clap(long = "meeting-id")]
     pub meeting_id: String,
 
-    /// You can specify the video device index by index or by name.
+    /// Specify which camera to use, either by index number or name.
     ///
-    /// If you specify the index, it will be used directly.
+    /// Examples:
+    ///   --video-device-index 0    # Use first camera
+    ///   --video-device-index "HD WebCam"  # Use camera by name
     ///
-    /// If you specify the name, it will be matched against the camera names.
+    /// If not provided, the program will list all available cameras.
+    /// You can also see available cameras by running:
+    ///   videocall-daemon info --list-cameras
     ///
-    /// Note*: MacOS users, oyu have to use the device uuid instead of the human readable name.
+    /// Note for MacOS users: You must use the device UUID instead of the human-readable name.
+    /// The UUID can be found in the "Extras" field when listing cameras.
     #[clap(long = "video-device-index", short = 'v')]
-    pub video_device_index: IndexKind,
+    pub video_device_index: Option<IndexKind>,
 
     #[clap(long = "audio-device", short = 'a')]
     pub audio_device: Option<String>,

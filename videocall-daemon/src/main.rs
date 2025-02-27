@@ -5,7 +5,7 @@ use modes::info::get_info;
 use modes::stream::stream;
 use tracing::debug;
 use tracing::level_filters::LevelFilter;
-use videocall_daemon::cli_args::{Mode, Opt};
+use videocall_daemon::cli_args::{Info, Mode, Opt};
 
 async fn initialize() {
     let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -42,14 +42,29 @@ async fn main() -> anyhow::Result<()> {
             .finish(),
     )
     .unwrap();
-    let opt = Opt::parse();
+
+    #[cfg(target_os = "macos")]
+    println!("*Attention: to select a camera on MacOS please use the UUID in the Extras field as the name as opposed to the actual Name.\n");
+
+    let mut opt = Opt::parse();
 
     // if os is mac os we need to ask for permission for camera and microphone
     initialize().await;
 
     match opt.mode {
-        Mode::Stream(s) => {
-            stream(s).await;
+        Mode::Stream(ref mut s) => {
+            // If video device index is None, show available cameras and exit
+            match s.video_device_index.clone() {
+                None => {
+                    println!("No camera selected. Available cameras:");
+                    get_info(Info { list_cameras: true, list_formats: None, list_resolutions: None }).await?;
+                    println!("\nPlease run the command again with --video-device-index <INDEX>");
+                    return Ok(());
+                },
+                Some(_index) => {
+                    stream(s.clone()).await;
+                }
+            }
         }
         Mode::Info(i) => {
             get_info(i).await?;

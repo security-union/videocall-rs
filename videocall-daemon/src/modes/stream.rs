@@ -31,7 +31,7 @@ pub async fn stream(opt: Stream) {
         );
     }
     let user_id = opt.user_id.clone();
-    let video_device_index = opt.video_device_index.clone();
+    let video_device_index = opt.video_device_index.clone().unwrap();
     let send_test_pattern = opt.send_test_pattern;
     let audio_device = opt.audio_device.clone();
     let local_streaming = opt.local_streaming_test;

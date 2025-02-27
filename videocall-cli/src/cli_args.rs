@@ -70,7 +70,7 @@ pub struct Stream {
     ///
     /// If not provided, the program will list all available cameras.
     /// You can also see available cameras by running:
-    ///   videocall-daemon info --list-cameras
+    ///   videocall-cli info --list-cameras
     ///
     /// Note for MacOS users: You must use the device UUID instead of the human-readable name.
     /// The UUID can be found in the "Extras" field when listing cameras.
@@ -104,7 +104,7 @@ pub struct Stream {
     /// - `4` to `8`: **Fast encoding**, lower quality (good for real-time streaming, live video).
     /// - `9` to `15`: **Very fast encoding**, lowest quality, largest files (for ultra-low-latency applications).
     ///
-    /// videocall-daemon --vp9-cpu-used 5  # Fast encoding, good for live streaming
+    /// videocall-cli --vp9-cpu-used 5  # Fast encoding, good for live streaming
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(4..=15))]
     pub vp9_cpu_used: u8,
 

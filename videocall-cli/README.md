@@ -30,19 +30,19 @@ sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-d
 1. Skip the hassle! Install the client directly with:
 
 ```sh
-cargo install videocall-daemon
+cargo install videocall-cli
 ```
 
 2. List the cameras in your system:
 ```sh
-videocall-daemon info --list-cameras
+videocall-cli info --list-cameras
 
 There are 2 available cameras.
 Name: NexiGo HD Webcam: NexiGo HD Web, Description: Video4Linux Device @ /dev/video4, Extra: , Index: 0
 ```
 3. Print the available resolutions and formats for your camera:
 ```sh
-videocall-daemon info --list-formats 0
+videocall-cli info --list-formats 0
 
 Name: NexiGo HD Webcam: NexiGo HD Web, Description: uvcvideo, Extra: usb-0000:00:03.0-5 (6, 8, 12), Index: 0
 YUYV:
@@ -58,7 +58,7 @@ NV12:
 4. Start streaming:
 
 ```
-videocall-daemon \
+videocall-cli \
   stream \
   --user-id <your-user-id> \
   --video-device-index 0 \
@@ -112,7 +112,7 @@ Want to create a Debian package? Easy!
    ```sh
    cargo deb
    ```
-   The package will be generated at: `target/debian/videocall-daemon...deb`.
+   The package will be generated at: `target/debian/videocall-cli...deb`.
 3. Verify dependencies (optional):  
    ```sh
    dpkg-deb -I <path_to_deb_file>

@@ -154,13 +154,13 @@ impl CameraDaemon {
             debug!("Camera opened... waiting for frames");
             let mut camera = match Camera::new(
                 video_device_index,
-                RequestedFormat::new::<I420Format>(RequestedFormatType::Exact(
+                RequestedFormat::new::<I420Format>(RequestedFormatType::Closest(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
             ) {
                 Ok(camera) => camera,
                 Err(e) => {
-                    panic!("{}\n please run 'info --list-formats' to see the available resolutions and fps", e)
+                    panic!("{}\n please run 'info --list-formats' to see the available resolutions, frame formats and fps", e)
                 }
             };
             let actual_resolution = camera.resolution();

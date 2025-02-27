@@ -87,7 +87,7 @@ pub struct Stream {
 
     /// Frame rate for the video stream.
     #[clap(long = "fps")]
-    #[clap(default_value = "15")]
+    #[clap(default_value = "30")]
     pub fps: u32,
 
     #[clap(long = "bitrate-kbps")]

@@ -1,10 +1,10 @@
 use tokio::sync::mpsc::channel;
-use videocall_daemon::cli_args::Stream;
-use videocall_daemon::consumers::camera_synk::CameraSynk;
-use videocall_daemon::consumers::dead_synk::DeadSynk;
-use videocall_daemon::consumers::quic::QUICClient;
-use videocall_daemon::consumers::CameraSynks;
-use videocall_daemon::producers::{
+use videocall_cli::cli_args::Stream;
+use videocall_cli::consumers::camera_synk::CameraSynk;
+use videocall_cli::consumers::dead_synk::DeadSynk;
+use videocall_cli::consumers::quic::QUICClient;
+use videocall_cli::consumers::CameraSynks;
+use videocall_cli::producers::{
     camera::{CameraConfig, CameraDaemon},
     microphone::MicrophoneDaemon,
     producer::Producer,

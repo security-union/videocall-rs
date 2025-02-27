@@ -5,7 +5,7 @@ use modes::info::get_info;
 use modes::stream::stream;
 use tracing::debug;
 use tracing::level_filters::LevelFilter;
-use videocall_daemon::cli_args::{Info, Mode, Opt};
+use videocall_cli::cli_args::{Info, Mode, Opt};
 
 async fn initialize() {
     let (sender, receiver) = tokio::sync::oneshot::channel();

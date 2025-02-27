@@ -8,7 +8,7 @@ on:
     tags:
       - '*'
     paths:
-      - 'videocall-daemon/**'
+      - 'videocall-cli/**'
 
 jobs:
   build_and_package:
@@ -33,10 +33,10 @@ jobs:
     - name: Build and Create DEB Package
       run: |
         cargo install cargo-deb
-        cd videocall-daemon
+        cd videocall-cli
         cargo deb
 
     - uses: actions/upload-artifact@v2
       with:
-        name: videocall-daemon.deb
-        path: videocall-daemon/target/debian/*.deb
+        name: videocall-cli.deb
+        path: videocall-cli/target/debian/*.deb

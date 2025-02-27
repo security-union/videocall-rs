@@ -8,7 +8,7 @@ members = [
 ]
 exclude = [
     "src-tauri",
-    "videocall-daemon",
+    "videocall-cli",
     "yew-ui",
     "leptos-website",
 ]

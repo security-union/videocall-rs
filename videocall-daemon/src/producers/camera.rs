@@ -154,7 +154,7 @@ impl CameraDaemon {
             debug!("Camera opened... waiting for frames");
             let mut camera = match Camera::new(
                 video_device_index,
-                RequestedFormat::new::<I420Format>(RequestedFormatType::Closest(
+                RequestedFormat::new::<I420Format>(RequestedFormatType::Exact(
                     CameraFormat::new_from(width, height, frame_format, framerate),
                 )),
             ) {

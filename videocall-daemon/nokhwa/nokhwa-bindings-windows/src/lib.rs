@@ -29,8 +29,8 @@
 
 #[cfg(all(windows, not(feature = "docs-only")))]
 pub mod wmf {
-    use nokhwa_core::error::NokhwaError;
-    use nokhwa_core::types::{
+    use videocall_nokhwa_core::error::NokhwaError;
+    use videocall_nokhwa_core::types::{
         ApiBackend, CameraControl, CameraFormat, CameraIndex, CameraInfo, ControlValueDescription,
         ControlValueSetter, FrameFormat, KnownCameraControl, KnownCameraControlFlag, Resolution,
     };

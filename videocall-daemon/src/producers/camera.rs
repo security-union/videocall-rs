@@ -160,7 +160,7 @@ impl CameraDaemon {
             ) {
                 Ok(camera) => camera,
                 Err(e) => {
-                    panic!("{}\n please run 'info --list-formats' to see the available resolutions and fps", e)
+                    panic!("{}\n please run 'info --list-formats' to see the available resolutions, frame formats and fps", e)
                 }
             };
             let actual_resolution = camera.resolution();

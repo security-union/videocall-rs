@@ -26,16 +26,47 @@ sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-d
 ## 🚀 Quick Start
 
 ### Install via Cargo
-Skip the hassle! Install the client directly with:
+
+1. Skip the hassle! Install the client directly with:
 
 ```sh
 cargo install videocall-daemon
+```
+
+2. List the cameras in your system:
+```sh
+videocall-daemon info --list-cameras
+
+There are 2 available cameras.
+Name: NexiGo HD Webcam: NexiGo HD Web, Description: Video4Linux Device @ /dev/video4, Extra: , Index: 0
+```
+3. Print the available resolutions and formats for your camera:
+```sh
+videocall-daemon info --list-formats 0
+
+Name: NexiGo HD Webcam: NexiGo HD Web, Description: uvcvideo, Extra: usb-0000:00:03.0-5 (6, 8, 12), Index: 0
+YUYV:
+ - 864x480: [10]
+ - 1600x896: [5]
+ - 1920x1080: [5]
+NV12:
+ - 640x480: [60, 30]
+ - 1280x720: [60, 30]
+ - 1920x1080: [60, 30]
+ ```
+
+4. Start streaming:
+
+```
 videocall-daemon \
   stream \
   --user-id <your-user-id> \
-  --video-device-index <your-camera-index> \
+  --video-device-index 0 \
   --meeting-id <meeting-id> \
-  --resolution 1280x720
+  --resolution 1280x720 \
+  --fps 30 \
+  --frame-format NV12 \
+  --bitrate-kbps 500
 ```
 
 ## 🌐 See Your Stream Live! using Chrome

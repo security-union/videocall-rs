@@ -5,9 +5,9 @@ use thiserror::Error;
 use url::Url;
 use videocall_nokhwa::utils::FrameFormat;
 
-/// Video Call Daemon
+/// Video Call CLI
 ///
-/// This daemon connects to the videocall.rs and streams audio and video to the specified meeting.
+/// This cli connects to the videocall.rs and streams audio and video to the specified meeting.
 ///
 /// You can watch the video at https://videocall.rs/meeting/{user_id}/{meeting_id}
 #[derive(Parser, Debug)]

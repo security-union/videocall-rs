@@ -1,5 +1,5 @@
 
-# VideoCall Daemon Rust Client
+# Videocall-cli Rust Client
 
 ## ✨ Features
 - Stream video effortlessly from the CLI on your desktop, robot, or Raspberry Pi.
@@ -126,7 +126,7 @@ Want to create a Debian package? Easy!
 
 
 ## 🎉 Ready to Stream?  
-Whether you're testing locally or connecting to production, **Video Call Daemon Rust Client** is here to elevate your video streaming experience. Install it today and see the difference!
+Whether you're testing locally or connecting to production, **Videocall-cli Rust Client** is here to elevate your video streaming experience. Install it today and see the difference!
 
 ---
 💡 *Have questions or issues? Drop us a line! We're here to help.*

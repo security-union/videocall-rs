@@ -18,4 +18,3 @@ version = "0.1.0"
 
 [dependencies.web-transport-quinn]
 version = "0.5"
-path = "../../web-transport-rs/web-transport-quinn"

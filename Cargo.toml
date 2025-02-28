@@ -5,7 +5,7 @@ members = [
     "bot",
     "videocall-types",
     "videocall-client"
-]
+, "webtransport-cli"]
 exclude = [
     "src-tauri",
     "videocall-cli",

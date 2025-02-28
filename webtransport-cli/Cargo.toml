@@ -1,0 +1,21 @@
+[package]
+name = "webtransport-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+
+futures = "0.3"
+quinn = "0.11.6"
+anyhow = "1.0.96"
+url = "2.5.4"
+protobuf = "3.3.0"
+
+[dependencies.videocall-types]
+path = "../videocall-types"
+version = "0.1.0"
+
+[dependencies.web-transport-quinn]
+version = "0.5"
+path = "../../web-transport-rs/web-transport-quinn"

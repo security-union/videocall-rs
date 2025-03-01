@@ -3,13 +3,13 @@ use leptos::*;
 #[component]
 pub fn SolutionsSection() -> impl IntoView {
     view! {
-        <section id="solutions" class="py-24 px-6 bg-background relative overflow-hidden">
+        <section id="solutions" class="w-full py-24 bg-background relative overflow-hidden">
+            {/* Full-width background elements */}
             <div class="absolute inset-0 bg-gradient-to-b from-background to-background-light/20 pointer-events-none"></div>
-            
-            {/* Subtle background pattern */}
             <div class="absolute inset-0 bg-grid-pattern opacity-5 pointer-events-none"></div>
             
-            <div class="max-w-4xl mx-auto relative z-10">
+            {/* Constrained content width */}
+            <div class="px-6 max-w-4xl mx-auto relative z-10">
                 <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"Solutions"}</h2>
                 <div class="grid md:grid-cols-2 gap-8 md:gap-12 lg:gap-16">
                     <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm" style="margin-bottom: 1em;">

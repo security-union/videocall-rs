@@ -3,15 +3,16 @@ use leptos::*;
 #[component]
 pub fn CustomersSection() -> impl IntoView {
     view! {
-        <section id="customers" class="py-24 px-6 relative overflow-hidden">
-            {/* Background elements */}
+        <section id="customers" class="w-full py-24 relative overflow-hidden">
+            {/* Full-width background elements */}
             <div class="absolute inset-0 bg-gradient-to-br from-background to-background-light/10 pointer-events-none"></div>
             
-            {/* Decorative elements */}
+            {/* Full-width decorative elements */}
             <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-primary/10 to-transparent"></div>
             <div class="absolute bottom-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-secondary/10 to-transparent"></div>
             
-            <div class="max-w-4xl mx-auto relative z-10">
+            {/* Constrained content width */}
+            <div class="px-6 max-w-4xl mx-auto relative z-10">
                 <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"Trusted By"}</h2>
                 
                 {/* Stats with 3D floating cards */}

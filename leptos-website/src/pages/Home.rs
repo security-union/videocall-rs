@@ -44,7 +44,7 @@ pub fn Home() -> impl IntoView {
                     class="text-4xl px-16 py-8".to_string()
                 />
             </div>
-            <div class="px-4">
+            <div class="max-w-[1720px] mx-auto relative">
                 <SolutionsSection/>
                 <DevelopersSection/>
                 <CompanySection/>

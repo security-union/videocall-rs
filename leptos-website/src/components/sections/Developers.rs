@@ -3,16 +3,17 @@ use leptos::*;
 #[component]
 pub fn DevelopersSection() -> impl IntoView {
     view! {
-        <section id="developers" class="py-24 px-6 relative overflow-hidden">
-            {/* Background elements */}
+        <section id="developers" class="w-full py-24 relative overflow-hidden">
+            {/* Full-width background elements */}
             <div class="absolute inset-0 bg-gradient-to-br from-background/50 to-background-light/5 pointer-events-none"></div>
             <div class="absolute inset-0 bg-grid-pattern opacity-[0.03] pointer-events-none"></div>
             
-            {/* Decorative elements */}
+            {/* Full-width decorative elements */}
             <div class="absolute top-40 -right-20 w-96 h-96 rounded-full bg-primary/10 blur-3xl opacity-20 animate-pulse-slow"></div>
             <div class="absolute bottom-40 -left-20 w-80 h-80 rounded-full bg-secondary/10 blur-3xl opacity-20 animate-pulse-slow"></div>
             
-            <div class="max-w-4xl mx-auto relative z-10">
+            {/* Constrained content width */}
+            <div class="px-6 max-w-4xl mx-auto relative z-10">
                 <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"For Developers"}</h2>
                 
                 <div class="grid md:grid-cols-3 gap-12 md:gap-16 lg:gap-20 mb-16">

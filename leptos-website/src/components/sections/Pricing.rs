@@ -3,16 +3,17 @@ use leptos::*;
 #[component]
 pub fn PricingSection() -> impl IntoView {
     view! {
-        <section id="pricing" class="py-24 px-6 relative overflow-hidden">
-            {/* Background elements */}
+        <section id="pricing" class="w-full py-24 relative overflow-hidden">
+            {/* Full-width background elements */}
             <div class="absolute inset-0 bg-gradient-to-br from-background to-background-light/10 pointer-events-none"></div>
             <div class="absolute inset-0 bg-dot-pattern opacity-5 pointer-events-none"></div>
             
-            {/* Decorative elements */}
+            {/* Full-width decorative elements */}
             <div class="absolute top-1/3 right-0 w-80 h-80 bg-primary/5 rounded-full blur-3xl opacity-50"></div>
             <div class="absolute bottom-1/3 left-0 w-60 h-60 bg-secondary/5 rounded-full blur-3xl opacity-50"></div>
             
-            <div class="max-w-4xl mx-auto relative z-10">
+            {/* Constrained content width */}
+            <div class="px-6 max-w-4xl mx-auto relative z-10">
                 <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"Pricing"}</h2>
                 
                 <div class="grid md:grid-cols-3 gap-8 md:gap-12 lg:gap-16" style="margin-bottom: 1em;">

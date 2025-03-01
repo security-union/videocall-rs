@@ -15,11 +15,11 @@ pub fn PricingSection() -> impl IntoView {
             <div class="max-w-4xl mx-auto relative z-10">
                 <h2 class="text-4xl font-bold mb-16 text-center gradient-text">{"Pricing"}</h2>
                 
-                <div class="grid md:grid-cols-3 gap-8">
+                <div class="grid md:grid-cols-3 gap-12 md:gap-16 lg:gap-20">
                     {/* Free tier */}
                     <div class="relative group overflow-hidden">
                         {/* Card */}
-                        <div class="sharp-card p-8 relative h-full flex flex-col">
+                        <div class="sharp-card p-8 md:p-10 lg:p-12 relative h-full flex flex-col">
                             {/* Plan label */}
                             <div class="absolute -right-14 top-6 bg-background-light/50 px-10 py-1 transform rotate-45 text-xs font-semibold text-foreground-muted">{"STARTER"}</div>
                             
@@ -32,12 +32,12 @@ pub fn PricingSection() -> impl IntoView {
                                 {"Free"}
                             </h3>
                             
-                            <div class="mt-4 mb-6">
+                            <div class="mt-4 mb-8">
                                 <span class="text-3xl font-bold text-foreground">{"$0"}</span>
                                 <span class="text-foreground-subtle text-sm ml-1">{"/ forever"}</span>
                             </div>
                             
-                            <ul class="space-y-4 mb-8 text-foreground-muted">
+                            <ul class="space-y-6 mb-10 text-foreground-muted">
                                 <li class="flex items-start">
                                     <svg class="w-5 h-5 text-success mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
@@ -80,12 +80,12 @@ pub fn PricingSection() -> impl IntoView {
                     </div>
                     
                     {/* Pro tier */}
-                    <div class="relative group overflow-hidden -mt-4 mb-4">
+                    <div class="relative group overflow-hidden -mt-4 md:-mt-6 mb-4 md:mb-6">
                         {/* Highlight accent */}
                         <div class="absolute inset-0 bg-gradient-to-b from-primary/5 to-secondary/5 rounded-xl transform scale-[1.03] group-hover:scale-[1.05] transition-transform duration-300"></div>
                         
                         {/* Card with glow effect */}
-                        <div class="sharp-card accent-glow p-8 relative h-full flex flex-col">
+                        <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col">
                             {/* Highlight banner */}
                             <div class="absolute top-0 right-0 bg-primary text-white text-xs font-bold px-3 py-1.5 rounded-bl-lg rounded-tr-lg">
                                 {"POPULAR"}
@@ -100,12 +100,12 @@ pub fn PricingSection() -> impl IntoView {
                                 {"Pro"}
                             </h3>
                             
-                            <div class="mt-4 mb-6">
+                            <div class="mt-4 mb-8">
                                 <span class="text-3xl font-bold bg-gradient-to-r from-primary to-secondary inline-block text-transparent bg-clip-text">{"$19"}</span>
                                 <span class="text-foreground-subtle text-sm ml-1">{"/ user / month"}</span>
                             </div>
                             
-                            <ul class="space-y-4 mb-8 text-foreground-muted">
+                            <ul class="space-y-6 mb-10 text-foreground-muted">
                                 <li class="flex items-start">
                                     <svg class="w-5 h-5 text-primary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
@@ -156,7 +156,7 @@ pub fn PricingSection() -> impl IntoView {
                     {/* Enterprise tier */}
                     <div class="relative group overflow-hidden">
                         {/* Card */}
-                        <div class="sharp-card p-8 relative h-full flex flex-col">
+                        <div class="sharp-card p-8 md:p-10 lg:p-12 relative h-full flex flex-col">
                             {/* Plan label */}
                             <div class="absolute -right-14 top-6 bg-background-light/50 px-10 py-1 transform rotate-45 text-xs font-semibold text-foreground-muted">{"CUSTOM"}</div>
                             
@@ -169,12 +169,12 @@ pub fn PricingSection() -> impl IntoView {
                                 {"Enterprise"}
                             </h3>
                             
-                            <div class="mt-4 mb-6">
+                            <div class="mt-4 mb-8">
                                 <span class="text-3xl font-bold text-foreground">{"Custom"}</span>
                                 <span class="text-foreground-subtle text-sm ml-1">{"/ tailored"}</span>
                             </div>
                             
-                            <ul class="space-y-4 mb-8 text-foreground-muted">
+                            <ul class="space-y-6 mb-10 text-foreground-muted">
                                 <li class="flex items-start">
                                     <svg class="w-5 h-5 text-secondary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />

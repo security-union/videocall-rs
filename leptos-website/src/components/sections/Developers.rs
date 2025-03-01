@@ -15,10 +15,10 @@ pub fn DevelopersSection() -> impl IntoView {
             <div class="max-w-4xl mx-auto relative z-10">
                 <h2 class="text-4xl font-bold mb-16 text-center gradient-text">{"For Developers"}</h2>
                 
-                <div class="grid md:grid-cols-3 gap-8 mb-16">
+                <div class="grid md:grid-cols-3 gap-12 md:gap-16 lg:gap-20 mb-16">
                     {/* Feature Card 1 */}
                     <div class="group">
-                        <div class="sharp-card h-full p-6 relative overflow-hidden">
+                        <div class="sharp-card h-full p-6 md:p-8 lg:p-10 relative overflow-hidden">
                             {/* Card accent */}
                             <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary to-primary/5"></div>
                             
@@ -47,7 +47,7 @@ pub fn DevelopersSection() -> impl IntoView {
                     
                     {/* Feature Card 2 */}
                     <div class="group">
-                        <div class="sharp-card h-full p-6 relative overflow-hidden">
+                        <div class="sharp-card h-full p-6 md:p-8 lg:p-10 relative overflow-hidden">
                             {/* Card accent */}
                             <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-secondary to-secondary/5"></div>
                             
@@ -76,7 +76,7 @@ pub fn DevelopersSection() -> impl IntoView {
                     
                     {/* Feature Card 3 */}
                     <div class="group">
-                        <div class="sharp-card h-full p-6 relative overflow-hidden">
+                        <div class="sharp-card h-full p-6 md:p-8 lg:p-10 relative overflow-hidden">
                             {/* Card accent */}
                             <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-accent to-accent/5"></div>
                             
@@ -105,7 +105,7 @@ pub fn DevelopersSection() -> impl IntoView {
                 </div>
                 
                 {/* GitHub card */}
-                <div class="sharp-card relative overflow-hidden group p-8 md:p-12">
+                <div class="sharp-card relative overflow-hidden group p-8 md:p-10 lg:p-12">
                     {/* Decorative elements */}
                     <div class="absolute -top-16 -right-16 w-32 h-32 bg-grid-pattern opacity-5 transform rotate-12"></div>
                     <div class="absolute -bottom-16 -left-16 w-32 h-32 bg-grid-pattern opacity-5 transform -rotate-12"></div>

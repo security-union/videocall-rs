@@ -29,13 +29,16 @@ pub fn PricingSection() -> impl IntoView {
                             {/* Hover glow effect */}
                             <div class="absolute -inset-0.5 bg-gradient-to-r from-gray-400/20 via-gray-400/5 to-gray-400/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
                             
-                            <h3 class="text-2xl font-semibold mb-2 text-foreground flex items-center">
+                            {/* Plan label */}
+                            <div class="absolute -right-14 top-6 bg-background-light/50 px-10 py-1 transform rotate-45 text-xs font-semibold text-foreground-muted">{"STARTER"}</div>
+                            
+                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
                                 <span class="w-7 h-7 rounded-full bg-gray-400/20 flex items-center justify-center mr-3">
                                     <svg class="w-3.5 h-3.5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                                     </svg>
                                 </span>
-                                <span>{"Free"}<sup class="text-sm font-bold text-primary ml-1">{"[STARTER]"}</sup></span>
+                                {"Free"}
                             </h3>
                             
                             <div class="mt-4 mb-8">
@@ -92,19 +95,24 @@ pub fn PricingSection() -> impl IntoView {
                         
                         {/* Card with glow effect */}
                         <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col bg-background-light/5 backdrop-blur-sm">
+                            {/* Highlight banner */}
+                            <div class="absolute top-0 right-0 bg-primary text-white text-xs font-bold px-3 py-1.5 rounded-bl-lg rounded-tr-lg">
+                                {"POPULAR"}
+                            </div>
+                            
                             {/* Accent line */}
                             <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-primary to-secondary"></div>
                             
                             {/* Hover glow effect */}
                             <div class="absolute -inset-0.5 bg-gradient-to-r from-primary/20 via-primary/5 to-primary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
                             
-                            <h3 class="text-2xl font-semibold mb-2 text-foreground flex items-center">
+                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
                                 <span class="w-7 h-7 rounded-full bg-primary/20 flex items-center justify-center mr-3">
                                     <svg class="w-3.5 h-3.5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                                     </svg>
                                 </span>
-                                <span>{"Pro"}<sup class="text-sm font-bold text-primary ml-1">{"[POPULAR]"}</sup></span>
+                                {"Pro"}
                             </h3>
                             
                             <div class="mt-4 mb-8">
@@ -173,13 +181,16 @@ pub fn PricingSection() -> impl IntoView {
                             {/* Hover glow effect */}
                             <div class="absolute -inset-0.5 bg-gradient-to-r from-secondary/20 via-secondary/5 to-secondary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
                             
-                            <h3 class="text-2xl font-semibold mb-2 text-foreground flex items-center">
+                            {/* Plan label */}
+                            <div class="absolute -right-14 top-6 bg-background-light/50 px-10 py-1 transform rotate-45 text-xs font-semibold text-foreground-muted">{"CUSTOM"}</div>
+                            
+                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
                                 <span class="w-7 h-7 rounded-full bg-secondary/20 flex items-center justify-center mr-3">
                                     <svg class="w-3.5 h-3.5 text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                                     </svg>
                                 </span>
-                                <span>{"Enterprise"}<sup class="text-sm font-bold text-primary ml-1">{"[CUSTOM]"}</sup></span>
+                                {"Enterprise"}
                             </h3>
                             
                             <div class="mt-4 mb-8">

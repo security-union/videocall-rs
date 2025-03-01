@@ -1,0 +1,56 @@
+@keyframes gradient-x {
+    0% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+    100% {
+        background-position: 0% 50%;
+    }
+}
+
+@keyframes sparkle {
+    0% {
+        transform: scale(0) rotate(0deg);
+        opacity: 0;
+    }
+    50% {
+        transform: scale(1) rotate(180deg);
+        opacity: 0.8;
+    }
+    100% {
+        transform: scale(0) rotate(360deg);
+        opacity: 0;
+    }
+}
+
+@keyframes shine {
+    100% {
+        left: 125%;
+    }
+}
+
+.animate-gradient-x {
+    animation: gradient-x 3s ease infinite;
+}
+
+.animate-sparkle {
+    animation: sparkle 2s ease-in-out infinite;
+}
+
+.animate-shine {
+    animation: shine 0.85s ease-in-out;
+}
+
+.delay-100 {
+    animation-delay: 0.1s;
+}
+
+.delay-200 {
+    animation-delay: 0.2s;
+}
+
+.delay-300 {
+    animation-delay: 0.3s;
+} 

@@ -26,13 +26,13 @@
      inkscape:document-units="mm"
      showgrid="false"
      inkscape:zoom="1.907548"
-     inkscape:cx="149.9307"
-     inkscape:cy="195.8011"
-     inkscape:window-width="1920"
-     inkscape:window-height="1027"
+     inkscape:cx="20.182978"
+     inkscape:cy="203.6646"
+     inkscape:window-width="2449"
+     inkscape:window-height="1205"
      inkscape:window-x="0"
-     inkscape:window-y="395"
-     inkscape:window-maximized="1"
+     inkscape:window-y="25"
+     inkscape:window-maximized="0"
      inkscape:current-layer="layer1" />
   <defs
      id="defs2">
@@ -71,37 +71,5 @@
          cy="175.28009"
          r="168.1013" />
     </g>
-    <text
-       xml:space="preserve"
-       style="font-weight:bold;font-size:42.0111px;line-height:0;font-family:'Russo One';-inkscape-font-specification:'Russo One Bold';text-align:center;text-anchor:middle;fill:none;stroke:#000000;stroke-width:2.48097;stroke-linecap:round"
-       x="201.74275"
-       y="352.21188"
-       id="text469"><tspan
-         sodipodi:role="line"
-         id="tspan467"
-         x="201.74275"
-         y="352.21188"
-         style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:2.48097">dario.lencina</tspan><tspan
-         sodipodi:role="line"
-         x="201.74275"
-         y="352.21188"
-         style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:2.48097"
-         id="tspan1179" /></text>
-    <text
-       xml:space="preserve"
-       style="font-weight:bold;font-size:42.0111px;line-height:0;font-family:'Russo One';-inkscape-font-specification:'Russo One Bold';text-align:center;text-anchor:middle;fill:none;stroke:#000000;stroke-width:2.48097;stroke-linecap:round"
-       x="201.30554"
-       y="390.05484"
-       id="text469-6"><tspan
-         sodipodi:role="line"
-         id="tspan467-0"
-         x="201.30554"
-         y="390.05484"
-         style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:2.48097">creator</tspan><tspan
-         sodipodi:role="line"
-         x="201.30554"
-         y="390.05484"
-         style="fill:#ffffff;fill-opacity:1;stroke:none;stroke-width:2.48097"
-         id="tspan1179-3" /></text>
   </g>
 </svg>

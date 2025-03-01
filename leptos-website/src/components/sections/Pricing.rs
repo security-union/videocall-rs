@@ -22,9 +22,6 @@ pub fn PricingSection() -> impl IntoView {
                             <span>{"Free"}</span>
                             <span class="inline-block w-4"></span>
                             <sup class="text-[15px] font-bold text-primary/80 tracking-wide">{"[STARTER]"}</sup>
-                        <h3 class="text-4xl font-semibold mb-6 text-foreground">
-                            {"Free"}
-                            <sup class="ml-6 text-[15px] font-bold text-primary/80 tracking-wide">{"[STARTER]"}</sup>
                         </h3>
                         <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Perfect for small teams and individuals who need reliable video conferencing."}</p>
                         <ul class="space-y-6 mb-10">

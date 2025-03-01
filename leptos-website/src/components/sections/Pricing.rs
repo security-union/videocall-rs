@@ -15,12 +15,16 @@ pub fn PricingSection() -> impl IntoView {
             <div class="max-w-4xl mx-auto relative z-10">
                 <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"Pricing"}</h2>
                 
-                <div class="grid md:grid-cols-3 gap-8 md:gap-12 lg:gap-16">
-                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm">
+                <div class="grid md:grid-cols-3 gap-8 md:gap-12 lg:gap-16" style="margin-bottom: 1em;">
+                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm" style="margin-bottom: 1em;">
                         <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary to-primary/20"></div>
-                        <h3 class="text-2xl font-semibold mb-6 text-foreground">
+                        <h3 class="text-4xl font-semibold mb-6 text-foreground flex items-center">
+                            <span>{"Free"}</span>
+                            <span class="inline-block w-4"></span>
+                            <sup class="text-[15px] font-bold text-primary/80 tracking-wide">{"[STARTER]"}</sup>
+                        <h3 class="text-4xl font-semibold mb-6 text-foreground">
                             {"Free"}
-                            <sup class="ml-1 text-sm font-bold text-primary/80 tracking-wide">{"STARTER"}</sup>
+                            <sup class="ml-6 text-[15px] font-bold text-primary/80 tracking-wide">{"[STARTER]"}</sup>
                         </h3>
                         <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Perfect for small teams and individuals who need reliable video conferencing."}</p>
                         <ul class="space-y-6 mb-10">
@@ -56,11 +60,11 @@ pub fn PricingSection() -> impl IntoView {
                             </span>
                         </a>
                     </div>
-                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm relative z-10 scale-105">
+                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm relative z-10 scale-105" style="margin-bottom: 1em;">
                         <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary to-secondary"></div>
-                        <h3 class="text-2xl font-semibold mb-6 text-foreground">
+                        <h3 class="text-4xl font-semibold mb-6 text-foreground">
                             {"Pro"}
-                            <sup class="ml-1 text-sm font-bold text-primary/80 tracking-wide">{"POPULAR"}</sup>
+                            <sup class="ml-6 text-[15px] font-bold text-primary/80 tracking-wide">{"[POPULAR]"}</sup>
                         </h3>
                         <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Enhanced features for professionals and growing teams who need more flexibility."}</p>
                         <ul class="space-y-6 mb-10">
@@ -102,11 +106,11 @@ pub fn PricingSection() -> impl IntoView {
                             </span>
                         </a>
                     </div>
-                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm">
+                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm" style="margin-bottom: 1em;">
                         <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-secondary to-secondary/20"></div>
-                        <h3 class="text-2xl font-semibold mb-6 text-foreground">
+                        <h3 class="text-4xl font-semibold mb-6 text-foreground">
                             {"Enterprise"}
-                            <sup class="ml-1 text-sm font-bold text-secondary/80 tracking-wide">{"CUSTOM"}</sup>
+                            <sup class="ml-6 text-[15px] font-bold text-secondary/80 tracking-wide">{"[CUSTOM]"}</sup>
                         </h3>
                         <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Tailored solutions for organizations that need advanced security and control."}</p>
                         <ul class="space-y-6 mb-10">

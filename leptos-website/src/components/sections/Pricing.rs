@@ -13,23 +13,29 @@ pub fn PricingSection() -> impl IntoView {
             <div class="absolute bottom-1/3 left-0 w-60 h-60 bg-secondary/5 rounded-full blur-3xl opacity-50"></div>
             
             <div class="max-w-4xl mx-auto relative z-10">
-                <h2 class="text-4xl font-bold mb-16 text-center gradient-text">{"Pricing"}</h2>
+                <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"Pricing"}</h2>
                 
                 <div class="grid md:grid-cols-3 gap-12 md:gap-16 lg:gap-20">
                     {/* Free tier */}
-                    <div class="relative group overflow-hidden">
+                    <div class="relative group overflow-hidden" style="margin-bottom: 1em;">
                         {/* Card */}
-                        <div class="sharp-card p-8 md:p-10 lg:p-12 relative h-full flex flex-col">
-                            {/* Plan label */}
-                            <div class="absolute -right-14 top-6 bg-background-light/50 px-10 py-1 transform rotate-45 text-xs font-semibold text-foreground-muted">{"STARTER"}</div>
+                        <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col bg-background-light/5 backdrop-blur-sm">
+                            {/* Accent line */}
+                            <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-gray-400 to-gray-400/5"></div>
                             
-                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
+                            {/* Highlight accent */}
+                            <div class="absolute inset-0 bg-gradient-to-b from-gray-400/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                            
+                            {/* Hover glow effect */}
+                            <div class="absolute -inset-0.5 bg-gradient-to-r from-gray-400/20 via-gray-400/5 to-gray-400/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
+                            
+                            <h3 class="text-2xl font-semibold mb-2 text-foreground flex items-center">
                                 <span class="w-7 h-7 rounded-full bg-gray-400/20 flex items-center justify-center mr-3">
                                     <svg class="w-3.5 h-3.5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                                     </svg>
                                 </span>
-                                {"Free"}
+                                <span>{"Free"}<sup class="text-sm font-bold text-primary ml-1">{"[STARTER]"}</sup></span>
                             </h3>
                             
                             <div class="mt-4 mb-8">
@@ -80,24 +86,25 @@ pub fn PricingSection() -> impl IntoView {
                     </div>
                     
                     {/* Pro tier */}
-                    <div class="relative group overflow-hidden -mt-4 md:-mt-6 mb-4 md:mb-6">
+                    <div class="relative group overflow-hidden -mt-4 md:-mt-6 mb-4 md:mb-6" style="margin-bottom: 1em;">
                         {/* Highlight accent */}
                         <div class="absolute inset-0 bg-gradient-to-b from-primary/5 to-secondary/5 rounded-xl transform scale-[1.03] group-hover:scale-[1.05] transition-transform duration-300"></div>
                         
                         {/* Card with glow effect */}
-                        <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col">
-                            {/* Highlight banner */}
-                            <div class="absolute top-0 right-0 bg-primary text-white text-xs font-bold px-3 py-1.5 rounded-bl-lg rounded-tr-lg">
-                                {"POPULAR"}
-                            </div>
+                        <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col bg-background-light/5 backdrop-blur-sm">
+                            {/* Accent line */}
+                            <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-primary to-secondary"></div>
                             
-                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
+                            {/* Hover glow effect */}
+                            <div class="absolute -inset-0.5 bg-gradient-to-r from-primary/20 via-primary/5 to-primary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
+                            
+                            <h3 class="text-2xl font-semibold mb-2 text-foreground flex items-center">
                                 <span class="w-7 h-7 rounded-full bg-primary/20 flex items-center justify-center mr-3">
                                     <svg class="w-3.5 h-3.5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                                     </svg>
                                 </span>
-                                {"Pro"}
+                                <span>{"Pro"}<sup class="text-sm font-bold text-primary ml-1">{"[POPULAR]"}</sup></span>
                             </h3>
                             
                             <div class="mt-4 mb-8">
@@ -154,19 +161,25 @@ pub fn PricingSection() -> impl IntoView {
                     </div>
                     
                     {/* Enterprise tier */}
-                    <div class="relative group overflow-hidden">
+                    <div class="relative group overflow-hidden" style="margin-bottom: 1em;">
                         {/* Card */}
-                        <div class="sharp-card p-8 md:p-10 lg:p-12 relative h-full flex flex-col">
-                            {/* Plan label */}
-                            <div class="absolute -right-14 top-6 bg-background-light/50 px-10 py-1 transform rotate-45 text-xs font-semibold text-foreground-muted">{"CUSTOM"}</div>
+                        <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col bg-background-light/5 backdrop-blur-sm">
+                            {/* Accent line */}
+                            <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-secondary to-secondary/5"></div>
                             
-                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
+                            {/* Highlight accent */}
+                            <div class="absolute inset-0 bg-gradient-to-b from-secondary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                            
+                            {/* Hover glow effect */}
+                            <div class="absolute -inset-0.5 bg-gradient-to-r from-secondary/20 via-secondary/5 to-secondary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
+                            
+                            <h3 class="text-2xl font-semibold mb-2 text-foreground flex items-center">
                                 <span class="w-7 h-7 rounded-full bg-secondary/20 flex items-center justify-center mr-3">
                                     <svg class="w-3.5 h-3.5 text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
                                     </svg>
                                 </span>
-                                {"Enterprise"}
+                                <span>{"Enterprise"}<sup class="text-sm font-bold text-primary ml-1">{"[CUSTOM]"}</sup></span>
                             </h3>
                             
                             <div class="mt-4 mb-8">

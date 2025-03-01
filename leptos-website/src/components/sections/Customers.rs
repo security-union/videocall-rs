@@ -12,13 +12,18 @@ pub fn CustomersSection() -> impl IntoView {
             <div class="absolute bottom-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-secondary/10 to-transparent"></div>
             
             <div class="max-w-4xl mx-auto relative z-10">
-                <h2 class="text-4xl font-bold mb-16 text-center gradient-text">{"Trusted By"}</h2>
+                <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"Trusted By"}</h2>
                 
                 {/* Stats with 3D floating cards */}
                 <div class="grid md:grid-cols-3 gap-12 md:gap-16 lg:gap-20 mb-24">
-                    <div class="float-card glass-card p-8 md:p-10 lg:p-12 text-center group cursor-pointer">
-                        {/* Purple glow on hover */}
-                        <div class="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 rounded-lg transition-opacity duration-300"></div>
+                    <div class="float-card glass-card accent-glow p-8 md:p-10 lg:p-12 text-center group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
+                        {/* Accent line */}
+                        <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-primary to-primary/5"></div>
+                        
+                        {/* Highlight accent */}
+                        <div class="absolute inset-0 bg-gradient-to-b from-primary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                        
+                        <div class="absolute inset-0 bg-background-light/5 backdrop-blur-sm rounded-lg"></div>
                         
                         <div class="relative z-10">
                             <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-primary/10 mb-6 mx-auto">
@@ -31,9 +36,14 @@ pub fn CustomersSection() -> impl IntoView {
                         </div>
                     </div>
                     
-                    <div class="float-card glass-card p-8 md:p-10 lg:p-12 text-center group cursor-pointer">
-                        {/* Blue glow on hover */}
-                        <div class="absolute inset-0 bg-secondary/5 opacity-0 group-hover:opacity-100 rounded-lg transition-opacity duration-300"></div>
+                    <div class="float-card glass-card accent-glow p-8 md:p-10 lg:p-12 text-center group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
+                        {/* Accent line */}
+                        <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-secondary to-secondary/5"></div>
+                        
+                        {/* Highlight accent */}
+                        <div class="absolute inset-0 bg-gradient-to-b from-secondary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                        
+                        <div class="absolute inset-0 bg-background-light/5 backdrop-blur-sm rounded-lg"></div>
                         
                         <div class="relative z-10">
                             <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-secondary/10 mb-6 mx-auto">
@@ -46,9 +56,14 @@ pub fn CustomersSection() -> impl IntoView {
                         </div>
                     </div>
                     
-                    <div class="float-card glass-card p-8 md:p-10 lg:p-12 text-center group cursor-pointer">
-                        {/* Pink glow on hover */}
-                        <div class="absolute inset-0 bg-accent/5 opacity-0 group-hover:opacity-100 rounded-lg transition-opacity duration-300"></div>
+                    <div class="float-card glass-card accent-glow p-8 md:p-10 lg:p-12 text-center group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
+                        {/* Accent line */}
+                        <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-accent to-accent/5"></div>
+                        
+                        {/* Highlight accent */}
+                        <div class="absolute inset-0 bg-gradient-to-b from-accent/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                        
+                        <div class="absolute inset-0 bg-background-light/5 backdrop-blur-sm rounded-lg"></div>
                         
                         <div class="relative z-10">
                             <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-accent/10 mb-6 mx-auto">
@@ -64,9 +79,9 @@ pub fn CustomersSection() -> impl IntoView {
                 
                 {/* Testimonials */}
                 <div class="space-y-16">
-                    <h3 class="text-2xl font-semibold mb-16 text-foreground text-center flex items-center justify-center">
-                        <span class="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center mr-3">
-                            <svg class="w-4 h-4 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <h3 class="text-7xl !text-7xl font-black tracking-tight mb-16 text-foreground text-left flex items-center" style="font-size: 2.88rem;">
+                        <span class="w-16 h-16 rounded-full bg-primary/20 flex items-center justify-center mr-6">
+                            <svg class="w-8 h-8 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
                             </svg>
                         </span>
@@ -75,12 +90,18 @@ pub fn CustomersSection() -> impl IntoView {
                     
                     <div class="grid md:grid-cols-2 gap-12 md:gap-16 lg:gap-20">
                         {/* First testimonial */}
-                        <div class="relative group">
+                        <div class="relative group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
                             {/* Floating quotation mark */}
                             <div class="absolute -top-6 -left-6 text-7xl text-primary/20 font-serif pointer-events-none group-hover:text-primary/30 transition-colors">{"❝"}</div>
                             
                             {/* Card */}
-                            <div class="sharp-card p-8 md:p-10 lg:p-12 relative bg-background-light/10 backdrop-blur-sm">
+                            <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative bg-background-light/5 backdrop-blur-sm">
+                                {/* Accent line */}
+                                <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-primary to-primary/5"></div>
+                                
+                                {/* Highlight accent */}
+                                <div class="absolute inset-0 bg-gradient-to-b from-primary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                                
                                 <p class="text-foreground-muted text-lg mb-6 leading-relaxed relative z-10">{"The performance and reliability of videocall.rs has been exceptional. The WebTransport implementation makes a real difference in latency."}</p>
                                 
                                 <div class="flex items-center">
@@ -98,12 +119,18 @@ pub fn CustomersSection() -> impl IntoView {
                         </div>
                         
                         {/* Second testimonial */}
-                        <div class="relative group">
+                        <div class="relative group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
                             {/* Floating quotation mark */}
                             <div class="absolute -top-6 -left-6 text-7xl text-secondary/20 font-serif pointer-events-none group-hover:text-secondary/30 transition-colors">{"❝"}</div>
                             
                             {/* Card */}
-                            <div class="sharp-card p-8 md:p-10 lg:p-12 relative bg-background-light/10 backdrop-blur-sm">
+                            <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative bg-background-light/5 backdrop-blur-sm">
+                                {/* Accent line */}
+                                <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-secondary to-secondary/5"></div>
+                                
+                                {/* Highlight accent */}
+                                <div class="absolute inset-0 bg-gradient-to-b from-secondary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                                
                                 <p class="text-foreground-muted text-lg mb-6 leading-relaxed relative z-10">{"Being open source and built with Rust gives us confidence in both the security and performance of the platform."}</p>
                                 
                                 <div class="flex items-center">

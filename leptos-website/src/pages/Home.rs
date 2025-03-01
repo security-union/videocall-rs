@@ -48,12 +48,13 @@ pub fn Home() -> impl IntoView {
                     </span>
                 </a>
             </div>
-
-            <SolutionsSection/>
-            <DevelopersSection/>
-            <CompanySection/>
-            <CustomersSection/>
-            <PricingSection/>
+            <div class="px-4">
+                <SolutionsSection/>
+                <DevelopersSection/>
+                <CompanySection/>
+                <CustomersSection/>
+                <PricingSection/>
+            </div>
         </Page>
     }
 }

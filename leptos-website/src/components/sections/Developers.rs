@@ -13,17 +13,19 @@ pub fn DevelopersSection() -> impl IntoView {
             <div class="absolute bottom-40 -left-20 w-80 h-80 rounded-full bg-secondary/10 blur-3xl opacity-20 animate-pulse-slow"></div>
             
             <div class="max-w-4xl mx-auto relative z-10">
-                <h2 class="text-4xl font-bold mb-16 text-center gradient-text">{"For Developers"}</h2>
+                <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"For Developers"}</h2>
                 
                 <div class="grid md:grid-cols-3 gap-12 md:gap-16 lg:gap-20 mb-16">
                     {/* Feature Card 1 */}
-                    <div class="group">
-                        <div class="sharp-card h-full p-6 md:p-8 lg:p-10 relative overflow-hidden">
+                    <div class="group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
+                        <div class="sharp-card accent-glow h-full p-8 md:p-10 lg:p-12 relative overflow-hidden bg-background-light/5 backdrop-blur-sm">
                             {/* Card accent */}
                             <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary to-primary/5"></div>
                             
+                            {/* Highlight accent */}
+                            <div class="absolute inset-0 bg-gradient-to-b from-primary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
                             {/* Hover glow effect */}
-                            <div class="absolute -inset-0.5 bg-gradient-to-r from-primary/0 to-primary/0 opacity-0 group-hover:opacity-10 rounded-xl blur-sm transition-opacity duration-300"></div>
+                            <div class="absolute -inset-0.5 bg-gradient-to-r from-primary/20 via-primary/5 to-primary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
                             
                             <div class="relative">
                                 <div class="w-12 h-12 rounded-lg bg-primary/10 flex items-center justify-center mb-4">
@@ -46,13 +48,16 @@ pub fn DevelopersSection() -> impl IntoView {
                     </div>
                     
                     {/* Feature Card 2 */}
-                    <div class="group">
-                        <div class="sharp-card h-full p-6 md:p-8 lg:p-10 relative overflow-hidden">
+                    <div class="group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
+                        <div class="sharp-card accent-glow h-full p-8 md:p-10 lg:p-12 relative overflow-hidden bg-background-light/5 backdrop-blur-sm">
                             {/* Card accent */}
                             <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-secondary to-secondary/5"></div>
                             
+                            {/* Highlight accent */}
+                            <div class="absolute inset-0 bg-gradient-to-b from-secondary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                            
                             {/* Hover glow effect */}
-                            <div class="absolute -inset-0.5 bg-gradient-to-r from-secondary/0 to-secondary/0 opacity-0 group-hover:opacity-10 rounded-xl blur-sm transition-opacity duration-300"></div>
+                            <div class="absolute -inset-0.5 bg-gradient-to-r from-secondary/20 via-secondary/5 to-secondary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
                             
                             <div class="relative">
                                 <div class="w-12 h-12 rounded-lg bg-secondary/10 flex items-center justify-center mb-4">
@@ -75,13 +80,16 @@ pub fn DevelopersSection() -> impl IntoView {
                     </div>
                     
                     {/* Feature Card 3 */}
-                    <div class="group">
-                        <div class="sharp-card h-full p-6 md:p-8 lg:p-10 relative overflow-hidden">
+                    <div class="group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
+                        <div class="sharp-card accent-glow h-full p-8 md:p-10 lg:p-12 relative overflow-hidden bg-background-light/5 backdrop-blur-sm">
                             {/* Card accent */}
                             <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-accent to-accent/5"></div>
                             
+                            {/* Highlight accent */}
+                            <div class="absolute inset-0 bg-gradient-to-b from-accent/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                            
                             {/* Hover glow effect */}
-                            <div class="absolute -inset-0.5 bg-gradient-to-r from-accent/0 to-accent/0 opacity-0 group-hover:opacity-10 rounded-xl blur-sm transition-opacity duration-300"></div>
+                            <div class="absolute -inset-0.5 bg-gradient-to-r from-accent/20 via-accent/5 to-accent/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
                             
                             <div class="relative">
                                 <div class="w-12 h-12 rounded-lg bg-accent/10 flex items-center justify-center mb-4">
@@ -105,10 +113,19 @@ pub fn DevelopersSection() -> impl IntoView {
                 </div>
                 
                 {/* GitHub card */}
-                <div class="sharp-card relative overflow-hidden group p-8 md:p-10 lg:p-12">
+                <div class="sharp-card accent-glow relative overflow-hidden group hover:scale-[1.02] transition-transform duration-300 p-8 md:p-10 lg:p-12 bg-background-light/5 backdrop-blur-sm">
+                    {/* Card accent */}
+                    <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary to-primary/5"></div>
+                    
+                    {/* Highlight accent */}
+                    <div class="absolute inset-0 bg-gradient-to-b from-primary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
+                    
                     {/* Decorative elements */}
                     <div class="absolute -top-16 -right-16 w-32 h-32 bg-grid-pattern opacity-5 transform rotate-12"></div>
                     <div class="absolute -bottom-16 -left-16 w-32 h-32 bg-grid-pattern opacity-5 transform -rotate-12"></div>
+                    
+                    {/* Hover glow effect */}
+                    <div class="absolute -inset-0.5 bg-gradient-to-r from-primary/20 via-primary/5 to-primary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
                     
                     <div class="relative z-10 flex flex-col md:flex-row items-center justify-between gap-8">
                         <div class="max-w-xl">

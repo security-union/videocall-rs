@@ -9,3 +9,12 @@ pub mod InteractiveCodeExample;
 pub mod Page;
 pub mod SpeedStats;
 pub mod SphereLogo;
+
+// Section components
+pub mod sections {
+    pub mod Solutions;
+    pub mod Developers;
+    pub mod Company;
+    pub mod Customers;
+    pub mod Pricing;
+}

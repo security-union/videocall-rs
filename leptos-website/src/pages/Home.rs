@@ -1,5 +1,10 @@
 use crate::components::HeroHeader::*;
 use crate::components::Page::*;
+use crate::components::sections::Solutions::SolutionsSection;
+use crate::components::sections::Developers::DevelopersSection;
+use crate::components::sections::Company::CompanySection;
+use crate::components::sections::Customers::CustomersSection;
+use crate::components::sections::Pricing::PricingSection;
 use leptos::*;
 use leptos_meta::*;
 
@@ -29,11 +34,26 @@ pub fn Home() -> impl IntoView {
             <div class="w-full flex justify-center pb-16">
                 <a
                     href="https://app.videocall.rs"
-                    class="font-semibold text-eggshell text-2xl px-8 py-5  bg-gradient-to-r from-dark_blue to-purple rounded-md shadow-[3px_3px_0px_#0d0b29] hover:saturate-200 transition-all"
+                    class="relative group font-semibold text-foreground text-xl px-12 py-5 bg-gradient-to-r from-primary to-secondary rounded-lg shadow-lg shadow-primary/20 hover:shadow-xl hover:shadow-primary/30 transition-all duration-300 overflow-hidden"
                 >
-                    "Create a meeting"
+                    {/* Shine effect on hover */}
+                    <span class="absolute inset-0 w-0 bg-white/20 skew-x-[-20deg] group-hover:w-full group-hover:transition-all group-hover:duration-700 transform -translate-x-full group-hover:translate-x-0"></span>
+                    
+                    {/* Button text */}
+                    <span class="relative flex items-center">
+                        {"Create a meeting"}
+                        <svg class="w-5 h-5 ml-2 transform group-hover:translate-x-1 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                        </svg>
+                    </span>
                 </a>
             </div>
+
+            <SolutionsSection/>
+            <DevelopersSection/>
+            <CompanySection/>
+            <CustomersSection/>
+            <PricingSection/>
         </Page>
     }
 }

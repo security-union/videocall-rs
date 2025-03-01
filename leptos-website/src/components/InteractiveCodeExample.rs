@@ -4,7 +4,11 @@ use leptos::*;
 pub fn InteractiveCodeExample(children: Children) -> impl IntoView {
     provide_context(RwSignal::new(OnStep::Idle));
 
-    children()
+    view! {
+        <div class="w-full min-h-[500px]">
+            {children()}
+        </div>
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

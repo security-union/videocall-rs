@@ -9,6 +9,7 @@ pub mod InteractiveCodeExample;
 pub mod Page;
 pub mod SpeedStats;
 pub mod SphereLogo;
+pub mod CTAButton;
 
 // Section components
 pub mod sections {
@@ -18,3 +19,11 @@ pub mod sections {
     pub mod Customers;
     pub mod Pricing;
 }
+
+pub use CodeExample::*;
+pub use Footer::*;
+pub use HeroHeader::*;
+pub use InteractiveCodeExample::*;
+pub use Page::*;
+pub use SphereLogo::*;
+pub use CTAButton::*;

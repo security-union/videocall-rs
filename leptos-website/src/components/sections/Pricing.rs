@@ -15,238 +15,138 @@ pub fn PricingSection() -> impl IntoView {
             <div class="max-w-4xl mx-auto relative z-10">
                 <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"Pricing"}</h2>
                 
-                <div class="grid md:grid-cols-3 gap-12 md:gap-16 lg:gap-20">
-                    {/* Free tier */}
-                    <div class="relative group overflow-hidden" style="margin-bottom: 1em;">
-                        {/* Card */}
-                        <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col bg-background-light/5 backdrop-blur-sm">
-                            {/* Accent line */}
-                            <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-gray-400 to-gray-400/5"></div>
-                            
-                            {/* Highlight accent */}
-                            <div class="absolute inset-0 bg-gradient-to-b from-gray-400/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
-                            
-                            {/* Hover glow effect */}
-                            <div class="absolute -inset-0.5 bg-gradient-to-r from-gray-400/20 via-gray-400/5 to-gray-400/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
-                            
-                            {/* Plan label */}
-                            <div class="absolute -right-14 top-6 bg-background-light/50 px-10 py-1 transform rotate-45 text-xs font-semibold text-foreground-muted">{"STARTER"}</div>
-                            
-                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
-                                <span class="w-7 h-7 rounded-full bg-gray-400/20 flex items-center justify-center mr-3">
-                                    <svg class="w-3.5 h-3.5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                                    </svg>
+                <div class="grid md:grid-cols-3 gap-8 md:gap-12 lg:gap-16">
+                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm">
+                        <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary to-primary/20"></div>
+                        <h3 class="text-2xl font-semibold mb-6 text-foreground">
+                            {"Free"}
+                            <sup class="ml-1 text-sm font-bold text-primary/80 tracking-wide">{"STARTER"}</sup>
+                        </h3>
+                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Perfect for small teams and individuals who need reliable video conferencing."}</p>
+                        <ul class="space-y-6 mb-10">
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
+                                    <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"Free"}
-                            </h3>
-                            
-                            <div class="mt-4 mb-8">
-                                <span class="text-3xl font-bold text-foreground">{"$0"}</span>
-                                <span class="text-foreground-subtle text-sm ml-1">{"/ forever"}</span>
-                            </div>
-                            
-                            <ul class="space-y-6 mb-10 text-foreground-muted">
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-success mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Up to 4 participants"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-success mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"30 minute meetings"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-success mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Basic features"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-success mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Community support"}</span>
-                                </li>
-                            </ul>
-                            
-                            <a 
-                                href="#" 
-                                class="mt-auto group/btn relative flex w-full items-center justify-center py-3 px-6 overflow-hidden rounded-lg transition-all"
-                            >
-                                {/* Button background */}
-                                <div class="absolute inset-0 bg-background-light/20 group-hover/btn:bg-background-light/30 transition-colors"></div>
-                                
-                                {/* Button text */}
-                                <span class="relative z-10 flex items-center text-foreground font-medium">
-                                    {"Get Started"}
+                                {"Up to 4 participants"}
+                            </li>
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
+                                    <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                            </a>
-                        </div>
+                                {"40-minute time limit"}
+                            </li>
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
+                                    <span class="text-primary text-sm">{"✓"}</span>
+                                </span>
+                                {"Screen sharing"}
+                            </li>
+                        </ul>
+                        <a href="#" class="group/btn relative inline-flex items-center justify-center py-4 px-6 overflow-hidden rounded-lg transition-all bg-gradient-to-r from-gray-700 via-gray-600 to-gray-700 hover:from-gray-600 hover:via-gray-500 hover:to-gray-600 border border-gray-700 hover:border-gray-500">
+                            {/* Button shine effect */}
+                            <div class="absolute top-0 -inset-full h-full w-1/3 z-5 block transform -skew-x-12 bg-gradient-to-r from-transparent to-white opacity-20 group-hover/btn:animate-shine"></div>
+                            
+                            {/* Button text */}
+                            <span class="relative z-10 flex items-center text-white font-semibold">
+                                {"Get Started"}
+                                <svg class="w-5 h-5 ml-2 transition-transform group-hover/btn:translate-x-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" />
+                                </svg>
+                            </span>
+                        </a>
                     </div>
-                    
-                    {/* Pro tier */}
-                    <div class="relative group overflow-hidden -mt-4 md:-mt-6 mb-4 md:mb-6" style="margin-bottom: 1em;">
-                        {/* Highlight accent */}
-                        <div class="absolute inset-0 bg-gradient-to-b from-primary/5 to-secondary/5 rounded-xl transform scale-[1.03] group-hover:scale-[1.05] transition-transform duration-300"></div>
-                        
-                        {/* Card with glow effect */}
-                        <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col bg-background-light/5 backdrop-blur-sm">
-                            {/* Highlight banner */}
-                            <div class="absolute top-0 right-0 bg-primary text-white text-xs font-bold px-3 py-1.5 rounded-bl-lg rounded-tr-lg">
-                                {"POPULAR"}
-                            </div>
-                            
-                            {/* Accent line */}
-                            <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-primary to-secondary"></div>
-                            
-                            {/* Hover glow effect */}
-                            <div class="absolute -inset-0.5 bg-gradient-to-r from-primary/20 via-primary/5 to-primary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
-                            
-                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
-                                <span class="w-7 h-7 rounded-full bg-primary/20 flex items-center justify-center mr-3">
-                                    <svg class="w-3.5 h-3.5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                                    </svg>
+                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm relative z-10 scale-105">
+                        <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-primary to-secondary"></div>
+                        <h3 class="text-2xl font-semibold mb-6 text-foreground">
+                            {"Pro"}
+                            <sup class="ml-1 text-sm font-bold text-primary/80 tracking-wide">{"POPULAR"}</sup>
+                        </h3>
+                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Enhanced features for professionals and growing teams who need more flexibility."}</p>
+                        <ul class="space-y-6 mb-10">
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
+                                    <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"Pro"}
-                            </h3>
-                            
-                            <div class="mt-4 mb-8">
-                                <span class="text-3xl font-bold bg-gradient-to-r from-primary to-secondary inline-block text-transparent bg-clip-text">{"$19"}</span>
-                                <span class="text-foreground-subtle text-sm ml-1">{"/ user / month"}</span>
-                            </div>
-                            
-                            <ul class="space-y-6 mb-10 text-foreground-muted">
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-primary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Up to 50 participants"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-primary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Unlimited meeting duration"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-primary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Advanced features"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-primary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Priority support"}</span>
-                                </li>
-                            </ul>
-                            
-                            <a 
-                                href="#" 
-                                class="mt-auto group/btn relative flex w-full items-center justify-center py-3 px-6 overflow-hidden rounded-lg transition-all"
-                            >
-                                {/* Button background with animated gradient */}
-                                <div class="absolute inset-0 bg-gradient-to-r from-primary to-secondary opacity-90 group-hover/btn:opacity-100 transition-opacity"></div>
-                                
-                                {/* Button shine effect */}
-                                <div class="absolute top-0 -inset-full h-full w-1/3 z-5 block transform -skew-x-12 bg-gradient-to-r from-transparent to-white opacity-20 group-hover/btn:animate-shine"></div>
-                                
-                                {/* Button text */}
-                                <span class="relative z-10 flex items-center text-white font-medium">
-                                    <svg class="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                                    </svg>
-                                    {"Start Free Trial"}
+                                {"Up to 50 participants"}
+                            </li>
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
+                                    <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                            </a>
-                        </div>
+                                {"Unlimited meeting duration"}
+                            </li>
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
+                                    <span class="text-primary text-sm">{"✓"}</span>
+                                </span>
+                                {"Cloud recording"}
+                            </li>
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
+                                    <span class="text-primary text-sm">{"✓"}</span>
+                                </span>
+                                {"Analytics dashboard"}
+                            </li>
+                        </ul>
+                        <a href="#" class="group/btn relative inline-flex items-center justify-center py-4 px-6 overflow-hidden rounded-lg transition-all bg-gradient-to-r from-primary via-primary/90 to-primary hover:from-primary/90 hover:via-primary/80 hover:to-primary/90 shadow-md shadow-primary/20 hover:shadow-lg hover:shadow-primary/30">
+                            {/* Button shine effect */}
+                            <div class="absolute top-0 -inset-full h-full w-1/3 z-5 block transform -skew-x-12 bg-gradient-to-r from-transparent to-white opacity-20 group-hover/btn:animate-shine"></div>
+                            
+                            {/* Button text */}
+                            <span class="relative z-10 flex items-center text-white font-semibold">
+                                {"Start Free Trial"}
+                                <svg class="w-5 h-5 ml-2 transition-transform group-hover/btn:translate-x-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" />
+                                </svg>
+                            </span>
+                        </a>
                     </div>
-                    
-                    {/* Enterprise tier */}
-                    <div class="relative group overflow-hidden" style="margin-bottom: 1em;">
-                        {/* Card */}
-                        <div class="sharp-card accent-glow p-8 md:p-10 lg:p-12 relative h-full flex flex-col bg-background-light/5 backdrop-blur-sm">
-                            {/* Accent line */}
-                            <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-secondary to-secondary/5"></div>
-                            
-                            {/* Highlight accent */}
-                            <div class="absolute inset-0 bg-gradient-to-b from-secondary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
-                            
-                            {/* Hover glow effect */}
-                            <div class="absolute -inset-0.5 bg-gradient-to-r from-secondary/20 via-secondary/5 to-secondary/20 opacity-0 group-hover:opacity-100 rounded-xl blur transition-all duration-500"></div>
-                            
-                            {/* Plan label */}
-                            <div class="absolute -right-14 top-6 bg-background-light/50 px-10 py-1 transform rotate-45 text-xs font-semibold text-foreground-muted">{"CUSTOM"}</div>
-                            
-                            <h3 class="text-xl font-semibold mb-2 text-foreground flex items-center">
-                                <span class="w-7 h-7 rounded-full bg-secondary/20 flex items-center justify-center mr-3">
-                                    <svg class="w-3.5 h-3.5 text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                                    </svg>
+                    <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm">
+                        <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-secondary to-secondary/20"></div>
+                        <h3 class="text-2xl font-semibold mb-6 text-foreground">
+                            {"Enterprise"}
+                            <sup class="ml-1 text-sm font-bold text-secondary/80 tracking-wide">{"CUSTOM"}</sup>
+                        </h3>
+                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Tailored solutions for organizations that need advanced security and control."}</p>
+                        <ul class="space-y-6 mb-10">
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-secondary/10 mr-3">
+                                    <span class="text-secondary text-sm">{"✓"}</span>
                                 </span>
-                                {"Enterprise"}
-                            </h3>
-                            
-                            <div class="mt-4 mb-8">
-                                <span class="text-3xl font-bold text-foreground">{"Custom"}</span>
-                                <span class="text-foreground-subtle text-sm ml-1">{"/ tailored"}</span>
-                            </div>
-                            
-                            <ul class="space-y-6 mb-10 text-foreground-muted">
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-secondary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Unlimited participants"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-secondary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Unlimited meeting duration"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-secondary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Custom features"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-secondary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"Dedicated support"}</span>
-                                </li>
-                                <li class="flex items-start">
-                                    <svg class="w-5 h-5 text-secondary mr-3 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
-                                    </svg>
-                                    <span>{"SLA guarantees"}</span>
-                                </li>
-                            </ul>
-                            
-                            <a 
-                                href="#" 
-                                class="mt-auto group/btn relative flex w-full items-center justify-center py-3 px-6 overflow-hidden rounded-lg transition-all"
-                            >
-                                {/* Button background */}
-                                <div class="absolute inset-0 bg-background-light/20 group-hover/btn:bg-background-light/30 transition-colors"></div>
-                                
-                                {/* Button text */}
-                                <span class="relative z-10 flex items-center text-foreground font-medium">
-                                    <svg class="w-5 h-5 mr-2 text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
-                                    </svg>
-                                    {"Contact Sales"}
+                                {"Unlimited participants"}
+                            </li>
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-secondary/10 mr-3">
+                                    <span class="text-secondary text-sm">{"✓"}</span>
                                 </span>
-                            </a>
-                        </div>
+                                {"Dedicated support"}
+                            </li>
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-secondary/10 mr-3">
+                                    <span class="text-secondary text-sm">{"✓"}</span>
+                                </span>
+                                {"Custom integrations"}
+                            </li>
+                            <li class="flex items-center text-foreground-muted">
+                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-secondary/10 mr-3">
+                                    <span class="text-secondary text-sm">{"✓"}</span>
+                                </span>
+                                {"Advanced security"}
+                            </li>
+                        </ul>
+                        <a href="#contact" class="group/btn relative inline-flex items-center justify-center py-4 px-6 overflow-hidden rounded-lg transition-all bg-gradient-to-r from-secondary via-secondary/90 to-secondary hover:from-secondary/90 hover:via-secondary/80 hover:to-secondary/90 shadow-md shadow-secondary/20 hover:shadow-lg hover:shadow-secondary/30">
+                            {/* Button shine effect */}
+                            <div class="absolute top-0 -inset-full h-full w-1/3 z-5 block transform -skew-x-12 bg-gradient-to-r from-transparent to-white opacity-20 group-hover/btn:animate-shine"></div>
+                            
+                            {/* Button text */}
+                            <span class="relative z-10 flex items-center text-white font-semibold">
+                                {"Contact Sales"}
+                                <svg class="w-5 h-5 ml-2 transition-transform group-hover/btn:translate-x-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8l4 4m0 0l-4 4m4-4H3" />
+                                </svg>
+                            </span>
+                        </a>
                     </div>
                 </div>
             </div>

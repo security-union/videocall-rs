@@ -1,16 +1,16 @@
-version: '3.8'
-
 services:
   yew-ui:
     volumes:
       - type: bind
         source: ../
         target: /app
-      - /app/target
       - rustlemania-yew-ui-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-yew-ui-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-yew-ui-cargo-target-cache:/usr/local/cargo/target
       - rustlemania-yew-ui-cache:/app/yew-ui/target
     build:
       dockerfile: ../docker/Dockerfile.yew
+      context: ../docker
     working_dir: /app/yew-ui
     command: bash -c "trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
     environment:
@@ -24,6 +24,9 @@ services:
       - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
       - E2EE_ENABLED=${E2EE_ENABLED:-false}
       - USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM:-}
+      - CARGO_TARGET_DIR=/app/yew-ui/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
     ports:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
 
@@ -32,21 +35,27 @@ services:
       - type: bind
         source: ../
         target: /app
-      - /app/target
       - rustlemania-leptos-ui-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-leptos-ui-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-leptos-ui-cargo-target-cache:/usr/local/cargo/target
       - rustlemania-leptos-ui-cache:/app/leptos-website/target
     build:
       dockerfile: ../docker/Dockerfile.website.dev
+      context: ../docker
     working_dir: /app/leptos-website
     command: bash -c "trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
     environment:
       - LEPTOS_SITE_ADDR="0.0.0.0:91"
+      - CARGO_TARGET_DIR=/app/leptos-website/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
     ports:
       - "91:91"
   
   websocket-api:
     build:
       dockerfile: ../docker/Dockerfile.actix
+      context: ../docker
     working_dir: /app/actix-api
     command: bash -c "/app/dbmate/startup.sh && cargo watch -x \"run -r --bin websocket_server\""
     environment:
@@ -60,16 +69,19 @@ services:
       - RUST_LOG=debug
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
     ports:
       - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
     volumes:
       - type: bind
         source: ../
         target: /app
-      - /app/target
       - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-actix-web-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-actix-web-cargo-target-cache:/usr/local/cargo/target
       - rustlemania-actix-web-target-cache:/app/actix-api/target
-
     depends_on:
       - postgres
       - nats
@@ -77,6 +89,7 @@ services:
   webtransport-api:
     build:
       dockerfile: ../docker/Dockerfile.actix
+      context: ../docker
     working_dir: /app/actix-api
     command: bash -c "cargo watch -x \"run -r --bin webtransport_server\""
     environment:
@@ -86,16 +99,19 @@ services:
       - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
       - KEY_PATH=certs/localhost.key
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
     ports:
       - "4433:4433/udp"
     volumes:
       - type: bind
         source: ../
         target: /app
-      - /app/target
       - rustlemania-actix-webtransport-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-actix-webtransport-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-actix-webtransport-cargo-target-cache:/usr/local/cargo/target
       - rustlemania-actix-webtransport-cache:/app/actix-api/target
-
     depends_on:
       - nats
 
@@ -116,10 +132,18 @@ services:
 
 volumes:
   rustlemania-actix-web-cargo-registry-cache:
-  rustlemania-actix-webtransport-cargo-registry-cache:
-  rustlemania-yew-ui-cargo-registry-cache:
+  rustlemania-actix-web-cargo-git-cache:
+  rustlemania-actix-web-cargo-target-cache:
   rustlemania-actix-web-target-cache:
+  rustlemania-actix-webtransport-cargo-registry-cache:
+  rustlemania-actix-webtransport-cargo-git-cache:
+  rustlemania-actix-webtransport-cargo-target-cache:
   rustlemania-actix-webtransport-cache:
+  rustlemania-yew-ui-cargo-registry-cache:
+  rustlemania-yew-ui-cargo-git-cache:
+  rustlemania-yew-ui-cargo-target-cache:
   rustlemania-yew-ui-cache:
   rustlemania-leptos-ui-cargo-registry-cache:
+  rustlemania-leptos-ui-cargo-git-cache:
+  rustlemania-leptos-ui-cargo-target-cache:
   rustlemania-leptos-ui-cache:

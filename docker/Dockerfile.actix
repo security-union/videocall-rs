@@ -2,3 +2,13 @@ FROM docker.io/securityunion/rustlemania-api-base:fix-ci-7d7323a2
 
 RUN rustup component add clippy
 RUN rustup component add rustfmt
+
+# Remove sccache installation and configuration
+# Install sccache for faster compilation
+# COPY install-sccache.sh /tmp/
+# RUN chmod +x /tmp/install-sccache.sh && /tmp/install-sccache.sh
+
+# Configure environment for sccache
+# ENV RUSTC_WRAPPER=/usr/local/bin/sccache
+# ENV SCCACHE_DIR=/root/.cache/sccache
+# ENV SCCACHE_CACHE_SIZE=5G

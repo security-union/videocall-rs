@@ -1,4 +1,4 @@
-FROM securityunion/rustlemania-api-base:1.72-slim as build
+FROM docker.io/securityunion/rustlemania-api-base:fix-ci-7d7323a2 as build
 
 ENV CARGO_TARGET_DIR=/app/actix-api/target
 COPY . /app

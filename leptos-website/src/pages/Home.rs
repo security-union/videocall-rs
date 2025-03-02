@@ -32,7 +32,7 @@ pub fn Home() -> impl IntoView {
         <Title text="Home"/>
         <Page>
             <HeroHeader/>
-            <div class="w-full flex justify-center pb-16 relative z-10">
+            <div class="w-full flex justify-center pb-16 relative z-10" style="margin-top: -2rem;">
                 <CTAButton
                     title="Create a meeting".to_string()
                     icon=IconProps {

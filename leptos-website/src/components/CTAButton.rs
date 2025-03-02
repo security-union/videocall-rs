@@ -13,6 +13,7 @@ pub fn CTAButton(
     #[prop(default = false)] animated: bool,
     #[prop(default = String::new())] class: String,
     #[prop(default = None)] href: Option<String>,
+    #[prop(default = None)] style: Option<String>,
 ) -> impl IntoView {
     let base_class = "cta-button".to_string();
     let combined_class = format!("{} {}", base_class, class);
@@ -23,7 +24,7 @@ pub fn CTAButton(
     let button_content = move || {
         view! {
             {/* Glow effect div for hover */}
-            <div class="cta-glow"></div>
+            <div class="cta-glow" style={style.clone()}></div>
             
             {/* Button content */}
             <div class="flex items-center justify-center">

@@ -205,7 +205,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: 1rem 2rem;
-  margin-top: -2rem;
+  /* margin-top: -2rem; */
   border-radius: 1rem;
   background-color: #7928CA; /* primary color */
   color: white;

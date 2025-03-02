@@ -16,7 +16,17 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use web_transport_quinn::Session;
 
+/// Videocall WebTransport API
+///
+/// This module contains the implementation of the Videocall WebTransport API.
+/// It is responsible for accepting incoming WebTransport connections and handling them.
+/// It also contains the logic for handling the WebTransport handshake and the WebTransport session.
+/// 
+/// 
+
+
 pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", b"h3-29"];
+
 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 

@@ -18,10 +18,18 @@ on:
         required: false
         default: 'all'
         type: string
+      force_deploy:
+        description: 'Force deployment regardless of previous workflow status'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   deploy:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Run if either:
+    # 1. Triggered by workflow_run and that workflow succeeded
+    # 2. Manually triggered (workflow_dispatch)
+    if: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     
     env:

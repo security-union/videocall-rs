@@ -46,9 +46,6 @@ jobs:
         with:
           version: 'latest'
       
-      - name: Update Helm repositories
-        run: helm repo update
-      
       - name: Deploy rustlemania-ui
         if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-ui') }}
         run: |

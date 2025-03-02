@@ -10,6 +10,7 @@ pub mod Page;
 pub mod SpeedStats;
 pub mod SphereLogo;
 pub mod CTAButton;
+pub mod SecondaryButton;
 
 // Section components
 pub mod sections {
@@ -27,3 +28,4 @@ pub use InteractiveCodeExample::*;
 pub use Page::*;
 pub use SphereLogo::*;
 pub use CTAButton::*;
+pub use SecondaryButton::*;

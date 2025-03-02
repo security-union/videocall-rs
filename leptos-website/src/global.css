@@ -255,4 +255,37 @@ body {
 
 .cta-button:hover svg {
   transform: scale(1.12);
+}
+
+/* Secondary Button - Black rectangle style */
+.secondary-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.75rem 1.5rem;
+  border-radius: 0.5rem;
+  background-color: #000000; /* Pure black */
+  color: white;
+  font-weight: 500;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  transition: all 0.3s ease;
+  overflow: hidden;
+}
+
+.secondary-button:hover {
+  background-color: #1a1a1a; /* Slightly lighter black on hover */
+  transform: translateY(-1px);
+  box-shadow: 0 6px 8px -2px rgba(0, 0, 0, 0.2);
+}
+
+.secondary-button::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 1px;
+  background-color: rgba(255, 255, 255, 0.1);
 } 

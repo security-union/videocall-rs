@@ -75,7 +75,7 @@ pub fn PricingSection() -> impl IntoView {
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"99.99% uptime SLA guarantee"}
+                                {"99.99% uptime SLA"}
                             </li>
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">

@@ -71,7 +71,7 @@ impl MicrophoneEncoder {
     /// Selects a microphone:
     ///
     /// * `device_id` - The value of `entry.device_id` for some entry in
-    /// [`media_device_list.audio_inputs.devices()`](crate::MediaDeviceList::audio_inputs)
+    ///   [`media_device_list.audio_inputs.devices()`](crate::MediaDeviceList::audio_inputs)
     ///
     /// The encoder starts without a microphone associated,
     /// [`encoder.selected(device_id)`](Self::select) must be called prior to starting encoding.

@@ -40,4 +40,6 @@ jobs:
           context: ./leptos-website
           file: docker/Dockerfile.website
           push: true
-          tags: securityunion/video-call-rs-website:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+          tags: |
+            securityunion/video-call-rs-website:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/video-call-rs-website:latest

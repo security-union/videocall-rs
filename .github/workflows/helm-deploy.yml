@@ -1,0 +1,78 @@
+name: Deploy to DigitalOcean Kubernetes
+
+on:
+  workflow_run:
+    workflows:
+      - "Publish UI to Docker image"
+      - "Publish API to Docker image"
+      - "Publish Website to Docker image"
+      - "Publish Base UI to Docker image"
+      - "Publish Base API to Docker image"
+    branches: [main]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to deploy (comma-separated)'
+        required: false
+        default: 'all'
+        type: string
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    
+    env:
+      KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      CLUSTER_NAME: ${{ secrets.CLUSTER_NAME }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      
+      - name: Save DigitalOcean kubeconfig
+        run: doctl kubernetes cluster kubeconfig save ${{ secrets.CLUSTER_NAME }}
+      
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
+      
+      - name: Update Helm repositories
+        run: helm repo update
+      
+      - name: Deploy rustlemania-ui
+        if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-ui') }}
+        run: |
+          helm upgrade --install rustlemania-ui ./helm/rustlemania-ui \
+            --namespace default \
+            --atomic
+      
+      - name: Deploy rustlemania-websocket
+        if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-websocket') }}
+        run: |
+          helm upgrade --install rustlemania-websocket ./helm/rustlemania-websocket \
+            --namespace default \
+            --atomic
+      
+      - name: Deploy rustlemania-webtransport
+        if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-webtransport') }}
+        run: |
+          helm upgrade --install rustlemania-webtransport ./helm/rustlemania-webtransport \
+            --namespace default \
+            --atomic
+      
+      - name: Deploy videocall-website
+        if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'videocall-website') }}
+        run: |
+          helm upgrade --install videocall-website ./helm/videocall-website \
+            --namespace default \
+            --atomic 

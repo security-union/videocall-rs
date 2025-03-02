@@ -24,10 +24,12 @@ jobs:
         id: extract_sha
         run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA::8})"
 
-      - name: Build and push Docker image
+      - name: Build and push Base API Docker image
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
         with:
           context: .
           file: ./docker/base_images/Dockerfile.actix
           push: true
-          tags: securityunion/rustlemania-api-base:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}
+          tags: |
+            securityunion/rustlemania-base-api:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/rustlemania-base-api:latest

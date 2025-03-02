@@ -23,38 +23,38 @@ pub fn PricingSection() -> impl IntoView {
                         <h3 class="text-4xl font-semibold mb-6 text-foreground flex items-center">
                             <span>{"Free"}</span>
                             <span class="inline-block w-4"></span>
-                            <sup class="text-[15px] font-bold text-primary/80 tracking-wide">{"[DIY]"}</sup>
+                            <sup class="text-[15px] font-bold text-primary/80 tracking-wide">{"[SELF-HOSTED]"}</sup>
                         </h3>
-                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"All features included for teams who want self-host and maintain their own infrastructure."}</p>
+                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Full-featured but you're responsible for hosting, maintenance, and uptime."}</p>
                         <ul class="space-y-6 mb-16">
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"Self-hosted"}
+                                {"Run on your own infrastructure"}
                             </li>
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"No SLA support"}
+                                {"Community support only"}
                             </li>
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"You manage patches and security"}
+                                {"You manage updates and security"}
                             </li>
                         </ul>
                         <CTAButton
-                            title="Get HELM Chart".to_string()
+                            title="Download".to_string()
                             icon=IconProps {
                                 path: "M8 5v14l11-7z".into(),
                                 size: "w-5 h-5".into(),
                             }
                             animated=true
                             href=Some("#".to_string())
-                            class="mt-0".to_string()
+                            class="mt-4".to_string()
                         />
                     </div>
                     <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm relative z-10 scale-105" style="margin-bottom: 1em;">
@@ -63,63 +63,51 @@ pub fn PricingSection() -> impl IntoView {
                             {"Pro"}
                             <sup class="ml-6 text-[15px] font-bold text-primary/80 tracking-wide">{"[POPULAR]"}</sup>
                         </h3>
-                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Enhanced features for professionals and growing teams who need more flexibility."}</p>
+                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"We host and manage everything for you with guaranteed uptime and reliability."}</p>
                         <ul class="space-y-6 mb-16">
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"Up to 50 participants"}
+                                {"Fully managed cloud hosting"}
                             </li>
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"Unlimited meeting duration"}
+                                {"99.99% uptime SLA guarantee"}
                             </li>
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"Cloud recording"}
-                            </li>
-                            <li class="flex items-center text-foreground-muted">
-                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
-                                    <span class="text-primary text-sm">{"✓"}</span>
-                                </span>
-                                {"Analytics dashboard"}
+                                {"Automatic updates and security patches"}
                             </li>
                         </ul>
                         <CTAButton
-                            title="Start Free Trial".to_string()
+                            title="Get Started".to_string()
                             icon=IconProps {
                                 path: "M8 5v14l11-7z".into(),
                                 size: "w-5 h-5".into(),
                             }
                             animated=false
                             href=Some("#".to_string())
-                            class="primary mt-0".to_string()
+                            class="primary mt-4".to_string()
                         />
                     </div>
                     <div class="group sharp-card accent-glow p-8 md:p-10 lg:p-12 rounded-xl backdrop-blur-sm" style="margin-bottom: 1em;">
                         <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-secondary to-secondary/20"></div>
                         <h3 class="text-4xl font-semibold mb-6 text-foreground">
                             {"Enterprise"}
-                            <sup class="ml-6 text-[15px] font-bold text-secondary/80 tracking-wide">{"[CUSTOM]"}</sup>
+                            <sup class="ml-6 text-[15px] font-bold text-secondary/80 tracking-wide">{"[DEDICATED]"}</sup>
                         </h3>
-                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Tailored solutions for organizations that need advanced security and control."}</p>
+                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Dedicated hosting with custom SLAs, advanced security, and white-glove support."}</p>
                         <ul class="space-y-6 mb-16">
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-secondary/10 mr-3">
                                     <span class="text-secondary text-sm">{"✓"}</span>
                                 </span>
-                                {"Unlimited participants"}
-                            </li>
-                            <li class="flex items-center text-foreground-muted">
-                                <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-secondary/10 mr-3">
-                                    <span class="text-secondary text-sm">{"✓"}</span>
-                                </span>
-                                {"Dedicated support"}
+                                {"Dedicated infrastructure"}
                             </li>
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-secondary/10 mr-3">
@@ -131,7 +119,7 @@ pub fn PricingSection() -> impl IntoView {
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-secondary/10 mr-3">
                                     <span class="text-secondary text-sm">{"✓"}</span>
                                 </span>
-                                {"Advanced security"}
+                                {"Enterprise-grade HELM chart with end-to-end encryption"}
                             </li>
                         </ul>
                         <CTAButton
@@ -142,7 +130,7 @@ pub fn PricingSection() -> impl IntoView {
                             }
                             animated=false
                             href=Some("#contact".to_string())
-                            class="secondary mt-0".to_string()
+                            class="secondary mt-4".to_string()
                         />
                     </div>
                 </div>

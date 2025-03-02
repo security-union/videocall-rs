@@ -125,7 +125,7 @@ pub fn HeroHeader() -> impl IntoView {
                                             "Always open-source, always awesome, powered by Rust"
                                         </p>
                                         <SecondaryButton
-                                            title="Watch Videos"
+                                            title="Watch How It Works"
                                             href=Some("https://www.youtube.com/watch?v=kZ9isFw1TQ8&list=PLxM2CWwQlzBtmhdaK2IeuQvpepKC6BYLOs".to_string())
                                             class="mt-4"
                                         />

@@ -31,4 +31,4 @@ jobs:
           file: ./docker/base_images/Dockerfile.yew
           push: true
           tags: |
-            securityunion/rustlemania-base-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/yew:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}

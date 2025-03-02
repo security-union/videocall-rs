@@ -23,31 +23,31 @@ pub fn PricingSection() -> impl IntoView {
                         <h3 class="text-4xl font-semibold mb-6 text-foreground flex items-center">
                             <span>{"Free"}</span>
                             <span class="inline-block w-4"></span>
-                            <sup class="text-[15px] font-bold text-primary/80 tracking-wide">{"[STARTER]"}</sup>
+                            <sup class="text-[15px] font-bold text-primary/80 tracking-wide">{"[DIY]"}</sup>
                         </h3>
-                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"Perfect for small teams and individuals who need reliable video conferencing."}</p>
+                        <p class="text-foreground-muted mb-10 text-lg leading-relaxed">{"All features included for teams who want self-host and maintain their own infrastructure."}</p>
                         <ul class="space-y-6 mb-16">
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"Up to 4 participants"}
+                                {"Self-hosted"}
                             </li>
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"40-minute time limit"}
+                                {"No SLA support"}
                             </li>
                             <li class="flex items-center text-foreground-muted">
                                 <span class="inline-flex items-center justify-center h-6 w-6 rounded-full bg-primary/10 mr-3">
                                     <span class="text-primary text-sm">{"✓"}</span>
                                 </span>
-                                {"Screen sharing"}
+                                {"You manage patches and security"}
                             </li>
                         </ul>
                         <CTAButton
-                            title="Get Started".to_string()
+                            title="Get HELM Chart".to_string()
                             icon=IconProps {
                                 path: "M8 5v14l11-7z".into(),
                                 size: "w-5 h-5".into(),
@@ -96,7 +96,7 @@ pub fn PricingSection() -> impl IntoView {
                                 path: "M8 5v14l11-7z".into(),
                                 size: "w-5 h-5".into(),
                             }
-                            animated=true
+                            animated=false
                             href=Some("#".to_string())
                             class="primary mt-0".to_string()
                         />
@@ -140,7 +140,7 @@ pub fn PricingSection() -> impl IntoView {
                                 path: "M8 5v14l11-7z".into(),
                                 size: "w-5 h-5".into(),
                             }
-                            animated=true
+                            animated=false
                             href=Some("#contact".to_string())
                             class="secondary mt-0".to_string()
                         />

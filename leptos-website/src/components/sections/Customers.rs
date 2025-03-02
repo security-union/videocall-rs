@@ -39,26 +39,6 @@ pub fn CustomersSection() -> impl IntoView {
                     
                     <div class="float-card glass-card accent-glow p-8 md:p-10 lg:p-12 text-center group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
                         {/* Accent line */}
-                        <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-secondary to-secondary/5"></div>
-                        
-                        {/* Highlight accent */}
-                        <div class="absolute inset-0 bg-gradient-to-b from-secondary/5 to-transparent rounded-xl transform scale-[1.01] group-hover:scale-[1.03] transition-transform duration-300"></div>
-                        
-                        <div class="absolute inset-0 bg-background-light/5 backdrop-blur-sm rounded-lg"></div>
-                        
-                        <div class="relative z-10">
-                            <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-secondary/10 mb-6 mx-auto">
-                                <svg class="w-8 h-8 text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-                                </svg>
-                            </div>
-                            <div class="text-5xl font-bold bg-gradient-to-r from-secondary to-secondary/70 inline-block text-transparent bg-clip-text mb-3 group-hover:scale-110 transform transition-transform">{"50+"}</div>
-                            <div class="text-foreground-muted text-lg">{"Contributors"}</div>
-                        </div>
-                    </div>
-                    
-                    <div class="float-card glass-card accent-glow p-8 md:p-10 lg:p-12 text-center group hover:scale-[1.02] transition-transform duration-300" style="margin-bottom: 1em;">
-                        {/* Accent line */}
                         <div class="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-accent to-accent/5"></div>
                         
                         {/* Highlight accent */}
@@ -72,7 +52,7 @@ pub fn CustomersSection() -> impl IntoView {
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
                                 </svg>
                             </div>
-                            <div class="text-5xl font-bold bg-gradient-to-r from-accent to-accent/70 inline-block text-transparent bg-clip-text mb-3 group-hover:scale-110 transform transition-transform">{"1000+"}</div>
+                            <div class="text-5xl font-bold bg-gradient-to-r from-accent to-accent/70 inline-block text-transparent bg-clip-text mb-3 group-hover:scale-110 transform transition-transform">{"1.5K+"}</div>
                             <div class="text-foreground-muted text-lg">{"GitHub Stars"}</div>
                         </div>
                     </div>

@@ -100,7 +100,6 @@ body {
   box-shadow: 
     0 8px 25px rgba(0, 0, 0, 0.3),
     0 0 0 1px rgba(121, 40, 202, 0.2);
-  transform: translateY(-3px);
 }
 
 /* Floating card effect */

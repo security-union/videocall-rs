@@ -81,7 +81,7 @@ impl CameraEncoder {
     /// Selects a camera:
     ///
     /// * `device_id` - The value of `entry.device_id` for some entry in
-    /// [`media_device_list.video_inputs.devices()`](crate::MediaDeviceList::video_inputs)
+    ///   [`media_device_list.video_inputs.devices()`](crate::MediaDeviceList::video_inputs)
     ///
     /// The encoder starts without a camera associated,
     /// [`encoder.selected(device_id)`](Self::select) must be called prior to starting encoding.

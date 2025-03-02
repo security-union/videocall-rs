@@ -1,37 +1,8 @@
 [build]
-# Enable incremental compilation
-incremental = true
-
-# Parallelize the build using all available CPU cores
-jobs = 8
-
-# Remove sccache configuration
-# Cache more aggressively
-# rustc-wrapper = "sccache"
-
-[target.wasm32-unknown-unknown]
-# Optimize for WASM targets
-rustflags = ["--cfg=web_sys_unstable_apis"]
-runner = 'wasm-bindgen-test-runner'
-
-[target.'cfg(all())']
-# Use thin LTO for better optimization without excessive compile times
-rustflags = ["-C", "lto=thin"]
-
-[profile.dev]
-# Optimize dependencies but not our code for faster compile times
-opt-level = 0
-debug = true
-
-[profile.release]
-# Full optimization for release builds
-opt-level = 3
-debug = false
-lto = true
-codegen-units = 1
+rustflags = [ "--cfg=web_sys_unstable_apis" ]
 
 [net]
-# Retry downloads
-retry = 2
-# Concurrent downloads
 git-fetch-with-cli = true
+
+[target.wasm32-unknown-unknown]
+runner = 'wasm-bindgen-test-runner'

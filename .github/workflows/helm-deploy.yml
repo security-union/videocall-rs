@@ -62,7 +62,8 @@ jobs:
           # Upgrade or install if not exists
           helm upgrade --install rustlemania-ui ./helm/rustlemania-ui \
             --namespace default \
-            --atomic
+            --atomic \
+            -f ./helm/rustlemania-ui/values.yaml
       
       - name: Deploy rustlemania-websocket
         if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-websocket') }}
@@ -73,6 +74,7 @@ jobs:
           helm upgrade --install rustlemania-websocket ./helm/rustlemania-websocket \
             --namespace default \
             --atomic
+            -f ./helm/rustlemania-websocket/values.yaml
       
       - name: Deploy rustlemania-webtransport
         if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-webtransport') }}
@@ -83,6 +85,7 @@ jobs:
           helm upgrade --install rustlemania-webtransport ./helm/rustlemania-webtransport \
             --namespace default \
             --atomic
+            -f ./helm/rustlemania-webtransport/values.yaml
       
       - name: Deploy videocall-website
         if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'videocall-website') }}
@@ -93,3 +96,4 @@ jobs:
           helm upgrade --install videocall-website ./helm/videocall-website \
             --namespace default \
             --atomic 
+            -f ./helm/videocall-website/values.yaml

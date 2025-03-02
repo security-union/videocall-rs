@@ -42,4 +42,6 @@ jobs:
           context: .
           file: Dockerfile.yew
           push: true
-          tags: securityunion/rustlemania-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+          tags: |
+            securityunion/rustlemania-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/rustlemania-ui:latest

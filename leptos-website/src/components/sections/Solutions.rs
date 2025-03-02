@@ -69,7 +69,7 @@ pub fn SolutionsSection() -> impl IntoView {
                         </ul>
                         <SecondaryButton
                             title="Learn More"
-                            href=Some("#contact".to_string())
+                            href=Some("https://github.com/security-union/videocall-rs".to_string())
                             class="mt-4"
                         />
                     </div>

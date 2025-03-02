@@ -47,11 +47,11 @@ pub fn CodeExampleLayout(
     };
 
     let border_class = if border { "border" } else { "" };
-    let code_children_class = "w-full lg:max-w-md max-w-full p-3 md:p-6 bg-[#0b081a] text-[14px] lg:text-[16px]  text-white  overflow-x-scroll";
+    let code_children_class = "w-full lg:max-w-md max-w-full p-3 md:p-6 bg-[#0b081a] text-[14px] lg:text-[16px] text-white overflow-x-scroll min-h-[300px]";
 
     view! {
         <div class=format!(
-            "flex flex-col lg:flex-row w-full  max-w-4xl  border-black border-opacity-30 bg-white rounded-md overflow-hidden mx-auto {} {}",
+            "flex flex-col lg:flex-row w-full max-w-4xl border-black border-opacity-30 bg-white rounded-md overflow-hidden mx-auto {} {}",
             shadow_class, border_class
         )>
             {match code {
@@ -75,8 +75,8 @@ pub fn CodeExampleLayout(
                         .into_view()
                 }
             }}
-            <div class="w-full flex flex-col lg:max-w-md max-w-full  border-black dark:border-eggshell border-opacity-30  items-center ">
-                <div class=" w-full bg-white dark:bg-black flex h-10 lg:rounded-tr-lg border-b border-black dark:border-eggshell border-opacity-30 gap-4 justify-between items-center px-4 pointer-events-none border-t lg:border-t-0 ">
+            <div class="w-full flex flex-col lg:max-w-md max-w-full border-black dark:border-eggshell border-opacity-30 items-center min-h-[300px]">
+                <div class="w-full bg-white dark:bg-black flex h-10 lg:rounded-tr-lg border-b border-black dark:border-eggshell border-opacity-30 gap-4 justify-between items-center px-4 pointer-events-none border-t lg:border-t-0">
                     <div class="w-full rounded-md bg-[#dbdbdb] items-center text-sm text-black text-opacity-80 h-5 px-2 pointer-events-none">
                         "example.com"
                     </div>
@@ -86,7 +86,7 @@ pub fn CodeExampleLayout(
                         <span class="w-3 h-3 rounded-full bg-light_blue"></span>
                     </div>
                 </div>
-                <div class=format!("w-full h-full {}", background)>{children()}</div>
+                <div class=format!("w-full h-full min-h-[250px] {}", background)>{children()}</div>
             </div>
         </div>
     }

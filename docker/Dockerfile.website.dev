@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y \
 
 RUN cargo install cargo-leptos --version 0.2.20
 
+RUN cargo install trunk --version 0.17.5
+
+
 WORKDIR /app
 
 

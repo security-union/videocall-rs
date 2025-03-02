@@ -1,3 +1,9 @@
+use crate::components::sections::Company::CompanySection;
+use crate::components::sections::Customers::CustomersSection;
+use crate::components::sections::Developers::DevelopersSection;
+use crate::components::sections::Pricing::PricingSection;
+use crate::components::sections::Solutions::SolutionsSection;
+use crate::components::CTAButton::*;
 use crate::components::HeroHeader::*;
 use crate::components::Page::*;
 use leptos::*;
@@ -26,13 +32,24 @@ pub fn Home() -> impl IntoView {
         <Title text="Home"/>
         <Page>
             <HeroHeader/>
-            <div class="w-full flex justify-center pb-16">
-                <a
-                    href="https://app.videocall.rs"
-                    class="font-semibold text-eggshell text-2xl px-8 py-5  bg-gradient-to-r from-dark_blue to-purple rounded-md shadow-[3px_3px_0px_#0d0b29] hover:saturate-200 transition-all"
-                >
-                    "Create a meeting"
-                </a>
+            <div class="w-full flex justify-center pb-16 relative z-10" style="margin-top: -2rem;">
+                <CTAButton
+                    title="Create a meeting".to_string()
+                    icon=IconProps {
+                        path: "M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z".into(),
+                        size: "w-16 h-16".into(),
+                    }
+                    animated=true
+                    href=Some("https://app.videocall.rs".to_string())
+                    class="text-4xl px-16 py-8".to_string()
+                />
+            </div>
+            <div class="max-w-[1720px] mx-auto relative">
+                <SolutionsSection/>
+                <DevelopersSection/>
+                <CompanySection/>
+                <CustomersSection/>
+                <PricingSection/>
             </div>
         </Page>
     }

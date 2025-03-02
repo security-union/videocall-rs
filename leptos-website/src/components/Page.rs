@@ -5,11 +5,11 @@ use leptos_meta::Style;
 
 #[component]
 pub fn Page(children: Children) -> impl IntoView {
-    view! { 
+    view! {
         <Style>{include_str!("../global.css")}</Style>
         <div class="min-h-screen text-foreground bg-background overflow-x-hidden">
             <div class="w-full min-h-[70vh]">
-                {children()} 
+                {children()}
             </div>
             <Footer/>
         </div>

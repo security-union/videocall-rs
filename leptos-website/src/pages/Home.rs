@@ -1,11 +1,11 @@
-use crate::components::HeroHeader::*;
-use crate::components::Page::*;
-use crate::components::sections::Solutions::SolutionsSection;
-use crate::components::sections::Developers::DevelopersSection;
 use crate::components::sections::Company::CompanySection;
 use crate::components::sections::Customers::CustomersSection;
+use crate::components::sections::Developers::DevelopersSection;
 use crate::components::sections::Pricing::PricingSection;
+use crate::components::sections::Solutions::SolutionsSection;
 use crate::components::CTAButton::*;
+use crate::components::HeroHeader::*;
+use crate::components::Page::*;
 use leptos::*;
 use leptos_meta::*;
 

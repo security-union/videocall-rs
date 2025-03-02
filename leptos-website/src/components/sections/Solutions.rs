@@ -1,5 +1,5 @@
-use leptos::*;
 use crate::components::SecondaryButton;
+use leptos::*;
 
 #[component]
 pub fn SolutionsSection() -> impl IntoView {
@@ -8,7 +8,7 @@ pub fn SolutionsSection() -> impl IntoView {
             {/* Full-width background elements */}
             <div class="absolute inset-0 bg-gradient-to-b from-background to-background-light/20 pointer-events-none"></div>
             <div class="absolute inset-0 bg-grid-pattern opacity-5 pointer-events-none"></div>
-            
+
             {/* Constrained content width */}
             <div class="px-6 max-w-4xl mx-auto relative z-10">
                 <h2 class="text-8xl !text-8xl font-black tracking-tight mb-16 text-left gradient-text" style="font-size: 3.84rem;">{"Solutions"}</h2>
@@ -77,4 +77,4 @@ pub fn SolutionsSection() -> impl IntoView {
             </div>
         </section>
     }
-} 
+}

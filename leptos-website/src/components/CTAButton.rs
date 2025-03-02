@@ -20,15 +20,15 @@ pub fn CTAButton(
 
     let icon_size = icon.size.to_string();
     let icon_path = icon.path.to_string();
-    
+
     let button_content = move || {
         view! {
             {/* Glow effect div for hover */}
             <div class="cta-glow" style={style.clone()}></div>
-            
+
             {/* Button content */}
             <div class="flex items-center justify-center">
-                <svg 
+                <svg
                     class=move || {
                         let mut classes = vec![&icon_size, "mr-6"];
                         if animated {
@@ -66,4 +66,4 @@ pub fn CTAButton(
             }.into_view()
         }}
     }
-} 
+}

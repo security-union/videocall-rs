@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
+use crate::components::SecondaryButton;
 use crate::components::SphereLogo::*;
 use leptos::*;
 use leptos_meta::Style;
 use leptos_router::A;
+
 #[component]
 pub fn HeroHeader() -> impl IntoView {
     view! {
@@ -122,14 +124,11 @@ pub fn HeroHeader() -> impl IntoView {
                                         <p class="mt-2 text-gray-300 max-w-[40ch]">
                                             "Always open-source, always awesome, powered by Rust"
                                         </p>
-                                        <div class="mt-4 flex gap-3">
-                                            <a
-                                                href="https://www.youtube.com/watch?v=kZ9isFw1TQ8&list=PLxM2CWwQlzBtmhdaK2IeuQvpepKC6BYLO"
-                                                class="font-semibold text-lg py-2 px-4 bg-primary hover:bg-primary/90 text-white rounded-md transition-all"
-                                            >
-                                                "Watch Videos"
-                                            </a>
-                                        </div>
+                                        <SecondaryButton
+                                            title="Watch Videos"
+                                            href=Some("https://www.youtube.com/watch?v=kZ9isFw1TQ8&list=PLxM2CWwQlzBtmhdaK2IeuQvpepKC6BYLOs".to_string())
+                                            class="mt-4"
+                                        />
                                     </div>
                                     <div class="w-[40%]"></div>
                                     <div class="max-w-[320px] md:max-w-[360px] lg:max-w-[400px] hidden md:block w-full h-full absolute right-0 top-4 aspect-square">

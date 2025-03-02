@@ -1,4 +1,4 @@
-FROM securityunion/rustlemania-api-base:update-rust-7c189827
+FROM docker.io/securityunion/rustlemania-api-base:fix-ci-7d7323a2
 
 RUN rustup component add clippy
 RUN rustup component add rustfmt

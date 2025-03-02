@@ -73,7 +73,7 @@ jobs:
           # Upgrade or install if not exists
           helm upgrade --install rustlemania-websocket ./helm/rustlemania-websocket \
             --namespace default \
-            --atomic
+            --atomic \
             -f ./helm/rustlemania-websocket/values.yaml
       
       - name: Deploy rustlemania-webtransport
@@ -84,7 +84,7 @@ jobs:
           # Upgrade or install if not exists
           helm upgrade --install rustlemania-webtransport ./helm/rustlemania-webtransport \
             --namespace default \
-            --atomic
+            --atomic \
             -f ./helm/rustlemania-webtransport/values.yaml
       
       - name: Deploy videocall-website
@@ -95,5 +95,5 @@ jobs:
           # Upgrade or install if not exists
           helm upgrade --install videocall-website ./helm/videocall-website \
             --namespace default \
-            --atomic 
+            --atomic \
             -f ./helm/videocall-website/values.yaml

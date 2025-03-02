@@ -47,13 +47,13 @@ pub fn PricingSection() -> impl IntoView {
                             </li>
                         </ul>
                         <CTAButton
-                            title="Download".to_string()
+                            title="Get the Helm Chart".to_string()
                             icon=IconProps {
                                 path: "M8 5v14l11-7z".into(),
                                 size: "w-5 h-5".into(),
                             }
                             animated=true
-                            href=Some("#".to_string())
+                            href=Some("https://github.com/security-union/videocall-rs".to_string())
                             class="mt-4".to_string()
                         />
                     </div>
@@ -91,7 +91,7 @@ pub fn PricingSection() -> impl IntoView {
                                 size: "w-5 h-5".into(),
                             }
                             animated=false
-                            href=Some("#".to_string())
+                            href=Some("https://github.com/security-union/videocall-rs".to_string())
                             class="primary mt-4".to_string()
                         />
                     </div>
@@ -129,7 +129,7 @@ pub fn PricingSection() -> impl IntoView {
                                 size: "w-5 h-5".into(),
                             }
                             animated=false
-                            href=Some("#contact".to_string())
+                            href=Some("mailto:social@securityunion.dev?subject=Enterprise%20Plan%20Inquiry".to_string())
                             class="secondary mt-4".to_string()
                         />
                     </div>

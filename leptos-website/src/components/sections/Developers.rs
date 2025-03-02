@@ -128,7 +128,7 @@ pub fn DevelopersSection() -> impl IntoView {
                         <div class="flex-shrink-0">
                             <SecondaryButton
                                 title="Visit GitHub Repository"
-                                href=Some("https://github.com/videocall-rs".to_string())
+                                href=Some("https://github.com/security-union/videocall-rs".to_string())
                                 class="flex items-center"
                             />
                         </div>

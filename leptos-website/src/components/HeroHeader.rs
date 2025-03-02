@@ -124,10 +124,10 @@ pub fn HeroHeader() -> impl IntoView {
                                         </p>
                                         <div class="mt-4 flex gap-3">
                                             <a
-                                                href="https://www.youtube.com/watch?v=LWwOSZJwEJI&list=PLxM2CWwQlzBtmhdaK2IeuQvpepKC6BYLO&index=3"
+                                                href="https://www.youtube.com/watch?v=kZ9isFw1TQ8&list=PLxM2CWwQlzBtmhdaK2IeuQvpepKC6BYLO"
                                                 class="font-semibold text-lg py-2 px-4 bg-primary hover:bg-primary/90 text-white rounded-md transition-all"
                                             >
-                                                "Video"
+                                                "Watch Videos"
                                             </a>
                                         </div>
                                     </div>

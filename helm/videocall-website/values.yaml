@@ -8,7 +8,7 @@ replicaCount: 1
 image:
   repository: securityunion/video-call-rs-website
   pullPolicy: Always
-  tag: main-27880057
+  tag: latest
 env:
   - name: RUST_LOG
     value: info

@@ -32,4 +32,3 @@ jobs:
           push: true
           tags: |
             securityunion/rustlemania-base-api:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
-            securityunion/rustlemania-base-api:latest

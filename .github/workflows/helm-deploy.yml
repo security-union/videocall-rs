@@ -52,6 +52,9 @@ jobs:
       - name: Deploy rustlemania-ui
         if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-ui') }}
         run: |
+          # Update chart dependencies
+          helm dependency update ./helm/rustlemania-ui
+          # Upgrade or install if not exists
           helm upgrade --install rustlemania-ui ./helm/rustlemania-ui \
             --namespace default \
             --atomic
@@ -59,6 +62,9 @@ jobs:
       - name: Deploy rustlemania-websocket
         if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-websocket') }}
         run: |
+          # Update chart dependencies
+          helm dependency update ./helm/rustlemania-websocket
+          # Upgrade or install if not exists
           helm upgrade --install rustlemania-websocket ./helm/rustlemania-websocket \
             --namespace default \
             --atomic
@@ -66,6 +72,9 @@ jobs:
       - name: Deploy rustlemania-webtransport
         if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'rustlemania-webtransport') }}
         run: |
+          # Update chart dependencies
+          helm dependency update ./helm/rustlemania-webtransport
+          # Upgrade or install if not exists
           helm upgrade --install rustlemania-webtransport ./helm/rustlemania-webtransport \
             --namespace default \
             --atomic
@@ -73,6 +82,9 @@ jobs:
       - name: Deploy videocall-website
         if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'videocall-website') }}
         run: |
+          # Update chart dependencies
+          helm dependency update ./helm/videocall-website
+          # Upgrade or install if not exists
           helm upgrade --install videocall-website ./helm/videocall-website \
             --namespace default \
             --atomic 

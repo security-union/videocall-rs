@@ -22,3 +22,8 @@
 1. Install kubernetes dashboard through the digital ocean marketplace 
 1. Start the kubernetes dashboard locally 
 ```kubectl -n kubernetes-dashboard port-forward svc/kubernetes-dashboard-kong-proxy 8443:443```
+
+## Updating the website
+
+1. Update the tag in the videocall-website/values.yaml file
+1. Run ```helm dependency update && helm upgrade videocall-website . -f values.yaml```

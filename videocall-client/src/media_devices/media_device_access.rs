@@ -15,7 +15,7 @@ pub struct MediaDeviceAccess {
     pub on_granted: Callback<()>,
 
     // Callback that is called when the user fails to grant access permission
-    pub on_denied: Callback<()>,
+    pub on_denied: Callback<JsValue>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -59,7 +59,7 @@ impl MediaDeviceAccess {
                     granted.store(true, Ordering::Release);
                     on_granted.emit(());
                 }
-                Err(_) => on_denied.emit(()),
+                Err(e) => on_denied.emit(e),
             }
         });
     }

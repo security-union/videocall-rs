@@ -156,7 +156,7 @@ pub fn home() -> Html {
                                     1 => html! {
                                         <>
                                             <h3 class="feature-title">{"High Performance"}</h3>
-                                            <p class="feature-description">{"Leveraging Rust's zero-cost abstractions and WebAssembly for maximum efficiency. Optimized WebRTC implementation with low latency for smooth video calls."}</p>
+                                            <p class="feature-description">{"Leveraging Rust's zero-cost abstractions and WebAssembly for maximum efficiency. Optimized WebTransport implementation with low latency for smooth video calls."}</p>
                                         </>
                                     },
                                     2 => html! {
@@ -172,13 +172,6 @@ pub fn home() -> Html {
                     </div>
                     
                     <div>
-                        // Code snippet
-                        <div class="code-snippet mb-4" style="margin-top:1em">
-                            <pre><code>{r#"git clone https://github.com/security-union/videocall-rs
-cd videocall-rs
-cargo run"#}</code></pre>
-                        </div>
-                        
                         // Developer call-to-action
                         <button 
                             onclick={open_github}

@@ -244,26 +244,127 @@ impl Component for AttendantsComponent {
                             html! {
                                 <nav class="host">
                                     <div class="controls">
-                                        <button
-                                            class="bg-yew-blue p-2 rounded-md text-white"
-                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
-                                            { if self.share_screen { "Stop Screen Share"} else { "Share Screen"} }
-                                        </button>
-                                        <button
-                                            class="bg-yew-blue p-2 rounded-md text-white"
-                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
-                                            { if !self.video_enabled { "Start Video"} else { "Stop Video"} }
-                                        </button>
-                                        <button
-                                            class="bg-yew-blue p-2 rounded-md text-white"
-                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
-                                            { if !self.mic_enabled { "Unmute"} else { "Mute"} }
-                                        </button>
-                                        <button
-                                            class="bg-yew-blue p-2 rounded-md text-white"
-                                            onclick={toggle_peer_list.clone()}>
-                                            { if !self.peer_list_open { "Open Peers"} else { "Close Peers"} }
-                                        </button>
+                                        <nav class="video-controls-container">
+                                            <button
+                                                class={classes!("video-control-button", self.mic_enabled.then_some("active"))}
+                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
+                                                {
+                                                    if self.mic_enabled {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"></path>
+                                                                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                                                                    <line x1="12" y1="19" x2="12" y2="22"></line>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Mute" }</span>
+                                                            </>
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <line x1="1" y1="1" x2="23" y2="23"></line>
+                                                                    <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V5a3 3 0 0 0-5.94-.6"></path>
+                                                                    <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path>
+                                                                    <line x1="12" y1="19" x2="12" y2="22"></line>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Unmute" }</span>
+                                                            </>
+                                                        }
+                                                    }
+                                                }
+                                            </button>
+                                            <button
+                                                class={classes!("video-control-button", self.video_enabled.then_some("active"))}
+                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
+                                                {
+                                                    if self.video_enabled {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <polygon points="23 7 16 12 23 17 23 7"></polygon>
+                                                                    <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Stop Video" }</span>
+                                                            </>
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
+                                                                    <line x1="1" y1="1" x2="23" y2="23"></line>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Start Video" }</span>
+                                                            </>
+                                                        }
+                                                    }
+                                                }
+                                            </button>
+                                            <button
+                                                class={classes!("video-control-button", self.share_screen.then_some("active"))}
+                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
+                                                {
+                                                    if self.share_screen {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                                                                    <line x1="8" y1="21" x2="16" y2="21"></line>
+                                                                    <line x1="12" y1="17" x2="12" y2="21"></line>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Stop Screen Share" }</span>
+                                                            </>
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="M13 3H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-3"></path>
+                                                                    <polyline points="8 21 12 17 16 21"></polyline>
+                                                                    <polyline points="16 7 20 7 20 3"></polyline>
+                                                                    <line x1="10" y1="14" x2="21" y2="3"></line>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Share Screen" }</span>
+                                                            </>
+                                                        }
+                                                    }
+                                                }
+                                            </button>
+                                            <button
+                                                class={classes!("video-control-button", self.peer_list_open.then_some("active"))}
+                                                onclick={toggle_peer_list.clone()}>
+                                                {
+                                                    if self.peer_list_open {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                                                                    <circle cx="9" cy="7" r="4"></circle>
+                                                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                                                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                                                                    <line x1="1" y1="1" x2="23" y2="23"></line>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Close Peers" }</span>
+                                                            </>
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                                                                    <circle cx="9" cy="7" r="4"></circle>
+                                                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                                                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Open Peers" }</span>
+                                                            </>
+                                                        }
+                                                    }
+                                                }
+                                            </button>
+                                        </nav>
                                     </div>
                                     {
                                         if media_access_granted {
@@ -301,3 +402,4 @@ impl Component for AttendantsComponent {
         }
     }
 }
+

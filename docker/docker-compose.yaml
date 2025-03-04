@@ -29,7 +29,21 @@ services:
       - CARGO_NET_OFFLINE=false
     ports:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
+    depends_on:
+      - tailwind-yew
 
+  tailwind-yew:
+    build:
+      dockerfile: ../docker/Dockerfile.tailwind
+      context: ../docker
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+    working_dir: /app/yew-ui
+    entrypoint: ["/bin/sh", "-c"]
+    command: "tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify"
+    
   website:
     volumes:
       - type: bind
@@ -43,7 +57,7 @@ services:
       dockerfile: ../docker/Dockerfile.website.dev
       context: ../docker
     working_dir: /app/leptos-website
-    command: bash -c "trunk serve --address 0.0.0.0 --port ${TRUNK_SERVE_PORT:-80}"
+    command: bash -c "cargo leptos watch"
     environment:
       - LEPTOS_SITE_ADDR="0.0.0.0:91"
       - CARGO_TARGET_DIR=/app/leptos-website/target
@@ -130,6 +144,7 @@ services:
     ports:
       - 5432
 
+  
 volumes:
   rustlemania-actix-web-cargo-registry-cache:
   rustlemania-actix-web-cargo-git-cache:

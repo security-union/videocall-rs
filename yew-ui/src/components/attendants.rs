@@ -81,6 +81,9 @@ pub struct AttendantsComponent {
     pub video_enabled: bool,
     pub peer_list_open: bool,
     pub error: Option<String>,
+    pending_mic_enable: bool,
+    pending_video_enable: bool,
+    pending_screen_share: bool,
 }
 
 impl AttendantsComponent {
@@ -125,8 +128,10 @@ impl AttendantsComponent {
         };
         media_device_access.on_denied = {
             let link = ctx.link().clone();
-            Callback::from(move |_| {
-                link.send_message(WsAction::MediaPermissionsError("Error requesting permissions. Please make sure to allow access to both camera and microphone.".to_string()))
+            Callback::from(move |e| {
+                let complete_error = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({:?})", e);
+                error!("{}", complete_error);
+                link.send_message(WsAction::MediaPermissionsError(complete_error.to_string()))
             })
         };
         media_device_access
@@ -146,12 +151,15 @@ impl Component for AttendantsComponent {
             video_enabled: false,
             peer_list_open: false,
             error: None,
+            pending_mic_enable: false,
+            pending_video_enable: false,
+            pending_screen_share: false,
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         if first_render {
-            ctx.link().send_message(WsAction::RequestMediaPermissions);
+            ctx.link().send_message(WsAction::Connect);
         }
     }
 
@@ -187,6 +195,22 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
+                    
+                    if self.pending_mic_enable {
+                        self.mic_enabled = true;
+                        self.pending_mic_enable = false;
+                    }
+                    
+                    if self.pending_video_enable {
+                        self.video_enabled = true;
+                        self.pending_video_enable = false;
+                    }
+                    
+                    if self.pending_screen_share {
+                        self.share_screen = true;
+                        self.pending_screen_share = false;
+                    }
+                    
                     ctx.link().send_message(WsAction::Connect);
                     true
                 }
@@ -200,13 +224,40 @@ impl Component for AttendantsComponent {
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
-                        self.share_screen = !self.share_screen;
+                        if !self.share_screen {
+                            if self.media_device_access.is_granted() {
+                                self.share_screen = true;
+                            } else {
+                                self.pending_screen_share = true;
+                                ctx.link().send_message(WsAction::RequestMediaPermissions);
+                            }
+                        } else {
+                            self.share_screen = false;
+                        }
                     }
                     MeetingAction::ToggleMicMute => {
-                        self.mic_enabled = !self.mic_enabled;
+                        if !self.mic_enabled {
+                            if self.media_device_access.is_granted() {
+                                self.mic_enabled = true;
+                            } else {
+                                self.pending_mic_enable = true;
+                                ctx.link().send_message(WsAction::RequestMediaPermissions);
+                            }
+                        } else {
+                            self.mic_enabled = false;
+                        }
                     }
                     MeetingAction::ToggleVideoOnOff => {
-                        self.video_enabled = !self.video_enabled;
+                        if !self.video_enabled {
+                            if self.media_device_access.is_granted() {
+                                self.video_enabled = true;
+                            } else {
+                                self.pending_video_enable = true;
+                                ctx.link().send_message(WsAction::RequestMediaPermissions);
+                            }
+                        } else {
+                            self.video_enabled = false;
+                        }
                     }
                 }
                 true
@@ -237,7 +288,14 @@ impl Component for AttendantsComponent {
         html! {
             <div id="main-container" class="meeting-page">
                 <div id="grid-container" style={if self.peer_list_open {"width: 80%;"} else {"width: 100%;"}}>
-                    { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
+                    { 
+                        self.error.as_ref().map(|error| html! { 
+                            <div class="error-container">
+                                <p class="error-message">{ error }</p>
+                                <img src="/assets/instructions.gif" alt="Permission instructions" class="instructions-gif" />
+                            </div> 
+                        }) 
+                    }
                     { rows }
                     {
                         if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {

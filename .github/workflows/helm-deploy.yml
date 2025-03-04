@@ -63,6 +63,7 @@ jobs:
           helm upgrade --install rustlemania-ui ./helm/rustlemania-ui \
             --namespace default \
             --atomic \
+            --set image.pullPolicy=Always \
             -f ./helm/rustlemania-ui/values.yaml
       
       - name: Deploy rustlemania-websocket
@@ -74,6 +75,7 @@ jobs:
           helm upgrade --install rustlemania-websocket ./helm/rustlemania-websocket \
             --namespace default \
             --atomic \
+            --set image.pullPolicy=Always \
             -f ./helm/rustlemania-websocket/values.yaml
       
       - name: Deploy rustlemania-webtransport
@@ -85,6 +87,7 @@ jobs:
           helm upgrade --install rustlemania-webtransport ./helm/rustlemania-webtransport \
             --namespace default \
             --atomic \
+            --set image.pullPolicy=Always \
             -f ./helm/rustlemania-webtransport/values.yaml
       
       - name: Deploy videocall-website
@@ -96,4 +99,5 @@ jobs:
           helm upgrade --install videocall-website ./helm/videocall-website \
             --namespace default \
             --atomic \
+            --set image.pullPolicy=Always \
             -f ./helm/videocall-website/values.yaml

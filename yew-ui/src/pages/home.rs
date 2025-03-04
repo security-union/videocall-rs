@@ -12,7 +12,7 @@ pub fn home() -> Html {
 
     let username_ref = use_node_ref();
     let meeting_id_ref = use_node_ref();
-    
+
     // Tab state for features section
     let active_tab = use_state(|| 0);
 
@@ -29,25 +29,25 @@ pub fn home() -> Html {
             })
         })
     };
-    
+
     let open_github = Callback::from(|_| {
         let window = web_sys::window().expect("no global window exists");
         let _ = window.open_with_url("https://github.com/security-union/videocall-rs");
     });
-    
+
     let set_active_tab = {
         let active_tab = active_tab.clone();
         Callback::from(move |tab: usize| {
             active_tab.set(tab);
         })
     };
-    
+
     html! {
         <div class="hero-container">
             <div class="floating-element floating-element-1"></div>
             <div class="floating-element floating-element-2"></div>
             <div class="floating-element floating-element-3"></div>
-            
+
             // GitHub corner ribbon
             <a href="https://github.com/security-union/videocall-rs" class="github-corner" aria-label="View source on GitHub">
                 <svg width="80" height="80" viewBox="0 0 250 250" style="fill:#7928CA; color:#0D131F; position: absolute; top: 0; border: 0; right: 0;" aria-hidden="true">
@@ -56,20 +56,20 @@ pub fn home() -> Html {
                     <path d="M115.0,115.0 C114.9,115.1 118.7,116.5 119.8,115.4 L133.7,101.6 C136.9,99.2 139.9,98.4 142.2,98.6 C133.8,88.0 127.5,74.4 143.8,58.0 C148.5,53.4 154.0,51.2 159.7,51.0 C160.3,49.4 163.2,43.6 171.4,40.1 C171.4,40.1 176.1,42.5 178.8,56.2 C183.1,58.6 187.2,61.8 190.9,65.4 C194.5,69.0 197.7,73.2 200.1,77.6 C213.8,80.2 216.3,84.9 216.3,84.9 C212.7,93.1 206.9,96.0 205.4,96.6 C205.1,102.4 203.0,107.8 198.3,112.5 C181.9,128.9 168.3,122.5 157.7,114.1 C157.9,116.9 156.7,120.9 152.7,124.9 L141.0,136.5 C139.8,137.7 141.6,141.9 141.8,141.8 Z" fill="currentColor" class="octo-body"></path>
                 </svg>
             </a>
-            
+
             <div class="hero-content">
                 <h1 class="hero-title text-center">{ "videocall.rs" }</h1>
                 <h2 class="hero-subtitle text-center text-xl mb-6">{ "Video calls with anyone, anywhere" }</h2>
-                
+
                 // Tech stack badges
                 <div class="flex justify-center items-center gap-6 mb-8" style="margin-top:1em">
                     <div class="tech-badge hover:scale-110 transition-transform">{"Rust"}</div>
                     <div class="tech-badge hover:scale-110 transition-transform">{"WebTransport"}</div>
                     <div class="tech-badge hover:scale-110 transition-transform">{"WASM"}</div>
                 </div>
-                
+
                 <div class="content-separator"></div>
-                
+
                 // Form section - moved to top for prominence
                 <form {onsubmit} class="w-full mb-8 border border-white/10 rounded-xl p-8 bg-background-light/10 backdrop-filter-blur">
                     <h3 class="text-center text-xl font-semibold mb-6 text-white/90">{"Start or Join a Meeting"}</h3>
@@ -87,7 +87,7 @@ pub fn home() -> Html {
                                 autofocus={true}
                             />
                         </div>
-                        
+
                         <div>
                             <label for="meeting-id" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Meeting ID"}</label>
                             <input
@@ -101,7 +101,7 @@ pub fn home() -> Html {
                             />
                             <p class="text-sm text-foreground-subtle mt-2 ml-1">{ "Characters allowed: a-z, A-Z, 0-9, and _" }</p>
                         </div>
-                        
+
                         <div class="mt-8">
                             <button type="submit" class="cta-button w-full flex items-center justify-center gap-2">
                                 <span class="text-lg">{ "Join Meeting" }</span>
@@ -114,31 +114,31 @@ pub fn home() -> Html {
                         </div>
                     </div>
                 </form>
-                
+
                 <p class="text-white/60 text-sm mb-3 text-center">{"Secure, simple video meetings"}</p>
-                
+
                 <div class="content-separator"></div>
-                
+
                 <h3 class="text-center text-lg font-medium mb-6 text-white/70">{"Developer Information"}</h3>
-                
+
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-8" style="margin-top:1em">
                     <div>
                         // Features section
                         <div class="features-container mb-6">
                             <div class="features-tabs">
-                                <button 
+                                <button
                                     class={if *active_tab == 0 { "feature-tab active" } else { "feature-tab" }}
                                     onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(0))}
                                 >
                                     {"Secure"}
                                 </button>
-                                <button 
+                                <button
                                     class={if *active_tab == 1 { "feature-tab active" } else { "feature-tab" }}
                                     onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(1))}
                                 >
                                     {"Fast"}
                                 </button>
-                                <button 
+                                <button
                                     class={if *active_tab == 2 { "feature-tab active" } else { "feature-tab" }}
                                     onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(2))}
                                 >
@@ -170,10 +170,10 @@ pub fn home() -> Html {
                             </div>
                         </div>
                     </div>
-                    
+
                     <div>
                         // Developer call-to-action
-                        <button 
+                        <button
                             onclick={open_github}
                             class="secondary-button flex items-center justify-center mx-auto gap-2"
                              style="margin-top:1em"

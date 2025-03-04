@@ -402,4 +402,3 @@ impl Component for AttendantsComponent {
         }
     }
 }
-

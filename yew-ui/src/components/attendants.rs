@@ -235,7 +235,7 @@ impl Component for AttendantsComponent {
         );
 
         html! {
-            <div id="main-container">
+            <div id="main-container" class="meeting-page">
                 <div id="grid-container" style={if self.peer_list_open {"width: 80%;"} else {"width: 100%;"}}>
                     { self.error.as_ref().map(|error| html! { <p>{ error }</p> }) }
                     { rows }

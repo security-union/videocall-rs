@@ -161,14 +161,14 @@ videocall.rs achieves horizontal scaling through its NATS-based architecture:
 │ ┌──────┐ │     │ ┌──────┐ │     │ ┌──────┐ │
 │ │Actix │ │     │ │Actix │ │     │ │Actix │ │
 │ └──────┘ │     │ └──────┘ │     │ └──────┘ │
-└────┬─────┘     └────┬─────┘     └────┬─────┘
-     │                │                │
-     │                ▼                │
+└────┬─────┘     └────┬─────┘     └───┬──────┘
+     │                │               │
+     │                ▼               │
      │         ┌─────────────┐        │
      └────────►│     NATS    │◄───────┘
                │  Messaging  │
-     ┌────────►│             │◄───────┐
-     │         └─────────────┘        │
+     ┌────────►│             │◄────────┐
+     │         └─────────────┘         │
      │                ▲                │
      │                │                │
 ┌────┴─────┐     ┌────┴─────┐     ┌────┴─────┐
@@ -193,7 +193,7 @@ videocall.rs achieves horizontal scaling through its NATS-based architecture:
 - `room.<room_id>.join` - New participant events
 - `room.<room_id>.leave` - Participant departure events
 - `room.<room_id>.message` - Chat messages
-- `system.stats` - System performance metrics
+- `system.stats` - System performance metrics (in development)
 
 ## Media Processing
 

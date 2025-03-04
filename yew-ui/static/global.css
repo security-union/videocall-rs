@@ -517,10 +517,9 @@ body {
 .hero-content {
   position: relative;
   z-index: 2;
-  max-width: 95%;
+  max-width: 90%;
   width: 650px;
   padding: 3rem;
-  margin: 2rem auto;
   background: rgba(31, 41, 61, 0.2);
   backdrop-filter: blur(16px);
   border-radius: 1.25rem;
@@ -685,43 +684,52 @@ body {
 
 /* Tech Badges */
 .tech-badge {
-  background: rgba(121, 40, 202, 0.1);
-  border: 1px solid rgba(121, 40, 202, 0.2);
-  color: rgba(255, 255, 255, 0.9);
-  padding: 0.625rem 1.25rem;
-  margin: 0 0.25rem;
-  border-radius: 2rem;
-  font-size: 0.875rem;
-  font-weight: 500;
-  letter-spacing: 0.025em;
-  transition: all 0.2s ease;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 80px;
+  padding: 0.35rem 0.8rem;
+  background: rgba(121, 40, 202, 0.2);
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 2rem;
+  border: 1px solid rgba(121, 40, 202, 0.3);
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+  transition: all 0.2s ease;
 }
 
 .tech-badge:hover {
-  background: rgba(121, 40, 202, 0.15);
-  border-color: rgba(121, 40, 202, 0.3);
   transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(121, 40, 202, 0.15);
+  background: rgba(121, 40, 202, 0.3);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
 }
 
 /* Code Snippet */
 .code-snippet {
   background: rgba(13, 19, 31, 0.7);
-  border-radius: 0.5rem;
+  border-radius: 0.75rem;
   border: 1px solid rgba(255, 255, 255, 0.1);
   overflow: hidden;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  box-shadow: 
+    0 4px 12px rgba(0, 0, 0, 0.2),
+    0 0 0 1px rgba(121, 40, 202, 0.1);
   max-width: 100%;
   text-align: left;
+  margin: 1.5rem 0;
+  transition: all 0.3s ease;
+}
+
+.code-snippet:hover {
+  border-color: rgba(255, 255, 255, 0.15);
+  box-shadow: 
+    0 6px 16px rgba(0, 0, 0, 0.25),
+    0 0 0 1px rgba(121, 40, 202, 0.15);
+  transform: translateY(-1px);
 }
 
 .code-snippet pre {
-  margin: 0;
-  padding: 1rem;
+  margin: 1.5rem 0 0;
+  padding: 1.25rem;
   overflow-x: auto;
 }
 
@@ -891,12 +899,6 @@ body {
   .grid.grid-cols-1.md\:grid-cols-2 > div:first-child {
     margin-bottom: 2rem;
   }
-  
-  .tech-badge {
-    padding: 0.5rem 1rem;
-    font-size: 0.8125rem;
-    min-width: 70px;
-  }
 }
 
 /* Form styling for better prominence */
@@ -907,6 +909,12 @@ body {
     0 0 0 1px rgba(121, 40, 202, 0.1);
   position: relative;
   z-index: 3;
+  padding: 2.5rem;
+  margin: 2rem 0;
+  background: rgba(31, 41, 61, 0.3);
+  backdrop-filter: blur(12px);
+  border-radius: 1.25rem;
+  transition: all 0.3s ease;
 }
 
 .hero-content form:hover {
@@ -914,17 +922,52 @@ body {
   box-shadow: 
     0 15px 40px -10px rgba(0, 0, 0, 0.25),
     0 0 0 1px rgba(121, 40, 202, 0.15);
+  transform: translateY(-2px);
+  background: rgba(31, 41, 61, 0.4);
+}
+
+.hero-content form h3 {
+  font-size: 1.75rem;
+  font-weight: 600;
+  margin-bottom: 2rem;
+  background: linear-gradient(to right, #fff, rgba(255, 255, 255, 0.8));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.hero-content form label {
+  color: rgba(255, 255, 255, 0.9);
+  font-weight: 500;
+}
+
+.hero-content form input {
+  background: rgba(13, 19, 31, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: white;
+  transition: all 0.2s ease;
+}
+
+.hero-content form input:hover {
+  border-color: rgba(255, 255, 255, 0.2);
+  background: rgba(13, 19, 31, 0.5);
+}
+
+.hero-content form input:focus {
+  border-color: rgba(121, 40, 202, 0.5);
+  background: rgba(13, 19, 31, 0.6);
+  box-shadow: 0 0 0 2px rgba(121, 40, 202, 0.2);
+}
+
+.hero-content form p {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.875rem;
 }
 
 /* Subtle separator */
 .content-separator {
   width: 100%;
   height: 1px;
-  background: linear-gradient(
-    90deg,
-    rgba(121, 40, 202, 0) 0%,
-    rgba(121, 40, 202, 0.2) 50%,
-    rgba(121, 40, 202, 0) 100%
-  );
+  background: linear-gradient(to right, transparent, rgba(255, 255, 255, 0.1), transparent);
   margin: 2rem 0;
 } 

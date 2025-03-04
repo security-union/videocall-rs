@@ -19,7 +19,7 @@ jobs:
 
       # Cache Docker layers
       - name: Cache Docker layers
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: /tmp/.docker
           key: ${{ runner.os }}-docker-${{ github.sha }}
@@ -28,7 +28,7 @@ jobs:
 
       # Cache Rust build artifacts
       - name: Cache Cargo Registry
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         with:
           path: |
             ~/.cargo/registry

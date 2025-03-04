@@ -195,22 +195,22 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
-                    
+
                     if self.pending_mic_enable {
                         self.mic_enabled = true;
                         self.pending_mic_enable = false;
                     }
-                    
+
                     if self.pending_video_enable {
                         self.video_enabled = true;
                         self.pending_video_enable = false;
                     }
-                    
+
                     if self.pending_screen_share {
                         self.share_screen = true;
                         self.pending_screen_share = false;
                     }
-                    
+
                     ctx.link().send_message(WsAction::Connect);
                     true
                 }
@@ -288,13 +288,13 @@ impl Component for AttendantsComponent {
         html! {
             <div id="main-container" class="meeting-page">
                 <div id="grid-container" style={if self.peer_list_open {"width: 80%;"} else {"width: 100%;"}}>
-                    { 
-                        self.error.as_ref().map(|error| html! { 
+                    {
+                        self.error.as_ref().map(|error| html! {
                             <div class="error-container">
                                 <p class="error-message">{ error }</p>
                                 <img src="/assets/instructions.gif" alt="Permission instructions" class="instructions-gif" />
-                            </div> 
-                        }) 
+                            </div>
+                        })
                     }
                     { rows }
                     {

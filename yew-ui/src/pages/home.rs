@@ -59,21 +59,20 @@ pub fn home() -> Html {
             
             <div class="hero-content">
                 <h1 class="hero-title text-center">{ "videocall.rs" }</h1>
-                <h2 class="hero-subtitle text-center text-xl mb-3">{ "Video calls with anyone, anywhere" }</h2>
+                <h2 class="hero-subtitle text-center text-xl mb-6">{ "Video calls with anyone, anywhere" }</h2>
                 
                 // Tech stack badges
-                <div class="flex justify-center gap-3 mb-5">
-                    <div class="tech-badge">{"Rust"}</div>
-                    <div class="tech-badge">{"WebTransport"}</div>
-                    <div class="tech-badge">{"Yew"}</div>
-                    <div class="tech-badge">{"Leptos"}</div>
+                <div class="flex justify-center items-center gap-6 mb-8" style="margin-top:1em">
+                    <div class="tech-badge hover:scale-110 transition-transform">{"Rust"}</div>
+                    <div class="tech-badge hover:scale-110 transition-transform">{"WebTransport"}</div>
+                    <div class="tech-badge hover:scale-110 transition-transform">{"WASM"}</div>
                 </div>
                 
                 <div class="content-separator"></div>
                 
                 // Form section - moved to top for prominence
-                <form {onsubmit} class="w-full mb-8 border border-white/10 rounded-xl p-7 bg-background-light/10 backdrop-filter-blur">
-                    <h3 class="text-center text-xl font-semibold mb-5 text-white/90">{"Start or Join a Meeting"}</h3>
+                <form {onsubmit} class="w-full mb-8 border border-white/10 rounded-xl p-8 bg-background-light/10 backdrop-filter-blur">
+                    <h3 class="text-center text-xl font-semibold mb-6 text-white/90">{"Start or Join a Meeting"}</h3>
                     <div class="space-y-6">
                         <div>
                             <label for="username" class="block text-white/80 text-sm font-medium mb-2 ml-1">{"Username"}</label>
@@ -116,11 +115,11 @@ pub fn home() -> Html {
                     </div>
                 </form>
                 
-                <p class="text-white/60 text-sm mb-3 text-center">{"Secure, end-to-end encrypted video meetings"}</p>
+                <p class="text-white/60 text-sm mb-3 text-center">{"Secure, simple video meetings"}</p>
                 
                 <div class="content-separator"></div>
                 
-                <h3 class="text-center text-lg font-medium mb-5 text-white/70">{"Developer Information"}</h3>
+                <h3 class="text-center text-lg font-medium mb-6 text-white/70">{"Developer Information"}</h3>
                 
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-8" style="margin-top:1em">
                     <div>
@@ -150,8 +149,8 @@ pub fn home() -> Html {
                                 {match *active_tab {
                                     0 => html! {
                                         <>
-                                            <h3 class="feature-title">{"End-to-End Encryption"}</h3>
-                                            <p class="feature-description">{"Built with strong cryptography using modern Rust libraries for secure, trustless communication. All data remains encrypted in transit and no keys are stored on servers."}</p>
+                                            <h3 class="feature-title">{"Simple"}</h3>
+                                            <p class="feature-description">{"No SFU's, no NAT traversal, no complicated setup. Just a simple, secure, and fast video calls via WebTransport."}</p>
                                         </>
                                     },
                                     1 => html! {

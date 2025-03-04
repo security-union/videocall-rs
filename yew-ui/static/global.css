@@ -1,5 +1,3 @@
-/* Global styles for the website, inspired by LiveKit */
-
 /* Base styles */
 html {
   font-size: 16px;
@@ -519,9 +517,10 @@ body {
 .hero-content {
   position: relative;
   z-index: 2;
-  max-width: 90%;
+  max-width: 95%;
   width: 650px;
   padding: 3rem;
+  margin: 2rem auto;
   background: rgba(31, 41, 61, 0.2);
   backdrop-filter: blur(16px);
   border-radius: 1.25rem;
@@ -686,24 +685,27 @@ body {
 
 /* Tech Badges */
 .tech-badge {
+  background: rgba(121, 40, 202, 0.1);
+  border: 1px solid rgba(121, 40, 202, 0.2);
+  color: rgba(255, 255, 255, 0.9);
+  padding: 0.625rem 1.25rem;
+  margin: 0 0.25rem;
+  border-radius: 2rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  letter-spacing: 0.025em;
+  transition: all 0.2s ease;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0.35rem 0.8rem;
-  background: rgba(121, 40, 202, 0.2);
-  color: rgba(255, 255, 255, 0.9);
-  font-size: 0.75rem;
-  font-weight: 600;
-  border-radius: 2rem;
-  border: 1px solid rgba(121, 40, 202, 0.3);
-  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
-  transition: all 0.2s ease;
+  min-width: 80px;
 }
 
 .tech-badge:hover {
+  background: rgba(121, 40, 202, 0.15);
+  border-color: rgba(121, 40, 202, 0.3);
   transform: translateY(-1px);
-  background: rgba(121, 40, 202, 0.3);
-  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+  box-shadow: 0 4px 12px rgba(121, 40, 202, 0.15);
 }
 
 /* Code Snippet */
@@ -889,6 +891,12 @@ body {
   .grid.grid-cols-1.md\:grid-cols-2 > div:first-child {
     margin-bottom: 2rem;
   }
+  
+  .tech-badge {
+    padding: 0.5rem 1rem;
+    font-size: 0.8125rem;
+    min-width: 70px;
+  }
 }
 
 /* Form styling for better prominence */
@@ -912,6 +920,11 @@ body {
 .content-separator {
   width: 100%;
   height: 1px;
-  background: linear-gradient(to right, transparent, rgba(255, 255, 255, 0.1), transparent);
+  background: linear-gradient(
+    90deg,
+    rgba(121, 40, 202, 0) 0%,
+    rgba(121, 40, 202, 0.2) 50%,
+    rgba(121, 40, 202, 0) 100%
+  );
   margin: 2rem 0;
 } 

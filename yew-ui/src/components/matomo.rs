@@ -9,7 +9,7 @@ use web_sys::js_sys;
 
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_namespace = window)]
+    #[wasm_bindgen(js_namespace = window, thread_local_v2)]
     static _paq: Array;
 }
 

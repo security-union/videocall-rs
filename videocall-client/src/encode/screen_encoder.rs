@@ -12,8 +12,6 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamTrack;
-use web_sys::MediaStreamTrackProcessor;
-use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
 use web_sys::VideoEncoder;
 use web_sys::VideoEncoderConfig;
@@ -25,6 +23,7 @@ use web_sys::VideoTrack;
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
+use super::track_processor::{CustomMediaStreamTrackProcessor, CustomMediaStreamTrackProcessorInit};
 
 use crate::constants::SCREEN_HEIGHT;
 use crate::constants::SCREEN_WIDTH;
@@ -136,7 +135,7 @@ impl ScreenEncoder {
             screen_encoder.configure(&screen_encoder_config);
 
             let screen_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+                CustomMediaStreamTrackProcessor::new(&CustomMediaStreamTrackProcessorInit::new(
                     &screen_track.unchecked_into::<MediaStreamTrack>(),
                 ))
                 .unwrap();

@@ -16,8 +16,6 @@ use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
-use web_sys::MediaStreamTrackProcessor;
-use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
 use web_sys::VideoEncoder;
 use web_sys::VideoEncoderConfig;
@@ -29,6 +27,7 @@ use web_sys::VideoTrack;
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
+use super::track_processor::{CustomMediaStreamTrackProcessor, CustomMediaStreamTrackProcessorInit};
 
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
@@ -198,7 +197,7 @@ impl CameraEncoder {
             video_encoder.configure(&video_encoder_config);
 
             let video_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+                CustomMediaStreamTrackProcessor::new(&CustomMediaStreamTrackProcessorInit::new(
                     &video_track.clone().unchecked_into::<MediaStreamTrack>(),
                 ))
                 .unwrap();

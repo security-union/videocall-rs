@@ -18,13 +18,12 @@ use web_sys::AudioTrack;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
-use web_sys::MediaStreamTrackProcessor;
-use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_audio_chunk;
+use super::track_processor::{CustomMediaStreamTrackProcessor, CustomMediaStreamTrackProcessorInit};
 
 use crate::constants::AUDIO_BITRATE;
 use crate::constants::AUDIO_CHANNELS;
@@ -160,7 +159,7 @@ impl MicrophoneEncoder {
             audio_encoder.configure(&audio_encoder_config);
 
             let audio_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
+                CustomMediaStreamTrackProcessor::new(&CustomMediaStreamTrackProcessorInit::new(
                     &audio_track.clone().unchecked_into::<MediaStreamTrack>(),
                 ))
                 .unwrap();

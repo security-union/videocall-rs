@@ -21,7 +21,12 @@ impl MatomoTracker {
     }
 
     pub fn push(&self, args: &JsValue) {
-        let method: js_sys::Function = js_sys::Reflect::get(&_paq, &"push".into()).unwrap().into();
+        // Get the _paq array from the window object since we can't directly use the thread_local variable
+        let window = web_sys::window().expect("no global window exists");
+        let paq_value = Reflect::get(&window, &JsValue::from_str("_paq")).unwrap();
+        let method: js_sys::Function = js_sys::Reflect::get(&paq_value, &"push".into())
+            .unwrap()
+            .into();
         let _ = method.call1(&JsValue::NULL, args);
     }
 

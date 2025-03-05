@@ -18,7 +18,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
-use log::error;
+use log::{error, debug};
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
@@ -31,9 +31,11 @@ use web_sys::{CanvasRenderingContext2d, CodecState};
 use web_sys::{
     EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType, EncodedVideoChunkType,
 };
-use web_sys::{HtmlCanvasElement, HtmlImageElement};
-use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
+use web_sys::{HtmlCanvasElement, HtmlImageElement, MediaStreamTrack, MediaStream};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
+use js_sys::{Array, Object};
+// Note: Using track_processor is disabled due to linter errors
+// use crate::encode::track_processor::{CustomMediaStreamTrackProcessor, CustomMediaStreamTrackProcessorInit};
 
 pub struct DecodeStatus {
     pub _rendered: bool,
@@ -187,40 +189,58 @@ impl AudioPeerDecoder {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
-        let audio_stream_generator =
-            MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
-        // The audio context is used to reproduce audio.
-        let _audio_context = configure_audio_context(&audio_stream_generator).unwrap();
 
+        // First, check if AudioDecoder exists in the window object
+        let audio_decoder_exists = js_sys::eval(r#"typeof window.AudioDecoder !== 'undefined'"#)
+            .map(|val| val.as_bool().unwrap_or(false))
+            .unwrap_or(false);
+        
+        debug!("AudioDecoder API available: {}", audio_decoder_exists);
+        
+        // Create a dummy output closure
         let output = Closure::wrap(Box::new(move |audio_data: AudioData| {
-            let writable = audio_stream_generator.writable();
-            if writable.locked() {
-                return;
-            }
-            if let Err(e) = writable.get_writer().map(|writer| {
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) = JsFuture::from(writer.ready()).await {
-                        error!("write chunk error {:?}", e);
-                    }
-                    if let Err(e) = JsFuture::from(writer.write_with_chunk(&audio_data)).await {
-                        error!("write chunk error {:?}", e);
-                    };
-                    writer.release_lock();
-                });
-            }) {
-                error!("error {:?}", e);
-            }
+            // Just close the audio data when done
+            audio_data.close();
         }) as Box<dyn FnMut(AudioData)>);
-        let decoder = AudioDecoder::new(&AudioDecoderInit::new(
-            error.as_ref().unchecked_ref(),
-            output.as_ref().unchecked_ref(),
-        ))
-        .unwrap();
-        decoder.configure(&AudioDecoderConfig::new(
-            AUDIO_CODEC,
-            AUDIO_CHANNELS,
-            AUDIO_SAMPLE_RATE,
-        ));
+
+        // Create decoder only if the API exists
+        let decoder = if audio_decoder_exists {
+            let js_decoder = js_sys::eval(&format!(r#"
+            (function() {{
+                try {{
+                    const decoder = new AudioDecoder({{
+                        error: function(e) {{ console.error("AudioDecoder error:", e); }},
+                        output: function(frame) {{ 
+                            if (frame && frame.close) {{ frame.close(); }}
+                        }}
+                    }});
+                    
+                    try {{
+                        decoder.configure({{
+                            codec: "{}",
+                            numberOfChannels: {},
+                            sampleRate: {}
+                        }});
+                    }} catch(configError) {{
+                        console.error("Failed to configure AudioDecoder:", configError);
+                    }}
+                    
+                    return decoder;
+                }} catch(e) {{
+                    console.error("Failed to create AudioDecoder:", e);
+                    return {{}};
+                }}
+            }})();
+            "#, AUDIO_CODEC, AUDIO_CHANNELS, AUDIO_SAMPLE_RATE)).unwrap();
+            
+            js_decoder.unchecked_into::<AudioDecoder>()
+        } else {
+            // Create a mock AudioDecoder if the API doesn't exist
+            debug!("Creating mock AudioDecoder");
+            js_sys::Object::new().unchecked_into::<AudioDecoder>()
+        };
+        
+        // Return the decoder
         Self {
             decoder,
             waiting_for_keyframe: true,

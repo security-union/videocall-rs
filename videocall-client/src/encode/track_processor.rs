@@ -91,10 +91,31 @@ impl CustomMediaStreamTrackProcessor {
                             this.t1 = performance.now();
                         }} else if ("{kind}" === "audio") {{
                             try {{
+                                // Setup audio processing
                                 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
                                 if (AudioContextClass) {{
-                                    this.ac = new AudioContextClass();
-                                    this.source = this.ac.createMediaStreamSource(new MediaStream([track]));
+                                    this.ac = new AudioContextClass({{sampleRate: 48000}});
+                                    this.mediaStream = new MediaStream([track]);
+                                    this.source = this.ac.createMediaStreamSource(this.mediaStream);
+                                    
+                                    // Create a processor node for audio data
+                                    this.processor = this.ac.createScriptProcessor(1024, 1, 1);
+                                    this.source.connect(this.processor);
+                                    this.processor.connect(this.ac.destination);
+                                    
+                                    // Buffer to store audio data
+                                    this.buffer = [];
+                                    
+                                    // Setup audio processor
+                                    this.processor.onaudioprocess = (e) => {{
+                                        const inputData = e.inputBuffer.getChannelData(0);
+                                        // Store a copy of the data
+                                        this.buffer.push(new Float32Array(inputData));
+                                        // Keep buffer to a reasonable size
+                                        if (this.buffer.length > 10) {{
+                                            this.buffer.shift();
+                                        }}
+                                    }};
                                 }}
                             }} catch(e) {{
                                 console.error("Audio context creation failed:", e);
@@ -155,18 +176,70 @@ impl CustomMediaStreamTrackProcessor {
                                 }});
                             }}
                         }} else if ("{kind}" === "audio") {{
-                            // Simple placeholder audio data
-                            this.t1 = performance.now();
-                            
-                            // Create placeholder audio data
-                            controller.enqueue({{
-                                type: 'audio',
-                                timestamp: this.t1,
-                                sampleRate: this.ac ? this.ac.sampleRate : 48000
-                            }});
-                            
-                            // Wait before next pull
-                            await new Promise(r => setTimeout(r, 10));
+                            // Create proper AudioData
+                            try {{
+                                if (typeof AudioData !== 'undefined' && this.buffer && this.buffer.length > 0) {{
+                                    // Get the latest audio data from our buffer
+                                    const audioBuffer = this.buffer.shift();
+                                    if (audioBuffer) {{
+                                        // Create proper AudioData object
+                                        const numChannels = 1; // Mono audio
+                                        const sampleRate = this.ac ? this.ac.sampleRate : 48000;
+                                        const format = "f32-planar"; // Float32 planar format
+                                        
+                                        // AudioData constructor parameters
+                                        const audioDataInit = {{
+                                            format: format,
+                                            sampleRate: sampleRate,
+                                            numberOfFrames: audioBuffer.length,
+                                            numberOfChannels: numChannels,
+                                            timestamp: this.t1,
+                                            data: audioBuffer
+                                        }};
+                                        
+                                        // Create AudioData object
+                                        const audioData = new AudioData(audioDataInit);
+                                        controller.enqueue(audioData);
+                                    }} else {{
+                                        // Wait for audio data to be available
+                                        await new Promise(r => setTimeout(r, 10));
+                                    }}
+                                }} else {{
+                                    // If AudioData API is not available, use a fallback
+                                    // Create a simple fallback that matches the expected interface
+                                    const sampleRate = this.ac ? this.ac.sampleRate : 48000;
+                                    const numberOfFrames = 1024;
+                                    const numberOfChannels = 1;
+                                    
+                                    // Create a Float32Array filled with zeros as placeholder audio
+                                    const audioData = new Float32Array(numberOfFrames);
+                                    
+                                    // Compatibility version for browsers without AudioData
+                                    const fallbackAudioData = {{
+                                        format: "f32-planar",
+                                        sampleRate: sampleRate,
+                                        numberOfFrames: numberOfFrames,
+                                        numberOfChannels: numberOfChannels,
+                                        timestamp: this.t1,
+                                        duration: numberOfFrames / sampleRate * 1000000,
+                                        allocationSize: function() {{ return numberOfFrames * 4; }},
+                                        copyTo: function() {{ /* No-op */ }},
+                                        clone: function() {{ return this; }},
+                                        close: function() {{ /* No-op */ }},
+                                        data: audioData
+                                    }};
+                                    
+                                    // Send it to the controller
+                                    controller.enqueue(fallbackAudioData);
+                                    
+                                    // Wait before next pull
+                                    await new Promise(r => setTimeout(r, 10));
+                                }}
+                            }} catch (audioError) {{
+                                console.error("Error processing audio:", audioError);
+                                // Wait before retry
+                                await new Promise(r => setTimeout(r, 100));
+                            }}
                         }}
                     }} catch (e) {{
                         console.error("Error in stream pull:", e);

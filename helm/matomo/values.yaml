@@ -5,6 +5,40 @@ mariadb:
     database: matomo
     username: matomo
     password: YOUR_MATOMO_PASSWORD
+  primary:
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+
+# Set number of replicas to 1 to avoid multi-attach volume errors
+replicaCount: 1
+
+# Configure CronJobs
+cronJobs:
+  archive:
+    enabled: true
+    schedule: "*/15 * * * *"  # Run every 15 minutes instead of every 5
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
+  scheduled_tasks:
+    enabled: true
+    schedule: "*/15 * * * *"  # Run every 15 minutes instead of every 5
+    resources:
+      limits:
+        cpu: 100m
+        memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
 
 service:
   type: NodePort
@@ -16,6 +50,7 @@ service:
 ingress:
   enabled: true
   hostname: matomo.videocall.rs
+  pathType: ImplementationSpecific
   annotations:
     kubernetes.io/ingress.class: nginx
     cert-manager.io/issuer: letsencrypt-prod
@@ -24,3 +59,29 @@ ingress:
     - hosts:
         - matomo.videocall.rs
       secretName: matomo-tls
+
+# Security settings for Matomo 9.1.0+
+global:
+  security:
+    allowInsecureImages: false
+
+# Persistence settings to make sure data is retained
+persistence:
+  enabled: true
+
+# Default Matomo admin credentials
+matomoUsername: admin
+matomoPassword: YOUR_ADMIN_PASSWORD
+
+# Resource settings for Matomo
+resources:
+  limits:
+    cpu: 500m
+    memory: 768Mi
+  requests:
+    cpu: 200m
+    memory: 384Mi
+
+# Disable any automatic updates to ensure stability
+updateStrategy:
+  type: Recreate

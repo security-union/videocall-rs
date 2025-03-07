@@ -264,7 +264,6 @@ We welcome contributions from the community! Here's how to get involved:
 See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information.
 
 
-
 ### Technology Stack
 
 - **Backend**: Rust + Actix Web + PostgreSQL + NATS
@@ -292,8 +291,7 @@ For a more comprehensive technical overview, see the [Architecture Document](ARC
 
 ### Channels
 
-- [YouTube Channel](https://www.youtube.com/@securityunion)
-- [Developer Blog](https://blog.videocall.rs)
+- [YouTube Channel](https://www.youtube.com/@dario.lencina)
 
 ## Contributors
 

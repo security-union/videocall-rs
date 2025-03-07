@@ -12,6 +12,7 @@ An open-source, high-performance video conferencing platform built with Rust, pr
 
 - [Overview](#overview)
 - [Features](#features)
+- [Why WebTransport Instead of WebRTC?](#why-webtransport-instead-of-webrtc)
 - [System Architecture](#system-architecture)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
@@ -42,6 +43,36 @@ videocall.rs is a modern, open-source video conferencing system written entirely
 - **Cross-Platform Support:** Works on major browsers (Chrome/Chromium, with Safari support in development)
 - **Native Client Support:** CLI tool for headless video streaming from devices like Raspberry Pi
 - **Open Source:** MIT licensed for maximum flexibility
+
+## Why WebTransport Instead of WebRTC?
+
+WebTransport is a core technology that differentiates videocall.rs from traditional video conferencing solutions. As a developer, here's why our WebTransport approach is technically superior:
+
+### Technical Advantages
+
+- **No SFUs, No NAT Traversal:** WebTransport eliminates the need for complex Selective Forwarding Units and NAT traversal mechanisms that plague WebRTC implementations and cause countless developer headaches.
+
+- **Simplified Architecture**: No more complex STUN/TURN servers, ICE candidates negotiation, or complicated signaling dances required by WebRTC. Just direct, straightforward connections.
+
+- **Protocol Efficiency**: Built on HTTP/3 and QUIC, WebTransport provides multiplexed, bidirectional streams with better congestion control and packet loss recovery than WebRTC's dated SCTP data channels.
+
+- **Lower Latency**: QUIC's 0-RTT connection establishment reduces initial connection times compared to WebRTC's multiple roundtrips.
+
+- **Clean Development Experience**: WebTransport offers a more intuitive developer API with a promise-based design and cleaner stream management.
+
+- **Future-Proof**: As part of the modern web platform developed by the IETF and W3C, WebTransport has strong browser vendor support and an actively evolving specification.
+
+### Developer Implications
+
+For developers integrating videocall.rs, this means:
+- ✅ Drastically simpler deployment architecture
+- ✅ No complex network configuration or firewall issues
+- ✅ Better performance in challenging network conditions
+- ✅ More predictable behavior across implementations
+- ✅ Less time spent debugging connectivity issues
+- ✅ A forward-looking technology investment
+
+Read our [Architecture Document](ARCHITECTURE.md) for a deep dive into how we implement WebTransport and the technical benefits it provides.
 
 ## System Architecture
 
@@ -177,6 +208,23 @@ videocall.rs has been benchmarked and optimized for the following scenarios:
 - **Small Groups (3-10):** Efficient mesh topology with adaptive quality based on network conditions
 - **Large Conferences:** Tested with up to 1000 participants using selective forwarding architecture
 
+### Technical Optimizations
+
+- **Zero-Copy Design:** Minimizes data copying between network stack and application code
+- **Asynchronous Core:** Built on Rust's async/await ecosystem with Tokio runtime  
+- **SIMD-Accelerated Processing:** Uses CPU vectorization for media operations where available
+- **Lock-Free Data Structures:** Minimizes contention in high-throughput scenarios
+- **Protocol-Level Optimizations:** Custom-tuned congestion control and packet scheduling
+
+### Resource Utilization
+
+Our server-side architecture is designed for efficiency at scale:
+
+- **Horizontal Scaling:** Linear performance scaling with additional server instances
+- **Load Distribution:** Automatic connection balancing across server pool
+- **Resource Governance:** Configurable limits for bandwidth, connections, and CPU utilization
+- **Container-Optimized:** Designed for efficient deployment in Kubernetes environments
+
 Performance metrics and tuning guidelines will be available in our [performance documentation](PERFORMANCE.md). (WIP)
 
 ## Security
@@ -215,18 +263,25 @@ We welcome contributions from the community! Here's how to get involved:
 
 See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information.
 
-## Project Structure
 
-```
-videocall-rs/
-├── actix-api/        # Backend server implementation
-├── yew-ui/           # Web frontend (Yew/WebAssembly)
-├── videocall-types/  # Shared type definitions
-├── videocall-client/ # Client library
-├── videocall-cli/    # Command-line interface
-├── protobuf/         # Protocol buffer definitions
-└── rfc/              # Request for Comments process
-```
+
+### Technology Stack
+
+- **Backend**: Rust + Actix Web + PostgreSQL + NATS
+- **Frontend**: Rust + Yew + WebAssembly + Tailwind CSS
+- **Transport**: WebTransport (QUIC/HTTP3) + WebSockets (fallback)
+- **Build System**: Cargo + Trunk + Docker + Helm
+- **Testing**: Rust test framework + Playwright for E2E tests
+
+### Key Technical Features
+
+- **Bidirectional Streaming**: Fully asynchronous message passing using QUIC streams
+- **Error Handling**: Comprehensive Result-based error propagation throughout the codebase
+- **Modularity**: Clean separation of concerns with well-defined interfaces between components
+- **Type Safety**: Extensive use of Rust's type system to prevent runtime errors
+- **Binary Protocol**: Efficient Protocol Buffer serialization for all messages
+
+For a more comprehensive technical overview, see the [Architecture Document](ARCHITECTURE.md).
 
 ## Demos and Media
 

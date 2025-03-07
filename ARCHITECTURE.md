@@ -11,6 +11,7 @@ This document provides a comprehensive overview of the videocall.rs architecture
 - [Horizontal Scaling](#horizontal-scaling)
 - [Media Processing](#media-processing)
 - [Security Architecture](#security-architecture)
+- [Deployment Architecture](#deployment-architecture)
 
 ## System Overview
 
@@ -233,6 +234,119 @@ videocall.rs implements true end-to-end encryption (E2EE) using a hybrid RSA/AES
 3. **Connection Validation**: Strict path and format validation for connection URLs
 
 This security model ensures that even if the server infrastructure is compromised, the media content remains confidential between participants.
+
+## Deployment Architecture
+
+videocall.rs is deployed using Helm charts for Kubernetes, providing a consistent and repeatable deployment process across environments.
+
+### Helm Chart Structure
+
+The deployment architecture consists of multiple Helm charts organized in a modular fashion:
+
+```mermaid
+graph TD
+    A[videocall-rs Deployment] --> B[Infrastructure Components]
+    A --> C[Application Components]
+    
+    B --> D[ingress-nginx]
+    B --> E[cert-manager]
+    B --> F[NATS]
+    B --> G[PostgreSQL]
+    B --> H[external-dns]
+    
+    C --> I[videocall-website]
+    C --> J[rustlemania-ui]
+    C --> K[rustlemania-websocket]
+    C --> L[rustlemania-webtransport]
+    C --> M[matomo]
+```
+
+### Primary Helm Charts
+
+1. **Infrastructure Components**
+   - **ingress-nginx**: Handles external traffic routing and load balancing
+   - **cert-manager**: Manages TLS certificates for secure connections
+   - **NATS**: Messaging backbone for component communication
+   - **PostgreSQL**: Database for persistent storage
+   - **external-dns**: Manages DNS records for service discovery
+
+2. **Application Components**
+   - **rustlemania-websocket**: Deploys the Actix API server for WebSocket connections
+   - **rustlemania-webtransport**: Deploys the WebTransport server
+   - **rustlemania-ui**: Deploys the Yew-based frontend application
+   - **videocall-website**: Deploys the marketing website
+   - **matomo**: Deploys analytics tools for usage tracking
+
+### Deployment Configuration
+
+Each component is configured through values files that specify:
+
+- Resource requirements (CPU, memory)
+- Replica counts for horizontal scaling
+- Connection parameters for inter-service communication
+- Security settings and credentials
+- Persistence configuration
+
+Example from the `matomo` chart values:
+
+```yaml
+# Matomo deployment configuration
+replicaCount: 1
+
+mariadb:
+  enabled: true
+  auth:
+    database: matomo
+    username: matomo
+
+service:
+  type: NodePort
+  port: 80
+
+ingress:
+  enabled: true
+  hostname: matomo.videocall.rs
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/issuer: letsencrypt-prod
+```
+
+### Deployment Workflow
+
+1. **Infrastructure Deployment**:
+   ```
+   helm repo update
+   helm upgrade --install nats ./helm/nats
+   helm upgrade --install postgres ./helm/postgres
+   helm upgrade --install cert-manager ./helm/cert-manager
+   helm upgrade --install ingress-nginx ./helm/ingress-nginx
+   ```
+
+2. **Application Deployment**:
+   ```
+   helm upgrade --install rustlemania-ui ./helm/rustlemania-ui
+   helm upgrade --install rustlemania-websocket ./helm/rustlemania-websocket
+   helm upgrade --install rustlemania-webtransport ./helm/rustlemania-webtransport
+   ```
+
+### Scaling Considerations
+
+The Helm charts are designed to support horizontal scaling:
+
+- WebSocket and WebTransport servers can be scaled independently
+- NATS ensures message delivery across all server instances
+- Stateless components use Kubernetes Deployments with configurable replica counts
+- Stateful components (PostgreSQL, MariaDB) use StatefulSets with proper persistence
+
+### Environment-Specific Configuration
+
+The deployment architecture supports multiple environments through value overrides:
+
+- **Development**: Minimal resource requirements, single replicas
+- **Staging**: Moderate resources, multiple replicas for testing
+- **Production**: Full resource allocation, high-availability configuration
+
+Each environment uses separate value files (e.g., `values.yaml`).
 
 ---
 

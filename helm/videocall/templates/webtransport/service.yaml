@@ -1,0 +1,34 @@
+{{- if .Values.components.webtransport.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "videocall.fullname" . }}-webtransport
+  labels:
+    {{- include "videocall.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webtransport
+  {{- with .Values.webtransport.service.annotations }}
+  annotations:
+    {{- $annotations := . -}}
+    {{- range $key, $value := . }}
+    {{- if eq $key "external-dns.alpha.kubernetes.io/hostname" }}
+    {{ $key }}: {{ include "videocall.transportUrl" $ }}
+    {{- else }}
+    {{ $key }}: {{ $value }}
+    {{- end }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.webtransport.service.type }}
+  ports:
+    - port: {{ .Values.webtransport.service.port }}
+      targetPort: wt-api
+      protocol: UDP
+      name: wt-api
+    - port: 444
+      targetPort: wt-api-health
+      protocol: TCP
+      name: health
+  selector:
+    {{- include "videocall.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: webtransport
+{{- end }} 

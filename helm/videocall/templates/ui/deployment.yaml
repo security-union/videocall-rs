@@ -1,0 +1,50 @@
+{{- if .Values.components.ui.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "videocall.fullname" . }}-ui
+  labels:
+    {{- include "videocall.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+spec:
+  replicas: {{ .Values.ui.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "videocall.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ui
+  template:
+    metadata:
+      labels:
+        {{- include "videocall.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ui
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}-ui
+          image: "{{ .Values.ui.image.repository }}:{{ .Values.ui.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.ui.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ui.service.port }}
+              protocol: TCP
+          {{- if .Values.ui.env }}
+          env:
+            {{- range .Values.ui.env }}
+            {{- if eq .name "RUSTLEMANIA_API_URL" }}
+            - name: {{ .name }}
+              value: "wss://{{ include "videocall.apiUrl" $ }}"
+            {{- else if eq .name "RUSTLEMANIA_TRANSPORT_URL" }}
+            - name: {{ .name }}
+              value: "https://{{ include "videocall.transportUrl" $ }}"
+            {{- else }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.ui.resources | nindent 12 }}
+{{- end }} 

@@ -1,0 +1,211 @@
+# Global settings applied to all components
+global:
+  environment: production
+  nameOverride: ""
+  fullnameOverride: ""
+  imagePullSecrets: []
+  domain: "videocall.rs"
+  tls:
+    enabled: true
+    issuer: "letsencrypt-prod"
+  # Custom URLs for each component (overrides the default pattern of component.domain)
+  urls:
+    ui: ""        # Leave empty to use the default: ui.domain
+    api: ""       # Leave empty to use the default: api.domain
+    transport: "" # Leave empty to use the default: transport.domain
+
+# Common resource settings
+resources:
+  small:
+    limits:
+      cpu: 300m
+      memory: 384Mi
+    requests:
+      cpu: 150m
+      memory: 192Mi
+  medium:
+    limits:
+      cpu: 750m
+      memory: 768Mi
+    requests:
+      cpu: 375m
+      memory: 384Mi
+  large:
+    limits:
+      cpu: 1500m
+      memory: 1.5Gi
+    requests:
+      cpu: 750m
+      memory: 768Mi
+
+# Component toggles
+components:
+  ui:
+    enabled: true
+  websocket:
+    enabled: true
+  webtransport:
+    enabled: true
+
+# UI Component Configuration
+ui:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/security-union/rustlemania-ui
+    tag: latest
+    pullPolicy: Always
+  service:
+    type: ClusterIP
+    port: 80
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    hosts:
+      - host: "ui.{{ .Values.global.domain }}"
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: ui-tls
+        hosts:
+          - "ui.{{ .Values.global.domain }}"
+  resources:
+    limits:
+      cpu: 300m
+      memory: 384Mi
+    requests:
+      cpu: 150m
+      memory: 192Mi
+  env:
+    - name: RUSTLEMANIA_API_URL
+      value: "wss://api.{{ .Values.global.domain }}"
+    - name: RUSTLEMANIA_TRANSPORT_URL
+      value: "https://transport.{{ .Values.global.domain }}"
+
+# WebSocket Component Configuration
+websocket:
+  replicaCount: 2
+  image:
+    repository: ghcr.io/security-union/rustlemania-websocket
+    tag: latest
+    pullPolicy: Always
+  service:
+    type: ClusterIP
+    port: 8080
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    hosts:
+      - host: "api.{{ .Values.global.domain }}"
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: api-tls
+        hosts:
+          - "api.{{ .Values.global.domain }}"
+  resources:
+    limits:
+      cpu: "50m"
+      memory: "10Mi"
+    requests:
+      cpu: "20m"
+      memory: "10Mi"
+  env:
+    - name: RUST_LOG
+      value: info
+    - name: ACTIX_PORT
+      value: "8080"
+    - name: UI_ENDPOINT
+      value: "https://ui.{{ .Values.global.domain }}"
+    - name: NATS_URL
+      value: nats:4222
+    - name: DATABASE_ENABLED
+      value: "false"
+    - name: DATABASE_URL
+      value: "postgresql://{{ .Values.postgresql.auth.username }}:{{ .Values.postgresql.auth.password }}@{{ .Release.Name }}-postgresql:5432/{{ .Values.postgresql.auth.database }}"
+
+# WebTransport Component Configuration
+webtransport:
+  replicaCount: 1
+  image:
+    repository: ghcr.io/security-union/rustlemania-webtransport
+    tag: latest
+    pullPolicy: Always
+  command: ['webtransport_server']
+  args: []
+  service:
+    type: LoadBalancer
+    port: 443
+    annotations:
+      external-dns.alpha.kubernetes.io/hostname: "transport.{{ .Values.global.domain }}"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "3"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "4"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "5"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
+      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
+  resources:
+    limits:
+      cpu: "300m"
+      memory: "300Mi"
+    requests:
+      cpu: "300m"
+      memory: "300Mi"
+  env:
+    - name: RUST_LOG
+      value: debug,quinn=warn
+    - name: NATS_URL
+      value: nats:4222
+    - name: LISTEN_URL
+      value: 0.0.0.0:443
+    - name: HEALTH_LISTEN_URL
+      value: 0.0.0.0:444
+    - name: CERT_PATH
+      value: /certs/tls.crt
+    - name: KEY_PATH
+      value: /certs/tls.key
+
+# Secrets Management
+secrets:
+  websocketCredentials:
+    create: true
+    databaseUrl: "postgresql://matomo:password@{{ .Release.Name }}-postgresql:5432/matomo"
+  sslCertificates:
+    create: true
+    # Values would be base64 encoded in a real deployment
+    cert: ""
+    key: ""
+
+# Dependencies configuration
+nats:
+  enabled: true
+  cluster:
+    enabled: true
+    replicas: 3
+  nats:
+    jetstream:
+      enabled: true
+  auth:
+    enabled: false
+
+postgresql:
+  enabled: true
+  auth:
+    username: videocall
+    password: changeme
+    database: videocall
+  primary:
+    persistence:
+      enabled: true
+      size: 8Gi 

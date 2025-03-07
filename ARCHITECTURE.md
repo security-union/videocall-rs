@@ -90,28 +90,6 @@ sequenceDiagram
     WebTransportServer-->>Client: Media & Data
 ```
 
-## Message Handling
-
-All communication in videocall.rs follows a consistent message format, regardless of transport protocol:
-
-```rust
-// Simplified message structure
-struct Message {
-    message_type: MessageType,
-    room_id: String,
-    sender: UserId,
-    payload: Vec<u8>,
-    timestamp: u64,
-}
-
-enum MessageType {
-    Join,
-    Leave,
-    Media,
-    ChatMessage,
-}
-```
-
 ### Message Flow
 
 1. **Client Generates Message**: A client creates a message (e.g., chat message, video frame)
@@ -126,24 +104,24 @@ enum MessageType {
 videocall.rs achieves horizontal scaling through its NATS-based architecture:
 
 ```mermaid
-flowchart TD
-    NATS[NATS<br>Messaging]
+graph TB
+    NATS((NATS<br>Messaging))
     
-    subgraph ActixServers["Actix Servers"]
-        Server1[Server 1<br>Actix] --> NATS
-        Server2[Server 2<br>Actix] --> NATS
-        Server3[Server 3<br>Actix] --> NATS
-    end
+    Server1[Server 1<br>Actix] --> NATS
+    Server2[Server 2<br>Actix] --> NATS
+    Server3[Server 3<br>Actix] --> NATS
     
-    subgraph WebTransportServers["WebTransport Servers"]
-        Server4[Server 4<br>WebTr.] --> NATS
-        Server5[Server 5<br>WebTr.] --> NATS
-        Server6[Server 6<br>WebTr.] --> NATS
-    end
+    NATS --> Server4[Server 4<br>WebTransport]
+    NATS --> Server5[Server 5<br>WebTransport]
+    NATS --> Server6[Server 6<br>WebTransport]
     
-    %% Position NATS between the two subgraphs
-    ActixServers ~~~ NATS
-    NATS ~~~ WebTransportServers
+    classDef actix fill:#333,stroke:#666,color:white
+    classDef webtransport fill:#222,stroke:#666,color:white
+    classDef nats fill:#444,stroke:#888,stroke-width:1px,color:white
+    
+    class Server1,Server2,Server3 actix
+    class Server4,Server5,Server6 webtransport
+    class NATS nats
 ```
 
 ### Scaling Characteristics
@@ -154,50 +132,10 @@ flowchart TD
 4. **Server Independence**: Servers can be added or removed without disrupting service
 5. **Failover**: If a server fails, clients can reconnect to another server
 
-### NATS Subject Structure
-
-- `room.<room_id>.join` - New participant events
-- `room.<room_id>.leave` - Participant departure events
-- `room.<room_id>.message` - Chat messages
-- `system.stats` - System performance metrics (in development)
-
 ## Media Processing
 
-videocall.rs uses WebTransport for media transmission, with custom optimizations:
-
-### Client-Side Processing
-
-1. **Media Capture**: Access to camera and microphone via browser APIs or native interfaces
-2. **Encoding**: Video encoded using VP8/VP9/H.264, audio with Opus
-3. **WebCodecs API**: Efficient media processing in modern browsers
-4. **Adaptive Bitrate**: Dynamic quality adjustment based on network conditions
-
-### Server-Side Processing (SFU Mode)
-
-For large meetings (10+ participants), the system switches to a Selective Forwarding Unit model:
-
-1. **Media Routing**: Server receives streams from broadcasters and selectively forwards to viewers via WebTransport
-2. **Speaker Detection**: Automated active speaker detection
-3. **Video Composition**: Optional server-side video composition for bandwidth-constrained clients
-4. **Recording**: Optional meeting recording functionality
+The media processing component handles the encoding and decoding of video streams. It supports various codecs and formats, including H.264, VP8, and VP9.
 
 ## Security Architecture
 
-### End-to-End Encryption
-
-When E2EE is enabled:
-
-1. **Key Exchange**: Peers exchange encryption keys using ECDH (Elliptic Curve Diffie-Hellman)
-2. **Media Encryption**: Media streams are encrypted before leaving the client
-3. **Server Blindness**: Servers cannot access the unencrypted media content
-4. **Key Rotation**: Regular key rotation for enhanced security
-
-### Transport Security
-
-1. **TLS/HTTPS**: All connections secured with TLS 1.3
-2. **QUIC Security**: WebTransport inherits QUIC's security properties
-3. **Certificate Validation**: Strict certificate validation
-
----
-
-This architecture document is meant to provide a clear understanding of how videocall.rs components fit together. For more detailed implementation information, please refer to the codebase documentation and comments. 
+The security architecture ensures that the system is secure and protects against common security threats. It includes features such as encryption, authentication, and access control.

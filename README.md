@@ -2,11 +2,11 @@
 
 [![GitHub Stars](https://img.shields.io/github/stars/security-union/videocall-rs?style=social)](https://github.com/security-union/videocall-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Discord](https://img.shields.io/discord/1234567890?color=7289DA&label=Discord&logo=discord&logoColor=white)](https://discord.gg/JP38NRe4CJ)
+[![Discord](https://img.shields.io/badge/Discord-Join%20Chat-7289DA?logo=discord&logoColor=white)](https://discord.gg/JP38NRe4CJ)
 
 An open-source, high-performance video conferencing platform built with Rust, providing real-time communication with low latency and end-to-end encryption.
 
-**[Website](https://videocall.rs)** | **[Documentation](https://docs.videocall.rs)** | **[Discord Community](https://discord.gg/JP38NRe4CJ)**
+**[Website](https://videocall.rs)** | **[Discord Community](https://discord.gg/JP38NRe4CJ)**
 
 ## Table of Contents
 
@@ -47,22 +47,34 @@ videocall.rs is a modern, open-source video conferencing system written entirely
 
 videocall.rs follows a microservices architecture with these primary components:
 
+```mermaid
+graph TD
+    Clients[Clients<br>Browsers, Mobile, CLI] -->|WebSocket| ActixAPI[Actix API<br>WebSocket]
+    Clients -->|WebTransport| WebTransportServer[WebTransport<br>Server]
+    ActixAPI --> NATS[NATS<br>Messaging]
+    WebTransportServer --> NATS
+```
+
 1. **actix-api:** Rust-based backend server using Actix Web framework
 2. **yew-ui:** Web frontend built with the Yew framework and compiled to WebAssembly
 3. **videocall-types:** Shared data types and protocol definitions
 4. **videocall-client:** Client library for native integration
 5. **videocall-cli:** Command-line interface for headless video streaming
-6. **videocall-daemon:** Background service for system integration
 
-![Architecture Diagram](https://videocall.rs/architecture.png)
+
+For a more detailed explanation of the system architecture, please see our [Architecture Document](ARCHITECTURE.md).
 
 ## Getting Started
+
+**⭐ RECOMMENDED: Docker is the only fully supported development method ⭐**
+
+We strongly recommend using the Docker-based setup for development, as it's well-maintained and provides consistent behavior across platforms. The manual setup described below is not as well maintained and may require additional troubleshooting.
 
 ### Prerequisites
 
 - Modern Linux distribution, macOS, or Windows 10/11
 - [Docker](https://docs.docker.com/engine/install/) and Docker Compose (for containerized setup)
-- [Rust toolchain](https://rustup.rs/) 1.70+ (for manual setup)
+- [Rust toolchain](https://rustup.rs/) 1.85+ (for manual setup)
 - Chrome/Chromium browser for frontend access
 
 ### Docker Setup
@@ -77,7 +89,7 @@ The quickest way to get started is with our Docker-based setup:
 
 2. Start the server (replace `<server-ip>` with your machine's IP address):
    ```
-   ACTIX_UI_BACKEND_URL=ws://<server-ip>:8080 make up
+   make up
    ```
 
 3. Open Chrome using the provided script for local WebTransport:
@@ -90,9 +102,11 @@ The quickest way to get started is with our Docker-based setup:
    http://<server-ip>/meeting/<username>/<meeting-id>
    ```
 
-### Manual Setup
+### Manual Setup (Experimental)
 
-For development or custom deployments:
+⚠️ **Warning**: This setup method is experimental and not as well maintained as the Docker approach. You may encounter issues that require manual debugging.
+
+For advanced users who prefer to run services directly on their machine:
 
 1. Create a PostgreSQL database:
    ```
@@ -153,7 +167,7 @@ videocall-cli stream \
   --bitrate-kbps 500
 ```
 
-For more usage examples, see our [usage documentation](https://docs.videocall.rs/usage).
+For detailed information about the CLI tool and all available options, see the [videocall-cli README](videocall-cli/README.md).
 
 ## Performance
 
@@ -163,16 +177,16 @@ videocall.rs has been benchmarked and optimized for the following scenarios:
 - **Small Groups (3-10):** Efficient mesh topology with adaptive quality based on network conditions
 - **Large Conferences:** Tested with up to 1000 participants using selective forwarding architecture
 
-Performance metrics and tuning guidelines are available in our [performance documentation](https://docs.videocall.rs/performance).
+Performance metrics and tuning guidelines will be available in our [performance documentation](PERFORMANCE.md). (WIP)
 
 ## Security
 
 Security is a core focus of videocall.rs:
 
-- **Transport Security:** All communications use TLS/HTTPS
-- **End-to-End Encryption:** Optional E2EE between peers with no server access to content
-- **Authentication:** Flexible integration with identity providers
-- **Access Controls:** Fine-grained permission system for meeting rooms
+- **Transport Security:** All communications use TLS/HTTPS.
+- **End-to-End Encryption:** Optional E2EE between peers with no server access to content.
+- **Authentication:** Flexible integration with identity providers.
+- **Access Controls:** Fine-grained permission system for meeting rooms.
 
 For details on our security model and best practices, see our [security documentation](https://docs.videocall.rs/security).
 
@@ -186,7 +200,6 @@ For details on our security model and best practices, see our [security document
 | 0.8.0   | Q1 2024    | 🔄 Screen Sharing Improvements |
 | 1.0.0   | Q2 2024    | 🔄 Production Release with Full API Stability |
 
-See our [detailed roadmap](https://github.com/security-union/videocall-rs/issues?q=is%3Aopen+is%3Aissue+label%3Aroadmap) for more information.
 
 ## Contributing
 
@@ -211,7 +224,6 @@ videocall-rs/
 ├── videocall-types/  # Shared type definitions
 ├── videocall-client/ # Client library
 ├── videocall-cli/    # Command-line interface
-├── videocall-daemon/ # System service
 ├── protobuf/         # Protocol buffer definitions
 └── rfc/              # Request for Comments process
 ```

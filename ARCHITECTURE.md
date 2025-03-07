@@ -55,55 +55,39 @@ graph TD
 
 ### WebSocket Connection Flow
 
-```
-┌────────┐          ┌──────────┐          ┌──────┐          ┌─────────┐
-│ Client │          │Actix API │          │ NATS │          │ Other   │
-│        │          │          │          │      │          │ Servers │
-└───┬────┘          └────┬─────┘          └──┬───┘          └────┬────┘
-    │                    │                   │                    │
-    │ WebSocket Connect  │                   │                    │
-    │ ─────────────────► │                   │                    │
-    │                    │                   │                    │
-    │  Authentication    │                   │                    │
-    │ ◄─────────────────►│                   │                    │
-    │                    │                   │                    │
-    │                    │ Subscribe to room │                    │
-    │                    │ ──────────────────►                    │
-    │                    │                   │                    │
-    │                    │                   │ Message broadcast  │
-    │                    │                   │ ───────────────────►
-    │                    │                   │                    │
-    │    Media & Data    │                   │                    │
-    │ ◄─────────────────►│                   │                    │
-    │                    │                   │                    │
+```mermaid
+sequenceDiagram
+    participant Client
+    participant ActixAPI as Actix API
+    participant NATS
+    participant OtherServers as Other Servers
+    
+    Client->>ActixAPI: WebSocket Connect
+    Client->>ActixAPI: Authentication
+    ActixAPI-->>Client: Authentication Response
+    ActixAPI->>NATS: Subscribe to room
+    NATS->>OtherServers: Message broadcast
+    Client->>ActixAPI: Media & Data
+    ActixAPI-->>Client: Media & Data
 ```
 
 ### WebTransport Connection Flow
 
-```
-┌────────┐        ┌─────────────┐        ┌──────┐        ┌──────────┐
-│ Client │        │ WebTransport│        │ NATS │        │ Other    │
-│        │        │   Server    │        │      │        │ Servers  │
-└───┬────┘        └──────┬──────┘        └──┬───┘        └─────┬────┘
-    │                    │                  │                  │
-    │  HTTP/3 Handshake  │                  │                  │
-    │ ─────────────────► │                  │                  │
-    │                    │                  │                  │
-    │ WebTransport Setup │                  │                  │
-    │ ◄─────────────────►│                  │                  │
-    │                    │                  │                  │
-    │ Create Streams     │                  │                  │
-    │ ─────────────────► │                  │                  │
-    │                    │                  │                  │
-    │                    │ Subscribe to room│                  │
-    │                    │ ─────────────────►                  │
-    │                    │                  │                  │
-    │                    │                  │Message broadcast │
-    │                    │                  │ ─────────────────►
-    │                    │                  │                  │
-    │    Media & Data    │                  │                  │
-    │ ◄─────────────────►│                  │                  │
-    │                    │                  │                  │
+```mermaid
+sequenceDiagram
+    participant Client
+    participant WebTransportServer as WebTransport Server
+    participant NATS
+    participant OtherServers as Other Servers
+    
+    Client->>WebTransportServer: HTTP/3 Handshake
+    Client->>WebTransportServer: WebTransport Setup
+    WebTransportServer-->>Client: WebTransport Setup Response
+    Client->>WebTransportServer: Create Streams
+    WebTransportServer->>NATS: Subscribe to room
+    NATS->>OtherServers: Message broadcast
+    Client->>WebTransportServer: Media & Data
+    WebTransportServer-->>Client: Media & Data
 ```
 
 ## Message Handling
@@ -141,30 +125,21 @@ enum MessageType {
 
 videocall.rs achieves horizontal scaling through its NATS-based architecture:
 
-```
-┌──────────┐     ┌──────────┐     ┌──────────┐
-│ Server 1 │     │ Server 2 │     │ Server 3 │
-│          │     │          │     │          │
-│ ┌──────┐ │     │ ┌──────┐ │     │ ┌──────┐ │
-│ │Actix │ │     │ │Actix │ │     │ │Actix │ │
-│ └──────┘ │     │ └──────┘ │     │ └──────┘ │
-└────┬─────┘     └────┬─────┘     └───┬──────┘
-     │                │               │
-     │                ▼               │
-     │         ┌─────────────┐        │
-     └────────►│     NATS    │◄───────┘
-               │  Messaging  │
-     ┌────────►│             │◄────────┐
-     │         └─────────────┘         │
-     │                ▲                │
-     │                │                │
-┌────┴─────┐     ┌────┴─────┐     ┌────┴─────┐
-│ Server 4 │     │ Server 5 │     │ Server 6 │
-│          │     │          │     │          │
-│ ┌──────┐ │     │ ┌──────┐ │     │ ┌──────┐ │
-│ │WebTr.│ │     │ │WebTr.│ │     │ │WebTr.│ │
-│ └──────┘ │     │ └──────┘ │     │ └──────┘ │
-└──────────┘     └──────────┘     └──────────┘
+```mermaid
+graph TD
+    subgraph "Actix Servers"
+        Server1[Server 1<br>Actix] --- NATS
+        Server2[Server 2<br>Actix] --- NATS
+        Server3[Server 3<br>Actix] --- NATS
+    end
+    
+    NATS[NATS<br>Messaging]
+    
+    subgraph "WebTransport Servers"
+        Server4[Server 4<br>WebTr.] --- NATS
+        Server5[Server 5<br>WebTr.] --- NATS
+        Server6[Server 6<br>WebTr.] --- NATS
+    end
 ```
 
 ### Scaling Characteristics

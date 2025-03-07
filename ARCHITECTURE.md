@@ -126,20 +126,24 @@ enum MessageType {
 videocall.rs achieves horizontal scaling through its NATS-based architecture:
 
 ```mermaid
-graph TD
-    subgraph "Actix Servers"
-        Server1[Server 1<br>Actix] --- NATS
-        Server2[Server 2<br>Actix] --- NATS
-        Server3[Server 3<br>Actix] --- NATS
-    end
-    
+flowchart TD
     NATS[NATS<br>Messaging]
     
-    subgraph "WebTransport Servers"
-        Server4[Server 4<br>WebTr.] --- NATS
-        Server5[Server 5<br>WebTr.] --- NATS
-        Server6[Server 6<br>WebTr.] --- NATS
+    subgraph ActixServers["Actix Servers"]
+        Server1[Server 1<br>Actix] --> NATS
+        Server2[Server 2<br>Actix] --> NATS
+        Server3[Server 3<br>Actix] --> NATS
     end
+    
+    subgraph WebTransportServers["WebTransport Servers"]
+        Server4[Server 4<br>WebTr.] --> NATS
+        Server5[Server 5<br>WebTr.] --> NATS
+        Server6[Server 6<br>WebTr.] --> NATS
+    end
+    
+    %% Position NATS between the two subgraphs
+    ActixServers ~~~ NATS
+    NATS ~~~ WebTransportServers
 ```
 
 ### Scaling Characteristics

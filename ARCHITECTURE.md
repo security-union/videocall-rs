@@ -16,25 +16,12 @@ This document provides a comprehensive overview of the videocall.rs architecture
 
 videocall.rs is designed as a distributed system with multiple specialized components that work together to provide real-time video conferencing. The architecture supports horizontal scaling through a pub/sub messaging system.
 
-```
-┌─────────────┐     ┌─────────────────────────────────────┐
-│             │     │          Backend Cluster            │
-│             │     │                                     │
-│             │     │ ┌─────────────┐                     │
-│             │     │ │             │                     │
-│   Clients   ├─────┼─►  Actix API  ├──┐                  │
-│  (Browsers, │     │ │ (WebSocket) │  │                  │
-│   Mobile,   │     │ │             │  │                  │
-│     CLI)    │     │ └─────────────┘  │                  │
-│             │     │                  │                  │
-│             │     │ ┌─────────────┐  │ ┌─────────────┐  │
-│             │     │ │             │  └─►             │  │
-│             ├─────┼─► WebTransport◄────►    NATS     │  │
-│             │     │ │    Server   │    │  Messaging  │  │
-│             │     │ │             ├────►             │  │
-└─────────────┘     │ └─────────────┘    └─────────────┘  │
-                    │                                     │
-                    └─────────────────────────────────────┘
+```mermaid
+graph TD
+    Clients[Clients<br>Browsers, Mobile, CLI] -->|WebSocket| ActixAPI[Actix API<br>WebSocket]
+    Clients -->|WebTransport| WebTransportServer[WebTransport<br>Server]
+    ActixAPI --> NATS[NATS<br>Messaging]
+    WebTransportServer --> NATS
 ```
 
 ## Key Components

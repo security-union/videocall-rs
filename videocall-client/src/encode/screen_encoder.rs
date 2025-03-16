@@ -86,16 +86,26 @@ impl ScreenEncoder {
         let screen_output_handler = {
             let mut buffer: [u8; 150000] = [0; 150000];
             let mut sequence_number = 0;
+            let client_clone = client.clone();
+            
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                
+                // Get DiagnosticsManager if available
+                let mut diag_manager_option = None;
+                if let Ok(diag) = client_clone.try_get_diagnostics_manager() {
+                    diag_manager_option = Some(diag);
+                }
+                
                 let packet: PacketWrapper = transform_screen_chunk(
                     chunk,
                     sequence_number,
                     &mut buffer,
                     &userid,
                     aes.clone(),
+                    diag_manager_option.as_mut(),
                 );
-                client.send_packet(packet);
+                client_clone.send_packet(packet);
                 sequence_number += 1;
             })
         };

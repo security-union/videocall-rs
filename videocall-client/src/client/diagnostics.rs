@@ -25,7 +25,7 @@ extern "C" {
 }
 
 /// Stream metrics tracked for a specific peer and media type
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StreamMetrics {
     peer_id: String, 
     media_type: MediaPacketType,
@@ -257,16 +257,6 @@ impl StreamMetrics {
     }
 }
 
-/// Manages diagnostics for all streams
-#[derive(Debug)]
-pub struct DiagnosticsManager {
-    stream_metrics: HashMap<String, StreamMetrics>,
-    own_user_id: String,
-    rtt_measurements: HashMap<String, u32>,
-    last_diagnostics_sent: Instant,
-    adaptation_params: AdaptationParameters,
-}
-
 /// Parameters used for adaptive streaming decisions
 #[derive(Debug)]
 pub struct AdaptationParameters {
@@ -289,6 +279,16 @@ impl Default for AdaptationParameters {
             keyframe_interval: 150, // Frames
         }
     }
+}
+
+/// Main diagnostics manager that tracks statistics from all peers
+#[derive(Debug)]
+pub struct DiagnosticsManager {
+    stream_metrics: HashMap<String, StreamMetrics>,
+    own_user_id: String,
+    rtt_measurements: HashMap<String, u32>,
+    last_diagnostics_sent: Instant,
+    adaptation_params: AdaptationParameters,
 }
 
 impl DiagnosticsManager {
@@ -502,6 +502,71 @@ impl DiagnosticsManager {
     /// Mark diagnostics as sent
     pub fn mark_diagnostics_sent(&mut self) {
         self.last_diagnostics_sent = Instant::now();
+    }
+
+    /// Track metrics for a frame that was encoded and sent
+    /// 
+    /// This method should be called by encoders whenever a frame is encoded and ready to be sent
+    /// 
+    /// # Parameters
+    /// * `own_id` - The sender's ID (usually our own user ID)
+    /// * `media_type` - The type of media (VIDEO, AUDIO, SCREEN)
+    /// * `timestamp` - The current timestamp when the frame was encoded
+    /// * `size_bytes` - The size of the encoded frame in bytes
+    /// * `sequence` - The sequence number of the frame
+    pub fn on_frame_encoded(&mut self, own_id: &str, media_type: MediaPacketType, 
+                           timestamp: f64, size_bytes: u32, sequence: u64) {
+        let stream_key = format!("outbound-{}-{:?}", own_id, media_type);
+        
+        // Get or create stream metrics for this peer/media type
+        let stream_metrics = self.stream_metrics.entry(stream_key.clone())
+            .or_insert_with(|| StreamMetrics::new(own_id.to_string(), media_type));
+        
+        // Add frame timestamp for FPS calculations
+        stream_metrics.add_frame_timestamp(timestamp);
+        
+        // Update sequence for tracking
+        stream_metrics.add_sequence(sequence);
+        
+        // Calculate approximate bitrate based on frame size and time since last frame
+        if let Some(last_timestamp) = stream_metrics.last_frame_received {
+            let time_diff_sec = (timestamp - last_timestamp) / 1000.0;
+            if time_diff_sec > 0.0 {
+                // Calculate bitrate in kbps
+                let bitrate_kbps = ((size_bytes as f64 * 8.0) / time_diff_sec) / 1000.0;
+                stream_metrics.update_bitrate(bitrate_kbps as u32);
+            }
+        }
+        
+        // Record encoding resolution for video/screen frames
+        match media_type {
+            MediaPacketType::VIDEO | MediaPacketType::SCREEN => {
+                // For video, we'll get resolution from constants or encoders later
+                // For now, use placeholder values
+                stream_metrics.update_resolution(1280, 720);
+            },
+            MediaPacketType::AUDIO => {
+                // For audio, we'll get sample rate and channels later
+                // For now, use placeholder values
+                stream_metrics.update_audio_params(48000, 2);
+            },
+            _ => {} // Ignore other media types
+        }
+        
+        debug!("Encoded frame: peer={}, type={:?}, sequence={}, size={}KB", 
+              own_id, media_type, sequence, size_bytes / 1024);
+    }
+}
+
+impl Clone for DiagnosticsManager {
+    fn clone(&self) -> Self {
+        Self {
+            stream_metrics: self.stream_metrics.clone(),
+            own_user_id: self.own_user_id.clone(),
+            rtt_measurements: self.rtt_measurements.clone(),
+            last_diagnostics_sent: Instant::now(), // Create a new Instant as it's not cloneable
+            adaptation_params: self.adaptation_params.clone(),
+        }
     }
 }
 

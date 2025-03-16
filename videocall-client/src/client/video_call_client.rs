@@ -274,6 +274,20 @@ impl VideoCallClient {
         &self.options.userid
     }
 
+    /// Tries to get a clone of the DiagnosticsManager if available
+    pub fn try_get_diagnostics_manager(&self) -> Result<DiagnosticsManager> {
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                if let Some(ref diag) = inner.diagnostics_manager {
+                    Ok(diag.clone())
+                } else {
+                    Err(anyhow!("DiagnosticsManager not available"))
+                }
+            }
+            Err(_) => Err(anyhow!("Could not borrow inner"))
+        }
+    }
+
     fn send_heartbeat_and_diagnostics(&self, user_id: String, elapsed_seconds: i32) {
         // First, check if we can borrow
         if let Ok(inner) = self.inner.try_borrow() {

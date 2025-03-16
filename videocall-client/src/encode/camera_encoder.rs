@@ -99,40 +99,49 @@ impl CameraEncoder {
     /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
     /// called, or if [`encoder.select(device_id)`](Self::select) has not been called.
     pub fn start(&mut self) {
-        // 1. Query the first device with a camera and a mic attached.
-        // 2. setup WebCodecs, in particular
-        // 3. send encoded video frames and raw audio to the server.
+        let device_id = if let Some(device) = &self.state.selected {
+            device.to_string()
+        } else {
+            return;
+        };
+        let video_elem_id = self.video_elem_id.clone();
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
-        let video_elem_id = self.video_elem_id.clone();
+        
         let EncoderState {
             destroy,
             enabled,
             switching,
             ..
         } = self.state.clone();
+        
         let video_output_handler = {
-            let mut buffer: [u8; 100000] = [0; 100000];
-            let mut sequence_number = 0;
+            let mut buffer: [u8; 150000] = [0; 150000];
+            let mut sequence = 0;
+            let client_clone = client.clone();
+            
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                // Get DiagnosticsManager if available
+                let mut diag_manager_option = None;
+                if let Ok(diag) = client_clone.try_get_diagnostics_manager() {
+                    diag_manager_option = Some(diag);
+                }
+                
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
-                    sequence_number,
+                    sequence,
                     &mut buffer,
                     &userid,
                     aes.clone(),
+                    diag_manager_option.as_mut(),
                 );
-                client.send_packet(packet);
-                sequence_number += 1;
+                client_clone.send_packet(packet);
+                sequence += 1;
             })
         };
-        let device_id = if let Some(vid) = &self.state.selected {
-            vid.to_string()
-        } else {
-            return;
-        };
+        
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let video_element = window()

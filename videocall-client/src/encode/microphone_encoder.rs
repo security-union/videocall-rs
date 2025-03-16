@@ -97,24 +97,36 @@ impl MicrophoneEncoder {
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
+        
         let audio_output_handler = {
             let mut buffer: [u8; 100000] = [0; 100000];
             let mut sequence = 0;
+            let client_clone = client.clone();
+            
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
+                
+                // Get DiagnosticsManager if available
+                let mut diag_manager_option = None;
+                if let Ok(diag) = client_clone.try_get_diagnostics_manager() {
+                    diag_manager_option = Some(diag);
+                }
+                
                 let packet: PacketWrapper =
-                    transform_audio_chunk(&chunk, &mut buffer, &userid, sequence, aes.clone());
-                client.send_packet(packet);
+                    transform_audio_chunk(&chunk, &mut buffer, &userid, sequence, aes.clone(), 
+                                         diag_manager_option.as_mut());
+                client_clone.send_packet(packet);
                 sequence += 1;
             })
         };
+        
         let EncoderState {
             destroy,
             enabled,
             switching,
             ..
         } = self.state.clone();
-
+        
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let media_devices = navigator.media_devices().unwrap();

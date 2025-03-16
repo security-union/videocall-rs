@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+message DiagnosticsPacket {
+  // Basic identification
+  string stream_id = 1;        // Identifier for the specific stream being diagnosed
+  string sender_id = 2;        // Email/ID of who is sending this diagnostic message
+  string target_id = 3;        // Email/ID of who the diagnostic is about
+  uint64 timestamp_ms = 4;     // When these diagnostics were collected
+  
+  // Stream type
+  MediaType media_type = 5;    // Type of media (audio/video/screen)
+  
+  // Common metrics for both audio and video
+  float packet_loss_percent = 6;      // Percentage of packets lost (0-100)
+  uint32 median_latency_ms = 7;       // Median end-to-end latency in milliseconds
+  uint32 jitter_ms = 8;               // Jitter in milliseconds
+  uint32 estimated_bandwidth_kbps = 9; // Estimated available bandwidth in Kbps
+  uint32 round_trip_time_ms = 13;     // Round-trip time between sender and receiver in milliseconds
+  
+  // Video-specific metrics (only populated for video streams)
+  VideoMetrics video_metrics = 10;
+  
+  // Audio-specific metrics (only populated for audio streams)
+  AudioMetrics audio_metrics = 11;
+  
+  // Quality adaptation hints to the sender
+  QualityHints quality_hints = 12;
+  
+  enum MediaType {
+    VIDEO = 0;
+    AUDIO = 1;
+    SCREEN = 2;
+  }
+}
+
+// Video-specific diagnostic metrics
+message VideoMetrics {
+  float fps_received = 1;      // Frames per second being received
+  uint32 width = 2;            // Current video width
+  uint32 height = 3;           // Current video height
+  uint32 bitrate_kbps = 4;     // Current measured bitrate in Kbps
+  uint32 decode_time_ms = 5;   // Average time to decode each frame
+  uint32 freeze_count = 6;     // Number of video freezes in the last reporting period
+  uint32 keyframes_received = 7; // Number of keyframes received in the last reporting period
+}
+
+// Audio-specific diagnostic metrics
+message AudioMetrics {
+  float audio_level = 1;       // Audio level (0.0-1.0)
+  uint32 sample_rate = 2;      // Sample rate in Hz
+  uint32 bitrate_kbps = 3;     // Current measured bitrate in Kbps
+  uint32 channels = 4;         // Number of audio channels
+  uint32 packets_lost = 5;     // Total packets lost during this reporting period
+  bool echo_detected = 6;      // Whether echo is detected
+  bool noise_detected = 7;     // Whether excessive noise is detected
+}
+
+// Quality hints that the receiver sends to the sender
+message QualityHints {
+  uint32 target_bitrate_kbps = 1;    // Suggested target bitrate
+  QualityPreference preference = 2;   // Quality preference
+  
+  enum QualityPreference {
+    BALANCED = 0;              // Balance between resolution and framerate
+    PRIORITIZE_FRAMERATE = 1;  // Prefer higher framerate over resolution
+    PRIORITIZE_RESOLUTION = 2; // Prefer higher resolution over framerate
+    PRIORITIZE_LOW_LATENCY = 3; // Prefer lowest possible latency
+  }
+}

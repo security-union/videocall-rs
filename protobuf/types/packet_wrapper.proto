@@ -6,6 +6,7 @@ message PacketWrapper {
     AES_KEY = 1;
     MEDIA = 2;
     CONNECTION = 3;
+    DIAGNOSTICS = 4;
   }
   PacketType packet_type = 1;
   string email = 2;

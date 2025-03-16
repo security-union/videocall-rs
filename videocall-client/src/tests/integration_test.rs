@@ -1,7 +1,6 @@
 use crate::client::diagnostics::DiagnosticsManager;
 use crate::decode::PeerDecodeManager;
 use crate::tests::mock_packet::MockPacketGenerator;
-use std::time::Duration;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::Callback;
 

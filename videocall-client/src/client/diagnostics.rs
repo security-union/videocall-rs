@@ -1,7 +1,6 @@
 use log::{debug, error, info};
 use protobuf::{Message, MessageField};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 use videocall_types::protos::diagnostics_packet::{
     AudioMetrics, DiagnosticsPacket, QualityHints, VideoMetrics,
 };
@@ -10,6 +9,10 @@ use videocall_types::protos::media_packet::media_packet::MediaType as MediaPacke
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::*;
+
+// Add js-sys for Date.now()
+#[cfg(target_arch = "wasm32")]
+use js_sys::Date;
 
 // Constants for diagnostics collection
 const DIAGNOSTICS_INTERVAL_MS: u32 = 2000; // Send diagnostics every 2 seconds
@@ -20,8 +23,29 @@ extern "C" {
     #[wasm_bindgen(js_namespace = console)]
     fn log(s: &str);
     
+    #[cfg(target_arch = "wasm32")]
     #[wasm_bindgen(js_namespace = self)]
     fn performance_now() -> f64;
+}
+
+// Function to get current time in milliseconds (WASM compatible)
+fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Use Date.now() in WASM context
+        Date::now()
+    }
+    
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // For non-WASM testing, just return a mock timestamp
+        // This avoids using std::time completely
+        static mut COUNTER: u64 = 1000;
+        unsafe {
+            COUNTER += 100;
+            COUNTER as f64
+        }
+    }
 }
 
 /// Stream metrics tracked for a specific peer and media type
@@ -192,7 +216,7 @@ impl StreamMetrics {
         packet.stream_id = format!("{}:{:?}", self.peer_id, self.media_type);
         packet.sender_id = sender_id;
         packet.target_id = self.peer_id.clone();
-        packet.timestamp_ms = js_sys::Date::now() as u64;
+        packet.timestamp_ms = now_ms() as u64;
         
         // Media type
         packet.media_type = match self.media_type {
@@ -287,7 +311,7 @@ pub struct DiagnosticsManager {
     stream_metrics: HashMap<String, StreamMetrics>,
     own_user_id: String,
     rtt_measurements: HashMap<String, u32>,
-    last_diagnostics_sent: Instant,
+    last_diagnostics_sent: f64, // Timestamp in milliseconds
     adaptation_params: AdaptationParameters,
 }
 
@@ -297,7 +321,7 @@ impl DiagnosticsManager {
             stream_metrics: HashMap::new(),
             own_user_id: user_id,
             rtt_measurements: HashMap::new(),
-            last_diagnostics_sent: Instant::now(),
+            last_diagnostics_sent: now_ms(),
             adaptation_params: AdaptationParameters::default(),
         }
     }
@@ -496,12 +520,12 @@ impl DiagnosticsManager {
     
     /// Check if it's time to send diagnostics
     pub fn should_send_diagnostics(&self) -> bool {
-        self.last_diagnostics_sent.elapsed() >= Duration::from_millis(DIAGNOSTICS_INTERVAL_MS as u64)
+        (now_ms() - self.last_diagnostics_sent) >= DIAGNOSTICS_INTERVAL_MS as f64
     }
     
     /// Mark diagnostics as sent
     pub fn mark_diagnostics_sent(&mut self) {
-        self.last_diagnostics_sent = Instant::now();
+        self.last_diagnostics_sent = now_ms();
     }
 
     /// Track metrics for a frame that was encoded and sent
@@ -516,6 +540,9 @@ impl DiagnosticsManager {
     /// * `sequence` - The sequence number of the frame
     pub fn on_frame_encoded(&mut self, own_id: &str, media_type: MediaPacketType, 
                            timestamp: f64, size_bytes: u32, sequence: u64) {
+        debug!("Diagnostics recording encoded frame: id={}, type={:?}, seq={}, size={}KB", 
+               own_id, media_type, sequence, size_bytes / 1024);
+        
         let stream_key = format!("outbound-{}-{:?}", own_id, media_type);
         
         // Get or create stream metrics for this peer/media type
@@ -535,6 +562,7 @@ impl DiagnosticsManager {
                 // Calculate bitrate in kbps
                 let bitrate_kbps = ((size_bytes as f64 * 8.0) / time_diff_sec) / 1000.0;
                 stream_metrics.update_bitrate(bitrate_kbps as u32);
+                debug!("Calculated outbound bitrate: {}kbps for {}", bitrate_kbps as u32, stream_key);
             }
         }
         
@@ -552,9 +580,6 @@ impl DiagnosticsManager {
             },
             _ => {} // Ignore other media types
         }
-        
-        debug!("Encoded frame: peer={}, type={:?}, sequence={}, size={}KB", 
-              own_id, media_type, sequence, size_bytes / 1024);
     }
 }
 
@@ -564,7 +589,7 @@ impl Clone for DiagnosticsManager {
             stream_metrics: self.stream_metrics.clone(),
             own_user_id: self.own_user_id.clone(),
             rtt_measurements: self.rtt_measurements.clone(),
-            last_diagnostics_sent: Instant::now(), // Create a new Instant as it's not cloneable
+            last_diagnostics_sent: now_ms(), // Use WASM-compatible time
             adaptation_params: self.adaptation_params.clone(),
         }
     }

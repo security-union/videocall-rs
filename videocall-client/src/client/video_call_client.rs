@@ -4,7 +4,7 @@ use super::diagnostics::DiagnosticsManager;
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use anyhow::{anyhow, Result};
-use log::{debug, error};
+use log::{debug, error, warn};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
@@ -102,12 +102,18 @@ impl VideoCallClient {
     /// See [VideoCallClientOptions] for description of the options.
     ///
     pub fn new(options: VideoCallClientOptions) -> Self {
+        debug!("Creating VideoCallClient for user: {}", options.userid);
+        
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
         let inner_options = InnerOptions {
             enable_e2ee: options.enable_e2ee,
             userid: options.userid.clone(),
             on_peer_added: options.on_peer_added.clone(),
         };
+        
+        debug!("Creating DiagnosticsManager for user: {}", options.userid);
+        let diagnostics_manager = DiagnosticsManager::new(options.userid.clone());
+        
         let inner = Rc::new(RefCell::new(Inner {
             options: inner_options,
             connection: None,
@@ -118,8 +124,10 @@ impl VideoCallClient {
                 options.get_peer_video_canvas_id.clone(),
                 options.get_peer_screen_canvas_id.clone(),
             ),
-            diagnostics_manager: Some(DiagnosticsManager::new(options.userid.clone())),
+            diagnostics_manager: Some(diagnostics_manager),
         }));
+        
+        debug!("VideoCallClient initialization complete for user: {}", options.userid);
 
         Self {
             options,
@@ -223,10 +231,23 @@ impl VideoCallClient {
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
+        debug!("Attempting to send packet: type={:?}, from={}, size={}B", 
+               media.packet_type.enum_value(),
+               media.email,
+               media.data.len());
+        
         match self.inner.try_borrow() {
-            Ok(inner) => inner.send_packet(media),
-            Err(_) => {
-                error!("Unable to borrow inner -- dropping send packet {:?}", media)
+            Ok(inner) => {
+                debug!("Successfully borrowed inner state to send packet");
+                inner.send_packet(media);
+            },
+            Err(e) => {
+                error!("Unable to borrow inner for send_packet: {:?}. Error: {}. Dropping packet type={:?}, from={}, size={}B", 
+                       e, 
+                       e.to_string(), 
+                       media.packet_type.enum_value(),
+                       media.email,
+                       media.data.len());
             }
         }
     }
@@ -276,15 +297,21 @@ impl VideoCallClient {
 
     /// Tries to get a clone of the DiagnosticsManager if available
     pub fn try_get_diagnostics_manager(&self) -> Result<DiagnosticsManager> {
+        debug!("Attempting to get diagnostics manager");
         match self.inner.try_borrow() {
             Ok(inner) => {
                 if let Some(ref diag) = inner.diagnostics_manager {
+                    debug!("Successfully retrieved diagnostics manager");
                     Ok(diag.clone())
                 } else {
+                    debug!("DiagnosticsManager not available in inner state");
                     Err(anyhow!("DiagnosticsManager not available"))
                 }
             }
-            Err(_) => Err(anyhow!("Could not borrow inner"))
+            Err(e) => {
+                warn!("Could not borrow inner state to get diagnostics manager: {:?}", e);
+                Err(anyhow!("Could not borrow inner: {}", e))
+            }
         }
     }
 
@@ -296,7 +323,10 @@ impl VideoCallClient {
                 let packet = MediaPacket {
                     media_type: MediaType::HEARTBEAT.into(),
                     email: user_id.clone(),
+                    #[cfg(target_arch = "wasm32")]
                     timestamp: js_sys::Date::now(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    timestamp: 1000.0, // Mock timestamp for non-WASM environments
                     ..Default::default()
                 };
                 if let Ok(data) = inner.aes.encrypt(&packet.write_to_bytes().unwrap()) {
@@ -346,7 +376,16 @@ impl VideoCallClient {
 impl Inner {
     fn send_packet(&self, media: PacketWrapper) {
         if let Some(connection) = &self.connection {
+            debug!("Sending packet through connection: type={:?}, from={}, size={}B",
+                  media.packet_type.enum_value(),
+                  media.email,
+                  media.data.len());
             connection.send_packet(media);
+        } else {
+            warn!("Cannot send packet - no active connection: type={:?}, from={}, size={}B",
+                 media.packet_type.enum_value(),
+                 media.email,
+                 media.data.len());
         }
     }
 

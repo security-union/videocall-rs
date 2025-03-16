@@ -22,24 +22,75 @@
 //!
 //! ## Client creation and connection:
 //! ```no_run
-//! let options = VideoCallClientOptions {...}; // set parameters and callbacks for various events
+//! use videocall_client::{VideoCallClient, VideoCallClientOptions};
+//! use yew::Callback;
+//! use wasm_bindgen::JsValue;
+//! use videocall_types::protos::media_packet::media_packet::MediaType;
+//! 
+//! // Create client options
+//! let options = VideoCallClientOptions {
+//!     userid: "test-user".to_string(),
+//!     websocket_url: "wss://example.com/ws".to_string(),
+//!     webtransport_url: "https://example.com/wt".to_string(),
+//!     enable_e2ee: false,
+//!     enable_webtransport: false,
+//!     on_peer_added: Callback::noop(),
+//!     on_peer_first_frame: Callback::noop(),
+//!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
+//!     get_peer_screen_canvas_id: Callback::from(|_| "screen-canvas".to_string()),
+//!     on_connected: Callback::noop(),
+//!     on_connection_lost: Callback::noop(),
+//! };
+//! 
+//! // Create the client
 //! let client = VideoCallClient::new(options);
-//!
-//! client.connect();
+//! 
+//! // Connect to the server
+//! let _ = client.connect();
 //! ```
 //!
 //! ## Encoder creation:
 //! ```no_run
-//! let camera = CameraEncoder.new(client, video_element_id);
-//! let microphone = MicrophoneEncoder.new(client);
-//! let screen = ScreenEncoder.new(client);
-//!
-//! camera.select(video_device);
+//! # use videocall_client::{VideoCallClient, VideoCallClientOptions, CameraEncoder, MicrophoneEncoder, ScreenEncoder};
+//! # use yew::Callback;
+//! # use wasm_bindgen::JsValue;
+//! # use videocall_types::protos::media_packet::media_packet::MediaType;
+//! # 
+//! # // Create client options
+//! # let options = VideoCallClientOptions {
+//! #    userid: "test-user".to_string(),
+//! #    websocket_url: "wss://example.com/ws".to_string(),
+//! #    webtransport_url: "https://example.com/wt".to_string(),
+//! #    enable_e2ee: false,
+//! #    enable_webtransport: false,
+//! #    on_peer_added: Callback::noop(),
+//! #    on_peer_first_frame: Callback::noop(),
+//! #    get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
+//! #    get_peer_screen_canvas_id: Callback::from(|_| "screen-canvas".to_string()),
+//! #    on_connected: Callback::noop(),
+//! #    on_connection_lost: Callback::noop(),
+//! # };
+//! # // Create the client
+//! # let client = VideoCallClient::new(options);
+//! # let video_element_id = "local-video";
+//! # let device_id = "camera1";
+//! 
+//! // Create encoders (note: these take ownership of client)
+//! let mut camera = CameraEncoder::new(client.clone(), video_element_id);
+//! let mut microphone = MicrophoneEncoder::new(client.clone());
+//! let mut screen = ScreenEncoder::new(client);
+//! 
+//! // Use camera
+//! camera.select(device_id.to_string());
 //! camera.start();
 //! camera.stop();
-//! microphone.select(video_device);
+//! 
+//! // Use microphone
+//! microphone.select(device_id.to_string());
 //! microphone.start();
 //! microphone.stop();
+//! 
+//! // Use screen sharing
 //! screen.start();
 //! screen.stop();
 //! ```
@@ -47,25 +98,55 @@
 //! ## Device access permission:
 //!
 //! ```no_run
-//! let media_device_access = MediaDeviceAccess::new();
-//! media_device_access.on_granted = ...; // callback
-//! media_device_access.on_denied = ...; // callback
+//! # use videocall_client::MediaDeviceAccess;
+//! # use yew::Callback;
+//! # use wasm_bindgen::JsValue;
+//! 
+//! let mut media_device_access = MediaDeviceAccess::new();
+//! 
+//! // Set up callbacks
+//! media_device_access.on_granted = Callback::from(|_: ()| {
+//!     println!("Access granted!");
+//! });
+//! 
+//! media_device_access.on_denied = Callback::from(|err: JsValue| {
+//!     println!("Access denied: {:?}", err);
+//! });
+//! 
+//! // Request access to devices
 //! media_device_access.request();
 //! ```
 //!
 //! ### Device query and listing:
 //! ```no_run
-//! let media_device_list = MediaDeviceList::new();
-//! media_device_list.audio_inputs.on_selected = ...; // callback
-//! media_device_access.video_inputs.on_selected = ...; // callback
-//!
+//! # use videocall_client::MediaDeviceList;
+//! # use yew::Callback;
+//! 
+//! let mut media_device_list = MediaDeviceList::new();
+//! 
+//! // Set up callbacks
+//! media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
+//!     println!("Audio device selected: {}", device_id);
+//! });
+//! 
+//! media_device_list.video_inputs.on_selected = Callback::from(|device_id: String| {
+//!     println!("Video device selected: {}", device_id);
+//! });
+//! 
+//! // Load devices
 //! media_device_list.load();
-//!
+//! 
+//! // Access devices and select them
 //! let microphones = media_device_list.audio_inputs.devices();
 //! let cameras = media_device_list.video_inputs.devices();
-//! media_device_list.audio_inputs.select(&microphones[i].device_id);
-//! media_device_list.video_inputs.select(&cameras[i].device_id);
-//!
+//! 
+//! if !microphones.is_empty() {
+//!     media_device_list.audio_inputs.select(&microphones[0].device_id());
+//! }
+//! 
+//! if !cameras.is_empty() {
+//!     media_device_list.video_inputs.select(&cameras[0].device_id());
+//! }
 //! ```
 
 mod client;

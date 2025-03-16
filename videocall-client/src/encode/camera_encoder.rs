@@ -123,10 +123,20 @@ impl CameraEncoder {
             
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                
+                // Log the start of packet processing
+                debug!("Camera encoder processing chunk: timestamp={}, type={:?}, size={}B", 
+                       chunk.timestamp(), 
+                       chunk.type_(), 
+                       chunk.byte_length());
+                
                 // Get DiagnosticsManager if available
                 let mut diag_manager_option = None;
                 if let Ok(diag) = client_clone.try_get_diagnostics_manager() {
+                    debug!("Successfully acquired diagnostics manager for camera encoder");
                     diag_manager_option = Some(diag);
+                } else {
+                    debug!("Failed to acquire diagnostics manager for camera encoder");
                 }
                 
                 let packet: PacketWrapper = transform_video_chunk(
@@ -137,7 +147,12 @@ impl CameraEncoder {
                     aes.clone(),
                     diag_manager_option.as_mut(),
                 );
+                
+                debug!("Camera encoder sending packet: sequence={}, email={}", sequence, userid);
+                
+                // Try to send the packet and log any issues
                 client_clone.send_packet(packet);
+                
                 sequence += 1;
             })
         };

@@ -20,7 +20,12 @@ pub fn transform_video_chunk(
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
+    
+    #[cfg(target_arch = "wasm32")]
     let now = js_sys::Date::now();
+    
+    #[cfg(not(target_arch = "wasm32"))]
+    let now = 1000.0; // Mock timestamp for non-WASM environments
     
     let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
@@ -72,12 +77,17 @@ pub fn transform_screen_chunk(
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
+    
+    #[cfg(target_arch = "wasm32")]
     let now = js_sys::Date::now();
     
+    #[cfg(not(target_arch = "wasm32"))]
+    let now = 1000.0; // Mock timestamp for non-WASM environments
+    
     let mut media_packet: MediaPacket = MediaPacket {
-        email: email.to_owned(),
         data: buffer[0..byte_length].to_vec(),
         frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
+        email: email.to_owned(),
         media_type: MediaType::SCREEN.into(),
         timestamp: chunk.timestamp(),
         video_metadata: Some(VideoMetadata {
@@ -124,18 +134,21 @@ pub fn transform_audio_chunk(
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     chunk.copy_to_with_u8_array(buffer);
+    
+    #[cfg(target_arch = "wasm32")]
     let now = js_sys::Date::now();
     
-    let mut media_packet: MediaPacket = MediaPacket {
-        email: email.to_owned(),
-        media_type: MediaType::AUDIO.into(),
+    #[cfg(not(target_arch = "wasm32"))]
+    let now = 1000.0; // Mock timestamp for non-WASM environments
+    
+    let mut media_packet = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
         frame_type: EncodedAudioChunkTypeWrapper(chunk.type_()).to_string(),
+        email: email.to_owned(),
+        media_type: MediaType::AUDIO.into(),
         timestamp: chunk.timestamp(),
         audio_metadata: Some(AudioMetadata {
-            audio_sample_rate: 48000.0, // Using 48kHz as default sample rate
-            audio_number_of_channels: 2, // Default, will be updated if available
-            audio_number_of_frames: sequence as u32, // Use sequence as frame count
+            audio_sample_rate: 0.0,
             ..Default::default()
         })
         .into(),

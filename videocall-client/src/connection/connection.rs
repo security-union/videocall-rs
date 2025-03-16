@@ -6,6 +6,7 @@ use super::task::Task;
 use super::ConnectOptions;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
+use log::{debug, warn};
 use protobuf::Message;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -82,7 +83,10 @@ impl Connection {
             let packet = MediaPacket {
                 media_type: MediaType::HEARTBEAT.into(),
                 email: userid.clone(),
+                #[cfg(target_arch = "wasm32")]
                 timestamp: js_sys::Date::now(),
+                #[cfg(not(target_arch = "wasm32"))]
+                timestamp: 1000.0, // Mock timestamp for non-WASM environments
                 ..Default::default()
             };
             let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();
@@ -109,7 +113,17 @@ impl Connection {
 
     pub fn send_packet(&self, packet: PacketWrapper) {
         if let Status::Connected = self.status.get() {
+            debug!("Connection layer sending packet: type={:?}, from={}, size={}B", 
+                   packet.packet_type.enum_value(),
+                   packet.email,
+                   packet.data.len());
             self.task.send_packet(packet);
+        } else {
+            warn!("Cannot send packet - connection status is not Connected: status={:?}, type={:?}, from={}, size={}B",
+                 self.status.get(),
+                 packet.packet_type.enum_value(),
+                 packet.email,
+                 packet.data.len());
         }
     }
 }

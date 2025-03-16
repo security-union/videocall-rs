@@ -25,10 +25,18 @@ impl MediaDeviceAccess {
     /// After construction, set the callbacks, then call the [`request()`](Self::request) method to request
     /// access, e.g.:
     ///
-    /// ```
-    /// let media_device_access = MediaDeviceAccess::new();
-    /// media_device_access.on_granted = ...; // callback
-    /// media_device_access.on_denied = ...; // callback
+    /// ```no_run
+    /// # use videocall_client::MediaDeviceAccess;
+    /// # use yew::Callback;
+    /// # use wasm_bindgen::JsValue;
+    /// #
+    /// let mut media_device_access = MediaDeviceAccess::new();
+    /// media_device_access.on_granted = Callback::from(|_| {
+    ///     println!("Access granted!");
+    /// });
+    /// media_device_access.on_denied = Callback::from(|err: JsValue| {
+    ///     println!("Access denied: {:?}", err);
+    /// });
     /// media_device_access.request();
     /// ```
     pub fn new() -> Self {

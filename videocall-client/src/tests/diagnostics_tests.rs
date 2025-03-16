@@ -1,6 +1,5 @@
-use crate::client::diagnostics::DiagnosticsManager;
+use crate::client::diagnostics::{DiagnosticsManager, now_ms};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use std::time::{Duration, Instant};
 
 #[cfg(test)]
 mod tests {
@@ -66,7 +65,7 @@ mod tests {
         manager.on_frame_received("peer1", MediaType::VIDEO, 1033.0, 15, Some(2));
         
         // Force the last sent time to be in the past
-        manager.override_last_sent_time(Instant::now() - Duration::from_secs(5));
+        manager.override_last_sent_time(now_ms() - 5000.0); // 5 seconds ago
         
         // Now it should want to send
         assert!(manager.should_send_diagnostics());
@@ -125,40 +124,35 @@ mod tests {
 impl DiagnosticsManager {
     // Only used in tests to check peer existence
     fn has_peer_data(&self, peer_id: &str) -> bool {
-        self.peer_metrics.contains_key(peer_id)
+        self.stream_metrics.iter().any(|(_, metrics)| metrics.peer_id == peer_id)
     }
     
     // Only used in tests to check frame counts
     fn get_frame_count(&self, peer_id: &str, media_type: MediaType) -> usize {
-        if let Some(metrics) = self.peer_metrics.get(peer_id) {
-            match media_type {
-                MediaType::VIDEO => metrics.video_frames.len(),
-                MediaType::AUDIO => metrics.audio_frames.len(),
-                _ => 0,
-            }
+        // Count frames by checking timestamps for this peer/media type
+        let key = Self::get_stream_key(peer_id, media_type);
+        if let Some(metrics) = self.stream_metrics.get(&key) {
+            metrics.frame_timestamps.len()
         } else {
             0
         }
     }
     
     // Only used in tests to override the last sent time
-    fn override_last_sent_time(&mut self, time: Instant) {
+    fn override_last_sent_time(&mut self, time: f64) {
         self.last_diagnostics_sent = time;
     }
     
     // Only used in tests to get the local user ID
     fn get_local_user_id(&self) -> &str {
-        &self.local_user_id
+        &self.own_user_id
     }
     
     // Only used in tests to get resolution
     fn get_resolution(&self, peer_id: &str, media_type: MediaType) -> (u32, u32) {
-        if let Some(metrics) = self.peer_metrics.get(peer_id) {
-            match media_type {
-                MediaType::VIDEO => (metrics.video_width, metrics.video_height),
-                MediaType::SCREEN => (metrics.screen_width, metrics.screen_height),
-                _ => (0, 0),
-            }
+        let key = Self::get_stream_key(peer_id, media_type);
+        if let Some(metrics) = self.stream_metrics.get(&key) {
+            (metrics.resolution_width, metrics.resolution_height)
         } else {
             (0, 0)
         }
@@ -166,8 +160,9 @@ impl DiagnosticsManager {
     
     // Only used in tests to get audio parameters
     fn get_audio_params(&self, peer_id: &str) -> (u32, u32) {
-        if let Some(metrics) = self.peer_metrics.get(peer_id) {
-            (metrics.audio_sample_rate, metrics.audio_channels)
+        let key = Self::get_stream_key(peer_id, MediaType::AUDIO);
+        if let Some(metrics) = self.stream_metrics.get(&key) {
+            (metrics.sample_rate.unwrap_or(0), metrics.channels.unwrap_or(0))
         } else {
             (0, 0)
         }

@@ -31,6 +31,15 @@ impl Task {
     }
 
     pub fn send_packet(&self, packet: PacketWrapper) {
+        debug!("Task sending packet: type={:?}, from={}, size={}B, transport={}", 
+               packet.packet_type.enum_value(),
+               packet.email,
+               packet.data.len(),
+               match self {
+                   Task::WebSocket(_) => "WebSocket",
+                   Task::WebTransport(_) => "WebTransport",
+               });
+               
         match self {
             Task::WebSocket(ws) => ws.send_packet(packet),
             Task::WebTransport(wt) => wt.send_packet(packet),

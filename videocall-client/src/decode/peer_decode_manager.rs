@@ -189,7 +189,21 @@ pub struct PeerDecodeManager {
 }
 
 impl PeerDecodeManager {
-    pub fn new() -> Self {
+    pub fn new(
+        on_first_frame: Callback<(String, MediaType)>,
+        get_video_canvas_id: Callback<String, String>,
+        get_screen_canvas_id: Callback<String, String>,
+    ) -> Self {
+        Self {
+            connected_peers: HashMapWithOrderedKeys::new(),
+            on_first_frame,
+            get_video_canvas_id,
+            get_screen_canvas_id,
+        }
+    }
+
+    // Create a constructor with default callbacks for backward compatibility
+    pub fn new_with_defaults() -> Self {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             on_first_frame: Callback::noop(),
@@ -237,16 +251,15 @@ impl PeerDecodeManager {
     }
 
     fn add_peer(&mut self, email: &str, aes: Option<Aes128State>) {
-        debug!("Adding peer {}", email);
-        self.connected_peers.insert(
-            email.to_owned(),
-            Peer::new(
-                self.get_video_canvas_id.emit(email.to_owned()),
-                self.get_screen_canvas_id.emit(email.to_owned()),
-                email.to_owned(),
-                aes,
-            ),
+        let video_canvas_id = self.get_video_canvas_id.emit(email.to_string());
+        let screen_canvas_id = self.get_screen_canvas_id.emit(email.to_string());
+        let peer = Peer::new(
+            video_canvas_id,
+            screen_canvas_id,
+            email.to_string(),
+            aes,
         );
+        self.connected_peers.insert(email.to_string(), peer);
     }
 
     pub fn delete_peer(&mut self, email: &String) {

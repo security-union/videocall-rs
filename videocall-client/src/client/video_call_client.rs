@@ -1,5 +1,6 @@
 use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
+use super::diagnostics::{AdaptationParameters, DiagnosticsManager};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use anyhow::{anyhow, Result};
@@ -10,6 +11,8 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use videocall_types::protos::aes_packet::AesPacket;
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
+use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -71,6 +74,7 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
+    diagnostics_manager: Option<DiagnosticsManager>,
 }
 
 /// The client struct for a video call connection.
@@ -99,120 +103,123 @@ impl VideoCallClient {
     ///
     pub fn new(options: VideoCallClientOptions) -> Self {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
+        let inner_options = InnerOptions {
+            enable_e2ee: options.enable_e2ee,
+            userid: options.userid.clone(),
+            on_peer_added: options.on_peer_added.clone(),
+        };
         let inner = Rc::new(RefCell::new(Inner {
-            options: InnerOptions {
-                enable_e2ee: options.enable_e2ee,
-                userid: options.userid.clone(),
-                on_peer_added: options.on_peer_added.clone(),
-            },
+            options: inner_options,
             connection: None,
-            aes: aes.clone(),
+            aes: Rc::clone(&aes),
             rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
-            peer_decode_manager: Self::create_peer_decoder_manager(&options),
+            peer_decode_manager: PeerDecodeManager::new(
+                options.on_peer_first_frame.clone(),
+                options.get_peer_video_canvas_id.clone(),
+                options.get_peer_screen_canvas_id.clone(),
+            ),
+            diagnostics_manager: Some(DiagnosticsManager::new(options.userid.clone())),
         }));
+
         Self {
             options,
-            aes,
             inner,
+            aes,
         }
     }
 
-    /// Initiates a connection to a videocall server.
+    /// Create a connection using the client options.
     ///
-    /// Initiates a connection using WebTransport (to
-    /// [`options.webtransport_url`](VideoCallClientOptions::webtransport_url)) or WebSocket (to
-    /// [`options.websocket_url`](VideoCallClientOptions::websocket_url)), based on the value of
-    /// [`options.enable_webtransport`](VideoCallClientOptions::enable_webtransport).
+    /// This can be used to set up a connection after the [VideoCallClient] struct is created.
     ///
-    /// Note that this method's success means only that it succesfully *attempted* initiation of the
-    /// connection.  The connection cannot actually be considered to have been succesful until the
-    /// [`options.on_connected`](VideoCallClientOptions::on_connected) callback has been invoked.
-    ///
-    /// If the connection does not succeed, the
-    /// [`options.on_connection_lost`](VideoCallClientOptions::on_connection_lost) callback will be
-    /// invoked.
-    ///
-    pub fn connect(&mut self) -> anyhow::Result<()> {
+    pub fn connect(&self) -> Result<()> {
         let options = ConnectOptions {
             userid: self.options.userid.clone(),
             websocket_url: self.options.websocket_url.clone(),
             webtransport_url: self.options.webtransport_url.clone(),
-            on_inbound_media: {
-                let inner = Rc::downgrade(&self.inner);
-                Callback::from(move |packet| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow_mut() {
-                            Ok(mut inner) => inner.on_inbound_media(packet),
-                            Err(_) => {
-                                error!(
-                                    "Unable to borrow inner -- dropping receive packet {:?}",
-                                    packet
-                                );
-                            }
-                        }
-                    }
-                })
-            },
-            on_connected: {
-                let inner = Rc::downgrade(&self.inner);
-                let callback = self.options.on_connected.clone();
-                Callback::from(move |_| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow() {
-                            Ok(inner) => inner.send_public_key(),
-                            Err(_) => {
-                                error!("Unable to borrow inner -- not sending public key");
-                            }
-                        }
-                    }
-                    callback.emit(());
-                })
-            },
+            on_connected: self.options.on_connected.clone(),
             on_connection_lost: self.options.on_connection_lost.clone(),
-            peer_monitor: {
-                let inner = Rc::downgrade(&self.inner);
-                let on_connection_lost = self.options.on_connection_lost.clone();
-                Callback::from(move |_| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow_mut() {
-                            Ok(mut inner) => {
-                                inner.peer_decode_manager.run_peer_monitor();
-                            }
-                            Err(_) => {
-                                on_connection_lost.emit(JsValue::from_str(
-                                    "Unable to borrow inner -- not starting peer monitor",
-                                ));
-                            }
-                        }
+            peer_monitor: Callback::from({
+                let inner = Rc::clone(&self.inner);
+                move |_| {
+                    if let Ok(mut inner) = inner.try_borrow_mut() {
+                        inner.send_public_key();
                     }
-                })
-            },
+                }
+            }),
+            on_inbound_media: Callback::from({
+                let inner = Rc::clone(&self.inner);
+                move |response| {
+                    if let Ok(mut inner) = inner.try_borrow_mut() {
+                        inner.on_inbound_media(response);
+                    }
+                }
+            }),
         };
-        info!(
-            "webtransport connect = {}",
-            self.options.enable_webtransport
-        );
-        info!(
-            "end to end encryption enabled = {}",
-            self.options.enable_e2ee
-        );
 
-        let mut borrowed = self.inner.try_borrow_mut()?;
-        borrowed.connection.replace(Connection::connect(
+        let mut inner = self.inner.borrow_mut();
+
+        // Create the connection
+        inner.connection = Some(Connection::connect(
             self.options.enable_webtransport,
             options,
-            self.aes.clone(),
+            Rc::clone(&self.aes),
         )?);
-        info!("Connected to server");
+        
+        // Setup diagnostics timer
+        let inner_weak = Rc::downgrade(&self.inner);
+        gloo::timers::callback::Interval::new(2000, move || {
+            if let Some(inner_rc) = inner_weak.upgrade() {
+                if let Ok(inner_ref) = inner_rc.try_borrow() {
+                    // Check if we should send diagnostics
+                    let should_send = if let Some(ref dm) = inner_ref.diagnostics_manager {
+                        dm.should_send_diagnostics()
+                    } else {
+                        false
+                    };
+                    
+                    // Get packets if we should send
+                    let packets = if should_send {
+                        if let Some(ref dm) = inner_ref.diagnostics_manager {
+                            dm.create_diagnostics_packets()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    
+                    // Send packets if we got any
+                    if !packets.is_empty() {
+                        if let Some(ref conn) = inner_ref.connection {
+                            for (_, packet) in &packets {
+                                conn.send_packet(packet.clone());
+                            }
+                        }
+                    }
+                    
+                    // Mark as sent if we sent anything
+                    if should_send {
+                        drop(inner_ref);
+                        if let Ok(mut inner_mut) = inner_rc.try_borrow_mut() {
+                            if let Some(ref mut dm) = inner_mut.diagnostics_manager {
+                                dm.mark_diagnostics_sent();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(())
     }
 
     fn create_peer_decoder_manager(opts: &VideoCallClientOptions) -> PeerDecodeManager {
-        let mut peer_decode_manager = PeerDecodeManager::new();
-        peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
-        peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
-        peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-        peer_decode_manager
+        PeerDecodeManager::new(
+            opts.on_peer_first_frame.clone(),
+            opts.get_peer_video_canvas_id.clone(),
+            opts.get_peer_screen_canvas_id.clone(),
+        )
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
@@ -265,6 +272,60 @@ impl VideoCallClient {
     /// Returns a reference to a copy of [`options.userid`](VideoCallClientOptions::userid)
     pub fn userid(&self) -> &String {
         &self.options.userid
+    }
+
+    fn send_heartbeat_and_diagnostics(&self, user_id: String, elapsed_seconds: i32) {
+        // First, check if we can borrow
+        if let Ok(inner) = self.inner.try_borrow() {
+            // Send heartbeat (existing functionality)
+            if let Some(connection) = &inner.connection {
+                let packet = MediaPacket {
+                    media_type: MediaType::HEARTBEAT.into(),
+                    email: user_id.clone(),
+                    timestamp: js_sys::Date::now(),
+                    ..Default::default()
+                };
+                if let Ok(data) = inner.aes.encrypt(&packet.write_to_bytes().unwrap()) {
+                    let packet = PacketWrapper {
+                        data,
+                        email: user_id.clone(),
+                        packet_type: PacketType::MEDIA.into(),
+                        ..Default::default()
+                    };
+                    
+                    connection.send_packet(packet);
+                }
+            }
+            
+            // Check if it's time to send diagnostics
+            let should_send = inner.diagnostics_manager.as_ref()
+                .map(|dm| dm.should_send_diagnostics())
+                .unwrap_or(false);
+                
+            if should_send {
+                // Need to get diagnostics packets before modifying manager
+                let packets = if let Some(dm) = &inner.diagnostics_manager {
+                    dm.create_diagnostics_packets()
+                } else {
+                    Vec::new()
+                };
+                
+                // Send the packets
+                if let Some(connection) = &inner.connection {
+                    for (target_peer, packet) in packets {
+                        connection.send_packet(packet);
+                    }
+                }
+                
+                // Drop the immutable borrow and create a mutable one to update timestamp
+                drop(inner);
+                if let Ok(mut inner) = self.inner.try_borrow_mut() {
+                    if let Some(ref mut dm) = inner.diagnostics_manager {
+                        dm.mark_diagnostics_sent();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -346,6 +407,18 @@ impl Inner {
             }
             Ok(PacketType::CONNECTION) => {
                 error!("Not implemented: CONNECTION packet type");
+            }
+            Ok(PacketType::DIAGNOSTICS) => {
+                if let Some(ref mut diagnostics_manager) = self.diagnostics_manager {
+                    match DiagnosticsPacket::parse_from_bytes(&response.data) {
+                        Ok(packet) => {
+                            diagnostics_manager.process_diagnostics(&response.email, packet);
+                        }
+                        Err(e) => {
+                            error!("Failed to parse diagnostics packet: {}", e);
+                        }
+                    }
+                }
             }
             Err(_) => {}
         }

@@ -183,7 +183,7 @@ impl PeerDecode for VideoPeerDecoder {
 pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
 
 impl AudioPeerDecoder {
-    pub fn new() -> Self {
+    pub fn new(audio_id: &str) -> Self {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);

@@ -400,7 +400,10 @@ impl Inner {
             }
             Ok(PacketType::MEDIA) => {
                 let email = response.email.clone();
-                if let Err(e) = self.peer_decode_manager.decode(response) {
+                if let Err(e) = self.peer_decode_manager.decode(
+                    response,
+                    self.diagnostics_manager.as_mut()
+                ) {
                     error!("error decoding packet: {}", e.to_string());
                     self.peer_decode_manager.delete_peer(&email);
                 }

@@ -1,7 +1,7 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use log::debug;
+use log::{debug, info};
 use protobuf::Message;
-use std::{fmt::Display, sync::Arc};
+use std::{fmt::Display, sync::Arc, time::Instant};
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::{
@@ -9,6 +9,7 @@ use videocall_types::protos::{
 };
 use yew::prelude::Callback;
 
+use crate::client::diagnostics::DiagnosticsManager;
 use crate::crypto::aes::Aes128State;
 
 use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
@@ -87,7 +88,7 @@ impl Peer {
         screen_canvas_id: &str,
     ) -> (AudioPeerDecoder, VideoPeerDecoder, VideoPeerDecoder) {
         (
-            AudioPeerDecoder::new(),
+            AudioPeerDecoder::new("audio-output"),
             VideoPeerDecoder::new(video_canvas_id),
             VideoPeerDecoder::new(screen_canvas_id),
         )
@@ -104,7 +105,9 @@ impl Peer {
     fn decode(
         &mut self,
         packet: &Arc<PacketWrapper>,
-    ) -> Result<(MediaType, DecodeStatus), PeerDecodeError> {
+    ) -> Result<(MediaType, DecodeStatus, DecodingMetrics), PeerDecodeError> {
+        let decode_start = Instant::now();
+        
         if packet
             .packet_type
             .enum_value()
@@ -128,33 +131,49 @@ impl Peer {
             .media_type
             .enum_value()
             .map_err(|_| PeerDecodeError::NoMediaType)?;
-        match media_type {
-            MediaType::VIDEO => Ok((
-                media_type,
+            
+        // Create simple metrics with minimal information
+        let mut metrics = DecodingMetrics {
+            media_type,
+            timestamp: packet.timestamp,
+            sequence: None, // We'll skip metadata extraction for now
+            width: 0,
+            height: 0,
+            sample_rate: 0,
+            channels: 0,
+            decode_time_ms: 0,
+        };
+        
+        let decode_status = match media_type {
+            MediaType::VIDEO => {
                 self.video
                     .decode(&packet)
-                    .map_err(|_| PeerDecodeError::VideoDecodeError)?,
-            )),
-            MediaType::AUDIO => Ok((
-                media_type,
+                    .map_err(|_| PeerDecodeError::VideoDecodeError)?
+            },
+            MediaType::AUDIO => {
                 self.audio
                     .decode(&packet)
-                    .map_err(|_| PeerDecodeError::AudioDecodeError)?,
-            )),
-            MediaType::SCREEN => Ok((
-                media_type,
+                    .map_err(|_| PeerDecodeError::AudioDecodeError)?
+            },
+            MediaType::SCREEN => {
                 self.screen
                     .decode(&packet)
-                    .map_err(|_| PeerDecodeError::ScreenDecodeError)?,
-            )),
-            MediaType::HEARTBEAT => Ok((
-                media_type,
+                    .map_err(|_| PeerDecodeError::ScreenDecodeError)?
+            },
+            MediaType::HEARTBEAT => {
                 DecodeStatus {
                     _rendered: false,
                     first_frame: false,
-                },
-            )),
-        }
+                }
+            },
+        };
+        
+        // Calculate decode time
+        metrics.decode_time_ms = decode_start.elapsed().as_millis() as u32;
+        
+        // We'll skip metadata extraction for now due to API limitations
+        
+        Ok((media_type, decode_status, metrics))
     }
 
     fn on_heartbeat(&mut self) {
@@ -178,6 +197,18 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
     Ok(Arc::new(
         MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?,
     ))
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodingMetrics {
+    pub media_type: MediaType,
+    pub timestamp: f64,
+    pub decode_time_ms: u32,
+    pub sequence: Option<u64>,
+    pub width: u32,
+    pub height: u32,
+    pub sample_rate: u32,
+    pub channels: u32,
 }
 
 #[derive(Debug)]
@@ -225,16 +256,52 @@ impl PeerDecodeManager {
         self.connected_peers.remove_if(pred);
     }
 
-    pub fn decode(&mut self, response: PacketWrapper) -> Result<(), PeerDecodeError> {
+    pub fn decode(
+        &mut self, 
+        response: PacketWrapper,
+        diagnostics_manager: Option<&mut DiagnosticsManager>
+    ) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
+        
         if let Some(peer) = self.connected_peers.get_mut(&email) {
             match peer.decode(&packet) {
-                Ok((MediaType::HEARTBEAT, _)) => {
+                Ok((MediaType::HEARTBEAT, _, _)) => {
                     peer.on_heartbeat();
                     Ok(())
                 }
-                Ok((media_type, decode_status)) => {
+                Ok((media_type, decode_status, metrics)) => {
+                    // Record metrics in diagnostics manager if available
+                    if let Some(diag_manager) = diagnostics_manager {
+                        diag_manager.on_frame_received(
+                            &email, 
+                            media_type,
+                            metrics.timestamp,
+                            metrics.decode_time_ms,
+                            metrics.sequence
+                        );
+                        
+                        // Update resolution for video/screen
+                        if (media_type == MediaType::VIDEO || media_type == MediaType::SCREEN) 
+                            && metrics.width > 0 && metrics.height > 0 {
+                            diag_manager.update_video_resolution(
+                                &email, 
+                                media_type,
+                                metrics.width,
+                                metrics.height
+                            );
+                        }
+                        
+                        // Update audio params
+                        if media_type == MediaType::AUDIO && metrics.sample_rate > 0 {
+                            diag_manager.update_audio_params(
+                                &email,
+                                metrics.sample_rate,
+                                metrics.channels
+                            );
+                        }
+                    }
+                    
                     if decode_status.first_frame {
                         self.on_first_frame.emit((email.clone(), media_type));
                     }

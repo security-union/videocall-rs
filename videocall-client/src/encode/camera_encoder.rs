@@ -99,64 +99,40 @@ impl CameraEncoder {
     /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
     /// called, or if [`encoder.select(device_id)`](Self::select) has not been called.
     pub fn start(&mut self) {
-        let device_id = if let Some(device) = &self.state.selected {
-            device.to_string()
-        } else {
-            return;
-        };
-        let video_elem_id = self.video_elem_id.clone();
+        // 1. Query the first device with a camera and a mic attached.
+        // 2. setup WebCodecs, in particular
+        // 3. send encoded video frames and raw audio to the server.
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
-        
+        let video_elem_id = self.video_elem_id.clone();
         let EncoderState {
             destroy,
             enabled,
             switching,
             ..
         } = self.state.clone();
-        
         let video_output_handler = {
-            let mut buffer: [u8; 150000] = [0; 150000];
-            let mut sequence = 0;
-            let client_clone = client.clone();
-            
+            let mut buffer: [u8; 100000] = [0; 100000];
+            let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                
-                // Log the start of packet processing
-                debug!("Camera encoder processing chunk: timestamp={}, type={:?}, size={}B", 
-                       chunk.timestamp(), 
-                       chunk.type_(), 
-                       chunk.byte_length());
-                
-                // Get DiagnosticsManager if available
-                let mut diag_manager_option = None;
-                if let Ok(diag) = client_clone.try_get_diagnostics_manager() {
-                    debug!("Successfully acquired diagnostics manager for camera encoder");
-                    diag_manager_option = Some(diag);
-                } else {
-                    debug!("Failed to acquire diagnostics manager for camera encoder");
-                }
-                
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
-                    sequence,
+                    sequence_number,
                     &mut buffer,
                     &userid,
                     aes.clone(),
-                    diag_manager_option.as_mut(),
                 );
-                
-                debug!("Camera encoder sending packet: sequence={}, email={}", sequence, userid);
-                
-                // Try to send the packet and log any issues
-                client_clone.send_packet(packet);
-                
-                sequence += 1;
+                client.send_packet(packet);
+                sequence_number += 1;
             })
         };
-        
+        let device_id = if let Some(vid) = &self.state.selected {
+            vid.to_string()
+        } else {
+            return;
+        };
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let video_element = window()

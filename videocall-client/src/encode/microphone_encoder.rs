@@ -4,7 +4,6 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
-use log::debug;
 use std::sync::atomic::Ordering;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -98,50 +97,24 @@ impl MicrophoneEncoder {
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
-        
         let audio_output_handler = {
             let mut buffer: [u8; 100000] = [0; 100000];
             let mut sequence = 0;
-            let client_clone = client.clone();
-            
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
-                
-                // Log the start of packet processing
-                debug!("Microphone encoder processing chunk: timestamp={}, type={:?}, size={}B", 
-                       chunk.timestamp(), 
-                       chunk.type_(), 
-                       chunk.byte_length());
-                
-                // Get DiagnosticsManager if available
-                let mut diag_manager_option = None;
-                if let Ok(diag) = client_clone.try_get_diagnostics_manager() {
-                    debug!("Successfully acquired diagnostics manager for audio encoder");
-                    diag_manager_option = Some(diag);
-                } else {
-                    debug!("Failed to acquire diagnostics manager for audio encoder");
-                }
-                
                 let packet: PacketWrapper =
-                    transform_audio_chunk(&chunk, &mut buffer, &userid, sequence, aes.clone(), 
-                                         diag_manager_option.as_mut());
-                
-                debug!("Microphone encoder sending packet: sequence={}, email={}", sequence, userid);
-                
-                // Try to send the packet and log any issues
-                client_clone.send_packet(packet);
-                
+                    transform_audio_chunk(&chunk, &mut buffer, &userid, sequence, aes.clone());
+                client.send_packet(packet);
                 sequence += 1;
             })
         };
-        
         let EncoderState {
             destroy,
             enabled,
             switching,
             ..
         } = self.state.clone();
-        
+
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let media_devices = navigator.media_devices().unwrap();

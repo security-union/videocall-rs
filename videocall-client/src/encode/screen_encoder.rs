@@ -3,7 +3,6 @@ use js_sys::Array;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
-use log::debug;
 use std::sync::atomic::Ordering;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -87,40 +86,16 @@ impl ScreenEncoder {
         let screen_output_handler = {
             let mut buffer: [u8; 150000] = [0; 150000];
             let mut sequence_number = 0;
-            let client_clone = client.clone();
-            
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                
-                // Log the start of packet processing
-                debug!("Screen encoder processing chunk: timestamp={}, type={:?}, size={}B", 
-                       chunk.timestamp(), 
-                       chunk.type_(), 
-                       chunk.byte_length());
-                
-                // Get DiagnosticsManager if available
-                let mut diag_manager_option = None;
-                if let Ok(diag) = client_clone.try_get_diagnostics_manager() {
-                    debug!("Successfully acquired diagnostics manager for screen encoder");
-                    diag_manager_option = Some(diag);
-                } else {
-                    debug!("Failed to acquire diagnostics manager for screen encoder");
-                }
-                
                 let packet: PacketWrapper = transform_screen_chunk(
                     chunk,
                     sequence_number,
                     &mut buffer,
                     &userid,
                     aes.clone(),
-                    diag_manager_option.as_mut(),
                 );
-                
-                debug!("Screen encoder sending packet: sequence={}, email={}", sequence_number, userid);
-                
-                // Try to send the packet and log any issues
-                client_clone.send_packet(packet);
-                
+                client.send_packet(packet);
                 sequence_number += 1;
             })
         };

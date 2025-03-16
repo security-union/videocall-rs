@@ -5,6 +5,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+tests = []
+
 [dependencies]
 aes = "0.8.3"
 anyhow = "1"
@@ -94,3 +97,11 @@ features = [
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.20"
+console_error_panic_hook = "0.1.7"
+
+[[test]]
+name = "wasm_tests"
+path = "tests/wasm.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

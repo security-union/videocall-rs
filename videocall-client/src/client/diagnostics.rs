@@ -1,7 +1,6 @@
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use protobuf::{Message, MessageField};
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 use videocall_types::protos::diagnostics_packet::{
     AudioMetrics, DiagnosticsPacket, QualityHints, VideoMetrics,
@@ -193,7 +192,7 @@ impl StreamMetrics {
         packet.stream_id = format!("{}:{:?}", self.peer_id, self.media_type);
         packet.sender_id = sender_id;
         packet.target_id = self.peer_id.clone();
-        packet.timestamp_ms = (js_sys::Date::now() as u64);
+        packet.timestamp_ms = js_sys::Date::now() as u64;
         
         // Media type
         packet.media_type = match self.media_type {

@@ -1,5 +1,5 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use log::{debug, info};
+use log::debug;
 use protobuf::Message;
 use std::{fmt::Display, sync::Arc, time::Instant};
 use videocall_types::protos::media_packet::MediaPacket;

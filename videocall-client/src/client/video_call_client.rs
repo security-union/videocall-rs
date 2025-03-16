@@ -1,15 +1,15 @@
 use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
-use super::diagnostics::{AdaptationParameters, DiagnosticsManager};
+use super::diagnostics::DiagnosticsManager;
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use anyhow::{anyhow, Result};
-use log::{debug, error, info};
+use log::{debug, error};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -142,7 +142,7 @@ impl VideoCallClient {
             peer_monitor: Callback::from({
                 let inner = Rc::clone(&self.inner);
                 move |_| {
-                    if let Ok(mut inner) = inner.try_borrow_mut() {
+                    if let Ok(inner) = inner.try_borrow_mut() {
                         inner.send_public_key();
                     }
                 }

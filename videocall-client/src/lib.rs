@@ -77,6 +77,9 @@ mod encode;
 mod media_devices;
 mod wrappers;
 
+#[cfg(any(test, feature = "tests"))]
+pub mod tests;
+
 pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use encode::{CameraEncoder, MicrophoneEncoder, ScreenEncoder};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};

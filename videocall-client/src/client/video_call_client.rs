@@ -2,6 +2,7 @@ use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
+use crate::diagnostics;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info};
 use protobuf::Message;
@@ -25,6 +26,9 @@ pub struct VideoCallClientOptions {
 
     /// `true` to use webtransport, `false` to use websocket
     pub enable_webtransport: bool,
+
+    /// `true` to enable diagnostics collection, `false` to disable it
+    pub enable_diagnostics: bool,
 
     /// Callback will be called as `callback(peer_userid)` when a new peer is added
     pub on_peer_added: Callback<String>,
@@ -55,6 +59,9 @@ pub struct VideoCallClientOptions {
 
     /// Callback will be called as `callback(())` if a connection gets dropped
     pub on_connection_lost: Callback<JsValue>,
+
+    /// Diagnostics reporting interval in milliseconds
+    pub diagnostics_interval_ms: u32,
 }
 
 #[derive(Debug)]
@@ -98,6 +105,11 @@ impl VideoCallClient {
     /// See [VideoCallClientOptions] for description of the options.
     ///
     pub fn new(options: VideoCallClientOptions) -> Self {
+        info!("📊 VIDEO_CALL_CLIENT: Creating new client with diagnostics enabled={}, interval={}ms", 
+              options.enable_diagnostics, options.diagnostics_interval_ms);
+        
+        diagnostics::init_diagnostics(options.enable_diagnostics, options.diagnostics_interval_ms);
+        
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
         let inner = Rc::new(RefCell::new(Inner {
             options: InnerOptions {
@@ -266,6 +278,20 @@ impl VideoCallClient {
     pub fn userid(&self) -> &String {
         &self.options.userid
     }
+
+    /// Get a summary of the current diagnostics
+    pub fn get_diagnostics_summary(&self) -> String {
+        info!("📊 VIDEO_CALL_CLIENT: Getting diagnostics summary");
+        let summary = diagnostics::get_diagnostics_summary();
+        info!("📊 VIDEO_CALL_CLIENT: Got diagnostics summary: {}", summary);
+        summary
+    }
+
+    /// Enable or disable diagnostics
+    pub fn enable_diagnostics(&self, enabled: bool) {
+        info!("📊 VIDEO_CALL_CLIENT: Setting diagnostics enabled={}", enabled);
+        diagnostics::enable_diagnostics(enabled);
+    }
 }
 
 impl Inner {
@@ -346,6 +372,9 @@ impl Inner {
             }
             Ok(PacketType::CONNECTION) => {
                 error!("Not implemented: CONNECTION packet type");
+            }
+            Ok(PacketType::DIAGNOSTICS) => {
+                error!("Not implemented: DIAGNOSTICS packet type");
             }
             Err(_) => {}
         }

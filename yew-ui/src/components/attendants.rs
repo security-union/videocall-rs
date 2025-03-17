@@ -116,6 +116,8 @@ impl AttendantsComponent {
             },
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
+            enable_diagnostics: true,
+            diagnostics_interval_ms: 1000,
         };
         VideoCallClient::new(opts)
     }

@@ -10,6 +10,7 @@ This document provides a comprehensive overview of the videocall.rs architecture
 - [Message Handling](#message-handling)
 - [Horizontal Scaling](#horizontal-scaling)
 - [Media Processing](#media-processing)
+- [Adaptive Streaming](#adaptive-streaming)
 - [Security Architecture](#security-architecture)
 - [Deployment Architecture](#deployment-architecture)
 
@@ -197,6 +198,109 @@ graph TB
 ## Media Processing
 
 The media processing component handles the encoding and decoding of video streams. It supports various codecs and formats, including H.264, VP8, and VP9.
+
+## Adaptive Streaming
+
+videocall.rs implements an adaptive streaming system that dynamically adjusts media quality based on network conditions. This ensures optimal user experience across varying network environments.
+
+### Diagnostics Exchange
+
+1. **Diagnostics Messages**: Peers periodically exchange diagnostics messages containing metrics about the quality of received media streams.
+   - These messages are sent by receivers back to the senders of media streams.
+   - Diagnostics include metrics like packet loss, latency, jitter, and estimated bandwidth.
+   - Audio and video streams have specialized metrics appropriate to their media type.
+
+2. **Message Flow**: 
+   ```mermaid
+   sequenceDiagram
+     participant A as Peer A (Sender)
+     participant B as Peer B (Receiver)
+     
+     A->>B: Media Stream
+     Note over B: Measures reception quality
+     B->>A: Diagnostics Packet
+     Note over A: Adapts encoding parameters
+     A->>B: Adapted Media Stream
+   ```
+
+### Adaptation Algorithm
+
+1. **Quality Parameters**: The system dynamically adjusts several parameters:
+   - Video: bitrate, resolution, frame rate, keyframe interval
+   - Audio: bitrate, sample rate, encoding complexity
+
+2. **Decision Logic**: Senders use an algorithm that considers:
+   - Current network conditions (from diagnostics)
+   - Receiver's quality preferences
+   - Available resources
+   - The relative importance of different quality aspects (resolution vs. framerate)
+
+3. **Adaptation Strategy**: The system follows these principles:
+   - Proactive adaptation before quality degrades
+   - Gradual quality changes to avoid jarring transitions (Future Work)
+   - Fast reaction to severe network degradation
+   - Balanced optimization for calls with multiple participants (Future Work)
+
+### Implementation Details
+
+The diagnostics and adaptation system uses Protocol Buffers for efficient message encoding:
+- `DiagnosticsPacket`: Contains all quality metrics and adaptation hints
+- `VideoMetrics`: Video-specific diagnostic information
+- `AudioMetrics`: Audio-specific diagnostic information
+- `QualityHints`: Receiver's preferences for adaptation
+
+### Multi-Receiver Adaptation Strategy
+
+When a sender streams to multiple receivers, each with potentially different network conditions and capabilities, an adaptation strategy is needed to determine optimal encoding parameters.
+
+#### Lowest Common Denominator Approach
+
+The initial implementation uses a "lowest common denominator" approach:
+
+1. **Collection Phase**: The sender collects diagnostics from all receivers.
+2. **Analysis Phase**: The sender identifies the most constrained receiver by selecting:
+   - Lowest estimated bandwidth
+   - Highest packet loss
+   - Highest latency
+   - Highest round-trip time (RTT)
+3. **Adaptation Phase**: The sender adjusts encoding parameters to accommodate the most constrained receiver.
+
+This ensures that all participants can receive the stream, though at a quality level determined by the most constrained participant.
+
+```mermaid
+sequenceDiagram
+    participant S as Sender
+    participant R1 as Receiver 1 (Good Connection)
+    participant R2 as Receiver 2 (Medium Connection)
+    participant R3 as Receiver 3 (Poor Connection)
+    
+    Note over S,R3: Initial stream at medium quality
+    S->>+R1: Media Stream
+    S->>+R2: Media Stream
+    S->>+R3: Media Stream
+    
+    R1->>-S: DiagnosticsPacket (BW: 2Mbps, Loss: 0.1%, RTT: 50ms)
+    R2->>-S: DiagnosticsPacket (BW: 1Mbps, Loss: 1%, RTT: 120ms)
+    R3->>-S: DiagnosticsPacket (BW: 300Kbps, Loss: 5%, RTT: 280ms)
+    
+    Note over S: Analyzes diagnostics<br/>Identifies R3 as most constrained
+    
+    Note over S: Adapts stream to lowest<br/>common denominator (300Kbps)
+    
+    S->>+R1: Adapted Media Stream (Lower Quality)
+    S->>+R2: Adapted Media Stream (Lower Quality) 
+    S->>+R3: Adapted Media Stream (Lower Quality)
+    
+    Note over S,R3: All receivers can now<br/>consume the stream reliably
+```
+
+#### Future Enhancements (Future Work)
+
+While the lowest common denominator approach ensures accessibility for all participants, future implementations will explore:
+
+1. **Tiered Quality Levels**: Group receivers into quality tiers based on their network conditions
+2. **Simulcast**: Encode multiple quality levels simultaneously for optimal experience
+3. **Weighted Prioritization**: Prioritize quality for active speakers or specified participants
 
 ## Security Architecture
 

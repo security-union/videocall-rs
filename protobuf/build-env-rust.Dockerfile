@@ -10,7 +10,7 @@ RUN apt-get update && \
         curl \
         protobuf-compiler
 
-RUN cargo install protobuf-codegen --vers 3.7.1
+RUN cargo install protobuf-codegen --vers 3.7.1 --locked
 
 RUN useradd --create-home $USER --uid $UID && \
         adduser $USER sudo && \

@@ -347,6 +347,9 @@ impl Inner {
             Ok(PacketType::CONNECTION) => {
                 error!("Not implemented: CONNECTION packet type");
             }
+            Ok(PacketType::DIAGNOSTICS) => {
+                error!("Not implemented: DIAGNOSTICS packet type");
+            }
             Err(_) => {}
         }
         if let PeerStatus::Added(peer_userid) = peer_status {

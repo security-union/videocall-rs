@@ -10,6 +10,18 @@ use videocall_types::protos::diagnostics_packet::{
     diagnostics_packet::MediaType as DiagMediaType
 };
 use js_sys::Date;
+use std::sync::mpsc::Sender;
+
+/// Define the messages that can be sent to the diagnostics system
+pub enum DiagnosticsMessage {
+    RecordPacket { peer_id: String, size: usize },
+    RecordVideoFrame { peer_id: String, width: u32, height: u32 },
+    RecordPacketLost { peer_id: String },
+    GetMetrics { peer_id: String, response_channel: Sender<Vec<StreamMetrics>> },
+    GetMetricsSummary { response_channel: Sender<String> },
+    SetEnabled { enabled: bool },
+    CreatePacketWrapper { peer_id: String, sender_id: String, response_channel: Sender<Option<PacketWrapper>> },
+}
 
 /// A simple struct to track metrics for an individual stream
 #[derive(Debug, Clone)]
@@ -178,201 +190,145 @@ impl StreamMetrics {
     }
 }
 
-/// A simple diagnostics manager that collects metrics for peers
+/// Simple diagnostics collector that tracks video frame dimensions and packet sizes
 #[derive(Debug)]
 pub struct SimpleDiagnostics {
-    metrics: RefCell<HashMap<String, StreamMetrics>>,
     enabled: bool,
+    video_frames: HashMap<String, (u32, u32)>,
+    packet_counts: HashMap<String, usize>,
+    packet_sizes: HashMap<String, usize>,
+    lost_packets: HashMap<String, usize>,
 }
 
 impl SimpleDiagnostics {
+    /// Create a new diagnostics collector
     pub fn new(enabled: bool) -> Self {
-        info!("Initializing SimpleDiagnostics, enabled: {}", enabled);
+        info!("Creating new SimpleDiagnostics, enabled: {}", enabled);
         Self {
-            metrics: RefCell::new(HashMap::new()),
             enabled,
+            video_frames: HashMap::new(),
+            packet_counts: HashMap::new(),
+            packet_sizes: HashMap::new(),
+            lost_packets: HashMap::new(),
         }
     }
-    
-    /// Record a received packet from a peer
-    pub fn record_packet(&self, peer_id: &str, size: usize) {
-        if !self.enabled {
-            return;
-        }
-        
-        let mut metrics = self.metrics.borrow_mut();
-        
-        // Update video metrics
-        let key = format!("{}:VIDEO", peer_id);
-        let entry = metrics
-            .entry(key.clone())
-            .or_insert_with(|| StreamMetrics::new(peer_id.to_string(), MediaType::VIDEO));
-        entry.update_packet_received(size);
-        
-        // Also update audio metrics (we don't know what type it is)
-        let key = format!("{}:AUDIO", peer_id);
-        let entry = metrics
-            .entry(key.clone())
-            .or_insert_with(|| StreamMetrics::new(peer_id.to_string(), MediaType::AUDIO));
-        entry.update_packet_received(size);
-    }
-    
-    /// Record a decoded video frame from a peer
-    pub fn record_video_frame(&self, peer_id: &str, width: u32, height: u32) {
-        if !self.enabled {
-            return;
-        }
-        
-        let mut metrics = self.metrics.borrow_mut();
-        let key = format!("{}:VIDEO", peer_id);
-        let entry = metrics
-            .entry(key.clone())
-            .or_insert_with(|| StreamMetrics::new(peer_id.to_string(), MediaType::VIDEO));
-        
-        entry.update_video_frame(width, height);
-    }
-    
-    /// Record a lost packet from a peer
-    pub fn record_packet_lost(&self, peer_id: &str) {
-        if !self.enabled {
-            return;
-        }
-        
-        let mut metrics = self.metrics.borrow_mut();
-        
-        // Update both video and audio metrics since we don't know the type
-        let key = format!("{}:VIDEO", peer_id);
-        let entry = metrics
-            .entry(key.clone())
-            .or_insert_with(|| StreamMetrics::new(peer_id.to_string(), MediaType::VIDEO));
-        entry.update_packet_lost();
-        
-        let key = format!("{}:AUDIO", peer_id);
-        let entry = metrics
-            .entry(key.clone())
-            .or_insert_with(|| StreamMetrics::new(peer_id.to_string(), MediaType::AUDIO));
-        entry.update_packet_lost();
-    }
-    
-    /// Get metrics for a specific peer
-    pub fn get_metrics(&self, peer_id: &str) -> Vec<StreamMetrics> {
-        if !self.enabled {
-            return Vec::new();
-        }
-        
-        let metrics = self.metrics.borrow();
-        let mut result = Vec::new();
-        
-        // Look up various possible metrics for this peer
-        for media_type in [MediaType::VIDEO, MediaType::AUDIO, MediaType::SCREEN] {
-            let key = format!("{}:{:?}", peer_id, media_type);
-            if let Some(metric) = metrics.get(&key) {
-                result.push(metric.clone());
-            }
-        }
-        
-        result
-    }
-    
+
     /// Enable or disable diagnostics collection
     pub fn set_enabled(&mut self, enabled: bool) {
-        info!("Setting diagnostics collection to: {}", enabled);
         self.enabled = enabled;
+        debug!("Diagnostics collection enabled: {}", enabled);
     }
-    
-    /// Create a PacketWrapper with a DiagnosticsPacket
-    pub fn create_packet_wrapper(&self, peer_id: &str, sender_id: &str) -> Option<PacketWrapper> {
+
+    /// Record a video frame for the given peer ID with the given dimensions
+    pub fn record_video_frame(&mut self, peer_id: &str, width: u32, height: u32) {
         if !self.enabled {
-            return None;
+            return;
         }
-        
-        let metrics = self.get_metrics(peer_id);
-        if metrics.is_empty() {
-            debug!("No metrics found for peer {}, can't create packet", peer_id);
-            return None;
-        }
-        
-        // Select the most appropriate metric to send (prefer video)
-        let metric = metrics.iter().find(|m| m.media_type == MediaType::VIDEO)
-            .or_else(|| metrics.iter().find(|m| m.media_type == MediaType::AUDIO))
-            .or_else(|| metrics.first())?;
-        
-        let diagnostics_packet = metric.to_diagnostics_packet(sender_id);
-        let mut packet_wrapper = PacketWrapper::new();
-        
-        // Set packet type using the EnumOrUnknown
-        packet_wrapper.packet_type = PacketType::DIAGNOSTICS.into();
-        packet_wrapper.data = diagnostics_packet.write_to_bytes().unwrap_or_default();
-        packet_wrapper.email = peer_id.to_string();
-        
-        info!(
-            "Created diagnostics packet wrapper for peer: {}, media_type: {:?}, size: {} bytes", 
-            peer_id, metric.media_type, packet_wrapper.data.len()
+        self.video_frames.insert(peer_id.to_string(), (width, height));
+        debug!(
+            "Recorded video frame for {}: {} x {}",
+            peer_id, width, height
         );
-        
-        Some(packet_wrapper)
     }
-    
-    /// Get a summary of metrics for all peers
+
+    /// Record a packet received from the given peer ID with the given size
+    pub fn record_packet(&mut self, peer_id: &str, size: usize) {
+        if !self.enabled {
+            return;
+        }
+        *self.packet_counts.entry(peer_id.to_string()).or_insert(0) += 1;
+        *self.packet_sizes.entry(peer_id.to_string()).or_insert(0) += size;
+        debug!(
+            "Recorded packet from {}, size: {} bytes",
+            peer_id, size
+        );
+    }
+
+    /// Record a packet loss from the given peer ID
+    pub fn record_packet_lost(&mut self, peer_id: &str) {
+        if !self.enabled {
+            return;
+        }
+        *self.lost_packets.entry(peer_id.to_string()).or_insert(0) += 1;
+        debug!("Recorded packet loss from {}", peer_id);
+    }
+
+    /// Process a batch of diagnostic data entries
+    pub fn process_batch(&mut self, diagnostic_data: Vec<(String, u32, u32, usize)>) {
+        if !self.enabled {
+            return;
+        }
+        
+        debug!("Processing batch of {} diagnostic entries", diagnostic_data.len());
+        for (peer_id, width, height, packet_size) in diagnostic_data {
+            self.record_video_frame(&peer_id, width, height);
+            self.record_packet(&peer_id, packet_size);
+        }
+    }
+
+    /// Get a summary of the metrics collected
     pub fn get_metrics_summary(&self) -> String {
         if !self.enabled {
             return "Diagnostics disabled".to_string();
         }
-        
-        let metrics = self.metrics.borrow();
-        if metrics.is_empty() {
-            return "No metrics collected yet".to_string();
-        }
-        
+
         let mut summary = String::new();
-        let mut peers = std::collections::HashSet::new();
-        
-        // Gather unique peer IDs
-        for key in metrics.keys() {
-            if let Some(idx) = key.find(':') {
-                peers.insert(key[..idx].to_string());
-            }
+        summary.push_str("Diagnostics Summary:\n");
+
+        // Video frames
+        summary.push_str("Video Frames:\n");
+        for (peer_id, (width, height)) in &self.video_frames {
+            summary.push_str(&format!("  {}: {}x{}\n", peer_id, width, height));
         }
-        
-        // Generate summary for each peer
-        for peer in peers {
-            let mut peer_summary = format!("Peer {}: ", peer);
-            
-            // Check for video metrics
-            let video_key = format!("{}:VIDEO", peer);
-            if let Some(metric) = metrics.get(&video_key) {
-                peer_summary.push_str(&format!(
-                    "Video: {}x{}, {} frames, {} kbps, {}% loss | ",
-                    metric.frame_width, metric.frame_height, metric.frames_received,
-                    metric.estimated_bandwidth_kbps, metric.packet_loss_percent
-                ));
-            }
-            
-            // Check for audio metrics
-            let audio_key = format!("{}:AUDIO", peer);
-            if let Some(metric) = metrics.get(&audio_key) {
-                peer_summary.push_str(&format!(
-                    "Audio: {} packets, {} kbps, {}% loss | ",
-                    metric.packet_count, metric.estimated_bandwidth_kbps,
-                    metric.packet_loss_percent
-                ));
-            }
-            
-            // Check for screen metrics
-            let screen_key = format!("{}:SCREEN", peer);
-            if let Some(metric) = metrics.get(&screen_key) {
-                peer_summary.push_str(&format!(
-                    "Screen: {}x{}, {} frames, {} kbps | ",
-                    metric.frame_width, metric.frame_height, metric.frames_received,
-                    metric.estimated_bandwidth_kbps
-                ));
-            }
-            
-            summary.push_str(&peer_summary);
-            summary.push('\n');
+
+        // Packet statistics
+        summary.push_str("Packet Statistics:\n");
+        for (peer_id, count) in &self.packet_counts {
+            let size = self.packet_sizes.get(peer_id).unwrap_or(&0);
+            let lost = self.lost_packets.get(peer_id).unwrap_or(&0);
+            summary.push_str(&format!(
+                "  {}: {} packets, {} bytes total, {} packets lost\n",
+                peer_id, count, size, lost
+            ));
         }
-        
-        info!("Generated metrics summary:\n{}", summary);
+
+        debug!("Generated metrics summary: {} bytes", summary.len());
         summary
+    }
+
+    /// Create a packet wrapper containing diagnostic data for a peer
+    pub fn create_packet_wrapper(&self, peer_id: &str, self_id: &str) -> Option<PacketWrapper> {
+        if !self.enabled {
+            return None;
+        }
+
+        // Check if we have data for this peer
+        if !self.video_frames.contains_key(peer_id) && !self.packet_counts.contains_key(peer_id) {
+            return None;
+        }
+
+        // Create a simple text-based diagnostics packet
+        let mut data = String::new();
+        data.push_str("DIAGNOSTICS:");
+
+        // Add video frame data if available
+        if let Some((width, height)) = self.video_frames.get(peer_id) {
+            data.push_str(&format!("video:{}x{}", width, height));
+        }
+
+        // Add packet stats if available
+        if let Some(count) = self.packet_counts.get(peer_id) {
+            let size = self.packet_sizes.get(peer_id).unwrap_or(&0);
+            let lost = self.lost_packets.get(peer_id).unwrap_or(&0);
+            data.push_str(&format!(";packets:{},{},{}", count, size, lost));
+        }
+
+        // Create and return the packet wrapper
+        Some(PacketWrapper {
+            packet_type: PacketType::DIAGNOSTICS.into(),
+            email: self_id.to_string(),
+            data: data.into_bytes(),
+            ..Default::default()
+        })
     }
 } 

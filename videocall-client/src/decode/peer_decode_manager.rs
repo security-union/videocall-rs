@@ -1,5 +1,4 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use crate::diagnostics::simple_diagnostics::SimpleDiagnostics;
 use log::{debug, info};
 use protobuf::Message;
 use std::{fmt::Display, sync::Arc};
@@ -286,60 +285,53 @@ impl PeerDecodeManager {
         }
     }
 
-    /// Process frames with the given diagnostics collector
-    pub fn process_diagnostics(&self, diagnostics: &SimpleDiagnostics) {
+    /// Collect diagnostic data for the given peer
+    pub fn collect_diagnostic_data(&self) -> Vec<(String, u32, u32, usize)> {
         let peer_count = self.sorted_keys().len();
-        debug!("Processing diagnostics for {} peers", peer_count);
+        debug!("Collecting diagnostics for {} peers", peer_count);
         
-        let mut video_frame_count = 0;
-        let mut screen_frame_count = 0;
-        let mut packet_stats_count = 0;
+        let mut diagnostic_data = Vec::new();
         
         for peer_id in self.sorted_keys() {
             if let Some(peer) = self.connected_peers.get(peer_id) {
-                // Record video metrics if available
+                // Collect video metrics if available
                 if !peer.video.is_waiting_for_keyframe() {
                     // In a real implementation, we would get the actual frame dimensions
                     // For now, we're using canvas ID length as a placeholder
                     let width = peer.video_canvas_id.len() as u32;
                     let height = peer.video_canvas_id.len() as u32;
+                    let packet_size = 1024; // placeholder size
                     
-                    diagnostics.record_video_frame(peer_id, width, height);
-                    video_frame_count += 1;
+                    diagnostic_data.push((peer_id.clone(), width, height, packet_size));
                     
                     debug!(
-                        "Recorded video frame dimensions for peer {}: {}x{}", 
+                        "Collected video frame dimensions for peer {}: {}x{}", 
                         peer_id, width, height
                     );
                 }
                 
-                // Record screen metrics if available
+                // Collect screen metrics if available
                 if !peer.screen.is_waiting_for_keyframe() {
                     let width = peer.screen_canvas_id.len() as u32; // Just a placeholder
                     let height = peer.screen_canvas_id.len() as u32;
+                    let packet_size = 1024; // placeholder size
                     
-                    diagnostics.record_video_frame(peer_id, width, height);
-                    screen_frame_count += 1;
+                    diagnostic_data.push((peer_id.clone(), width, height, packet_size));
                     
                     debug!(
-                        "Recorded screen frame dimensions for peer {}: {}x{}", 
+                        "Collected screen frame dimensions for peer {}: {}x{}", 
                         peer_id, width, height
                     );
                 }
-                
-                // Record packet statistics
-                // In a production implementation, we'd use real packet size data
-                // Here we're using a placeholder size
-                let packet_size = 1024; // placeholder
-                diagnostics.record_packet(peer_id, packet_size);
-                packet_stats_count += 1;
             }
         }
         
         info!(
-            "Processed diagnostics: {} peers, {} video frames, {} screen frames, {} packet stats",
-            peer_count, video_frame_count, screen_frame_count, packet_stats_count
+            "Collected diagnostic data: {} entries from {} peers",
+            diagnostic_data.len(), peer_count
         );
+        
+        diagnostic_data
     }
 }
 

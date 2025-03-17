@@ -1,5 +1,5 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use log::{debug, info};
+use log::debug;
 use protobuf::Message;
 use std::{fmt::Display, sync::Arc};
 use videocall_types::protos::media_packet::MediaPacket;
@@ -12,8 +12,6 @@ use yew::prelude::Callback;
 use crate::crypto::aes::Aes128State;
 
 use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
-
-use std::fmt;
 
 #[derive(Debug)]
 pub enum PeerDecodeError {
@@ -170,7 +168,7 @@ impl Peer {
         }
         debug!(
             "---@@@--- detected heartbeat stop for {}",
-            self.email
+            self.email.clone()
         );
         false
     }
@@ -182,11 +180,9 @@ fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> 
     ))
 }
 
-/// Peer Decode Manager decrypts and routes messages to the correct decoders
+#[derive(Debug)]
 pub struct PeerDecodeManager {
-    /// A mapping from peer userid to a [Peer] object that handles their media
     connected_peers: HashMapWithOrderedKeys<String, Peer>,
-
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -211,15 +207,10 @@ impl PeerDecodeManager {
     }
 
     pub fn run_peer_monitor(&mut self) {
-        // The predicate should return true for peers to KEEP
-        let pred = |peer: &mut Peer| !peer.check_heartbeat();
+        let pred = |peer: &mut Peer| peer.check_heartbeat();
         self.connected_peers.remove_if(pred);
     }
 
-    /// Decode a packet by selecting the appropriate decoder
-    ///
-    /// Decrypts the message and passes it to the proper peer and media type decoder.
-    ///
     pub fn decode(&mut self, response: PacketWrapper) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
@@ -283,63 +274,5 @@ impl PeerDecodeManager {
             }
             None => Err(PeerDecodeError::NoSuchPeer(email.clone())),
         }
-    }
-
-    /// Collect diagnostic data for the given peer
-    pub fn collect_diagnostic_data(&self) -> Vec<(String, u32, u32, usize)> {
-        let peer_count = self.sorted_keys().len();
-        debug!("Collecting diagnostics for {} peers", peer_count);
-        
-        let mut diagnostic_data = Vec::new();
-        
-        for peer_id in self.sorted_keys() {
-            if let Some(peer) = self.connected_peers.get(peer_id) {
-                // Collect video metrics if available
-                if !peer.video.is_waiting_for_keyframe() {
-                    // In a real implementation, we would get the actual frame dimensions
-                    // For now, we're using canvas ID length as a placeholder
-                    let width = peer.video_canvas_id.len() as u32;
-                    let height = peer.video_canvas_id.len() as u32;
-                    let packet_size = 1024; // placeholder size
-                    
-                    diagnostic_data.push((peer_id.clone(), width, height, packet_size));
-                    
-                    debug!(
-                        "Collected video frame dimensions for peer {}: {}x{}", 
-                        peer_id, width, height
-                    );
-                }
-                
-                // Collect screen metrics if available
-                if !peer.screen.is_waiting_for_keyframe() {
-                    let width = peer.screen_canvas_id.len() as u32; // Just a placeholder
-                    let height = peer.screen_canvas_id.len() as u32;
-                    let packet_size = 1024; // placeholder size
-                    
-                    diagnostic_data.push((peer_id.clone(), width, height, packet_size));
-                    
-                    debug!(
-                        "Collected screen frame dimensions for peer {}: {}x{}", 
-                        peer_id, width, height
-                    );
-                }
-            }
-        }
-        
-        info!(
-            "Collected diagnostic data: {} entries from {} peers",
-            diagnostic_data.len(), peer_count
-        );
-        
-        diagnostic_data
-    }
-}
-
-// Add a manual Debug implementation
-impl fmt::Debug for PeerDecodeManager {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PeerDecodeManager")
-            .field("connected_peers", &self.connected_peers)
-            .finish()
     }
 }

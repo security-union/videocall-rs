@@ -2,11 +2,8 @@ use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
-use crate::diagnostics::simple_diagnostics::SimpleDiagnostics;
 use anyhow::{anyhow, Result};
-use gloo::timers::callback::Interval;
-use js_sys::Date;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
@@ -74,8 +71,6 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
-    diagnostics: SimpleDiagnostics,
-    diagnostics_timer: Option<Interval>,
 }
 
 /// The client struct for a video call connection.
@@ -114,8 +109,6 @@ impl VideoCallClient {
             aes: aes.clone(),
             rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
             peer_decode_manager: Self::create_peer_decoder_manager(&options),
-            diagnostics: SimpleDiagnostics::new(true),
-            diagnostics_timer: None,
         }));
         Self {
             options,
@@ -163,7 +156,6 @@ impl VideoCallClient {
             on_connected: {
                 let inner = Rc::downgrade(&self.inner);
                 let callback = self.options.on_connected.clone();
-                let client_weak = Rc::downgrade(&self.inner); // For starting diagnostics
                 Callback::from(move |_| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         match inner.try_borrow() {
@@ -173,21 +165,6 @@ impl VideoCallClient {
                             }
                         }
                     }
-                    
-                    // Auto-start diagnostics when connected
-                    if let Some(client_ref) = Weak::upgrade(&client_weak) {
-                        if let Ok(client_borrowed) = client_ref.try_borrow() {
-                            let self_id = client_borrowed.options.userid.clone();
-                            error!("DIAGNOSTICS: Auto-starting for user {}", self_id);
-                            drop(client_borrowed); // Release the borrow before trying again
-                            
-                            if let Ok(mut client_borrowed_mut) = client_ref.try_borrow_mut() {
-                                client_borrowed_mut.diagnostics.set_enabled(true);
-                                error!("DIAGNOSTICS: Successfully enabled collection");
-                            }
-                        }
-                    }
-                    
                     callback.emit(());
                 })
             },
@@ -227,12 +204,6 @@ impl VideoCallClient {
             self.aes.clone(),
         )?);
         info!("Connected to server");
-        
-        // Start the diagnostics timer after establishing connection
-        drop(borrowed); // Release the borrow before trying to start diagnostics
-        error!("DIAGNOSTICS: Starting diagnostics timer after connection");
-        self.start_diagnostics(); // Start collecting diagnostics
-        
         Ok(())
     }
 
@@ -295,154 +266,6 @@ impl VideoCallClient {
     pub fn userid(&self) -> &String {
         &self.options.userid
     }
-
-    /// Returns a summary of the diagnostics information collected
-    pub fn get_diagnostics_summary(&self) -> String {
-        info!("Getting diagnostics summary");
-        error!("DIAGNOSTICS: Attempting to generate diagnostics summary");
-        
-        // Use message passing to collect and process diagnostics data
-        let diagnostic_data = match self.inner.try_borrow() {
-            Ok(inner) => inner.peer_decode_manager.collect_diagnostic_data(),
-            Err(_) => {
-                warn!("Failed to access peer decode manager for diagnostics");
-                error!("DIAGNOSTICS: Failed to access peer decode manager");
-                return "Error: Could not collect diagnostics data".to_string();
-            }
-        };
-        
-        error!("DIAGNOSTICS: Collected {} data points", diagnostic_data.len());
-        
-        // Process the collected data with the diagnostics module
-        // No need for a mutable borrow of the entire inner struct
-        let mut diagnostics = SimpleDiagnostics::new(true);
-        diagnostics.process_batch(diagnostic_data);
-        
-        // Get the summary from our temporary diagnostics instance
-        let summary = diagnostics.get_metrics_summary();
-        debug!("Diagnostics summary generated, length: {} chars", summary.len());
-        error!("DIAGNOSTICS: Summary generated, length: {} chars", summary.len());
-        summary
-    }
-
-    /// Enable or disable diagnostics collection
-    pub fn set_diagnostics_enabled(&self, enabled: bool) {
-        info!("Setting diagnostics enabled: {}", enabled);
-        error!("DIAGNOSTICS: Setting enabled state to {}", enabled);
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            inner.diagnostics.set_enabled(enabled);
-            debug!("Diagnostics collection set to {}", enabled);
-        } else {
-            warn!("Failed to set diagnostics enabled state to {}", enabled);
-        }
-    }
-
-    pub fn start_diagnostics(&self) {
-        // Set up a timer to periodically update the diagnostics
-        info!("Starting diagnostics collection and reporting");
-        error!("DIAGNOSTICS: Starting collection and reporting");
-        let inner_weak = Rc::downgrade(&self.inner);
-        
-        // Use a fixed interval of 5000ms (5 seconds)
-        const DIAGNOSTICS_INTERVAL_MS: u32 = 5000;
-        
-        let timer = Interval::new(DIAGNOSTICS_INTERVAL_MS, move || {
-            error!("DIAGNOSTICS: Timer fired at {}", js_sys::Date::now());
-            if let Some(inner) = Weak::upgrade(&inner_weak) {
-                // Collect diagnostic data
-                let diagnostic_data = match inner.try_borrow() {
-                    Ok(inner_ref) => inner_ref.peer_decode_manager.collect_diagnostic_data(),
-                    Err(_) => {
-                        warn!("Could not access peer decode manager for diagnostics");
-                        error!("DIAGNOSTICS: Could not access peer decode manager in timer");
-                        return;
-                    }
-                };
-                
-                if diagnostic_data.is_empty() {
-                    debug!("No diagnostic data to process");
-                    error!("DIAGNOSTICS: No data to process in timer");
-                    return;
-                }
-                
-                error!("DIAGNOSTICS: Processing {} data points", diagnostic_data.len());
-                
-                // Process data and prepare packets in a separate mutable borrow
-                let packets_to_send: Vec<PacketWrapper> = match inner.try_borrow_mut() {
-                    Ok(mut inner_mut) => {
-                        // Update the diagnostics module with collected data
-                        inner_mut.diagnostics.process_batch(diagnostic_data);
-                        
-                        // Create diagnostic packets for each peer
-                        let mut packets = Vec::new();
-                        let userid = inner_mut.options.userid.clone();
-                        
-                        for peer_id in inner_mut.peer_decode_manager.sorted_keys() {
-                            if let Some(packet) = inner_mut.diagnostics.create_packet_wrapper(peer_id, &userid) {
-                                debug!("Created diagnostic packet for peer {}", peer_id);
-                                packets.push(packet);
-                            }
-                        }
-                        
-                        error!("DIAGNOSTICS: Created {} packets to send", packets.len());
-                        packets
-                    },
-                    Err(_) => {
-                        warn!("Could not get mutable access to process diagnostics");
-                        error!("DIAGNOSTICS: Could not get mutable access in timer");
-                        return;
-                    }
-                };
-                
-                // Send the prepared packets in a separate borrow
-                if !packets_to_send.is_empty() {
-                    debug!("Sending {} diagnostic packets", packets_to_send.len());
-                    let packet_count = packets_to_send.len(); // Store the count before moving
-                    match inner.try_borrow() {
-                        Ok(inner_ref) => {
-                            for packet in packets_to_send {
-                                inner_ref.send_packet(packet);
-                            }
-                            info!("Sent diagnostic packets to peers");
-                            error!("DIAGNOSTICS: Successfully sent {} packets", packet_count); // Use stored count
-                        },
-                        Err(_) => {
-                            warn!("Could not send diagnostic packets");
-                            error!("DIAGNOSTICS: Could not send packets");
-                        }
-                    }
-                }
-            } else {
-                warn!("Diagnostic timer fired but inner reference is gone");
-                error!("DIAGNOSTICS: Inner reference is gone in timer");
-            }
-        });
-        
-        // Store the timer
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            inner.diagnostics_timer = Some(timer);
-            info!("Diagnostics timer started, reporting every {}ms", DIAGNOSTICS_INTERVAL_MS);
-            error!("DIAGNOSTICS: Timer started with interval {}ms", DIAGNOSTICS_INTERVAL_MS);
-        } else {
-            warn!("Failed to store diagnostics timer");
-            error!("DIAGNOSTICS: Failed to store timer");
-        }
-    }
-
-    /// Helper method for testing logging levels
-    pub fn test_log_levels(&self) {
-        error!("DIAGNOSTICS TEST: This is an ERROR level message");
-        warn!("DIAGNOSTICS TEST: This is a WARN level message");
-        info!("DIAGNOSTICS TEST: This is an INFO level message");
-        debug!("DIAGNOSTICS TEST: This is a DEBUG level message");
-        
-        // Also test with the diagnostics timer
-        error!("DIAGNOSTICS: Forcing timer cycle at {}", Date::now());
-        if let Ok(inner) = self.inner.try_borrow() {
-            let data = inner.peer_decode_manager.collect_diagnostic_data();
-            error!("DIAGNOSTICS TEST: Collected {} diagnostic data points", data.len());
-        }
-    }
 }
 
 impl Inner {
@@ -458,10 +281,6 @@ impl Inner {
             response.packet_type.enum_value(),
             response.email
         );
-        
-        // Record packet for diagnostics
-        self.diagnostics.record_packet(&response.email, response.data.len());
-        
         let peer_status = self.peer_decode_manager.ensure_peer(&response.email);
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
@@ -485,8 +304,6 @@ impl Inner {
                         }
                         Err(e) => {
                             error!("Failed to parse aes packet: {}", e.to_string());
-                            // Record packet loss for diagnostics
-                            self.diagnostics.record_packet_lost(&response.email);
                         }
                     }
                 }
@@ -522,35 +339,18 @@ impl Inner {
             }
             Ok(PacketType::MEDIA) => {
                 let email = response.email.clone();
-                
-                // Check if this is a diagnostics packet in a MEDIA wrapper
-                let data_str = std::str::from_utf8(&response.data);
-                if let Ok(data_str) = data_str {
-                    if data_str.starts_with("DIAGNOSTICS:") {
-                        debug!("Received diagnostics data from {}: {}", email, data_str);
-                        // In a future version, we'd parse and use this data for adaptation
-                        return;
-                    }
-                }
-                
                 if let Err(e) = self.peer_decode_manager.decode(response) {
                     error!("error decoding packet: {}", e.to_string());
                     self.peer_decode_manager.delete_peer(&email);
-                    // Record packet loss for diagnostics
-                    self.diagnostics.record_packet_lost(&email);
                 }
             }
             Ok(PacketType::CONNECTION) => {
                 error!("Not implemented: CONNECTION packet type");
             }
-            // Handle any other packet types including DIAGNOSTICS
-            Ok(_) => {
-                debug!("Received unknown packet type from {}", response.email);
+            Ok(PacketType::DIAGNOSTICS) => {
+                error!("Not implemented: DIAGNOSTICS packet type");
             }
-            Err(_) => {
-                // Record packet loss for diagnostics
-                self.diagnostics.record_packet_lost(&response.email);
-            }
+            Err(_) => {}
         }
         if let PeerStatus::Added(peer_userid) = peer_status {
             debug!("added peer {}", peer_userid);

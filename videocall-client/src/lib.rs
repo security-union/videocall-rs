@@ -68,6 +68,9 @@
 //!
 //! ```
 
+use log::info;
+use wasm_bindgen::prelude::*;
+
 mod client;
 mod connection;
 mod constants;
@@ -78,6 +81,15 @@ mod media_devices;
 mod wrappers;
 mod diagnostics;
 
-pub use client::{VideoCallClient, VideoCallClientOptions};
+pub use client::VideoCallClient;
+pub use client::VideoCallClientOptions;
 pub use encode::{CameraEncoder, MicrophoneEncoder, ScreenEncoder};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};
+pub use videocall_types::protos::media_packet::media_packet::MediaType;
+
+#[wasm_bindgen(start)]
+pub fn start() {
+    // This will be called when the WASM module loads
+    info!("🚀 INITIALIZATION: videocall-client library starting up");
+    info!("📊 INITIALIZATION: Diagnostics system will be initialized when VideoCallClient is created");
+}

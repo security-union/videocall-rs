@@ -3828,6 +3828,7 @@ dependencies = [
  "aes",
  "anyhow",
  "cbc",
+ "futures",
  "getrandom",
  "gloo 0.8.1",
  "gloo-timers 0.2.6",

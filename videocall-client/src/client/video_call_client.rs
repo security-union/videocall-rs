@@ -105,6 +105,9 @@ impl VideoCallClient {
     /// See [VideoCallClientOptions] for description of the options.
     ///
     pub fn new(options: VideoCallClientOptions) -> Self {
+        info!("📊 VIDEO_CALL_CLIENT: Creating new client with diagnostics enabled={}, interval={}ms", 
+              options.enable_diagnostics, options.diagnostics_interval_ms);
+        
         diagnostics::init_diagnostics(options.enable_diagnostics, options.diagnostics_interval_ms);
         
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
@@ -278,11 +281,15 @@ impl VideoCallClient {
 
     /// Get a summary of the current diagnostics
     pub fn get_diagnostics_summary(&self) -> String {
-        diagnostics::get_diagnostics_summary()
+        info!("📊 VIDEO_CALL_CLIENT: Getting diagnostics summary");
+        let summary = diagnostics::get_diagnostics_summary();
+        info!("📊 VIDEO_CALL_CLIENT: Got diagnostics summary: {}", summary);
+        summary
     }
 
     /// Enable or disable diagnostics
     pub fn enable_diagnostics(&self, enabled: bool) {
+        info!("📊 VIDEO_CALL_CLIENT: Setting diagnostics enabled={}", enabled);
         diagnostics::enable_diagnostics(enabled);
     }
 }

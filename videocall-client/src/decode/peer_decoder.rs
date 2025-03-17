@@ -18,13 +18,14 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
-use log::error;
+use log::{error, info};
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::spawn_local;
 use web_sys::window;
 use web_sys::{AudioData, AudioDecoder, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
@@ -184,6 +185,7 @@ pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
 
 impl AudioPeerDecoder {
     pub fn new() -> Self {
+        info!("🔊 AUDIO_DECODER: Creating new audio peer decoder");
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
@@ -198,32 +200,25 @@ impl AudioPeerDecoder {
                 return;
             }
             if let Err(e) = writable.get_writer().map(|writer| {
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) = JsFuture::from(writer.ready()).await {
-                        error!("write chunk error {:?}", e);
-                    }
-                    if let Err(e) = JsFuture::from(writer.write_with_chunk(&audio_data)).await {
-                        error!("write chunk error {:?}", e);
-                    };
-                    writer.release_lock();
-                });
+                // This block of code will be executed if `get_writer()` succeeds.
+                let _ = writer.write_with_chunk(&audio_data);
+                audio_data.close();
             }) {
-                error!("error {:?}", e);
+                error!("error writing to writable {:?}", e);
             }
         }) as Box<dyn FnMut(AudioData)>);
-        let decoder = AudioDecoder::new(&AudioDecoderInit::new(
+
+        let init = AudioDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
-        ))
-        .unwrap();
-        decoder.configure(&AudioDecoderConfig::new(
-            AUDIO_CODEC,
-            AUDIO_CHANNELS,
-            AUDIO_SAMPLE_RATE,
-        ));
+        );
+        let config = AudioDecoderConfig::new(AUDIO_CODEC, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS);
+        let decoder = AudioDecoder::new(&init).unwrap();
+        decoder.configure(&config);
+
         Self {
             decoder,
-            waiting_for_keyframe: true,
+            waiting_for_keyframe: false,
             decoded: false,
             _error: error,
             _output: output,

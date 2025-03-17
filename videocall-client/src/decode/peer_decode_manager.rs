@@ -1,6 +1,6 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use crate::diagnostics;
-use log::debug;
+use log::{debug, info, warn};
 use protobuf::Message;
 use std::{fmt::Display, sync::Arc};
 use videocall_types::protos::media_packet::MediaPacket;
@@ -215,16 +215,26 @@ impl PeerDecodeManager {
     pub fn decode(&mut self, response: PacketWrapper) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
+        info!("🎬 DECODER: Processing packet from {}, size={} bytes", email, packet.data.len());
+        
         if let Some(peer) = self.connected_peers.get_mut(&email) {
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
+                    debug!("🎬 DECODER: Processed heartbeat packet from {}", email);
                     peer.on_heartbeat();
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
                     // Record diagnostics information
+                    info!("🎬 DECODER: Successfully decoded {:?} packet from {}", media_type, email);
+                    
                     // Record packet size for all media types
-                    diagnostics::record_packet(&email, packet.data.len());
+                    let packet_size = packet.data.len();
+                    info!("🎬 DECODER: Sending packet data to diagnostics: peer={}, size={}", email, packet_size);
+                    let packet_recorded = diagnostics::record_packet(&email, packet_size);
+                    if !packet_recorded {
+                        warn!("🎬 DECODER: Failed to record packet data in diagnostics");
+                    }
                     
                     // For video/screen, get dimensions from the decoded frame
                     // Since VideoMetadata doesn't have width/height, we'll use default values for now
@@ -233,27 +243,40 @@ impl PeerDecodeManager {
                         let default_width = 640;  // Default HD width
                         let default_height = 480; // Default HD height
                         
-                        diagnostics::record_video_frame(
+                        info!("🎬 DECODER: Sending video frame data to diagnostics: peer={}, media_type={:?}, size={}x{}", 
+                              email, media_type, default_width, default_height);
+                        let frame_recorded = diagnostics::record_video_frame(
                             &email,
                             default_width,
                             default_height,
                         );
+                        if !frame_recorded {
+                            warn!("🎬 DECODER: Failed to record video frame in diagnostics");
+                        }
                     }
                     
                     if decode_status.first_frame {
+                        info!("🎬 DECODER: First frame of {:?} received from {}", media_type, email);
                         self.on_first_frame.emit((email.clone(), media_type));
                     }
                     Ok(())
                 }
                 Err(e) => {
                     // Record packet loss diagnostics
-                    diagnostics::record_packet_lost(&email);
+                    warn!("🎬 DECODER: Failed to decode packet from {}: {}", email, e);
+                    
+                    info!("🎬 DECODER: Sending packet loss to diagnostics: peer={}", email);
+                    let loss_recorded = diagnostics::record_packet_lost(&email);
+                    if !loss_recorded {
+                        warn!("🎬 DECODER: Failed to record packet loss in diagnostics");
+                    }
                     
                     peer.reset();
                     Err(e)
                 }
             }
         } else {
+            warn!("🎬 DECODER: No peer found for {}", email);
             Err(PeerDecodeError::NoSuchPeer(email.clone()))
         }
     }

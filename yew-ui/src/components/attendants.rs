@@ -1,4 +1,4 @@
-use crate::components::{canvas_generator, peer_list::PeerList};
+use crate::components::{canvas_generator, diagnostics_panel::DiagnosticsPanel, peer_list::PeerList};
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::{error, warn};
@@ -31,6 +31,7 @@ pub enum MeetingAction {
 #[derive(Debug)]
 pub enum UserScreenAction {
     TogglePeerList,
+    ToggleDiagnostics,
 }
 
 #[derive(Debug)]
@@ -84,6 +85,7 @@ pub struct AttendantsComponent {
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
+    diagnostics_panel_open: bool,
 }
 
 impl AttendantsComponent {
@@ -156,6 +158,7 @@ impl Component for AttendantsComponent {
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
+            diagnostics_panel_open: false,
         }
     }
 
@@ -268,6 +271,12 @@ impl Component for AttendantsComponent {
                 match action {
                     UserScreenAction::TogglePeerList => {
                         self.peer_list_open = !self.peer_list_open;
+                        if self.peer_list_open {
+                            self.diagnostics_panel_open = false;
+                        }
+                    }
+                    UserScreenAction::ToggleDiagnostics => {
+                        self.diagnostics_panel_open = !self.diagnostics_panel_open;
                     }
                 }
                 true
@@ -280,6 +289,7 @@ impl Component for AttendantsComponent {
         let media_access_granted = self.media_device_access.is_granted();
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
+        // let toggle_diagnostics = ctx.link().callback(|_| UserScreenAction::ToggleDiagnostics);
 
         let peers = self.client.sorted_peer_keys();
         let rows = canvas_generator::generate(

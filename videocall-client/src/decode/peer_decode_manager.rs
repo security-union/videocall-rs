@@ -1,4 +1,5 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
+use crate::diagnostics;
 use log::debug;
 use protobuf::Message;
 use std::{fmt::Display, sync::Arc};
@@ -221,12 +222,33 @@ impl PeerDecodeManager {
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
+                    // Record diagnostics information
+                    // Record packet size for all media types
+                    diagnostics::record_packet(&email, packet.data.len());
+                    
+                    // For video/screen, get dimensions from the decoded frame
+                    // Since VideoMetadata doesn't have width/height, we'll use default values for now
+                    if media_type == MediaType::VIDEO || media_type == MediaType::SCREEN {
+                        // Use constants or default values since we don't have access to actual frame dimensions
+                        let default_width = 640;  // Default HD width
+                        let default_height = 480; // Default HD height
+                        
+                        diagnostics::record_video_frame(
+                            &email,
+                            default_width,
+                            default_height,
+                        );
+                    }
+                    
                     if decode_status.first_frame {
                         self.on_first_frame.emit((email.clone(), media_type));
                     }
                     Ok(())
                 }
                 Err(e) => {
+                    // Record packet loss diagnostics
+                    diagnostics::record_packet_lost(&email);
+                    
                     peer.reset();
                     Err(e)
                 }

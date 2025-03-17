@@ -10,17 +10,16 @@ use videocall_types::protos::diagnostics_packet::{
     diagnostics_packet::MediaType as DiagMediaType
 };
 use js_sys::Date;
-use std::sync::mpsc::Sender;
+use futures::channel::oneshot;
 
 /// Define the messages that can be sent to the diagnostics system
 pub enum DiagnosticsMessage {
     RecordPacket { peer_id: String, size: usize },
     RecordVideoFrame { peer_id: String, width: u32, height: u32 },
     RecordPacketLost { peer_id: String },
-    GetMetrics { peer_id: String, response_channel: Sender<Vec<StreamMetrics>> },
-    GetMetricsSummary { response_channel: Sender<String> },
+    GetMetricsSummary { response_channel: oneshot::Sender<String> },
     SetEnabled { enabled: bool },
-    CreatePacketWrapper { peer_id: String, sender_id: String, response_channel: Sender<Option<PacketWrapper>> },
+    CreatePacketWrapper { peer_id: String, sender_id: String, response_channel: oneshot::Sender<Option<PacketWrapper>> },
 }
 
 /// A simple struct to track metrics for an individual stream

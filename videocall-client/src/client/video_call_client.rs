@@ -2,6 +2,7 @@ use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
+use crate::diagnostics;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info};
 use protobuf::Message;
@@ -25,6 +26,9 @@ pub struct VideoCallClientOptions {
 
     /// `true` to use webtransport, `false` to use websocket
     pub enable_webtransport: bool,
+
+    /// `true` to enable diagnostics collection, `false` to disable it
+    pub enable_diagnostics: bool,
 
     /// Callback will be called as `callback(peer_userid)` when a new peer is added
     pub on_peer_added: Callback<String>,
@@ -55,6 +59,9 @@ pub struct VideoCallClientOptions {
 
     /// Callback will be called as `callback(())` if a connection gets dropped
     pub on_connection_lost: Callback<JsValue>,
+
+    /// Diagnostics reporting interval in milliseconds
+    pub diagnostics_interval_ms: u32,
 }
 
 #[derive(Debug)]
@@ -98,6 +105,8 @@ impl VideoCallClient {
     /// See [VideoCallClientOptions] for description of the options.
     ///
     pub fn new(options: VideoCallClientOptions) -> Self {
+        diagnostics::init_diagnostics(options.enable_diagnostics, options.diagnostics_interval_ms);
+        
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
         let inner = Rc::new(RefCell::new(Inner {
             options: InnerOptions {
@@ -265,6 +274,16 @@ impl VideoCallClient {
     /// Returns a reference to a copy of [`options.userid`](VideoCallClientOptions::userid)
     pub fn userid(&self) -> &String {
         &self.options.userid
+    }
+
+    /// Get a summary of the current diagnostics
+    pub fn get_diagnostics_summary(&self) -> String {
+        diagnostics::get_diagnostics_summary()
+    }
+
+    /// Enable or disable diagnostics
+    pub fn enable_diagnostics(&self, enabled: bool) {
+        diagnostics::enable_diagnostics(enabled);
     }
 }
 

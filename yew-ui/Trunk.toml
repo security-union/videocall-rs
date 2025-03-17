@@ -1,0 +1,6 @@
+[watch]
+# Watch the videocall-client directory for changes along with the current yew-ui directory
+paths = ["../videocall-client/src", "../videocall-client/Cargo.toml"]
+
+[serve]
+# Keep default serve settings 

@@ -82,7 +82,7 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
-    diagnostics: Option<Arc<DiagnosticManager>>,
+    _diagnostics: Option<Arc<DiagnosticManager>>,
 }
 
 /// The client struct for a video call connection.
@@ -96,7 +96,7 @@ pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
     aes: Rc<Aes128State>,
-    diagnostics: Option<Arc<DiagnosticManager>>,
+    _diagnostics: Option<Arc<DiagnosticManager>>,
 }
 
 impl PartialEq for VideoCallClient {
@@ -151,14 +151,14 @@ impl VideoCallClient {
             aes: aes.clone(),
             rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
             peer_decode_manager: Self::create_peer_decoder_manager(&options, diagnostics.clone()),
-            diagnostics: diagnostics.clone(),
+            _diagnostics: diagnostics.clone(),
         }));
 
         Self {
             options,
             inner,
             aes,
-            diagnostics,
+            _diagnostics: diagnostics,
         }
     }
 

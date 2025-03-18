@@ -53,7 +53,7 @@ struct FpsTracker {
     fps: f64,
     last_fps_update: f64, // timestamp in ms
     total_frames: u32,
-    media_type: MediaType,
+    _media_type: MediaType,
 }
 
 impl FpsTracker {
@@ -63,7 +63,7 @@ impl FpsTracker {
             fps: 0.0,
             last_fps_update: Date::now(),
             total_frames: 0,
-            media_type,
+            _media_type: media_type,
         }
     }
 
@@ -91,6 +91,9 @@ pub struct DiagnosticManager {
     frames_dropped: Arc<AtomicU32>,
     report_interval_ms: u64,
 }
+
+unsafe impl Sync for DiagnosticManager {}
+unsafe impl Send for DiagnosticManager {}
 
 // Internal worker that processes diagnostic events
 struct DiagnosticWorker {

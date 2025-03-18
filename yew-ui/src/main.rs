@@ -25,7 +25,6 @@ use crate::constants::ENABLE_OAUTH;
 /// It is responsible for rendering the main application and handling routing.
 /// 
 ///
-///
 
 #[derive(Clone, Routable, PartialEq, Debug, EnumDisplay)]
 enum Route {

@@ -322,10 +322,7 @@ impl DiagnosticWorker {
                 peer_id,
                 media_type,
             } => {
-                let peer_trackers = self
-                    .fps_trackers
-                    .entry(peer_id.clone())
-                    .or_default();
+                let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
 
                 let tracker = peer_trackers
                     .entry(media_type)

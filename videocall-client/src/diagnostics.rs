@@ -1,6 +1,8 @@
-use futures::channel::mpsc::{self, Sender, Receiver};
+use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::StreamExt;
+use js_sys::Date;
 use log::debug;
+use std::error::Error;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -10,17 +12,18 @@ use std::{
         Arc, Mutex,
     },
 };
-use wasm_bindgen::JsValue;
-use yew::Callback;
-use std::error::Error;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use wasm_bindgen::JsValue;
 use web_sys::{Performance, Window};
-use js_sys::Date;
+use yew::Callback;
 
 // Basic structure for diagnostics events
 #[derive(Debug, Clone)]
 pub enum DiagnosticEvent {
-    FrameReceived { peer_id: String, media_type: MediaType },
+    FrameReceived {
+        peer_id: String,
+        media_type: MediaType,
+    },
     RequestStats,
     SetStatsCallback(Callback<String>),
     SetReportingInterval(u64),
@@ -72,14 +75,14 @@ impl FpsTracker {
         self.total_frames += 1;
         let now = Date::now();
         let elapsed_ms = now - self.last_fps_update;
-        
+
         // Update FPS calculation every second
         if elapsed_ms >= 1000.0 {
             self.fps = (self.frames_count as f64 * 1000.0) / elapsed_ms;
             self.frames_count = 0;
             self.last_fps_update = now;
         }
-        
+
         self.fps
     }
 }
@@ -121,7 +124,7 @@ impl Default for DiagnosticManager {
 impl DiagnosticManager {
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel(100); // Buffer size of 100 messages
-        
+
         // Spawn the worker to process events
         let worker = DiagnosticWorker {
             fps_trackers: HashMap::new(),
@@ -130,9 +133,9 @@ impl DiagnosticManager {
             report_interval_ms: 1000,
             receiver,
         };
-        
+
         wasm_bindgen_futures::spawn_local(worker.run());
-        
+
         Self {
             sender,
             frames_decoded: Arc::new(AtomicU32::new(0)),
@@ -140,20 +143,28 @@ impl DiagnosticManager {
             report_interval_ms: 1000, // Default to 1 second updates
         }
     }
-    
+
     // Set the callback for UI updates
     pub fn set_stats_callback(&self, callback: Callback<String>) {
-        if let Ok(_) = self.sender.clone().try_send(DiagnosticEvent::SetStatsCallback(callback)) {
+        if let Ok(_) = self
+            .sender
+            .clone()
+            .try_send(DiagnosticEvent::SetStatsCallback(callback))
+        {
             // Successfully sent the callback
         } else {
             debug!("Failed to set stats callback - channel full or closed");
         }
     }
-    
+
     // Set how often stats should be reported to the UI (in milliseconds)
     pub fn set_reporting_interval(&mut self, interval_ms: u64) {
         self.report_interval_ms = interval_ms;
-        if let Ok(_) = self.sender.clone().try_send(DiagnosticEvent::SetReportingInterval(interval_ms)) {
+        if let Ok(_) = self
+            .sender
+            .clone()
+            .try_send(DiagnosticEvent::SetReportingInterval(interval_ms))
+        {
             // Successfully set the interval
         } else {
             debug!("Failed to set reporting interval - channel full or closed");
@@ -164,22 +175,26 @@ impl DiagnosticManager {
     pub fn track_frame(&self, peer_id: &str, media_type: MediaType) -> f64 {
         // Increment total frames decoded
         self.frames_decoded.fetch_add(1, Ordering::SeqCst);
-        
+
         // Send the frame event to the worker
-        if let Ok(_) = self.sender.clone().try_send(DiagnosticEvent::FrameReceived { 
-            peer_id: peer_id.to_string(),
-            media_type,
-        }) {
+        if let Ok(_) = self
+            .sender
+            .clone()
+            .try_send(DiagnosticEvent::FrameReceived {
+                peer_id: peer_id.to_string(),
+                media_type,
+            })
+        {
             // Frame event sent successfully
         } else {
             debug!("Failed to send frame event - channel full or closed");
         }
-        
+
         // We don't know the actual FPS here, but we'll request stats
         if let Ok(_) = self.sender.clone().try_send(DiagnosticEvent::RequestStats) {
             // Request sent successfully
         }
-        
+
         0.0 // Return a default value since we can't get real-time FPS anymore
     }
 
@@ -197,13 +212,13 @@ impl DiagnosticManager {
     pub fn get_frames_dropped(&self) -> u32 {
         self.frames_dropped.load(Ordering::SeqCst)
     }
-    
+
     // Method to be implemented fully later
     pub fn report_event(&self, _event: DiagnosticEvent) -> Result<(), Box<dyn Error>> {
         // Will be implemented when we need it
         Ok(())
     }
-    
+
     // Method to be implemented fully later
     pub fn get_stats(&self) -> Result<JsValue, Box<dyn Error>> {
         // Will be implemented when we need it
@@ -218,55 +233,59 @@ impl DiagnosticWorker {
             self.maybe_report_stats_to_ui();
         }
     }
-    
+
     fn handle_event(&mut self, event: DiagnosticEvent) {
         match event {
-            DiagnosticEvent::FrameReceived { peer_id, media_type } => {
-                let peer_trackers = self.fps_trackers
+            DiagnosticEvent::FrameReceived {
+                peer_id,
+                media_type,
+            } => {
+                let peer_trackers = self
+                    .fps_trackers
                     .entry(peer_id.clone())
                     .or_insert_with(HashMap::new);
-                    
+
                 let tracker = peer_trackers
                     .entry(media_type)
                     .or_insert_with(|| FpsTracker::new(media_type));
-                    
+
                 tracker.track_frame();
-            },
+            }
             DiagnosticEvent::SetStatsCallback(callback) => {
                 self.on_stats_update = Some(callback);
-            },
+            }
             DiagnosticEvent::SetReportingInterval(interval) => {
                 self.report_interval_ms = interval;
-            },
+            }
             DiagnosticEvent::RequestStats => {
                 self.maybe_report_stats_to_ui();
             }
         }
     }
-    
+
     // Check if it's time to report stats and do so if needed
     fn maybe_report_stats_to_ui(&mut self) {
         let now = Date::now();
         let elapsed_ms = now - self.last_report_time;
-        
+
         if elapsed_ms >= self.report_interval_ms as f64 {
             // Time to report
             let stats_string = self.get_fps_stats_string();
-            
+
             // Report stats to UI if callback is set
             if let Some(callback) = &self.on_stats_update {
                 callback.emit(stats_string);
             }
-            
+
             // Update last report time
             self.last_report_time = now;
         }
     }
-    
+
     // Get all FPS stats for all peers
     fn get_all_fps_stats(&self) -> HashMap<String, HashMap<MediaType, f64>> {
         let mut result = HashMap::new();
-        
+
         for (peer_id, peer_trackers) in &self.fps_trackers {
             let mut media_fps = HashMap::new();
             for (media_type, tracker) in peer_trackers {
@@ -274,15 +293,15 @@ impl DiagnosticWorker {
             }
             result.insert(peer_id.clone(), media_fps);
         }
-        
+
         result
     }
-    
+
     // Get a formatted string with FPS stats for all peers
     fn get_fps_stats_string(&self) -> String {
         let stats = self.get_all_fps_stats();
         let mut result = String::new();
-        
+
         for (peer_id, media_stats) in stats.iter() {
             result.push_str(&format!("Peer {}: ", peer_id));
             for (media_type, fps) in media_stats.iter() {
@@ -296,7 +315,7 @@ impl DiagnosticWorker {
             }
             result.push('\n');
         }
-        
+
         result
     }
-} 
+}

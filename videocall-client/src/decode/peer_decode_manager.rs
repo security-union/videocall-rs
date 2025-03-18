@@ -243,11 +243,11 @@ impl PeerDecodeManager {
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_frame(&email, media_type);
                     }
-                    
+
                     if decode_status.first_frame {
                         self.on_first_frame.emit((email.clone(), media_type));
                     }
-                    
+
                     Ok(())
                 }
                 Err(e) => {
@@ -299,13 +299,13 @@ impl PeerDecodeManager {
             None => Err(PeerDecodeError::NoSuchPeer(email.clone())),
         }
     }
-    
+
     pub fn get_fps(&self, _peer_id: &str, _media_type: MediaType) -> f64 {
         // FPS tracking is now handled by the DiagnosticManager internally
         // We return 0.0 here as we can't get real-time FPS immediately
         0.0
     }
-    
+
     pub fn get_all_fps_stats(&self) -> Option<String> {
         None
     }

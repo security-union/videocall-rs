@@ -252,3 +252,72 @@ select {
   white-space: pre-wrap;
 }
 
+/* Diagnostics Sidebar */
+#diagnostics-sidebar {
+  position: fixed;
+  right: -20%;
+  top: 0;
+  height: 100%;
+  width: 20%;
+  background-color: #242526;
+  color: white;
+  transition: right 0.3s ease;
+  z-index: 20;
+  overflow-y: auto;
+  box-shadow: -2px 0 10px rgba(0, 0, 0, 0.3);
+}
+
+#diagnostics-sidebar.visible {
+  right: 0;
+  visibility: visible;
+}
+
+#diagnostics-sidebar .sidebar-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 15px;
+  border-bottom: 1px solid #3a3b3c;
+}
+
+#diagnostics-sidebar h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+#diagnostics-sidebar .close-button {
+  background: none;
+  border: none;
+  color: white;
+  font-size: 24px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+
+#diagnostics-sidebar .sidebar-content {
+  padding: 15px;
+}
+
+#diagnostics-sidebar .diagnostics-data pre {
+  font-family: monospace;
+  font-size: 14px;
+  white-space: pre-wrap;
+  color: #00ff00;
+  background-color: rgba(0, 0, 0, 0.3);
+  padding: 10px;
+  border-radius: 5px;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+
+#diagnostics-sidebar .diagnostics-empty {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100px;
+  color: #999;
+  font-style: italic;
+}
+

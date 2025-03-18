@@ -57,13 +57,13 @@ pub struct VideoCallClientOptions {
 
     /// Callback will be called as `callback(())` if a connection gets dropped
     pub on_connection_lost: Callback<JsValue>,
-    
+
     /// Callback will be called as `callback(stats_string)` with diagnostics information
     pub on_diagnostics_update: Option<Callback<String>>,
-    
+
     /// `true` to enable diagnostics collection; `false` to disable
     pub enable_diagnostics: bool,
-    
+
     /// How often to send diagnostics updates in milliseconds (default: 1000)
     pub diagnostics_update_interval_ms: Option<u64>,
 }
@@ -112,27 +112,27 @@ impl VideoCallClient {
     ///
     pub fn new(options: VideoCallClientOptions) -> Self {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
-        
+
         // Create diagnostics manager if enabled
         let diagnostics = if options.enable_diagnostics {
             let diagnostics = Arc::new(DiagnosticManager::new());
-            
+
             // Set up diagnostics callback if provided
             if let Some(callback) = &options.on_diagnostics_update {
                 diagnostics.set_stats_callback(callback.clone());
             }
-            
+
             // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 let mut diag = DiagnosticManager::new();
                 diag.set_reporting_interval(interval);
                 let diagnostics = Arc::new(diag);
-                
+
                 // Set up diagnostics callback if provided
                 if let Some(callback) = &options.on_diagnostics_update {
                     diagnostics.set_stats_callback(callback.clone());
                 }
-                
+
                 Some(diagnostics)
             } else {
                 Some(diagnostics)
@@ -252,7 +252,10 @@ impl VideoCallClient {
         Ok(())
     }
 
-    fn create_peer_decoder_manager(opts: &VideoCallClientOptions, diagnostics: Option<Arc<DiagnosticManager>>) -> PeerDecodeManager {
+    fn create_peer_decoder_manager(
+        opts: &VideoCallClientOptions,
+        diagnostics: Option<Arc<DiagnosticManager>>,
+    ) -> PeerDecodeManager {
         match diagnostics {
             Some(diagnostics) => {
                 let mut peer_decode_manager = PeerDecodeManager::new_with_diagnostics(diagnostics);
@@ -330,13 +333,16 @@ impl VideoCallClient {
     pub fn get_diagnostics(&self) -> Option<String> {
         self.inner.borrow().peer_decode_manager.get_all_fps_stats()
     }
-    
+
     /// Get the FPS for a specific peer and media type
-    /// 
+    ///
     /// Returns the current frames per second for the specified peer and media type,
     /// or 0.0 if diagnostics are disabled or the peer doesn't exist.
     pub fn get_peer_fps(&self, peer_id: &str, media_type: MediaType) -> f64 {
-        self.inner.borrow().peer_decode_manager.get_fps(peer_id, media_type)
+        self.inner
+            .borrow()
+            .peer_decode_manager
+            .get_fps(peer_id, media_type)
     }
 }
 

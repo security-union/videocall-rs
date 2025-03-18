@@ -73,10 +73,10 @@ mod connection;
 pub mod constants;
 pub mod crypto;
 pub mod decode;
+pub mod diagnostics;
 mod encode;
 mod media_devices;
 mod wrappers;
-pub mod diagnostics;
 
 pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use encode::{CameraEncoder, MicrophoneEncoder, ScreenEncoder};

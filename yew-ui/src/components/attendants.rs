@@ -32,6 +32,7 @@ pub enum MeetingAction {
 #[derive(Debug)]
 pub enum UserScreenAction {
     TogglePeerList,
+    ToggleDiagnostics,
 }
 
 #[derive(Debug)]
@@ -81,6 +82,7 @@ pub struct AttendantsComponent {
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub peer_list_open: bool,
+    pub diagnostics_open: bool,
     pub error: Option<String>,
     pub diagnostics_data: Option<String>,
     pending_mic_enable: bool,
@@ -158,6 +160,7 @@ impl Component for AttendantsComponent {
             mic_enabled: false,
             video_enabled: false,
             peer_list_open: false,
+            diagnostics_open: false,
             error: None,
             diagnostics_data: None,
             pending_mic_enable: false,
@@ -279,6 +282,15 @@ impl Component for AttendantsComponent {
                 match action {
                     UserScreenAction::TogglePeerList => {
                         self.peer_list_open = !self.peer_list_open;
+                        if self.peer_list_open {
+                            self.diagnostics_open = false;
+                        }
+                    }
+                    UserScreenAction::ToggleDiagnostics => {
+                        self.diagnostics_open = !self.diagnostics_open;
+                        if self.diagnostics_open {
+                            self.peer_list_open = false;
+                        }
                     }
                 }
                 true
@@ -291,6 +303,7 @@ impl Component for AttendantsComponent {
         let media_access_granted = self.media_device_access.is_granted();
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
+        let toggle_diagnostics = ctx.link().callback(|_| UserScreenAction::ToggleDiagnostics);
 
         let peers = self.client.sorted_peer_keys();
         let rows = canvas_generator::generate(
@@ -300,7 +313,7 @@ impl Component for AttendantsComponent {
 
         html! {
             <div id="main-container" class="meeting-page">
-                <div id="grid-container" style={if self.peer_list_open {"width: 80%;"} else {"width: 100%;"}}>
+                <div id="grid-container" style={if self.peer_list_open || self.diagnostics_open {"width: 80%;"} else {"width: 100%;"}}>
                     {
                         self.error.as_ref().map(|error| html! {
                             <div class="error-container">
@@ -310,13 +323,6 @@ impl Component for AttendantsComponent {
                         })
                     }
                     { rows }
-                    {
-                        self.diagnostics_data.as_ref().map(|diagnostics| html! {
-                            <div class="diagnostics-container">
-                                <pre class="diagnostics-data">{ diagnostics }</pre>
-                            </div>
-                        })
-                    }
                     {
                         if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
                             html! {
@@ -442,6 +448,32 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            <button
+                                                class={classes!("video-control-button", self.diagnostics_open.then_some("active"))}
+                                                onclick={toggle_diagnostics.clone()}>
+                                                {
+                                                    if self.diagnostics_open {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
+                                                                    <line x1="3" y1="3" x2="21" y2="21"></line>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Close Diagnostics" }</span>
+                                                            </>
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Open Diagnostics" }</span>
+                                                            </>
+                                                        }
+                                                    }
+                                                }
+                                            </button>
                                         </nav>
                                     </div>
                                     {
@@ -475,6 +507,28 @@ impl Component for AttendantsComponent {
                 </div>
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={peers} onclose={toggle_peer_list} />
+                </div>
+                <div id="diagnostics-sidebar" class={if self.diagnostics_open {"visible"} else {""}}>
+                    <div class="sidebar-header">
+                        <h2>{"Diagnostics"}</h2>
+                        <button class="close-button" onclick={toggle_diagnostics.clone()}>{"×"}</button>
+                    </div>
+                    <div class="sidebar-content">
+                        {
+                            match &self.diagnostics_data {
+                                Some(data) => html! {
+                                    <div class="diagnostics-data">
+                                        <pre>{ data }</pre>
+                                    </div>
+                                },
+                                None => html! {
+                                    <div class="diagnostics-empty">
+                                        <p>{"No diagnostics data available yet."}</p>
+                                    </div>
+                                }
+                            }
+                        }
+                    </div>
                 </div>
             </div>
         }

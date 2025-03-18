@@ -1,17 +1,16 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
+use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
+use crate::crypto::aes::Aes128State;
+use crate::diagnostics::DiagnosticManager;
+use anyhow::Result;
 use log::debug;
 use protobuf::Message;
 use std::{fmt::Display, sync::Arc};
+use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::{
-    media_packet::media_packet::MediaType, packet_wrapper::PacketWrapper,
-};
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 use yew::prelude::Callback;
-
-use crate::crypto::aes::Aes128State;
-
-use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
 
 #[derive(Debug)]
 pub enum PeerDecodeError {
@@ -186,6 +185,13 @@ pub struct PeerDecodeManager {
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
+    diagnostics: Option<Arc<DiagnosticManager>>,
+}
+
+impl Default for PeerDecodeManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PeerDecodeManager {
@@ -195,6 +201,17 @@ impl PeerDecodeManager {
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
+            diagnostics: None,
+        }
+    }
+
+    pub fn new_with_diagnostics(diagnostics: Arc<DiagnosticManager>) -> Self {
+        Self {
+            connected_peers: HashMapWithOrderedKeys::new(),
+            on_first_frame: Callback::noop(),
+            get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
+            get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
+            diagnostics: Some(diagnostics),
         }
     }
 
@@ -221,9 +238,14 @@ impl PeerDecodeManager {
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
+                    if let Some(diagnostics) = &self.diagnostics {
+                        diagnostics.track_frame(&email, media_type);
+                    }
+
                     if decode_status.first_frame {
                         self.on_first_frame.emit((email.clone(), media_type));
                     }
+
                     Ok(())
                 }
                 Err(e) => {
@@ -274,5 +296,15 @@ impl PeerDecodeManager {
             }
             None => Err(PeerDecodeError::NoSuchPeer(email.clone())),
         }
+    }
+
+    pub fn get_fps(&self, _peer_id: &str, _media_type: MediaType) -> f64 {
+        // FPS tracking is now handled by the DiagnosticManager internally
+        // We return 0.0 here as we can't get real-time FPS immediately
+        0.0
+    }
+
+    pub fn get_all_fps_stats(&self) -> Option<String> {
+        None
     }
 }

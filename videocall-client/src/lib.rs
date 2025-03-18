@@ -70,9 +70,10 @@
 
 mod client;
 mod connection;
-mod constants;
-mod crypto;
-mod decode;
+pub mod constants;
+pub mod crypto;
+pub mod decode;
+pub mod diagnostics;
 mod encode;
 mod media_devices;
 mod wrappers;

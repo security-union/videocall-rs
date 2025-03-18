@@ -9,6 +9,7 @@ edition = "2021"
 aes = "0.8.3"
 anyhow = "1"
 cbc = { version = "0.1.2", features = ["alloc"] }
+futures = "0.3"
 getrandom = { version = "0.2.10", features = ["js"] }
 gloo = "0.8.0"
 gloo-timers = "0.2.6"
@@ -89,7 +90,8 @@ features = [
     "MediaDeviceInfo",
     "MediaDeviceKind",
     "MediaTrackConstraints",
-    "CanvasRenderingContext2d"
+    "CanvasRenderingContext2d",
+    "Performance"
 ]
 
 [dev-dependencies]

@@ -55,32 +55,35 @@ impl Component for PeerList {
         });
 
         html! {
-        <>
-            <div id="peer-list-container-header">
-                <p><b>{ "Attendants" }</b></p>
-                <button onclick={ctx.props().onclose.clone()}>{ "X" }</button>
-            </div>
-            <div class="search-box">
-                <input
-                    type="text"
-                    placeholder="Search..."
-                    value={self.search_query.clone()}
-                    oninput={search_peers}
-                />
-            </div>
-            <div>
-                <p style="margin-top:20px"><b>{ "In call" }</b></p>
-            </div>
-            <div class="peer-list">
-                <ul>
-                    { for filtered_peers.iter().map(|peer|
-                        html!{
-                            <li><PeerListItem name={peer.clone()}/></li>
-                        })
-                    }
-                </ul>
-            </div>
-        </>
+            <>
+                <div class="sidebar-header">
+                    <h2>{ "Attendants" }</h2>
+                    <button class="close-button" onclick={ctx.props().onclose.clone()}>{"×"}</button>
+                </div>
+                <div class="sidebar-content">
+                    <div class="search-container">
+                        <input
+                            type="text"
+                            placeholder="Search attendants..."
+                            value={self.search_query.clone()}
+                            oninput={search_peers}
+                            class="search-input"
+                        />
+                    </div>
+                    <div class="attendants-section">
+                        <h3>{ "In call" }</h3>
+                        <div class="peer-list">
+                            <ul>
+                                { for filtered_peers.iter().map(|peer|
+                                    html!{
+                                        <li><PeerListItem name={peer.clone()}/></li>
+                                    })
+                                }
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </>
         }
     }
 }

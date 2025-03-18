@@ -24,3 +24,12 @@ pub const SCREEN_HEIGHT: u32 = 1080u32;
 pub const SCREEN_WIDTH: u32 = 1920u32;
 
 pub const RSA_BITS: usize = 1024;
+
+use videocall_types::protos::media_packet::media_packet::MediaType;
+
+pub static SUPPORTED_MEDIA_TYPES: &[MediaType] = &[
+    MediaType::AUDIO,
+    MediaType::VIDEO,
+    MediaType::SCREEN,
+    MediaType::HEARTBEAT,
+];

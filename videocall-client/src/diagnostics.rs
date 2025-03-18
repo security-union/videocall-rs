@@ -57,6 +57,7 @@ struct FpsTracker {
     fps: f64,
     last_fps_update: f64, // timestamp in ms
     total_frames: u32,
+    #[allow(dead_code)]
     media_type: MediaType,
     last_frame_time: f64, // Add timestamp of last received frame
 }
@@ -116,6 +117,7 @@ impl FpsTracker {
 
 // Define a struct to hold the JavaScript timer resources
 struct JsTimer {
+    #[allow(dead_code)]
     closure: Closure<dyn FnMut()>,
     interval_id: i32,
 }
@@ -229,36 +231,32 @@ impl DiagnosticManager {
 
     // Set the callback for UI updates
     pub fn set_stats_callback(&self, callback: Callback<String>) {
-        if let Err(_) = self
+        if let Err(e) = self
             .sender
             .clone()
             .try_send(DiagnosticEvent::SetStatsCallback(callback))
         {
-            // Successfully sent the callback
-            debug!("Failed to set stats callback - channel full or closed");
+            debug!("Failed to set stats callback: {e}");
         }
     }
 
     // Set how often stats should be reported to the UI (in milliseconds)
     pub fn set_reporting_interval(&mut self, interval_ms: u64) {
         self.report_interval_ms = interval_ms;
-        if let Err(_) = self
+        if let Err(e) = self
             .sender
             .clone()
             .try_send(DiagnosticEvent::SetReportingInterval(interval_ms))
         {
-            // Successfully set the interval
-            debug!("Failed to set reporting interval - channel full or closed");
+            debug!("Failed to set reporting interval: {e}");
         }
     }
 
     // Track a frame received from a peer for a specific media type
     pub fn track_frame(&self, peer_id: &str, media_type: MediaType) -> f64 {
-        // Increment total frames decoded
         self.frames_decoded.fetch_add(1, Ordering::SeqCst);
 
-        // Send the frame event to the worker
-        if let Err(_) = self
+        if let Err(e) = self
             .sender
             .clone()
             .try_send(DiagnosticEvent::FrameReceived {
@@ -266,17 +264,14 @@ impl DiagnosticManager {
                 media_type,
             })
         {
-            // Frame event sent successfully
-            debug!("Failed to send frame event - channel full or closed");
+            debug!("Failed to send frame event: {e}");
         }
 
-        // We don't know the actual FPS here, but we'll request stats
-        if let Err(_) = self.sender.clone().try_send(DiagnosticEvent::RequestStats) {
-            // Request sent successfully
-            debug!("Failed to request stats - channel full or closed");
+        if let Err(e) = self.sender.clone().try_send(DiagnosticEvent::RequestStats) {
+            debug!("Failed to request stats: {e}");
         }
 
-        0.0 // Return a default value since we can't get real-time FPS anymore
+        0.0
     }
 
     // Increment the frames dropped counter

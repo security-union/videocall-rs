@@ -1,7 +1,7 @@
 use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::StreamExt;
 use js_sys::Date;
-use log::debug;
+use log::{debug, error};
 use std::error::Error;
 use std::{
     collections::HashMap,
@@ -143,28 +143,25 @@ impl DiagnosticManager {
 
     // Set the callback for UI updates
     pub fn set_stats_callback(&self, callback: Callback<String>) {
-        if let Ok(_) = self
+        if let Err(e) = self
             .sender
             .clone()
             .try_send(DiagnosticEvent::SetStatsCallback(callback))
         {
-            // Successfully sent the callback
-        } else {
-            debug!("Failed to set stats callback - channel full or closed");
+            error!("Failed to set stats callback - {}", e);
         }
     }
 
     // Set how often stats should be reported to the UI (in milliseconds)
     pub fn set_reporting_interval(&mut self, interval_ms: u64) {
         self.report_interval_ms = interval_ms;
-        if let Ok(_) = self
+        if let Err(e) = self
             .sender
             .clone()
             .try_send(DiagnosticEvent::SetReportingInterval(interval_ms))
         {
             // Successfully set the interval
-        } else {
-            debug!("Failed to set reporting interval - channel full or closed");
+            error!("Failed to set reporting interval - {}", e);
         }
     }
 
@@ -174,13 +171,14 @@ impl DiagnosticManager {
         self.frames_decoded.fetch_add(1, Ordering::SeqCst);
 
         // Send the frame event to the worker
-        if let Ok(_) = self
+        if self
             .sender
             .clone()
             .try_send(DiagnosticEvent::FrameReceived {
                 peer_id: peer_id.to_string(),
                 media_type,
             })
+            .is_ok()
         {
             // Frame event sent successfully
         } else {
@@ -188,8 +186,11 @@ impl DiagnosticManager {
         }
 
         // We don't know the actual FPS here, but we'll request stats
-        if let Ok(_) = self.sender.clone().try_send(DiagnosticEvent::RequestStats) {
-            // Request sent successfully
+        if let Err(e) = self.sender.clone().try_send(DiagnosticEvent::RequestStats) {
+            debug!(
+                "Failed to send request stats - channel full or closed: {}",
+                e
+            );
         }
 
         0.0 // Return a default value since we can't get real-time FPS anymore

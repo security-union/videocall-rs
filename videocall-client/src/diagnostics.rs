@@ -1,9 +1,8 @@
 use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::StreamExt;
 use js_sys::Date;
-use log::{debug, error};
+use log::debug;
 use std::{
-    cell::RefCell,
     collections::HashMap,
     error::Error,
     rc::Rc,
@@ -331,7 +330,7 @@ impl DiagnosticWorker {
                 let peer_trackers = self
                     .fps_trackers
                     .entry(peer_id.clone())
-                    .or_insert_with(HashMap::new);
+                    .or_default();
 
                 let tracker = peer_trackers
                     .entry(media_type)

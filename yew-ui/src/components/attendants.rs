@@ -178,7 +178,7 @@ impl Component for AttendantsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        log::debug!("AttendantsComponent update: {:?}", msg);
+        debug!("AttendantsComponent update: {:?}", msg);
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {

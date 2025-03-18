@@ -2,22 +2,14 @@ use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
-use anyhow::{anyhow, Result};
-use js_sys::Date;
-use log::{debug, error, warn};
+use anyhow::Result;
+use log::debug;
 use protobuf::Message;
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    rc::Rc,
-    sync::{Arc, Mutex},
-};
+use std::{fmt::Display, sync::Arc};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{Performance, Window};
 use yew::prelude::Callback;
 
 #[derive(Debug)]
@@ -194,6 +186,12 @@ pub struct PeerDecodeManager {
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Arc<DiagnosticManager>>,
+}
+
+impl Default for PeerDecodeManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PeerDecodeManager {

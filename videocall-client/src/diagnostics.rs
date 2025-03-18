@@ -4,17 +4,14 @@ use js_sys::Date;
 use log::debug;
 use std::error::Error;
 use std::{
-    cell::RefCell,
     collections::HashMap,
-    rc::Rc,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc,
     },
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
-use web_sys::{Performance, Window};
 use yew::Callback;
 
 // Basic structure for diagnostics events
@@ -240,10 +237,7 @@ impl DiagnosticWorker {
                 peer_id,
                 media_type,
             } => {
-                let peer_trackers = self
-                    .fps_trackers
-                    .entry(peer_id.clone())
-                    .or_insert_with(HashMap::new);
+                let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
 
                 let tracker = peer_trackers
                     .entry(media_type)

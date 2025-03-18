@@ -182,6 +182,12 @@ impl PeerDecode for VideoPeerDecoder {
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
 pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
 
+impl Default for AudioPeerDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioPeerDecoder {
     pub fn new() -> Self {
         let error = Closure::wrap(Box::new(move |e: JsValue| {

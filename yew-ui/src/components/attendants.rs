@@ -1,7 +1,7 @@
 use crate::components::{canvas_generator, peer_list::PeerList};
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use log::{error, warn};
+use log::{error, warn, debug};
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
@@ -18,6 +18,7 @@ pub enum WsAction {
     MediaPermissionsGranted,
     MediaPermissionsError(String),
     Log(String),
+    DiagnosticsUpdated(String),
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -81,6 +82,7 @@ pub struct AttendantsComponent {
     pub video_enabled: bool,
     pub peer_list_open: bool,
     pub error: Option<String>,
+    pub diagnostics_data: Option<String>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -116,6 +118,12 @@ impl AttendantsComponent {
             },
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
+            enable_diagnostics: true,
+            on_diagnostics_update: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |stats| link.send_message(Msg::from(WsAction::DiagnosticsUpdated(stats))))
+            }),
+            diagnostics_update_interval_ms: Some(1000),
         };
         VideoCallClient::new(opts)
     }
@@ -151,6 +159,7 @@ impl Component for AttendantsComponent {
             video_enabled: false,
             peer_list_open: false,
             error: None,
+            diagnostics_data: None,
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -164,7 +173,7 @@ impl Component for AttendantsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        log::info!("AttendantsComponent update: {:?}", msg);
+        log::debug!("AttendantsComponent update: {:?}", msg);
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
@@ -216,6 +225,10 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsError(error) => {
                     self.error = Some(error);
+                    true
+                }
+                WsAction::DiagnosticsUpdated(stats) => {
+                    self.diagnostics_data = Some(stats);
                     true
                 }
             },
@@ -297,6 +310,13 @@ impl Component for AttendantsComponent {
                         })
                     }
                     { rows }
+                    {
+                        self.diagnostics_data.as_ref().map(|diagnostics| html! {
+                            <div class="diagnostics-container">
+                                <pre class="diagnostics-data">{ diagnostics }</pre>
+                            </div>
+                        })
+                    }
                     {
                         if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
                             html! {

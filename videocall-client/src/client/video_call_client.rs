@@ -2,6 +2,7 @@ use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
+use crate::diagnostics::DiagnosticManager;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info};
 use protobuf::Message;
@@ -9,6 +10,7 @@ use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -55,6 +57,15 @@ pub struct VideoCallClientOptions {
 
     /// Callback will be called as `callback(())` if a connection gets dropped
     pub on_connection_lost: Callback<JsValue>,
+    
+    /// Callback will be called as `callback(stats_string)` with diagnostics information
+    pub on_diagnostics_update: Option<Callback<String>>,
+    
+    /// `true` to enable diagnostics collection; `false` to disable
+    pub enable_diagnostics: bool,
+    
+    /// How often to send diagnostics updates in milliseconds (default: 1000)
+    pub diagnostics_update_interval_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -71,6 +82,7 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
+    diagnostics: Option<Arc<DiagnosticManager>>,
 }
 
 /// The client struct for a video call connection.
@@ -84,6 +96,7 @@ pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
     aes: Rc<Aes128State>,
+    diagnostics: Option<Arc<DiagnosticManager>>,
 }
 
 impl PartialEq for VideoCallClient {
@@ -99,6 +112,35 @@ impl VideoCallClient {
     ///
     pub fn new(options: VideoCallClientOptions) -> Self {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
+        
+        // Create diagnostics manager if enabled
+        let diagnostics = if options.enable_diagnostics {
+            let diagnostics = Arc::new(DiagnosticManager::new());
+            
+            // Set up diagnostics callback if provided
+            if let Some(callback) = &options.on_diagnostics_update {
+                diagnostics.set_stats_callback(callback.clone());
+            }
+            
+            // Set update interval if provided
+            if let Some(interval) = options.diagnostics_update_interval_ms {
+                let mut diag = DiagnosticManager::new();
+                diag.set_reporting_interval(interval);
+                let diagnostics = Arc::new(diag);
+                
+                // Set up diagnostics callback if provided
+                if let Some(callback) = &options.on_diagnostics_update {
+                    diagnostics.set_stats_callback(callback.clone());
+                }
+                
+                Some(diagnostics)
+            } else {
+                Some(diagnostics)
+            }
+        } else {
+            None
+        };
+
         let inner = Rc::new(RefCell::new(Inner {
             options: InnerOptions {
                 enable_e2ee: options.enable_e2ee,
@@ -108,12 +150,15 @@ impl VideoCallClient {
             connection: None,
             aes: aes.clone(),
             rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
-            peer_decode_manager: Self::create_peer_decoder_manager(&options),
+            peer_decode_manager: Self::create_peer_decoder_manager(&options, diagnostics.clone()),
+            diagnostics: diagnostics.clone(),
         }));
+
         Self {
             options,
-            aes,
             inner,
+            aes,
+            diagnostics,
         }
     }
 
@@ -207,12 +252,23 @@ impl VideoCallClient {
         Ok(())
     }
 
-    fn create_peer_decoder_manager(opts: &VideoCallClientOptions) -> PeerDecodeManager {
-        let mut peer_decode_manager = PeerDecodeManager::new();
-        peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
-        peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
-        peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
-        peer_decode_manager
+    fn create_peer_decoder_manager(opts: &VideoCallClientOptions, diagnostics: Option<Arc<DiagnosticManager>>) -> PeerDecodeManager {
+        match diagnostics {
+            Some(diagnostics) => {
+                let mut peer_decode_manager = PeerDecodeManager::new_with_diagnostics(diagnostics);
+                peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
+                peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
+                peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
+                peer_decode_manager
+            }
+            None => {
+                let mut peer_decode_manager = PeerDecodeManager::new();
+                peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
+                peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
+                peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
+                peer_decode_manager
+            }
+        }
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
@@ -265,6 +321,22 @@ impl VideoCallClient {
     /// Returns a reference to a copy of [`options.userid`](VideoCallClientOptions::userid)
     pub fn userid(&self) -> &String {
         &self.options.userid
+    }
+
+    /// Get diagnostics information for all peers
+    ///
+    /// Returns a formatted string with FPS stats for all peers if diagnostics are enabled,
+    /// or None if diagnostics are disabled.
+    pub fn get_diagnostics(&self) -> Option<String> {
+        self.inner.borrow().peer_decode_manager.get_all_fps_stats()
+    }
+    
+    /// Get the FPS for a specific peer and media type
+    /// 
+    /// Returns the current frames per second for the specified peer and media type,
+    /// or 0.0 if diagnostics are disabled or the peer doesn't exist.
+    pub fn get_peer_fps(&self, peer_id: &str, media_type: MediaType) -> f64 {
+        self.inner.borrow().peer_decode_manager.get_fps(peer_id, media_type)
     }
 }
 

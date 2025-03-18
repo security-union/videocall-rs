@@ -230,3 +230,25 @@ select {
   visibility: visible;
 }
 
+/* Diagnostics styling */
+.diagnostics-container {
+  position: fixed;
+  bottom: 10px;
+  right: 10px;
+  background-color: rgba(0, 0, 0, 0.7);
+  color: #00ff00;
+  padding: 10px;
+  border-radius: 5px;
+  font-family: monospace;
+  max-width: 300px;
+  max-height: 200px;
+  overflow: auto;
+  z-index: 1000;
+}
+
+.diagnostics-data {
+  margin: 0;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+

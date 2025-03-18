@@ -1,7 +1,7 @@
 use crate::components::{canvas_generator, peer_list::PeerList};
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
-use log::{error, warn, debug};
+use log::{debug, error, warn};
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
@@ -123,7 +123,9 @@ impl AttendantsComponent {
             enable_diagnostics: true,
             on_diagnostics_update: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |stats| link.send_message(Msg::from(WsAction::DiagnosticsUpdated(stats))))
+                Callback::from(move |stats| {
+                    link.send_message(Msg::from(WsAction::DiagnosticsUpdated(stats)))
+                })
             }),
             diagnostics_update_interval_ms: Some(1000),
         };

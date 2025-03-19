@@ -8,11 +8,11 @@ use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -153,7 +153,10 @@ impl VideoCallClient {
                 connection: None,
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
-                peer_decode_manager: Self::create_peer_decoder_manager(&options, diagnostics.clone()),
+                peer_decode_manager: Self::create_peer_decoder_manager(
+                    &options,
+                    diagnostics.clone(),
+                ),
                 _diagnostics: diagnostics.clone(),
             })),
             aes,
@@ -164,7 +167,7 @@ impl VideoCallClient {
         if let Some(diagnostics) = &diagnostics {
             let client_clone = client.clone();
             diagnostics.set_packet_handler(Callback::from(move |packet| {
-               client_clone.send_diagnostic_packet(packet); 
+                client_clone.send_diagnostic_packet(packet);
             }));
         }
 
@@ -449,9 +452,17 @@ impl Inner {
                 error!("Not implemented: CONNECTION packet type");
             }
             Ok(PacketType::DIAGNOSTICS) => {
-                error!("Not implemented: DIAGNOSTICS packet type");
+                // For now, just log the packet after unmarshalling
+                if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
+                {
+                    debug!("Received diagnostics packet: {:?}", diagnostics_packet);
+                } else {
+                    error!("Failed to parse diagnostics packet");
+                }
             }
-            Err(_) => {}
+            Err(e) => {
+                error!("Failed to parse diagnostics packet: {}", e.to_string());
+            }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {
             debug!("added peer {}", peer_userid);

@@ -11,8 +11,10 @@ use std::{
         Arc,
     },
 };
+use videocall_types::protos::diagnostics_packet::{
+    self as diag, AudioMetrics, DiagnosticsPacket, VideoMetrics,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::diagnostics_packet::{self as diag, DiagnosticsPacket, VideoMetrics, AudioMetrics};
 use wasm_bindgen::prelude::*;
 use web_sys::{console, window};
 use yew::Callback;
@@ -334,47 +336,46 @@ impl DiagnosticWorker {
     fn handle_event(&mut self, event: DiagnosticEvent) {
         match event {
             DiagnosticEvent::FrameReceived {
-                        peer_id,
-                        media_type,
-                    } => {
-                        let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
+                peer_id,
+                media_type,
+            } => {
+                let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
 
-                        let tracker = peer_trackers
-                            .entry(media_type)
-                            .or_insert_with(|| FpsTracker::new(media_type));
+                let tracker = peer_trackers
+                    .entry(media_type)
+                    .or_insert_with(|| FpsTracker::new(media_type));
 
-                        tracker.track_frame();
-                    }
+                tracker.track_frame();
+            }
             DiagnosticEvent::SetStatsCallback(callback) => {
-                        self.on_stats_update = Some(callback);
-                    }
+                self.on_stats_update = Some(callback);
+            }
             DiagnosticEvent::SetReportingInterval(interval) => {
-                        self.report_interval_ms = interval;
-                    }
+                self.report_interval_ms = interval;
+            }
             DiagnosticEvent::RequestStats => {
-                        self.maybe_report_stats_to_ui();
-                    }
+                self.maybe_report_stats_to_ui();
+            }
             DiagnosticEvent::HeartbeatTick => {
-                        // Log heartbeat for debugging
-                        console::log_1(&"Diagnostics heartbeat tick".into());
+                // Log heartbeat for debugging
+                debug!("Diagnostics heartbeat tick");
 
-                        // Always report stats on heartbeat
-                        self.maybe_report_stats_to_ui();
-                        // Create and send diagnostic packets for each peer
+                // Always report stats on heartbeat
+                self.maybe_report_stats_to_ui();
+                // Create and send diagnostic packets for each peer
 
-                        self.send_diagnostic_packets();
-                        
-                    }
+                self.send_diagnostic_packets();
+            }
             DiagnosticEvent::SetPacketHandler(callback) => {
-                        self.packet_handler = Some(callback);
-                    }
+                self.packet_handler = Some(callback);
+            }
         }
     }
 
     fn send_diagnostic_packets(&self) {
         let now = Date::now();
         let timestamp_ms = now as u64;
-        
+
         for (peer_id, peer_trackers) in &self.fps_trackers {
             // Create separate packets for audio and video
             for (media_type, tracker) in peer_trackers {
@@ -382,13 +383,13 @@ impl DiagnosticWorker {
                 if self.packet_handler.is_none() {
                     continue;
                 }
-                
+
                 // Create a new diagnostics packet
                 let mut packet = DiagnosticsPacket::new();
                 packet.sender_id = window().unwrap().location().hostname().unwrap_or_default();
                 packet.target_id = peer_id.clone();
                 packet.timestamp_ms = timestamp_ms;
-                
+
                 // Convert MediaType from our enum to the proto enum
                 let proto_media_type = match media_type {
                     MediaType::VIDEO => diag::diagnostics_packet::MediaType::VIDEO,
@@ -397,12 +398,12 @@ impl DiagnosticWorker {
                     _ => continue, // Skip unknown media types
                 };
                 packet.media_type = proto_media_type.into();
-                
+
                 // Set metrics based on media type
                 if *media_type == MediaType::AUDIO {
                     let mut audio_metrics = AudioMetrics::new();
                     audio_metrics.fps_received = tracker.fps as f32;
-                    
+
                     // audio_metrics.set_sample_rate(48000); // Default sample rate
                     // packet.set_audio_metrics(audio_metrics);
                     packet.audio_metrics = ::protobuf::MessageField::some(audio_metrics);
@@ -413,11 +414,13 @@ impl DiagnosticWorker {
                     // video_metrics.set_frames_decoded(tracker.total_frames);
                     packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
                 }
-                
+
                 // Send the packet
                 if let Some(handler) = &self.packet_handler {
-                    debug!("Sending diagnostic packet to {}: {:?} FPS: {:.2}", 
-                            peer_id, media_type, tracker.fps);
+                    debug!(
+                        "Sending diagnostic packet to {}: {:?} FPS: {:.2}",
+                        peer_id, media_type, tracker.fps
+                    );
                     handler.emit(packet);
                 }
             }
@@ -473,14 +476,15 @@ impl DiagnosticWorker {
                 let mut packet = DiagnosticsPacket::new();
                 packet.sender_id = peer_id.clone();
                 packet.timestamp_ms = now as u64;
-                
+
                 // Convert MediaType to diagnostics packet MediaType
                 packet.media_type = match media_type {
                     MediaType::VIDEO => diag::diagnostics_packet::MediaType::VIDEO,
                     MediaType::AUDIO => diag::diagnostics_packet::MediaType::AUDIO,
                     MediaType::SCREEN => diag::diagnostics_packet::MediaType::SCREEN,
                     _ => continue, // Skip other types
-                }.into();
+                }
+                .into();
 
                 match media_type {
                     MediaType::VIDEO | MediaType::SCREEN => {

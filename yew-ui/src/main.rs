@@ -23,7 +23,6 @@ use crate::constants::ENABLE_OAUTH;
 ///
 /// This module contains the main entry point for the Videocall UI.
 /// It is responsible for rendering the main application and handling routing.
-/// 
 ///
 
 #[derive(Clone, Routable, PartialEq, Debug, EnumDisplay)]

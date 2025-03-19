@@ -8,6 +8,7 @@ use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
@@ -141,25 +142,33 @@ impl VideoCallClient {
             None
         };
 
-        let inner = Rc::new(RefCell::new(Inner {
-            options: InnerOptions {
-                enable_e2ee: options.enable_e2ee,
-                userid: options.userid.clone(),
-                on_peer_added: options.on_peer_added.clone(),
-            },
-            connection: None,
-            aes: aes.clone(),
-            rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
-            peer_decode_manager: Self::create_peer_decoder_manager(&options, diagnostics.clone()),
-            _diagnostics: diagnostics.clone(),
-        }));
-
-        Self {
-            options,
-            inner,
+        let client = Self {
+            options: options.clone(),
+            inner: Rc::new(RefCell::new(Inner {
+                options: InnerOptions {
+                    enable_e2ee: options.enable_e2ee,
+                    userid: options.userid.clone(),
+                    on_peer_added: options.on_peer_added.clone(),
+                },
+                connection: None,
+                aes: aes.clone(),
+                rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
+                peer_decode_manager: Self::create_peer_decoder_manager(&options, diagnostics.clone()),
+                _diagnostics: diagnostics.clone(),
+            })),
             aes,
-            _diagnostics: diagnostics,
+            _diagnostics: diagnostics.clone(),
+        };
+
+        // Set up the packet forwarding from DiagnosticManager to VideoCallClient
+        if let Some(diagnostics) = &diagnostics {
+            let client_clone = client.clone();
+            diagnostics.set_packet_handler(Callback::from(move |packet| {
+               client_clone.send_diagnostic_packet(packet); 
+            }));
         }
+
+        client
     }
 
     /// Initiates a connection to a videocall server.
@@ -343,6 +352,20 @@ impl VideoCallClient {
             .borrow()
             .peer_decode_manager
             .get_fps(peer_id, media_type)
+    }
+
+    /// Send a diagnostic packet to the server
+    pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.send_packet(PacketWrapper {
+                packet_type: PacketType::DIAGNOSTICS.into(),
+                email: self.options.userid.clone(),
+                data: packet.write_to_bytes().unwrap(),
+                ..Default::default()
+            });
+        } else {
+            error!("Failed to borrow inner for sending diagnostic packet");
+        }
     }
 }
 

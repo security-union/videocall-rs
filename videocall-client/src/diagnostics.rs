@@ -1,7 +1,7 @@
 use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::StreamExt;
 use js_sys::Date;
-use log::debug;
+use log::{debug, error};
 use std::{
     collections::HashMap,
     error::Error,
@@ -12,6 +12,7 @@ use std::{
     },
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::diagnostics_packet::{self as diag, DiagnosticsPacket, VideoMetrics, AudioMetrics};
 use wasm_bindgen::prelude::*;
 use web_sys::{console, window};
 use yew::Callback;
@@ -27,6 +28,7 @@ pub enum DiagnosticEvent {
     SetStatsCallback(Callback<String>),
     SetReportingInterval(u64),
     HeartbeatTick, // New event for heartbeat
+    SetPacketHandler(Callback<DiagnosticsPacket>),
 }
 
 // Stats for a peer's decoder
@@ -151,6 +153,7 @@ struct DiagnosticWorker {
     on_stats_update: Option<Callback<String>>,
     last_report_time: f64, // timestamp in ms
     report_interval_ms: u64,
+    packet_handler: Option<Callback<DiagnosticsPacket>>,
     receiver: Receiver<DiagnosticEvent>,
 }
 
@@ -178,6 +181,7 @@ impl DiagnosticManager {
         let worker = DiagnosticWorker {
             fps_trackers: HashMap::new(),
             on_stats_update: None,
+            packet_handler: None,
             last_report_time: Date::now(),
             report_interval_ms: 500,
             receiver,
@@ -236,7 +240,18 @@ impl DiagnosticManager {
             .clone()
             .try_send(DiagnosticEvent::SetStatsCallback(callback))
         {
-            debug!("Failed to set stats callback: {e}");
+            error!("Failed to set stats callback: {e}");
+        }
+    }
+
+    // Set the callback for when a diagnostic packet is received
+    pub fn set_packet_handler(&self, callback: Callback<DiagnosticsPacket>) {
+        if let Err(e) = self
+            .sender
+            .clone()
+            .try_send(DiagnosticEvent::SetPacketHandler(callback))
+        {
+            error!("Failed to set packet handler: {e}");
         }
     }
 
@@ -248,7 +263,7 @@ impl DiagnosticManager {
             .clone()
             .try_send(DiagnosticEvent::SetReportingInterval(interval_ms))
         {
-            debug!("Failed to set reporting interval: {e}");
+            error!("Failed to set reporting interval: {e}");
         }
     }
 
@@ -264,11 +279,11 @@ impl DiagnosticManager {
                 media_type,
             })
         {
-            debug!("Failed to send frame event: {e}");
+            error!("Failed to send frame event: {e}");
         }
 
         if let Err(e) = self.sender.clone().try_send(DiagnosticEvent::RequestStats) {
-            debug!("Failed to request stats: {e}");
+            error!("Failed to request stats: {e}");
         }
 
         0.0
@@ -319,54 +334,57 @@ impl DiagnosticWorker {
     fn handle_event(&mut self, event: DiagnosticEvent) {
         match event {
             DiagnosticEvent::FrameReceived {
-                peer_id,
-                media_type,
-            } => {
-                let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
+                        peer_id,
+                        media_type,
+                    } => {
+                        let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
 
-                let tracker = peer_trackers
-                    .entry(media_type)
-                    .or_insert_with(|| FpsTracker::new(media_type));
+                        let tracker = peer_trackers
+                            .entry(media_type)
+                            .or_insert_with(|| FpsTracker::new(media_type));
 
-                tracker.track_frame();
-            }
-            DiagnosticEvent::SetStatsCallback(callback) => {
-                self.on_stats_update = Some(callback);
-            }
-            DiagnosticEvent::SetReportingInterval(interval) => {
-                self.report_interval_ms = interval;
-            }
-            DiagnosticEvent::RequestStats => {
-                self.maybe_report_stats_to_ui();
-            }
-            DiagnosticEvent::HeartbeatTick => {
-                // Check for inactive streams and update their FPS to zero
-                let now = Date::now();
-
-                // Log heartbeat for debugging
-                console::log_1(&"Diagnostics heartbeat tick".into());
-
-                for (peer_id, peer_trackers) in &mut self.fps_trackers {
-                    for (media_type, tracker) in peer_trackers {
-                        let before_fps = tracker.fps;
-                        tracker.check_inactive(now);
-
-                        // Log if FPS was changed by the check_inactive call
-                        if before_fps != tracker.fps {
-                            console::log_1(
-                                &format!(
-                                    "Peer {} {:?} FPS changed: {:.2} -> {:.2}",
-                                    peer_id, media_type, before_fps, tracker.fps
-                                )
-                                .into(),
-                            );
-                        }
+                        tracker.track_frame();
                     }
-                }
+            DiagnosticEvent::SetStatsCallback(callback) => {
+                        self.on_stats_update = Some(callback);
+                    }
+            DiagnosticEvent::SetReportingInterval(interval) => {
+                        self.report_interval_ms = interval;
+                    }
+            DiagnosticEvent::RequestStats => {
+                        self.maybe_report_stats_to_ui();
+                    }
+            DiagnosticEvent::HeartbeatTick => {
+                        // Check for inactive streams and update their FPS to zero
+                        let now = Date::now();
 
-                // Always report stats on heartbeat
-                self.maybe_report_stats_to_ui();
-            }
+                        // Log heartbeat for debugging
+                        console::log_1(&"Diagnostics heartbeat tick".into());
+
+                        for (peer_id, peer_trackers) in &mut self.fps_trackers {
+                            for (media_type, tracker) in peer_trackers {
+                                let before_fps = tracker.fps;
+                                tracker.check_inactive(now);
+
+                                // Log if FPS was changed by the check_inactive call
+                                if before_fps != tracker.fps {
+                                    console::log_1(
+                                        &format!(
+                                            "Peer {} {:?} FPS changed: {:.2} -> {:.2}",
+                                            peer_id, media_type, before_fps, tracker.fps
+                                        )
+                                        .into(),
+                                    );
+                                }
+                            }
+                        }
+
+                        // Always report stats on heartbeat
+                        self.maybe_report_stats_to_ui();
+                    }
+            DiagnosticEvent::SetPacketHandler(callback) => {
+                        self.packet_handler = Some(callback);
+                    }
         }
     }
 
@@ -414,6 +432,38 @@ impl DiagnosticWorker {
         result.push_str(&format!("Time: {:.0}ms\n", now));
 
         for (peer_id, media_stats) in stats.iter() {
+            // Create and send diagnostic packets for each media type
+            for (media_type, fps) in media_stats.iter() {
+                let mut packet = DiagnosticsPacket::new();
+                packet.sender_id = peer_id.clone();
+                packet.timestamp_ms = now as u64;
+                
+                // Convert MediaType to diagnostics packet MediaType
+                packet.media_type = match media_type {
+                    MediaType::VIDEO => diag::diagnostics_packet::MediaType::VIDEO,
+                    MediaType::AUDIO => diag::diagnostics_packet::MediaType::AUDIO,
+                    MediaType::SCREEN => diag::diagnostics_packet::MediaType::SCREEN,
+                    _ => continue, // Skip other types
+                }.into();
+
+                match media_type {
+                    MediaType::VIDEO | MediaType::SCREEN => {
+                        let mut video_metrics = VideoMetrics::new();
+                        video_metrics.fps_received = *fps as f32;
+                        packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
+                    }
+                    MediaType::AUDIO => {
+                        let mut audio_metrics = AudioMetrics::new();
+                        audio_metrics.fps_received = *fps as f32;
+                        packet.audio_metrics = ::protobuf::MessageField::some(audio_metrics);
+                    }
+                    _ => {}
+                }
+
+                // TODO: Send packet through WebRTC data channel
+            }
+
+            // Continue with existing string formatting
             result.push_str(&format!("Peer {}: ", peer_id));
             for (media_type, fps) in media_stats.iter() {
                 let media_str = match media_type {
@@ -423,7 +473,6 @@ impl DiagnosticWorker {
                     MediaType::HEARTBEAT => "Heartbeat",
                 };
 
-                // Indicate clearly when a stream is inactive (0 FPS)
                 if *fps <= 0.01 {
                     result.push_str(&format!("{}=INACTIVE ", media_str));
                 } else {

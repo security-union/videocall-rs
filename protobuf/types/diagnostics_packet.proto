@@ -46,13 +46,14 @@ message VideoMetrics {
 
 // Audio-specific diagnostic metrics
 message AudioMetrics {
-  float audio_level = 1;       // Audio level (0.0-1.0 scale)
-  uint32 sample_rate = 2;      // Sample rate (Hertz)
-  uint32 bitrate_kbps = 3;     // Current measured bitrate (kilobits per second)
-  uint32 channels = 4;         // Number of audio channels (count)
-  uint32 packets_lost = 5;     // Total packets lost during this reporting period (count)
-  bool echo_detected = 6;      // Whether echo is detected (boolean)
-  bool noise_detected = 7;     // Whether excessive noise is detected (boolean)
+  float fps_received = 1;      // Frames per second being received (fps)
+  float audio_level = 2;       // Audio level (0.0-1.0 scale)
+  uint32 sample_rate = 3;      // Sample rate (Hertz)
+  uint32 bitrate_kbps = 4;     // Current measured bitrate (kilobits per second)
+  uint32 channels = 5;         // Number of audio channels (count)
+  uint32 packets_lost = 6;     // Total packets lost during this reporting period (count)
+  bool echo_detected = 7;      // Whether echo is detected (boolean)
+  bool noise_detected = 8;     // Whether excessive noise is detected (boolean)
 }
 
 // Quality hints that the receiver sends to the sender

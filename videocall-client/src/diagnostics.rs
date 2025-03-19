@@ -355,36 +355,72 @@ impl DiagnosticWorker {
                         self.maybe_report_stats_to_ui();
                     }
             DiagnosticEvent::HeartbeatTick => {
-                        // Check for inactive streams and update their FPS to zero
-                        let now = Date::now();
-
                         // Log heartbeat for debugging
                         console::log_1(&"Diagnostics heartbeat tick".into());
 
-                        for (peer_id, peer_trackers) in &mut self.fps_trackers {
-                            for (media_type, tracker) in peer_trackers {
-                                let before_fps = tracker.fps;
-                                tracker.check_inactive(now);
-
-                                // Log if FPS was changed by the check_inactive call
-                                if before_fps != tracker.fps {
-                                    console::log_1(
-                                        &format!(
-                                            "Peer {} {:?} FPS changed: {:.2} -> {:.2}",
-                                            peer_id, media_type, before_fps, tracker.fps
-                                        )
-                                        .into(),
-                                    );
-                                }
-                            }
-                        }
-
                         // Always report stats on heartbeat
                         self.maybe_report_stats_to_ui();
+                        // Create and send diagnostic packets for each peer
+
+                        self.send_diagnostic_packets();
+                        
                     }
             DiagnosticEvent::SetPacketHandler(callback) => {
                         self.packet_handler = Some(callback);
                     }
+        }
+    }
+
+    fn send_diagnostic_packets(&self) {
+        let now = Date::now();
+        let timestamp_ms = now as u64;
+        
+        for (peer_id, peer_trackers) in &self.fps_trackers {
+            // Create separate packets for audio and video
+            for (media_type, tracker) in peer_trackers {
+                // Skip if we don't have a packet handler
+                if self.packet_handler.is_none() {
+                    continue;
+                }
+                
+                // Create a new diagnostics packet
+                let mut packet = DiagnosticsPacket::new();
+                packet.sender_id = window().unwrap().location().hostname().unwrap_or_default();
+                packet.target_id = peer_id.clone();
+                packet.timestamp_ms = timestamp_ms;
+                
+                // Convert MediaType from our enum to the proto enum
+                let proto_media_type = match media_type {
+                    MediaType::VIDEO => diag::diagnostics_packet::MediaType::VIDEO,
+                    MediaType::SCREEN => diag::diagnostics_packet::MediaType::SCREEN,
+                    MediaType::AUDIO => diag::diagnostics_packet::MediaType::AUDIO,
+                    _ => continue, // Skip unknown media types
+                };
+                packet.media_type = proto_media_type.into();
+                
+                // Set metrics based on media type
+                if *media_type == MediaType::AUDIO {
+                    let mut audio_metrics = AudioMetrics::new();
+                    audio_metrics.fps_received = tracker.fps as f32;
+                    
+                    // audio_metrics.set_sample_rate(48000); // Default sample rate
+                    // packet.set_audio_metrics(audio_metrics);
+                    packet.audio_metrics = ::protobuf::MessageField::some(audio_metrics);
+                } else {
+                    // For video and screen
+                    let mut video_metrics = VideoMetrics::new();
+                    video_metrics.fps_received = tracker.fps as f32;
+                    // video_metrics.set_frames_decoded(tracker.total_frames);
+                    packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
+                }
+                
+                // Send the packet
+                if let Some(handler) = &self.packet_handler {
+                    debug!("Sending diagnostic packet to {}: {:?} FPS: {:.2}", 
+                            peer_id, media_type, tracker.fps);
+                    handler.emit(packet);
+                }
+            }
         }
     }
 

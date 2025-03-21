@@ -477,7 +477,8 @@ impl Inner {
             }
             Ok(PacketType::DIAGNOSTICS) => {
                 // Parse and handle the diagnostics packet
-                if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data) {
+                if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
+                {
                     debug!("Received diagnostics packet: {:?}", diagnostics_packet);
                     if let Some(sender_diagnostics) = &self.sender_diagnostics {
                         sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);

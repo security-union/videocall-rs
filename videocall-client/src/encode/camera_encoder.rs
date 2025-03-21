@@ -38,7 +38,7 @@ use crate::diagnostics::{EncoderControl, EncoderControlSender};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures::{StreamExt, select, FutureExt};
+use futures::{select, FutureExt, StreamExt};
 
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
@@ -296,7 +296,8 @@ impl CameraEncoder {
                                 .unchecked_into::<VideoFrame>();
                             video_encoder.encode_with_options(
                                 &video_frame,
-                                &VideoEncoderEncodeOptions::new().key_frame(video_frame_counter % 150 == 0),
+                                &VideoEncoderEncodeOptions::new()
+                                    .key_frame(video_frame_counter % 150 == 0),
                             );
                             video_frame.close();
                             video_frame_counter += 1;

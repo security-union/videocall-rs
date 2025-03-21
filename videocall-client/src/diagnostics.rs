@@ -1,11 +1,11 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::error::Error;
 
-use futures::channel::mpsc::{self, Sender, UnboundedSender, UnboundedReceiver, Receiver};
+use futures::channel::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
@@ -17,11 +17,7 @@ use web_sys::{console, window, Window};
 use yew::Callback;
 
 use videocall_types::protos::diagnostics_packet::{
-    self as diag,
-    DiagnosticsPacket,
-    quality_hints::QualityPreference,
-    AudioMetrics,
-    VideoMetrics,
+    self as diag, quality_hints::QualityPreference, AudioMetrics, DiagnosticsPacket, VideoMetrics,
 };
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -32,7 +28,7 @@ pub enum DiagnosticEvent {
     FrameReceived {
         peer_id: String,
         media_type: MediaType,
-        frame_size: u64,  // Size of the frame in bytes
+        frame_size: u64, // Size of the frame in bytes
     },
     RequestStats,
     SetStatsCallback(Callback<String>),
@@ -71,10 +67,10 @@ struct FpsTracker {
     total_frames: u32,
     #[allow(dead_code)]
     media_type: MediaType,
-    last_frame_time: f64, // Add timestamp of last received frame
-    bytes_received: u64,  // Track total bytes received
+    last_frame_time: f64,     // Add timestamp of last received frame
+    bytes_received: u64,      // Track total bytes received
     last_bitrate_update: f64, // Last time we calculated bitrate
-    current_bitrate: f64, // Current bitrate in kbits/sec
+    current_bitrate: f64,     // Current bitrate in kbits/sec
 }
 
 impl FpsTracker {
@@ -98,7 +94,7 @@ impl FpsTracker {
         self.total_frames += 1;
         let now = Date::now();
         self.last_frame_time = now; // Record when we received the frame
-        
+
         // Update bytes and calculate bitrate
         self.bytes_received += bytes;
         let elapsed_ms = now - self.last_bitrate_update;
@@ -107,11 +103,11 @@ impl FpsTracker {
         if elapsed_ms >= 1000.0 {
             self.fps = (self.frames_count as f64 * 1000.0) / elapsed_ms;
             self.frames_count = 0;
-            
+
             // Calculate bitrate in kbits/sec
             let bits = (self.bytes_received * 8) as f64;
             self.current_bitrate = (bits / elapsed_ms) * 1000.0 / 1000.0; // Convert to kbits/sec
-            
+
             // Reset counters
             self.bytes_received = 0;
             self.last_fps_update = now;
@@ -510,22 +506,22 @@ impl DiagnosticWorker {
 
         for (peer_id, media_stats) in stats.iter() {
             result.push_str(&format!("Peer {}: ", peer_id));
-            
+
             // First show Video if it exists
             if let Some((fps, bitrate)) = media_stats.get(&MediaType::VIDEO) {
                 self.append_media_stats(&mut result, "Video", *fps, *bitrate);
             }
-            
+
             // Then show Audio if it exists
             if let Some((fps, bitrate)) = media_stats.get(&MediaType::AUDIO) {
                 self.append_media_stats(&mut result, "Audio", *fps, *bitrate);
             }
-            
+
             // Finally show Screen if it exists
             if let Some((fps, bitrate)) = media_stats.get(&MediaType::SCREEN) {
                 self.append_media_stats(&mut result, "Screen", *fps, *bitrate);
             }
-            
+
             result.push('\n');
         }
 
@@ -540,7 +536,10 @@ impl DiagnosticWorker {
         if fps <= 0.01 || bitrate <= 0.01 {
             result.push_str(&format!("{}=INACTIVE ", media_str));
         } else {
-            result.push_str(&format!("{}={:.2} FPS {:.1} kbit/s ", media_str, fps, bitrate));
+            result.push_str(&format!(
+                "{}={:.2} FPS {:.1} kbit/s ",
+                media_str, fps, bitrate
+            ));
         }
     }
 }
@@ -587,11 +586,11 @@ impl StreamStats {
         self.packet_loss_percent = packet.packet_loss_percent;
         self.median_latency_ms = packet.median_latency_ms;
         self.jitter_ms = packet.jitter_ms;
-        
+
         self.estimated_bandwidth_kbps = match media_type {
             MediaType::VIDEO => packet.video_metrics.clone().unwrap().bitrate_kbps,
             MediaType::AUDIO => packet.audio_metrics.clone().unwrap().bitrate_kbps,
-            _ => 0
+            _ => 0,
         };
         self.round_trip_time_ms = packet.round_trip_time_ms;
     }
@@ -650,7 +649,10 @@ impl SenderDiagnosticManager {
         let sender_clone = sender.clone();
 
         let callback = Closure::wrap(Box::new(move || {
-            if let Err(e) = sender_clone.clone().try_send(SenderDiagnosticEvent::HeartbeatTick) {
+            if let Err(e) = sender_clone
+                .clone()
+                .try_send(SenderDiagnosticEvent::HeartbeatTick)
+            {
                 console::log_1(&format!("Failed to send sender heartbeat: {:?}", e).into());
             }
         }) as Box<dyn FnMut()>);
@@ -739,10 +741,9 @@ impl SenderDiagnosticWorker {
                     let peer_stats = self.stream_stats.entry(target_id.clone()).or_default();
                     let stats = peer_stats
                         .entry(media_type)
-                    .or_insert_with(|| StreamStats::new(target_id, media_type));
+                        .or_insert_with(|| StreamStats::new(target_id, media_type));
                     stats.update_from_packet(&packet, media_type);
                 }
-                
 
                 // Forward to encoder for potential bitrate adjustments
                 if let Some(callback) = &self.encoder_callback {
@@ -791,17 +792,17 @@ impl SenderDiagnosticWorker {
         // Only show stats for the current peer (where peer_id matches our userid)
         for (peer_id, media_stats) in &self.stream_stats {
             result.push_str(&format!("Peer {}\n", peer_id));
-            
+
             // First show Video if it exists
             if let Some(stats) = media_stats.get(&MediaType::VIDEO) {
                 self.append_media_stats(&mut result, "Video", stats);
             }
-            
+
             // Then show Audio if it exists
             if let Some(stats) = media_stats.get(&MediaType::AUDIO) {
                 self.append_media_stats(&mut result, "Audio", stats);
             }
-            
+
             // Finally show Screen if it exists
             if let Some(stats) = media_stats.get(&MediaType::SCREEN) {
                 self.append_media_stats(&mut result, "Screen", stats);
@@ -857,10 +858,13 @@ impl EncoderControlSender {
     }
 
     pub fn update_quality_preference(&self, media_type: MediaType, preference: QualityPreference) {
-        if let Err(e) = self.sender.unbounded_send(EncoderControl::UpdateQualityPreference {
-            media_type,
-            preference,
-        }) {
+        if let Err(e) = self
+            .sender
+            .unbounded_send(EncoderControl::UpdateQualityPreference {
+                media_type,
+                preference,
+            })
+        {
             error!("Failed to send quality preference update: {}", e);
         }
     }

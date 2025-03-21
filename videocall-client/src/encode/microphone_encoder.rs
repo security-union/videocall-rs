@@ -16,13 +16,13 @@ use web_sys::AudioEncoder;
 use web_sys::AudioEncoderConfig;
 use web_sys::AudioEncoderInit;
 use web_sys::AudioTrack;
+use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MediaStreamTrackProcessor;
 use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
-use web_sys::LatencyMode;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
@@ -36,7 +36,7 @@ use crate::diagnostics::{EncoderControl, EncoderControlSender};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures::{StreamExt, select, FutureExt};
+use futures::{select, FutureExt, StreamExt};
 
 /// [MicrophoneEncoder] encodes the audio from a microphone and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///

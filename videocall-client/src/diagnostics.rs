@@ -198,6 +198,7 @@ struct DiagnosticWorker {
     report_interval_ms: u64,
     packet_handler: Option<Callback<DiagnosticsPacket>>,
     receiver: Receiver<DiagnosticEvent>,
+    userid: String,
 }
 
 impl std::fmt::Debug for DiagnosticManager {
@@ -210,15 +211,9 @@ impl std::fmt::Debug for DiagnosticManager {
     }
 }
 
-impl Default for DiagnosticManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DiagnosticManager {
-    pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel(100); // Buffer size of 100 messages
+    pub fn new(userid: String) -> Self {
+        let (sender, receiver) = mpsc::channel(100);
 
         // Spawn the worker to process events
         let worker = DiagnosticWorker {
@@ -228,6 +223,7 @@ impl DiagnosticManager {
             last_report_time: Date::now(),
             report_interval_ms: 500,
             receiver,
+            userid,
         };
 
         wasm_bindgen_futures::spawn_local(worker.run());
@@ -240,7 +236,6 @@ impl DiagnosticManager {
             timer: None,
         };
 
-        // Set up heartbeat timer to ensure diagnostics run even when no frames are coming in
         manager.setup_heartbeat(sender);
 
         manager
@@ -426,7 +421,7 @@ impl DiagnosticWorker {
                 }
 
                 let mut packet = DiagnosticsPacket::new();
-                packet.sender_id = window().unwrap().location().hostname().unwrap_or_default();
+                packet.sender_id = self.userid.clone();
                 packet.target_id = peer_id.clone();
                 packet.timestamp_ms = timestamp_ms;
 
@@ -613,10 +608,11 @@ struct SenderDiagnosticWorker {
     last_report_time: f64,
     report_interval_ms: u64,
     receiver: Receiver<SenderDiagnosticEvent>,
+    userid: String,
 }
 
 impl SenderDiagnosticManager {
-    pub fn new() -> Self {
+    pub fn new(userid: String) -> Self {
         let (sender, receiver) = mpsc::channel(100);
 
         let worker = SenderDiagnosticWorker {
@@ -626,6 +622,7 @@ impl SenderDiagnosticManager {
             last_report_time: Date::now(),
             report_interval_ms: 500,
             receiver,
+            userid,
         };
 
         wasm_bindgen_futures::spawn_local(worker.run());

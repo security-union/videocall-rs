@@ -120,7 +120,7 @@ impl VideoCallClient {
 
         // Create diagnostics manager if enabled
         let diagnostics = if options.enable_diagnostics {
-            let diagnostics = Arc::new(DiagnosticManager::new());
+            let diagnostics = Arc::new(DiagnosticManager::new(options.userid.clone()));
 
             // Set up diagnostics callback if provided
             if let Some(callback) = &options.on_diagnostics_update {
@@ -129,7 +129,7 @@ impl VideoCallClient {
 
             // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {
-                let mut diag = DiagnosticManager::new();
+                let mut diag = DiagnosticManager::new(options.userid.clone());
                 diag.set_reporting_interval(interval);
                 let diagnostics = Arc::new(diag);
 
@@ -148,7 +148,7 @@ impl VideoCallClient {
 
         // Create sender diagnostics manager if diagnostics are enabled
         let sender_diagnostics = if options.enable_diagnostics {
-            let sender_diagnostics = Arc::new(SenderDiagnosticManager::new());
+            let sender_diagnostics = Arc::new(SenderDiagnosticManager::new(options.userid.clone()));
 
             // Set up sender diagnostics callback if provided
             if let Some(callback) = &options.on_sender_stats_update {

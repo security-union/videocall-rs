@@ -25,6 +25,7 @@ pub enum DiagnosticEvent {
     FrameReceived {
         peer_id: String,
         media_type: MediaType,
+        frame_size: u64,  // Size of the frame in bytes
     },
     RequestStats,
     SetStatsCallback(Callback<String>),
@@ -64,6 +65,9 @@ struct FpsTracker {
     #[allow(dead_code)]
     media_type: MediaType,
     last_frame_time: f64, // Add timestamp of last received frame
+    bytes_received: u64,  // Track total bytes received
+    last_bitrate_update: f64, // Last time we calculated bitrate
+    current_bitrate: f64, // Current bitrate in kbits/sec
 }
 
 impl FpsTracker {
@@ -76,24 +80,38 @@ impl FpsTracker {
             total_frames: 0,
             media_type,
             last_frame_time: now,
+            bytes_received: 0,
+            last_bitrate_update: now,
+            current_bitrate: 0.0,
         }
     }
 
-    fn track_frame(&mut self) -> f64 {
+    fn track_frame_with_size(&mut self, bytes: u64) -> (f64, f64) {
         self.frames_count += 1;
         self.total_frames += 1;
         let now = Date::now();
         self.last_frame_time = now; // Record when we received the frame
-        let elapsed_ms = now - self.last_fps_update;
+        
+        // Update bytes and calculate bitrate
+        self.bytes_received += bytes;
+        let elapsed_ms = now - self.last_bitrate_update;
 
         // Update FPS calculation every second
         if elapsed_ms >= 1000.0 {
             self.fps = (self.frames_count as f64 * 1000.0) / elapsed_ms;
             self.frames_count = 0;
+            
+            // Calculate bitrate in kbits/sec
+            let bits = (self.bytes_received * 8) as f64;
+            self.current_bitrate = (bits / elapsed_ms) * 1000.0 / 1000.0; // Convert to kbits/sec
+            
+            // Reset counters
+            self.bytes_received = 0;
             self.last_fps_update = now;
+            self.last_bitrate_update = now;
         }
 
-        self.fps
+        (self.fps, self.current_bitrate)
     }
 
     // Check if no frames have been received for a while and reset FPS if needed
@@ -270,7 +288,7 @@ impl DiagnosticManager {
     }
 
     // Track a frame received from a peer for a specific media type
-    pub fn track_frame(&self, peer_id: &str, media_type: MediaType) -> f64 {
+    pub fn track_frame(&self, peer_id: &str, media_type: MediaType, frame_size: u64) -> f64 {
         self.frames_decoded.fetch_add(1, Ordering::SeqCst);
 
         if let Err(e) = self
@@ -279,6 +297,7 @@ impl DiagnosticManager {
             .try_send(DiagnosticEvent::FrameReceived {
                 peer_id: peer_id.to_string(),
                 media_type,
+                frame_size,
             })
         {
             error!("Failed to send frame event: {e}");
@@ -338,6 +357,7 @@ impl DiagnosticWorker {
             DiagnosticEvent::FrameReceived {
                 peer_id,
                 media_type,
+                frame_size,
             } => {
                 let peer_trackers = self.fps_trackers.entry(peer_id.clone()).or_default();
 
@@ -345,7 +365,7 @@ impl DiagnosticWorker {
                     .entry(media_type)
                     .or_insert_with(|| FpsTracker::new(media_type));
 
-                tracker.track_frame();
+                tracker.track_frame_with_size(frame_size);
             }
             DiagnosticEvent::SetStatsCallback(callback) => {
                 self.on_stats_update = Some(callback);
@@ -377,49 +397,40 @@ impl DiagnosticWorker {
         let timestamp_ms = now as u64;
 
         for (peer_id, peer_trackers) in &self.fps_trackers {
-            // Create separate packets for audio and video
             for (media_type, tracker) in peer_trackers {
-                // Skip if we don't have a packet handler
                 if self.packet_handler.is_none() {
                     continue;
                 }
 
-                // Create a new diagnostics packet
                 let mut packet = DiagnosticsPacket::new();
                 packet.sender_id = window().unwrap().location().hostname().unwrap_or_default();
                 packet.target_id = peer_id.clone();
                 packet.timestamp_ms = timestamp_ms;
 
-                // Convert MediaType from our enum to the proto enum
                 let proto_media_type = match media_type {
                     MediaType::VIDEO => diag::diagnostics_packet::MediaType::VIDEO,
                     MediaType::SCREEN => diag::diagnostics_packet::MediaType::SCREEN,
                     MediaType::AUDIO => diag::diagnostics_packet::MediaType::AUDIO,
-                    _ => continue, // Skip unknown media types
+                    _ => continue,
                 };
                 packet.media_type = proto_media_type.into();
 
-                // Set metrics based on media type
                 if *media_type == MediaType::AUDIO {
                     let mut audio_metrics = AudioMetrics::new();
                     audio_metrics.fps_received = tracker.fps as f32;
-
-                    // audio_metrics.set_sample_rate(48000); // Default sample rate
-                    // packet.set_audio_metrics(audio_metrics);
+                    audio_metrics.bitrate_kbps = tracker.current_bitrate as u32;
                     packet.audio_metrics = ::protobuf::MessageField::some(audio_metrics);
                 } else {
-                    // For video and screen
                     let mut video_metrics = VideoMetrics::new();
                     video_metrics.fps_received = tracker.fps as f32;
-                    // video_metrics.set_frames_decoded(tracker.total_frames);
+                    video_metrics.bitrate_kbps = tracker.current_bitrate as u32;
                     packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
                 }
 
-                // Send the packet
                 if let Some(handler) = &self.packet_handler {
                     debug!(
-                        "Sending diagnostic packet to {}: {:?} FPS: {:.2}",
-                        peer_id, media_type, tracker.fps
+                        "Sending diagnostic packet to {}: {:?} FPS: {:.2} Bitrate: {:.1} kbit/s",
+                        peer_id, media_type, tracker.fps, tracker.current_bitrate
                     );
                     handler.emit(packet);
                 }
@@ -447,13 +458,13 @@ impl DiagnosticWorker {
     }
 
     // Get all FPS stats for all peers
-    fn get_all_fps_stats(&self) -> HashMap<String, HashMap<MediaType, f64>> {
+    fn get_all_fps_stats(&self) -> HashMap<String, HashMap<MediaType, (f64, f64)>> {
         let mut result = HashMap::new();
 
         for (peer_id, peer_trackers) in &self.fps_trackers {
             let mut media_fps = HashMap::new();
             for (media_type, tracker) in peer_trackers {
-                media_fps.insert(*media_type, tracker.fps);
+                media_fps.insert(*media_type, (tracker.fps, tracker.current_bitrate));
             }
             result.insert(peer_id.clone(), media_fps);
         }
@@ -471,41 +482,8 @@ impl DiagnosticWorker {
         result.push_str(&format!("Time: {:.0}ms\n", now));
 
         for (peer_id, media_stats) in stats.iter() {
-            // Create and send diagnostic packets for each media type
-            for (media_type, fps) in media_stats.iter() {
-                let mut packet = DiagnosticsPacket::new();
-                packet.sender_id = peer_id.clone();
-                packet.timestamp_ms = now as u64;
-
-                // Convert MediaType to diagnostics packet MediaType
-                packet.media_type = match media_type {
-                    MediaType::VIDEO => diag::diagnostics_packet::MediaType::VIDEO,
-                    MediaType::AUDIO => diag::diagnostics_packet::MediaType::AUDIO,
-                    MediaType::SCREEN => diag::diagnostics_packet::MediaType::SCREEN,
-                    _ => continue, // Skip other types
-                }
-                .into();
-
-                match media_type {
-                    MediaType::VIDEO | MediaType::SCREEN => {
-                        let mut video_metrics = VideoMetrics::new();
-                        video_metrics.fps_received = *fps as f32;
-                        packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
-                    }
-                    MediaType::AUDIO => {
-                        let mut audio_metrics = AudioMetrics::new();
-                        audio_metrics.fps_received = *fps as f32;
-                        packet.audio_metrics = ::protobuf::MessageField::some(audio_metrics);
-                    }
-                    _ => {}
-                }
-
-                // TODO: Send packet through WebRTC data channel
-            }
-
-            // Continue with existing string formatting
             result.push_str(&format!("Peer {}: ", peer_id));
-            for (media_type, fps) in media_stats.iter() {
+            for (media_type, (fps, bitrate)) in media_stats.iter() {
                 let media_str = match media_type {
                     MediaType::VIDEO => "Video",
                     MediaType::AUDIO => "Audio",
@@ -516,7 +494,7 @@ impl DiagnosticWorker {
                 if *fps <= 0.01 {
                     result.push_str(&format!("{}=INACTIVE ", media_str));
                 } else {
-                    result.push_str(&format!("{}={:.2} FPS ", media_str, fps));
+                    result.push_str(&format!("{}={:.2} FPS {:.1} kbit/s ", media_str, fps, bitrate));
                 }
             }
             result.push('\n');

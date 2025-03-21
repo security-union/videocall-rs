@@ -239,7 +239,7 @@ impl PeerDecodeManager {
                 }
                 Ok((media_type, decode_status)) => {
                     if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.track_frame(&email, media_type);
+                        diagnostics.track_frame(&email, media_type, packet.data.len() as u64);
                     }
 
                     if decode_status.first_frame {

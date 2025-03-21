@@ -1,23 +1,30 @@
-use futures::channel::mpsc::{self, Receiver, Sender};
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use std::error::Error;
+
+use futures::channel::mpsc::{self, Sender, UnboundedSender, UnboundedReceiver, Receiver};
 use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
-use std::{
-    collections::HashMap,
-    error::Error,
-    rc::Rc,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-};
-use videocall_types::protos::diagnostics_packet::{
-    self as diag, AudioMetrics, DiagnosticsPacket, VideoMetrics,
-};
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use wasm_bindgen::prelude::*;
-use web_sys::{console, window};
+use protobuf::Message;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
+use web_sys::{console, window, Window};
 use yew::Callback;
+
+use videocall_types::protos::diagnostics_packet::{
+    self as diag,
+    DiagnosticsPacket,
+    quality_hints::QualityPreference,
+    AudioMetrics,
+    VideoMetrics,
+};
+
+use videocall_types::protos::media_packet::media_packet::MediaType;
 
 // Basic structure for diagnostics events
 #[derive(Debug, Clone)]
@@ -243,7 +250,6 @@ impl DiagnosticManager {
 
     // Start a JavaScript interval timer that sends heartbeat events
     fn setup_heartbeat(&mut self, sender: Sender<DiagnosticEvent>) {
-        let window = window().expect("Failed to get window");
         let sender_clone = sender.clone();
 
         // Create a closure that sends a heartbeat event through the channel
@@ -257,7 +263,8 @@ impl DiagnosticManager {
         }) as Box<dyn FnMut()>);
 
         // Set up the interval to run every 500ms
-        let interval_id = window
+        let interval_id = window()
+            .expect("Failed to get window")
             .set_interval_with_callback_and_timeout_and_arguments_0(
                 callback.as_ref().unchecked_ref(),
                 500,
@@ -640,7 +647,6 @@ impl SenderDiagnosticManager {
     }
 
     fn setup_heartbeat(&mut self, sender: Sender<SenderDiagnosticEvent>) {
-        let window = window().expect("Failed to get window");
         let sender_clone = sender.clone();
 
         let callback = Closure::wrap(Box::new(move || {
@@ -649,7 +655,8 @@ impl SenderDiagnosticManager {
             }
         }) as Box<dyn FnMut()>);
 
-        let interval_id = window
+        let interval_id = window()
+            .expect("Failed to get window")
             .set_interval_with_callback_and_timeout_and_arguments_0(
                 callback.as_ref().unchecked_ref(),
                 500,
@@ -815,5 +822,46 @@ impl SenderDiagnosticWorker {
             stats.round_trip_time_ms,
             stats.estimated_bandwidth_kbps
         ));
+    }
+}
+
+#[derive(Debug)]
+pub enum EncoderControl {
+    UpdateBitrate {
+        media_type: MediaType,
+        target_bitrate_kbps: u32,
+    },
+    UpdateQualityPreference {
+        media_type: MediaType,
+        preference: QualityPreference,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct EncoderControlSender {
+    sender: UnboundedSender<EncoderControl>,
+}
+
+impl EncoderControlSender {
+    pub fn new(sender: UnboundedSender<EncoderControl>) -> Self {
+        Self { sender }
+    }
+
+    pub fn update_bitrate(&self, media_type: MediaType, target_bitrate_kbps: u32) {
+        if let Err(e) = self.sender.unbounded_send(EncoderControl::UpdateBitrate {
+            media_type,
+            target_bitrate_kbps,
+        }) {
+            error!("Failed to send bitrate update: {}", e);
+        }
+    }
+
+    pub fn update_quality_preference(&self, media_type: MediaType, preference: QualityPreference) {
+        if let Err(e) = self.sender.unbounded_send(EncoderControl::UpdateQualityPreference {
+            media_type,
+            preference,
+        }) {
+            error!("Failed to send quality preference update: {}", e);
+        }
     }
 }

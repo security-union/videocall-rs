@@ -75,7 +75,7 @@ impl CameraEncoder {
         }
     }
 
-    pub fn set_encoder_control(&mut self, control: EncoderControlSender) {
+    pub fn set_encoder_control(&mut self, _control: EncoderControlSender) {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         self.encoder_control = Some(rx);
         let _ = EncoderControlSender::new(tx);

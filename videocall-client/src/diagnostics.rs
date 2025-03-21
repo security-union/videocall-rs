@@ -8,7 +8,6 @@ use futures::channel::mpsc::{self, Receiver, Sender, UnboundedSender};
 use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
-use protobuf::Message;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -117,7 +116,7 @@ impl FpsTracker {
     }
 
     // Check if no frames have been received for a while and reset FPS if needed
-    fn check_inactive(&mut self, now: f64) {
+    fn _check_inactive(&mut self, now: f64) {
         let inactive_ms = now - self.last_frame_time;
 
         // If no frames for more than 1 second, consider the feed inactive
@@ -480,8 +479,6 @@ impl DiagnosticWorker {
     // Get all FPS stats for all peers
     fn get_all_fps_stats(&self) -> HashMap<String, HashMap<MediaType, (f64, f64)>> {
         let mut result = HashMap::new();
-        let now = Date::now();
-
         for (peer_id, peer_trackers) in &self.fps_trackers {
             let mut media_fps = HashMap::new();
             for (media_type, tracker) in peer_trackers {
@@ -556,27 +553,27 @@ pub enum SenderDiagnosticEvent {
 // Structure to track stats for a media stream we're sending
 #[derive(Debug)]
 struct StreamStats {
-    media_type: MediaType,
+    _media_type: MediaType,
     last_update: f64,
     packet_loss_percent: f32,
     median_latency_ms: u32,
     jitter_ms: u32,
     estimated_bandwidth_kbps: u32,
     round_trip_time_ms: u32,
-    peer_id: String,
+    _peer_id: String,
 }
 
 impl StreamStats {
     fn new(peer_id: String, media_type: MediaType) -> Self {
         Self {
-            media_type,
+            _media_type: media_type,
             last_update: Date::now(),
             packet_loss_percent: 0.0,
             median_latency_ms: 0,
             jitter_ms: 0,
             estimated_bandwidth_kbps: 0,
             round_trip_time_ms: 0,
-            peer_id,
+            _peer_id: peer_id,
         }
     }
 
@@ -603,7 +600,7 @@ impl StreamStats {
 pub struct SenderDiagnosticManager {
     sender: Sender<SenderDiagnosticEvent>,
     timer: Option<Rc<JsTimer>>,
-    report_interval_ms: u64,
+    _report_interval_ms: u64,
 }
 
 struct SenderDiagnosticWorker {
@@ -635,7 +632,7 @@ impl SenderDiagnosticManager {
         let mut manager = Self {
             sender: sender.clone(),
             timer: None,
-            report_interval_ms: 500,
+            _report_interval_ms: 500,
         };
 
         // Set up heartbeat timer
@@ -733,7 +730,6 @@ impl SenderDiagnosticWorker {
                     diag::diagnostics_packet::MediaType::VIDEO => MediaType::VIDEO,
                     diag::diagnostics_packet::MediaType::AUDIO => MediaType::AUDIO,
                     diag::diagnostics_packet::MediaType::SCREEN => MediaType::SCREEN,
-                    _ => return,
                 };
 
                 if sender_id == self.userid {

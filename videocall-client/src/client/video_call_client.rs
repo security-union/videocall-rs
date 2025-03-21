@@ -2,7 +2,7 @@ use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
-use crate::diagnostics::DiagnosticManager;
+use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use anyhow::{anyhow, Result};
 use log::{debug, error, info};
 use protobuf::Message;
@@ -62,6 +62,9 @@ pub struct VideoCallClientOptions {
     /// Callback will be called as `callback(stats_string)` with diagnostics information
     pub on_diagnostics_update: Option<Callback<String>>,
 
+    /// Callback will be called as `callback(stats_string)` with sender diagnostics information
+    pub on_sender_stats_update: Option<Callback<String>>,
+
     /// `true` to enable diagnostics collection; `false` to disable
     pub enable_diagnostics: bool,
 
@@ -84,6 +87,7 @@ struct Inner {
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
     _diagnostics: Option<Arc<DiagnosticManager>>,
+    sender_diagnostics: Option<Arc<SenderDiagnosticManager>>,
 }
 
 /// The client struct for a video call connection.
@@ -142,6 +146,25 @@ impl VideoCallClient {
             None
         };
 
+        // Create sender diagnostics manager if diagnostics are enabled
+        let sender_diagnostics = if options.enable_diagnostics {
+            let sender_diagnostics = Arc::new(SenderDiagnosticManager::new());
+
+            // Set up sender diagnostics callback if provided
+            if let Some(callback) = &options.on_sender_stats_update {
+                sender_diagnostics.set_stats_callback(callback.clone());
+            }
+
+            // Set update interval if provided
+            if let Some(interval) = options.diagnostics_update_interval_ms {
+                sender_diagnostics.set_reporting_interval(interval);
+            }
+
+            Some(sender_diagnostics)
+        } else {
+            None
+        };
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -158,6 +181,7 @@ impl VideoCallClient {
                     diagnostics.clone(),
                 ),
                 _diagnostics: diagnostics.clone(),
+                sender_diagnostics: sender_diagnostics.clone(),
             })),
             aes,
             _diagnostics: diagnostics.clone(),
@@ -452,10 +476,12 @@ impl Inner {
                 error!("Not implemented: CONNECTION packet type");
             }
             Ok(PacketType::DIAGNOSTICS) => {
-                // For now, just log the packet after unmarshalling
-                if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
-                {
+                // Parse and handle the diagnostics packet
+                if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data) {
                     debug!("Received diagnostics packet: {:?}", diagnostics_packet);
+                    if let Some(sender_diagnostics) = &self.sender_diagnostics {
+                        sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);
+                    }
                 } else {
                     error!("Failed to parse diagnostics packet");
                 }

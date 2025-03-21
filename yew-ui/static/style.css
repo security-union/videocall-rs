@@ -383,3 +383,83 @@ select {
   padding: 15px;
 }
 
+.diagnostics-sidebar {
+    position: fixed;
+    right: 0;
+    top: 0;
+    width: 300px;
+    height: 100vh;
+    background-color: rgba(0, 0, 0, 0.9);
+    color: white;
+    padding: 20px;
+    box-shadow: -2px 0 5px rgba(0, 0, 0, 0.3);
+    z-index: 1000;
+    transition: transform 0.3s ease-in-out;
+    overflow-y: auto;
+}
+
+.diagnostics-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+    padding-bottom: 10px;
+}
+
+.diagnostics-header h2 {
+    margin: 0;
+    font-size: 1.5em;
+}
+
+.close-button {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 24px;
+    cursor: pointer;
+    padding: 0;
+    margin: 0;
+}
+
+.close-button:hover {
+    color: #ff4444;
+}
+
+.diagnostics-data {
+    max-height: 80vh;
+    overflow-y: auto;
+}
+
+.diagnostics-section {
+    margin-bottom: 20px;
+    padding: 10px;
+    background-color: rgba(255, 255, 255, 0.1);
+    border-radius: 5px;
+}
+
+.diagnostics-section h3 {
+    margin: 0 0 10px 0;
+    font-size: 1.2em;
+    color: #4CAF50;
+    border-bottom: 1px solid #4CAF50;
+    padding-bottom: 5px;
+}
+
+.diagnostics-text {
+    font-family: monospace;
+    white-space: pre-wrap;
+    margin: 0;
+    padding: 10px;
+    background-color: rgba(0, 0, 0, 0.3);
+    border-radius: 3px;
+    font-size: 0.9em;
+}
+
+.diagnostics-section p {
+    color: #888;
+    font-style: italic;
+    margin: 10px 0;
+    text-align: center;
+}
+

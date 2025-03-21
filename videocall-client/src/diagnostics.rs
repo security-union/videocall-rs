@@ -169,6 +169,14 @@ impl Drop for JsTimer {
     }
 }
 
+impl std::fmt::Debug for JsTimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsTimer")
+            .field("interval_id", &self.interval_id)
+            .finish()
+    }
+}
+
 // The DiagnosticManager manages the collection and reporting of diagnostic information
 pub struct DiagnosticManager {
     sender: Sender<DiagnosticEvent>,
@@ -532,5 +540,278 @@ impl DiagnosticWorker {
         } else {
             result.push_str(&format!("{}={:.2} FPS {:.1} kbit/s ", media_str, fps, bitrate));
         }
+    }
+}
+
+// Event types for sender diagnostics
+#[derive(Debug, Clone)]
+pub enum SenderDiagnosticEvent {
+    DiagnosticPacketReceived(DiagnosticsPacket),
+    SetStatsCallback(Callback<String>),
+    SetReportingInterval(u64),
+    HeartbeatTick,
+    SetEncoderCallback(Callback<DiagnosticsPacket>),
+}
+
+// Structure to track stats for a media stream we're sending
+#[derive(Debug)]
+struct StreamStats {
+    media_type: MediaType,
+    last_update: f64,
+    packet_loss_percent: f32,
+    median_latency_ms: u32,
+    jitter_ms: u32,
+    estimated_bandwidth_kbps: u32,
+    round_trip_time_ms: u32,
+    peer_id: String,
+}
+
+impl StreamStats {
+    fn new(peer_id: String, media_type: MediaType) -> Self {
+        Self {
+            media_type,
+            last_update: Date::now(),
+            packet_loss_percent: 0.0,
+            median_latency_ms: 0,
+            jitter_ms: 0,
+            estimated_bandwidth_kbps: 0,
+            round_trip_time_ms: 0,
+            peer_id,
+        }
+    }
+
+    fn update_from_packet(&mut self, packet: &DiagnosticsPacket) {
+        self.last_update = Date::now();
+        self.packet_loss_percent = packet.packet_loss_percent;
+        self.median_latency_ms = packet.median_latency_ms;
+        self.jitter_ms = packet.jitter_ms;
+        self.estimated_bandwidth_kbps = packet.estimated_bandwidth_kbps;
+        self.round_trip_time_ms = packet.round_trip_time_ms;
+    }
+
+    fn is_stale(&self) -> bool {
+        Date::now() - self.last_update > 2000.0 // Consider stale after 2 seconds
+    }
+}
+
+#[derive(Debug)]
+pub struct SenderDiagnosticManager {
+    sender: Sender<SenderDiagnosticEvent>,
+    timer: Option<Rc<JsTimer>>,
+    report_interval_ms: u64,
+}
+
+struct SenderDiagnosticWorker {
+    stream_stats: HashMap<String, HashMap<MediaType, StreamStats>>, // peer_id -> media_type -> stats
+    on_stats_update: Option<Callback<String>>,
+    encoder_callback: Option<Callback<DiagnosticsPacket>>,
+    last_report_time: f64,
+    report_interval_ms: u64,
+    receiver: Receiver<SenderDiagnosticEvent>,
+}
+
+impl SenderDiagnosticManager {
+    pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel(100);
+
+        let worker = SenderDiagnosticWorker {
+            stream_stats: HashMap::new(),
+            on_stats_update: None,
+            encoder_callback: None,
+            last_report_time: Date::now(),
+            report_interval_ms: 500,
+            receiver,
+        };
+
+        wasm_bindgen_futures::spawn_local(worker.run());
+
+        let mut manager = Self {
+            sender: sender.clone(),
+            timer: None,
+            report_interval_ms: 500,
+        };
+
+        // Set up heartbeat timer
+        manager.setup_heartbeat(sender);
+
+        manager
+    }
+
+    fn setup_heartbeat(&mut self, sender: Sender<SenderDiagnosticEvent>) {
+        let window = window().expect("Failed to get window");
+        let sender_clone = sender.clone();
+
+        let callback = Closure::wrap(Box::new(move || {
+            if let Err(e) = sender_clone.clone().try_send(SenderDiagnosticEvent::HeartbeatTick) {
+                console::log_1(&format!("Failed to send sender heartbeat: {:?}", e).into());
+            }
+        }) as Box<dyn FnMut()>);
+
+        let interval_id = window
+            .set_interval_with_callback_and_timeout_and_arguments_0(
+                callback.as_ref().unchecked_ref(),
+                500,
+            )
+            .expect("Failed to set interval");
+
+        self.timer = Some(Rc::new(JsTimer {
+            closure: callback,
+            interval_id,
+        }));
+    }
+
+    pub fn set_stats_callback(&self, callback: Callback<String>) {
+        if let Err(e) = self
+            .sender
+            .clone()
+            .try_send(SenderDiagnosticEvent::SetStatsCallback(callback))
+        {
+            error!("Failed to set sender stats callback: {e}");
+        }
+    }
+
+    pub fn set_encoder_callback(&self, callback: Callback<DiagnosticsPacket>) {
+        if let Err(e) = self
+            .sender
+            .clone()
+            .try_send(SenderDiagnosticEvent::SetEncoderCallback(callback))
+        {
+            error!("Failed to set encoder callback: {e}");
+        }
+    }
+
+    pub fn set_reporting_interval(&self, interval_ms: u64) {
+        if let Err(e) = self
+            .sender
+            .clone()
+            .try_send(SenderDiagnosticEvent::SetReportingInterval(interval_ms))
+        {
+            error!("Failed to set sender reporting interval: {e}");
+        }
+    }
+
+    pub fn handle_diagnostic_packet(&self, packet: DiagnosticsPacket) {
+        if let Err(e) = self
+            .sender
+            .clone()
+            .try_send(SenderDiagnosticEvent::DiagnosticPacketReceived(packet))
+        {
+            error!("Failed to handle diagnostic packet: {e}");
+        }
+    }
+}
+
+impl Drop for SenderDiagnosticManager {
+    fn drop(&mut self) {
+        self.timer = None;
+    }
+}
+
+impl SenderDiagnosticWorker {
+    async fn run(mut self) {
+        while let Some(event) = self.receiver.next().await {
+            self.handle_event(event);
+        }
+    }
+
+    fn handle_event(&mut self, event: SenderDiagnosticEvent) {
+        match event {
+            SenderDiagnosticEvent::DiagnosticPacketReceived(packet) => {
+                let peer_id = packet.sender_id.clone();
+                let media_type = match packet.media_type.enum_value_or_default() {
+                    diag::diagnostics_packet::MediaType::VIDEO => MediaType::VIDEO,
+                    diag::diagnostics_packet::MediaType::AUDIO => MediaType::AUDIO,
+                    diag::diagnostics_packet::MediaType::SCREEN => MediaType::SCREEN,
+                    _ => return,
+                };
+
+                let peer_stats = self.stream_stats.entry(peer_id.clone()).or_default();
+                let stats = peer_stats
+                    .entry(media_type)
+                    .or_insert_with(|| StreamStats::new(peer_id, media_type));
+                
+                stats.update_from_packet(&packet);
+
+                // Forward to encoder for potential bitrate adjustments
+                if let Some(callback) = &self.encoder_callback {
+                    callback.emit(packet);
+                }
+            }
+            SenderDiagnosticEvent::SetStatsCallback(callback) => {
+                self.on_stats_update = Some(callback);
+            }
+            SenderDiagnosticEvent::SetReportingInterval(interval) => {
+                self.report_interval_ms = interval;
+            }
+            SenderDiagnosticEvent::HeartbeatTick => {
+                self.maybe_report_stats_to_ui();
+            }
+            SenderDiagnosticEvent::SetEncoderCallback(callback) => {
+                self.encoder_callback = Some(callback);
+            }
+        }
+    }
+
+    fn maybe_report_stats_to_ui(&mut self) {
+        let now = Date::now();
+        let elapsed_ms = now - self.last_report_time;
+
+        if elapsed_ms >= self.report_interval_ms as f64 {
+            let stats_string = self.get_stats_string();
+
+            if let Some(callback) = &self.on_stats_update {
+                callback.emit(stats_string);
+            }
+
+            self.last_report_time = now;
+        }
+    }
+
+    fn get_stats_string(&mut self) -> String {
+        let mut result = String::new();
+        let now = Date::now();
+
+        // Remove stale entries
+        self.stream_stats.retain(|_, media_stats| {
+            media_stats.retain(|_, stats| !stats.is_stale());
+            !media_stats.is_empty()
+        });
+
+        for (peer_id, media_stats) in &self.stream_stats {
+            result.push_str(&format!("Peer {}:\n", peer_id));
+            
+            // First show Video if it exists
+            if let Some(stats) = media_stats.get(&MediaType::VIDEO) {
+                self.append_media_stats(&mut result, "Video", stats);
+            }
+            
+            // Then show Audio if it exists
+            if let Some(stats) = media_stats.get(&MediaType::AUDIO) {
+                self.append_media_stats(&mut result, "Audio", stats);
+            }
+            
+            // Finally show Screen if it exists
+            if let Some(stats) = media_stats.get(&MediaType::SCREEN) {
+                self.append_media_stats(&mut result, "Screen", stats);
+            }
+            
+            result.push('\n');
+        }
+
+        if self.stream_stats.is_empty() {
+            result.push_str("No active peers.\n");
+        }
+
+        result
+    }
+
+    fn append_media_stats(&self, result: &mut String, media_str: &str, stats: &StreamStats) {
+        result.push_str(&format!(
+            "  {}: Loss={:.1}% RTT={}ms BW={} kbit/s\n",
+            media_str,
+            stats.packet_loss_percent,
+            stats.round_trip_time_ms,
+            stats.estimated_bandwidth_kbps
+        ));
     }
 }

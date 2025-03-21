@@ -580,12 +580,17 @@ impl StreamStats {
         }
     }
 
-    fn update_from_packet(&mut self, packet: &DiagnosticsPacket) {
+    fn update_from_packet(&mut self, packet: &DiagnosticsPacket, media_type: MediaType) {
         self.last_update = Date::now();
         self.packet_loss_percent = packet.packet_loss_percent;
         self.median_latency_ms = packet.median_latency_ms;
         self.jitter_ms = packet.jitter_ms;
-        self.estimated_bandwidth_kbps = packet.estimated_bandwidth_kbps;
+        
+        self.estimated_bandwidth_kbps = match media_type {
+            MediaType::VIDEO => packet.video_metrics.clone().unwrap().bitrate_kbps,
+            MediaType::AUDIO => packet.audio_metrics.clone().unwrap().bitrate_kbps,
+            _ => 0
+        };
         self.round_trip_time_ms = packet.round_trip_time_ms;
     }
 
@@ -730,7 +735,7 @@ impl SenderDiagnosticWorker {
                     .entry(media_type)
                     .or_insert_with(|| StreamStats::new(peer_id, media_type));
                 
-                stats.update_from_packet(&packet);
+                stats.update_from_packet(&packet, media_type);
 
                 // Forward to encoder for potential bitrate adjustments
                 if let Some(callback) = &self.encoder_callback {

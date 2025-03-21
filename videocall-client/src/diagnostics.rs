@@ -3,9 +3,8 @@ use std::error::Error;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
-use futures::channel::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{self, Receiver, Sender, UnboundedSender};
 use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
@@ -13,7 +12,7 @@ use protobuf::Message;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use web_sys::{console, window, Window};
+use web_sys::{console, window};
 use yew::Callback;
 
 use videocall_types::protos::diagnostics_packet::{

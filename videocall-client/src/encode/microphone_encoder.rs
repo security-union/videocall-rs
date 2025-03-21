@@ -11,12 +11,10 @@ use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::AudioData;
 use web_sys::AudioEncoder;
 use web_sys::AudioEncoderConfig;
 use web_sys::AudioEncoderInit;
 use web_sys::AudioTrack;
-use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
@@ -28,14 +26,13 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_audio_chunk;
 
-use crate::constants::AUDIO_BITRATE;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::diagnostics::{EncoderControl, EncoderControlSender};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
-use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::UnboundedReceiver;
 use futures::{select, FutureExt, StreamExt};
 
 /// [MicrophoneEncoder] encodes the audio from a microphone and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.

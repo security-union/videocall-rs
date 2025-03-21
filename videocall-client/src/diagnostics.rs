@@ -421,8 +421,8 @@ impl DiagnosticWorker {
                 }
 
                 let mut packet = DiagnosticsPacket::new();
-                packet.sender_id = self.userid.clone();
-                packet.target_id = peer_id.clone();
+                packet.target_id = self.userid.clone();
+                packet.sender_id = peer_id.clone();
                 packet.timestamp_ms = timestamp_ms;
 
                 let proto_media_type = match media_type {
@@ -719,7 +719,8 @@ impl SenderDiagnosticWorker {
     fn handle_event(&mut self, event: SenderDiagnosticEvent) {
         match event {
             SenderDiagnosticEvent::DiagnosticPacketReceived(packet) => {
-                let peer_id = packet.sender_id.clone();
+                let sender_id = packet.sender_id.clone();
+                let target_id = packet.target_id.clone();
                 let media_type = match packet.media_type.enum_value_or_default() {
                     diag::diagnostics_packet::MediaType::VIDEO => MediaType::VIDEO,
                     diag::diagnostics_packet::MediaType::AUDIO => MediaType::AUDIO,
@@ -727,12 +728,14 @@ impl SenderDiagnosticWorker {
                     _ => return,
                 };
 
-                let peer_stats = self.stream_stats.entry(peer_id.clone()).or_default();
-                let stats = peer_stats
-                    .entry(media_type)
-                    .or_insert_with(|| StreamStats::new(peer_id, media_type));
+                if sender_id == self.userid {
+                    let peer_stats = self.stream_stats.entry(target_id.clone()).or_default();
+                    let stats = peer_stats
+                        .entry(media_type)
+                    .or_insert_with(|| StreamStats::new(target_id, media_type));
+                    stats.update_from_packet(&packet, media_type);
+                }
                 
-                stats.update_from_packet(&packet, media_type);
 
                 // Forward to encoder for potential bitrate adjustments
                 if let Some(callback) = &self.encoder_callback {
@@ -771,7 +774,6 @@ impl SenderDiagnosticWorker {
 
     fn get_stats_string(&mut self) -> String {
         let mut result = String::new();
-        let now = Date::now();
 
         // Remove stale entries
         self.stream_stats.retain(|_, media_stats| {
@@ -779,8 +781,9 @@ impl SenderDiagnosticWorker {
             !media_stats.is_empty()
         });
 
+        // Only show stats for the current peer (where peer_id matches our userid)
         for (peer_id, media_stats) in &self.stream_stats {
-            result.push_str(&format!("Peer {}:\n", peer_id));
+            result.push_str(&format!("Peer {}\n", peer_id));
             
             // First show Video if it exists
             if let Some(stats) = media_stats.get(&MediaType::VIDEO) {
@@ -796,12 +799,9 @@ impl SenderDiagnosticWorker {
             if let Some(stats) = media_stats.get(&MediaType::SCREEN) {
                 self.append_media_stats(&mut result, "Screen", stats);
             }
-            
-            result.push('\n');
         }
-
         if self.stream_stats.is_empty() {
-            result.push_str("No active peers.\n");
+            result.push_str("No feedback received about your streams yet.\n");
         }
 
         result

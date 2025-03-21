@@ -513,14 +513,21 @@ impl Component for AttendantsComponent {
                 <div id="diagnostics-sidebar" class={if self.diagnostics_open {"visible"} else {""}}>
                     <div class="sidebar-header">
                         <h2>{"Diagnostics"}</h2>
-                        <button class="close-button" onclick={toggle_diagnostics.clone()}>{"×"}</button>
+                        <button class="close-button" onclick={toggle_diagnostics}>{"×"}</button>
                     </div>
                     <div class="sidebar-content">
                         {
                             match &self.diagnostics_data {
                                 Some(data) => html! {
                                     <div class="diagnostics-data">
-                                        <pre>{ data }</pre>
+                                        <div class="diagnostics-section">
+                                            <h3>{"Reception Stats"}</h3>
+                                            <pre>{ data }</pre>
+                                        </div>
+                                        <div class="diagnostics-section">
+                                            <h3>{"Sending Stats"}</h3>
+                                            <pre>{"Coming soon..."}</pre>
+                                        </div>
                                     </div>
                                 },
                                 None => html! {

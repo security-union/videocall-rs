@@ -120,19 +120,34 @@ impl FpsTracker {
 
         // If no frames for more than 1 second, consider the feed inactive
         if inactive_ms > 1000.0 {
-            // Set FPS to zero immediately when inactive
-            if self.fps > 0.0 {
+            // Set FPS and bitrate to zero immediately when inactive
+            if self.fps > 0.0 || self.current_bitrate > 0.0 {
                 console::log_1(
                     &format!(
-                        "Detected inactive stream, setting FPS to 0 (inactive for {:.0}ms)",
+                        "Detected inactive stream, setting metrics to 0 (inactive for {:.0}ms)",
                         inactive_ms
                     )
                     .into(),
                 );
                 self.fps = 0.0;
+                self.current_bitrate = 0.0;
                 self.frames_count = 0;
+                self.bytes_received = 0;
                 self.last_fps_update = now;
+                self.last_bitrate_update = now;
             }
+        }
+    }
+
+    fn get_metrics(&self) -> (f64, f64) {
+        let now = Date::now();
+        let inactive_ms = now - self.last_frame_time;
+
+        // If inactive for more than 1 second, return zeros
+        if inactive_ms > 1000.0 {
+            (0.0, 0.0)
+        } else {
+            (self.fps, self.current_bitrate)
         }
     }
 }
@@ -460,11 +475,13 @@ impl DiagnosticWorker {
     // Get all FPS stats for all peers
     fn get_all_fps_stats(&self) -> HashMap<String, HashMap<MediaType, (f64, f64)>> {
         let mut result = HashMap::new();
+        let now = Date::now();
 
         for (peer_id, peer_trackers) in &self.fps_trackers {
             let mut media_fps = HashMap::new();
             for (media_type, tracker) in peer_trackers {
-                media_fps.insert(*media_type, (tracker.fps, tracker.current_bitrate));
+                let metrics = tracker.get_metrics();
+                media_fps.insert(*media_type, metrics);
             }
             result.insert(peer_id.clone(), media_fps);
         }
@@ -483,20 +500,22 @@ impl DiagnosticWorker {
 
         for (peer_id, media_stats) in stats.iter() {
             result.push_str(&format!("Peer {}: ", peer_id));
-            for (media_type, (fps, bitrate)) in media_stats.iter() {
-                let media_str = match media_type {
-                    MediaType::VIDEO => "Video",
-                    MediaType::AUDIO => "Audio",
-                    MediaType::SCREEN => "Screen",
-                    MediaType::HEARTBEAT => "Heartbeat",
-                };
-
-                if *fps <= 0.01 {
-                    result.push_str(&format!("{}=INACTIVE ", media_str));
-                } else {
-                    result.push_str(&format!("{}={:.2} FPS {:.1} kbit/s ", media_str, fps, bitrate));
-                }
+            
+            // First show Video if it exists
+            if let Some((fps, bitrate)) = media_stats.get(&MediaType::VIDEO) {
+                self.append_media_stats(&mut result, "Video", *fps, *bitrate);
             }
+            
+            // Then show Audio if it exists
+            if let Some((fps, bitrate)) = media_stats.get(&MediaType::AUDIO) {
+                self.append_media_stats(&mut result, "Audio", *fps, *bitrate);
+            }
+            
+            // Finally show Screen if it exists
+            if let Some((fps, bitrate)) = media_stats.get(&MediaType::SCREEN) {
+                self.append_media_stats(&mut result, "Screen", *fps, *bitrate);
+            }
+            
             result.push('\n');
         }
 
@@ -505,5 +524,13 @@ impl DiagnosticWorker {
         }
 
         result
+    }
+
+    fn append_media_stats(&self, result: &mut String, media_str: &str, fps: f64, bitrate: f64) {
+        if fps <= 0.01 || bitrate <= 0.01 {
+            result.push_str(&format!("{}=INACTIVE ", media_str));
+        } else {
+            result.push_str(&format!("{}={:.2} FPS {:.1} kbit/s ", media_str, fps, bitrate));
+        }
     }
 }

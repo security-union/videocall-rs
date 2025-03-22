@@ -412,45 +412,7 @@ impl VideoCallClient {
             if let Some(sender_diagnostics) = &inner.sender_diagnostics {
                 let (tx, rx) = mpsc::unbounded();
                 // Create a proper EncoderControlSender with the receiver
-                let control = EncoderControlSender::new(rx, bitrate_kbps);
-
-                // Set up the encoder callback to forward diagnostic packets to the encoder
-                // sender_diagnostics.add_encoder_callback(Callback::from(
-                //     move |packet: DiagnosticsPacket| {
-                //         match media_type {
-                //             MediaType::VIDEO => {
-                //                 if let Some(metrics) = packet.video_metrics.as_ref() {
-                //                     debug!("📹 Video metrics received - Current bitrate: {} kbps, Target bitrate: {} kbps", 
-                //                         metrics.bitrate_kbps, metrics.bitrate_kbps);
-                //                     if let Err(e) = tx.unbounded_send(packet) {
-                //                         error!("Failed to send encoder control event: {}", e.to_string());
-                //                     }
-                //                 }
-                //             }
-                //             MediaType::AUDIO => {
-                //                 if let Some(metrics) = packet.audio_metrics.as_ref() {
-                //                     debug!("🎤 Audio metrics received - Current bitrate: {} kbps, Target bitrate: {} kbps", 
-                //                         metrics.bitrate_kbps, metrics.bitrate_kbps);
-                //                     if let Err(e) = tx.unbounded_send(packet) {
-                //                         error!("Failed to send encoder control event: {}", e.to_string());
-                //                     }
-                //                 }
-                //             }
-                //             MediaType::SCREEN => {
-                //                 if let Some(metrics) = packet.video_metrics.as_ref() {
-                //                     debug!("🖥️ Screen metrics received - Current bitrate: {} kbps, Target bitrate: {} kbps", 
-                //                         metrics.bitrate_kbps, metrics.bitrate_kbps);
-                //                     if let Err(e) = tx.unbounded_send(packet) {
-                //                         error!("Failed to send encoder control event: {}", e.to_string());
-                //                     }
-                //                 }
-                //             }
-                //             _ => {
-                //                 error!("❌ Unsupported media type: {}", media_type);
-                //             }
-                //         }
-                //     },
-                // ));
+                let control = EncoderControlSender::new(rx, bitrate_kbps, media_type);
                 sender_diagnostics.add_sender_channel(tx, media_type);
                 return Some(control);
             }

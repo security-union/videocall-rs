@@ -55,9 +55,9 @@ impl Component for Host {
 
     fn create(ctx: &Context<Self>) -> Self {
         let client = ctx.props().client.clone();
-        let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID);
-        let mut microphone = MicrophoneEncoder::new(client.clone());
-        let mut screen = ScreenEncoder::new(client.clone());
+        let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID, VIDEO_BITRATE_KBPS);
+        let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
+        let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
 
         let (video_encoder_control, video_encoder_receiver) = client.get_encoder_control_sender(MediaType::VIDEO, VIDEO_BITRATE_KBPS).expect("Failed to get video encoder control");
         let (audio_encoder_control, audio_encoder_receiver) = client.get_encoder_control_sender(MediaType::AUDIO, AUDIO_BITRATE_KBPS).expect("Failed to get audio encoder control");

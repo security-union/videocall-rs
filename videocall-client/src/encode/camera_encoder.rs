@@ -80,7 +80,7 @@ impl CameraEncoder {
         let current_bitrate = self.current_bitrate.clone();
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(event) = control.next().await {
-                info!("Camera encoder control event: {:?}", event);
+                // info!("Camera encoder control event: {:?}", event);
                 if let EncoderControl::UpdateBitrate { target_bitrate_kbps } = event {
                     current_bitrate.store(target_bitrate_kbps, Ordering::Relaxed);
                 }
@@ -253,6 +253,7 @@ impl CameraEncoder {
                 // Update the bitrate if it has changed
                 let new_current_bitrate = current_bitrate.load(Ordering::Relaxed);
                 if new_current_bitrate != local_bitrate {
+                    log::info!("Updating video bitrate to {}", new_current_bitrate);
                     local_bitrate = new_current_bitrate;
                     video_encoder_config.bitrate(local_bitrate as f64);
                     video_encoder.configure(&video_encoder_config);

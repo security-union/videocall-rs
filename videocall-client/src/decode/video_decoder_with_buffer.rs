@@ -29,13 +29,6 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
         self.video_decoder.configure(config);
     }
 
-    pub fn get_jitter_metric(&self) -> f32 {
-        // Returns value between 0.0 and 1.0 representing current jitter
-        // 0.0 = no jitter (empty cache)
-        // 1.0 = maximum jitter (cache at MAX_BUFFER_SIZE)
-        self.cache.len() as f32 / MAX_BUFFER_SIZE as f32
-    }
-
     pub fn decode(&mut self, image: Arc<MediaPacket>) {
         let new_sequence_number = image.video_metadata.sequence;
         let frame_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;

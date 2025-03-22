@@ -1,8 +1,11 @@
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::StreamExt;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
+use log::info;
 use std::sync::atomic::Ordering;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -29,6 +32,7 @@ use super::transform::transform_screen_chunk;
 use crate::constants::SCREEN_HEIGHT;
 use crate::constants::SCREEN_WIDTH;
 use crate::constants::VIDEO_CODEC;
+use crate::diagnostics::EncoderControl;
 
 /// [ScreenEncoder] encodes the user's screen and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
@@ -52,6 +56,15 @@ impl ScreenEncoder {
             client,
             state: EncoderState::new(),
         }
+    }
+
+
+    pub fn set_encoder_control(&mut self, mut control: UnboundedReceiver<EncoderControl>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(event) = control.next().await {
+                info!("Screen encoder control event: {:?}", event);
+            }
+        });
     }
 
     // The next two methods delegate to self.state

@@ -64,10 +64,12 @@ impl MicrophoneEncoder {
         }
     }
 
-    pub fn set_encoder_control(&mut self, control: EncoderControlSender) {
-        let (tx, rx) = futures::channel::mpsc::unbounded();
-        self.encoder_control = Some(rx);
-        control.update_bitrate(MediaType::AUDIO, self.current_bitrate);
+    pub fn set_encoder_control(&mut self, mut control: UnboundedReceiver<EncoderControl>) {
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(event) = control.next().await {
+                info!("Microphone encoder control event: {:?}", event);
+            }
+        });
     }
 
     // The next three methods delegate to self.state
@@ -212,8 +214,7 @@ impl MicrophoneEncoder {
 
                     select! {
                         control = control_rx.next() => {
-                            if let Some(EncoderControl::UpdateBitrate { media_type, target_bitrate_kbps }) = control {
-                                if media_type == MediaType::AUDIO {
+                            if let Some(EncoderControl::UpdateBitrate { target_bitrate_kbps }) = control {
                                     info!("🎤 Microphone encoder applying bitrate update - Old: {} kbps, New: {} kbps", 
                                         current_bitrate, target_bitrate_kbps);
                                     current_bitrate = target_bitrate_kbps;
@@ -223,7 +224,6 @@ impl MicrophoneEncoder {
                                     // config.sample_rate(AUDIO_SAMPLE_RATE);
                                     // audio_encoder.configure(&config);
                                     info!("🎤 Microphone encoder bitrate update applied successfully");
-                                }
                             }
                         }
                         frame = JsFuture::from(audio_reader.read()).fuse() => {

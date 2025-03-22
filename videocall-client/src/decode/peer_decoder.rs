@@ -56,13 +56,6 @@ impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
     pub fn is_waiting_for_keyframe(&self) -> bool {
         self.waiting_for_keyframe
     }
-
-    pub fn get_jitter_metric(&self) -> f32 
-    where 
-        WebDecoder: AsRef<VideoDecoderWithBuffer<VideoDecoderWrapper>>
-    {
-        self.decoder.as_ref().get_jitter_metric()
-    }
 }
 
 pub trait PeerDecode {
@@ -163,10 +156,6 @@ impl VideoPeerDecoder {
             _error: error,
             _output: output,
         }
-    }
-
-    pub fn get_jitter_metric(&self) -> f32 {
-        self.decoder.get_jitter_metric()
     }
 
     fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedVideoChunkType {

@@ -11,7 +11,7 @@ use log::{debug, error};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use web_sys::{console, window};
+use web_sys::window;
 use yew::Callback;
 
 use videocall_types::protos::diagnostics_packet::{
@@ -123,12 +123,9 @@ impl FpsTracker {
         if inactive_ms > 1000.0 {
             // Set FPS and bitrate to zero immediately when inactive
             if self.fps > 0.0 || self.current_bitrate > 0.0 {
-                console::log_1(
-                    &format!(
+                log::info!(
                         "Detected inactive stream, setting metrics to 0 (inactive for {:.0}ms)",
                         inactive_ms
-                    )
-                    .into(),
                 );
                 self.fps = 0.0;
                 self.current_bitrate = 0.0;
@@ -252,7 +249,7 @@ impl DiagnosticManager {
                 .clone()
                 .try_send(DiagnosticEvent::HeartbeatTick)
             {
-                console::log_1(&format!("Failed to send heartbeat: {:?}", e).into());
+                log::info!("Failed to send heartbeat: {:?}", e);
             }
         }) as Box<dyn FnMut()>);
 
@@ -596,7 +593,7 @@ impl StreamStats {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SenderDiagnosticManager {
     sender: Sender<SenderDiagnosticEvent>,
     timer: Option<Rc<JsTimer>>,
@@ -822,71 +819,66 @@ impl SenderDiagnosticWorker {
     }
 }
 
-#[derive(Debug)]
+/// EncoderControl is responsible for bridging the gap between the encoder and the
+/// diagnostics system.
+
+/// It closes the loop by allowing the encoder to adjust its settings based on
+/// feedback from the diagnostics system.
+#[derive(Debug, Clone)]
 pub enum EncoderControl {
     UpdateBitrate {
-        media_type: MediaType,
         target_bitrate_kbps: u32,
     },
     UpdateQualityPreference {
-        media_type: MediaType,
         preference: QualityPreference,
     },
 }
 
+#[derive(Debug)]
 pub struct EncoderControlSender {
-    sender: UnboundedSender<EncoderControl>,
-}
-
-struct EncoderControlWorker {
-    receiver: UnboundedReceiver<EncoderControl>,
-}
-
-impl EncoderControlWorker {
-    async fn run(mut self) {
-        while let Some(event) = self.receiver.next().await {
-            self.handle_event(event);
-        }
-    }
-
-    fn handle_event(&mut self, event: EncoderControl) {
-        // Will be implemented when needed
-    }
 }
 
 impl EncoderControlSender {
-    pub fn new(diagnostics_receiver: UnboundedReceiver<EncoderControl>) -> Self {
-        let worker: EncoderControlWorker = EncoderControlWorker { receiver: diagnostics_receiver };
-        wasm_bindgen_futures::spawn_local(worker.run());
-        Self { 
-            sender: mpsc::unbounded().0,
-        }
+    pub fn new(mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>) -> (Self, UnboundedReceiver<EncoderControl>) {
+        let (sender, receiver) = mpsc::unbounded();
+        // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(event) = diagnostics_receiver.next().await {
+                //sender.unbounded_send(event).unwrap();
+                log::info!("Encoder control event: {:?}", event);
+                if let Err(e) = sender.unbounded_send(
+                    EncoderControl::UpdateBitrate {target_bitrate_kbps: 0 }
+                ) {
+                    error!("Failed to send bitrate update: {}", e);
+                }
+
+            }
+        });
+        
+        (Self {}, receiver)
     }
 
     pub fn update_bitrate(&self, media_type: MediaType, target_bitrate_kbps: u32) {
-        if let Err(e) = self.sender.unbounded_send(EncoderControl::UpdateBitrate {
-            media_type,
-            target_bitrate_kbps,
-        }) {
-            error!("Failed to send bitrate update: {}", e);
-        }
+        // if let Some(sender) = &self.sender {
+        //     if let Err(e) = sender.unbounded_send(EncoderControl::UpdateBitrate {
+        //         media_type,
+        //         target_bitrate_kbps,
+        //     }) {
+        //         error!("Failed to send bitrate update: {}", e);
+        //     }
+        // }
     }
 
     pub fn update_quality_preference(&self, media_type: MediaType, preference: QualityPreference) {
-        if let Err(e) = self
-            .sender
-            .unbounded_send(EncoderControl::UpdateQualityPreference {
-                media_type,
-                preference,
-            })
-        {
-            error!("Failed to send quality preference update: {}", e);
-        }
+        // if let Some(sender) = &self.sender {
+        //     if let Err(e) = sender.unbounded_send(EncoderControl::UpdateQualityPreference {
+        //         media_type,
+        //         preference,
+        //     }) {
+        //         error!("Failed to send quality preference update: {}", e);
+        //     }
+        // }
     }
+
 }
 
-impl Drop for EncoderControlSender {
-    fn drop(&mut self) {
-        self.sender.close_channel();
-    }
-}

@@ -18,7 +18,7 @@ clippy-fix:
 
 fmt:
 		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app/yew-ui && cargo fmt"
-		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo fmt""
+		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo fmt"
 
 check: 
 		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo clippy --all  -- --deny warnings && cargo fmt --check"

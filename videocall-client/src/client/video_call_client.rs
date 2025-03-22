@@ -399,15 +399,18 @@ impl VideoCallClient {
     }
 
     /// Get an encoder control sender that can be used to control encoder bitrates
-    /// The encoder should select the media type based on the media_type parameter
+    /// The encoder should select the media type based on the media_type parameter.
+    /// 
+    /// The EncoderControlSender shall subscribe to sender_diagnostics, and update the bitrate of the encoder
+    /// then send the EncoderControl event to the encoder via a UnboundedSender.
     pub fn get_encoder_control_sender(
         &self,
         media_type: MediaType,
-    ) -> Option<(EncoderControlSender, UnboundedReceiver<EncoderControl>)> {
+    ) -> Option<EncoderControlSender> {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(sender_diagnostics) = &inner.sender_diagnostics {
                 let (tx, rx) = mpsc::unbounded();
-                let control = EncoderControlSender::new(tx.clone());
+                let control = EncoderControlSender::new(rx);
 
                 // Set up the encoder callback to forward diagnostic packets to the encoder
                 sender_diagnostics.add_encoder_callback(Callback::from(
@@ -415,8 +418,8 @@ impl VideoCallClient {
                         match media_type {
                             MediaType::VIDEO => {
                                 if let Some(metrics) = packet.video_metrics.as_ref() {
-                                    info!("📹 Video metrics received in client - Bitrate: {} kbps", 
-                                        metrics.bitrate_kbps);
+                                    info!("📹 Video metrics received - Current bitrate: {} kbps, Target bitrate: {} kbps", 
+                                        metrics.bitrate_kbps, metrics.bitrate_kbps);
                                     let _ = tx.unbounded_send(EncoderControl::UpdateBitrate {
                                         media_type: MediaType::VIDEO,
                                         target_bitrate_kbps: metrics.bitrate_kbps,
@@ -449,7 +452,7 @@ impl VideoCallClient {
                         }
                     },
                 ));
-                return Some((control, rx));
+                return Some(control);
             }
         }
         None

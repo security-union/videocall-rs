@@ -64,10 +64,10 @@ impl MicrophoneEncoder {
         }
     }
 
-    pub fn set_encoder_control(&mut self, _control: EncoderControlSender) {
-        let (sender, receiver) = self.client.get_encoder_control_sender(MediaType::AUDIO).unwrap();
-        self.encoder_control = Some(receiver);
-        sender.update_bitrate(MediaType::AUDIO, self.current_bitrate);
+    pub fn set_encoder_control(&mut self, control: EncoderControlSender) {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        self.encoder_control = Some(rx);
+        control.update_bitrate(MediaType::AUDIO, self.current_bitrate);
     }
 
     // The next three methods delegate to self.state

@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use futures::channel::mpsc::{self, Receiver, Sender, UnboundedSender};
+use futures::channel::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
@@ -834,14 +834,33 @@ pub enum EncoderControl {
     },
 }
 
-#[derive(Debug, Clone)]
 pub struct EncoderControlSender {
     sender: UnboundedSender<EncoderControl>,
 }
 
+struct EncoderControlWorker {
+    receiver: UnboundedReceiver<EncoderControl>,
+}
+
+impl EncoderControlWorker {
+    async fn run(mut self) {
+        while let Some(event) = self.receiver.next().await {
+            self.handle_event(event);
+        }
+    }
+
+    fn handle_event(&mut self, event: EncoderControl) {
+        // Will be implemented when needed
+    }
+}
+
 impl EncoderControlSender {
-    pub fn new(sender: UnboundedSender<EncoderControl>) -> Self {
-        Self { sender }
+    pub fn new(diagnostics_receiver: UnboundedReceiver<EncoderControl>) -> Self {
+        let worker: EncoderControlWorker = EncoderControlWorker { receiver: diagnostics_receiver };
+        wasm_bindgen_futures::spawn_local(worker.run());
+        Self { 
+            sender: mpsc::unbounded().0,
+        }
     }
 
     pub fn update_bitrate(&self, media_type: MediaType, target_bitrate_kbps: u32) {
@@ -863,5 +882,11 @@ impl EncoderControlSender {
         {
             error!("Failed to send quality preference update: {}", e);
         }
+    }
+}
+
+impl Drop for EncoderControlSender {
+    fn drop(&mut self) {
+        self.sender.close_channel();
     }
 }

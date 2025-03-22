@@ -12,7 +12,7 @@ const MAX_BUFFER_SIZE: usize = 10;
 #[derive(Debug)]
 pub struct VideoDecoderWithBuffer<A: VideoDecoderTrait> {
     video_decoder: A,
-    cache: BTreeMap<u64, Arc<MediaPacket>>,
+    pub cache: BTreeMap<u64, Arc<MediaPacket>>,
     sequence: Option<u64>,
 }
 
@@ -27,6 +27,13 @@ impl<T: VideoDecoderTrait> VideoDecoderWithBuffer<T> {
 
     pub fn configure(&self, config: &VideoDecoderConfig) {
         self.video_decoder.configure(config);
+    }
+
+    pub fn get_jitter_metric(&self) -> f32 {
+        // Returns value between 0.0 and 1.0 representing current jitter
+        // 0.0 = no jitter (empty cache)
+        // 1.0 = maximum jitter (cache at MAX_BUFFER_SIZE)
+        self.cache.len() as f32 / MAX_BUFFER_SIZE as f32
     }
 
     pub fn decode(&mut self, image: Arc<MediaPacket>) {

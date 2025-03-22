@@ -72,7 +72,6 @@ impl CameraEncoder {
             client,
             video_elem_id: video_elem_id.to_string(),
             state: EncoderState::new(),
-            encoder_control: None,
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
         }
     }

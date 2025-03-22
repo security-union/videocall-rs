@@ -545,6 +545,7 @@ pub enum SenderDiagnosticEvent {
     SetReportingInterval(u64),
     HeartbeatTick,
     AddEncoderCallback(Callback<DiagnosticsPacket>),
+    AddSenderChannel(UnboundedSender<DiagnosticsPacket>, MediaType),
 }
 
 // Structure to track stats for a media stream we're sending
@@ -604,6 +605,7 @@ struct SenderDiagnosticWorker {
     stream_stats: HashMap<String, HashMap<MediaType, StreamStats>>, // peer_id -> media_type -> stats
     on_stats_update: Option<Callback<String>>,
     encoder_callbacks: Vec<Callback<DiagnosticsPacket>>,
+    sender_channels: Vec<(UnboundedSender<DiagnosticsPacket>, MediaType)>,
     last_report_time: f64,
     report_interval_ms: u64,
     receiver: Receiver<SenderDiagnosticEvent>,
@@ -618,6 +620,7 @@ impl SenderDiagnosticManager {
             stream_stats: HashMap::new(),
             on_stats_update: None,
             encoder_callbacks: Vec::new(),
+            sender_channels: Vec::new(),
             last_report_time: Date::now(),
             report_interval_ms: 500,
             receiver,
@@ -684,6 +687,16 @@ impl SenderDiagnosticManager {
         }
     }
 
+    pub fn add_sender_channel(&self, sender: UnboundedSender<DiagnosticsPacket>, media_type: MediaType) {
+        if let Err(e) = self
+            .sender
+            .clone()
+            .try_send(SenderDiagnosticEvent::AddSenderChannel(sender, media_type))
+        {
+            error!("Failed to set sender channel: {e}");
+        }
+    }
+
     pub fn set_reporting_interval(&self, interval_ms: u64) {
         if let Err(e) = self
             .sender
@@ -737,9 +750,12 @@ impl SenderDiagnosticWorker {
                     stats.update_from_packet(&packet, media_type);
                 }
 
-                // Forward to encoder for potential bitrate adjustments
-                for callback in &self.encoder_callbacks {
-                    callback.emit(packet.clone());
+                for (sender, sender_media_type) in &self.sender_channels {
+                    if sender_media_type == &media_type {
+                        if let Err(e) = sender.unbounded_send(packet.clone()) {
+                            error!("Failed to send diagnostic packet to sender: {e}");
+                        }
+                    }
                 }
             }
             SenderDiagnosticEvent::SetStatsCallback(callback) => {
@@ -754,6 +770,9 @@ impl SenderDiagnosticWorker {
             SenderDiagnosticEvent::AddEncoderCallback(callback) => {
                 // Add the callback to the list of callbacks
                 self.encoder_callbacks.push(callback);
+            }
+            SenderDiagnosticEvent::AddSenderChannel(sender, media_type) => {
+                self.sender_channels.push((sender, media_type));
             }
         }
     }
@@ -842,7 +861,6 @@ impl EncoderControlSender {
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(event) = diagnostics_receiver.next().await {
-                //sender.unbounded_send(event).unwrap();
                 log::info!("Encoder control event: {:?}", event);
                 if let Err(e) = sender.unbounded_send(EncoderControl::UpdateBitrate {
                     target_bitrate_kbps: 0,

@@ -124,8 +124,8 @@ impl FpsTracker {
             // Set FPS and bitrate to zero immediately when inactive
             if self.fps > 0.0 || self.current_bitrate > 0.0 {
                 log::info!(
-                        "Detected inactive stream, setting metrics to 0 (inactive for {:.0}ms)",
-                        inactive_ms
+                    "Detected inactive stream, setting metrics to 0 (inactive for {:.0}ms)",
+                    inactive_ms
                 );
                 self.fps = 0.0;
                 self.current_bitrate = 0.0;
@@ -826,35 +826,32 @@ impl SenderDiagnosticWorker {
 /// feedback from the diagnostics system.
 #[derive(Debug, Clone)]
 pub enum EncoderControl {
-    UpdateBitrate {
-        target_bitrate_kbps: u32,
-    },
-    UpdateQualityPreference {
-        preference: QualityPreference,
-    },
+    UpdateBitrate { target_bitrate_kbps: u32 },
+    UpdateQualityPreference { preference: QualityPreference },
 }
 
 #[derive(Debug)]
-pub struct EncoderControlSender {
-}
+pub struct EncoderControlSender {}
 
 impl EncoderControlSender {
-    pub fn new(mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>) -> (Self, UnboundedReceiver<EncoderControl>) {
+    pub fn new(
+        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
+        ideal_bitrate_kbps: u32,
+    ) -> (Self, UnboundedReceiver<EncoderControl>) {
         let (sender, receiver) = mpsc::unbounded();
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(event) = diagnostics_receiver.next().await {
                 //sender.unbounded_send(event).unwrap();
                 log::info!("Encoder control event: {:?}", event);
-                if let Err(e) = sender.unbounded_send(
-                    EncoderControl::UpdateBitrate {target_bitrate_kbps: 0 }
-                ) {
+                if let Err(e) = sender.unbounded_send(EncoderControl::UpdateBitrate {
+                    target_bitrate_kbps: 0,
+                }) {
                     error!("Failed to send bitrate update: {}", e);
                 }
-
             }
         });
-        
+
         (Self {}, receiver)
     }
 
@@ -879,6 +876,4 @@ impl EncoderControlSender {
         //     }
         // }
     }
-
 }
-

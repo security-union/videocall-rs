@@ -6,6 +6,10 @@ pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/l
 pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lobby");
 pub const CANVAS_LIMIT: usize = 20;
 
+pub const AUDIO_BITRATE_KBPS: u32 = 100_000u32;
+pub const VIDEO_BITRATE_KBPS: u32 = 250_000u32;
+pub const SCREEN_BITRATE_KBPS: u32 = 250_000u32;
+
 pub fn split_users(s: Option<&str>) -> Vec<String> {
     if let Some(s) = s {
         s.split(',')

@@ -5,7 +5,10 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
 use log::info;
+use std::rc::Rc;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -52,8 +55,7 @@ pub struct CameraEncoder {
     client: VideoCallClient,
     video_elem_id: String,
     state: EncoderState,
-    encoder_control: Option<UnboundedReceiver<EncoderControl>>,
-    current_bitrate: u32,
+    current_bitrate: Rc<AtomicU32>,
 }
 
 impl CameraEncoder {
@@ -65,20 +67,24 @@ impl CameraEncoder {
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
-    pub fn new(client: VideoCallClient, video_elem_id: &str) -> Self {
+    pub fn new(client: VideoCallClient, video_elem_id: &str, initial_bitrate: u32) -> Self {
         Self {
             client,
             video_elem_id: video_elem_id.to_string(),
             state: EncoderState::new(),
             encoder_control: None,
-            current_bitrate: 100_000,
+            current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
         }
     }
 
     pub fn set_encoder_control(&mut self, mut control: UnboundedReceiver<EncoderControl>) {
+        let current_bitrate = self.current_bitrate.clone();
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(event) = control.next().await {
                 info!("Camera encoder control event: {:?}", event);
+                if let EncoderControl::UpdateBitrate { target_bitrate_kbps } = event {
+                    current_bitrate.store(target_bitrate_kbps, Ordering::Relaxed);
+                }
             }
         });
     }
@@ -129,6 +135,7 @@ impl CameraEncoder {
             switching,
             ..
         } = self.state.clone();
+        let current_bitrate = self.current_bitrate.clone();
         let video_output_handler = {
             let mut buffer: [u8; 100000] = [0; 100000];
             let mut sequence_number = 0;
@@ -151,8 +158,6 @@ impl CameraEncoder {
             return;
         };
 
-        let current_bitrate = self.current_bitrate;
-        let encoder_control = self.encoder_control.take();
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let video_element = window()
@@ -213,7 +218,7 @@ impl CameraEncoder {
             let mut video_encoder_config =
                 VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
 
-            video_encoder_config.bitrate(current_bitrate as f64);
+            video_encoder_config.bitrate(current_bitrate.load(Ordering::Relaxed) as f64);
             video_encoder_config.latency_mode(LatencyMode::Realtime);
             video_encoder.configure(&video_encoder_config);
 
@@ -229,83 +234,46 @@ impl CameraEncoder {
 
             // Start encoding video and audio.
             let mut video_frame_counter = 0;
-            let current_bitrate = current_bitrate;
 
-            if let Some(mut control_rx) = encoder_control {
-                loop {
-                    if !enabled.load(Ordering::Acquire)
-                        || destroy.load(Ordering::Acquire)
-                        || switching.load(Ordering::Acquire)
-                    {
-                        switching.store(false, Ordering::Release);
-                        let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
-                        video_track.stop();
-                        video_encoder.close();
-                        return;
-                    }
+            // Cache the initial bitrate 
+            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed);
 
-                    select! {
-                        control = control_rx.next() => {
-                            if let Some(EncoderControl::UpdateBitrate { target_bitrate_kbps }) = control {
-                                    info!("📹 Camera encoder applying bitrate update - Old: {} kbps, New: {} kbps", 
-                                        current_bitrate, target_bitrate_kbps);
-                                    // current_bitrate = target_bitrate_kbps;
-                                    // let mut config = VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
-                                    // config.bitrate(current_bitrate as f64);
-                                    // config.latency_mode(LatencyMode::Realtime);
-                                    // video_encoder.configure(&config);
-                                    info!("📹 Camera encoder bitrate update applied successfully");
-                            }
-                        }
-                        frame = JsFuture::from(video_reader.read()).fuse() => {
-                            match frame {
-                                Ok(js_frame) => {
-                                    let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                                        .unwrap()
-                                        .unchecked_into::<VideoFrame>();
-                                    video_encoder.encode_with_options(
-                                        &video_frame,
-                                        VideoEncoderEncodeOptions::new().key_frame(video_frame_counter % 150 == 0),
-                                    );
-                                    video_frame.close();
-                                    video_frame_counter += 1;
-                                }
-                                Err(e) => {
-                                    error!("error {:?}", e);
-                                }
-                            }
-                        }
-                    }
+
+            loop {
+                if !enabled.load(Ordering::Acquire)
+                    || destroy.load(Ordering::Acquire)
+                    || switching.load(Ordering::Acquire)
+                {
+                    switching.store(false, Ordering::Release);
+                    let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
+                    video_track.stop();
+                    video_encoder.close();
+                    return;
                 }
-            } else {
-                loop {
-                    if !enabled.load(Ordering::Acquire)
-                        || destroy.load(Ordering::Acquire)
-                        || switching.load(Ordering::Acquire)
-                    {
-                        switching.store(false, Ordering::Release);
-                        let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
-                        video_track.stop();
-                        video_encoder.close();
-                        return;
-                    }
 
-                    match JsFuture::from(video_reader.read()).await {
-                        Ok(js_frame) => {
-                            let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                                .unwrap()
-                                .unchecked_into::<VideoFrame>();
-                            video_encoder.encode_with_options(
-                                &video_frame,
-                                VideoEncoderEncodeOptions::new()
-                                    .key_frame(video_frame_counter % 150 == 0),
-                            );
-                            video_frame.close();
-                            video_frame_counter += 1;
-                        }
-                        Err(e) => {
-                            error!("error {:?}", e);
-                        }
+                // Update the bitrate if it has changed
+                let new_current_bitrate = current_bitrate.load(Ordering::Relaxed);
+                if new_current_bitrate != local_bitrate {
+                    local_bitrate = new_current_bitrate;
+                    video_encoder_config.bitrate(local_bitrate as f64);
+                    video_encoder.configure(&video_encoder_config);
+                }
+
+                match JsFuture::from(video_reader.read()).await {
+                    Ok(js_frame) => {
+                        let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
+                            .unwrap()
+                            .unchecked_into::<VideoFrame>();
+                        video_encoder.encode_with_options(
+                            &video_frame,
+                            VideoEncoderEncodeOptions::new()
+                                .key_frame(video_frame_counter % 150 == 0),
+                        );
+                        video_frame.close();
+                        video_frame_counter += 1;
+                    }
+                    Err(e) => {
+                        error!("error {:?}", e);
                     }
                 }
             }

@@ -58,7 +58,6 @@ impl ScreenEncoder {
         }
     }
 
-
     pub fn set_encoder_control(&mut self, mut control: UnboundedReceiver<EncoderControl>) {
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(event) = control.next().await {

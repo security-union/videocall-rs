@@ -215,7 +215,7 @@ impl MicrophoneEncoder {
                     select! {
                         control = control_rx.next() => {
                             if let Some(EncoderControl::UpdateBitrate { target_bitrate_kbps }) = control {
-                                    info!("🎤 Microphone encoder applying bitrate update - Old: {} kbps, New: {} kbps", 
+                                    info!("🎤 Microphone encoder applying bitrate update - Old: {} kbps, New: {} kbps",
                                         current_bitrate, target_bitrate_kbps);
                                     current_bitrate = target_bitrate_kbps;
                                     // let mut config = AudioEncoderConfig::new(AUDIO_CODEC);

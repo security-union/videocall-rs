@@ -4,6 +4,7 @@ use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCal
 use videocall_types::protos::media_packet::media_packet::MediaType;   
 use std::fmt::Debug;
 use yew::prelude::*;
+use videocall_client::diagnostics::EncoderControlSender;
 
 use crate::components::device_selector::DeviceSelector;
 
@@ -28,6 +29,9 @@ pub struct Host {
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
+    video_encoder_control: EncoderControlSender,
+    audio_encoder_control: EncoderControlSender,
+    screen_encoder_control: EncoderControlSender,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -52,13 +56,17 @@ impl Component for Host {
         let client = ctx.props().client.clone();
         let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID);
         let mut microphone = MicrophoneEncoder::new(client.clone());
-        let screen = ScreenEncoder::new(client.clone());
+        let mut screen = ScreenEncoder::new(client.clone());
 
-        camera.set_encoder_control(client.get_encoder_control_sender(MediaType::VIDEO).unwrap());
-        microphone.set_encoder_control(client.get_encoder_control_sender(MediaType::AUDIO).unwrap());
-        // TODO: Add screen encoder control
-        // screen.set_encoder_control(client.get_encoder_control_sender(MediaType::SCREEN).unwrap());
+        let (video_encoder_control, video_encoder_receiver) = client.get_encoder_control_sender(MediaType::VIDEO).expect("Failed to get video encoder control");
+        let (audio_encoder_control, audio_encoder_receiver) = client.get_encoder_control_sender(MediaType::AUDIO).expect("Failed to get audio encoder control");
+        let (screen_encoder_control, screen_encoder_receiver) = client.get_encoder_control_sender(MediaType::SCREEN).expect("Failed to get screen encoder control");
 
+        // Connect the receiver of each controller to the encoder
+        camera.set_encoder_control(video_encoder_receiver);
+        microphone.set_encoder_control(audio_encoder_receiver);
+        screen.set_encoder_control(screen_encoder_receiver);
+        
         Self {
             camera,
             microphone,
@@ -66,11 +74,13 @@ impl Component for Host {
             share_screen: ctx.props().share_screen,
             mic_enabled: ctx.props().mic_enabled,
             video_enabled: ctx.props().video_enabled,
+            video_encoder_control,
+            audio_encoder_control,
+            screen_encoder_control,
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        // Determine if we should start/stop screen share.
         if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::EnableScreenShare);
@@ -78,7 +88,6 @@ impl Component for Host {
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::DisableScreenShare);
         }
-        // Determine if we should start/stop microphone.
         if self.microphone.set_enabled(ctx.props().mic_enabled) {
             self.mic_enabled = ctx.props().mic_enabled;
             ctx.link()
@@ -87,7 +96,6 @@ impl Component for Host {
             self.mic_enabled = ctx.props().mic_enabled;
             ctx.link().send_message(Msg::DisableMicrophone)
         }
-        // Determine if we should start/stop video.
         if self.camera.set_enabled(ctx.props().video_enabled) {
             self.video_enabled = ctx.props().video_enabled;
             ctx.link()

@@ -6,7 +6,7 @@ use crate::diagnostics::{
     DiagnosticManager, EncoderControl, EncoderControlSender, SenderDiagnosticManager,
 };
 use anyhow::{anyhow, Result};
-use futures::channel::mpsc;
+use futures::channel::mpsc::{self, UnboundedReceiver};
 use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
@@ -403,48 +403,53 @@ impl VideoCallClient {
     pub fn get_encoder_control_sender(
         &self,
         media_type: MediaType,
-    ) -> Option<EncoderControlSender> {
+    ) -> Option<(EncoderControlSender, UnboundedReceiver<EncoderControl>)> {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(sender_diagnostics) = &inner.sender_diagnostics {
-                let (tx, _rx): (
-                    mpsc::UnboundedSender<EncoderControl>,
-                    mpsc::UnboundedReceiver<EncoderControl>,
-                ) = mpsc::unbounded();
+                let (tx, rx) = mpsc::unbounded();
                 let control = EncoderControlSender::new(tx.clone());
 
                 // Set up the encoder callback to forward diagnostic packets to the encoder
                 sender_diagnostics.add_encoder_callback(Callback::from(
-                    move |packet: DiagnosticsPacket| match media_type {
-                        MediaType::VIDEO => {
-                            if let Some(metrics) = packet.video_metrics.as_ref() {
-                                let _ = tx.unbounded_send(EncoderControl::UpdateBitrate {
-                                    media_type: MediaType::VIDEO,
-                                    target_bitrate_kbps: metrics.bitrate_kbps,
-                                });
+                    move |packet: DiagnosticsPacket| {
+                        match media_type {
+                            MediaType::VIDEO => {
+                                if let Some(metrics) = packet.video_metrics.as_ref() {
+                                    info!("📹 Video metrics received in client - Bitrate: {} kbps", 
+                                        metrics.bitrate_kbps);
+                                    let _ = tx.unbounded_send(EncoderControl::UpdateBitrate {
+                                        media_type: MediaType::VIDEO,
+                                        target_bitrate_kbps: metrics.bitrate_kbps,
+                                    });
+                                }
                             }
-                        }
-                        MediaType::AUDIO => {
-                            if let Some(metrics) = packet.audio_metrics.as_ref() {
-                                let _ = tx.unbounded_send(EncoderControl::UpdateBitrate {
-                                    media_type: MediaType::AUDIO,
-                                    target_bitrate_kbps: metrics.bitrate_kbps,
-                                });
+                            MediaType::AUDIO => {
+                                if let Some(metrics) = packet.audio_metrics.as_ref() {
+                                    info!("🎤 Audio metrics received - Current bitrate: {} kbps, Target bitrate: {} kbps", 
+                                        metrics.bitrate_kbps, metrics.bitrate_kbps);
+                                    let _ = tx.unbounded_send(EncoderControl::UpdateBitrate {
+                                        media_type: MediaType::AUDIO,
+                                        target_bitrate_kbps: metrics.bitrate_kbps,
+                                    });
+                                }
                             }
-                        }
-                        MediaType::SCREEN => {
-                            if let Some(metrics) = packet.video_metrics.as_ref() {
-                                let _ = tx.unbounded_send(EncoderControl::UpdateBitrate {
-                                    media_type: MediaType::SCREEN,
-                                    target_bitrate_kbps: metrics.bitrate_kbps,
-                                });
+                            MediaType::SCREEN => {
+                                if let Some(metrics) = packet.video_metrics.as_ref() {
+                                    info!("🖥️ Screen metrics received - Current bitrate: {} kbps, Target bitrate: {} kbps", 
+                                        metrics.bitrate_kbps, metrics.bitrate_kbps);
+                                    let _ = tx.unbounded_send(EncoderControl::UpdateBitrate {
+                                        media_type: MediaType::SCREEN,
+                                        target_bitrate_kbps: metrics.bitrate_kbps,
+                                    });
+                                }
                             }
-                        }
-                        _ => {
-                            error!("Unsupported media type: {}", media_type);
+                            _ => {
+                                error!("❌ Unsupported media type: {}", media_type);
+                            }
                         }
                     },
                 ));
-                return Some(control);
+                return Some((control, rx));
             }
         }
         None

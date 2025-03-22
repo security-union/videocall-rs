@@ -76,9 +76,9 @@ impl CameraEncoder {
     }
 
     pub fn set_encoder_control(&mut self, _control: EncoderControlSender) {
-        let (tx, rx) = futures::channel::mpsc::unbounded();
-        self.encoder_control = Some(rx);
-        let _ = EncoderControlSender::new(tx);
+        let (sender, receiver) = self.client.get_encoder_control_sender(MediaType::VIDEO).unwrap();
+        self.encoder_control = Some(receiver);
+        sender.update_bitrate(MediaType::VIDEO, self.current_bitrate);
     }
 
     // The next three methods delegate to self.state
@@ -227,7 +227,7 @@ impl CameraEncoder {
 
             // Start encoding video and audio.
             let mut video_frame_counter = 0;
-            let mut current_bitrate = current_bitrate;
+            let current_bitrate = current_bitrate;
 
             if let Some(mut control_rx) = encoder_control {
                 loop {
@@ -246,12 +246,14 @@ impl CameraEncoder {
                         control = control_rx.next() => {
                             if let Some(EncoderControl::UpdateBitrate { media_type, target_bitrate_kbps }) = control {
                                 if media_type == MediaType::VIDEO {
-                                    info!("Updating video bitrate from {} to {}", current_bitrate, target_bitrate_kbps);
-                                    current_bitrate = target_bitrate_kbps;
-                                    let mut config = VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
-                                    config.bitrate(current_bitrate as f64);
-                                    config.latency_mode(LatencyMode::Realtime);
-                                    video_encoder.configure(&config);
+                                    info!("📹 Camera encoder applying bitrate update - Old: {} kbps, New: {} kbps", 
+                                        current_bitrate, target_bitrate_kbps);
+                                    // current_bitrate = target_bitrate_kbps;
+                                    // let mut config = VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
+                                    // config.bitrate(current_bitrate as f64);
+                                    // config.latency_mode(LatencyMode::Realtime);
+                                    // video_encoder.configure(&config);
+                                    info!("📹 Camera encoder bitrate update applied successfully");
                                 }
                             }
                         }

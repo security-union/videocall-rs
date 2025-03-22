@@ -54,8 +54,10 @@ impl Component for Host {
         let mut microphone = MicrophoneEncoder::new(client.clone());
         let screen = ScreenEncoder::new(client.clone());
 
-        camera.set_encoder_control(client.get_encoder_control_sender(MediaType::VIDEO).unwrap());
-        microphone.set_encoder_control(client.get_encoder_control_sender(MediaType::AUDIO).unwrap());
+        let (video_control, _) = client.get_encoder_control_sender(MediaType::VIDEO).unwrap();
+        let (audio_control, _) = client.get_encoder_control_sender(MediaType::AUDIO).unwrap();
+        camera.set_encoder_control(video_control);
+        microphone.set_encoder_control(audio_control);
         // TODO: Add screen encoder control
         // screen.set_encoder_control(client.get_encoder_control_sender(MediaType::SCREEN).unwrap());
 

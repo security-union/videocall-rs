@@ -65,9 +65,9 @@ impl MicrophoneEncoder {
     }
 
     pub fn set_encoder_control(&mut self, _control: EncoderControlSender) {
-        let (tx, rx) = futures::channel::mpsc::unbounded();
-        self.encoder_control = Some(rx);
-        let _ = EncoderControlSender::new(tx);
+        let (sender, receiver) = self.client.get_encoder_control_sender(MediaType::AUDIO).unwrap();
+        self.encoder_control = Some(receiver);
+        sender.update_bitrate(MediaType::AUDIO, self.current_bitrate);
     }
 
     // The next three methods delegate to self.state
@@ -214,13 +214,15 @@ impl MicrophoneEncoder {
                         control = control_rx.next() => {
                             if let Some(EncoderControl::UpdateBitrate { media_type, target_bitrate_kbps }) = control {
                                 if media_type == MediaType::AUDIO {
-                                    info!("Updating audio bitrate from {} to {}", current_bitrate, target_bitrate_kbps);
+                                    info!("🎤 Microphone encoder applying bitrate update - Old: {} kbps, New: {} kbps", 
+                                        current_bitrate, target_bitrate_kbps);
                                     current_bitrate = target_bitrate_kbps;
-                                    let mut config = AudioEncoderConfig::new(AUDIO_CODEC);
-                                    config.bitrate(current_bitrate as f64);
-                                    config.number_of_channels(AUDIO_CHANNELS);
-                                    config.sample_rate(AUDIO_SAMPLE_RATE);
-                                    audio_encoder.configure(&config);
+                                    // let mut config = AudioEncoderConfig::new(AUDIO_CODEC);
+                                    // config.bitrate(current_bitrate as f64);
+                                    // config.number_of_channels(AUDIO_CHANNELS);
+                                    // config.sample_rate(AUDIO_SAMPLE_RATE);
+                                    // audio_encoder.configure(&config);
+                                    info!("🎤 Microphone encoder bitrate update applied successfully");
                                 }
                             }
                         }

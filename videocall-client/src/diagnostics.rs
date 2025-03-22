@@ -164,7 +164,7 @@ impl Drop for JsTimer {
     fn drop(&mut self) {
         // This ensures the interval is cleared when the timer is dropped
         if let Some(window) = window() {
-            console::log_1(&"Cleaning up diagnostics heartbeat interval".into());
+            log::info!("Cleaning up diagnostics heartbeat interval");
             window.clear_interval_with_handle(self.interval_id);
         }
     }
@@ -547,7 +547,7 @@ pub enum SenderDiagnosticEvent {
     SetStatsCallback(Callback<String>),
     SetReportingInterval(u64),
     HeartbeatTick,
-    SetEncoderCallback(Callback<DiagnosticsPacket>),
+    AddEncoderCallback(Callback<DiagnosticsPacket>),
 }
 
 // Structure to track stats for a media stream we're sending
@@ -606,7 +606,7 @@ pub struct SenderDiagnosticManager {
 struct SenderDiagnosticWorker {
     stream_stats: HashMap<String, HashMap<MediaType, StreamStats>>, // peer_id -> media_type -> stats
     on_stats_update: Option<Callback<String>>,
-    encoder_callback: Option<Callback<DiagnosticsPacket>>,
+    encoder_callbacks: Vec<Callback<DiagnosticsPacket>>,
     last_report_time: f64,
     report_interval_ms: u64,
     receiver: Receiver<SenderDiagnosticEvent>,
@@ -620,7 +620,7 @@ impl SenderDiagnosticManager {
         let worker = SenderDiagnosticWorker {
             stream_stats: HashMap::new(),
             on_stats_update: None,
-            encoder_callback: None,
+            encoder_callbacks: Vec::new(),
             last_report_time: Date::now(),
             report_interval_ms: 500,
             receiver,
@@ -649,7 +649,7 @@ impl SenderDiagnosticManager {
                 .clone()
                 .try_send(SenderDiagnosticEvent::HeartbeatTick)
             {
-                console::log_1(&format!("Failed to send sender heartbeat: {:?}", e).into());
+                log::info!("Failed to send sender heartbeat: {:?}", e);
             }
         }) as Box<dyn FnMut()>);
 
@@ -677,11 +677,11 @@ impl SenderDiagnosticManager {
         }
     }
 
-    pub fn set_encoder_callback(&self, callback: Callback<DiagnosticsPacket>) {
+    pub fn add_encoder_callback(&self, callback: Callback<DiagnosticsPacket>) {
         if let Err(e) = self
             .sender
             .clone()
-            .try_send(SenderDiagnosticEvent::SetEncoderCallback(callback))
+            .try_send(SenderDiagnosticEvent::AddEncoderCallback(callback))
         {
             error!("Failed to set encoder callback: {e}");
         }
@@ -741,8 +741,8 @@ impl SenderDiagnosticWorker {
                 }
 
                 // Forward to encoder for potential bitrate adjustments
-                if let Some(callback) = &self.encoder_callback {
-                    callback.emit(packet);
+                for callback in &self.encoder_callbacks {
+                    callback.emit(packet.clone());
                 }
             }
             SenderDiagnosticEvent::SetStatsCallback(callback) => {
@@ -754,8 +754,9 @@ impl SenderDiagnosticWorker {
             SenderDiagnosticEvent::HeartbeatTick => {
                 self.maybe_report_stats_to_ui();
             }
-            SenderDiagnosticEvent::SetEncoderCallback(callback) => {
-                self.encoder_callback = Some(callback);
+            SenderDiagnosticEvent::AddEncoderCallback(callback) => {
+                // Add the callback to the list of callbacks
+                self.encoder_callbacks.push(callback);
             }
         }
     }

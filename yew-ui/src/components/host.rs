@@ -1,7 +1,7 @@
 use gloo_timers::callback::Timeout;
 use log::debug;
 use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
-
+use videocall_types::protos::media_packet::media_packet::MediaType;   
 use std::fmt::Debug;
 use yew::prelude::*;
 
@@ -49,11 +49,20 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let client = &ctx.props().client;
+        let client = ctx.props().client.clone();
+        let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID);
+        let mut microphone = MicrophoneEncoder::new(client.clone());
+        let screen = ScreenEncoder::new(client.clone());
+
+        camera.set_encoder_control(client.get_encoder_control_sender(MediaType::VIDEO).unwrap());
+        microphone.set_encoder_control(client.get_encoder_control_sender(MediaType::AUDIO).unwrap());
+        // TODO: Add screen encoder control
+        // screen.set_encoder_control(client.get_encoder_control_sender(MediaType::SCREEN).unwrap());
+
         Self {
-            camera: CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID),
-            microphone: MicrophoneEncoder::new(client.clone()),
-            screen: ScreenEncoder::new(client.clone()),
+            camera,
+            microphone,
+            screen,
             share_screen: ctx.props().share_screen,
             mic_enabled: ctx.props().mic_enabled,
             video_enabled: ctx.props().video_enabled,

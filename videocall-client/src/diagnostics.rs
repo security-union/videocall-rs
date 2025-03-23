@@ -861,9 +861,9 @@ impl EncoderControlSender {
         let (sender, receiver) = mpsc::unbounded();
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         let controller_config = pidgeon::ControllerConfig::default()
-        .with_kp(5.0)
+        .with_kp(2.0)
         .with_ki(2.0)
-        .with_kd(1.0)
+        .with_kd(0.0)
         .with_setpoint(ideal_bitrate_kbps as f64)
         .with_output_limits(ideal_bitrate_kbps as f64 * 0.2, ideal_bitrate_kbps as f64 * 1.2);
         wasm_bindgen_futures::spawn_local(async move {
@@ -876,6 +876,10 @@ impl EncoderControlSender {
                 time_since_last = time_now;
                 let diagnostics_bitrate = event.video_metrics.unwrap().bitrate_kbps as f64 * 1000.0;
                 let output_wasted = pid.compute(diagnostics_bitrate, dt);
+                if output_wasted < 100.0 {
+                    log::error!("Output wasted is too low: {}", output_wasted);
+                    continue;
+                }
                 log::info!("ideal_bitrate_kbps: {}, diagnostics bitrate: {}, output wasted: {}", ideal_bitrate_kbps, diagnostics_bitrate, output_wasted);
                 if let Err(e) = sender.unbounded_send(EncoderControl::UpdateBitrate {
                     target_bitrate_kbps: output_wasted as u32,

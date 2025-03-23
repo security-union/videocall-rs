@@ -2,11 +2,9 @@ use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
-use crate::diagnostics::{
-    DiagnosticManager, EncoderControl, EncoderControlSender, SenderDiagnosticManager,
-};
+use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use anyhow::{anyhow, Result};
-use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::UnboundedSender;
 use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};

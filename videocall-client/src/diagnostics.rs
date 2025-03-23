@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use futures::channel::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{self, Receiver, Sender, UnboundedSender};
 use futures::StreamExt;
 use js_sys::Date;
 use log::{debug, error};
@@ -945,7 +945,7 @@ impl EncoderControlSender {
 
         // Skip processing if time delta is too small or too large
         // This avoids instability from rapid updates or stale data
-        if dt < 50.0 || dt > 5000.0 {
+        if !(50.0..=5000.0).contains(&dt) {
             log::info!("Skipping update - time delta ({} ms) out of range", dt);
             return Some(500_000.0); // Return default bitrate
         }
@@ -1000,10 +1000,7 @@ impl EncoderControlSender {
         );
 
         // Ensure we have a reasonable bitrate (between 100kbps and 2Mbps)
-        if corrected_bitrate < 100_000.0
-            || corrected_bitrate > 2_000_000.0
-            || corrected_bitrate.is_nan()
-        {
+        if !(100_000.0..=2_000_000.0).contains(&corrected_bitrate) || corrected_bitrate.is_nan() {
             log::warn!("Bitrate out of bounds or NaN: {}", corrected_bitrate);
             // Return a safe default value instead of None to maintain stability
             return Some(f64::max(100_000.0, f64::min(base_bitrate, 2_000_000.0)));
@@ -1017,7 +1014,7 @@ impl EncoderControlSender {
 mod tests {
     use super::*;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::AtomicU32;
     use videocall_types::protos::diagnostics_packet::{DiagnosticsPacket, VideoMetrics};
     use wasm_bindgen_test::*;
 

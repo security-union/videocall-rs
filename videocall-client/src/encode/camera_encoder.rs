@@ -87,6 +87,8 @@ impl CameraEncoder {
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
+                    // transform kbits to bits
+                    let bitrate = bitrate * 1000.0;
                     current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                 }
             }
@@ -274,9 +276,12 @@ impl CameraEncoder {
                     return;
                 }
 
-                // Update the bitrate if it has changed
+                // Update the bitrate if it has changed more than 10%
                 let new_current_bitrate = current_bitrate.load(Ordering::Relaxed);
-                if new_current_bitrate != local_bitrate {
+                if new_current_bitrate != local_bitrate
+                    && (new_current_bitrate as f64) / (local_bitrate as f64) > 0.9
+                    && (new_current_bitrate as f64) / (local_bitrate as f64) < 1.1
+                {
                     log::info!("Updating video bitrate to {}", new_current_bitrate);
                     local_bitrate = new_current_bitrate;
                     video_encoder_config.bitrate(local_bitrate as f64);

@@ -924,7 +924,7 @@ impl EncoderControlSender {
 
         let target_fps = self._current_fps.load(Ordering::Relaxed) as f64;
         if target_fps <= 0.0 {
-            return Some(500_000.0); // Default bitrate if target FPS is invalid
+            return Some(self._ideal_bitrate_kbps as f64); // Default bitrate in bps if target FPS is invalid
         }
 
         // Add current FPS to history
@@ -945,9 +945,9 @@ impl EncoderControlSender {
 
         // Skip processing if time delta is too small or too large
         // This avoids instability from rapid updates or stale data
-        if !(50.0..=5000.0).contains(&dt) {
+        if !(50.0..=1000.0).contains(&dt) {
             log::info!("Skipping update - time delta ({} ms) out of range", dt);
-            return Some(500_000.0); // Return default bitrate
+            return Some(self._ideal_bitrate_kbps as f64); // Return default bitrate in bps
         }
 
         // Compute the error: difference between target and actual FPS
@@ -960,12 +960,11 @@ impl EncoderControlSender {
             } else {
                 // During initialization, just track the error but don't react strongly
                 self.last_error = current_error;
-                return Some(500_000.0); // Return default bitrate during initialization
+                return Some(self._ideal_bitrate_kbps as f64); // Return default bitrate in bps during initialization
             }
         }
 
         // Calculate rate of change of error for smoother response
-        let error_derivative = (current_error - self.last_error) / dt * 1000.0;
         self.last_error = current_error;
 
         // Use PID controller to compute adjustment based on FPS error
@@ -975,8 +974,8 @@ impl EncoderControlSender {
         let normalized_jitter = jitter / target_fps;
         let jitter_factor = (normalized_jitter * 5.0).min(1.0);
 
-        // Base bitrate calculation
-        let base_bitrate = 500_000.0;
+        // Base bitrate calculation (convert from kbps to bps)
+        let base_bitrate = self._ideal_bitrate_kbps as f64;
 
         // Adjust bitrate based on PID output
         // Scale factor is lower (3,000) for more gradual adjustments
@@ -991,19 +990,28 @@ impl EncoderControlSender {
         // Calculate final bitrate
         let corrected_bitrate = after_pid - jitter_reduction;
 
+        // Calculate min and max bitrate limits based on ideal bitrate (in bps)
+        let min_bitrate = (self._ideal_bitrate_kbps as f64) * 0.1; // 10% of ideal
+        let max_bitrate = (self._ideal_bitrate_kbps as f64) * 1.5; // 150% of ideal
+
         // Log detailed diagnostic information
         log::info!(
-            "FPS: target={:.1} received={:.1} error={:.1} | PID output={:.2} | Jitter={:.2} factor={:.2} | Bitrate: base={} pid_adj={:.0} jitter_adj={:.0} final={:.0}", 
+            "FPS: target={:.1} received={:.1} error={:.1} | PID output={:.2} | Jitter={:.2} factor={:.2} | Bitrate: base={:.0} bps pid_adj={:.0} jitter_adj={:.0} final={:.0} bps", 
             target_fps, fps_received, current_error,
             fps_error_output, jitter, jitter_factor,
             base_bitrate, fps_adjustment, jitter_reduction, corrected_bitrate
         );
 
-        // Ensure we have a reasonable bitrate (between 100kbps and 2Mbps)
-        if !(100_000.0..=2_000_000.0).contains(&corrected_bitrate) || corrected_bitrate.is_nan() {
-            log::warn!("Bitrate out of bounds or NaN: {}", corrected_bitrate);
+        // Ensure we have a reasonable bitrate (between min_bitrate and max_bitrate)
+        if !(min_bitrate..=max_bitrate).contains(&corrected_bitrate) || corrected_bitrate.is_nan() {
+            log::warn!(
+                "Bitrate out of bounds or NaN: {:.0} kbps (min: {:.0} kbps, max: {:.0} kbps)",
+                corrected_bitrate,
+                min_bitrate,
+                max_bitrate
+            );
             // Return a safe default value instead of None to maintain stability
-            return Some(f64::max(100_000.0, f64::min(base_bitrate, 2_000_000.0)));
+            return Some(f64::max(min_bitrate, f64::min(base_bitrate, max_bitrate)));
         }
 
         Some(corrected_bitrate)
@@ -1048,7 +1056,9 @@ mod tests {
     fn test_happy_path() {
         // Setup
         let target_fps = Rc::new(AtomicU32::new(30));
-        let mut controller = EncoderControlSender::new(500_000, target_fps.clone());
+        // Use 500 kbps as the ideal bitrate
+        let ideal_bitrate_kbps = 500;
+        let mut controller = EncoderControlSender::new(ideal_bitrate_kbps, target_fps.clone());
 
         // Generate a series of packets with perfect conditions
         // FPS matches the target exactly, no jitter
@@ -1059,10 +1069,11 @@ mod tests {
             // With perfect conditions (no error, no jitter),
             // the bitrate should stay close to the ideal
             if let Some(bitrate) = result {
-                // Should be close to base bitrate (500,000)
+                // Should be close to base bitrate (in kbps)
                 assert!(
-                    (bitrate - 500_000.0).abs() < 10_000.0,
-                    "Expected bitrate close to base (500,000), got {}",
+                    (bitrate - (ideal_bitrate_kbps) as f64).abs() < 10.0,
+                    "Expected bitrate close to base ({} kbps), got {} kbps",
+                    ideal_bitrate_kbps,
                     bitrate
                 );
             }
@@ -1085,7 +1096,9 @@ mod tests {
     fn test_bandwidth_drop() {
         // Setup with a target of 30 FPS
         let target_fps = Rc::new(AtomicU32::new(30));
-        let mut controller = EncoderControlSender::new(500_000, target_fps.clone());
+        // Use 500 kbps as the ideal bitrate
+        let ideal_bitrate_kbps = 500;
+        let mut controller = EncoderControlSender::new(ideal_bitrate_kbps, target_fps.clone());
 
         // First get a baseline with perfect conditions
         let good_packet = create_test_packet(30.0, 500); // Perfect FPS
@@ -1117,6 +1130,22 @@ mod tests {
             "Expected bitrate to decrease when FPS drops. Good: {}, Poor: {}",
             good_bitrate,
             poor_bitrate
+        );
+
+        // Verify that the bitrate is within the expected bounds (min and max)
+        let min_bitrate = (ideal_bitrate_kbps) as f64 * 0.1; // 10% of ideal
+        let max_bitrate = (ideal_bitrate_kbps) as f64 * 1.5; // 150% of ideal
+        assert!(
+            poor_bitrate >= min_bitrate,
+            "Poor bitrate {} bps should be greater than or equal to minimum bitrate {} bps",
+            poor_bitrate,
+            min_bitrate
+        );
+        assert!(
+            poor_bitrate <= max_bitrate,
+            "Poor bitrate {} bps should be less than or equal to maximum bitrate {} bps",
+            poor_bitrate,
+            max_bitrate
         );
     }
 }

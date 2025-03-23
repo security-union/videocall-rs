@@ -27,6 +27,7 @@ urlencoding = "2.1.2"
 getrandom = { version = "0.2.10", features = ["js"] }
 wasm-bindgen-futures = "0.4.30"
 enum-display = "0.1.4"
+futures = "0.3.31"
 
 [dependencies.web-sys]
 version = "0.3.60"

@@ -1,8 +1,8 @@
 use crate::constants::*;
+use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
 use std::fmt::Debug;
-use videocall_client::diagnostics::EncoderControlSender;
 use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
@@ -30,9 +30,6 @@ pub struct Host {
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
-    video_encoder_control: EncoderControlSender,
-    audio_encoder_control: EncoderControlSender,
-    screen_encoder_control: EncoderControlSender,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -59,20 +56,17 @@ impl Component for Host {
         let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
         let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
 
-        let (video_encoder_control, video_encoder_receiver) = client
-            .get_encoder_control_sender(MediaType::VIDEO, VIDEO_BITRATE_KBPS)
-            .expect("Failed to get video encoder control");
-        let (audio_encoder_control, audio_encoder_receiver) = client
-            .get_encoder_control_sender(MediaType::AUDIO, AUDIO_BITRATE_KBPS)
-            .expect("Failed to get audio encoder control");
-        let (screen_encoder_control, screen_encoder_receiver) = client
-            .get_encoder_control_sender(MediaType::SCREEN, SCREEN_BITRATE_KBPS)
-            .expect("Failed to get screen encoder control");
+        let (tx, rx) = mpsc::unbounded();
+        client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
+        camera.set_encoder_control(rx);
 
-        // Connect the receiver of each controller to the encoder
-        camera.set_encoder_control(video_encoder_receiver);
-        microphone.set_encoder_control(audio_encoder_receiver);
-        screen.set_encoder_control(screen_encoder_receiver);
+        // let (tx, rx) = mpsc::unbounded();
+        // client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
+        // microphone.set_encoder_control(rx);
+
+        // let (tx, rx) = mpsc::unbounded();
+        // client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
+        // screen.set_encoder_control(rx);
 
         Self {
             camera,
@@ -81,9 +75,6 @@ impl Component for Host {
             share_screen: ctx.props().share_screen,
             mic_enabled: ctx.props().mic_enabled,
             video_enabled: ctx.props().video_enabled,
-            video_encoder_control,
-            audio_encoder_control,
-            screen_encoder_control,
         }
     }
 

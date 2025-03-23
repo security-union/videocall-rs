@@ -853,76 +853,60 @@ pub enum EncoderControl {
     UpdateQualityPreference { preference: QualityPreference },
 }
 
-#[derive(Debug)]
-pub struct EncoderControlSender {}
+pub struct EncoderControlSender {
+    pid: pidgeon::PidController,
+    last_update: f64,
+    _ideal_bitrate_kbps: Rc<AtomicU32>,
+    _current_fps: Rc<AtomicU32>,
+}
 
 impl EncoderControlSender {
     pub fn new(
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
-        ideal_bitrate_kbps: u32,
-        media_type: MediaType,
-    ) -> (Self, UnboundedReceiver<EncoderControl>) {
-        let (sender, receiver) = mpsc::unbounded();
+        ideal_bitrate_kbps: Rc<AtomicU32>,
+        current_fps: Rc<AtomicU32>,
+    ) -> Self {
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         let controller_config = pidgeon::ControllerConfig::default()
             .with_kp(0.01)
-            .with_ki(0.3)
-            .with_kd(0.5)
-            .with_setpoint(ideal_bitrate_kbps as f64)
+            .with_ki(0.03)
+            .with_kd(0.05)
+            .with_setpoint(current_fps.load(Ordering::Relaxed) as f64)
             .with_output_limits(
-                ideal_bitrate_kbps as f64 * 0.2,
-                ideal_bitrate_kbps as f64 * 1.2,
+                current_fps.load(Ordering::Relaxed) as f64 * 0.2,
+                current_fps.load(Ordering::Relaxed) as f64 * 1.2,
             );
-        wasm_bindgen_futures::spawn_local(async move {
-            let mut pid = pidgeon::PidController::new(controller_config);
-            let mut time_since_last = Date::now();
-            while let Some(event) = diagnostics_receiver.next().await {
-                log::debug!("Encoder control event: {:?}", event);
-                let time_now = Date::now();
-                let dt = time_now - time_since_last;
-                time_since_last = time_now;
-                let diagnostics_bitrate = event.video_metrics.unwrap().bitrate_kbps as f64 * 1000.0;
-                let output_wasted = pid.compute(diagnostics_bitrate, dt);
-                if output_wasted < 100.0 {
-                    log::error!("Output wasted is too low: {}", output_wasted);
-                    continue;
-                }
-                log::info!(
-                    "ideal_bitrate_kbps: {}, diagnostics bitrate: {}, output wasted: {}",
-                    ideal_bitrate_kbps,
-                    diagnostics_bitrate,
-                    output_wasted
-                );
-                if let Err(e) = sender.unbounded_send(EncoderControl::UpdateBitrate {
-                    target_bitrate_kbps: output_wasted as u32,
-                }) {
-                    error!("Failed to send bitrate update: {}", e);
-                }
-            }
-        });
-
-        (Self {}, receiver)
+        let pid = pidgeon::PidController::new(controller_config);
+        Self { pid, last_update: Date::now(), _ideal_bitrate_kbps: ideal_bitrate_kbps, _current_fps: current_fps }
     }
 
-    pub fn update_bitrate(&self, media_type: MediaType, target_bitrate_kbps: u32) {
-        // if let Some(sender) = &self.sender {
-        //     if let Err(e) = sender.unbounded_send(EncoderControl::UpdateBitrate {
-        //         media_type,
-        //         target_bitrate_kbps,
-        //     }) {
-        //         error!("Failed to send bitrate update: {}", e);
-        //     }
-        // }
-    }
+    pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
+        // detect if current_fps changed if so, change the setpoint of the pid controller
+        if self.pid.setpoint() != self._current_fps.load(Ordering::Relaxed) as f64 {
+            let _ = self.pid.set_setpoint(self._current_fps.load(Ordering::Relaxed) as f64);
+            let min = self._current_fps.load(Ordering::Relaxed) as f64 * 0.2;
+            let max = self._current_fps.load(Ordering::Relaxed) as f64 * 1.2;
+            self.pid.set_output_limits(min, max);
+            log::info!("new config {} {} {}", self.pid.setpoint(), min, max);
+        }
 
-    pub fn update_quality_preference(&self, media_type: MediaType, preference: QualityPreference) {
-        // if let Some(sender) = &self.sender {
-        //     if let Err(e) = sender.unbounded_send(EncoderControl::UpdateQualityPreference {
-        //         media_type,
-        //         preference,
-        //     }) {
-        //         error!("Failed to send quality preference update: {}", e);
-        //     }
-        // }
+        let fps_received = packet.video_metrics.unwrap().fps_received as f64;
+        let dt = Date::now() - self.last_update;
+        self.last_update = Date::now();
+        // log::info!("FPS received: {}", fps_received);
+        let error = self.pid.compute(fps_received, dt);
+        // log::info!("PID Error: {}", error);
+        // scale error to 0-1
+        let max = self._current_fps.load(Ordering::Relaxed) as f64 * 1.2;
+        let min = self._current_fps.load(Ordering::Relaxed) as f64 * 0.2;
+        let error = (error - min) / (max - min);
+        // log::info!("Error: {}", error);
+
+        // Transform error into a bitrate
+        let corrected_bitrate = error * self._ideal_bitrate_kbps.load(Ordering::Relaxed) as f64;
+        // log::info!("Corrected bitrate: {}", corrected_bitrate);
+        if corrected_bitrate < 100.0 {
+            return None;
+        }
+        Some(corrected_bitrate)
     }
 }

@@ -4,11 +4,10 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
-use log::info;
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -36,11 +35,10 @@ use super::transform::transform_video_chunk;
 use crate::constants::VIDEO_CODEC;
 use crate::constants::VIDEO_HEIGHT;
 use crate::constants::VIDEO_WIDTH;
-use crate::diagnostics::{EncoderControl, EncoderControlSender};
-use videocall_types::protos::media_packet::media_packet::MediaType;
+use crate::diagnostics::EncoderControlSender;
 
 use futures::channel::mpsc::UnboundedReceiver;
-use futures::{select, FutureExt, StreamExt};
+use futures::StreamExt;
 
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
@@ -56,6 +54,7 @@ pub struct CameraEncoder {
     video_elem_id: String,
     state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
+    current_fps: Rc<AtomicU32>,
 }
 
 impl CameraEncoder {
@@ -73,22 +72,28 @@ impl CameraEncoder {
             video_elem_id: video_elem_id.to_string(),
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
+            current_fps: Rc::new(AtomicU32::new(0)),
         }
     }
 
-    pub fn set_encoder_control(&mut self, mut control: UnboundedReceiver<EncoderControl>) {
+    pub fn set_encoder_control(&mut self, mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>) {
         let current_bitrate = self.current_bitrate.clone();
+        let current_fps = self.current_fps.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            while let Some(event) = control.next().await {
-                // info!("Camera encoder control event: {:?}", event);
-                if let EncoderControl::UpdateBitrate {
-                    target_bitrate_kbps,
-                } = event
-                {
-                    current_bitrate.store(target_bitrate_kbps, Ordering::Relaxed);
-                }
+            let mut encoder_control = EncoderControlSender::new(current_bitrate.clone(), current_fps.clone());
+            while let Some(event) = diagnostics_receiver.next().await {
+                let output_wasted = encoder_control.process_diagnostics_packet(event);
+                log::info!("Camera encoder control event: {:?}", output_wasted);
+                // if let Some(output_wasted) = output_wasted {
+                //     current_bitrate.store(output_wasted as u32, Ordering::Relaxed);
+                // }
             }
         });
+    }
+
+    /// Gets the current encoder output frame rate
+    pub fn get_current_fps(&self) -> u32 {
+        self.current_fps.load(Ordering::Relaxed)
     }
 
     // The next three methods delegate to self.state
@@ -138,11 +143,27 @@ impl CameraEncoder {
             ..
         } = self.state.clone();
         let current_bitrate = self.current_bitrate.clone();
+        let current_fps = self.current_fps.clone();
         let video_output_handler = {
             let mut buffer: [u8; 100000] = [0; 100000];
             let mut sequence_number = 0;
+            let mut last_chunk_time = window().performance().unwrap().now();
+            let mut chunks_in_last_second = 0;
+            
             Box::new(move |chunk: JsValue| {
+                let now = window().performance().unwrap().now();
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                
+                // Update FPS calculation
+                chunks_in_last_second += 1;
+                if now - last_chunk_time >= 1000.0 {
+                    let fps = chunks_in_last_second;
+                    current_fps.store(fps, Ordering::Relaxed);
+                    log::info!("Encoder output FPS: {}", fps);
+                    chunks_in_last_second = 0;
+                    last_chunk_time = now;
+                }
+                
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
                     sequence_number,
@@ -195,7 +216,6 @@ impl CameraEncoder {
             );
 
             // Setup video encoder
-
             let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
                 error!("error_handler error {:?}", e);
             }) as Box<dyn FnMut(JsValue)>);
@@ -219,9 +239,9 @@ impl CameraEncoder {
 
             let mut video_encoder_config =
                 VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
-
             video_encoder_config.bitrate(current_bitrate.load(Ordering::Relaxed) as f64);
             video_encoder_config.latency_mode(LatencyMode::Realtime);
+
             video_encoder.configure(&video_encoder_config);
 
             let video_processor =

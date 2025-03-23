@@ -29,8 +29,7 @@ use super::transform::transform_audio_chunk;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::diagnostics::{EncoderControl, EncoderControlSender};
-use videocall_types::protos::media_packet::media_packet::MediaType;
+use crate::diagnostics::EncoderControl;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::{select, FutureExt, StreamExt};

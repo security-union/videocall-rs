@@ -6,7 +6,7 @@ use crate::diagnostics::{
     DiagnosticManager, EncoderControl, EncoderControlSender, SenderDiagnosticManager,
 };
 use anyhow::{anyhow, Result};
-use futures::channel::mpsc::{self, UnboundedReceiver};
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
@@ -398,26 +398,12 @@ impl VideoCallClient {
         }
     }
 
-    /// Get an encoder control sender that can be used to control encoder bitrates
-    /// The encoder should select the media type based on the media_type parameter.
-    ///
-    /// The EncoderControlSender shall subscribe to sender_diagnostics, and update the bitrate of the encoder
-    /// then send the EncoderControl event to the encoder via a UnboundedSender.
-    pub fn get_encoder_control_sender(
-        &self,
-        media_type: MediaType,
-        bitrate_kbps: u32,
-    ) -> Option<(EncoderControlSender, UnboundedReceiver<EncoderControl>)> {
+    pub fn subscribe_diagnostics(&self, tx: UnboundedSender<DiagnosticsPacket>, media_type: MediaType) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(sender_diagnostics) = &inner.sender_diagnostics {
-                let (tx, rx) = mpsc::unbounded();
-                // Create a proper EncoderControlSender with the receiver
-                let control = EncoderControlSender::new(rx, bitrate_kbps, media_type);
                 sender_diagnostics.add_sender_channel(tx, media_type);
-                return Some(control);
             }
         }
-        None
     }
 }
 

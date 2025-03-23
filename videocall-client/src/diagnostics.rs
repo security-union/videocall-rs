@@ -861,10 +861,7 @@ pub struct EncoderControlSender {
 }
 
 impl EncoderControlSender {
-    pub fn new(
-        ideal_bitrate_kbps: Rc<AtomicU32>,
-        current_fps: Rc<AtomicU32>,
-    ) -> Self {
+    pub fn new(ideal_bitrate_kbps: Rc<AtomicU32>, current_fps: Rc<AtomicU32>) -> Self {
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         let controller_config = pidgeon::ControllerConfig::default()
             .with_kp(0.01)
@@ -876,13 +873,20 @@ impl EncoderControlSender {
                 current_fps.load(Ordering::Relaxed) as f64 * 1.2,
             );
         let pid = pidgeon::PidController::new(controller_config);
-        Self { pid, last_update: Date::now(), _ideal_bitrate_kbps: ideal_bitrate_kbps, _current_fps: current_fps }
+        Self {
+            pid,
+            last_update: Date::now(),
+            _ideal_bitrate_kbps: ideal_bitrate_kbps,
+            _current_fps: current_fps,
+        }
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
         // detect if current_fps changed if so, change the setpoint of the pid controller
         if self.pid.setpoint() != self._current_fps.load(Ordering::Relaxed) as f64 {
-            let _ = self.pid.set_setpoint(self._current_fps.load(Ordering::Relaxed) as f64);
+            let _ = self
+                .pid
+                .set_setpoint(self._current_fps.load(Ordering::Relaxed) as f64);
             let min = self._current_fps.load(Ordering::Relaxed) as f64 * 0.2;
             let max = self._current_fps.load(Ordering::Relaxed) as f64 * 1.2;
             self.pid.set_output_limits(min, max);

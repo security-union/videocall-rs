@@ -1,11 +1,11 @@
 use crate::constants::*;
-use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
 use std::fmt::Debug;
 use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
+use futures::channel::mpsc;
 
 use crate::components::device_selector::DeviceSelector;
 
@@ -50,7 +50,7 @@ impl Component for Host {
     type Message = Msg;
     type Properties = MeetingProps;
 
-    fn create(ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self{
         let client = ctx.props().client.clone();
         let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID, VIDEO_BITRATE_KBPS);
         let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);

@@ -4,10 +4,10 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
@@ -76,17 +76,21 @@ impl CameraEncoder {
         }
     }
 
-    pub fn set_encoder_control(&mut self, mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>) {
+    pub fn set_encoder_control(
+        &mut self,
+        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
+    ) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderControlSender::new(current_bitrate.clone(), current_fps.clone());
+            let mut encoder_control =
+                EncoderControlSender::new(current_bitrate.clone(), current_fps.clone());
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 log::info!("Camera encoder control event: {:?}", output_wasted);
-                // if let Some(output_wasted) = output_wasted {
-                //     current_bitrate.store(output_wasted as u32, Ordering::Relaxed);
-                // }
+                if let Some(output_wasted) = output_wasted {
+                    current_bitrate.store(output_wasted as u32, Ordering::Relaxed);
+                }
             }
         });
     }
@@ -149,11 +153,11 @@ impl CameraEncoder {
             let mut sequence_number = 0;
             let mut last_chunk_time = window().performance().unwrap().now();
             let mut chunks_in_last_second = 0;
-            
+
             Box::new(move |chunk: JsValue| {
                 let now = window().performance().unwrap().now();
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                
+
                 // Update FPS calculation
                 chunks_in_last_second += 1;
                 if now - last_chunk_time >= 1000.0 {
@@ -163,7 +167,7 @@ impl CameraEncoder {
                     chunks_in_last_second = 0;
                     last_chunk_time = now;
                 }
-                
+
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
                     sequence_number,

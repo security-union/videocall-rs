@@ -398,7 +398,11 @@ impl VideoCallClient {
         }
     }
 
-    pub fn subscribe_diagnostics(&self, tx: UnboundedSender<DiagnosticsPacket>, media_type: MediaType) {
+    pub fn subscribe_diagnostics(
+        &self,
+        tx: UnboundedSender<DiagnosticsPacket>,
+        media_type: MediaType,
+    ) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(sender_diagnostics) = &inner.sender_diagnostics {
                 sender_diagnostics.add_sender_channel(tx, media_type);

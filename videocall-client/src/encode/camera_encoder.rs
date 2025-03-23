@@ -4,6 +4,7 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
+use yew::Callback;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -55,6 +56,7 @@ pub struct CameraEncoder {
     state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
+    on_encoder_settings_update: Callback<String>,
 }
 
 impl CameraEncoder {
@@ -66,13 +68,14 @@ impl CameraEncoder {
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
-    pub fn new(client: VideoCallClient, video_elem_id: &str, initial_bitrate: u32) -> Self {
+    pub fn new(client: VideoCallClient, video_elem_id: &str, initial_bitrate: u32, on_encoder_settings_update: Callback<String>) -> Self {
         Self {
             client,
             video_elem_id: video_elem_id.to_string(),
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
             current_fps: Rc::new(AtomicU32::new(0)),
+            on_encoder_settings_update,
         }
     }
 
@@ -82,11 +85,13 @@ impl CameraEncoder {
     ) {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderControlSender::new(500, current_fps.clone());
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
+                    on_encoder_settings_update.emit(format!("Camera bitrate: {:.2} kbps", bitrate));
                     // transform kbits to bits
                     let bitrate = bitrate * 1000.0;
                     current_bitrate.store(bitrate as u32, Ordering::Relaxed);

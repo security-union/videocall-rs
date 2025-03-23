@@ -21,6 +21,9 @@ pub enum Msg {
     DisableVideo,
     AudioDeviceChanged(String),
     VideoDeviceChanged(String),
+    CameraEncoderSettingsUpdated(String),
+    MicrophoneEncoderSettingsUpdated(String),
+    ScreenEncoderSettingsUpdated(String),
 }
 
 pub struct Host {
@@ -44,6 +47,8 @@ pub struct MeetingProps {
     pub mic_enabled: bool,
 
     pub video_enabled: bool,
+
+    pub on_encoder_settings_update: Callback<String>,
 }
 
 impl Component for Host {
@@ -52,7 +57,13 @@ impl Component for Host {
 
     fn create(ctx: &Context<Self>) -> Self{
         let client = ctx.props().client.clone();
-        let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID, VIDEO_BITRATE_KBPS);
+
+        // Create 3 callbacks for the 3 encoders
+        let camera_callback = ctx.link().callback(Msg::CameraEncoderSettingsUpdated);
+        let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
+        let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
+
+        let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID, VIDEO_BITRATE_KBPS, camera_callback);
         let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
         let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
 
@@ -160,6 +171,16 @@ impl Component for Host {
                     timeout.forget();
                 }
                 false
+            }
+            Msg::CameraEncoderSettingsUpdated(settings) => {
+                ctx.props().on_encoder_settings_update.emit(settings);
+                true
+            }
+            Msg::MicrophoneEncoderSettingsUpdated(settings) => {
+                true
+            }
+            Msg::ScreenEncoderSettingsUpdated(settings) => {
+                true
             }
         }
     }

@@ -71,6 +71,9 @@ pub struct VideoCallClientOptions {
 
     /// How often to send diagnostics updates in milliseconds (default: 1000)
     pub diagnostics_update_interval_ms: Option<u64>,
+
+    /// Callback for encoder settings
+    pub on_encoder_settings_update: Option<Callback<String>>,
 }
 
 #[derive(Debug)]

@@ -20,6 +20,7 @@ pub enum WsAction {
     Log(String),
     DiagnosticsUpdated(String),
     SenderStatsUpdated(String),
+    EncoderSettingsUpdated(String),
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -87,6 +88,7 @@ pub struct AttendantsComponent {
     pub error: Option<String>,
     pub diagnostics_data: Option<String>,
     pub sender_stats: Option<String>,
+    pub encoder_settings: Option<String>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -136,6 +138,12 @@ impl AttendantsComponent {
                 })
             }),
             diagnostics_update_interval_ms: Some(1000),
+            on_encoder_settings_update: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |settings| {
+                    link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
+                })
+            }),
         };
         VideoCallClient::new(opts)
     }
@@ -177,6 +185,7 @@ impl Component for AttendantsComponent {
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
+            encoder_settings: None,
         }
     }
 
@@ -247,6 +256,10 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::SenderStatsUpdated(stats) => {
                     self.sender_stats = Some(stats);
+                    true
+                }
+                WsAction::EncoderSettingsUpdated(settings) => {
+                    self.encoder_settings = Some(settings);
                     true
                 }
             },
@@ -325,6 +338,10 @@ impl Component for AttendantsComponent {
             &self.client,
             peers.iter().take(CANVAS_LIMIT).cloned().collect(),
         );
+
+        let on_encoder_settings_update = ctx.link().callback(|settings| {
+            WsAction::EncoderSettingsUpdated(settings)
+        });
 
         html! {
             <div id="main-container" class="meeting-page">
@@ -493,7 +510,7 @@ impl Component for AttendantsComponent {
                                     </div>
                                     {
                                         if media_access_granted {
-                                            html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} />}
+                                            html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} on_encoder_settings_update={on_encoder_settings_update} />}
                                         } else {
                                             html! {<></>}
                                         }
@@ -544,6 +561,14 @@ impl Component for AttendantsComponent {
                                     <pre>{ data }</pre>
                                 } else {
                                     <p>{"No sending data available."}</p>
+                                }
+                            </div>
+                            <div class="diagnostics-section">
+                                <h3>{"Encoder Settings"}</h3>
+                                if let Some(data) = &self.encoder_settings {
+                                    <pre>{ data }</pre>
+                                } else {
+                                    <p>{"No encoder settings available."}</p>
                                 }
                             </div>
                         </div>

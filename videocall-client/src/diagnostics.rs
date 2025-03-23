@@ -858,21 +858,20 @@ pub struct EncoderControlSender {
     last_update: f64,
     _ideal_bitrate_kbps: u32,
     _current_fps: Rc<AtomicU32>,
+    fps_history: std::collections::VecDeque<f64>, // Sliding window of recent FPS values
+    max_history_size: usize,                      // Maximum size of history window
 }
 
 impl EncoderControlSender {
     pub fn new(ideal_bitrate_kbps: u32, current_fps: Rc<AtomicU32>) -> Self {
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         let controller_config = pidgeon::ControllerConfig::default()
-            .with_kp(0.2)     // Reduced proportional gain for slower response
-            .with_ki(0.05)    // Very low integral gain to prevent windup
-            .with_kd(0.03)    // Minimal derivative gain
+            .with_kp(0.4) // Reduced proportional gain for slower response
+            .with_ki(0.05) // Very low integral gain to prevent windup
+            .with_kd(0.01) // Minimal derivative gain
             .with_setpoint(0.0) // We want the difference between target and actual to be zero
             .with_deadband(0.1) // Small deadband to ignore tiny fluctuations
-            .with_output_limits(
-                0.0,
-                100.0,
-            )
+            .with_output_limits(0.0, 100.0)
             .with_anti_windup(true);
         let pid = pidgeon::PidController::new(controller_config);
         Self {
@@ -880,46 +879,263 @@ impl EncoderControlSender {
             last_update: Date::now(),
             _ideal_bitrate_kbps: ideal_bitrate_kbps,
             _current_fps: current_fps,
+            fps_history: std::collections::VecDeque::with_capacity(10),
+            max_history_size: 10, // Store last 10 FPS values (configurable)
         }
+    }
+
+    // Calculate the standard deviation of FPS values to measure jitter
+    fn calculate_jitter(&self) -> f64 {
+        if self.fps_history.len() < 2 {
+            return 0.0; // Not enough samples to calculate jitter
+        }
+
+        // Calculate mean
+        let sum: f64 = self.fps_history.iter().sum();
+        let mean = sum / self.fps_history.len() as f64;
+
+        // Calculate variance
+        let variance: f64 = self
+            .fps_history
+            .iter()
+            .map(|&fps| {
+                let diff = fps - mean;
+                diff * diff
+            })
+            .sum::<f64>()
+            / self.fps_history.len() as f64;
+
+        // Return standard deviation
+        variance.sqrt()
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
         let fps_received = packet.video_metrics.unwrap().fps_received as f64;
         let target_fps = self._current_fps.load(Ordering::Relaxed) as f64;
-        
-        log::info!("FPS received: {}, Target FPS: {}", fps_received, target_fps);
-        
+
+        // Add current FPS to history
+        self.fps_history.push_back(fps_received);
+
+        // Maintain history size limit
+        while self.fps_history.len() > self.max_history_size {
+            self.fps_history.pop_front();
+        }
+
+        // Calculate jitter (FPS standard deviation)
+        let jitter = self.calculate_jitter();
+
+        log::info!(
+            "FPS received: {}, Target FPS: {}, Jitter: {:.2}",
+            fps_received,
+            target_fps,
+            jitter
+        );
+
         // Compute the error: difference between target and actual FPS
         let pid_input = target_fps - fps_received;
-        
+
         let now = Date::now();
         let dt = now - self.last_update;
         self.last_update = now;
-        
-        // Skip updates with very small time deltas to avoid instability
-        if dt < 50.0 {
-            log::info!("Skipping PID update - time delta too small: {}ms", dt);
-            return None;
-        }
-        
-        // Compute PID output
-        let output = self.pid.compute(pid_input, dt);
-        
-        // Base bitrate plus adjustment from PID
-        // Start with a reasonable bitrate and adjust up/down based on PID output
+
+        // Compute PID output based on FPS error
+        let fps_error_output = self.pid.compute(pid_input, dt);
+
+        // Scale jitter to be relative to the expected FPS
+        // This ensures jitter of 1 FPS is more significant at low target FPS
+        let normalized_jitter = if target_fps > 0.0 {
+            jitter / target_fps
+        } else {
+            jitter
+        };
+
+        // Calculate jitter factor (0.0-1.0 range typically)
+        // At 20% jitter (normalized), we apply a significant reduction
+        let jitter_factor = (normalized_jitter * 5.0).min(1.0);
+
+        // Base bitrate calculation from PID controller
         let base_bitrate = 500_000.0;
-        let adjustment = output * 5_000.0; // Scale factor for adjustment
-        let corrected_bitrate = base_bitrate - adjustment;
-        
-        log::info!("PID input: {:0.2}, PID output: {:0.2}, bitrate: {:0.2}", 
-                 pid_input, output, corrected_bitrate);
-        
+        let fps_adjustment = fps_error_output * 5_000.0;
+
+        // Calculate final bitrate using both components:
+        // 1. Apply PID adjustment based on FPS error
+        // 2. Apply percentage-based reduction for jitter
+        let after_pid = base_bitrate - fps_adjustment;
+
+        // Apply up to 30% reduction based on jitter factor
+        let jitter_reduction = after_pid * (jitter_factor * 0.3);
+        let corrected_bitrate = after_pid - jitter_reduction;
+
+        log::info!(
+            "FPS error: {:0.2}, PID output: {:0.2}, Jitter factor: {:0.2}, After PID: {:0.2}, Jitter reduction: {:0.2}, Final bitrate: {:0.2}", 
+            pid_input, fps_error_output, jitter_factor, after_pid, jitter_reduction, corrected_bitrate
+        );
+
         // Ensure we have a reasonable bitrate (between 100kbps and 2Mbps)
-        if corrected_bitrate < 100_000.0 || corrected_bitrate > 2_000_000.0 || corrected_bitrate.is_nan() {
+        if corrected_bitrate < 100_000.0
+            || corrected_bitrate > 2_000_000.0
+            || corrected_bitrate.is_nan()
+        {
             log::warn!("Bitrate out of bounds or NaN: {}", corrected_bitrate);
             return None;
         }
-        
+
         Some(corrected_bitrate)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use videocall_types::protos::diagnostics_packet::{DiagnosticsPacket, VideoMetrics};
+    use wasm_bindgen_test::*;
+
+    // Remove browser-only configuration and make tests run in any environment
+    // wasm_bindgen_test_configure!(run_in_browser);
+
+    // Helper to simulate time passing more reliably
+    fn simulate_time_passing(controller: &mut EncoderControlSender, ms: f64) {
+        let now = js_sys::Date::now();
+        controller.last_update = now - ms;
+    }
+
+    fn create_test_packet(fps: f32, bitrate_kbps: u32) -> DiagnosticsPacket {
+        let mut packet = DiagnosticsPacket::new();
+        packet.sender_id = "test_sender".to_string();
+        packet.target_id = "test_target".to_string();
+        packet.timestamp_ms = js_sys::Date::now() as u64;
+        packet.media_type =
+            videocall_types::protos::diagnostics_packet::diagnostics_packet::MediaType::VIDEO
+                .into();
+
+        let mut video_metrics = VideoMetrics::new();
+        video_metrics.fps_received = fps;
+        video_metrics.bitrate_kbps = bitrate_kbps;
+        packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
+
+        packet
+    }
+
+    #[wasm_bindgen_test]
+    fn test_happy_path() {
+        // Setup
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderControlSender::new(500_000, target_fps.clone());
+
+        // Generate a series of packets with perfect conditions
+        // FPS matches the target exactly, no jitter
+        for _ in 0..10 {
+            let packet = create_test_packet(30.0, 500);
+            let result = controller.process_diagnostics_packet(packet);
+
+            // With perfect conditions (no error, no jitter),
+            // the bitrate should stay close to the ideal
+            if let Some(bitrate) = result {
+                // Should be close to base bitrate (500,000)
+                assert!(
+                    (bitrate - 500_000.0).abs() < 10_000.0,
+                    "Expected bitrate close to base (500,000), got {}",
+                    bitrate
+                );
+            }
+
+            // Simulate time passing for the next packet
+            simulate_time_passing(&mut controller, 100.0); // 100ms ago
+        }
+
+        // Check history shows stable FPS
+        assert_eq!(controller.fps_history.len(), 10);
+        let jitter = controller.calculate_jitter();
+        assert!(
+            jitter < 0.1,
+            "Expected near-zero jitter in happy path, got {}",
+            jitter
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_bandwidth_drop() {
+        // Setup
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderControlSender::new(500_000, target_fps.clone());
+        
+        // Step 1: Start with perfect conditions (happy path)
+        for _ in 0..5 {
+            let packet = create_test_packet(30.0, 500);
+            let _ = controller.process_diagnostics_packet(packet);
+            simulate_time_passing(&mut controller, 100.0); // 100ms ago
+        }
+        
+        // Verify we're at normal bitrate
+        let packet = create_test_packet(30.0, 500);
+        let initial_bitrate = controller.process_diagnostics_packet(packet).unwrap_or(0.0);
+        assert!(initial_bitrate > 450_000.0, "Expected initial bitrate near base value");
+        
+        // Step 2: Simulate bandwidth drop
+        // FPS drops more dramatically and we use longer time intervals
+        let fps_drops = [25.0, 20.0, 15.0, 10.0, 5.0];
+        let mut bitrates = Vec::new();
+        
+        for fps in fps_drops.iter() {
+            // Use a larger time step to allow PID controller to respond more
+            simulate_time_passing(&mut controller, 300.0);
+            
+            // Send the same FPS multiple times to build up more effect
+            for _ in 0..3 {
+                let packet = create_test_packet(*fps, 500);
+                if let Some(bitrate) = controller.process_diagnostics_packet(packet) {
+                    simulate_time_passing(&mut controller, 100.0);
+                    bitrates.push(bitrate);
+                }
+            }
+        }
+        
+        // With our PID tuning, the bitrate might not decrease monotonically
+        // between every pair of measurements, but the overall trend should be down
+        
+        // The last bitrate should be significantly lower than the initial
+        assert!(
+            bitrates.last().unwrap() < &(initial_bitrate * 0.8),
+            "Expected final bitrate ({}) to be at least 20% lower than initial ({})",
+            bitrates.last().unwrap(),
+            initial_bitrate
+        );
+        
+        // Step 3: Add jitter to the mix
+        // Keep average FPS low but add oscillation
+        let jittery_fps = [5.0, 15.0, 5.0, 15.0, 5.0];
+        let mut jittery_bitrates = Vec::new();
+        
+        for fps in jittery_fps.iter() {
+            // Use a larger time step to allow jitter calculation to accumulate
+            simulate_time_passing(&mut controller, 200.0);
+            
+            // Send multiple packets with the same FPS
+            for _ in 0..2 {
+                let packet = create_test_packet(*fps, 500);
+                if let Some(bitrate) = controller.process_diagnostics_packet(packet) {
+                    simulate_time_passing(&mut controller, 100.0);
+                    jittery_bitrates.push(bitrate);
+                }
+            }
+        }
+        
+        // Calculate jitter - should be high
+        let jitter = controller.calculate_jitter();
+        assert!(jitter > 4.0, "Expected high jitter with oscillating FPS, got {}", jitter);
+        
+        // Get the average of the last few bitrates for stable comparison
+        let avg_steady_bitrate = bitrates.iter().rev().take(3).sum::<f64>() / 3.0;
+        let avg_jittery_bitrate = jittery_bitrates.iter().rev().take(3).sum::<f64>() / 3.0;
+        
+        // Final bitrate with jitter should be lower than steady low FPS
+        assert!(
+            avg_jittery_bitrate < avg_steady_bitrate,
+            "Expected average jittery bitrate ({}) to be lower than average steady bitrate ({})",
+            avg_jittery_bitrate,
+            avg_steady_bitrate
+        );
     }
 }

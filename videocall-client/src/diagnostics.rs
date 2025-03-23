@@ -687,7 +687,11 @@ impl SenderDiagnosticManager {
         }
     }
 
-    pub fn add_sender_channel(&self, sender: UnboundedSender<DiagnosticsPacket>, media_type: MediaType) {
+    pub fn add_sender_channel(
+        &self,
+        sender: UnboundedSender<DiagnosticsPacket>,
+        media_type: MediaType,
+    ) {
         if let Err(e) = self
             .sender
             .clone()
@@ -861,11 +865,14 @@ impl EncoderControlSender {
         let (sender, receiver) = mpsc::unbounded();
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         let controller_config = pidgeon::ControllerConfig::default()
-        .with_kp(0.01)
-        .with_ki(0.3)
-        .with_kd(0.5)
-        .with_setpoint(ideal_bitrate_kbps as f64)
-        .with_output_limits(ideal_bitrate_kbps as f64 * 0.2, ideal_bitrate_kbps as f64 * 1.2);
+            .with_kp(0.01)
+            .with_ki(0.3)
+            .with_kd(0.5)
+            .with_setpoint(ideal_bitrate_kbps as f64)
+            .with_output_limits(
+                ideal_bitrate_kbps as f64 * 0.2,
+                ideal_bitrate_kbps as f64 * 1.2,
+            );
         wasm_bindgen_futures::spawn_local(async move {
             let mut pid = pidgeon::PidController::new(controller_config);
             let mut time_since_last = Date::now();
@@ -880,7 +887,12 @@ impl EncoderControlSender {
                     log::error!("Output wasted is too low: {}", output_wasted);
                     continue;
                 }
-                log::info!("ideal_bitrate_kbps: {}, diagnostics bitrate: {}, output wasted: {}", ideal_bitrate_kbps, diagnostics_bitrate, output_wasted);
+                log::info!(
+                    "ideal_bitrate_kbps: {}, diagnostics bitrate: {}, output wasted: {}",
+                    ideal_bitrate_kbps,
+                    diagnostics_bitrate,
+                    output_wasted
+                );
                 if let Err(e) = sender.unbounded_send(EncoderControl::UpdateBitrate {
                     target_bitrate_kbps: output_wasted as u32,
                 }) {

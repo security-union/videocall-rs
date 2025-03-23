@@ -1,11 +1,11 @@
+use crate::constants::*;
 use gloo_timers::callback::Timeout;
 use log::debug;
-use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
-use videocall_types::protos::media_packet::media_packet::MediaType;   
 use std::fmt::Debug;
-use yew::prelude::*;
 use videocall_client::diagnostics::EncoderControlSender;
-use crate::constants::*;
+use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
 
@@ -59,15 +59,21 @@ impl Component for Host {
         let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
         let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
 
-        let (video_encoder_control, video_encoder_receiver) = client.get_encoder_control_sender(MediaType::VIDEO, VIDEO_BITRATE_KBPS).expect("Failed to get video encoder control");
-        let (audio_encoder_control, audio_encoder_receiver) = client.get_encoder_control_sender(MediaType::AUDIO, AUDIO_BITRATE_KBPS).expect("Failed to get audio encoder control");
-        let (screen_encoder_control, screen_encoder_receiver) = client.get_encoder_control_sender(MediaType::SCREEN, SCREEN_BITRATE_KBPS).expect("Failed to get screen encoder control");
+        let (video_encoder_control, video_encoder_receiver) = client
+            .get_encoder_control_sender(MediaType::VIDEO, VIDEO_BITRATE_KBPS)
+            .expect("Failed to get video encoder control");
+        let (audio_encoder_control, audio_encoder_receiver) = client
+            .get_encoder_control_sender(MediaType::AUDIO, AUDIO_BITRATE_KBPS)
+            .expect("Failed to get audio encoder control");
+        let (screen_encoder_control, screen_encoder_receiver) = client
+            .get_encoder_control_sender(MediaType::SCREEN, SCREEN_BITRATE_KBPS)
+            .expect("Failed to get screen encoder control");
 
         // Connect the receiver of each controller to the encoder
         camera.set_encoder_control(video_encoder_receiver);
         microphone.set_encoder_control(audio_encoder_receiver);
         screen.set_encoder_control(screen_encoder_receiver);
-        
+
         Self {
             camera,
             microphone,

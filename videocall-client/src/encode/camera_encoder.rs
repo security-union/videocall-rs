@@ -81,7 +81,10 @@ impl CameraEncoder {
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(event) = control.next().await {
                 // info!("Camera encoder control event: {:?}", event);
-                if let EncoderControl::UpdateBitrate { target_bitrate_kbps } = event {
+                if let EncoderControl::UpdateBitrate {
+                    target_bitrate_kbps,
+                } = event
+                {
                     current_bitrate.store(target_bitrate_kbps, Ordering::Relaxed);
                 }
             }
@@ -234,9 +237,8 @@ impl CameraEncoder {
             // Start encoding video and audio.
             let mut video_frame_counter = 0;
 
-            // Cache the initial bitrate 
+            // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed);
-
 
             loop {
                 if !enabled.load(Ordering::Acquire)

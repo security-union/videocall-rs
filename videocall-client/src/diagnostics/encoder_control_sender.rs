@@ -61,23 +61,18 @@ impl EncoderControlSender {
             return 0.0; // Not enough samples to calculate jitter
         }
 
-        // Calculate mean
-        let sum: f64 = self.fps_history.iter().sum();
-        let mean = sum / self.fps_history.len() as f64;
-
-        // Calculate variance
-        let variance: f64 = self
-            .fps_history
+        // Calculate frame-to-frame differences
+        let differences: Vec<f64> = self.fps_history
             .iter()
-            .map(|&fps| {
-                let diff = fps - mean;
-                diff * diff
-            })
-            .sum::<f64>()
-            / self.fps_history.len() as f64;
+            .zip(self.fps_history.iter().skip(1))
+            .map(|(&a, &b)| (b - a).abs())
+            .collect();
 
-        // Return standard deviation
-        variance.sqrt()
+        // Calculate mean of absolute differences
+        let sum: f64 = differences.iter().sum();
+        let mean_difference = sum / differences.len() as f64;
+
+        mean_difference
     }
 
     pub fn process_diagnostics_packet_with_time(&mut self, packet: DiagnosticsPacket, now: f64) -> Option<f64> {
@@ -110,10 +105,10 @@ impl EncoderControlSender {
 
         // Skip processing if time delta is too small or too large
         // This avoids instability from rapid updates or stale data
-        if !(50.0..=1000.0).contains(&dt) {
-            log::info!("Skipping update - time delta ({} ms) out of range", dt);
-            return Some(self._ideal_bitrate_kbps as f64); // Return default bitrate in bps
-        }
+        // if !(50.0..=1000.0).contains(&dt) {
+        //     log::info!("Skipping update - time delta ({} ms) out of range", dt);
+        //     return Some(self._ideal_bitrate_kbps as f64); // Return default bitrate in bps
+        // }
 
         // Compute the error: difference between target and actual FPS
         let current_error = target_fps - fps_received;
@@ -149,8 +144,8 @@ impl EncoderControlSender {
         // Apply the PID-based adjustment
         let after_pid = base_bitrate - fps_adjustment;
 
-        // Apply jitter penalty (up to 20% reduction for maximum jitter)
-        let jitter_reduction = after_pid * (jitter_factor * 0.2);
+        // Apply jitter penalty (up to 50% reduction for maximum jitter)
+        let jitter_reduction = after_pid * (jitter_factor * 0.9);
 
         // Calculate final bitrate
         let corrected_bitrate = after_pid - jitter_reduction;
@@ -567,6 +562,62 @@ mod tests {
         assert!(
             degradation_min < baseline_mean && recovery_max > degradation_min,
             "Controller should adapt bitrate down during degradation and up during recovery"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_calculate_jitter() {
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let mut controller = EncoderControlSender::new(500, target_fps);
+
+        // Test empty history
+        assert_eq!(controller.calculate_jitter(), 0.0, "Empty history should return 0 jitter");
+
+        // Test single value (should still be 0)
+        controller.fps_history.push_back(30.0);
+        assert_eq!(controller.calculate_jitter(), 0.0, "Single value should return 0 jitter");
+
+        // Test constant values (no jitter)
+        controller.fps_history.push_back(30.0);
+        controller.fps_history.push_back(30.0);
+        assert_eq!(controller.calculate_jitter(), 0.0, "Constant values should have 0 jitter");
+
+        // Test oscillating values
+        controller.fps_history.clear();
+        controller.fps_history.push_back(10.0);
+        controller.fps_history.push_back(20.0);
+        controller.fps_history.push_back(10.0);
+        controller.fps_history.push_back(20.0);
+        
+        // For oscillating [10,20,10,20], we expect:
+        // Differences: |20-10| = 10, |10-20| = 10, |20-10| = 10
+        // Mean difference = (10 + 10 + 10) / 3 = 10
+        let expected_jitter = 10.0;
+        let actual_jitter = controller.calculate_jitter();
+        assert!(
+            (actual_jitter - expected_jitter).abs() < 0.001,
+            "Expected jitter {}, got {}",
+            expected_jitter,
+            actual_jitter
+        );
+
+        // Test gradual change
+        controller.fps_history.clear();
+        controller.fps_history.push_back(10.0);
+        controller.fps_history.push_back(12.0);
+        controller.fps_history.push_back(14.0);
+        controller.fps_history.push_back(16.0);
+        
+        // For gradual change [10,12,14,16], we expect:
+        // Differences: |12-10| = 2, |14-12| = 2, |16-14| = 2
+        // Mean difference = (2 + 2 + 2) / 3 = 2
+        let expected_jitter = 2.0;
+        let actual_jitter = controller.calculate_jitter();
+        assert!(
+            (actual_jitter - expected_jitter).abs() < 0.001,
+            "Expected jitter {}, got {}",
+            expected_jitter,
+            actual_jitter
         );
     }
 }

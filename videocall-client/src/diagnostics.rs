@@ -856,22 +856,24 @@ pub enum EncoderControl {
 pub struct EncoderControlSender {
     pid: pidgeon::PidController,
     last_update: f64,
-    _ideal_bitrate_kbps: Rc<AtomicU32>,
+    _ideal_bitrate_kbps: u32,
     _current_fps: Rc<AtomicU32>,
 }
 
 impl EncoderControlSender {
-    pub fn new(ideal_bitrate_kbps: Rc<AtomicU32>, current_fps: Rc<AtomicU32>) -> Self {
+    pub fn new(ideal_bitrate_kbps: u32, current_fps: Rc<AtomicU32>) -> Self {
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         let controller_config = pidgeon::ControllerConfig::default()
-            .with_kp(0.01)
-            .with_ki(0.03)
-            .with_kd(0.05)
-            .with_setpoint(current_fps.load(Ordering::Relaxed) as f64)
+            .with_kp(0.5)     // Increased proportional gain for faster response
+            .with_ki(0.1)     // Reduced integral gain to prevent windup
+            .with_kd(0.05)    // Small derivative gain to dampen oscillations
+            .with_setpoint(0.0) // We want the difference between target and actual to be zero
+            .with_deadband(0.1) // Small deadband to ignore tiny fluctuations
             .with_output_limits(
-                current_fps.load(Ordering::Relaxed) as f64 * 0.2,
-                current_fps.load(Ordering::Relaxed) as f64 * 1.2,
-            );
+                0.0,
+                100.0,
+            )
+            .with_anti_windup(true);
         let pid = pidgeon::PidController::new(controller_config);
         Self {
             pid,
@@ -882,35 +884,42 @@ impl EncoderControlSender {
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
-        // detect if current_fps changed if so, change the setpoint of the pid controller
-        if self.pid.setpoint() != self._current_fps.load(Ordering::Relaxed) as f64 {
-            let _ = self
-                .pid
-                .set_setpoint(self._current_fps.load(Ordering::Relaxed) as f64);
-            let min = self._current_fps.load(Ordering::Relaxed) as f64 * 0.2;
-            let max = self._current_fps.load(Ordering::Relaxed) as f64 * 1.2;
-            self.pid.set_output_limits(min, max);
-            log::info!("new config {} {} {}", self.pid.setpoint(), min, max);
-        }
-
         let fps_received = packet.video_metrics.unwrap().fps_received as f64;
-        let dt = Date::now() - self.last_update;
-        self.last_update = Date::now();
-        // log::info!("FPS received: {}", fps_received);
-        let error = self.pid.compute(fps_received, dt);
-        // log::info!("PID Error: {}", error);
-        // scale error to 0-1
-        let max = self._current_fps.load(Ordering::Relaxed) as f64 * 1.2;
-        let min = self._current_fps.load(Ordering::Relaxed) as f64 * 0.2;
-        let error = (error - min) / (max - min);
-        // log::info!("Error: {}", error);
-
-        // Transform error into a bitrate
-        let corrected_bitrate = error * self._ideal_bitrate_kbps.load(Ordering::Relaxed) as f64;
-        // log::info!("Corrected bitrate: {}", corrected_bitrate);
-        if corrected_bitrate < 100.0 {
+        let target_fps = self._current_fps.load(Ordering::Relaxed) as f64;
+        
+        log::info!("FPS received: {}, Target FPS: {}", fps_received, target_fps);
+        
+        // Compute the error: difference between target and actual FPS
+        let pid_input = target_fps - fps_received;
+        
+        let now = Date::now();
+        let dt = now - self.last_update;
+        self.last_update = now;
+        
+        // Skip updates with very small time deltas to avoid instability
+        if dt < 50.0 {
+            log::info!("Skipping PID update - time delta too small: {}ms", dt);
             return None;
         }
+        
+        // Compute PID output
+        let output = self.pid.compute(pid_input, dt);
+        
+        // Base bitrate plus adjustment from PID
+        // Start with a reasonable bitrate and adjust up/down based on PID output
+        let base_bitrate = 500_000.0;
+        let adjustment = output * 5_000.0; // Scale factor for adjustment
+        let corrected_bitrate = base_bitrate - adjustment;
+        
+        log::info!("PID input: {:0.2}, PID output: {:0.2}, bitrate: {:0.2}", 
+                 pid_input, output, corrected_bitrate);
+        
+        // Ensure we have a reasonable bitrate (between 100kbps and 2Mbps)
+        if corrected_bitrate < 100_000.0 || corrected_bitrate > 2_000_000.0 || corrected_bitrate.is_nan() {
+            log::warn!("Bitrate out of bounds or NaN: {}", corrected_bitrate);
+            return None;
+        }
+        
         Some(corrected_bitrate)
     }
 }

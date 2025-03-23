@@ -864,9 +864,9 @@ impl EncoderControlSender {
     pub fn new(ideal_bitrate_kbps: u32, current_fps: Rc<AtomicU32>) -> Self {
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         let controller_config = pidgeon::ControllerConfig::default()
-            .with_kp(0.5)     // Increased proportional gain for faster response
-            .with_ki(0.1)     // Reduced integral gain to prevent windup
-            .with_kd(0.05)    // Small derivative gain to dampen oscillations
+            .with_kp(0.2)     // Reduced proportional gain for slower response
+            .with_ki(0.05)    // Very low integral gain to prevent windup
+            .with_kd(0.03)    // Minimal derivative gain
             .with_setpoint(0.0) // We want the difference between target and actual to be zero
             .with_deadband(0.1) // Small deadband to ignore tiny fluctuations
             .with_output_limits(

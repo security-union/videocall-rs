@@ -861,9 +861,9 @@ impl EncoderControlSender {
         let (sender, receiver) = mpsc::unbounded();
         // Receive the diagnostics receiver in wasm_bindgen_futures::spawn_local
         let controller_config = pidgeon::ControllerConfig::default()
-        .with_kp(2.0)
-        .with_ki(2.0)
-        .with_kd(0.0)
+        .with_kp(0.01)
+        .with_ki(0.3)
+        .with_kd(0.5)
         .with_setpoint(ideal_bitrate_kbps as f64)
         .with_output_limits(ideal_bitrate_kbps as f64 * 0.2, ideal_bitrate_kbps as f64 * 1.2);
         wasm_bindgen_futures::spawn_local(async move {

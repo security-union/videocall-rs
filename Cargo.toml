@@ -4,12 +4,12 @@ members = [
     "actix-api",
     "bot",
     "videocall-types",
-    "videocall-client",
+    "videocall-client"
 ]
 exclude = [
     "src-tauri",
-    "videocall-cli",
     "leptos-website",
+    "videocall-cli",
     "yew-ui"
 ]
 

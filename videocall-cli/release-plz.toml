@@ -10,29 +10,10 @@ publish_timeout = "10m"
 git_release_enable = true  # enable release creation on Github/Gitlab
 
 [[package]]
-name = "videocall-client"
+name = "videocall-cli"
 publish = true
 changelog_update = true
 git_release_enable = true
-
-[[package]]
-name = "videocall-types"
-publish = true
-changelog_update = true
-git_release_enable = true
-
-[[package]]
-name = "bot"
-publish = false
-changelog_update = true
-git_release_enable = true
-
-[[package]]
-name = "videocall-api"
-publish = false
-changelog_update = true
-git_release_enable = true
-
 
 [changelog]
 protect_breaking_commits = true

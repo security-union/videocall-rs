@@ -22,8 +22,8 @@ pub enum Msg {
     AudioDeviceChanged(String),
     VideoDeviceChanged(String),
     CameraEncoderSettingsUpdated(String),
-    MicrophoneEncoderSettingsUpdated(String),
-    ScreenEncoderSettingsUpdated(String),
+    // MicrophoneEncoderSettingsUpdated(String),
+    // ScreenEncoderSettingsUpdated(String),
 }
 
 pub struct Host {
@@ -177,12 +177,12 @@ impl Component for Host {
                 ctx.props().on_encoder_settings_update.emit(settings);
                 true
             }
-            Msg::MicrophoneEncoderSettingsUpdated(_settings) => {
-                true
-            }
-            Msg::ScreenEncoderSettingsUpdated(_settings) => {
-                true
-            }
+            // Msg::MicrophoneEncoderSettingsUpdated(_settings) => {
+            //     true
+            // }
+            // Msg::ScreenEncoderSettingsUpdated(_settings) => {
+            //     true
+            // }
         }
     }
 

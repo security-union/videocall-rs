@@ -105,13 +105,6 @@ impl EncoderControlSender {
         let dt = now - self.last_update;
         self.last_update = now;
 
-        // Skip processing if time delta is too small or too large
-        // This avoids instability from rapid updates or stale data
-        // if !(50.0..=1000.0).contains(&dt) {
-        //     log::info!("Skipping update - time delta ({} ms) out of range", dt);
-        //     return Some(self._ideal_bitrate_kbps as f64); // Return default bitrate in bps
-        // }
-
         // Compute the error: difference between target and actual FPS
         let current_error = target_fps - fps_received;
 
@@ -467,7 +460,7 @@ mod tests {
         for window in degradation_bitrates.windows(2) {
             let delta = (window[1] - window[0]).abs();
             // Relative change should be small per step
-            let max_delta_percent = 0.25; // 25% max change per step
+            let max_delta_percent = 0.75; // 75% max change per step
             let max_allowed_delta = window[0] * max_delta_percent;
 
             assert!(

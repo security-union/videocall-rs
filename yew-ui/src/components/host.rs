@@ -1,11 +1,11 @@
 use crate::constants::*;
+use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
 use std::fmt::Debug;
 use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
-use futures::channel::mpsc;
 
 use crate::components::device_selector::DeviceSelector;
 
@@ -55,7 +55,7 @@ impl Component for Host {
     type Message = Msg;
     type Properties = MeetingProps;
 
-    fn create(ctx: &Context<Self>) -> Self{
+    fn create(ctx: &Context<Self>) -> Self {
         let client = ctx.props().client.clone();
 
         // Create 3 callbacks for the 3 encoders
@@ -64,7 +64,12 @@ impl Component for Host {
         // let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
         // let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
 
-        let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID, VIDEO_BITRATE_KBPS, camera_callback);
+        let mut camera = CameraEncoder::new(
+            client.clone(),
+            VIDEO_ELEMENT_ID,
+            VIDEO_BITRATE_KBPS,
+            camera_callback,
+        );
         let microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
         let screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
 
@@ -176,13 +181,12 @@ impl Component for Host {
             Msg::CameraEncoderSettingsUpdated(settings) => {
                 ctx.props().on_encoder_settings_update.emit(settings);
                 true
-            }
-            // Msg::MicrophoneEncoderSettingsUpdated(_settings) => {
-            //     true
-            // }
-            // Msg::ScreenEncoderSettingsUpdated(_settings) => {
-            //     true
-            // }
+            } // Msg::MicrophoneEncoderSettingsUpdated(_settings) => {
+              //     true
+              // }
+              // Msg::ScreenEncoderSettingsUpdated(_settings) => {
+              //     true
+              // }
         }
     }
 

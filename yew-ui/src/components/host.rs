@@ -46,7 +46,12 @@ pub struct EncoderSettings {
 /// Keep in mind that this should contain 1 line per encoder.
 impl ToString for EncoderSettings {
     fn to_string(&self) -> String {
-        format!("Camera: {}\nMic: {}\nScreen: {}", self.camera.clone().unwrap_or("None".to_string()), self.microphone.clone().unwrap_or("None".to_string()), self.screen.clone().unwrap_or("None".to_string()))
+        format!(
+            "Camera: {}\nMic: {}\nScreen: {}",
+            self.camera.clone().unwrap_or("None".to_string()),
+            self.microphone.clone().unwrap_or("None".to_string()),
+            self.screen.clone().unwrap_or("None".to_string())
+        )
     }
 }
 
@@ -84,7 +89,8 @@ impl Component for Host {
             VIDEO_BITRATE_KBPS,
             camera_callback,
         );
-        let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+        let mut microphone =
+            MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
         let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS, screen_callback);
 
         let (tx, rx) = mpsc::unbounded();
@@ -153,7 +159,9 @@ impl Component for Host {
             Msg::DisableScreenShare => {
                 self.screen.stop();
                 self.encoder_settings.screen = None;
-                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
             Msg::Start => true,
@@ -167,7 +175,9 @@ impl Component for Host {
             Msg::DisableMicrophone => {
                 self.microphone.stop();
                 self.encoder_settings.microphone = None;
-                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
             Msg::EnableVideo(should_enable) => {
@@ -180,7 +190,9 @@ impl Component for Host {
             Msg::DisableVideo => {
                 self.camera.stop();
                 self.encoder_settings.camera = None;
-                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
             Msg::AudioDeviceChanged(audio) => {
@@ -206,19 +218,25 @@ impl Component for Host {
             Msg::CameraEncoderSettingsUpdated(settings) => {
                 // update the self.camera settings
                 self.encoder_settings.camera = Some(settings);
-                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
             Msg::MicrophoneEncoderSettingsUpdated(settings) => {
                 // update the self.microphone settings
                 self.encoder_settings.microphone = Some(settings);
-                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
             Msg::ScreenEncoderSettingsUpdated(settings) => {
                 // update the self.screen settings
                 self.encoder_settings.screen = Some(settings);
-                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
         }

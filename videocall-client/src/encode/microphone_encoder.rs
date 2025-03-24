@@ -56,7 +56,11 @@ impl MicrophoneEncoder {
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     /// The encoder is created without a microphone selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
-    pub fn new(client: VideoCallClient, bitrate_kbps: u32, on_encoder_settings_update: Callback<String>) -> Self {
+    pub fn new(
+        client: VideoCallClient,
+        bitrate_kbps: u32,
+        on_encoder_settings_update: Callback<String>,
+    ) -> Self {
         Self {
             client,
             state: EncoderState::new(),

@@ -58,7 +58,7 @@ impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
 }
 
 pub trait PeerDecode {
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()>;
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
 }
 
 ///
@@ -122,7 +122,7 @@ impl VideoPeerDecoder {
 }
 
 impl PeerDecode for VideoPeerDecoder {
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let first_frame = !self.decoded;
         let chunk_type = self.get_chunk_type(packet);
 
@@ -134,8 +134,7 @@ impl PeerDecode for VideoPeerDecoder {
                     self.decoded = true;
                 }
                 CodecState::Closed => {
-                    log::error!("decoder closed");
-                    return Err(());
+                    return Err(anyhow::anyhow!("decoder closed"));
                 }
                 _ => {}
             }
@@ -217,7 +216,7 @@ impl AudioPeerDecoder {
 }
 
 impl PeerDecode for AudioPeerDecoder {
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let first_frame = !self.decoded;
         let chunk_type = self.get_chunk_type(packet);
 
@@ -229,8 +228,7 @@ impl PeerDecode for AudioPeerDecoder {
                     self.decoded = true;
                 }
                 CodecState::Closed => {
-                    log::error!("decoder closed");
-                    return Err(());
+                    return Err(anyhow::anyhow!("decoder closed"));
                 }
                 _ => {}
             }

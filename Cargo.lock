@@ -3018,51 +3018,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sec-api"
-version = "0.1.0"
-dependencies = [
- "actix",
- "actix-cors",
- "actix-http",
- "actix-rt",
- "actix-web",
- "actix-web-actors",
- "anyhow",
- "async-nats",
- "base64 0.13.1",
- "bytes",
- "bytestring",
- "derive_more",
- "futures",
- "http 0.2.11",
- "jsonwebtoken",
- "oauth2",
- "octets",
- "protobuf",
- "quinn",
- "quinn-proto",
- "r2d2",
- "r2d2_postgres",
- "rand",
- "rayon",
- "regex",
- "reqwest",
- "rustls 0.23.12",
- "rustls-native-certs 0.7.1",
- "rustls-pemfile 2.1.2",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tracing-tree",
- "urlencoding",
- "uuid",
- "videocall-types",
- "web-transport-quinn",
-]
-
-[[package]]
 name = "security-framework"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3830,6 +3785,51 @@ name = "version_check"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
+
+[[package]]
+name = "videocall-api"
+version = "0.1.0"
+dependencies = [
+ "actix",
+ "actix-cors",
+ "actix-http",
+ "actix-rt",
+ "actix-web",
+ "actix-web-actors",
+ "anyhow",
+ "async-nats",
+ "base64 0.13.1",
+ "bytes",
+ "bytestring",
+ "derive_more",
+ "futures",
+ "http 0.2.11",
+ "jsonwebtoken",
+ "oauth2",
+ "octets",
+ "protobuf",
+ "quinn",
+ "quinn-proto",
+ "r2d2",
+ "r2d2_postgres",
+ "rand",
+ "rayon",
+ "regex",
+ "reqwest",
+ "rustls 0.23.12",
+ "rustls-native-certs 0.7.1",
+ "rustls-pemfile 2.1.2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-tree",
+ "urlencoding",
+ "uuid",
+ "videocall-types",
+ "web-transport-quinn",
+]
 
 [[package]]
 name = "videocall-client"

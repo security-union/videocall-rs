@@ -87,7 +87,7 @@ impl CameraEncoder {
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderControlSender::new(500, current_fps.clone());
+            let mut encoder_control = EncoderControlSender::new(200, current_fps.clone());
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {

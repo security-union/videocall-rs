@@ -153,7 +153,7 @@ impl EncoderControlSender {
         let max_bitrate = (self._ideal_bitrate_kbps as f64) * 1.5; // 150% of ideal
 
         // Log detailed diagnostic information
-        log::info!(
+        log::debug!(
             "FPS: target={:.1} received={:.1} error={:.1} | PID output={:.2} | Jitter={:.2} factor={:.2} | Bitrate: base={:.0} bps pid_adj={:.0} jitter_adj={:.0} final={:.0} bps", 
             target_fps, fps_received, current_error,
             fps_error_output, jitter, jitter_factor,

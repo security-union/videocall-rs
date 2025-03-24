@@ -7,8 +7,6 @@ on:
       - 'types/**'
       - 'yew-ui/**'
       - 'docker/**'
-      - 'videocall-client/**'
-
 name: check backend
   
 jobs:

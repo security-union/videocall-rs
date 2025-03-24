@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use js_sys::Date;
 
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
+use videocall_types::protos::media_packet::media_packet::MediaType;
 
 /// EncoderControl is responsible for bridging the gap between the encoder and the
 /// diagnostics system.
@@ -76,10 +77,13 @@ impl EncoderControlSender {
         packet: DiagnosticsPacket,
         now: f64,
     ) -> Option<f64> {
+        let media_type = packet.media_type;
+
         // Extract the received FPS from the packet
-        let fps_received = match packet.video_metrics.as_ref() {
-            Some(metrics) => metrics.fps_received as f64,
-            None => return None, // No video metrics available
+        let fps_received = match media_type.enum_value_or_default() {
+            MediaType::VIDEO => packet.video_metrics.as_ref().unwrap().fps_received as f64,
+            MediaType::AUDIO => packet.audio_metrics.as_ref().unwrap().fps_received as f64,
+            _ => return None, // No video metrics available
         };
         let target_fps = self._current_fps.load(Ordering::Relaxed) as f64;
         // Correct fps_received max to be the target fps

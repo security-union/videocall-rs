@@ -93,13 +93,15 @@ impl CameraEncoder {
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderControlSender::new(200, current_fps.clone());
+            let mut encoder_control = EncoderControlSender::new(
+                current_bitrate.load(Ordering::Relaxed),
+                current_fps.clone(),
+            );
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
                     if enabled.load(Ordering::Acquire) {
                         on_encoder_settings_update.emit(format!("Bitrate: {:.2} kbps", bitrate));
-                        let bitrate = bitrate * 1000.0;
                         current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                     } else {
                         on_encoder_settings_update.emit("Disabled".to_string());
@@ -257,7 +259,7 @@ impl CameraEncoder {
 
             let mut video_encoder_config =
                 VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
-            video_encoder_config.bitrate(current_bitrate.load(Ordering::Relaxed) as f64);
+            video_encoder_config.bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
             video_encoder_config.latency_mode(LatencyMode::Realtime);
 
             video_encoder.configure(&video_encoder_config);
@@ -276,7 +278,7 @@ impl CameraEncoder {
             let mut video_frame_counter = 0;
 
             // Cache the initial bitrate
-            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed);
+            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
 
             loop {
                 if !enabled.load(Ordering::Acquire)
@@ -291,7 +293,7 @@ impl CameraEncoder {
                 }
 
                 // Update the bitrate if it has changed more than 10%
-                let new_current_bitrate = current_bitrate.load(Ordering::Relaxed);
+                let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
                 if new_current_bitrate != local_bitrate
                     && (new_current_bitrate as f64) / (local_bitrate as f64) > 0.9
                     && (new_current_bitrate as f64) / (local_bitrate as f64) < 1.1

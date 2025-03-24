@@ -80,7 +80,10 @@ impl ScreenEncoder {
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderControlSender::new(200, current_fps.clone());
+            let mut encoder_control = EncoderControlSender::new(
+                current_bitrate.load(Ordering::Relaxed),
+                current_fps.clone(),
+            );
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
@@ -88,7 +91,6 @@ impl ScreenEncoder {
                         if let Some(callback) = &on_encoder_settings_update {
                             callback.emit(format!("Bitrate: {:.2} kbps", bitrate));
                         }
-                        let bitrate = bitrate * 1000.0;
                         current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                     } else if let Some(callback) = &on_encoder_settings_update {
                         callback.emit("Disabled".to_string());
@@ -175,7 +177,6 @@ impl ScreenEncoder {
                     if now - last_chunk_time >= 1000.0 {
                         let fps = chunks_in_last_second;
                         current_fps.store(fps, Ordering::Relaxed);
-                        info!("Screen encoder output FPS: {}", fps);
                         chunks_in_last_second = 0;
                         last_chunk_time = now;
                     }
@@ -207,7 +208,7 @@ impl ScreenEncoder {
             let screen_encoder = Box::new(VideoEncoder::new(&screen_encoder_init).unwrap());
 
             // Cache the initial bitrate
-            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed);
+            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
             let mut screen_encoder_config =
                 VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
             screen_encoder_config.bitrate(local_bitrate as f64);
@@ -238,7 +239,7 @@ impl ScreenEncoder {
                 }
 
                 // Update the bitrate if it has changed from diagnostics system
-                let new_bitrate = current_bitrate.load(Ordering::Relaxed);
+                let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
                 if new_bitrate != local_bitrate
                     && (new_bitrate as f64) / (local_bitrate as f64) > 0.9
                     && (new_bitrate as f64) / (local_bitrate as f64) < 1.1

@@ -75,11 +75,14 @@ impl MicrophoneEncoder {
     ) {
         let current_bitrate = self.current_bitrate.clone();
         // For audio we'll use a dummy FPS counter - audio doesn't have FPS but the API requires it
-        let dummy_fps = Rc::new(AtomicU32::new(30));
+        let dummy_fps = Rc::new(AtomicU32::new(50));
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderControlSender::new(200, dummy_fps.clone());
+            let mut encoder_control = EncoderControlSender::new(
+                current_bitrate.load(Ordering::Relaxed),
+                dummy_fps.clone(),
+            );
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
@@ -87,7 +90,6 @@ impl MicrophoneEncoder {
                         if let Some(callback) = &on_encoder_settings_update {
                             callback.emit(format!("Bitrate: {:.2} kbps", bitrate));
                         }
-                        let bitrate = bitrate * 1000.0;
                         current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                     } else if let Some(callback) = &on_encoder_settings_update {
                         callback.emit("Disabled".to_string());
@@ -209,7 +211,7 @@ impl MicrophoneEncoder {
             let audio_encoder = Box::new(AudioEncoder::new(&audio_encoder_init).unwrap());
 
             // Cache the initial bitrate
-            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed);
+            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
             let mut audio_encoder_config = AudioEncoderConfig::new(AUDIO_CODEC);
             audio_encoder_config.bitrate(local_bitrate as f64);
             audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE);
@@ -238,7 +240,7 @@ impl MicrophoneEncoder {
                 }
 
                 // Update the bitrate if it has changed from diagnostics system
-                let new_bitrate = current_bitrate.load(Ordering::Relaxed);
+                let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
                 if new_bitrate != local_bitrate
                     && (new_bitrate as f64) / (local_bitrate as f64) > 0.9
                     && (new_bitrate as f64) / (local_bitrate as f64) < 1.1

@@ -22,8 +22,8 @@ pub enum Msg {
     AudioDeviceChanged(String),
     VideoDeviceChanged(String),
     CameraEncoderSettingsUpdated(String),
-    // MicrophoneEncoderSettingsUpdated(String),
-    // ScreenEncoderSettingsUpdated(String),
+    MicrophoneEncoderSettingsUpdated(String),
+    ScreenEncoderSettingsUpdated(String),
 }
 
 pub struct Host {
@@ -75,9 +75,8 @@ impl Component for Host {
 
         // Create 3 callbacks for the 3 encoders
         let camera_callback = ctx.link().callback(Msg::CameraEncoderSettingsUpdated);
-        // TODO: add microphone and screen encoder callbacks to show encoder settings
-        // let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
-        // let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
+        let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
+        let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
 
         let mut camera = CameraEncoder::new(
             client.clone(),
@@ -85,8 +84,8 @@ impl Component for Host {
             VIDEO_BITRATE_KBPS,
             camera_callback,
         );
-        let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
-        let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
+        let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+        let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS, screen_callback);
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
@@ -209,12 +208,19 @@ impl Component for Host {
                 self.encoder_settings.camera = Some(settings);
                 ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
                 true
-            } // Msg::MicrophoneEncoderSettingsUpdated(_settings) => {
-              //     true
-              // }
-              // Msg::ScreenEncoderSettingsUpdated(_settings) => {
-              //     true
-              // }
+            }
+            Msg::MicrophoneEncoderSettingsUpdated(settings) => {
+                // update the self.microphone settings
+                self.encoder_settings.microphone = Some(settings);
+                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
+                true
+            }
+            Msg::ScreenEncoderSettingsUpdated(settings) => {
+                // update the self.screen settings
+                self.encoder_settings.screen = Some(settings);
+                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
+                true
+            }
         }
     }
 

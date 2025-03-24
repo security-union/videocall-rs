@@ -57,13 +57,13 @@ impl ScreenEncoder {
     /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
-    pub fn new(client: VideoCallClient, bitrate_kbps: u32) -> Self {
+    pub fn new(client: VideoCallClient, bitrate_kbps: u32, on_encoder_settings_update: Callback<String>) -> Self {
         Self {
             client,
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(bitrate_kbps)),
             current_fps: Rc::new(AtomicU32::new(0)),
-            on_encoder_settings_update: None,
+            on_encoder_settings_update: Some(on_encoder_settings_update),
         }
     }
 

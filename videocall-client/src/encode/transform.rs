@@ -3,7 +3,7 @@ use crate::crypto::aes::Aes128State;
 use protobuf::Message;
 use std::rc::Rc;
 use videocall_types::protos::{
-    media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
+    media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 use web_sys::{EncodedAudioChunk, EncodedVideoChunk};
@@ -92,7 +92,7 @@ pub fn transform_audio_chunk(
         data: buffer[0..chunk.byte_length() as usize].to_vec(),
         frame_type: EncodedAudioChunkTypeWrapper(chunk.type_()).to_string(),
         timestamp: chunk.timestamp(),
-        video_metadata: Some(VideoMetadata {
+        audio_metadata: Some(AudioMetadata {
             sequence,
             ..Default::default()
         })

@@ -4,7 +4,6 @@ use js_sys::Boolean;
 use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
-use yew::Callback;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -28,6 +27,7 @@ use web_sys::VideoEncoderEncodeOptions;
 use web_sys::VideoEncoderInit;
 use web_sys::VideoFrame;
 use web_sys::VideoTrack;
+use yew::Callback;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
@@ -68,7 +68,12 @@ impl CameraEncoder {
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
-    pub fn new(client: VideoCallClient, video_elem_id: &str, initial_bitrate: u32, on_encoder_settings_update: Callback<String>) -> Self {
+    pub fn new(
+        client: VideoCallClient,
+        video_elem_id: &str,
+        initial_bitrate: u32,
+        on_encoder_settings_update: Callback<String>,
+    ) -> Self {
         Self {
             client,
             video_elem_id: video_elem_id.to_string(),

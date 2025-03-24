@@ -62,7 +62,8 @@ impl EncoderControlSender {
         }
 
         // Calculate frame-to-frame differences
-        let differences: Vec<f64> = self.fps_history
+        let differences: Vec<f64> = self
+            .fps_history
             .iter()
             .zip(self.fps_history.iter().skip(1))
             .map(|(&a, &b)| (b - a).abs())
@@ -75,7 +76,11 @@ impl EncoderControlSender {
         mean_difference
     }
 
-    pub fn process_diagnostics_packet_with_time(&mut self, packet: DiagnosticsPacket, now: f64) -> Option<f64> {
+    pub fn process_diagnostics_packet_with_time(
+        &mut self,
+        packet: DiagnosticsPacket,
+        now: f64,
+    ) -> Option<f64> {
         // Extract the received FPS from the packet
         let fps_received = match packet.video_metrics.as_ref() {
             Some(metrics) => metrics.fps_received as f64,
@@ -319,119 +324,140 @@ mod tests {
         let target_fps = Rc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderControlSender::new(ideal_bitrate_kbps, target_fps.clone());
-        
+
         // Simulation time control
         let start_time = 1000.0;
         let mut current_time = start_time;
         let time_step_ms = 100.0;
-        
+
         // Initialize controller
         controller.last_update = start_time;
-        
+
         // Data collection for trend analysis
         let mut all_bitrates: Vec<f64> = Vec::new();
         let mut all_fps_values: Vec<f32> = Vec::new();
-        
+
         log::info!("=== BASELINE PHASE: Initial stable conditions ===");
-        
+
         // Phase 0: Establish baseline (30 seconds of stable conditions)
         let stable_fps = 30.0;
         let baseline_duration_ms = 30_000.0;
         let baseline_end_time = current_time + baseline_duration_ms;
-        
+
         let mut baseline_bitrates: Vec<f64> = Vec::new();
-        
+
         // Run with stable conditions
         while current_time < baseline_end_time {
             current_time += time_step_ms;
-            
+
             let packet = create_test_packet(stable_fps, 500);
-            let bitrate = controller.process_diagnostics_packet_with_time(packet, current_time).unwrap();
-            
+            let bitrate = controller
+                .process_diagnostics_packet_with_time(packet, current_time)
+                .unwrap();
+
             baseline_bitrates.push(bitrate);
             all_bitrates.push(bitrate);
             all_fps_values.push(stable_fps);
-            
+
             // Log periodically
             if (current_time - start_time) % 5000.0 < time_step_ms {
-                log::info!("Baseline at {:.1}s: FPS={:.1}, Bitrate={:.1}", 
-                    (current_time - start_time) / 1000.0, stable_fps, bitrate);
+                log::info!(
+                    "Baseline at {:.1}s: FPS={:.1}, Bitrate={:.1}",
+                    (current_time - start_time) / 1000.0,
+                    stable_fps,
+                    bitrate
+                );
             }
         }
-        
+
         // Verify baseline is stable
         let baseline_mean = baseline_bitrates.iter().sum::<f64>() / baseline_bitrates.len() as f64;
-        let baseline_variance = baseline_bitrates.iter()
+        let baseline_variance = baseline_bitrates
+            .iter()
             .map(|&x| (x - baseline_mean).powi(2))
-            .sum::<f64>() / baseline_bitrates.len() as f64;
+            .sum::<f64>()
+            / baseline_bitrates.len() as f64;
         let baseline_std_dev = baseline_variance.sqrt();
-        
-        log::info!("Baseline stats: Mean={:.1}, StdDev={:.1} ({:.1}% of mean)", 
-            baseline_mean, baseline_std_dev, (baseline_std_dev / baseline_mean) * 100.0);
-        
+
+        log::info!(
+            "Baseline stats: Mean={:.1}, StdDev={:.1} ({:.1}% of mean)",
+            baseline_mean,
+            baseline_std_dev,
+            (baseline_std_dev / baseline_mean) * 100.0
+        );
+
         // Verify baseline is relatively stable (std dev should be small percentage of mean)
         assert!(
             baseline_std_dev < baseline_mean * 0.05,
             "Expected stable baseline, but std dev ({:.1}) is too high relative to mean ({:.1})",
-            baseline_std_dev, baseline_mean
+            baseline_std_dev,
+            baseline_mean
         );
-        
+
         log::info!("=== DEGRADATION PHASE: Network deterioration ===");
-        
+
         // Phase 1: Network deterioration (60 seconds)
         let degraded_fps = 5.0;
         let degradation_duration_ms = 60_000.0;
         let degradation_end_time = current_time + degradation_duration_ms;
-        
+
         let mut degradation_bitrates: Vec<f64> = Vec::new();
         let mut degradation_bitrate_trend: Vec<f64> = Vec::new();
-        
+
         // Capture initial conditions for comparison
         let initial_degradation_time = current_time;
-        
+
         while current_time < degradation_end_time {
             current_time += time_step_ms;
-            
+
             let packet = create_test_packet(degraded_fps, 500);
-            let bitrate = controller.process_diagnostics_packet_with_time(packet, current_time).unwrap();
-            
+            let bitrate = controller
+                .process_diagnostics_packet_with_time(packet, current_time)
+                .unwrap();
+
             degradation_bitrates.push(bitrate);
             all_bitrates.push(bitrate);
             all_fps_values.push(degraded_fps);
-            
+
             // Sample trend at regular intervals
             if (current_time - initial_degradation_time) % 5000.0 < time_step_ms {
                 degradation_bitrate_trend.push(bitrate);
-                
-                log::info!("Degradation at {:.1}s: FPS={:.1}, Bitrate={:.1}", 
-                    (current_time - start_time) / 1000.0, degraded_fps, bitrate);
+
+                log::info!(
+                    "Degradation at {:.1}s: FPS={:.1}, Bitrate={:.1}",
+                    (current_time - start_time) / 1000.0,
+                    degraded_fps,
+                    bitrate
+                );
             }
         }
-        
+
         // Verify degradation response
         // 1. Direction: Bitrate should trend downward
         // 2. Consistency: Changes should be gradual
-        
+
         let degradation_trend_len = degradation_bitrate_trend.len();
         if degradation_trend_len >= 3 {
             // Analyze the general trend (should be downward)
             let initial_samples_avg = degradation_bitrate_trend
                 .iter()
-                .take(degradation_trend_len/3)
-                .sum::<f64>() / (degradation_trend_len/3) as f64;
-                
+                .take(degradation_trend_len / 3)
+                .sum::<f64>()
+                / (degradation_trend_len / 3) as f64;
+
             let final_samples_avg = degradation_bitrate_trend
                 .iter()
-                .skip(2*degradation_trend_len/3)
-                .sum::<f64>() / (degradation_trend_len - 2*degradation_trend_len/3) as f64;
-            
+                .skip(2 * degradation_trend_len / 3)
+                .sum::<f64>()
+                / (degradation_trend_len - 2 * degradation_trend_len / 3) as f64;
+
             log::info!(
                 "Degradation trend: Initial avg={:.1}, Final avg={:.1}, Change={:.1}%",
                 initial_samples_avg,
                 final_samples_avg,
                 (final_samples_avg - initial_samples_avg) / initial_samples_avg * 100.0
             );
-            
+
             // We just want to verify the direction, not a specific magnitude
             // The controller should trend downward over time when FPS is poor
             assert!(
@@ -439,125 +465,151 @@ mod tests {
                 "Expected bitrate to trend downward during degradation"
             );
         }
-        
+
         // Verify smooth transitions (no wild jumps)
         for window in degradation_bitrates.windows(2) {
             let delta = (window[1] - window[0]).abs();
             // Relative change should be small per step
             let max_delta_percent = 0.25; // 25% max change per step
             let max_allowed_delta = window[0] * max_delta_percent;
-            
+
             assert!(
                 delta <= max_allowed_delta,
                 "Detected excessive bitrate change: {:.1} to {:.1} (change of {:.1}% exceeds {:.1}%)",
-                window[0], window[1], 
-                (delta / window[0]) * 100.0, 
+                window[0], window[1],
+                (delta / window[0]) * 100.0,
                 max_delta_percent * 100.0
             );
         }
-        
+
         log::info!("=== RECOVERY PHASE: Network improvement ===");
-        
+
         // Phase 2: Network recovery (90 seconds)
         let recovery_duration_ms = 90_000.0;
         let recovery_end_time = current_time + recovery_duration_ms;
-        
+
         let mut recovery_bitrates: Vec<f64> = Vec::new();
         let mut recovery_bitrate_trend: Vec<f64> = Vec::new();
-        
+
         // Capture initial recovery state
         let initial_recovery_time = current_time;
-        
+
         while current_time < recovery_end_time {
             current_time += time_step_ms;
-            
+
             // Linear improvement from degraded_fps back to stable_fps
             let progress = (current_time - initial_recovery_time) / recovery_duration_ms;
             let current_fps = degraded_fps + (stable_fps - degraded_fps) * progress as f32;
-            
+
             let packet = create_test_packet(current_fps, 500);
-            let bitrate = controller.process_diagnostics_packet_with_time(packet, current_time).unwrap();
-            
+            let bitrate = controller
+                .process_diagnostics_packet_with_time(packet, current_time)
+                .unwrap();
+
             recovery_bitrates.push(bitrate);
             all_bitrates.push(bitrate);
             all_fps_values.push(current_fps);
-            
+
             // Sample trend at regular intervals
             if (current_time - initial_recovery_time) % 5000.0 < time_step_ms {
                 recovery_bitrate_trend.push(bitrate);
-                
-                log::info!("Recovery at {:.1}s: FPS={:.1}, Bitrate={:.1}, Progress={:.1}%", 
-                    (current_time - start_time) / 1000.0, 
-                    current_fps, 
+
+                log::info!(
+                    "Recovery at {:.1}s: FPS={:.1}, Bitrate={:.1}, Progress={:.1}%",
+                    (current_time - start_time) / 1000.0,
+                    current_fps,
                     bitrate,
-                    progress * 100.0);
+                    progress * 100.0
+                );
             }
         }
-        
+
         // Verify recovery response
         // 1. Direction: Bitrate should trend upward
         // 2. Consistency: Changes should be gradual
-        
+
         let recovery_trend_len = recovery_bitrate_trend.len();
         if recovery_trend_len >= 3 {
             // Analyze the general trend (should be upward)
             let initial_samples_avg = recovery_bitrate_trend
                 .iter()
-                .take(recovery_trend_len/3)
-                .sum::<f64>() / (recovery_trend_len/3) as f64;
-                
+                .take(recovery_trend_len / 3)
+                .sum::<f64>()
+                / (recovery_trend_len / 3) as f64;
+
             let final_samples_avg = recovery_bitrate_trend
                 .iter()
-                .skip(2*recovery_trend_len/3)
-                .sum::<f64>() / (recovery_trend_len - 2*recovery_trend_len/3) as f64;
-            
+                .skip(2 * recovery_trend_len / 3)
+                .sum::<f64>()
+                / (recovery_trend_len - 2 * recovery_trend_len / 3) as f64;
+
             log::info!(
                 "Recovery trend: Initial avg={:.1}, Final avg={:.1}, Change={:.1}%",
                 initial_samples_avg,
                 final_samples_avg,
                 (final_samples_avg - initial_samples_avg) / initial_samples_avg * 100.0
             );
-            
+
             // We expect the trend to be upward during recovery
             assert!(
                 final_samples_avg >= initial_samples_avg,
                 "Expected bitrate to trend upward during recovery"
             );
         }
-        
+
         // Verify smooth transitions (no wild jumps)
         for window in recovery_bitrates.windows(2) {
             let delta = (window[1] - window[0]).abs();
             // Relative change should be small per step
             let max_delta_percent = 0.25; // 25% max change per step
             let max_allowed_delta = window[0] * max_delta_percent;
-            
+
             assert!(
                 delta <= max_allowed_delta,
                 "Detected excessive bitrate change: {:.1} to {:.1} (change of {:.1}% exceeds {:.1}%)",
-                window[0], window[1], 
-                (delta / window[0]) * 100.0, 
+                window[0], window[1],
+                (delta / window[0]) * 100.0,
                 max_delta_percent * 100.0
             );
         }
-        
+
         // Overall simulation statistics
         let overall_min = all_bitrates.iter().copied().fold(f64::INFINITY, f64::min);
-        let overall_max = all_bitrates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let degradation_min = degradation_bitrates.iter().copied().fold(f64::INFINITY, f64::min);
-        let recovery_max = recovery_bitrates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        
+        let overall_max = all_bitrates
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let degradation_min = degradation_bitrates
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let recovery_max = recovery_bitrates
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+
         log::info!("=== TEST SUMMARY ===");
-        log::info!("Simulation duration: {:.1} seconds", (current_time - start_time) / 1000.0);
+        log::info!(
+            "Simulation duration: {:.1} seconds",
+            (current_time - start_time) / 1000.0
+        );
         log::info!("Baseline bitrate: {:.1} kbps", baseline_mean);
-        log::info!("Overall range: {:.1} - {:.1} kbps", overall_min, overall_max);
+        log::info!(
+            "Overall range: {:.1} - {:.1} kbps",
+            overall_min,
+            overall_max
+        );
         log::info!("Lowest during degradation: {:.1} kbps", degradation_min);
         log::info!("Highest during recovery: {:.1} kbps", recovery_max);
-        log::info!("FPS range: {:.1} - {:.1}", 
+        log::info!(
+            "FPS range: {:.1} - {:.1}",
             all_fps_values.iter().copied().fold(f32::INFINITY, f32::min),
-            all_fps_values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            all_fps_values
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
         );
-        
+
         // Verify overall behavior is adaptive
         assert!(
             degradation_min < baseline_mean && recovery_max > degradation_min,
@@ -571,16 +623,28 @@ mod tests {
         let mut controller = EncoderControlSender::new(500, target_fps);
 
         // Test empty history
-        assert_eq!(controller.calculate_jitter(), 0.0, "Empty history should return 0 jitter");
+        assert_eq!(
+            controller.calculate_jitter(),
+            0.0,
+            "Empty history should return 0 jitter"
+        );
 
         // Test single value (should still be 0)
         controller.fps_history.push_back(30.0);
-        assert_eq!(controller.calculate_jitter(), 0.0, "Single value should return 0 jitter");
+        assert_eq!(
+            controller.calculate_jitter(),
+            0.0,
+            "Single value should return 0 jitter"
+        );
 
         // Test constant values (no jitter)
         controller.fps_history.push_back(30.0);
         controller.fps_history.push_back(30.0);
-        assert_eq!(controller.calculate_jitter(), 0.0, "Constant values should have 0 jitter");
+        assert_eq!(
+            controller.calculate_jitter(),
+            0.0,
+            "Constant values should have 0 jitter"
+        );
 
         // Test oscillating values
         controller.fps_history.clear();
@@ -588,7 +652,7 @@ mod tests {
         controller.fps_history.push_back(20.0);
         controller.fps_history.push_back(10.0);
         controller.fps_history.push_back(20.0);
-        
+
         // For oscillating [10,20,10,20], we expect:
         // Differences: |20-10| = 10, |10-20| = 10, |20-10| = 10
         // Mean difference = (10 + 10 + 10) / 3 = 10
@@ -607,7 +671,7 @@ mod tests {
         controller.fps_history.push_back(12.0);
         controller.fps_history.push_back(14.0);
         controller.fps_history.push_back(16.0);
-        
+
         // For gradual change [10,12,14,16], we expect:
         // Differences: |12-10| = 2, |14-12| = 2, |16-14| = 2
         // Mean difference = (2 + 2 + 2) / 3 = 2

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::{
-    AudioDecoder, AudioDecoderConfig, AudioDecoderInit, CodecState,
-    EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType,
+    AudioDecoder, AudioDecoderConfig, AudioDecoderInit, CodecState, EncodedAudioChunk,
+    EncodedAudioChunkInit, EncodedAudioChunkType,
 };
 
 // Define the trait for audio decoders
@@ -29,10 +29,12 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
     }
 
     fn decode(&self, audio: Arc<MediaPacket>) {
-        let chunk_type = EncodedAudioChunkType::from_js_value(&JsValue::from(audio.frame_type.clone())).unwrap();
+        let chunk_type =
+            EncodedAudioChunkType::from_js_value(&JsValue::from(audio.frame_type.clone())).unwrap();
         let audio_data = Uint8Array::new_with_length(audio.data.len().try_into().unwrap());
         audio_data.copy_from(&audio.data);
-        let mut audio_chunk = EncodedAudioChunkInit::new(&audio_data.into(), audio.timestamp, chunk_type);
+        let mut audio_chunk =
+            EncodedAudioChunkInit::new(&audio_data.into(), audio.timestamp, chunk_type);
         audio_chunk.duration(audio.duration);
         let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
         self.0.decode(&encoded_audio_chunk);
@@ -54,33 +56,35 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
 impl MediaDecoderTrait for AudioDecoderWrapper {
     type InitType = AudioDecoderInit;
     type ConfigType = AudioDecoderConfig;
-    
+
     fn new(init: &Self::InitType) -> Result<Self, JsValue>
     where
         Self: Sized,
     {
         AudioDecoder::new(init).map(AudioDecoderWrapper)
     }
-    
+
     fn configure(&self, config: &Self::ConfigType) {
         self.0.configure(config);
     }
-    
+
     fn decode(&self, packet: Arc<MediaPacket>) {
         AudioDecoderTrait::decode(self, packet);
     }
-    
+
     fn state(&self) -> CodecState {
         self.0.state()
     }
-    
+
     fn get_sequence_number(&self, packet: &MediaPacket) -> u64 {
         packet.audio_metadata.sequence
     }
-    
+
     fn is_keyframe(&self, packet: &MediaPacket) -> bool {
-        let chunk_type = EncodedAudioChunkType::from_js_value(&JsValue::from(packet.frame_type.clone())).unwrap();
+        let chunk_type =
+            EncodedAudioChunkType::from_js_value(&JsValue::from(packet.frame_type.clone()))
+                .unwrap();
         // For audio, "key" frame concept is different, but we'll determine based on the type
         chunk_type == EncodedAudioChunkType::Key
     }
-} 
+}

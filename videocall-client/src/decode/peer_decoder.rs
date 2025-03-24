@@ -125,7 +125,7 @@ impl PeerDecode for VideoPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
         let first_frame = !self.decoded;
         let chunk_type = self.get_chunk_type(packet);
-        
+
         if !self.waiting_for_keyframe || chunk_type == EncodedVideoChunkType::Key {
             match self.decoder.state() {
                 CodecState::Configured => {
@@ -140,7 +140,7 @@ impl PeerDecode for VideoPeerDecoder {
                 _ => {}
             }
         }
-        
+
         Ok(DecodeStatus {
             _rendered: true,
             first_frame,
@@ -220,7 +220,7 @@ impl PeerDecode for AudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
         let first_frame = !self.decoded;
         let chunk_type = self.get_chunk_type(packet);
-        
+
         if !self.waiting_for_keyframe || chunk_type == EncodedAudioChunkType::Key {
             match self.decoder.state() {
                 CodecState::Configured => {
@@ -235,7 +235,7 @@ impl PeerDecode for AudioPeerDecoder {
                 _ => {}
             }
         }
-        
+
         Ok(DecodeStatus {
             _rendered: true,
             first_frame,

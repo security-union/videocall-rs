@@ -13,9 +13,7 @@ aes = "0.8.3"
 anyhow = "1"
 cbc = { version = "0.1.2", features = ["alloc"] }
 futures = "0.3"
-getrandom = { version = "0.2.10", features = ["js"] }
 gloo = "0.8.0"
-gloo-timers = "0.2.6"
 gloo-utils = "0.1"
 js-sys = "0.3"
 log = "0.4.19"

@@ -2,6 +2,9 @@
 name = "bot"
 version = "0.1.0"
 edition = "2018"
+release = false
+license = "MIT OR Apache-2.0"
+description = "A bot for the videocall project"
 
 [dependencies]
 tokio = { version = "1.28.1", features = ["full"] }
@@ -10,7 +13,7 @@ serde = "1.0.130"
 serde_json = "1.0.72"
 rand = "0.8.5"
 futures = "0.3.16"
-videocall-types = { path= "../videocall-types"}
+videocall-types = { path= "../videocall-types", version = "0.1.0"}
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"

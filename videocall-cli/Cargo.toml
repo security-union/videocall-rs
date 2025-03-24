@@ -14,6 +14,7 @@ keywords = ["quic", "webtransport", "zoom"]
 categories = ["network-programming", "multimedia"]
 description = "Effortlessly stream video from the CLI with our native client, designed for your desktop, robot, or Raspberry Pi."
 include = ["src/**/*", "assets/**/*"]
+release = true
 
 [workspace]
 members = ["nokhwa", "nokhwa/nokhwa-bindings-macos", "nokhwa/nokhwa-bindings-windows", "nokhwa/nokhwa-bindings-linux", "nokhwa/nokhwa-core"]

@@ -24,9 +24,9 @@ impl fmt::Display for EncodedVideoChunkTypeWrapper {
 
 pub struct EncodedAudioChunkTypeWrapper(pub EncodedAudioChunkType);
 
-impl From<String> for EncodedAudioChunkTypeWrapper {
-    fn from(s: String) -> Self {
-        match s.as_str() {
+impl From<&str> for EncodedAudioChunkTypeWrapper {
+    fn from(s: &str) -> Self {
+        match s {
             "key" => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key),
             _ => EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Delta),
         }

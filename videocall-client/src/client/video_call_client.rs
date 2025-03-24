@@ -2,16 +2,17 @@ use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
-use crate::diagnostics::DiagnosticManager;
+use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use anyhow::{anyhow, Result};
+use futures::channel::mpsc::UnboundedSender;
 use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -61,11 +62,17 @@ pub struct VideoCallClientOptions {
     /// Callback will be called as `callback(stats_string)` with diagnostics information
     pub on_diagnostics_update: Option<Callback<String>>,
 
+    /// Callback will be called as `callback(stats_string)` with sender diagnostics information
+    pub on_sender_stats_update: Option<Callback<String>>,
+
     /// `true` to enable diagnostics collection; `false` to disable
     pub enable_diagnostics: bool,
 
     /// How often to send diagnostics updates in milliseconds (default: 1000)
     pub diagnostics_update_interval_ms: Option<u64>,
+
+    /// Callback for encoder settings
+    pub on_encoder_settings_update: Option<Callback<String>>,
 }
 
 #[derive(Debug)]
@@ -82,7 +89,8 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
-    _diagnostics: Option<Arc<DiagnosticManager>>,
+    _diagnostics: Option<Rc<DiagnosticManager>>,
+    sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
 }
 
 /// The client struct for a video call connection.
@@ -96,7 +104,7 @@ pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
     aes: Rc<Aes128State>,
-    _diagnostics: Option<Arc<DiagnosticManager>>,
+    _diagnostics: Option<Rc<DiagnosticManager>>,
 }
 
 impl PartialEq for VideoCallClient {
@@ -115,7 +123,7 @@ impl VideoCallClient {
 
         // Create diagnostics manager if enabled
         let diagnostics = if options.enable_diagnostics {
-            let diagnostics = Arc::new(DiagnosticManager::new());
+            let diagnostics = Rc::new(DiagnosticManager::new(options.userid.clone()));
 
             // Set up diagnostics callback if provided
             if let Some(callback) = &options.on_diagnostics_update {
@@ -124,9 +132,9 @@ impl VideoCallClient {
 
             // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {
-                let mut diag = DiagnosticManager::new();
+                let mut diag = DiagnosticManager::new(options.userid.clone());
                 diag.set_reporting_interval(interval);
-                let diagnostics = Arc::new(diag);
+                let diagnostics = Rc::new(diag);
 
                 // Set up diagnostics callback if provided
                 if let Some(callback) = &options.on_diagnostics_update {
@@ -141,25 +149,56 @@ impl VideoCallClient {
             None
         };
 
-        let inner = Rc::new(RefCell::new(Inner {
-            options: InnerOptions {
-                enable_e2ee: options.enable_e2ee,
-                userid: options.userid.clone(),
-                on_peer_added: options.on_peer_added.clone(),
-            },
-            connection: None,
-            aes: aes.clone(),
-            rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
-            peer_decode_manager: Self::create_peer_decoder_manager(&options, diagnostics.clone()),
-            _diagnostics: diagnostics.clone(),
-        }));
+        // Create sender diagnostics manager if diagnostics are enabled
+        let sender_diagnostics = if options.enable_diagnostics {
+            let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.userid.clone()));
 
-        Self {
-            options,
-            inner,
+            // Set up sender diagnostics callback if provided
+            if let Some(callback) = &options.on_sender_stats_update {
+                sender_diagnostics.set_stats_callback(callback.clone());
+            }
+
+            // Set update interval if provided
+            if let Some(interval) = options.diagnostics_update_interval_ms {
+                sender_diagnostics.set_reporting_interval(interval);
+            }
+
+            Some(sender_diagnostics)
+        } else {
+            None
+        };
+
+        let client = Self {
+            options: options.clone(),
+            inner: Rc::new(RefCell::new(Inner {
+                options: InnerOptions {
+                    enable_e2ee: options.enable_e2ee,
+                    userid: options.userid.clone(),
+                    on_peer_added: options.on_peer_added.clone(),
+                },
+                connection: None,
+                aes: aes.clone(),
+                rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
+                peer_decode_manager: Self::create_peer_decoder_manager(
+                    &options,
+                    diagnostics.clone(),
+                ),
+                _diagnostics: diagnostics.clone(),
+                sender_diagnostics: sender_diagnostics.clone(),
+            })),
             aes,
-            _diagnostics: diagnostics,
+            _diagnostics: diagnostics.clone(),
+        };
+
+        // Set up the packet forwarding from DiagnosticManager to VideoCallClient
+        if let Some(diagnostics) = &diagnostics {
+            let client_clone = client.clone();
+            diagnostics.set_packet_handler(Callback::from(move |packet| {
+                client_clone.send_diagnostic_packet(packet);
+            }));
         }
+
+        client
     }
 
     /// Initiates a connection to a videocall server.
@@ -254,7 +293,7 @@ impl VideoCallClient {
 
     fn create_peer_decoder_manager(
         opts: &VideoCallClientOptions,
-        diagnostics: Option<Arc<DiagnosticManager>>,
+        diagnostics: Option<Rc<DiagnosticManager>>,
     ) -> PeerDecodeManager {
         match diagnostics {
             Some(diagnostics) => {
@@ -344,6 +383,32 @@ impl VideoCallClient {
             .peer_decode_manager
             .get_fps(peer_id, media_type)
     }
+
+    /// Send a diagnostic packet to the server
+    pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.send_packet(PacketWrapper {
+                packet_type: PacketType::DIAGNOSTICS.into(),
+                email: self.options.userid.clone(),
+                data: packet.write_to_bytes().unwrap(),
+                ..Default::default()
+            });
+        } else {
+            error!("Failed to borrow inner for sending diagnostic packet");
+        }
+    }
+
+    pub fn subscribe_diagnostics(
+        &self,
+        tx: UnboundedSender<DiagnosticsPacket>,
+        media_type: MediaType,
+    ) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(sender_diagnostics) = &inner.sender_diagnostics {
+                sender_diagnostics.add_sender_channel(tx, media_type);
+            }
+        }
+    }
 }
 
 impl Inner {
@@ -426,9 +491,20 @@ impl Inner {
                 error!("Not implemented: CONNECTION packet type");
             }
             Ok(PacketType::DIAGNOSTICS) => {
-                error!("Not implemented: DIAGNOSTICS packet type");
+                // Parse and handle the diagnostics packet
+                if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
+                {
+                    debug!("Received diagnostics packet: {:?}", diagnostics_packet);
+                    if let Some(sender_diagnostics) = &self.sender_diagnostics {
+                        sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);
+                    }
+                } else {
+                    error!("Failed to parse diagnostics packet");
+                }
             }
-            Err(_) => {}
+            Err(e) => {
+                error!("Failed to parse diagnostics packet: {}", e.to_string());
+            }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {
             debug!("added peer {}", peer_userid);

@@ -12,6 +12,12 @@ pub struct HashMapWithOrderedKeys<K: Ord, V> {
 //
 // Only implementing the methods that are needed in peer_decode_manager
 //
+impl<K: Ord + Hash + Clone, V> Default for HashMapWithOrderedKeys<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<K: Ord + Hash + Clone, V> HashMapWithOrderedKeys<K, V> {
     pub fn new() -> Self {
         Self {

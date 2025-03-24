@@ -1,14 +1,6 @@
-name: Build and Package DEB
+name: Build and Package videocall-cli DEB
 
 on:
-  push:
-    branches:
-      - main
-      - add-debian-distribution
-    tags:
-      - '*'
-    paths:
-      - 'videocall-cli/**'
   pull_request:
     paths:
       - 'videocall-cli/**'

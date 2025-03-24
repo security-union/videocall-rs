@@ -1,8 +1,10 @@
+use crate::constants::*;
+use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
-use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
-
 use std::fmt::Debug;
+use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
+use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
@@ -19,6 +21,9 @@ pub enum Msg {
     DisableVideo,
     AudioDeviceChanged(String),
     VideoDeviceChanged(String),
+    CameraEncoderSettingsUpdated(String),
+    MicrophoneEncoderSettingsUpdated(String),
+    ScreenEncoderSettingsUpdated(String),
 }
 
 pub struct Host {
@@ -28,6 +33,27 @@ pub struct Host {
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
+    pub encoder_settings: EncoderSettings,
+}
+
+pub struct EncoderSettings {
+    pub camera: Option<String>,
+    pub microphone: Option<String>,
+    pub screen: Option<String>,
+}
+
+/// Beautify the encoder settings for display.
+/// Keep in mind that this should contain 1 line per encoder.
+impl std::fmt::Display for EncoderSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Camera: {}\nMic: {}\nScreen: {}",
+            self.camera.clone().unwrap_or("None".to_string()),
+            self.microphone.clone().unwrap_or("None".to_string()),
+            self.screen.clone().unwrap_or("None".to_string())
+        )
+    }
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -42,6 +68,8 @@ pub struct MeetingProps {
     pub mic_enabled: bool,
 
     pub video_enabled: bool,
+
+    pub on_encoder_settings_update: Callback<String>,
 }
 
 impl Component for Host {
@@ -49,19 +77,51 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let client = &ctx.props().client;
+        let client = ctx.props().client.clone();
+
+        // Create 3 callbacks for the 3 encoders
+        let camera_callback = ctx.link().callback(Msg::CameraEncoderSettingsUpdated);
+        let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
+        let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
+
+        let mut camera = CameraEncoder::new(
+            client.clone(),
+            VIDEO_ELEMENT_ID,
+            VIDEO_BITRATE_KBPS,
+            camera_callback,
+        );
+        let mut microphone =
+            MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+        let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS, screen_callback);
+
+        let (tx, rx) = mpsc::unbounded();
+        client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
+        camera.set_encoder_control(rx);
+
+        let (tx, rx) = mpsc::unbounded();
+        client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
+        microphone.set_encoder_control(rx);
+
+        let (tx, rx) = mpsc::unbounded();
+        client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
+        screen.set_encoder_control(rx);
+
         Self {
-            camera: CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID),
-            microphone: MicrophoneEncoder::new(client.clone()),
-            screen: ScreenEncoder::new(client.clone()),
+            camera,
+            microphone,
+            screen,
             share_screen: ctx.props().share_screen,
             mic_enabled: ctx.props().mic_enabled,
             video_enabled: ctx.props().video_enabled,
+            encoder_settings: EncoderSettings {
+                camera: None,
+                microphone: None,
+                screen: None,
+            },
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        // Determine if we should start/stop screen share.
         if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::EnableScreenShare);
@@ -69,7 +129,6 @@ impl Component for Host {
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::DisableScreenShare);
         }
-        // Determine if we should start/stop microphone.
         if self.microphone.set_enabled(ctx.props().mic_enabled) {
             self.mic_enabled = ctx.props().mic_enabled;
             ctx.link()
@@ -78,7 +137,6 @@ impl Component for Host {
             self.mic_enabled = ctx.props().mic_enabled;
             ctx.link().send_message(Msg::DisableMicrophone)
         }
-        // Determine if we should start/stop video.
         if self.camera.set_enabled(ctx.props().video_enabled) {
             self.video_enabled = ctx.props().video_enabled;
             ctx.link()
@@ -101,6 +159,10 @@ impl Component for Host {
             }
             Msg::DisableScreenShare => {
                 self.screen.stop();
+                self.encoder_settings.screen = None;
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
             Msg::Start => true,
@@ -113,6 +175,10 @@ impl Component for Host {
             }
             Msg::DisableMicrophone => {
                 self.microphone.stop();
+                self.encoder_settings.microphone = None;
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
             Msg::EnableVideo(should_enable) => {
@@ -124,6 +190,10 @@ impl Component for Host {
             }
             Msg::DisableVideo => {
                 self.camera.stop();
+                self.encoder_settings.camera = None;
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
                 true
             }
             Msg::AudioDeviceChanged(audio) => {
@@ -145,6 +215,30 @@ impl Component for Host {
                     timeout.forget();
                 }
                 false
+            }
+            Msg::CameraEncoderSettingsUpdated(settings) => {
+                // update the self.camera settings
+                self.encoder_settings.camera = Some(settings);
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
+                true
+            }
+            Msg::MicrophoneEncoderSettingsUpdated(settings) => {
+                // update the self.microphone settings
+                self.encoder_settings.microphone = Some(settings);
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
+                true
+            }
+            Msg::ScreenEncoderSettingsUpdated(settings) => {
+                // update the self.screen settings
+                self.encoder_settings.screen = Some(settings);
+                ctx.props()
+                    .on_encoder_settings_update
+                    .emit(self.encoder_settings.to_string());
+                true
             }
         }
     }

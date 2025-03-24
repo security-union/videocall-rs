@@ -282,6 +282,60 @@ See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information
 
 For a more comprehensive technical overview, see the [Architecture Document](ARCHITECTURE.md).
 
+### Git Hooks
+
+This repository includes Git hooks to ensure code quality:
+
+1. **Pre-commit Hook**: Automatically runs `cargo fmt` before each commit to ensure consistent code formatting.
+2. **Post-commit Hook**: Runs `cargo clippy` after each commit to check for potential code improvements.
+
+To install these hooks, run the following commands from the project root:
+
+```bash
+# Create the hooks directory if it doesn't exist
+mkdir -p .git/hooks
+
+# Create the pre-commit hook
+cat > .git/hooks/pre-commit << 'EOF'
+#!/bin/sh
+
+# Run cargo fmt and check if there are changes
+echo "Running cargo fmt..."
+cargo fmt --all -- --check
+
+# Check the exit code of cargo fmt
+if [ $? -ne 0 ]; then
+    echo "cargo fmt found formatting issues. Please fix them before committing."
+    exit 1
+fi
+
+exit 0
+EOF
+
+# Create the post-commit hook
+cat > .git/hooks/post-commit << 'EOF'
+#!/bin/sh
+
+# Run cargo clippy after the commit
+echo "Running cargo clippy..."
+cargo clippy -- -D warnings
+
+# Check the exit code of cargo clippy
+if [ $? -ne 0 ]; then
+    echo "Cargo clippy found issues in your code. Please fix them."
+    # We can't abort the commit since it's already done, but we can inform the user
+    echo "The commit was successful, but please consider fixing the clippy issues before pushing."
+fi
+
+exit 0
+EOF
+
+# Make the hooks executable
+chmod +x .git/hooks/pre-commit .git/hooks/post-commit
+```
+
+These hooks help maintain code quality by ensuring proper formatting and checking for common issues.
+
 ## Demos and Media
 
 ### Technical Presentations

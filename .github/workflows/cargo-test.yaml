@@ -7,7 +7,6 @@ on:
       - 'types/**'
       - 'yew-ui/**'
       - 'docker/**'
-
 name: check backend
   
 jobs:

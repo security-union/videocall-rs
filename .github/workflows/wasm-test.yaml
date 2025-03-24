@@ -1,0 +1,44 @@
+name: WebAssembly Tests
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'videocall-client/**'
+      - 'types/**'
+  pull_request:
+    paths:
+      - 'videocall-client/**'
+      - 'types/**'
+
+jobs:
+  wasm-test:
+    name: WebAssembly Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          override: true
+          profile: minimal
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Run wasm-pack tests
+        run: cd videocall-client && wasm-pack test --node 

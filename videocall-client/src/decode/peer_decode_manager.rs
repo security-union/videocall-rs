@@ -5,6 +5,7 @@ use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
 use protobuf::Message;
+use std::rc::Rc;
 use std::{fmt::Display, sync::Arc};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -185,7 +186,7 @@ pub struct PeerDecodeManager {
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
-    diagnostics: Option<Arc<DiagnosticManager>>,
+    diagnostics: Option<Rc<DiagnosticManager>>,
 }
 
 impl Default for PeerDecodeManager {
@@ -205,7 +206,7 @@ impl PeerDecodeManager {
         }
     }
 
-    pub fn new_with_diagnostics(diagnostics: Arc<DiagnosticManager>) -> Self {
+    pub fn new_with_diagnostics(diagnostics: Rc<DiagnosticManager>) -> Self {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             on_first_frame: Callback::noop(),
@@ -239,7 +240,7 @@ impl PeerDecodeManager {
                 }
                 Ok((media_type, decode_status)) => {
                     if let Some(diagnostics) = &self.diagnostics {
-                        diagnostics.track_frame(&email, media_type);
+                        diagnostics.track_frame(&email, media_type, packet.data.len() as u64);
                     }
 
                     if decode_status.first_frame {

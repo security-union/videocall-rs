@@ -11,8 +11,9 @@
 //
 
 use super::super::wrappers::EncodedVideoChunkTypeWrapper;
+use super::audio_decoder_wrapper::AudioDecoderWrapper;
 use super::config::configure_audio_context;
-use super::video_decoder_with_buffer::VideoDecoderWithBuffer;
+use super::media_decoder_with_buffer::{AudioDecoderWithBuffer, VideoDecoderWithBuffer};
 use super::video_decoder_wrapper::VideoDecoderWrapper;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
@@ -26,11 +27,9 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
-use web_sys::{AudioData, AudioDecoder, AudioDecoderConfig, AudioDecoderInit};
+use web_sys::{AudioData, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
-use web_sys::{
-    EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType, EncodedVideoChunkType,
-};
+use web_sys::{EncodedAudioChunkType, EncodedVideoChunkType};
 use web_sys::{HtmlCanvasElement, HtmlImageElement};
 use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
@@ -45,7 +44,7 @@ pub struct DecodeStatus {
 //
 #[derive(Debug)]
 pub struct PeerDecoder<WebDecoder, Chunk> {
-    decoder: WebDecoder,
+    pub decoder: WebDecoder,
     waiting_for_keyframe: bool,
     decoded: bool,
     _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
@@ -59,48 +58,7 @@ impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
 }
 
 pub trait PeerDecode {
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()>;
-}
-
-///
-/// Implementation of decode(packet) -> Result<DecodeStatus, ()>
-///
-/// (Defined as a macro rather than a trait because traits can't refer to members.)
-///
-macro_rules! impl_decode {
-    ($self: expr, $packet: expr, $ChunkType: ty, $ref: tt) => {{
-        let first_frame = !$self.decoded;
-        let chunk_type = $self.get_chunk_type(&$packet);
-        if !$self.waiting_for_keyframe || chunk_type == <$ChunkType>::Key {
-            match $self.decoder.state() {
-                CodecState::Configured => {
-                    $self
-                        .decoder
-                        .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
-                    $self.waiting_for_keyframe = false;
-                    $self.decoded = true;
-                }
-                CodecState::Closed => {
-                    log::error!("decoder closed");
-                    return Err(());
-                }
-                _ => {}
-            }
-        }
-        Ok(DecodeStatus {
-            _rendered: true,
-            first_frame,
-        })
-    }};
-}
-
-macro_rules! opt_ref {
-    ($val: expr, "ref") => {
-        &$val
-    };
-    ($val: expr, "") => {
-        $val
-    };
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
 }
 
 ///
@@ -161,15 +119,31 @@ impl VideoPeerDecoder {
     fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedVideoChunkType {
         EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0
     }
-
-    fn get_chunk(&self, packet: &Arc<MediaPacket>, _: EncodedVideoChunkType) -> Arc<MediaPacket> {
-        packet.clone()
-    }
 }
 
 impl PeerDecode for VideoPeerDecoder {
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
-        impl_decode!(self, packet, EncodedVideoChunkType, "")
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
+        let first_frame = !self.decoded;
+        let chunk_type = self.get_chunk_type(packet);
+
+        if !self.waiting_for_keyframe || chunk_type == EncodedVideoChunkType::Key {
+            match self.decoder.state() {
+                CodecState::Configured => {
+                    self.decoder.decode(packet.clone());
+                    self.waiting_for_keyframe = false;
+                    self.decoded = true;
+                }
+                CodecState::Closed => {
+                    return Err(anyhow::anyhow!("decoder closed"));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(DecodeStatus {
+            _rendered: true,
+            first_frame,
+        })
     }
 }
 
@@ -180,7 +154,7 @@ impl PeerDecode for VideoPeerDecoder {
 ///
 /// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
-pub type AudioPeerDecoder = PeerDecoder<AudioDecoder, AudioData>;
+pub type AudioPeerDecoder = PeerDecoder<AudioDecoderWithBuffer<AudioDecoderWrapper>, AudioData>;
 
 impl Default for AudioPeerDecoder {
     fn default() -> Self {
@@ -217,7 +191,7 @@ impl AudioPeerDecoder {
                 error!("error {:?}", e);
             }
         }) as Box<dyn FnMut(AudioData)>);
-        let decoder = AudioDecoder::new(&AudioDecoderInit::new(
+        let decoder = AudioDecoderWithBuffer::new(&AudioDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
         ))
@@ -239,25 +213,30 @@ impl AudioPeerDecoder {
     fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedAudioChunkType {
         EncodedAudioChunkType::from_js_value(&JsValue::from(packet.frame_type.clone())).unwrap()
     }
-
-    fn get_chunk(
-        &self,
-        packet: &Arc<MediaPacket>,
-        chunk_type: EncodedAudioChunkType,
-    ) -> EncodedAudioChunk {
-        let audio_data = &packet.data;
-        let audio_data_js: js_sys::Uint8Array =
-            js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
-        audio_data_js.copy_from(audio_data.as_slice());
-        let mut audio_chunk =
-            EncodedAudioChunkInit::new(&audio_data_js.into(), packet.timestamp, chunk_type);
-        audio_chunk.duration(packet.duration);
-        EncodedAudioChunk::new(&audio_chunk).unwrap()
-    }
 }
 
 impl PeerDecode for AudioPeerDecoder {
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
-        impl_decode!(self, packet, EncodedAudioChunkType, "ref")
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
+        let first_frame = !self.decoded;
+        let chunk_type = self.get_chunk_type(packet);
+
+        if !self.waiting_for_keyframe || chunk_type == EncodedAudioChunkType::Key {
+            match self.decoder.state() {
+                CodecState::Configured => {
+                    self.decoder.decode(packet.clone());
+                    self.waiting_for_keyframe = false;
+                    self.decoded = true;
+                }
+                CodecState::Closed => {
+                    return Err(anyhow::anyhow!("decoder closed"));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(DecodeStatus {
+            _rendered: true,
+            first_frame,
+        })
     }
 }

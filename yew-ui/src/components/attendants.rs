@@ -19,6 +19,8 @@ pub enum WsAction {
     MediaPermissionsError(String),
     Log(String),
     DiagnosticsUpdated(String),
+    SenderStatsUpdated(String),
+    EncoderSettingsUpdated(String),
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -85,6 +87,8 @@ pub struct AttendantsComponent {
     pub diagnostics_open: bool,
     pub error: Option<String>,
     pub diagnostics_data: Option<String>,
+    pub sender_stats: Option<String>,
+    pub encoder_settings: Option<String>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -127,7 +131,19 @@ impl AttendantsComponent {
                     link.send_message(Msg::from(WsAction::DiagnosticsUpdated(stats)))
                 })
             }),
+            on_sender_stats_update: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |stats| {
+                    link.send_message(Msg::from(WsAction::SenderStatsUpdated(stats)))
+                })
+            }),
             diagnostics_update_interval_ms: Some(1000),
+            on_encoder_settings_update: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |settings| {
+                    link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
+                })
+            }),
         };
         VideoCallClient::new(opts)
     }
@@ -165,9 +181,11 @@ impl Component for AttendantsComponent {
             diagnostics_open: false,
             error: None,
             diagnostics_data: None,
+            sender_stats: None,
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
+            encoder_settings: None,
         }
     }
 
@@ -234,6 +252,14 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::DiagnosticsUpdated(stats) => {
                     self.diagnostics_data = Some(stats);
+                    true
+                }
+                WsAction::SenderStatsUpdated(stats) => {
+                    self.sender_stats = Some(stats);
+                    true
+                }
+                WsAction::EncoderSettingsUpdated(settings) => {
+                    self.encoder_settings = Some(settings);
                     true
                 }
             },
@@ -312,6 +338,8 @@ impl Component for AttendantsComponent {
             &self.client,
             peers.iter().take(CANVAS_LIMIT).cloned().collect(),
         );
+
+        let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
         html! {
             <div id="main-container" class="meeting-page">
@@ -480,7 +508,7 @@ impl Component for AttendantsComponent {
                                     </div>
                                     {
                                         if media_access_granted {
-                                            html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} />}
+                                            html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} on_encoder_settings_update={on_encoder_settings_update} />}
                                         } else {
                                             html! {<></>}
                                         }
@@ -513,26 +541,79 @@ impl Component for AttendantsComponent {
                 <div id="diagnostics-sidebar" class={if self.diagnostics_open {"visible"} else {""}}>
                     <div class="sidebar-header">
                         <h2>{"Diagnostics"}</h2>
-                        <button class="close-button" onclick={toggle_diagnostics.clone()}>{"×"}</button>
+                        <button class="close-button" onclick={toggle_diagnostics}>{"×"}</button>
                     </div>
                     <div class="sidebar-content">
-                        {
-                            match &self.diagnostics_data {
-                                Some(data) => html! {
-                                    <div class="diagnostics-data">
-                                        <pre>{ data }</pre>
-                                    </div>
-                                },
-                                None => html! {
-                                    <div class="diagnostics-empty">
-                                        <p>{"No diagnostics data available yet."}</p>
-                                    </div>
+                        <div class="diagnostics-data">
+                            <div class="diagnostics-section">
+                                <h3>{"Reception Stats"}</h3>
+                                if let Some(data) = &self.diagnostics_data {
+                                    <pre>{ data }</pre>
+                                } else {
+                                    <p>{"No reception data available."}</p>
                                 }
-                            }
-                        }
+                            </div>
+                            <div class="diagnostics-section">
+                                <h3>{"Sending Stats"}</h3>
+                                if let Some(data) = &self.sender_stats {
+                                    <pre>{ data }</pre>
+                                } else {
+                                    <p>{"No sending data available."}</p>
+                                }
+                            </div>
+                            <div class="diagnostics-section">
+                                <h3>{"Encoder Settings"}</h3>
+                                if let Some(data) = &self.encoder_settings {
+                                    <pre>{ data }</pre>
+                                } else {
+                                    <p>{"No encoder settings available."}</p>
+                                }
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
         }
     }
+}
+
+#[function_component(DiagnosticsSidebar)]
+fn diagnostics_sidebar(props: &DiagnosticsSidebarProps) -> Html {
+    let diagnostics_data = props.diagnostics_data.clone();
+    let sender_stats = props.sender_stats.clone();
+    let on_close = props.on_close.clone();
+
+    html! {
+        <div class="diagnostics-sidebar">
+            <div class="diagnostics-header">
+                <h2>{"Diagnostics"}</h2>
+                <button class="close-button" onclick={on_close}>{"×"}</button>
+            </div>
+            <div class="diagnostics-data">
+                <div class="diagnostics-section">
+                    <h3>{"Reception Stats"}</h3>
+                    if let Some(data) = diagnostics_data {
+                        <pre class="diagnostics-text">{data}</pre>
+                    } else {
+                        <p>{"No reception data available."}</p>
+                    }
+                </div>
+                <div class="diagnostics-section">
+                    <h3>{"Sending Stats"}</h3>
+                    if let Some(data) = sender_stats {
+                        <pre class="diagnostics-text">{data}</pre>
+                    } else {
+                        <p>{"No sending data available."}</p>
+                    }
+                </div>
+            </div>
+        </div>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+pub struct DiagnosticsSidebarProps {
+    pub diagnostics_data: Option<String>,
+    pub sender_stats: Option<String>,
+    pub on_close: Callback<MouseEvent>,
 }

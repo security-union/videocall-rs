@@ -41,7 +41,7 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
         let is_keyframe = self.decoder.is_keyframe(&packet);
 
         // Check for sequence reset
-        let sequence_reset_detected = self.sequence.map_or(false, |seq| {
+        let sequence_reset_detected = self.sequence.is_some_and(|seq| {
             (seq as i64 - new_sequence as i64).abs() > self.max_sequence_gap as i64
         });
 
@@ -95,15 +95,13 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
                 if next_sequence < current_sequence {
                     self.buffer.remove(&next_sequence);
                 // Process next frame in sequence
-                } else if current_sequence + 1 == next_sequence {
+                } else if current_sequence + 1 == next_sequence
+                    || (self.buffer.len() >= (2 * self.max_sequence_gap as usize / 3))
+                {
                     if let Some(frame) = self.decode_next_frame(next_sequence) {
                         decoded_frames.push(frame);
                     }
                 // Fast forward if we have a gap but buffer is getting too large
-                } else if self.buffer.len() >= (2 * self.max_sequence_gap as usize / 3) {
-                    if let Some(frame) = self.decode_next_frame(next_sequence) {
-                        decoded_frames.push(frame);
-                    }
                 } else {
                     // Wait for more frames
                     break;
@@ -301,7 +299,7 @@ mod tests {
         }
 
         // Verify buffer state - we should have buffered at least some frames
-        assert!(decoder.buffer.len() > 0, "Buffer should contain frames");
+        assert!(!decoder.buffer.is_empty(), "Buffer should contain frames");
     }
 
     #[wasm_bindgen_test]
@@ -451,7 +449,7 @@ mod tests {
         // Either the buffer was reset and only contains the new frame,
         // or it contains the new frame plus some old ones
         assert!(
-            decoder.buffer.len() >= 1,
+            !decoder.buffer.is_empty(),
             "Buffer should contain at least the new frame"
         );
 
@@ -620,7 +618,7 @@ mod tests {
         }
 
         // Verify buffer state - we should have buffered at least some frames
-        assert!(decoder.buffer.len() > 0, "Buffer should contain frames");
+        assert!(!decoder.buffer.is_empty(), "Buffer should contain frames");
     }
 
     #[wasm_bindgen_test]
@@ -734,7 +732,7 @@ mod tests {
         // Either the buffer was reset and only contains the new frame,
         // or it contains the new frame plus some old ones
         assert!(
-            decoder.buffer.len() >= 1,
+            !decoder.buffer.is_empty(),
             "Buffer should contain at least the new frame"
         );
 

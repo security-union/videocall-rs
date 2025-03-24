@@ -9,7 +9,6 @@ use videocall_types::protos::diagnostics_packet::{
 
 /// EncoderControl is responsible for bridging the gap between the encoder and the
 /// diagnostics system.
-
 /// It closes the loop by allowing the encoder to adjust its settings based on
 /// feedback from the diagnostics system.
 #[derive(Debug, Clone)]
@@ -71,9 +70,8 @@ impl EncoderControlSender {
 
         // Calculate mean of absolute differences
         let sum: f64 = differences.iter().sum();
-        let mean_difference = sum / differences.len() as f64;
 
-        mean_difference
+        sum / differences.len() as f64
     }
 
     pub fn process_diagnostics_packet_with_time(

@@ -15,7 +15,7 @@ use web_sys::window;
 use yew::Callback;
 
 use videocall_types::protos::diagnostics_packet::{
-    self as diag, quality_hints::QualityPreference, AudioMetrics, DiagnosticsPacket, VideoMetrics,
+    self as diag, AudioMetrics, DiagnosticsPacket, VideoMetrics,
 };
 
 use videocall_types::protos::media_packet::media_packet::MediaType;

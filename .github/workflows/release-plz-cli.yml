@@ -3,7 +3,7 @@ name: Release-plz CLI
 on:
   push:
     branches:
-      - main
+      - release-cli
 
 jobs:
   release-plz-cli-release:

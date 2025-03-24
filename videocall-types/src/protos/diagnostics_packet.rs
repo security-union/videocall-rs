@@ -37,27 +37,14 @@ pub struct DiagnosticsPacket {
     pub target_id: ::std::string::String,
     // @@protoc_insertion_point(field:DiagnosticsPacket.timestamp_ms)
     pub timestamp_ms: u64,
-    ///  Stream type
     // @@protoc_insertion_point(field:DiagnosticsPacket.media_type)
-    pub media_type: ::protobuf::EnumOrUnknown<diagnostics_packet::MediaType>,
-    ///  Common metrics for both audio and video
-    // @@protoc_insertion_point(field:DiagnosticsPacket.median_latency_ms)
-    pub median_latency_ms: u32,
-    // @@protoc_insertion_point(field:DiagnosticsPacket.jitter_ms)
-    pub jitter_ms: u32,
-    // @@protoc_insertion_point(field:DiagnosticsPacket.estimated_bandwidth_kbps)
-    pub estimated_bandwidth_kbps: u32,
-    // @@protoc_insertion_point(field:DiagnosticsPacket.round_trip_time_ms)
-    pub round_trip_time_ms: u32,
+    pub media_type: ::protobuf::EnumOrUnknown<super::media_packet::media_packet::MediaType>,
     ///  Video-specific metrics (only populated for video streams)
     // @@protoc_insertion_point(field:DiagnosticsPacket.video_metrics)
     pub video_metrics: ::protobuf::MessageField<VideoMetrics>,
     ///  Audio-specific metrics (only populated for audio streams)
     // @@protoc_insertion_point(field:DiagnosticsPacket.audio_metrics)
     pub audio_metrics: ::protobuf::MessageField<AudioMetrics>,
-    ///  Quality adaptation hints to the sender
-    // @@protoc_insertion_point(field:DiagnosticsPacket.quality_hints)
-    pub quality_hints: ::protobuf::MessageField<QualityHints>,
     // special fields
     // @@protoc_insertion_point(special_field:DiagnosticsPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -75,7 +62,7 @@ impl DiagnosticsPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(12);
+        let mut fields = ::std::vec::Vec::with_capacity(7);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "stream_id",
@@ -102,26 +89,6 @@ impl DiagnosticsPacket {
             |m: &DiagnosticsPacket| { &m.media_type },
             |m: &mut DiagnosticsPacket| { &mut m.media_type },
         ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "median_latency_ms",
-            |m: &DiagnosticsPacket| { &m.median_latency_ms },
-            |m: &mut DiagnosticsPacket| { &mut m.median_latency_ms },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "jitter_ms",
-            |m: &DiagnosticsPacket| { &m.jitter_ms },
-            |m: &mut DiagnosticsPacket| { &mut m.jitter_ms },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "estimated_bandwidth_kbps",
-            |m: &DiagnosticsPacket| { &m.estimated_bandwidth_kbps },
-            |m: &mut DiagnosticsPacket| { &mut m.estimated_bandwidth_kbps },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "round_trip_time_ms",
-            |m: &DiagnosticsPacket| { &m.round_trip_time_ms },
-            |m: &mut DiagnosticsPacket| { &mut m.round_trip_time_ms },
-        ));
         fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, VideoMetrics>(
             "video_metrics",
             |m: &DiagnosticsPacket| { &m.video_metrics },
@@ -131,11 +98,6 @@ impl DiagnosticsPacket {
             "audio_metrics",
             |m: &DiagnosticsPacket| { &m.audio_metrics },
             |m: &mut DiagnosticsPacket| { &mut m.audio_metrics },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, QualityHints>(
-            "quality_hints",
-            |m: &DiagnosticsPacket| { &m.quality_hints },
-            |m: &mut DiagnosticsPacket| { &mut m.quality_hints },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<DiagnosticsPacket>(
             "DiagnosticsPacket",
@@ -170,26 +132,11 @@ impl ::protobuf::Message for DiagnosticsPacket {
                 40 => {
                     self.media_type = is.read_enum_or_unknown()?;
                 },
-                48 => {
-                    self.median_latency_ms = is.read_uint32()?;
-                },
-                56 => {
-                    self.jitter_ms = is.read_uint32()?;
-                },
-                64 => {
-                    self.estimated_bandwidth_kbps = is.read_uint32()?;
-                },
-                72 => {
-                    self.round_trip_time_ms = is.read_uint32()?;
-                },
-                82 => {
+                50 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.video_metrics)?;
                 },
-                90 => {
+                58 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.audio_metrics)?;
-                },
-                98 => {
-                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.quality_hints)?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -215,30 +162,14 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if self.timestamp_ms != 0 {
             my_size += ::protobuf::rt::uint64_size(4, self.timestamp_ms);
         }
-        if self.media_type != ::protobuf::EnumOrUnknown::new(diagnostics_packet::MediaType::VIDEO) {
+        if self.media_type != ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::VIDEO) {
             my_size += ::protobuf::rt::int32_size(5, self.media_type.value());
-        }
-        if self.median_latency_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(6, self.median_latency_ms);
-        }
-        if self.jitter_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(7, self.jitter_ms);
-        }
-        if self.estimated_bandwidth_kbps != 0 {
-            my_size += ::protobuf::rt::uint32_size(8, self.estimated_bandwidth_kbps);
-        }
-        if self.round_trip_time_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(9, self.round_trip_time_ms);
         }
         if let Some(v) = self.video_metrics.as_ref() {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
         if let Some(v) = self.audio_metrics.as_ref() {
-            let len = v.compute_size();
-            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
-        }
-        if let Some(v) = self.quality_hints.as_ref() {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
@@ -260,29 +191,14 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if self.timestamp_ms != 0 {
             os.write_uint64(4, self.timestamp_ms)?;
         }
-        if self.media_type != ::protobuf::EnumOrUnknown::new(diagnostics_packet::MediaType::VIDEO) {
+        if self.media_type != ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::VIDEO) {
             os.write_enum(5, ::protobuf::EnumOrUnknown::value(&self.media_type))?;
         }
-        if self.median_latency_ms != 0 {
-            os.write_uint32(6, self.median_latency_ms)?;
-        }
-        if self.jitter_ms != 0 {
-            os.write_uint32(7, self.jitter_ms)?;
-        }
-        if self.estimated_bandwidth_kbps != 0 {
-            os.write_uint32(8, self.estimated_bandwidth_kbps)?;
-        }
-        if self.round_trip_time_ms != 0 {
-            os.write_uint32(9, self.round_trip_time_ms)?;
-        }
         if let Some(v) = self.video_metrics.as_ref() {
-            ::protobuf::rt::write_message_field_with_cached_size(10, v, os)?;
+            ::protobuf::rt::write_message_field_with_cached_size(6, v, os)?;
         }
         if let Some(v) = self.audio_metrics.as_ref() {
-            ::protobuf::rt::write_message_field_with_cached_size(11, v, os)?;
-        }
-        if let Some(v) = self.quality_hints.as_ref() {
-            ::protobuf::rt::write_message_field_with_cached_size(12, v, os)?;
+            ::protobuf::rt::write_message_field_with_cached_size(7, v, os)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -305,14 +221,9 @@ impl ::protobuf::Message for DiagnosticsPacket {
         self.sender_id.clear();
         self.target_id.clear();
         self.timestamp_ms = 0;
-        self.media_type = ::protobuf::EnumOrUnknown::new(diagnostics_packet::MediaType::VIDEO);
-        self.median_latency_ms = 0;
-        self.jitter_ms = 0;
-        self.estimated_bandwidth_kbps = 0;
-        self.round_trip_time_ms = 0;
+        self.media_type = ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::VIDEO);
         self.video_metrics.clear();
         self.audio_metrics.clear();
-        self.quality_hints.clear();
         self.special_fields.clear();
     }
 
@@ -323,13 +234,8 @@ impl ::protobuf::Message for DiagnosticsPacket {
             target_id: ::std::string::String::new(),
             timestamp_ms: 0,
             media_type: ::protobuf::EnumOrUnknown::from_i32(0),
-            median_latency_ms: 0,
-            jitter_ms: 0,
-            estimated_bandwidth_kbps: 0,
-            round_trip_time_ms: 0,
             video_metrics: ::protobuf::MessageField::none(),
             audio_metrics: ::protobuf::MessageField::none(),
-            quality_hints: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -353,76 +259,6 @@ impl ::protobuf::reflect::ProtobufValue for DiagnosticsPacket {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
-/// Nested message and enums of message `DiagnosticsPacket`
-pub mod diagnostics_packet {
-    #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
-    // @@protoc_insertion_point(enum:DiagnosticsPacket.MediaType)
-    pub enum MediaType {
-        // @@protoc_insertion_point(enum_value:DiagnosticsPacket.MediaType.VIDEO)
-        VIDEO = 0,
-        // @@protoc_insertion_point(enum_value:DiagnosticsPacket.MediaType.AUDIO)
-        AUDIO = 1,
-        // @@protoc_insertion_point(enum_value:DiagnosticsPacket.MediaType.SCREEN)
-        SCREEN = 2,
-    }
-
-    impl ::protobuf::Enum for MediaType {
-        const NAME: &'static str = "MediaType";
-
-        fn value(&self) -> i32 {
-            *self as i32
-        }
-
-        fn from_i32(value: i32) -> ::std::option::Option<MediaType> {
-            match value {
-                0 => ::std::option::Option::Some(MediaType::VIDEO),
-                1 => ::std::option::Option::Some(MediaType::AUDIO),
-                2 => ::std::option::Option::Some(MediaType::SCREEN),
-                _ => ::std::option::Option::None
-            }
-        }
-
-        fn from_str(str: &str) -> ::std::option::Option<MediaType> {
-            match str {
-                "VIDEO" => ::std::option::Option::Some(MediaType::VIDEO),
-                "AUDIO" => ::std::option::Option::Some(MediaType::AUDIO),
-                "SCREEN" => ::std::option::Option::Some(MediaType::SCREEN),
-                _ => ::std::option::Option::None
-            }
-        }
-
-        const VALUES: &'static [MediaType] = &[
-            MediaType::VIDEO,
-            MediaType::AUDIO,
-            MediaType::SCREEN,
-        ];
-    }
-
-    impl ::protobuf::EnumFull for MediaType {
-        fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
-            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
-            descriptor.get(|| super::file_descriptor().enum_by_package_relative_name("DiagnosticsPacket.MediaType").unwrap()).clone()
-        }
-
-        fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
-            let index = *self as usize;
-            Self::enum_descriptor().value_by_index(index)
-        }
-    }
-
-    impl ::std::default::Default for MediaType {
-        fn default() -> Self {
-            MediaType::VIDEO
-        }
-    }
-
-    impl MediaType {
-        pub(in super) fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
-            ::protobuf::reflect::GeneratedEnumDescriptorData::new::<MediaType>("DiagnosticsPacket.MediaType")
-        }
-    }
-}
-
 ///  Video-specific diagnostic metrics
 // @@protoc_insertion_point(message:VideoMetrics)
 #[derive(PartialEq,Clone,Default,Debug)]
@@ -432,10 +268,6 @@ pub struct VideoMetrics {
     pub fps_received: f32,
     // @@protoc_insertion_point(field:VideoMetrics.bitrate_kbps)
     pub bitrate_kbps: u32,
-    // @@protoc_insertion_point(field:VideoMetrics.decode_time_ms)
-    pub decode_time_ms: u32,
-    // @@protoc_insertion_point(field:VideoMetrics.freeze_count)
-    pub freeze_count: u32,
     // special fields
     // @@protoc_insertion_point(special_field:VideoMetrics.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -453,7 +285,7 @@ impl VideoMetrics {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(4);
+        let mut fields = ::std::vec::Vec::with_capacity(2);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "fps_received",
@@ -464,16 +296,6 @@ impl VideoMetrics {
             "bitrate_kbps",
             |m: &VideoMetrics| { &m.bitrate_kbps },
             |m: &mut VideoMetrics| { &mut m.bitrate_kbps },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "decode_time_ms",
-            |m: &VideoMetrics| { &m.decode_time_ms },
-            |m: &mut VideoMetrics| { &mut m.decode_time_ms },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "freeze_count",
-            |m: &VideoMetrics| { &m.freeze_count },
-            |m: &mut VideoMetrics| { &mut m.freeze_count },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<VideoMetrics>(
             "VideoMetrics",
@@ -499,12 +321,6 @@ impl ::protobuf::Message for VideoMetrics {
                 16 => {
                     self.bitrate_kbps = is.read_uint32()?;
                 },
-                24 => {
-                    self.decode_time_ms = is.read_uint32()?;
-                },
-                32 => {
-                    self.freeze_count = is.read_uint32()?;
-                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -523,12 +339,6 @@ impl ::protobuf::Message for VideoMetrics {
         if self.bitrate_kbps != 0 {
             my_size += ::protobuf::rt::uint32_size(2, self.bitrate_kbps);
         }
-        if self.decode_time_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(3, self.decode_time_ms);
-        }
-        if self.freeze_count != 0 {
-            my_size += ::protobuf::rt::uint32_size(4, self.freeze_count);
-        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -540,12 +350,6 @@ impl ::protobuf::Message for VideoMetrics {
         }
         if self.bitrate_kbps != 0 {
             os.write_uint32(2, self.bitrate_kbps)?;
-        }
-        if self.decode_time_ms != 0 {
-            os.write_uint32(3, self.decode_time_ms)?;
-        }
-        if self.freeze_count != 0 {
-            os.write_uint32(4, self.freeze_count)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -566,8 +370,6 @@ impl ::protobuf::Message for VideoMetrics {
     fn clear(&mut self) {
         self.fps_received = 0.;
         self.bitrate_kbps = 0;
-        self.decode_time_ms = 0;
-        self.freeze_count = 0;
         self.special_fields.clear();
     }
 
@@ -575,8 +377,6 @@ impl ::protobuf::Message for VideoMetrics {
         static instance: VideoMetrics = VideoMetrics {
             fps_received: 0.,
             bitrate_kbps: 0,
-            decode_time_ms: 0,
-            freeze_count: 0,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -607,16 +407,8 @@ pub struct AudioMetrics {
     // message fields
     // @@protoc_insertion_point(field:AudioMetrics.fps_received)
     pub fps_received: f32,
-    // @@protoc_insertion_point(field:AudioMetrics.audio_level)
-    pub audio_level: f32,
-    // @@protoc_insertion_point(field:AudioMetrics.sample_rate)
-    pub sample_rate: u32,
     // @@protoc_insertion_point(field:AudioMetrics.bitrate_kbps)
     pub bitrate_kbps: u32,
-    // @@protoc_insertion_point(field:AudioMetrics.echo_detected)
-    pub echo_detected: bool,
-    // @@protoc_insertion_point(field:AudioMetrics.noise_detected)
-    pub noise_detected: bool,
     // special fields
     // @@protoc_insertion_point(special_field:AudioMetrics.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -634,7 +426,7 @@ impl AudioMetrics {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(6);
+        let mut fields = ::std::vec::Vec::with_capacity(2);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "fps_received",
@@ -642,29 +434,9 @@ impl AudioMetrics {
             |m: &mut AudioMetrics| { &mut m.fps_received },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "audio_level",
-            |m: &AudioMetrics| { &m.audio_level },
-            |m: &mut AudioMetrics| { &mut m.audio_level },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "sample_rate",
-            |m: &AudioMetrics| { &m.sample_rate },
-            |m: &mut AudioMetrics| { &mut m.sample_rate },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "bitrate_kbps",
             |m: &AudioMetrics| { &m.bitrate_kbps },
             |m: &mut AudioMetrics| { &mut m.bitrate_kbps },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "echo_detected",
-            |m: &AudioMetrics| { &m.echo_detected },
-            |m: &mut AudioMetrics| { &mut m.echo_detected },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "noise_detected",
-            |m: &AudioMetrics| { &m.noise_detected },
-            |m: &mut AudioMetrics| { &mut m.noise_detected },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<AudioMetrics>(
             "AudioMetrics",
@@ -687,20 +459,8 @@ impl ::protobuf::Message for AudioMetrics {
                 13 => {
                     self.fps_received = is.read_float()?;
                 },
-                21 => {
-                    self.audio_level = is.read_float()?;
-                },
-                24 => {
-                    self.sample_rate = is.read_uint32()?;
-                },
-                32 => {
+                16 => {
                     self.bitrate_kbps = is.read_uint32()?;
-                },
-                40 => {
-                    self.echo_detected = is.read_bool()?;
-                },
-                48 => {
-                    self.noise_detected = is.read_bool()?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -717,20 +477,8 @@ impl ::protobuf::Message for AudioMetrics {
         if self.fps_received != 0. {
             my_size += 1 + 4;
         }
-        if self.audio_level != 0. {
-            my_size += 1 + 4;
-        }
-        if self.sample_rate != 0 {
-            my_size += ::protobuf::rt::uint32_size(3, self.sample_rate);
-        }
         if self.bitrate_kbps != 0 {
-            my_size += ::protobuf::rt::uint32_size(4, self.bitrate_kbps);
-        }
-        if self.echo_detected != false {
-            my_size += 1 + 1;
-        }
-        if self.noise_detected != false {
-            my_size += 1 + 1;
+            my_size += ::protobuf::rt::uint32_size(2, self.bitrate_kbps);
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -741,20 +489,8 @@ impl ::protobuf::Message for AudioMetrics {
         if self.fps_received != 0. {
             os.write_float(1, self.fps_received)?;
         }
-        if self.audio_level != 0. {
-            os.write_float(2, self.audio_level)?;
-        }
-        if self.sample_rate != 0 {
-            os.write_uint32(3, self.sample_rate)?;
-        }
         if self.bitrate_kbps != 0 {
-            os.write_uint32(4, self.bitrate_kbps)?;
-        }
-        if self.echo_detected != false {
-            os.write_bool(5, self.echo_detected)?;
-        }
-        if self.noise_detected != false {
-            os.write_bool(6, self.noise_detected)?;
+            os.write_uint32(2, self.bitrate_kbps)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -774,22 +510,14 @@ impl ::protobuf::Message for AudioMetrics {
 
     fn clear(&mut self) {
         self.fps_received = 0.;
-        self.audio_level = 0.;
-        self.sample_rate = 0;
         self.bitrate_kbps = 0;
-        self.echo_detected = false;
-        self.noise_detected = false;
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static AudioMetrics {
         static instance: AudioMetrics = AudioMetrics {
             fps_received: 0.,
-            audio_level: 0.,
-            sample_rate: 0,
             bitrate_kbps: 0,
-            echo_detected: false,
-            noise_detected: false,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -813,368 +541,67 @@ impl ::protobuf::reflect::ProtobufValue for AudioMetrics {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
-///  Quality hints that the receiver sends to the sender
-// @@protoc_insertion_point(message:QualityHints)
-#[derive(PartialEq,Clone,Default,Debug)]
-pub struct QualityHints {
-    // message fields
-    // @@protoc_insertion_point(field:QualityHints.target_bitrate_kbps)
-    pub target_bitrate_kbps: u32,
-    // @@protoc_insertion_point(field:QualityHints.preference)
-    pub preference: ::protobuf::EnumOrUnknown<quality_hints::QualityPreference>,
-    // special fields
-    // @@protoc_insertion_point(special_field:QualityHints.special_fields)
-    pub special_fields: ::protobuf::SpecialFields,
-}
-
-impl<'a> ::std::default::Default for &'a QualityHints {
-    fn default() -> &'a QualityHints {
-        <QualityHints as ::protobuf::Message>::default_instance()
-    }
-}
-
-impl QualityHints {
-    pub fn new() -> QualityHints {
-        ::std::default::Default::default()
-    }
-
-    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(2);
-        let mut oneofs = ::std::vec::Vec::with_capacity(0);
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "target_bitrate_kbps",
-            |m: &QualityHints| { &m.target_bitrate_kbps },
-            |m: &mut QualityHints| { &mut m.target_bitrate_kbps },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "preference",
-            |m: &QualityHints| { &m.preference },
-            |m: &mut QualityHints| { &mut m.preference },
-        ));
-        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<QualityHints>(
-            "QualityHints",
-            fields,
-            oneofs,
-        )
-    }
-}
-
-impl ::protobuf::Message for QualityHints {
-    const NAME: &'static str = "QualityHints";
-
-    fn is_initialized(&self) -> bool {
-        true
-    }
-
-    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
-        while let Some(tag) = is.read_raw_tag_or_eof()? {
-            match tag {
-                8 => {
-                    self.target_bitrate_kbps = is.read_uint32()?;
-                },
-                16 => {
-                    self.preference = is.read_enum_or_unknown()?;
-                },
-                tag => {
-                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
-                },
-            };
-        }
-        ::std::result::Result::Ok(())
-    }
-
-    // Compute sizes of nested messages
-    #[allow(unused_variables)]
-    fn compute_size(&self) -> u64 {
-        let mut my_size = 0;
-        if self.target_bitrate_kbps != 0 {
-            my_size += ::protobuf::rt::uint32_size(1, self.target_bitrate_kbps);
-        }
-        if self.preference != ::protobuf::EnumOrUnknown::new(quality_hints::QualityPreference::BALANCED) {
-            my_size += ::protobuf::rt::int32_size(2, self.preference.value());
-        }
-        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
-        self.special_fields.cached_size().set(my_size as u32);
-        my_size
-    }
-
-    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if self.target_bitrate_kbps != 0 {
-            os.write_uint32(1, self.target_bitrate_kbps)?;
-        }
-        if self.preference != ::protobuf::EnumOrUnknown::new(quality_hints::QualityPreference::BALANCED) {
-            os.write_enum(2, ::protobuf::EnumOrUnknown::value(&self.preference))?;
-        }
-        os.write_unknown_fields(self.special_fields.unknown_fields())?;
-        ::std::result::Result::Ok(())
-    }
-
-    fn special_fields(&self) -> &::protobuf::SpecialFields {
-        &self.special_fields
-    }
-
-    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
-        &mut self.special_fields
-    }
-
-    fn new() -> QualityHints {
-        QualityHints::new()
-    }
-
-    fn clear(&mut self) {
-        self.target_bitrate_kbps = 0;
-        self.preference = ::protobuf::EnumOrUnknown::new(quality_hints::QualityPreference::BALANCED);
-        self.special_fields.clear();
-    }
-
-    fn default_instance() -> &'static QualityHints {
-        static instance: QualityHints = QualityHints {
-            target_bitrate_kbps: 0,
-            preference: ::protobuf::EnumOrUnknown::from_i32(0),
-            special_fields: ::protobuf::SpecialFields::new(),
-        };
-        &instance
-    }
-}
-
-impl ::protobuf::MessageFull for QualityHints {
-    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
-        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
-        descriptor.get(|| file_descriptor().message_by_package_relative_name("QualityHints").unwrap()).clone()
-    }
-}
-
-impl ::std::fmt::Display for QualityHints {
-    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-        ::protobuf::text_format::fmt(self, f)
-    }
-}
-
-impl ::protobuf::reflect::ProtobufValue for QualityHints {
-    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
-}
-
-/// Nested message and enums of message `QualityHints`
-pub mod quality_hints {
-    #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
-    // @@protoc_insertion_point(enum:QualityHints.QualityPreference)
-    pub enum QualityPreference {
-        // @@protoc_insertion_point(enum_value:QualityHints.QualityPreference.BALANCED)
-        BALANCED = 0,
-        // @@protoc_insertion_point(enum_value:QualityHints.QualityPreference.PRIORITIZE_FRAMERATE)
-        PRIORITIZE_FRAMERATE = 1,
-        // @@protoc_insertion_point(enum_value:QualityHints.QualityPreference.PRIORITIZE_RESOLUTION)
-        PRIORITIZE_RESOLUTION = 2,
-        // @@protoc_insertion_point(enum_value:QualityHints.QualityPreference.PRIORITIZE_LOW_LATENCY)
-        PRIORITIZE_LOW_LATENCY = 3,
-    }
-
-    impl ::protobuf::Enum for QualityPreference {
-        const NAME: &'static str = "QualityPreference";
-
-        fn value(&self) -> i32 {
-            *self as i32
-        }
-
-        fn from_i32(value: i32) -> ::std::option::Option<QualityPreference> {
-            match value {
-                0 => ::std::option::Option::Some(QualityPreference::BALANCED),
-                1 => ::std::option::Option::Some(QualityPreference::PRIORITIZE_FRAMERATE),
-                2 => ::std::option::Option::Some(QualityPreference::PRIORITIZE_RESOLUTION),
-                3 => ::std::option::Option::Some(QualityPreference::PRIORITIZE_LOW_LATENCY),
-                _ => ::std::option::Option::None
-            }
-        }
-
-        fn from_str(str: &str) -> ::std::option::Option<QualityPreference> {
-            match str {
-                "BALANCED" => ::std::option::Option::Some(QualityPreference::BALANCED),
-                "PRIORITIZE_FRAMERATE" => ::std::option::Option::Some(QualityPreference::PRIORITIZE_FRAMERATE),
-                "PRIORITIZE_RESOLUTION" => ::std::option::Option::Some(QualityPreference::PRIORITIZE_RESOLUTION),
-                "PRIORITIZE_LOW_LATENCY" => ::std::option::Option::Some(QualityPreference::PRIORITIZE_LOW_LATENCY),
-                _ => ::std::option::Option::None
-            }
-        }
-
-        const VALUES: &'static [QualityPreference] = &[
-            QualityPreference::BALANCED,
-            QualityPreference::PRIORITIZE_FRAMERATE,
-            QualityPreference::PRIORITIZE_RESOLUTION,
-            QualityPreference::PRIORITIZE_LOW_LATENCY,
-        ];
-    }
-
-    impl ::protobuf::EnumFull for QualityPreference {
-        fn enum_descriptor() -> ::protobuf::reflect::EnumDescriptor {
-            static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::EnumDescriptor> = ::protobuf::rt::Lazy::new();
-            descriptor.get(|| super::file_descriptor().enum_by_package_relative_name("QualityHints.QualityPreference").unwrap()).clone()
-        }
-
-        fn descriptor(&self) -> ::protobuf::reflect::EnumValueDescriptor {
-            let index = *self as usize;
-            Self::enum_descriptor().value_by_index(index)
-        }
-    }
-
-    impl ::std::default::Default for QualityPreference {
-        fn default() -> Self {
-            QualityPreference::BALANCED
-        }
-    }
-
-    impl QualityPreference {
-        pub(in super) fn generated_enum_descriptor_data() -> ::protobuf::reflect::GeneratedEnumDescriptorData {
-            ::protobuf::reflect::GeneratedEnumDescriptorData::new::<QualityPreference>("QualityHints.QualityPreference")
-        }
-    }
-}
-
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1etypes/diagnostics_packet.proto\"\xc5\x04\n\x11DiagnosticsPacket\
-    \x12\x1b\n\tstream_id\x18\x01\x20\x01(\tR\x08streamId\x12\x1b\n\tsender_\
-    id\x18\x02\x20\x01(\tR\x08senderId\x12\x1b\n\ttarget_id\x18\x03\x20\x01(\
-    \tR\x08targetId\x12!\n\x0ctimestamp_ms\x18\x04\x20\x01(\x04R\x0btimestam\
-    pMs\x12;\n\nmedia_type\x18\x05\x20\x01(\x0e2\x1c.DiagnosticsPacket.Media\
-    TypeR\tmediaType\x12*\n\x11median_latency_ms\x18\x06\x20\x01(\rR\x0fmedi\
-    anLatencyMs\x12\x1b\n\tjitter_ms\x18\x07\x20\x01(\rR\x08jitterMs\x128\n\
-    \x18estimated_bandwidth_kbps\x18\x08\x20\x01(\rR\x16estimatedBandwidthKb\
-    ps\x12+\n\x12round_trip_time_ms\x18\t\x20\x01(\rR\x0froundTripTimeMs\x12\
-    2\n\rvideo_metrics\x18\n\x20\x01(\x0b2\r.VideoMetricsR\x0cvideoMetrics\
-    \x122\n\raudio_metrics\x18\x0b\x20\x01(\x0b2\r.AudioMetricsR\x0caudioMet\
-    rics\x122\n\rquality_hints\x18\x0c\x20\x01(\x0b2\r.QualityHintsR\x0cqual\
-    ityHints\"-\n\tMediaType\x12\t\n\x05VIDEO\x10\0\x12\t\n\x05AUDIO\x10\x01\
-    \x12\n\n\x06SCREEN\x10\x02\"\x9d\x01\n\x0cVideoMetrics\x12!\n\x0cfps_rec\
-    eived\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12!\n\x0cbitrate_kbps\x18\
-    \x02\x20\x01(\rR\x0bbitrateKbps\x12$\n\x0edecode_time_ms\x18\x03\x20\x01\
-    (\rR\x0cdecodeTimeMs\x12!\n\x0cfreeze_count\x18\x04\x20\x01(\rR\x0bfreez\
-    eCount\"\xe2\x01\n\x0cAudioMetrics\x12!\n\x0cfps_received\x18\x01\x20\
-    \x01(\x02R\x0bfpsReceived\x12\x1f\n\x0baudio_level\x18\x02\x20\x01(\x02R\
-    \naudioLevel\x12\x1f\n\x0bsample_rate\x18\x03\x20\x01(\rR\nsampleRate\
-    \x12!\n\x0cbitrate_kbps\x18\x04\x20\x01(\rR\x0bbitrateKbps\x12#\n\recho_\
-    detected\x18\x05\x20\x01(\x08R\x0cechoDetected\x12%\n\x0enoise_detected\
-    \x18\x06\x20\x01(\x08R\rnoiseDetected\"\xf3\x01\n\x0cQualityHints\x12.\n\
-    \x13target_bitrate_kbps\x18\x01\x20\x01(\rR\x11targetBitrateKbps\x12?\n\
-    \npreference\x18\x02\x20\x01(\x0e2\x1f.QualityHints.QualityPreferenceR\n\
-    preference\"r\n\x11QualityPreference\x12\x0c\n\x08BALANCED\x10\0\x12\x18\
-    \n\x14PRIORITIZE_FRAMERATE\x10\x01\x12\x19\n\x15PRIORITIZE_RESOLUTION\
-    \x10\x02\x12\x1a\n\x16PRIORITIZE_LOW_LATENCY\x10\x03J\xf9\x19\n\x06\x12\
-    \x04\0\0?\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\
-    \x02\0\x20\x01\n\n\n\x03\x04\0\x01\x12\x03\x02\x08\x19\nY\n\x04\x04\0\
-    \x02\0\x12\x03\x04\x02\x17\x1a\x16\x20Basic\x20identification\n\"4\x20Id\
-    entifier\x20for\x20the\x20specific\x20stream\x20being\x20diagnosed\n\n\
-    \x0c\n\x05\x04\0\x02\0\x05\x12\x03\x04\x02\x08\n\x0c\n\x05\x04\0\x02\0\
-    \x01\x12\x03\x04\t\x12\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x04\x15\x16\n\
-    A\n\x04\x04\0\x02\x01\x12\x03\x05\x02\x17\"4\x20Email/ID\x20of\x20who\
+    \n\x1etypes/diagnostics_packet.proto\x1a\x18types/media_packet.proto\"\
+    \xac\x02\n\x11DiagnosticsPacket\x12\x1b\n\tstream_id\x18\x01\x20\x01(\tR\
+    \x08streamId\x12\x1b\n\tsender_id\x18\x02\x20\x01(\tR\x08senderId\x12\
+    \x1b\n\ttarget_id\x18\x03\x20\x01(\tR\x08targetId\x12!\n\x0ctimestamp_ms\
+    \x18\x04\x20\x01(\x04R\x0btimestampMs\x125\n\nmedia_type\x18\x05\x20\x01\
+    (\x0e2\x16.MediaPacket.MediaTypeR\tmediaType\x122\n\rvideo_metrics\x18\
+    \x06\x20\x01(\x0b2\r.VideoMetricsR\x0cvideoMetrics\x122\n\raudio_metrics\
+    \x18\x07\x20\x01(\x0b2\r.AudioMetricsR\x0caudioMetrics\"T\n\x0cVideoMetr\
+    ics\x12!\n\x0cfps_received\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12!\n\
+    \x0cbitrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbps\"T\n\x0cAudioMetrics\
+    \x12!\n\x0cfps_received\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12!\n\x0cb\
+    itrate_kbps\x18\x02\x20\x01(\rR\x0bbitrateKbpsJ\xf9\n\n\x06\x12\x04\0\0\
+    \x1f\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n+\n\x02\x03\0\x12\x03\x03\0\"\
+    \x1a\x20\x20Import\x20the\x20MediaPacket\x20message\n\n\n\n\x02\x04\0\
+    \x12\x04\x05\0\x13\x01\n\n\n\x03\x04\0\x01\x12\x03\x05\x08\x19\nY\n\x04\
+    \x04\0\x02\0\x12\x03\x07\x02\x17\x1a\x16\x20Basic\x20identification\n\"4\
+    \x20Identifier\x20for\x20the\x20specific\x20stream\x20being\x20diagnosed\
+    \n\n\x0c\n\x05\x04\0\x02\0\x05\x12\x03\x07\x02\x08\n\x0c\n\x05\x04\0\x02\
+    \0\x01\x12\x03\x07\t\x12\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x07\x15\x16\
+    \nA\n\x04\x04\0\x02\x01\x12\x03\x08\x02\x17\"4\x20Email/ID\x20of\x20who\
     \x20is\x20sending\x20this\x20diagnostic\x20message\n\n\x0c\n\x05\x04\0\
-    \x02\x01\x05\x12\x03\x05\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\
-    \x05\t\x12\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x05\x15\x16\n6\n\x04\
-    \x04\0\x02\x02\x12\x03\x06\x02\x17\")\x20Email/ID\x20of\x20who\x20the\
-    \x20diagnostic\x20is\x20about\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\
-    \x06\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x06\t\x12\n\x0c\n\x05\
-    \x04\0\x02\x02\x03\x12\x03\x06\x15\x16\nO\n\x04\x04\0\x02\x03\x12\x03\
-    \x07\x02\x1a\"B\x20When\x20these\x20diagnostics\x20were\x20collected\x20\
-    (milliseconds\x20since\x20epoch)\n\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\
-    \x07\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x07\t\x15\n\x0c\n\x05\
-    \x04\0\x02\x03\x03\x12\x03\x07\x18\x19\n@\n\x04\x04\0\x02\x04\x12\x03\n\
-    \x02\x1b\x1a\r\x20Stream\x20type\n\"$\x20Type\x20of\x20media\x20(audio/v\
-    ideo/screen)\n\n\x0c\n\x05\x04\0\x02\x04\x06\x12\x03\n\x02\x0b\n\x0c\n\
-    \x05\x04\0\x02\x04\x01\x12\x03\n\x0c\x16\n\x0c\n\x05\x04\0\x02\x04\x03\
-    \x12\x03\n\x19\x1a\nb\n\x04\x04\0\x02\x05\x12\x03\r\x02\x1f\x1a)\x20Comm\
-    on\x20metrics\x20for\x20both\x20audio\x20and\x20video\n\"*\x20Median\x20\
-    end-to-end\x20latency\x20(milliseconds)\n\n\x0c\n\x05\x04\0\x02\x05\x05\
-    \x12\x03\r\x02\x08\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\r\t\x1a\n\x0c\n\
-    \x05\x04\0\x02\x05\x03\x12\x03\r\x1d\x1e\n$\n\x04\x04\0\x02\x06\x12\x03\
-    \x0e\x02\x17\"\x17\x20Jitter\x20(milliseconds)\n\n\x0c\n\x05\x04\0\x02\
-    \x06\x05\x12\x03\x0e\x02\x08\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x0e\t\
-    \x12\n\x0c\n\x05\x04\0\x02\x06\x03\x12\x03\x0e\x15\x16\nB\n\x04\x04\0\
-    \x02\x07\x12\x03\x0f\x02&\"5\x20Estimated\x20available\x20bandwidth\x20(\
-    kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\0\x02\x07\x05\x12\x03\x0f\
-    \x02\x08\n\x0c\n\x05\x04\0\x02\x07\x01\x12\x03\x0f\t!\n\x0c\n\x05\x04\0\
-    \x02\x07\x03\x12\x03\x0f$%\nI\n\x04\x04\0\x02\x08\x12\x03\x10\x02\x20\"<\
-    \x20Round-trip\x20time\x20between\x20sender\x20and\x20receiver\x20(milli\
-    seconds)\n\n\x0c\n\x05\x04\0\x02\x08\x05\x12\x03\x10\x02\x08\n\x0c\n\x05\
-    \x04\0\x02\x08\x01\x12\x03\x10\t\x1b\n\x0c\n\x05\x04\0\x02\x08\x03\x12\
-    \x03\x10\x1e\x1f\nH\n\x04\x04\0\x02\t\x12\x03\x13\x02\"\x1a;\x20Video-sp\
-    ecific\x20metrics\x20(only\x20populated\x20for\x20video\x20streams)\n\n\
-    \x0c\n\x05\x04\0\x02\t\x06\x12\x03\x13\x02\x0e\n\x0c\n\x05\x04\0\x02\t\
-    \x01\x12\x03\x13\x0f\x1c\n\x0c\n\x05\x04\0\x02\t\x03\x12\x03\x13\x1f!\nH\
-    \n\x04\x04\0\x02\n\x12\x03\x16\x02\"\x1a;\x20Audio-specific\x20metrics\
-    \x20(only\x20populated\x20for\x20audio\x20streams)\n\n\x0c\n\x05\x04\0\
-    \x02\n\x06\x12\x03\x16\x02\x0e\n\x0c\n\x05\x04\0\x02\n\x01\x12\x03\x16\
-    \x0f\x1c\n\x0c\n\x05\x04\0\x02\n\x03\x12\x03\x16\x1f!\n5\n\x04\x04\0\x02\
-    \x0b\x12\x03\x19\x02\"\x1a(\x20Quality\x20adaptation\x20hints\x20to\x20t\
-    he\x20sender\n\n\x0c\n\x05\x04\0\x02\x0b\x06\x12\x03\x19\x02\x0e\n\x0c\n\
-    \x05\x04\0\x02\x0b\x01\x12\x03\x19\x0f\x1c\n\x0c\n\x05\x04\0\x02\x0b\x03\
-    \x12\x03\x19\x1f!\n\x0c\n\x04\x04\0\x04\0\x12\x04\x1b\x02\x1f\x03\n\x0c\
-    \n\x05\x04\0\x04\0\x01\x12\x03\x1b\x07\x10\n\r\n\x06\x04\0\x04\0\x02\0\
-    \x12\x03\x1c\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x1c\x04\t\
-    \n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x1c\x0c\r\n\r\n\x06\x04\0\x04\
-    \0\x02\x01\x12\x03\x1d\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\
-    \x03\x1d\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x1d\x0c\r\n\r\
-    \n\x06\x04\0\x04\0\x02\x02\x12\x03\x1e\x04\x0f\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x02\x01\x12\x03\x1e\x04\n\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\
-    \x03\x1e\r\x0e\n/\n\x02\x04\x01\x12\x04#\0(\x01\x1a#\x20Video-specific\
-    \x20diagnostic\x20metrics\n\n\n\n\x03\x04\x01\x01\x12\x03#\x08\x14\n5\n\
-    \x04\x04\x01\x02\0\x12\x03$\x02\x19\"(\x20Frames\x20per\x20second\x20bei\
-    ng\x20received\x20(fps)\n\n\x0c\n\x05\x04\x01\x02\0\x05\x12\x03$\x02\x07\
-    \n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03$\x08\x14\n\x0c\n\x05\x04\x01\x02\
-    \0\x03\x12\x03$\x17\x18\n=\n\x04\x04\x01\x02\x01\x12\x03%\x02\x1a\"0\x20\
-    Current\x20measured\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\
-    \x05\x04\x01\x02\x01\x05\x12\x03%\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\
-    \x01\x12\x03%\t\x15\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03%\x18\x19\n?\
-    \n\x04\x04\x01\x02\x02\x12\x03&\x02\x1c\"2\x20Average\x20time\x20to\x20d\
-    ecode\x20each\x20frame\x20(milliseconds)\n\n\x0c\n\x05\x04\x01\x02\x02\
-    \x05\x12\x03&\x02\x08\n\x0c\n\x05\x04\x01\x02\x02\x01\x12\x03&\t\x17\n\
-    \x0c\n\x05\x04\x01\x02\x02\x03\x12\x03&\x1a\x1b\nK\n\x04\x04\x01\x02\x03\
-    \x12\x03'\x02\x1a\">\x20Number\x20of\x20video\x20freezes\x20in\x20the\
-    \x20last\x20reporting\x20period\x20(count)\n\n\x0c\n\x05\x04\x01\x02\x03\
-    \x05\x12\x03'\x02\x08\n\x0c\n\x05\x04\x01\x02\x03\x01\x12\x03'\t\x15\n\
-    \x0c\n\x05\x04\x01\x02\x03\x03\x12\x03'\x18\x19\n/\n\x02\x04\x02\x12\x04\
-    +\02\x01\x1a#\x20Audio-specific\x20diagnostic\x20metrics\n\n\n\n\x03\x04\
-    \x02\x01\x12\x03+\x08\x14\n5\n\x04\x04\x02\x02\0\x12\x03,\x02\x19\"(\x20\
-    Frames\x20per\x20second\x20being\x20received\x20(fps)\n\n\x0c\n\x05\x04\
-    \x02\x02\0\x05\x12\x03,\x02\x07\n\x0c\n\x05\x04\x02\x02\0\x01\x12\x03,\
-    \x08\x14\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x03,\x17\x18\n*\n\x04\x04\x02\
-    \x02\x01\x12\x03-\x02\x18\"\x1d\x20Audio\x20level\x20(0.0-1.0\x20scale)\
-    \n\n\x0c\n\x05\x04\x02\x02\x01\x05\x12\x03-\x02\x07\n\x0c\n\x05\x04\x02\
-    \x02\x01\x01\x12\x03-\x08\x13\n\x0c\n\x05\x04\x02\x02\x01\x03\x12\x03-\
-    \x16\x17\n\"\n\x04\x04\x02\x02\x02\x12\x03.\x02\x19\"\x15\x20Sample\x20r\
-    ate\x20(Hertz)\n\n\x0c\n\x05\x04\x02\x02\x02\x05\x12\x03.\x02\x08\n\x0c\
-    \n\x05\x04\x02\x02\x02\x01\x12\x03.\t\x14\n\x0c\n\x05\x04\x02\x02\x02\
-    \x03\x12\x03.\x17\x18\n=\n\x04\x04\x02\x02\x03\x12\x03/\x02\x1a\"0\x20Cu\
-    rrent\x20measured\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\
-    \x05\x04\x02\x02\x03\x05\x12\x03/\x02\x08\n\x0c\n\x05\x04\x02\x02\x03\
-    \x01\x12\x03/\t\x15\n\x0c\n\x05\x04\x02\x02\x03\x03\x12\x03/\x18\x19\n1\
-    \n\x04\x04\x02\x02\x04\x12\x030\x02\x19\"$\x20Whether\x20echo\x20is\x20d\
-    etected\x20(boolean)\n\n\x0c\n\x05\x04\x02\x02\x04\x05\x12\x030\x02\x06\
-    \n\x0c\n\x05\x04\x02\x02\x04\x01\x12\x030\x07\x14\n\x0c\n\x05\x04\x02\
-    \x02\x04\x03\x12\x030\x17\x18\n<\n\x04\x04\x02\x02\x05\x12\x031\x02\x1a\
-    \"/\x20Whether\x20excessive\x20noise\x20is\x20detected\x20(boolean)\n\n\
-    \x0c\n\x05\x04\x02\x02\x05\x05\x12\x031\x02\x06\n\x0c\n\x05\x04\x02\x02\
-    \x05\x01\x12\x031\x07\x15\n\x0c\n\x05\x04\x02\x02\x05\x03\x12\x031\x18\
-    \x19\nA\n\x02\x04\x03\x12\x045\0?\x01\x1a5\x20Quality\x20hints\x20that\
-    \x20the\x20receiver\x20sends\x20to\x20the\x20sender\n\n\n\n\x03\x04\x03\
-    \x01\x12\x035\x08\x14\n=\n\x04\x04\x03\x02\0\x12\x036\x02!\"0\x20Suggest\
-    ed\x20target\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\
-    \x03\x02\0\x05\x12\x036\x02\x08\n\x0c\n\x05\x04\x03\x02\0\x01\x12\x036\t\
-    \x1c\n\x0c\n\x05\x04\x03\x02\0\x03\x12\x036\x1f\x20\n(\n\x04\x04\x03\x02\
-    \x01\x12\x037\x02#\"\x1b\x20Quality\x20preference\x20(enum)\n\n\x0c\n\
-    \x05\x04\x03\x02\x01\x06\x12\x037\x02\x13\n\x0c\n\x05\x04\x03\x02\x01\
-    \x01\x12\x037\x14\x1e\n\x0c\n\x05\x04\x03\x02\x01\x03\x12\x037!\"\n\x0c\
-    \n\x04\x04\x03\x04\0\x12\x049\x02>\x03\n\x0c\n\x05\x04\x03\x04\0\x01\x12\
-    \x039\x07\x18\n9\n\x06\x04\x03\x04\0\x02\0\x12\x03:\x04\x11\"*\x20Balanc\
-    e\x20between\x20resolution\x20and\x20framerate\n\n\x0e\n\x07\x04\x03\x04\
-    \0\x02\0\x01\x12\x03:\x04\x0c\n\x0e\n\x07\x04\x03\x04\0\x02\0\x02\x12\
-    \x03:\x0f\x10\n8\n\x06\x04\x03\x04\0\x02\x01\x12\x03;\x04\x1d\")\x20Pref\
-    er\x20higher\x20framerate\x20over\x20resolution\n\n\x0e\n\x07\x04\x03\
-    \x04\0\x02\x01\x01\x12\x03;\x04\x18\n\x0e\n\x07\x04\x03\x04\0\x02\x01\
-    \x02\x12\x03;\x1b\x1c\n8\n\x06\x04\x03\x04\0\x02\x02\x12\x03<\x04\x1e\")\
-    \x20Prefer\x20higher\x20resolution\x20over\x20framerate\n\n\x0e\n\x07\
-    \x04\x03\x04\0\x02\x02\x01\x12\x03<\x04\x19\n\x0e\n\x07\x04\x03\x04\0\
-    \x02\x02\x02\x12\x03<\x1c\x1d\n/\n\x06\x04\x03\x04\0\x02\x03\x12\x03=\
-    \x04\x1f\"\x20\x20Prefer\x20lowest\x20possible\x20latency\n\n\x0e\n\x07\
-    \x04\x03\x04\0\x02\x03\x01\x12\x03=\x04\x1a\n\x0e\n\x07\x04\x03\x04\0\
-    \x02\x03\x02\x12\x03=\x1d\x1eb\x06proto3\
+    \x02\x01\x05\x12\x03\x08\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\
+    \x08\t\x12\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x08\x15\x16\n6\n\x04\
+    \x04\0\x02\x02\x12\x03\t\x02\x17\")\x20Email/ID\x20of\x20who\x20the\x20d\
+    iagnostic\x20is\x20about\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\t\x02\
+    \x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\t\t\x12\n\x0c\n\x05\x04\0\x02\
+    \x02\x03\x12\x03\t\x15\x16\nO\n\x04\x04\0\x02\x03\x12\x03\n\x02\x1a\"B\
+    \x20When\x20these\x20diagnostics\x20were\x20collected\x20(milliseconds\
+    \x20since\x20epoch)\n\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\n\x02\x08\n\
+    \x0c\n\x05\x04\0\x02\x03\x01\x12\x03\n\t\x15\n\x0c\n\x05\x04\0\x02\x03\
+    \x03\x12\x03\n\x18\x19\n1\n\x04\x04\0\x02\x04\x12\x03\x0c\x02'\"$\x20Typ\
+    e\x20of\x20media\x20(audio/video/screen)\n\n\x0c\n\x05\x04\0\x02\x04\x06\
+    \x12\x03\x0c\x02\x17\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x0c\x18\"\n\
+    \x0c\n\x05\x04\0\x02\x04\x03\x12\x03\x0c%&\nH\n\x04\x04\0\x02\x05\x12\
+    \x03\x0f\x02!\x1a;\x20Video-specific\x20metrics\x20(only\x20populated\
+    \x20for\x20video\x20streams)\n\n\x0c\n\x05\x04\0\x02\x05\x06\x12\x03\x0f\
+    \x02\x0e\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\x0f\x0f\x1c\n\x0c\n\x05\
+    \x04\0\x02\x05\x03\x12\x03\x0f\x1f\x20\nH\n\x04\x04\0\x02\x06\x12\x03\
+    \x12\x02!\x1a;\x20Audio-specific\x20metrics\x20(only\x20populated\x20for\
+    \x20audio\x20streams)\n\n\x0c\n\x05\x04\0\x02\x06\x06\x12\x03\x12\x02\
+    \x0e\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x12\x0f\x1c\n\x0c\n\x05\x04\0\
+    \x02\x06\x03\x12\x03\x12\x1f\x20\n/\n\x02\x04\x01\x12\x04\x16\0\x19\x01\
+    \x1a#\x20Video-specific\x20diagnostic\x20metrics\n\n\n\n\x03\x04\x01\x01\
+    \x12\x03\x16\x08\x14\n5\n\x04\x04\x01\x02\0\x12\x03\x17\x02\x19\"(\x20Fr\
+    ames\x20per\x20second\x20being\x20received\x20(fps)\n\n\x0c\n\x05\x04\
+    \x01\x02\0\x05\x12\x03\x17\x02\x07\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03\
+    \x17\x08\x14\n\x0c\n\x05\x04\x01\x02\0\x03\x12\x03\x17\x17\x18\n=\n\x04\
+    \x04\x01\x02\x01\x12\x03\x18\x02\x1a\"0\x20Current\x20measured\x20bitrat\
+    e\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x01\x02\x01\x05\x12\
+    \x03\x18\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\x01\x12\x03\x18\t\x15\n\x0c\
+    \n\x05\x04\x01\x02\x01\x03\x12\x03\x18\x18\x19\n/\n\x02\x04\x02\x12\x04\
+    \x1c\0\x1f\x01\x1a#\x20Audio-specific\x20diagnostic\x20metrics\n\n\n\n\
+    \x03\x04\x02\x01\x12\x03\x1c\x08\x14\n5\n\x04\x04\x02\x02\0\x12\x03\x1d\
+    \x02\x19\"(\x20Frames\x20per\x20second\x20being\x20received\x20(fps)\n\n\
+    \x0c\n\x05\x04\x02\x02\0\x05\x12\x03\x1d\x02\x07\n\x0c\n\x05\x04\x02\x02\
+    \0\x01\x12\x03\x1d\x08\x14\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x03\x1d\x17\
+    \x18\n=\n\x04\x04\x02\x02\x01\x12\x03\x1e\x02\x1a\"0\x20Current\x20measu\
+    red\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\x02\x02\
+    \x01\x05\x12\x03\x1e\x02\x08\n\x0c\n\x05\x04\x02\x02\x01\x01\x12\x03\x1e\
+    \t\x15\n\x0c\n\x05\x04\x02\x02\x01\x03\x12\x03\x1e\x18\x19b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -1191,15 +618,13 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     static file_descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::FileDescriptor> = ::protobuf::rt::Lazy::new();
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
-            let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(4);
+            let mut deps = ::std::vec::Vec::with_capacity(1);
+            deps.push(super::media_packet::file_descriptor().clone());
+            let mut messages = ::std::vec::Vec::with_capacity(3);
             messages.push(DiagnosticsPacket::generated_message_descriptor_data());
             messages.push(VideoMetrics::generated_message_descriptor_data());
             messages.push(AudioMetrics::generated_message_descriptor_data());
-            messages.push(QualityHints::generated_message_descriptor_data());
-            let mut enums = ::std::vec::Vec::with_capacity(2);
-            enums.push(diagnostics_packet::MediaType::generated_enum_descriptor_data());
-            enums.push(quality_hints::QualityPreference::generated_enum_descriptor_data());
+            let mut enums = ::std::vec::Vec::with_capacity(0);
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(
                 file_descriptor_proto(),
                 deps,

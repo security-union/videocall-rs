@@ -15,7 +15,7 @@ use web_sys::window;
 use yew::Callback;
 
 use videocall_types::protos::diagnostics_packet::{
-    self as diag, AudioMetrics, DiagnosticsPacket, VideoMetrics,
+    AudioMetrics, DiagnosticsPacket, VideoMetrics,
 };
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -423,13 +423,7 @@ impl DiagnosticWorker {
                 packet.sender_id = peer_id.clone();
                 packet.timestamp_ms = timestamp_ms;
 
-                let proto_media_type = match media_type {
-                    MediaType::VIDEO => diag::diagnostics_packet::MediaType::VIDEO,
-                    MediaType::SCREEN => diag::diagnostics_packet::MediaType::SCREEN,
-                    MediaType::AUDIO => diag::diagnostics_packet::MediaType::AUDIO,
-                    _ => continue,
-                };
-                packet.media_type = proto_media_type.into();
+                packet.media_type = (*media_type).into();
 
                 if *media_type == MediaType::AUDIO {
                     let mut audio_metrics = AudioMetrics::new();
@@ -575,15 +569,12 @@ impl StreamStats {
 
     fn update_from_packet(&mut self, packet: &DiagnosticsPacket, media_type: MediaType) {
         self.last_update = Date::now();
-        self.median_latency_ms = packet.median_latency_ms;
-        self.jitter_ms = packet.jitter_ms;
 
         self.estimated_bandwidth_kbps = match media_type {
             MediaType::VIDEO => packet.video_metrics.clone().unwrap().bitrate_kbps,
             MediaType::AUDIO => packet.audio_metrics.clone().unwrap().bitrate_kbps,
             _ => 0,
         };
-        self.round_trip_time_ms = packet.round_trip_time_ms;
     }
 
     fn is_stale(&self) -> bool {
@@ -737,11 +728,7 @@ impl SenderDiagnosticWorker {
             SenderDiagnosticEvent::DiagnosticPacketReceived(packet) => {
                 let sender_id = packet.sender_id.clone();
                 let target_id = packet.target_id.clone();
-                let media_type = match packet.media_type.enum_value_or_default() {
-                    diag::diagnostics_packet::MediaType::VIDEO => MediaType::VIDEO,
-                    diag::diagnostics_packet::MediaType::AUDIO => MediaType::AUDIO,
-                    diag::diagnostics_packet::MediaType::SCREEN => MediaType::SCREEN,
-                };
+                let media_type: MediaType = packet.media_type.enum_value_or_default();
 
                 if sender_id == self.userid {
                     let peer_stats = self.stream_stats.entry(target_id.clone()).or_default();

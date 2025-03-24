@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use js_sys::Date;
 
 use videocall_types::protos::diagnostics_packet::{
-    quality_hints::QualityPreference, DiagnosticsPacket,
+    DiagnosticsPacket,
 };
 
 /// EncoderControl is responsible for bridging the gap between the encoder and the
@@ -14,7 +14,6 @@ use videocall_types::protos::diagnostics_packet::{
 #[derive(Debug, Clone)]
 pub enum EncoderControl {
     UpdateBitrate { target_bitrate_kbps: u32 },
-    UpdateQualityPreference { preference: QualityPreference },
 }
 
 pub struct EncoderControlSender {
@@ -208,7 +207,7 @@ mod tests {
         packet.target_id = "test_target".to_string();
         packet.timestamp_ms = js_sys::Date::now() as u64;
         packet.media_type =
-            videocall_types::protos::diagnostics_packet::diagnostics_packet::MediaType::VIDEO
+            videocall_types::protos::media_packet::media_packet::MediaType::VIDEO
                 .into();
 
         let mut video_metrics = VideoMetrics::new();

@@ -60,12 +60,13 @@ impl Component for Host {
 
         // Create 3 callbacks for the 3 encoders
         let camera_callback = ctx.link().callback(Msg::CameraEncoderSettingsUpdated);
-        let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
-        let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
+        // TODO: add microphone and screen encoder callbacks to show encoder settings
+        // let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
+        // let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
 
         let mut camera = CameraEncoder::new(client.clone(), VIDEO_ELEMENT_ID, VIDEO_BITRATE_KBPS, camera_callback);
-        let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
-        let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
+        let microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
+        let screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
@@ -176,10 +177,10 @@ impl Component for Host {
                 ctx.props().on_encoder_settings_update.emit(settings);
                 true
             }
-            Msg::MicrophoneEncoderSettingsUpdated(settings) => {
+            Msg::MicrophoneEncoderSettingsUpdated(_settings) => {
                 true
             }
-            Msg::ScreenEncoderSettingsUpdated(settings) => {
+            Msg::ScreenEncoderSettingsUpdated(_settings) => {
                 true
             }
         }

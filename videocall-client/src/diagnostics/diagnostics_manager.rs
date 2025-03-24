@@ -728,9 +728,6 @@ impl SenderDiagnosticWorker {
                 let sender_id = packet.sender_id.clone();
                 let target_id = packet.target_id.clone();
                 let media_type: MediaType = packet.media_type.enum_value_or_default();
-
-                log::info!("Received diagnostic packet from {sender_id} to {target_id} with media type {media_type} {packet:?}");
-
                 if sender_id == self.userid {
                     let peer_stats = self.stream_stats.entry(target_id.clone()).or_default();
                     let stats = peer_stats

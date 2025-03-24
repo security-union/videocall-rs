@@ -83,6 +83,7 @@ impl EncoderControlSender {
         let fps_received = match media_type.enum_value_or_default() {
             MediaType::VIDEO => packet.video_metrics.as_ref().unwrap().fps_received as f64,
             MediaType::AUDIO => packet.audio_metrics.as_ref().unwrap().fps_received as f64,
+            MediaType::SCREEN => packet.video_metrics.as_ref().unwrap().fps_received as f64,
             _ => return None, // No video metrics available
         };
         let target_fps = self._current_fps.load(Ordering::Relaxed) as f64;

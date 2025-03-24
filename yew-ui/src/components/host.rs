@@ -33,6 +33,21 @@ pub struct Host {
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
+    pub encoder_settings: EncoderSettings,
+}
+
+pub struct EncoderSettings {
+    pub camera: Option<String>,
+    pub microphone: Option<String>,
+    pub screen: Option<String>,
+}
+
+/// Beautify the encoder settings for display.
+/// Keep in mind that this should contain 1 line per encoder.
+impl ToString for EncoderSettings {
+    fn to_string(&self) -> String {
+        format!("Camera: {}\nMic: {}\nScreen: {}", self.camera.clone().unwrap_or("None".to_string()), self.microphone.clone().unwrap_or("None".to_string()), self.screen.clone().unwrap_or("None".to_string()))
+    }
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -70,20 +85,20 @@ impl Component for Host {
             VIDEO_BITRATE_KBPS,
             camera_callback,
         );
-        let microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
-        let screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
+        let mut microphone = MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS);
+        let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS);
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
         camera.set_encoder_control(rx);
 
-        // let (tx, rx) = mpsc::unbounded();
-        // client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
-        // microphone.set_encoder_control(rx);
+        let (tx, rx) = mpsc::unbounded();
+        client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
+        microphone.set_encoder_control(rx);
 
-        // let (tx, rx) = mpsc::unbounded();
-        // client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
-        // screen.set_encoder_control(rx);
+        let (tx, rx) = mpsc::unbounded();
+        client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
+        screen.set_encoder_control(rx);
 
         Self {
             camera,
@@ -92,6 +107,11 @@ impl Component for Host {
             share_screen: ctx.props().share_screen,
             mic_enabled: ctx.props().mic_enabled,
             video_enabled: ctx.props().video_enabled,
+            encoder_settings: EncoderSettings {
+                camera: None,
+                microphone: None,
+                screen: None,
+            },
         }
     }
 
@@ -133,6 +153,8 @@ impl Component for Host {
             }
             Msg::DisableScreenShare => {
                 self.screen.stop();
+                self.encoder_settings.screen = None;
+                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
                 true
             }
             Msg::Start => true,
@@ -145,6 +167,8 @@ impl Component for Host {
             }
             Msg::DisableMicrophone => {
                 self.microphone.stop();
+                self.encoder_settings.microphone = None;
+                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
                 true
             }
             Msg::EnableVideo(should_enable) => {
@@ -156,6 +180,8 @@ impl Component for Host {
             }
             Msg::DisableVideo => {
                 self.camera.stop();
+                self.encoder_settings.camera = None;
+                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
                 true
             }
             Msg::AudioDeviceChanged(audio) => {
@@ -179,7 +205,9 @@ impl Component for Host {
                 false
             }
             Msg::CameraEncoderSettingsUpdated(settings) => {
-                ctx.props().on_encoder_settings_update.emit(settings);
+                // update the self.camera settings
+                self.encoder_settings.camera = Some(settings);
+                ctx.props().on_encoder_settings_update.emit(self.encoder_settings.to_string());
                 true
             } // Msg::MicrophoneEncoderSettingsUpdated(_settings) => {
               //     true

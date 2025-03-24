@@ -34,7 +34,7 @@ use super::transform::transform_audio_chunk;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::diagnostics::{EncoderControl, EncoderControlSender};
+use crate::diagnostics::EncoderControlSender;
 
 /// [MicrophoneEncoder] encodes the audio from a microphone and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///

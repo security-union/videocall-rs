@@ -24,14 +24,14 @@ git_release_enable = true
 [[package]]
 name = "bot"
 publish = false
-changelog_update = true
-git_release_enable = true
+changelog_update = false
+git_release_enable = false
 
 [[package]]
 name = "videocall-api"
 publish = false
-changelog_update = true
-git_release_enable = true
+changelog_update = false
+git_release_enable = false
 
 
 [changelog]

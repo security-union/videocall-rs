@@ -14,9 +14,7 @@ use wasm_bindgen::JsValue;
 use web_sys::window;
 use yew::Callback;
 
-use videocall_types::protos::diagnostics_packet::{
-    AudioMetrics, DiagnosticsPacket, VideoMetrics,
-};
+use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacket, VideoMetrics};
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
 

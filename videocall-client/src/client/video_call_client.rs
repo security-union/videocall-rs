@@ -11,7 +11,6 @@ use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -90,8 +89,8 @@ struct Inner {
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
-    _diagnostics: Option<Arc<DiagnosticManager>>,
-    sender_diagnostics: Option<Arc<SenderDiagnosticManager>>,
+    _diagnostics: Option<Rc<DiagnosticManager>>,
+    sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
 }
 
 /// The client struct for a video call connection.
@@ -105,7 +104,7 @@ pub struct VideoCallClient {
     options: VideoCallClientOptions,
     inner: Rc<RefCell<Inner>>,
     aes: Rc<Aes128State>,
-    _diagnostics: Option<Arc<DiagnosticManager>>,
+    _diagnostics: Option<Rc<DiagnosticManager>>,
 }
 
 impl PartialEq for VideoCallClient {
@@ -124,7 +123,7 @@ impl VideoCallClient {
 
         // Create diagnostics manager if enabled
         let diagnostics = if options.enable_diagnostics {
-            let diagnostics = Arc::new(DiagnosticManager::new(options.userid.clone()));
+            let diagnostics = Rc::new(DiagnosticManager::new(options.userid.clone()));
 
             // Set up diagnostics callback if provided
             if let Some(callback) = &options.on_diagnostics_update {
@@ -135,7 +134,7 @@ impl VideoCallClient {
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 let mut diag = DiagnosticManager::new(options.userid.clone());
                 diag.set_reporting_interval(interval);
-                let diagnostics = Arc::new(diag);
+                let diagnostics = Rc::new(diag);
 
                 // Set up diagnostics callback if provided
                 if let Some(callback) = &options.on_diagnostics_update {
@@ -152,7 +151,7 @@ impl VideoCallClient {
 
         // Create sender diagnostics manager if diagnostics are enabled
         let sender_diagnostics = if options.enable_diagnostics {
-            let sender_diagnostics = Arc::new(SenderDiagnosticManager::new(options.userid.clone()));
+            let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.userid.clone()));
 
             // Set up sender diagnostics callback if provided
             if let Some(callback) = &options.on_sender_stats_update {
@@ -294,7 +293,7 @@ impl VideoCallClient {
 
     fn create_peer_decoder_manager(
         opts: &VideoCallClientOptions,
-        diagnostics: Option<Arc<DiagnosticManager>>,
+        diagnostics: Option<Rc<DiagnosticManager>>,
     ) -> PeerDecodeManager {
         match diagnostics {
             Some(diagnostics) => {

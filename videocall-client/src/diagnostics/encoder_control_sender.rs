@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use js_sys::Date;
 
-use videocall_types::protos::diagnostics_packet::{
-    DiagnosticsPacket,
-};
+use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 
 /// EncoderControl is responsible for bridging the gap between the encoder and the
 /// diagnostics system.
@@ -200,8 +198,7 @@ mod tests {
         packet.target_id = "test_target".to_string();
         packet.timestamp_ms = js_sys::Date::now() as u64;
         packet.media_type =
-            videocall_types::protos::media_packet::media_packet::MediaType::VIDEO
-                .into();
+            videocall_types::protos::media_packet::media_packet::MediaType::VIDEO.into();
 
         let mut video_metrics = VideoMetrics::new();
         video_metrics.fps_received = fps;

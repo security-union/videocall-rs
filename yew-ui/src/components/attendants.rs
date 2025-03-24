@@ -339,9 +339,7 @@ impl Component for AttendantsComponent {
             peers.iter().take(CANVAS_LIMIT).cloned().collect(),
         );
 
-        let on_encoder_settings_update = ctx
-            .link()
-            .callback(WsAction::EncoderSettingsUpdated);
+        let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
         html! {
             <div id="main-container" class="meeting-page">

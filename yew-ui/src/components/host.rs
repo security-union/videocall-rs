@@ -46,7 +46,8 @@ pub struct EncoderSettings {
 /// Keep in mind that this should contain 1 line per encoder.
 impl std::fmt::Display for EncoderSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-      write!(f,
+        write!(
+            f,
             "Camera: {}\nMic: {}\nScreen: {}",
             self.camera.clone().unwrap_or("None".to_string()),
             self.microphone.clone().unwrap_or("None".to_string()),

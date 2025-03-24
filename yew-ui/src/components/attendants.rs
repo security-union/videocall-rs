@@ -341,7 +341,7 @@ impl Component for AttendantsComponent {
 
         let on_encoder_settings_update = ctx
             .link()
-            .callback(|settings| WsAction::EncoderSettingsUpdated(settings));
+            .callback(WsAction::EncoderSettingsUpdated);
 
         html! {
             <div id="main-container" class="meeting-page">

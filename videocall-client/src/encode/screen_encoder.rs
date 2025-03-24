@@ -43,6 +43,7 @@ use crate::diagnostics::EncoderControl;
 pub struct ScreenEncoder {
     client: VideoCallClient,
     state: EncoderState,
+    bitrate_kbps: u32,
 }
 
 impl ScreenEncoder {
@@ -51,10 +52,11 @@ impl ScreenEncoder {
     /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
-    pub fn new(client: VideoCallClient, _bitrate_kbps: u32) -> Self {
+    pub fn new(client: VideoCallClient, bitrate_kbps: u32) -> Self {
         Self {
             client,
             state: EncoderState::new(),
+            bitrate_kbps,
         }
     }
 
@@ -95,6 +97,7 @@ impl ScreenEncoder {
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
+        let bitrate_kbps = self.bitrate_kbps;
         let screen_output_handler = {
             let mut buffer: [u8; 150000] = [0; 150000];
             let mut sequence_number = 0;
@@ -143,7 +146,7 @@ impl ScreenEncoder {
             let screen_encoder = Box::new(VideoEncoder::new(&screen_encoder_init).unwrap());
             let mut screen_encoder_config =
                 VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
-            screen_encoder_config.bitrate(64_000f64);
+            screen_encoder_config.bitrate(bitrate_kbps as f64);
             screen_encoder_config.latency_mode(LatencyMode::Realtime);
             screen_encoder.configure(&screen_encoder_config);
 

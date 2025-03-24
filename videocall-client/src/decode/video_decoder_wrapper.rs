@@ -1,14 +1,15 @@
 use super::super::wrappers::EncodedVideoChunkTypeWrapper;
+use super::media_decoder_trait::MediaDecoderTrait;
 use js_sys::Uint8Array;
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::{
-    CodecState, EncodedVideoChunk, EncodedVideoChunkInit, VideoDecoder, VideoDecoderConfig,
+    CodecState, EncodedVideoChunk, EncodedVideoChunkInit, EncodedVideoChunkType, VideoDecoder, VideoDecoderConfig,
     VideoDecoderInit,
 };
 
-// Define the trait
+// Legacy trait kept for backward compatibility
 pub trait VideoDecoderTrait {
     fn new(init: &VideoDecoderInit) -> Result<Self, JsValue>
     where
@@ -22,7 +23,7 @@ pub trait VideoDecoderTrait {
 #[derive(Debug)]
 pub struct VideoDecoderWrapper(web_sys::VideoDecoder);
 
-// Implement the trait for the wrapper struct
+// Implement the original trait for backward compatibility
 impl VideoDecoderTrait for VideoDecoderWrapper {
     fn configure(&self, config: &VideoDecoderConfig) {
         self.0.configure(config);
@@ -41,10 +42,45 @@ impl VideoDecoderTrait for VideoDecoderWrapper {
     fn state(&self) -> CodecState {
         self.0.state()
     }
+    
     fn new(init: &VideoDecoderInit) -> Result<Self, JsValue>
     where
         Self: Sized,
     {
         VideoDecoder::new(init).map(VideoDecoderWrapper)
+    }
+}
+
+// Implement the general media decoder trait
+impl MediaDecoderTrait for VideoDecoderWrapper {
+    type InitType = VideoDecoderInit;
+    type ConfigType = VideoDecoderConfig;
+    
+    fn new(init: &Self::InitType) -> Result<Self, JsValue>
+    where
+        Self: Sized,
+    {
+        VideoDecoder::new(init).map(VideoDecoderWrapper)
+    }
+    
+    fn configure(&self, config: &Self::ConfigType) {
+        self.0.configure(config);
+    }
+    
+    fn decode(&self, packet: Arc<MediaPacket>) {
+        VideoDecoderTrait::decode(self, packet);
+    }
+    
+    fn state(&self) -> CodecState {
+        self.0.state()
+    }
+    
+    fn get_sequence_number(&self, packet: &MediaPacket) -> u64 {
+        packet.video_metadata.sequence
+    }
+    
+    fn is_keyframe(&self, packet: &MediaPacket) -> bool {
+        let chunk_type = EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0;
+        chunk_type == EncodedVideoChunkType::Key
     }
 }

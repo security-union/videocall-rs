@@ -553,7 +553,6 @@ pub enum SenderDiagnosticEvent {
 struct StreamStats {
     _media_type: MediaType,
     last_update: f64,
-    packet_loss_percent: f32,
     median_latency_ms: u32,
     jitter_ms: u32,
     estimated_bandwidth_kbps: u32,
@@ -563,10 +562,9 @@ struct StreamStats {
 
 impl StreamStats {
     fn new(peer_id: String, media_type: MediaType) -> Self {
-        Self {
+        StreamStats {
             _media_type: media_type,
             last_update: Date::now(),
-            packet_loss_percent: 0.0,
             median_latency_ms: 0,
             jitter_ms: 0,
             estimated_bandwidth_kbps: 0,
@@ -577,7 +575,6 @@ impl StreamStats {
 
     fn update_from_packet(&mut self, packet: &DiagnosticsPacket, media_type: MediaType) {
         self.last_update = Date::now();
-        self.packet_loss_percent = packet.packet_loss_percent;
         self.median_latency_ms = packet.median_latency_ms;
         self.jitter_ms = packet.jitter_ms;
 
@@ -833,11 +830,12 @@ impl SenderDiagnosticWorker {
 
     fn append_media_stats(&self, result: &mut String, media_str: &str, stats: &StreamStats) {
         result.push_str(&format!(
-            "  {}: Loss={:.1}% RTT={}ms BW={} kbit/s\n",
+            "{}: {} kbps, {} ms latency, {} ms jitter, {} ms RTT\n",
             media_str,
-            stats.packet_loss_percent,
+            stats.estimated_bandwidth_kbps,
+            stats.median_latency_ms,
+            stats.jitter_ms,
             stats.round_trip_time_ms,
-            stats.estimated_bandwidth_kbps
         ));
     }
 }

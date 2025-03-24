@@ -22,6 +22,7 @@ message AudioMetadata {
   uint32 audio_number_of_channels = 2;
   uint32 audio_number_of_frames = 3;
   float audio_sample_rate = 4;
+  uint64 sequence = 5;
 }
 
 message VideoMetadata {

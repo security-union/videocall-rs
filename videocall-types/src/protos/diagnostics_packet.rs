@@ -41,8 +41,6 @@ pub struct DiagnosticsPacket {
     // @@protoc_insertion_point(field:DiagnosticsPacket.media_type)
     pub media_type: ::protobuf::EnumOrUnknown<diagnostics_packet::MediaType>,
     ///  Common metrics for both audio and video
-    // @@protoc_insertion_point(field:DiagnosticsPacket.packet_loss_percent)
-    pub packet_loss_percent: f32,
     // @@protoc_insertion_point(field:DiagnosticsPacket.median_latency_ms)
     pub median_latency_ms: u32,
     // @@protoc_insertion_point(field:DiagnosticsPacket.jitter_ms)
@@ -77,7 +75,7 @@ impl DiagnosticsPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(13);
+        let mut fields = ::std::vec::Vec::with_capacity(12);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "stream_id",
@@ -103,11 +101,6 @@ impl DiagnosticsPacket {
             "media_type",
             |m: &DiagnosticsPacket| { &m.media_type },
             |m: &mut DiagnosticsPacket| { &mut m.media_type },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "packet_loss_percent",
-            |m: &DiagnosticsPacket| { &m.packet_loss_percent },
-            |m: &mut DiagnosticsPacket| { &mut m.packet_loss_percent },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "median_latency_ms",
@@ -177,19 +170,16 @@ impl ::protobuf::Message for DiagnosticsPacket {
                 40 => {
                     self.media_type = is.read_enum_or_unknown()?;
                 },
-                53 => {
-                    self.packet_loss_percent = is.read_float()?;
-                },
-                56 => {
+                48 => {
                     self.median_latency_ms = is.read_uint32()?;
                 },
-                64 => {
+                56 => {
                     self.jitter_ms = is.read_uint32()?;
                 },
-                72 => {
+                64 => {
                     self.estimated_bandwidth_kbps = is.read_uint32()?;
                 },
-                104 => {
+                72 => {
                     self.round_trip_time_ms = is.read_uint32()?;
                 },
                 82 => {
@@ -228,20 +218,17 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if self.media_type != ::protobuf::EnumOrUnknown::new(diagnostics_packet::MediaType::VIDEO) {
             my_size += ::protobuf::rt::int32_size(5, self.media_type.value());
         }
-        if self.packet_loss_percent != 0. {
-            my_size += 1 + 4;
-        }
         if self.median_latency_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(7, self.median_latency_ms);
+            my_size += ::protobuf::rt::uint32_size(6, self.median_latency_ms);
         }
         if self.jitter_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(8, self.jitter_ms);
+            my_size += ::protobuf::rt::uint32_size(7, self.jitter_ms);
         }
         if self.estimated_bandwidth_kbps != 0 {
-            my_size += ::protobuf::rt::uint32_size(9, self.estimated_bandwidth_kbps);
+            my_size += ::protobuf::rt::uint32_size(8, self.estimated_bandwidth_kbps);
         }
         if self.round_trip_time_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(13, self.round_trip_time_ms);
+            my_size += ::protobuf::rt::uint32_size(9, self.round_trip_time_ms);
         }
         if let Some(v) = self.video_metrics.as_ref() {
             let len = v.compute_size();
@@ -276,20 +263,17 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if self.media_type != ::protobuf::EnumOrUnknown::new(diagnostics_packet::MediaType::VIDEO) {
             os.write_enum(5, ::protobuf::EnumOrUnknown::value(&self.media_type))?;
         }
-        if self.packet_loss_percent != 0. {
-            os.write_float(6, self.packet_loss_percent)?;
-        }
         if self.median_latency_ms != 0 {
-            os.write_uint32(7, self.median_latency_ms)?;
+            os.write_uint32(6, self.median_latency_ms)?;
         }
         if self.jitter_ms != 0 {
-            os.write_uint32(8, self.jitter_ms)?;
+            os.write_uint32(7, self.jitter_ms)?;
         }
         if self.estimated_bandwidth_kbps != 0 {
-            os.write_uint32(9, self.estimated_bandwidth_kbps)?;
+            os.write_uint32(8, self.estimated_bandwidth_kbps)?;
         }
         if self.round_trip_time_ms != 0 {
-            os.write_uint32(13, self.round_trip_time_ms)?;
+            os.write_uint32(9, self.round_trip_time_ms)?;
         }
         if let Some(v) = self.video_metrics.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(10, v, os)?;
@@ -322,7 +306,6 @@ impl ::protobuf::Message for DiagnosticsPacket {
         self.target_id.clear();
         self.timestamp_ms = 0;
         self.media_type = ::protobuf::EnumOrUnknown::new(diagnostics_packet::MediaType::VIDEO);
-        self.packet_loss_percent = 0.;
         self.median_latency_ms = 0;
         self.jitter_ms = 0;
         self.estimated_bandwidth_kbps = 0;
@@ -340,7 +323,6 @@ impl ::protobuf::Message for DiagnosticsPacket {
             target_id: ::std::string::String::new(),
             timestamp_ms: 0,
             media_type: ::protobuf::EnumOrUnknown::from_i32(0),
-            packet_loss_percent: 0.,
             median_latency_ms: 0,
             jitter_ms: 0,
             estimated_bandwidth_kbps: 0,
@@ -448,18 +430,12 @@ pub struct VideoMetrics {
     // message fields
     // @@protoc_insertion_point(field:VideoMetrics.fps_received)
     pub fps_received: f32,
-    // @@protoc_insertion_point(field:VideoMetrics.width)
-    pub width: u32,
-    // @@protoc_insertion_point(field:VideoMetrics.height)
-    pub height: u32,
     // @@protoc_insertion_point(field:VideoMetrics.bitrate_kbps)
     pub bitrate_kbps: u32,
     // @@protoc_insertion_point(field:VideoMetrics.decode_time_ms)
     pub decode_time_ms: u32,
     // @@protoc_insertion_point(field:VideoMetrics.freeze_count)
     pub freeze_count: u32,
-    // @@protoc_insertion_point(field:VideoMetrics.keyframes_received)
-    pub keyframes_received: u32,
     // special fields
     // @@protoc_insertion_point(special_field:VideoMetrics.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -477,22 +453,12 @@ impl VideoMetrics {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(7);
+        let mut fields = ::std::vec::Vec::with_capacity(4);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "fps_received",
             |m: &VideoMetrics| { &m.fps_received },
             |m: &mut VideoMetrics| { &mut m.fps_received },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "width",
-            |m: &VideoMetrics| { &m.width },
-            |m: &mut VideoMetrics| { &mut m.width },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "height",
-            |m: &VideoMetrics| { &m.height },
-            |m: &mut VideoMetrics| { &mut m.height },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "bitrate_kbps",
@@ -508,11 +474,6 @@ impl VideoMetrics {
             "freeze_count",
             |m: &VideoMetrics| { &m.freeze_count },
             |m: &mut VideoMetrics| { &mut m.freeze_count },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "keyframes_received",
-            |m: &VideoMetrics| { &m.keyframes_received },
-            |m: &mut VideoMetrics| { &mut m.keyframes_received },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<VideoMetrics>(
             "VideoMetrics",
@@ -536,22 +497,13 @@ impl ::protobuf::Message for VideoMetrics {
                     self.fps_received = is.read_float()?;
                 },
                 16 => {
-                    self.width = is.read_uint32()?;
-                },
-                24 => {
-                    self.height = is.read_uint32()?;
-                },
-                32 => {
                     self.bitrate_kbps = is.read_uint32()?;
                 },
-                40 => {
+                24 => {
                     self.decode_time_ms = is.read_uint32()?;
                 },
-                48 => {
+                32 => {
                     self.freeze_count = is.read_uint32()?;
-                },
-                56 => {
-                    self.keyframes_received = is.read_uint32()?;
                 },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
@@ -568,23 +520,14 @@ impl ::protobuf::Message for VideoMetrics {
         if self.fps_received != 0. {
             my_size += 1 + 4;
         }
-        if self.width != 0 {
-            my_size += ::protobuf::rt::uint32_size(2, self.width);
-        }
-        if self.height != 0 {
-            my_size += ::protobuf::rt::uint32_size(3, self.height);
-        }
         if self.bitrate_kbps != 0 {
-            my_size += ::protobuf::rt::uint32_size(4, self.bitrate_kbps);
+            my_size += ::protobuf::rt::uint32_size(2, self.bitrate_kbps);
         }
         if self.decode_time_ms != 0 {
-            my_size += ::protobuf::rt::uint32_size(5, self.decode_time_ms);
+            my_size += ::protobuf::rt::uint32_size(3, self.decode_time_ms);
         }
         if self.freeze_count != 0 {
-            my_size += ::protobuf::rt::uint32_size(6, self.freeze_count);
-        }
-        if self.keyframes_received != 0 {
-            my_size += ::protobuf::rt::uint32_size(7, self.keyframes_received);
+            my_size += ::protobuf::rt::uint32_size(4, self.freeze_count);
         }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
@@ -595,23 +538,14 @@ impl ::protobuf::Message for VideoMetrics {
         if self.fps_received != 0. {
             os.write_float(1, self.fps_received)?;
         }
-        if self.width != 0 {
-            os.write_uint32(2, self.width)?;
-        }
-        if self.height != 0 {
-            os.write_uint32(3, self.height)?;
-        }
         if self.bitrate_kbps != 0 {
-            os.write_uint32(4, self.bitrate_kbps)?;
+            os.write_uint32(2, self.bitrate_kbps)?;
         }
         if self.decode_time_ms != 0 {
-            os.write_uint32(5, self.decode_time_ms)?;
+            os.write_uint32(3, self.decode_time_ms)?;
         }
         if self.freeze_count != 0 {
-            os.write_uint32(6, self.freeze_count)?;
-        }
-        if self.keyframes_received != 0 {
-            os.write_uint32(7, self.keyframes_received)?;
+            os.write_uint32(4, self.freeze_count)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -631,24 +565,18 @@ impl ::protobuf::Message for VideoMetrics {
 
     fn clear(&mut self) {
         self.fps_received = 0.;
-        self.width = 0;
-        self.height = 0;
         self.bitrate_kbps = 0;
         self.decode_time_ms = 0;
         self.freeze_count = 0;
-        self.keyframes_received = 0;
         self.special_fields.clear();
     }
 
     fn default_instance() -> &'static VideoMetrics {
         static instance: VideoMetrics = VideoMetrics {
             fps_received: 0.,
-            width: 0,
-            height: 0,
             bitrate_kbps: 0,
             decode_time_ms: 0,
             freeze_count: 0,
-            keyframes_received: 0,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -685,10 +613,6 @@ pub struct AudioMetrics {
     pub sample_rate: u32,
     // @@protoc_insertion_point(field:AudioMetrics.bitrate_kbps)
     pub bitrate_kbps: u32,
-    // @@protoc_insertion_point(field:AudioMetrics.channels)
-    pub channels: u32,
-    // @@protoc_insertion_point(field:AudioMetrics.packets_lost)
-    pub packets_lost: u32,
     // @@protoc_insertion_point(field:AudioMetrics.echo_detected)
     pub echo_detected: bool,
     // @@protoc_insertion_point(field:AudioMetrics.noise_detected)
@@ -710,7 +634,7 @@ impl AudioMetrics {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(8);
+        let mut fields = ::std::vec::Vec::with_capacity(6);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "fps_received",
@@ -731,16 +655,6 @@ impl AudioMetrics {
             "bitrate_kbps",
             |m: &AudioMetrics| { &m.bitrate_kbps },
             |m: &mut AudioMetrics| { &mut m.bitrate_kbps },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "channels",
-            |m: &AudioMetrics| { &m.channels },
-            |m: &mut AudioMetrics| { &mut m.channels },
-        ));
-        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
-            "packets_lost",
-            |m: &AudioMetrics| { &m.packets_lost },
-            |m: &mut AudioMetrics| { &mut m.packets_lost },
         ));
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "echo_detected",
@@ -783,15 +697,9 @@ impl ::protobuf::Message for AudioMetrics {
                     self.bitrate_kbps = is.read_uint32()?;
                 },
                 40 => {
-                    self.channels = is.read_uint32()?;
-                },
-                48 => {
-                    self.packets_lost = is.read_uint32()?;
-                },
-                56 => {
                     self.echo_detected = is.read_bool()?;
                 },
-                64 => {
+                48 => {
                     self.noise_detected = is.read_bool()?;
                 },
                 tag => {
@@ -818,12 +726,6 @@ impl ::protobuf::Message for AudioMetrics {
         if self.bitrate_kbps != 0 {
             my_size += ::protobuf::rt::uint32_size(4, self.bitrate_kbps);
         }
-        if self.channels != 0 {
-            my_size += ::protobuf::rt::uint32_size(5, self.channels);
-        }
-        if self.packets_lost != 0 {
-            my_size += ::protobuf::rt::uint32_size(6, self.packets_lost);
-        }
         if self.echo_detected != false {
             my_size += 1 + 1;
         }
@@ -848,17 +750,11 @@ impl ::protobuf::Message for AudioMetrics {
         if self.bitrate_kbps != 0 {
             os.write_uint32(4, self.bitrate_kbps)?;
         }
-        if self.channels != 0 {
-            os.write_uint32(5, self.channels)?;
-        }
-        if self.packets_lost != 0 {
-            os.write_uint32(6, self.packets_lost)?;
-        }
         if self.echo_detected != false {
-            os.write_bool(7, self.echo_detected)?;
+            os.write_bool(5, self.echo_detected)?;
         }
         if self.noise_detected != false {
-            os.write_bool(8, self.noise_detected)?;
+            os.write_bool(6, self.noise_detected)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -881,8 +777,6 @@ impl ::protobuf::Message for AudioMetrics {
         self.audio_level = 0.;
         self.sample_rate = 0;
         self.bitrate_kbps = 0;
-        self.channels = 0;
-        self.packets_lost = 0;
         self.echo_detected = false;
         self.noise_detected = false;
         self.special_fields.clear();
@@ -894,8 +788,6 @@ impl ::protobuf::Message for AudioMetrics {
             audio_level: 0.,
             sample_rate: 0,
             bitrate_kbps: 0,
-            channels: 0,
-            packets_lost: 0,
             echo_detected: false,
             noise_detected: false,
             special_fields: ::protobuf::SpecialFields::new(),
@@ -1138,177 +1030,151 @@ pub mod quality_hints {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1etypes/diagnostics_packet.proto\"\xf5\x04\n\x11DiagnosticsPacket\
+    \n\x1etypes/diagnostics_packet.proto\"\xc5\x04\n\x11DiagnosticsPacket\
     \x12\x1b\n\tstream_id\x18\x01\x20\x01(\tR\x08streamId\x12\x1b\n\tsender_\
     id\x18\x02\x20\x01(\tR\x08senderId\x12\x1b\n\ttarget_id\x18\x03\x20\x01(\
     \tR\x08targetId\x12!\n\x0ctimestamp_ms\x18\x04\x20\x01(\x04R\x0btimestam\
     pMs\x12;\n\nmedia_type\x18\x05\x20\x01(\x0e2\x1c.DiagnosticsPacket.Media\
-    TypeR\tmediaType\x12.\n\x13packet_loss_percent\x18\x06\x20\x01(\x02R\x11\
-    packetLossPercent\x12*\n\x11median_latency_ms\x18\x07\x20\x01(\rR\x0fmed\
-    ianLatencyMs\x12\x1b\n\tjitter_ms\x18\x08\x20\x01(\rR\x08jitterMs\x128\n\
-    \x18estimated_bandwidth_kbps\x18\t\x20\x01(\rR\x16estimatedBandwidthKbps\
-    \x12+\n\x12round_trip_time_ms\x18\r\x20\x01(\rR\x0froundTripTimeMs\x122\
-    \n\rvideo_metrics\x18\n\x20\x01(\x0b2\r.VideoMetricsR\x0cvideoMetrics\
+    TypeR\tmediaType\x12*\n\x11median_latency_ms\x18\x06\x20\x01(\rR\x0fmedi\
+    anLatencyMs\x12\x1b\n\tjitter_ms\x18\x07\x20\x01(\rR\x08jitterMs\x128\n\
+    \x18estimated_bandwidth_kbps\x18\x08\x20\x01(\rR\x16estimatedBandwidthKb\
+    ps\x12+\n\x12round_trip_time_ms\x18\t\x20\x01(\rR\x0froundTripTimeMs\x12\
+    2\n\rvideo_metrics\x18\n\x20\x01(\x0b2\r.VideoMetricsR\x0cvideoMetrics\
     \x122\n\raudio_metrics\x18\x0b\x20\x01(\x0b2\r.AudioMetricsR\x0caudioMet\
     rics\x122\n\rquality_hints\x18\x0c\x20\x01(\x0b2\r.QualityHintsR\x0cqual\
     ityHints\"-\n\tMediaType\x12\t\n\x05VIDEO\x10\0\x12\t\n\x05AUDIO\x10\x01\
-    \x12\n\n\x06SCREEN\x10\x02\"\xfa\x01\n\x0cVideoMetrics\x12!\n\x0cfps_rec\
-    eived\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12\x14\n\x05width\x18\x02\
-    \x20\x01(\rR\x05width\x12\x16\n\x06height\x18\x03\x20\x01(\rR\x06height\
-    \x12!\n\x0cbitrate_kbps\x18\x04\x20\x01(\rR\x0bbitrateKbps\x12$\n\x0edec\
-    ode_time_ms\x18\x05\x20\x01(\rR\x0cdecodeTimeMs\x12!\n\x0cfreeze_count\
-    \x18\x06\x20\x01(\rR\x0bfreezeCount\x12-\n\x12keyframes_received\x18\x07\
-    \x20\x01(\rR\x11keyframesReceived\"\xa1\x02\n\x0cAudioMetrics\x12!\n\x0c\
-    fps_received\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12\x1f\n\x0baudio_lev\
-    el\x18\x02\x20\x01(\x02R\naudioLevel\x12\x1f\n\x0bsample_rate\x18\x03\
-    \x20\x01(\rR\nsampleRate\x12!\n\x0cbitrate_kbps\x18\x04\x20\x01(\rR\x0bb\
-    itrateKbps\x12\x1a\n\x08channels\x18\x05\x20\x01(\rR\x08channels\x12!\n\
-    \x0cpackets_lost\x18\x06\x20\x01(\rR\x0bpacketsLost\x12#\n\recho_detecte\
-    d\x18\x07\x20\x01(\x08R\x0cechoDetected\x12%\n\x0enoise_detected\x18\x08\
-    \x20\x01(\x08R\rnoiseDetected\"\xf3\x01\n\x0cQualityHints\x12.\n\x13targ\
-    et_bitrate_kbps\x18\x01\x20\x01(\rR\x11targetBitrateKbps\x12?\n\nprefere\
-    nce\x18\x02\x20\x01(\x0e2\x1f.QualityHints.QualityPreferenceR\npreferenc\
-    e\"r\n\x11QualityPreference\x12\x0c\n\x08BALANCED\x10\0\x12\x18\n\x14PRI\
-    ORITIZE_FRAMERATE\x10\x01\x12\x19\n\x15PRIORITIZE_RESOLUTION\x10\x02\x12\
-    \x1a\n\x16PRIORITIZE_LOW_LATENCY\x10\x03J\xcf\x1e\n\x06\x12\x04\0\0E\x01\
-    \n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0!\x01\n\n\
-    \n\x03\x04\0\x01\x12\x03\x02\x08\x19\nY\n\x04\x04\0\x02\0\x12\x03\x04\
-    \x02\x17\x1a\x16\x20Basic\x20identification\n\"4\x20Identifier\x20for\
-    \x20the\x20specific\x20stream\x20being\x20diagnosed\n\n\x0c\n\x05\x04\0\
-    \x02\0\x05\x12\x03\x04\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x04\t\
-    \x12\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x04\x15\x16\nA\n\x04\x04\0\x02\
-    \x01\x12\x03\x05\x02\x17\"4\x20Email/ID\x20of\x20who\x20is\x20sending\
-    \x20this\x20diagnostic\x20message\n\n\x0c\n\x05\x04\0\x02\x01\x05\x12\
-    \x03\x05\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x05\t\x12\n\x0c\n\
-    \x05\x04\0\x02\x01\x03\x12\x03\x05\x15\x16\n6\n\x04\x04\0\x02\x02\x12\
-    \x03\x06\x02\x17\")\x20Email/ID\x20of\x20who\x20the\x20diagnostic\x20is\
-    \x20about\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x06\x02\x08\n\x0c\n\
-    \x05\x04\0\x02\x02\x01\x12\x03\x06\t\x12\n\x0c\n\x05\x04\0\x02\x02\x03\
-    \x12\x03\x06\x15\x16\nO\n\x04\x04\0\x02\x03\x12\x03\x07\x02\x1a\"B\x20Wh\
-    en\x20these\x20diagnostics\x20were\x20collected\x20(milliseconds\x20sinc\
-    e\x20epoch)\n\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\x07\x02\x08\n\x0c\n\
-    \x05\x04\0\x02\x03\x01\x12\x03\x07\t\x15\n\x0c\n\x05\x04\0\x02\x03\x03\
-    \x12\x03\x07\x18\x19\n@\n\x04\x04\0\x02\x04\x12\x03\n\x02\x1b\x1a\r\x20S\
-    tream\x20type\n\"$\x20Type\x20of\x20media\x20(audio/video/screen)\n\n\
-    \x0c\n\x05\x04\0\x02\x04\x06\x12\x03\n\x02\x0b\n\x0c\n\x05\x04\0\x02\x04\
-    \x01\x12\x03\n\x0c\x16\n\x0c\n\x05\x04\0\x02\x04\x03\x12\x03\n\x19\x1a\n\
-    ]\n\x04\x04\0\x02\x05\x12\x03\r\x02\x20\x1a)\x20Common\x20metrics\x20for\
-    \x20both\x20audio\x20and\x20video\n\"%\x20Percentage\x20of\x20packets\
-    \x20lost\x20(0-100%)\n\n\x0c\n\x05\x04\0\x02\x05\x05\x12\x03\r\x02\x07\n\
-    \x0c\n\x05\x04\0\x02\x05\x01\x12\x03\r\x08\x1b\n\x0c\n\x05\x04\0\x02\x05\
-    \x03\x12\x03\r\x1e\x1f\n7\n\x04\x04\0\x02\x06\x12\x03\x0e\x02\x1f\"*\x20\
-    Median\x20end-to-end\x20latency\x20(milliseconds)\n\n\x0c\n\x05\x04\0\
-    \x02\x06\x05\x12\x03\x0e\x02\x08\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\
-    \x0e\t\x1a\n\x0c\n\x05\x04\0\x02\x06\x03\x12\x03\x0e\x1d\x1e\n$\n\x04\
-    \x04\0\x02\x07\x12\x03\x0f\x02\x17\"\x17\x20Jitter\x20(milliseconds)\n\n\
-    \x0c\n\x05\x04\0\x02\x07\x05\x12\x03\x0f\x02\x08\n\x0c\n\x05\x04\0\x02\
-    \x07\x01\x12\x03\x0f\t\x12\n\x0c\n\x05\x04\0\x02\x07\x03\x12\x03\x0f\x15\
-    \x16\nB\n\x04\x04\0\x02\x08\x12\x03\x10\x02&\"5\x20Estimated\x20availabl\
-    e\x20bandwidth\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\0\x02\
-    \x08\x05\x12\x03\x10\x02\x08\n\x0c\n\x05\x04\0\x02\x08\x01\x12\x03\x10\t\
-    !\n\x0c\n\x05\x04\0\x02\x08\x03\x12\x03\x10$%\nI\n\x04\x04\0\x02\t\x12\
-    \x03\x11\x02!\"<\x20Round-trip\x20time\x20between\x20sender\x20and\x20re\
-    ceiver\x20(milliseconds)\n\n\x0c\n\x05\x04\0\x02\t\x05\x12\x03\x11\x02\
-    \x08\n\x0c\n\x05\x04\0\x02\t\x01\x12\x03\x11\t\x1b\n\x0c\n\x05\x04\0\x02\
-    \t\x03\x12\x03\x11\x1e\x20\nH\n\x04\x04\0\x02\n\x12\x03\x14\x02\"\x1a;\
-    \x20Video-specific\x20metrics\x20(only\x20populated\x20for\x20video\x20s\
-    treams)\n\n\x0c\n\x05\x04\0\x02\n\x06\x12\x03\x14\x02\x0e\n\x0c\n\x05\
-    \x04\0\x02\n\x01\x12\x03\x14\x0f\x1c\n\x0c\n\x05\x04\0\x02\n\x03\x12\x03\
-    \x14\x1f!\nH\n\x04\x04\0\x02\x0b\x12\x03\x17\x02\"\x1a;\x20Audio-specifi\
-    c\x20metrics\x20(only\x20populated\x20for\x20audio\x20streams)\n\n\x0c\n\
-    \x05\x04\0\x02\x0b\x06\x12\x03\x17\x02\x0e\n\x0c\n\x05\x04\0\x02\x0b\x01\
-    \x12\x03\x17\x0f\x1c\n\x0c\n\x05\x04\0\x02\x0b\x03\x12\x03\x17\x1f!\n5\n\
-    \x04\x04\0\x02\x0c\x12\x03\x1a\x02\"\x1a(\x20Quality\x20adaptation\x20hi\
-    nts\x20to\x20the\x20sender\n\n\x0c\n\x05\x04\0\x02\x0c\x06\x12\x03\x1a\
-    \x02\x0e\n\x0c\n\x05\x04\0\x02\x0c\x01\x12\x03\x1a\x0f\x1c\n\x0c\n\x05\
-    \x04\0\x02\x0c\x03\x12\x03\x1a\x1f!\n\x0c\n\x04\x04\0\x04\0\x12\x04\x1c\
-    \x02\x20\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x1c\x07\x10\n\r\n\x06\
-    \x04\0\x04\0\x02\0\x12\x03\x1d\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\
-    \x12\x03\x1d\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x1d\x0c\r\n\
-    \r\n\x06\x04\0\x04\0\x02\x01\x12\x03\x1e\x04\x0e\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x01\x01\x12\x03\x1e\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\
-    \x03\x1e\x0c\r\n\r\n\x06\x04\0\x04\0\x02\x02\x12\x03\x1f\x04\x0f\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x02\x01\x12\x03\x1f\x04\n\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x02\x02\x12\x03\x1f\r\x0e\n/\n\x02\x04\x01\x12\x04$\0,\x01\x1a#\x20\
-    Video-specific\x20diagnostic\x20metrics\n\n\n\n\x03\x04\x01\x01\x12\x03$\
-    \x08\x14\n5\n\x04\x04\x01\x02\0\x12\x03%\x02\x19\"(\x20Frames\x20per\x20\
-    second\x20being\x20received\x20(fps)\n\n\x0c\n\x05\x04\x01\x02\0\x05\x12\
-    \x03%\x02\x07\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03%\x08\x14\n\x0c\n\x05\
-    \x04\x01\x02\0\x03\x12\x03%\x17\x18\n+\n\x04\x04\x01\x02\x01\x12\x03&\
-    \x02\x13\"\x1e\x20Current\x20video\x20width\x20(pixels)\n\n\x0c\n\x05\
-    \x04\x01\x02\x01\x05\x12\x03&\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\x01\
-    \x12\x03&\t\x0e\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03&\x11\x12\n,\n\
-    \x04\x04\x01\x02\x02\x12\x03'\x02\x14\"\x1f\x20Current\x20video\x20heigh\
-    t\x20(pixels)\n\n\x0c\n\x05\x04\x01\x02\x02\x05\x12\x03'\x02\x08\n\x0c\n\
-    \x05\x04\x01\x02\x02\x01\x12\x03'\t\x0f\n\x0c\n\x05\x04\x01\x02\x02\x03\
-    \x12\x03'\x12\x13\n=\n\x04\x04\x01\x02\x03\x12\x03(\x02\x1a\"0\x20Curren\
-    t\x20measured\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\
-    \x04\x01\x02\x03\x05\x12\x03(\x02\x08\n\x0c\n\x05\x04\x01\x02\x03\x01\
-    \x12\x03(\t\x15\n\x0c\n\x05\x04\x01\x02\x03\x03\x12\x03(\x18\x19\n?\n\
-    \x04\x04\x01\x02\x04\x12\x03)\x02\x1c\"2\x20Average\x20time\x20to\x20dec\
-    ode\x20each\x20frame\x20(milliseconds)\n\n\x0c\n\x05\x04\x01\x02\x04\x05\
-    \x12\x03)\x02\x08\n\x0c\n\x05\x04\x01\x02\x04\x01\x12\x03)\t\x17\n\x0c\n\
-    \x05\x04\x01\x02\x04\x03\x12\x03)\x1a\x1b\nK\n\x04\x04\x01\x02\x05\x12\
-    \x03*\x02\x1a\">\x20Number\x20of\x20video\x20freezes\x20in\x20the\x20las\
-    t\x20reporting\x20period\x20(count)\n\n\x0c\n\x05\x04\x01\x02\x05\x05\
-    \x12\x03*\x02\x08\n\x0c\n\x05\x04\x01\x02\x05\x01\x12\x03*\t\x15\n\x0c\n\
-    \x05\x04\x01\x02\x05\x03\x12\x03*\x18\x19\nP\n\x04\x04\x01\x02\x06\x12\
-    \x03+\x02\x20\"C\x20Number\x20of\x20keyframes\x20received\x20in\x20the\
-    \x20last\x20reporting\x20period\x20(count)\n\n\x0c\n\x05\x04\x01\x02\x06\
-    \x05\x12\x03+\x02\x08\n\x0c\n\x05\x04\x01\x02\x06\x01\x12\x03+\t\x1b\n\
-    \x0c\n\x05\x04\x01\x02\x06\x03\x12\x03+\x1e\x1f\n/\n\x02\x04\x02\x12\x04\
-    /\08\x01\x1a#\x20Audio-specific\x20diagnostic\x20metrics\n\n\n\n\x03\x04\
-    \x02\x01\x12\x03/\x08\x14\n5\n\x04\x04\x02\x02\0\x12\x030\x02\x19\"(\x20\
+    \x12\n\n\x06SCREEN\x10\x02\"\x9d\x01\n\x0cVideoMetrics\x12!\n\x0cfps_rec\
+    eived\x18\x01\x20\x01(\x02R\x0bfpsReceived\x12!\n\x0cbitrate_kbps\x18\
+    \x02\x20\x01(\rR\x0bbitrateKbps\x12$\n\x0edecode_time_ms\x18\x03\x20\x01\
+    (\rR\x0cdecodeTimeMs\x12!\n\x0cfreeze_count\x18\x04\x20\x01(\rR\x0bfreez\
+    eCount\"\xe2\x01\n\x0cAudioMetrics\x12!\n\x0cfps_received\x18\x01\x20\
+    \x01(\x02R\x0bfpsReceived\x12\x1f\n\x0baudio_level\x18\x02\x20\x01(\x02R\
+    \naudioLevel\x12\x1f\n\x0bsample_rate\x18\x03\x20\x01(\rR\nsampleRate\
+    \x12!\n\x0cbitrate_kbps\x18\x04\x20\x01(\rR\x0bbitrateKbps\x12#\n\recho_\
+    detected\x18\x05\x20\x01(\x08R\x0cechoDetected\x12%\n\x0enoise_detected\
+    \x18\x06\x20\x01(\x08R\rnoiseDetected\"\xf3\x01\n\x0cQualityHints\x12.\n\
+    \x13target_bitrate_kbps\x18\x01\x20\x01(\rR\x11targetBitrateKbps\x12?\n\
+    \npreference\x18\x02\x20\x01(\x0e2\x1f.QualityHints.QualityPreferenceR\n\
+    preference\"r\n\x11QualityPreference\x12\x0c\n\x08BALANCED\x10\0\x12\x18\
+    \n\x14PRIORITIZE_FRAMERATE\x10\x01\x12\x19\n\x15PRIORITIZE_RESOLUTION\
+    \x10\x02\x12\x1a\n\x16PRIORITIZE_LOW_LATENCY\x10\x03J\xf9\x19\n\x06\x12\
+    \x04\0\0?\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\
+    \x02\0\x20\x01\n\n\n\x03\x04\0\x01\x12\x03\x02\x08\x19\nY\n\x04\x04\0\
+    \x02\0\x12\x03\x04\x02\x17\x1a\x16\x20Basic\x20identification\n\"4\x20Id\
+    entifier\x20for\x20the\x20specific\x20stream\x20being\x20diagnosed\n\n\
+    \x0c\n\x05\x04\0\x02\0\x05\x12\x03\x04\x02\x08\n\x0c\n\x05\x04\0\x02\0\
+    \x01\x12\x03\x04\t\x12\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x04\x15\x16\n\
+    A\n\x04\x04\0\x02\x01\x12\x03\x05\x02\x17\"4\x20Email/ID\x20of\x20who\
+    \x20is\x20sending\x20this\x20diagnostic\x20message\n\n\x0c\n\x05\x04\0\
+    \x02\x01\x05\x12\x03\x05\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\
+    \x05\t\x12\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\x05\x15\x16\n6\n\x04\
+    \x04\0\x02\x02\x12\x03\x06\x02\x17\")\x20Email/ID\x20of\x20who\x20the\
+    \x20diagnostic\x20is\x20about\n\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\
+    \x06\x02\x08\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x06\t\x12\n\x0c\n\x05\
+    \x04\0\x02\x02\x03\x12\x03\x06\x15\x16\nO\n\x04\x04\0\x02\x03\x12\x03\
+    \x07\x02\x1a\"B\x20When\x20these\x20diagnostics\x20were\x20collected\x20\
+    (milliseconds\x20since\x20epoch)\n\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\
+    \x07\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x07\t\x15\n\x0c\n\x05\
+    \x04\0\x02\x03\x03\x12\x03\x07\x18\x19\n@\n\x04\x04\0\x02\x04\x12\x03\n\
+    \x02\x1b\x1a\r\x20Stream\x20type\n\"$\x20Type\x20of\x20media\x20(audio/v\
+    ideo/screen)\n\n\x0c\n\x05\x04\0\x02\x04\x06\x12\x03\n\x02\x0b\n\x0c\n\
+    \x05\x04\0\x02\x04\x01\x12\x03\n\x0c\x16\n\x0c\n\x05\x04\0\x02\x04\x03\
+    \x12\x03\n\x19\x1a\nb\n\x04\x04\0\x02\x05\x12\x03\r\x02\x1f\x1a)\x20Comm\
+    on\x20metrics\x20for\x20both\x20audio\x20and\x20video\n\"*\x20Median\x20\
+    end-to-end\x20latency\x20(milliseconds)\n\n\x0c\n\x05\x04\0\x02\x05\x05\
+    \x12\x03\r\x02\x08\n\x0c\n\x05\x04\0\x02\x05\x01\x12\x03\r\t\x1a\n\x0c\n\
+    \x05\x04\0\x02\x05\x03\x12\x03\r\x1d\x1e\n$\n\x04\x04\0\x02\x06\x12\x03\
+    \x0e\x02\x17\"\x17\x20Jitter\x20(milliseconds)\n\n\x0c\n\x05\x04\0\x02\
+    \x06\x05\x12\x03\x0e\x02\x08\n\x0c\n\x05\x04\0\x02\x06\x01\x12\x03\x0e\t\
+    \x12\n\x0c\n\x05\x04\0\x02\x06\x03\x12\x03\x0e\x15\x16\nB\n\x04\x04\0\
+    \x02\x07\x12\x03\x0f\x02&\"5\x20Estimated\x20available\x20bandwidth\x20(\
+    kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\0\x02\x07\x05\x12\x03\x0f\
+    \x02\x08\n\x0c\n\x05\x04\0\x02\x07\x01\x12\x03\x0f\t!\n\x0c\n\x05\x04\0\
+    \x02\x07\x03\x12\x03\x0f$%\nI\n\x04\x04\0\x02\x08\x12\x03\x10\x02\x20\"<\
+    \x20Round-trip\x20time\x20between\x20sender\x20and\x20receiver\x20(milli\
+    seconds)\n\n\x0c\n\x05\x04\0\x02\x08\x05\x12\x03\x10\x02\x08\n\x0c\n\x05\
+    \x04\0\x02\x08\x01\x12\x03\x10\t\x1b\n\x0c\n\x05\x04\0\x02\x08\x03\x12\
+    \x03\x10\x1e\x1f\nH\n\x04\x04\0\x02\t\x12\x03\x13\x02\"\x1a;\x20Video-sp\
+    ecific\x20metrics\x20(only\x20populated\x20for\x20video\x20streams)\n\n\
+    \x0c\n\x05\x04\0\x02\t\x06\x12\x03\x13\x02\x0e\n\x0c\n\x05\x04\0\x02\t\
+    \x01\x12\x03\x13\x0f\x1c\n\x0c\n\x05\x04\0\x02\t\x03\x12\x03\x13\x1f!\nH\
+    \n\x04\x04\0\x02\n\x12\x03\x16\x02\"\x1a;\x20Audio-specific\x20metrics\
+    \x20(only\x20populated\x20for\x20audio\x20streams)\n\n\x0c\n\x05\x04\0\
+    \x02\n\x06\x12\x03\x16\x02\x0e\n\x0c\n\x05\x04\0\x02\n\x01\x12\x03\x16\
+    \x0f\x1c\n\x0c\n\x05\x04\0\x02\n\x03\x12\x03\x16\x1f!\n5\n\x04\x04\0\x02\
+    \x0b\x12\x03\x19\x02\"\x1a(\x20Quality\x20adaptation\x20hints\x20to\x20t\
+    he\x20sender\n\n\x0c\n\x05\x04\0\x02\x0b\x06\x12\x03\x19\x02\x0e\n\x0c\n\
+    \x05\x04\0\x02\x0b\x01\x12\x03\x19\x0f\x1c\n\x0c\n\x05\x04\0\x02\x0b\x03\
+    \x12\x03\x19\x1f!\n\x0c\n\x04\x04\0\x04\0\x12\x04\x1b\x02\x1f\x03\n\x0c\
+    \n\x05\x04\0\x04\0\x01\x12\x03\x1b\x07\x10\n\r\n\x06\x04\0\x04\0\x02\0\
+    \x12\x03\x1c\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x1c\x04\t\
+    \n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x1c\x0c\r\n\r\n\x06\x04\0\x04\
+    \0\x02\x01\x12\x03\x1d\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\
+    \x03\x1d\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x1d\x0c\r\n\r\
+    \n\x06\x04\0\x04\0\x02\x02\x12\x03\x1e\x04\x0f\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x02\x01\x12\x03\x1e\x04\n\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\
+    \x03\x1e\r\x0e\n/\n\x02\x04\x01\x12\x04#\0(\x01\x1a#\x20Video-specific\
+    \x20diagnostic\x20metrics\n\n\n\n\x03\x04\x01\x01\x12\x03#\x08\x14\n5\n\
+    \x04\x04\x01\x02\0\x12\x03$\x02\x19\"(\x20Frames\x20per\x20second\x20bei\
+    ng\x20received\x20(fps)\n\n\x0c\n\x05\x04\x01\x02\0\x05\x12\x03$\x02\x07\
+    \n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03$\x08\x14\n\x0c\n\x05\x04\x01\x02\
+    \0\x03\x12\x03$\x17\x18\n=\n\x04\x04\x01\x02\x01\x12\x03%\x02\x1a\"0\x20\
+    Current\x20measured\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\
+    \x05\x04\x01\x02\x01\x05\x12\x03%\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\
+    \x01\x12\x03%\t\x15\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\x03%\x18\x19\n?\
+    \n\x04\x04\x01\x02\x02\x12\x03&\x02\x1c\"2\x20Average\x20time\x20to\x20d\
+    ecode\x20each\x20frame\x20(milliseconds)\n\n\x0c\n\x05\x04\x01\x02\x02\
+    \x05\x12\x03&\x02\x08\n\x0c\n\x05\x04\x01\x02\x02\x01\x12\x03&\t\x17\n\
+    \x0c\n\x05\x04\x01\x02\x02\x03\x12\x03&\x1a\x1b\nK\n\x04\x04\x01\x02\x03\
+    \x12\x03'\x02\x1a\">\x20Number\x20of\x20video\x20freezes\x20in\x20the\
+    \x20last\x20reporting\x20period\x20(count)\n\n\x0c\n\x05\x04\x01\x02\x03\
+    \x05\x12\x03'\x02\x08\n\x0c\n\x05\x04\x01\x02\x03\x01\x12\x03'\t\x15\n\
+    \x0c\n\x05\x04\x01\x02\x03\x03\x12\x03'\x18\x19\n/\n\x02\x04\x02\x12\x04\
+    +\02\x01\x1a#\x20Audio-specific\x20diagnostic\x20metrics\n\n\n\n\x03\x04\
+    \x02\x01\x12\x03+\x08\x14\n5\n\x04\x04\x02\x02\0\x12\x03,\x02\x19\"(\x20\
     Frames\x20per\x20second\x20being\x20received\x20(fps)\n\n\x0c\n\x05\x04\
-    \x02\x02\0\x05\x12\x030\x02\x07\n\x0c\n\x05\x04\x02\x02\0\x01\x12\x030\
-    \x08\x14\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x030\x17\x18\n*\n\x04\x04\x02\
-    \x02\x01\x12\x031\x02\x18\"\x1d\x20Audio\x20level\x20(0.0-1.0\x20scale)\
-    \n\n\x0c\n\x05\x04\x02\x02\x01\x05\x12\x031\x02\x07\n\x0c\n\x05\x04\x02\
-    \x02\x01\x01\x12\x031\x08\x13\n\x0c\n\x05\x04\x02\x02\x01\x03\x12\x031\
-    \x16\x17\n\"\n\x04\x04\x02\x02\x02\x12\x032\x02\x19\"\x15\x20Sample\x20r\
-    ate\x20(Hertz)\n\n\x0c\n\x05\x04\x02\x02\x02\x05\x12\x032\x02\x08\n\x0c\
-    \n\x05\x04\x02\x02\x02\x01\x12\x032\t\x14\n\x0c\n\x05\x04\x02\x02\x02\
-    \x03\x12\x032\x17\x18\n=\n\x04\x04\x02\x02\x03\x12\x033\x02\x1a\"0\x20Cu\
+    \x02\x02\0\x05\x12\x03,\x02\x07\n\x0c\n\x05\x04\x02\x02\0\x01\x12\x03,\
+    \x08\x14\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x03,\x17\x18\n*\n\x04\x04\x02\
+    \x02\x01\x12\x03-\x02\x18\"\x1d\x20Audio\x20level\x20(0.0-1.0\x20scale)\
+    \n\n\x0c\n\x05\x04\x02\x02\x01\x05\x12\x03-\x02\x07\n\x0c\n\x05\x04\x02\
+    \x02\x01\x01\x12\x03-\x08\x13\n\x0c\n\x05\x04\x02\x02\x01\x03\x12\x03-\
+    \x16\x17\n\"\n\x04\x04\x02\x02\x02\x12\x03.\x02\x19\"\x15\x20Sample\x20r\
+    ate\x20(Hertz)\n\n\x0c\n\x05\x04\x02\x02\x02\x05\x12\x03.\x02\x08\n\x0c\
+    \n\x05\x04\x02\x02\x02\x01\x12\x03.\t\x14\n\x0c\n\x05\x04\x02\x02\x02\
+    \x03\x12\x03.\x17\x18\n=\n\x04\x04\x02\x02\x03\x12\x03/\x02\x1a\"0\x20Cu\
     rrent\x20measured\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\
-    \x05\x04\x02\x02\x03\x05\x12\x033\x02\x08\n\x0c\n\x05\x04\x02\x02\x03\
-    \x01\x12\x033\t\x15\n\x0c\n\x05\x04\x02\x02\x03\x03\x12\x033\x18\x19\n/\
-    \n\x04\x04\x02\x02\x04\x12\x034\x02\x16\"\"\x20Number\x20of\x20audio\x20\
-    channels\x20(count)\n\n\x0c\n\x05\x04\x02\x02\x04\x05\x12\x034\x02\x08\n\
-    \x0c\n\x05\x04\x02\x02\x04\x01\x12\x034\t\x11\n\x0c\n\x05\x04\x02\x02\
-    \x04\x03\x12\x034\x14\x15\nF\n\x04\x04\x02\x02\x05\x12\x035\x02\x1a\"9\
-    \x20Total\x20packets\x20lost\x20during\x20this\x20reporting\x20period\
-    \x20(count)\n\n\x0c\n\x05\x04\x02\x02\x05\x05\x12\x035\x02\x08\n\x0c\n\
-    \x05\x04\x02\x02\x05\x01\x12\x035\t\x15\n\x0c\n\x05\x04\x02\x02\x05\x03\
-    \x12\x035\x18\x19\n1\n\x04\x04\x02\x02\x06\x12\x036\x02\x19\"$\x20Whethe\
-    r\x20echo\x20is\x20detected\x20(boolean)\n\n\x0c\n\x05\x04\x02\x02\x06\
-    \x05\x12\x036\x02\x06\n\x0c\n\x05\x04\x02\x02\x06\x01\x12\x036\x07\x14\n\
-    \x0c\n\x05\x04\x02\x02\x06\x03\x12\x036\x17\x18\n<\n\x04\x04\x02\x02\x07\
-    \x12\x037\x02\x1a\"/\x20Whether\x20excessive\x20noise\x20is\x20detected\
-    \x20(boolean)\n\n\x0c\n\x05\x04\x02\x02\x07\x05\x12\x037\x02\x06\n\x0c\n\
-    \x05\x04\x02\x02\x07\x01\x12\x037\x07\x15\n\x0c\n\x05\x04\x02\x02\x07\
-    \x03\x12\x037\x18\x19\nA\n\x02\x04\x03\x12\x04;\0E\x01\x1a5\x20Quality\
-    \x20hints\x20that\x20the\x20receiver\x20sends\x20to\x20the\x20sender\n\n\
-    \n\n\x03\x04\x03\x01\x12\x03;\x08\x14\n=\n\x04\x04\x03\x02\0\x12\x03<\
-    \x02!\"0\x20Suggested\x20target\x20bitrate\x20(kilobits\x20per\x20second\
-    )\n\n\x0c\n\x05\x04\x03\x02\0\x05\x12\x03<\x02\x08\n\x0c\n\x05\x04\x03\
-    \x02\0\x01\x12\x03<\t\x1c\n\x0c\n\x05\x04\x03\x02\0\x03\x12\x03<\x1f\x20\
-    \n(\n\x04\x04\x03\x02\x01\x12\x03=\x02#\"\x1b\x20Quality\x20preference\
-    \x20(enum)\n\n\x0c\n\x05\x04\x03\x02\x01\x06\x12\x03=\x02\x13\n\x0c\n\
-    \x05\x04\x03\x02\x01\x01\x12\x03=\x14\x1e\n\x0c\n\x05\x04\x03\x02\x01\
-    \x03\x12\x03=!\"\n\x0c\n\x04\x04\x03\x04\0\x12\x04?\x02D\x03\n\x0c\n\x05\
-    \x04\x03\x04\0\x01\x12\x03?\x07\x18\n9\n\x06\x04\x03\x04\0\x02\0\x12\x03\
-    @\x04\x11\"*\x20Balance\x20between\x20resolution\x20and\x20framerate\n\n\
-    \x0e\n\x07\x04\x03\x04\0\x02\0\x01\x12\x03@\x04\x0c\n\x0e\n\x07\x04\x03\
-    \x04\0\x02\0\x02\x12\x03@\x0f\x10\n8\n\x06\x04\x03\x04\0\x02\x01\x12\x03\
-    A\x04\x1d\")\x20Prefer\x20higher\x20framerate\x20over\x20resolution\n\n\
-    \x0e\n\x07\x04\x03\x04\0\x02\x01\x01\x12\x03A\x04\x18\n\x0e\n\x07\x04\
-    \x03\x04\0\x02\x01\x02\x12\x03A\x1b\x1c\n8\n\x06\x04\x03\x04\0\x02\x02\
-    \x12\x03B\x04\x1e\")\x20Prefer\x20higher\x20resolution\x20over\x20framer\
-    ate\n\n\x0e\n\x07\x04\x03\x04\0\x02\x02\x01\x12\x03B\x04\x19\n\x0e\n\x07\
-    \x04\x03\x04\0\x02\x02\x02\x12\x03B\x1c\x1d\n/\n\x06\x04\x03\x04\0\x02\
-    \x03\x12\x03C\x04\x1f\"\x20\x20Prefer\x20lowest\x20possible\x20latency\n\
-    \n\x0e\n\x07\x04\x03\x04\0\x02\x03\x01\x12\x03C\x04\x1a\n\x0e\n\x07\x04\
-    \x03\x04\0\x02\x03\x02\x12\x03C\x1d\x1eb\x06proto3\
+    \x05\x04\x02\x02\x03\x05\x12\x03/\x02\x08\n\x0c\n\x05\x04\x02\x02\x03\
+    \x01\x12\x03/\t\x15\n\x0c\n\x05\x04\x02\x02\x03\x03\x12\x03/\x18\x19\n1\
+    \n\x04\x04\x02\x02\x04\x12\x030\x02\x19\"$\x20Whether\x20echo\x20is\x20d\
+    etected\x20(boolean)\n\n\x0c\n\x05\x04\x02\x02\x04\x05\x12\x030\x02\x06\
+    \n\x0c\n\x05\x04\x02\x02\x04\x01\x12\x030\x07\x14\n\x0c\n\x05\x04\x02\
+    \x02\x04\x03\x12\x030\x17\x18\n<\n\x04\x04\x02\x02\x05\x12\x031\x02\x1a\
+    \"/\x20Whether\x20excessive\x20noise\x20is\x20detected\x20(boolean)\n\n\
+    \x0c\n\x05\x04\x02\x02\x05\x05\x12\x031\x02\x06\n\x0c\n\x05\x04\x02\x02\
+    \x05\x01\x12\x031\x07\x15\n\x0c\n\x05\x04\x02\x02\x05\x03\x12\x031\x18\
+    \x19\nA\n\x02\x04\x03\x12\x045\0?\x01\x1a5\x20Quality\x20hints\x20that\
+    \x20the\x20receiver\x20sends\x20to\x20the\x20sender\n\n\n\n\x03\x04\x03\
+    \x01\x12\x035\x08\x14\n=\n\x04\x04\x03\x02\0\x12\x036\x02!\"0\x20Suggest\
+    ed\x20target\x20bitrate\x20(kilobits\x20per\x20second)\n\n\x0c\n\x05\x04\
+    \x03\x02\0\x05\x12\x036\x02\x08\n\x0c\n\x05\x04\x03\x02\0\x01\x12\x036\t\
+    \x1c\n\x0c\n\x05\x04\x03\x02\0\x03\x12\x036\x1f\x20\n(\n\x04\x04\x03\x02\
+    \x01\x12\x037\x02#\"\x1b\x20Quality\x20preference\x20(enum)\n\n\x0c\n\
+    \x05\x04\x03\x02\x01\x06\x12\x037\x02\x13\n\x0c\n\x05\x04\x03\x02\x01\
+    \x01\x12\x037\x14\x1e\n\x0c\n\x05\x04\x03\x02\x01\x03\x12\x037!\"\n\x0c\
+    \n\x04\x04\x03\x04\0\x12\x049\x02>\x03\n\x0c\n\x05\x04\x03\x04\0\x01\x12\
+    \x039\x07\x18\n9\n\x06\x04\x03\x04\0\x02\0\x12\x03:\x04\x11\"*\x20Balanc\
+    e\x20between\x20resolution\x20and\x20framerate\n\n\x0e\n\x07\x04\x03\x04\
+    \0\x02\0\x01\x12\x03:\x04\x0c\n\x0e\n\x07\x04\x03\x04\0\x02\0\x02\x12\
+    \x03:\x0f\x10\n8\n\x06\x04\x03\x04\0\x02\x01\x12\x03;\x04\x1d\")\x20Pref\
+    er\x20higher\x20framerate\x20over\x20resolution\n\n\x0e\n\x07\x04\x03\
+    \x04\0\x02\x01\x01\x12\x03;\x04\x18\n\x0e\n\x07\x04\x03\x04\0\x02\x01\
+    \x02\x12\x03;\x1b\x1c\n8\n\x06\x04\x03\x04\0\x02\x02\x12\x03<\x04\x1e\")\
+    \x20Prefer\x20higher\x20resolution\x20over\x20framerate\n\n\x0e\n\x07\
+    \x04\x03\x04\0\x02\x02\x01\x12\x03<\x04\x19\n\x0e\n\x07\x04\x03\x04\0\
+    \x02\x02\x02\x12\x03<\x1c\x1d\n/\n\x06\x04\x03\x04\0\x02\x03\x12\x03=\
+    \x04\x1f\"\x20\x20Prefer\x20lowest\x20possible\x20latency\n\n\x0e\n\x07\
+    \x04\x03\x04\0\x02\x03\x01\x12\x03=\x04\x1a\n\x0e\n\x07\x04\x03\x04\0\
+    \x02\x03\x02\x12\x03=\x1d\x1eb\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

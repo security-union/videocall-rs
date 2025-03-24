@@ -91,15 +91,19 @@ impl CameraEncoder {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
+        let enabled = self.state.enabled.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderControlSender::new(200, current_fps.clone());
             while let Some(event) = diagnostics_receiver.next().await {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
-                    on_encoder_settings_update.emit(format!("Camera bitrate: {:.2} kbps", bitrate));
-                    // transform kbits to bits
-                    let bitrate = bitrate * 1000.0;
-                    current_bitrate.store(bitrate as u32, Ordering::Relaxed);
+                    if enabled.load(Ordering::Acquire) {
+                        on_encoder_settings_update.emit(format!("Bitrate: {:.2} kbps", bitrate));
+                        let bitrate = bitrate * 1000.0;
+                        current_bitrate.store(bitrate as u32, Ordering::Relaxed);
+                    } else {
+                        on_encoder_settings_update.emit("Disabled".to_string());
+                    }
                 }
             }
         });

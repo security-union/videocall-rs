@@ -216,7 +216,9 @@ impl MicrophoneEncoder {
             audio_encoder_config.set_bitrate(local_bitrate as f64);
             audio_encoder_config.set_sample_rate(AUDIO_SAMPLE_RATE);
             audio_encoder_config.set_number_of_channels(AUDIO_CHANNELS);
-            audio_encoder.configure(&audio_encoder_config);
+            if let Err(e) = audio_encoder.configure(&audio_encoder_config) {
+                error!("Error configuring microphone encoder: {:?}", e);
+            }
 
             let audio_processor =
                 MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(&media_track))
@@ -235,7 +237,9 @@ impl MicrophoneEncoder {
                 {
                     switching.store(false, Ordering::Release);
                     media_track.stop();
-                    audio_encoder.close();
+                    if let Err(e) = audio_encoder.close() {
+                        error!("Error closing microphone encoder: {:?}", e);
+                    }
                     break;
                 }
 
@@ -251,14 +255,18 @@ impl MicrophoneEncoder {
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_sample_rate(AUDIO_SAMPLE_RATE);
                     new_config.set_number_of_channels(AUDIO_CHANNELS);
-                    audio_encoder.configure(&new_config);
+                    if let Err(e) = audio_encoder.configure(&new_config) {
+                        error!("Error configuring microphone encoder: {:?}", e);
+                    }
                 }
 
                 match JsFuture::from(audio_reader.read()).await {
                     Ok(js_frame) => match Reflect::get(&js_frame, &JsString::from("value")) {
                         Ok(value) => {
                             let audio_frame = value.unchecked_into::<web_sys::AudioData>();
-                            audio_encoder.encode(&audio_frame);
+                            if let Err(e) = audio_encoder.encode(&audio_frame) {
+                                error!("Error encoding microphone frame: {:?}", e);
+                            }
                             audio_frame.close();
                         }
                         Err(e) => {

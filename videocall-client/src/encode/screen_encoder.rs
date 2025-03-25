@@ -213,7 +213,9 @@ impl ScreenEncoder {
                 VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
             screen_encoder_config.set_bitrate(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
-            screen_encoder.configure(&screen_encoder_config);
+            if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
+                error!("Error configuring screen encoder: {:?}", e);
+            }
 
             let screen_processor =
                 MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(&media_track))
@@ -234,7 +236,9 @@ impl ScreenEncoder {
                 {
                     switching.store(false, Ordering::Release);
                     media_track.stop();
-                    screen_encoder.close();
+                    if let Err(e) = screen_encoder.close() {
+                        error!("Error closing screen encoder: {:?}", e);
+                    }
                     break;
                 }
 
@@ -250,7 +254,9 @@ impl ScreenEncoder {
                         VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
-                    screen_encoder.configure(&new_config);
+                    if let Err(e) = screen_encoder.configure(&new_config) {
+                        error!("Error configuring screen encoder: {:?}", e);
+                    }
                 }
 
                 match JsFuture::from(screen_reader.read()).await {
@@ -260,7 +266,9 @@ impl ScreenEncoder {
                             let opts = VideoEncoderEncodeOptions::new();
                             screen_frame_counter = (screen_frame_counter + 1) % 50;
                             opts.set_key_frame(screen_frame_counter == 0);
-                            screen_encoder.encode_with_options(&video_frame, &opts);
+                            if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
+                                error!("Error encoding screen frame: {:?}", e);
+                            }
                             video_frame.close();
                         }
                         Err(e) => {

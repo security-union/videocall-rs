@@ -6,15 +6,15 @@ members = [
     "videocall-types",
     "videocall-client",
     "videocall-cli",
+]
+exclude = [
+    "src-tauri",
+    "leptos-website",
+    "yew-ui",
     "videocall-cli/nokhwa", 
     "videocall-cli/nokhwa/nokhwa-bindings-macos", 
     "videocall-cli/nokhwa/nokhwa-bindings-windows", 
     "videocall-cli/nokhwa/nokhwa-bindings-linux", 
     "videocall-cli/nokhwa/nokhwa-core"
-]
-exclude = [
-    "src-tauri",
-    "leptos-website",
-    "yew-ui"
 ]
 

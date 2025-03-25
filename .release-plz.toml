@@ -16,6 +16,12 @@ changelog_update = true
 git_release_enable = true
 
 [[package]]
+name = "videocall-cli"
+publish = true
+changelog_update = true
+git_release_enable = true
+
+[[package]]
 name = "videocall-types"
 publish = true
 changelog_update = true

@@ -13,8 +13,8 @@ pub trait AudioDecoderTrait {
     fn new(init: &AudioDecoderInit) -> Result<Self, JsValue>
     where
         Self: Sized;
-    fn configure(&self, config: &AudioDecoderConfig);
-    fn decode(&self, audio: Arc<MediaPacket>);
+    fn configure(&self, config: &AudioDecoderConfig) -> Result<(), JsValue>;
+    fn decode(&self, audio: Arc<MediaPacket>) -> Result<(), JsValue>;
     fn state(&self) -> CodecState;
 }
 
@@ -24,11 +24,11 @@ pub struct AudioDecoderWrapper(web_sys::AudioDecoder);
 
 // Implement the trait for the wrapper struct
 impl AudioDecoderTrait for AudioDecoderWrapper {
-    fn configure(&self, config: &AudioDecoderConfig) {
-        self.0.configure(config);
+    fn configure(&self, config: &AudioDecoderConfig) -> Result<(), JsValue> {
+        self.0.configure(config)
     }
 
-    fn decode(&self, audio: Arc<MediaPacket>) {
+    fn decode(&self, audio: Arc<MediaPacket>) -> Result<(), JsValue> {
         let chunk_type =
             EncodedAudioChunkType::from_js_value(&JsValue::from(audio.frame_type.clone())).unwrap();
         let audio_data = Uint8Array::new_with_length(audio.data.len().try_into().unwrap());
@@ -37,7 +37,7 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
             EncodedAudioChunkInit::new(&audio_data.into(), audio.timestamp, chunk_type);
         audio_chunk.set_duration(audio.duration);
         let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
-        self.0.decode(&encoded_audio_chunk);
+        self.0.decode(&encoded_audio_chunk)
     }
 
     fn state(&self) -> CodecState {
@@ -64,12 +64,12 @@ impl MediaDecoderTrait for AudioDecoderWrapper {
         AudioDecoder::new(init).map(AudioDecoderWrapper)
     }
 
-    fn configure(&self, config: &Self::ConfigType) {
-        self.0.configure(config);
+    fn configure(&self, config: &Self::ConfigType) -> Result<(), JsValue> {
+        self.0.configure(config)
     }
 
-    fn decode(&self, packet: Arc<MediaPacket>) {
-        AudioDecoderTrait::decode(self, packet);
+    fn decode(&self, packet: Arc<MediaPacket>) -> Result<(), JsValue> {
+        AudioDecoderTrait::decode(self, packet)
     }
 
     fn state(&self) -> CodecState {

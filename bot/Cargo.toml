@@ -5,6 +5,13 @@ edition = "2018"
 release = false
 license = "MIT OR Apache-2.0"
 description = "A bot for the videocall project"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>",
+]
+keywords = ["quic", "webtransport", "zoom"]
+categories = ["network-programming", "multimedia"]
 
 [dependencies]
 tokio = { version = "1.28.1", features = ["full"] }

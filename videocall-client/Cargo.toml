@@ -36,7 +36,7 @@ yew-websocket = "1.21.0"
 yew-webtransport = "0.21.1"
 
 [dependencies.web-sys]
-version = "0.3.60"
+version = "0.3.72"
 features = [
     "AudioTrack",
     "AudioData",

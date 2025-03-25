@@ -4,12 +4,17 @@ members = [
     "actix-api",
     "bot",
     "videocall-types",
-    "videocall-client"
+    "videocall-client",
+    "videocall-cli",
+    "videocall-cli/nokhwa", 
+    "videocall-cli/nokhwa/nokhwa-bindings-macos", 
+    "videocall-cli/nokhwa/nokhwa-bindings-windows", 
+    "videocall-cli/nokhwa/nokhwa-bindings-linux", 
+    "videocall-cli/nokhwa/nokhwa-core"
 ]
 exclude = [
     "src-tauri",
     "leptos-website",
-    "videocall-cli",
     "yew-ui"
 ]
 

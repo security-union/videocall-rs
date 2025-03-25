@@ -1,7 +1,7 @@
 [workspace]
 allow_dirty = false
 pr_branch_prefix = "release-plz-"
-pr_name = "Release {{ package }} v{{ version }}"
+pr_name = "New Release v{{ version }}"
 pr_labels = ["release"]
 publish_allow_dirty = false
 publish_timeout = "10m"

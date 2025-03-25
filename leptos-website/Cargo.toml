@@ -2,6 +2,12 @@
 name = "leptos_website"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Website for the videocall.rs project"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+keywords = ["leptos", "videocall", "webrtc", "webtransport", "quic"]
+categories = ["web-programming", "multimedia"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

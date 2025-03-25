@@ -8,6 +8,8 @@ publish_timeout = "10m"
 # dependencies_update = false  # if you want to disable dependencies update
 # changelog_level = "workspace"  # to disable changelogs set it to 'off'
 git_release_enable = true  # enable release creation on Github/Gitlab
+ignored_packages = ["videocall-api"]
+
 
 [[package]]
 name = "videocall-client"

@@ -48,5 +48,5 @@ videocall-nokhwa = { path = "nokhwa", version = "0.10.7", features = ["input-nat
 
 [dependencies.videocall-types]
 path = "../videocall-types"
-version = "0.1.0"
+version = "0.2.*"
 

@@ -9,7 +9,7 @@ readme = "README.md"
 authors = [
     "Dario Lencina <dario@securityunion.dev>"
 ]
-keywords = ["quic", "webtransport", "zoom"]
+keywords = ["quic", "webtransport", "zoom", "webrtc"]
 categories = ["network-programming", "multimedia"]
 description = "types for the videocall streaming platform"
 release = true

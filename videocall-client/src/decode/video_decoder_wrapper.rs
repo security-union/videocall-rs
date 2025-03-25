@@ -14,8 +14,8 @@ pub trait VideoDecoderTrait {
     fn new(init: &VideoDecoderInit) -> Result<Self, JsValue>
     where
         Self: Sized;
-    fn configure(&self, config: &VideoDecoderConfig);
-    fn decode(&self, image: Arc<MediaPacket>);
+    fn configure(&self, config: &VideoDecoderConfig) -> Result<(), JsValue>;
+    fn decode(&self, image: Arc<MediaPacket>) -> Result<(), JsValue>;
     fn state(&self) -> CodecState;
 }
 
@@ -25,18 +25,18 @@ pub struct VideoDecoderWrapper(web_sys::VideoDecoder);
 
 // Implement the original trait for backward compatibility
 impl VideoDecoderTrait for VideoDecoderWrapper {
-    fn configure(&self, config: &VideoDecoderConfig) {
-        self.0.configure(config);
+    fn configure(&self, config: &VideoDecoderConfig) -> Result<(), JsValue> {
+        self.0.configure(config)
     }
 
-    fn decode(&self, image: Arc<MediaPacket>) {
+    fn decode(&self, image: Arc<MediaPacket>) -> Result<(), JsValue> {
         let chunk_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
         let video_data = Uint8Array::new_with_length(image.data.len().try_into().unwrap());
         video_data.copy_from(&image.data);
-        let mut video_chunk = EncodedVideoChunkInit::new(&video_data, image.timestamp, chunk_type);
-        video_chunk.duration(image.duration);
+        let video_chunk = EncodedVideoChunkInit::new(&video_data, image.timestamp, chunk_type);
+        video_chunk.set_duration(image.duration);
         let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
-        self.0.decode(&encoded_video_chunk);
+        self.0.decode(&encoded_video_chunk)
     }
 
     fn state(&self) -> CodecState {
@@ -63,12 +63,12 @@ impl MediaDecoderTrait for VideoDecoderWrapper {
         VideoDecoder::new(init).map(VideoDecoderWrapper)
     }
 
-    fn configure(&self, config: &Self::ConfigType) {
-        self.0.configure(config);
+    fn configure(&self, config: &Self::ConfigType) -> Result<(), JsValue> {
+        self.0.configure(config)
     }
 
-    fn decode(&self, packet: Arc<MediaPacket>) {
-        VideoDecoderTrait::decode(self, packet);
+    fn decode(&self, packet: Arc<MediaPacket>) -> Result<(), JsValue> {
+        VideoDecoderTrait::decode(self, packet)
     }
 
     fn state(&self) -> CodecState {

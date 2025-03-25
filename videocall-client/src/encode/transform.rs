@@ -1,5 +1,6 @@
 use super::super::wrappers::{EncodedAudioChunkTypeWrapper, EncodedVideoChunkTypeWrapper};
 use crate::crypto::aes::Aes128State;
+use js_sys::Uint8Array;
 use protobuf::Message;
 use std::rc::Rc;
 use videocall_types::protos::{
@@ -7,6 +8,11 @@ use videocall_types::protos::{
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 use web_sys::{EncodedAudioChunk, EncodedVideoChunk};
+
+pub fn buffer_to_uint8array(buf: &mut [u8]) -> Uint8Array {
+    // Convert &mut [u8] to a Uint8Array
+    unsafe { Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len()) }
+}
 
 pub fn transform_video_chunk(
     chunk: EncodedVideoChunk,
@@ -16,7 +22,9 @@ pub fn transform_video_chunk(
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
-    chunk.copy_to_with_u8_array(buffer);
+    if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
+        log::error!("Error copying video chunk: {:?}", e);
+    }
     let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
         frame_type: EncodedVideoChunkTypeWrapper(chunk.type_()).to_string(),
@@ -51,7 +59,9 @@ pub fn transform_screen_chunk(
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
-    chunk.copy_to_with_u8_array(buffer);
+    if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
+        log::error!("Error copying video chunk: {:?}", e);
+    }
     let mut media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),
         data: buffer[0..byte_length].to_vec(),
@@ -85,7 +95,9 @@ pub fn transform_audio_chunk(
     sequence: u64,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
-    chunk.copy_to_with_u8_array(buffer);
+    if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
+        log::error!("Error copying audio chunk: {:?}", e);
+    }
     let mut media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),
         media_type: MediaType::AUDIO.into(),

@@ -7,6 +7,11 @@ description = "A client for the videocall project"
 release = true
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>",
+]
+keywords = ["quic", "webtransport", "zoom", "webrtc"]
+categories = ["network-programming", "multimedia"]
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -31,7 +36,7 @@ yew-websocket = "1.21.0"
 yew-webtransport = "0.21.1"
 
 [dependencies.web-sys]
-version = "0.3.60"
+version = "0.3.72"
 features = [
     "AudioTrack",
     "AudioData",

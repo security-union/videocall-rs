@@ -32,8 +32,8 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
         })
     }
 
-    pub fn configure(&self, config: &D::ConfigType) {
-        self.decoder.configure(config);
+    pub fn configure(&self, config: &D::ConfigType) -> Result<(), JsValue> {
+        self.decoder.configure(config)
     }
 
     pub fn decode(&mut self, packet: Arc<MediaPacket>) -> Vec<Arc<MediaPacket>> {
@@ -117,7 +117,9 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
     // Decode a specific frame and update sequence
     fn decode_next_frame(&mut self, next_sequence: u64) -> Option<Arc<MediaPacket>> {
         if let Some(frame) = self.buffer.remove(&next_sequence) {
-            self.decoder.decode(frame.clone());
+            if let Err(e) = self.decoder.decode(frame.clone()) {
+                log::error!("Error decoding frame: {:?}", e);
+            }
             self.sequence = Some(next_sequence);
             Some(frame)
         } else {
@@ -171,13 +173,15 @@ mod tests {
             })
         }
 
-        fn configure(&self, _config: &Self::ConfigType) {
+        fn configure(&self, _config: &Self::ConfigType) -> Result<(), JsValue> {
             // Mock implementation, do nothing
+            Ok(())
         }
 
-        fn decode(&self, packet: Arc<MediaPacket>) {
+        fn decode(&self, packet: Arc<MediaPacket>) -> Result<(), JsValue> {
             let mut chunks = self.chunks.lock().unwrap();
             chunks.push(packet);
+            Ok(())
         }
 
         fn state(&self) -> CodecState {

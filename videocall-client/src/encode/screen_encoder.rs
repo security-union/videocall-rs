@@ -209,11 +209,13 @@ impl ScreenEncoder {
 
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
-            let mut screen_encoder_config =
+            let screen_encoder_config =
                 VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
-            screen_encoder_config.bitrate(local_bitrate as f64);
-            screen_encoder_config.latency_mode(LatencyMode::Realtime);
-            screen_encoder.configure(&screen_encoder_config);
+            screen_encoder_config.set_bitrate(local_bitrate as f64);
+            screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
+            if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
+                error!("Error configuring screen encoder: {:?}", e);
+            }
 
             let screen_processor =
                 MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(&media_track))
@@ -234,7 +236,9 @@ impl ScreenEncoder {
                 {
                     switching.store(false, Ordering::Release);
                     media_track.stop();
-                    screen_encoder.close();
+                    if let Err(e) = screen_encoder.close() {
+                        error!("Error closing screen encoder: {:?}", e);
+                    }
                     break;
                 }
 
@@ -246,21 +250,26 @@ impl ScreenEncoder {
                 {
                     info!("📊 Updating screen bitrate to {}", new_bitrate);
                     local_bitrate = new_bitrate;
-                    let mut new_config =
+                    let new_config =
                         VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
-                    new_config.bitrate(local_bitrate as f64);
-                    new_config.latency_mode(LatencyMode::Realtime);
-                    screen_encoder.configure(&new_config);
+                    new_config.set_bitrate(local_bitrate as f64);
+                    new_config.set_latency_mode(LatencyMode::Realtime);
+                    if let Err(e) = screen_encoder.configure(&new_config) {
+                        error!("Error configuring screen encoder: {:?}", e);
+                    }
                 }
 
                 match JsFuture::from(screen_reader.read()).await {
                     Ok(js_frame) => match Reflect::get(&js_frame, &JsString::from("value")) {
                         Ok(value) => {
                             let video_frame = value.unchecked_into::<VideoFrame>();
-                            let mut opts = VideoEncoderEncodeOptions::new();
+                            let opts = VideoEncoderEncodeOptions::new();
                             screen_frame_counter = (screen_frame_counter + 1) % 50;
-                            opts.key_frame(screen_frame_counter == 0);
-                            screen_encoder.encode_with_options(&video_frame, &opts);
+                            opts.set_key_frame(screen_frame_counter == 0);
+                            if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts)
+                            {
+                                error!("Error encoding screen frame: {:?}", e);
+                            }
                             video_frame.close();
                         }
                         Err(e) => {

@@ -2,6 +2,12 @@
 name = "yew-ui"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A Yew UI for the videocall project"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+keywords = ["quic", "webtransport", "zoom", "webrtc", "yew"]
+categories = ["network-programming", "multimedia", "web-programming"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -22,7 +28,7 @@ enum-display = "0.1.4"
 futures = "0.3.31"
 
 [dependencies.web-sys]
-version = "0.3.60"
+version = "0.3.72"
 features = [
     "HtmlDocument",
     "console",

@@ -101,8 +101,8 @@ fn handle_unidirectional_stream(
             let read_result = JsFuture::from(incoming_unistreams.read()).await;
             match read_result {
                 Err(e) => {
-                    let mut reason = WebTransportCloseInfo::default();
-                    reason.reason(format!("Failed to read incoming unistream {e:?}").as_str());
+                    let reason = WebTransportCloseInfo::default();
+                    reason.set_reason(format!("Failed to read incoming unistream {e:?}").as_str());
                     break;
                 }
                 Ok(result) => {
@@ -151,8 +151,8 @@ fn handle_bidirectional_stream(
 
             match read_result {
                 Err(e) => {
-                    let mut reason = WebTransportCloseInfo::default();
-                    reason.reason(format!("Failed to read incoming bidistream {e:?}").as_str());
+                    let reason = WebTransportCloseInfo::default();
+                    reason.set_reason(format!("Failed to read incoming bidistream {e:?}").as_str());
                     break;
                 }
                 Ok(result) => {

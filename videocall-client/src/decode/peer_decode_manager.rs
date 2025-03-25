@@ -11,6 +11,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
 #[derive(Debug)]
@@ -68,9 +69,9 @@ impl Peer {
         screen_canvas_id: String,
         email: String,
         aes: Option<Aes128State>,
-    ) -> Self {
-        let (audio, video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id);
-        Self {
+    ) -> Result<Self, JsValue> {
+        let (audio, video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id)?;
+        Ok(Self {
             audio,
             video,
             screen,
@@ -79,26 +80,27 @@ impl Peer {
             screen_canvas_id,
             aes,
             heartbeat_count: 1,
-        }
+        })
     }
 
     fn new_decoders(
         video_canvas_id: &str,
         screen_canvas_id: &str,
-    ) -> (AudioPeerDecoder, VideoPeerDecoder, VideoPeerDecoder) {
-        (
-            AudioPeerDecoder::new(),
-            VideoPeerDecoder::new(video_canvas_id),
-            VideoPeerDecoder::new(screen_canvas_id),
-        )
+    ) -> Result<(AudioPeerDecoder, VideoPeerDecoder, VideoPeerDecoder), JsValue> {
+        Ok((
+            AudioPeerDecoder::new()?,
+            VideoPeerDecoder::new(video_canvas_id)?,
+            VideoPeerDecoder::new(screen_canvas_id)?,
+        ))
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result<(), JsValue> {
         let (audio, video, screen) =
-            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id);
+            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id)?;
         self.audio = audio;
         self.video = video;
         self.screen = screen;
+        Ok(())
     }
 
     fn decode(
@@ -249,17 +251,14 @@ impl PeerDecodeManager {
 
                     Ok(())
                 }
-                Err(e) => {
-                    peer.reset();
-                    Err(e)
-                }
+                Err(e) => peer.reset().map_err(|_| e),
             }
         } else {
             Err(PeerDecodeError::NoSuchPeer(email.clone()))
         }
     }
 
-    fn add_peer(&mut self, email: &str, aes: Option<Aes128State>) {
+    fn add_peer(&mut self, email: &str, aes: Option<Aes128State>) -> Result<(), JsValue> {
         debug!("Adding peer {}", email);
         self.connected_peers.insert(
             email.to_owned(),
@@ -268,8 +267,9 @@ impl PeerDecodeManager {
                 self.get_screen_canvas_id.emit(email.to_owned()),
                 email.to_owned(),
                 aes,
-            ),
+            )?,
         );
+        Ok(())
     }
 
     pub fn delete_peer(&mut self, email: &String) {
@@ -280,8 +280,12 @@ impl PeerDecodeManager {
         if self.connected_peers.contains_key(email) {
             PeerStatus::NoChange
         } else {
-            self.add_peer(email, None);
-            PeerStatus::Added(email.clone())
+            if let Err(e) = self.add_peer(email, None) {
+                log::error!("Error adding peer: {:?}", e);
+                PeerStatus::NoChange
+            } else {
+                PeerStatus::Added(email.clone())
+            }
         }
     }
 

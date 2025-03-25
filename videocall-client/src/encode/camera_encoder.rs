@@ -211,12 +211,12 @@ impl CameraEncoder {
                 .unchecked_into::<HtmlVideoElement>();
 
             let media_devices = navigator.media_devices().unwrap();
-            let mut constraints = MediaStreamConstraints::new();
-            let mut media_info = web_sys::MediaTrackConstraints::new();
-            media_info.device_id(&device_id.into());
+            let constraints = MediaStreamConstraints::new();
+            let media_info = web_sys::MediaTrackConstraints::new();
+            media_info.set_device_id(&device_id.into());
 
-            constraints.video(&media_info.into());
-            constraints.audio(&Boolean::from(false));
+            constraints.set_video(&media_info.into());
+            constraints.set_audio(&Boolean::from(false));
 
             let devices_query = media_devices
                 .get_user_media_with_constraints(&constraints)
@@ -254,15 +254,18 @@ impl CameraEncoder {
                 .clone()
                 .unchecked_into::<MediaStreamTrack>()
                 .get_settings();
-            video_settings.width(VIDEO_WIDTH);
-            video_settings.height(VIDEO_HEIGHT);
+            video_settings.set_width(VIDEO_WIDTH);
+            video_settings.set_height(VIDEO_HEIGHT);
 
-            let mut video_encoder_config =
+            let video_encoder_config =
                 VideoEncoderConfig::new(VIDEO_CODEC, VIDEO_HEIGHT as u32, VIDEO_WIDTH as u32);
-            video_encoder_config.bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
-            video_encoder_config.latency_mode(LatencyMode::Realtime);
+            video_encoder_config
+                .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
+            video_encoder_config.set_latency_mode(LatencyMode::Realtime);
 
-            video_encoder.configure(&video_encoder_config);
+            if let Err(e) = video_encoder.configure(&video_encoder_config) {
+                error!("Error configuring video encoder: {:?}", e);
+            }
 
             let video_processor =
                 MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
@@ -288,7 +291,9 @@ impl CameraEncoder {
                     switching.store(false, Ordering::Release);
                     let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                     video_track.stop();
-                    video_encoder.close();
+                    if let Err(e) = video_encoder.close() {
+                        error!("Error closing video encoder: {:?}", e);
+                    }
                     return;
                 }
 
@@ -300,8 +305,10 @@ impl CameraEncoder {
                 {
                     log::info!("Updating video bitrate to {}", new_current_bitrate);
                     local_bitrate = new_current_bitrate;
-                    video_encoder_config.bitrate(local_bitrate as f64);
-                    video_encoder.configure(&video_encoder_config);
+                    video_encoder_config.set_bitrate(local_bitrate as f64);
+                    if let Err(e) = video_encoder.configure(&video_encoder_config) {
+                        error!("Error configuring video encoder: {:?}", e);
+                    }
                 }
 
                 match JsFuture::from(video_reader.read()).await {
@@ -309,11 +316,13 @@ impl CameraEncoder {
                         let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
                             .unwrap()
                             .unchecked_into::<VideoFrame>();
-                        video_encoder.encode_with_options(
-                            &video_frame,
-                            VideoEncoderEncodeOptions::new()
-                                .key_frame(video_frame_counter % 150 == 0),
-                        );
+                        let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
+                        video_encoder_encode_options.set_key_frame(video_frame_counter % 150 == 0);
+                        if let Err(e) = video_encoder
+                            .encode_with_options(&video_frame, &video_encoder_encode_options)
+                        {
+                            error!("Error encoding video frame: {:?}", e);
+                        }
                         video_frame.close();
                         video_frame_counter += 1;
                     }

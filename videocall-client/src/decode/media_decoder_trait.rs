@@ -17,10 +17,10 @@ pub trait MediaDecoderTrait {
         Self: Sized;
 
     /// Configure the decoder with codec-specific settings
-    fn configure(&self, config: &Self::ConfigType);
+    fn configure(&self, config: &Self::ConfigType) -> Result<(), JsValue>;
 
     /// Decode a media packet
-    fn decode(&self, packet: Arc<MediaPacket>);
+    fn decode(&self, packet: Arc<MediaPacket>) -> Result<(), JsValue>;
 
     /// Get the current state of the decoder
     fn state(&self) -> CodecState;

@@ -71,7 +71,7 @@ pub trait PeerDecode {
 pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue>;
 
 impl VideoPeerDecoder {
-    pub fn new(canvas_id: &str) -> Self {
+    pub fn new(canvas_id: &str) -> Result<Self, JsValue> {
         let id = canvas_id.to_owned();
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
@@ -106,14 +106,14 @@ impl VideoPeerDecoder {
             output.as_ref().unchecked_ref(),
         ))
         .unwrap();
-        decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC));
-        Self {
+        decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC))?;
+        Ok(Self {
             decoder,
             waiting_for_keyframe: true,
             decoded: false,
             _error: error,
             _output: output,
-        }
+        })
     }
 
     fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedVideoChunkType {
@@ -156,14 +156,8 @@ impl PeerDecode for VideoPeerDecoder {
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
 pub type AudioPeerDecoder = PeerDecoder<AudioDecoderWithBuffer<AudioDecoderWrapper>, AudioData>;
 
-impl Default for AudioPeerDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AudioPeerDecoder {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, JsValue> {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
@@ -200,14 +194,14 @@ impl AudioPeerDecoder {
             AUDIO_CODEC,
             AUDIO_CHANNELS,
             AUDIO_SAMPLE_RATE,
-        ));
-        Self {
+        ))?;
+        Ok(Self {
             decoder,
             waiting_for_keyframe: true,
             decoded: false,
             _error: error,
             _output: output,
-        }
+        })
     }
 
     fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedAudioChunkType {

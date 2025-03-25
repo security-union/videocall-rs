@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/security-union/videocall-rs/compare/videocall-client-v0.1.0...videocall-client-v0.1.1) - 2025-03-25
+
+### Other
+
+- Try to get release plz to work ([#216](https://github.com/security-union/videocall-rs/pull/216))
+- add release-plz.toml ([#212](https://github.com/security-union/videocall-rs/pull/212))
+
 ## [0.1.0](https://github.com/security-union/videocall-rs/releases/tag/videocall-client-v0.1.0) - 2025-03-24
 
 ### Fixed

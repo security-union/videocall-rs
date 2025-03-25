@@ -535,8 +535,6 @@ dependencies = [
  "futures",
  "protobuf",
  "rand",
- "serde",
- "serde_json",
  "tokio",
  "tokio-tungstenite",
  "url",

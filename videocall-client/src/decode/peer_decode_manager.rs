@@ -5,13 +5,13 @@ use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
 use protobuf::Message;
-use wasm_bindgen::JsValue;
 use std::rc::Rc;
 use std::{fmt::Display, sync::Arc};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
 #[derive(Debug)]
@@ -251,9 +251,7 @@ impl PeerDecodeManager {
 
                     Ok(())
                 }
-                Err(e) => {
-                    peer.reset().map_err(|_| e)
-                }
+                Err(e) => peer.reset().map_err(|_| e),
             }
         } else {
             Err(PeerDecodeError::NoSuchPeer(email.clone()))

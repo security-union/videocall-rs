@@ -318,7 +318,9 @@ impl CameraEncoder {
                             .unchecked_into::<VideoFrame>();
                         let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
                         video_encoder_encode_options.set_key_frame(video_frame_counter % 150 == 0);
-                        if let Err(e) = video_encoder.encode_with_options(&video_frame, &video_encoder_encode_options) {
+                        if let Err(e) = video_encoder
+                            .encode_with_options(&video_frame, &video_encoder_encode_options)
+                        {
                             error!("Error encoding video frame: {:?}", e);
                         }
                         video_frame.close();

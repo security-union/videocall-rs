@@ -1,4 +1,3 @@
-#![allow(clippy::all)]
 /*
 * Copyright 2022 l1npengtul <l1npengtul@protonmail.com> / The Nokhwa Contributors
 *
@@ -20,6 +19,8 @@
 // save yourselves. write apple code in swift and bind it to rust.
 
 // <some change so we can call this 0.10.4>
+
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[macro_use]

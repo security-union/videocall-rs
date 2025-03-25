@@ -691,7 +691,7 @@ pub enum KnownCameraControl {
     Iris,
     Focus,
     /// Other camera control. Listed is the ID.
-    /// Wasteful, however is needed for a unified API across Windows, Linux, and `MacOSX` due to Microsoft's usage of GUIDs.
+    /// Wasteful, however is needed for a unified API across Windows, Linux, and MacOSX due to Microsoft's usage of GUIDs.
     ///
     /// THIS SHOULD ONLY BE USED WHEN YOU KNOW THE PLATFORM THAT YOU ARE RUNNING ON.
     Other(u128),
@@ -1230,6 +1230,7 @@ impl ControlValueSetter {
         }
     }
     #[must_use]
+
     pub fn as_integer(&self) -> Option<&i64> {
         if let ControlValueSetter::Integer(i) = self {
             Some(i)
@@ -1238,6 +1239,7 @@ impl ControlValueSetter {
         }
     }
     #[must_use]
+
     pub fn as_float(&self) -> Option<&f64> {
         if let ControlValueSetter::Float(f) = self {
             Some(f)
@@ -1246,6 +1248,7 @@ impl ControlValueSetter {
         }
     }
     #[must_use]
+
     pub fn as_boolean(&self) -> Option<&bool> {
         if let ControlValueSetter::Boolean(f) = self {
             Some(f)
@@ -1254,6 +1257,7 @@ impl ControlValueSetter {
         }
     }
     #[must_use]
+
     pub fn as_str(&self) -> Option<&str> {
         if let ControlValueSetter::String(s) = self {
             Some(s)
@@ -1262,6 +1266,7 @@ impl ControlValueSetter {
         }
     }
     #[must_use]
+
     pub fn as_bytes(&self) -> Option<&[u8]> {
         if let ControlValueSetter::Bytes(b) = self {
             Some(b)

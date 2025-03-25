@@ -33,9 +33,9 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
             EncodedAudioChunkType::from_js_value(&JsValue::from(audio.frame_type.clone())).unwrap();
         let audio_data = Uint8Array::new_with_length(audio.data.len().try_into().unwrap());
         audio_data.copy_from(&audio.data);
-        let mut audio_chunk =
+        let audio_chunk =
             EncodedAudioChunkInit::new(&audio_data.into(), audio.timestamp, chunk_type);
-        audio_chunk.duration(audio.duration);
+        audio_chunk.set_duration(audio.duration);
         let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
         self.0.decode(&encoded_audio_chunk);
     }

@@ -33,8 +33,8 @@ impl VideoDecoderTrait for VideoDecoderWrapper {
         let chunk_type = EncodedVideoChunkTypeWrapper::from(image.frame_type.as_str()).0;
         let video_data = Uint8Array::new_with_length(image.data.len().try_into().unwrap());
         video_data.copy_from(&image.data);
-        let mut video_chunk = EncodedVideoChunkInit::new(&video_data, image.timestamp, chunk_type);
-        video_chunk.duration(image.duration);
+        let video_chunk = EncodedVideoChunkInit::new(&video_data, image.timestamp, chunk_type);
+        video_chunk.set_duration(image.duration);
         let encoded_video_chunk = EncodedVideoChunk::new(&video_chunk).unwrap();
         self.0.decode(&encoded_video_chunk);
     }

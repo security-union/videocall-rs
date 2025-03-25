@@ -1,5 +1,4 @@
-#![deny(clippy::pedantic)]
-#![warn(clippy::all)]
+#![allow(clippy::all)]
 #![cfg_attr(feature = "test-fail-warnings", deny(warnings))]
 #![cfg_attr(feature = "docs-features", feature(doc_cfg))]
 /*

@@ -173,12 +173,12 @@ impl MicrophoneEncoder {
             let navigator = window().navigator();
 
             let media_devices = navigator.media_devices().unwrap();
-            let mut constraints = MediaStreamConstraints::new();
-            let mut media_info = web_sys::MediaTrackConstraints::new();
-            media_info.device_id(&device_id.into());
+            let constraints = MediaStreamConstraints::new();
+            let media_info = web_sys::MediaTrackConstraints::new();
+            media_info.set_device_id(&device_id.into());
 
-            constraints.audio(&media_info.into());
-            constraints.video(&Boolean::from(false));
+            constraints.set_audio(&media_info.into());
+            constraints.set_video(&Boolean::from(false));
 
             let devices_query = media_devices
                 .get_user_media_with_constraints(&constraints)
@@ -212,10 +212,10 @@ impl MicrophoneEncoder {
 
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
-            let mut audio_encoder_config = AudioEncoderConfig::new(AUDIO_CODEC);
-            audio_encoder_config.bitrate(local_bitrate as f64);
-            audio_encoder_config.sample_rate(AUDIO_SAMPLE_RATE);
-            audio_encoder_config.number_of_channels(AUDIO_CHANNELS);
+            let audio_encoder_config = AudioEncoderConfig::new(AUDIO_CODEC);
+            audio_encoder_config.set_bitrate(local_bitrate as f64);
+            audio_encoder_config.set_sample_rate(AUDIO_SAMPLE_RATE);
+            audio_encoder_config.set_number_of_channels(AUDIO_CHANNELS);
             audio_encoder.configure(&audio_encoder_config);
 
             let audio_processor =
@@ -247,10 +247,10 @@ impl MicrophoneEncoder {
                 {
                     info!("📊 Updating microphone bitrate to {}", new_bitrate);
                     local_bitrate = new_bitrate;
-                    let mut new_config = AudioEncoderConfig::new(AUDIO_CODEC);
-                    new_config.bitrate(local_bitrate as f64);
-                    new_config.sample_rate(AUDIO_SAMPLE_RATE);
-                    new_config.number_of_channels(AUDIO_CHANNELS);
+                    let new_config = AudioEncoderConfig::new(AUDIO_CODEC);
+                    new_config.set_bitrate(local_bitrate as f64);
+                    new_config.set_sample_rate(AUDIO_SAMPLE_RATE);
+                    new_config.set_number_of_channels(AUDIO_CHANNELS);
                     audio_encoder.configure(&new_config);
                 }
 

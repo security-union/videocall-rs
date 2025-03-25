@@ -14,11 +14,7 @@
  * limitations under the License.
  */
 
-#![deny(clippy::pedantic)]
-#![warn(clippy::all)]
-#![allow(clippy::missing_errors_doc)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::too_many_lines)]
+#![allow(clippy::all)]
 
 //! # nokhwa-bindings-windows
 //! This crate is the `MediaFoundation` bindings for the `nokhwa` crate.

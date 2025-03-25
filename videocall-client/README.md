@@ -32,10 +32,6 @@ compiled to npm module that could be called from javascript, e.g. in an electron
 
 Currently, only the Chrome browser is supported, due to some of the Web APIs that are used.
 
-**NOTE:** This initial version is a slightly frankenstein result of piecemeal refactoring bits
-from the original app and stitching them together.   It could use cleaning up both the API the
-internal design.
-
 ## Outline of usage
 
 For more detailed documentation see the doc for each struct.

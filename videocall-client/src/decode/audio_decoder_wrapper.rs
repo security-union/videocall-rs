@@ -1,5 +1,6 @@
 use super::media_decoder_trait::MediaDecoderTrait;
 use js_sys::Uint8Array;
+use log::{error, info};
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
@@ -25,6 +26,7 @@ pub struct AudioDecoderWrapper(web_sys::AudioDecoder);
 // Implement the trait for the wrapper struct
 impl AudioDecoderTrait for AudioDecoderWrapper {
     fn configure(&self, config: &AudioDecoderConfig) -> Result<(), JsValue> {
+        info!("Configuring audio decoder with config: {:?}", config);
         self.0.configure(config)
     }
 
@@ -37,17 +39,38 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
             EncodedAudioChunkInit::new(&audio_data.into(), audio.timestamp, chunk_type);
         audio_chunk.set_duration(audio.duration);
         let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
-        self.0.decode(&encoded_audio_chunk)
+
+        log::debug!(
+            "Decoding audio chunk: type={:?}, size={}, timestamp={}, duration={}",
+            chunk_type,
+            audio.data.len(),
+            audio.timestamp,
+            audio.duration,
+        );
+
+        match self.0.decode(&encoded_audio_chunk) {
+            Ok(_) => {
+                log::debug!("Successfully decoded audio chunk");
+                Ok(())
+            }
+            Err(e) => {
+                error!("Error decoding audio chunk: {:?}", e);
+                Err(e)
+            }
+        }
     }
 
     fn state(&self) -> CodecState {
-        self.0.state()
+        let state = self.0.state();
+        log::debug!("Audio decoder state: {:?}", state);
+        state
     }
 
     fn new(init: &AudioDecoderInit) -> Result<Self, JsValue>
     where
         Self: Sized,
     {
+        info!("Creating new audio decoder");
         AudioDecoder::new(init).map(AudioDecoderWrapper)
     }
 }
@@ -61,19 +84,31 @@ impl MediaDecoderTrait for AudioDecoderWrapper {
     where
         Self: Sized,
     {
+        info!("Creating new audio decoder (MediaDecoderTrait)");
         AudioDecoder::new(init).map(AudioDecoderWrapper)
     }
 
     fn configure(&self, config: &Self::ConfigType) -> Result<(), JsValue> {
+        info!(
+            "Configuring audio decoder (MediaDecoderTrait) with config: {:?}",
+            config
+        );
         self.0.configure(config)
     }
 
     fn decode(&self, packet: Arc<MediaPacket>) -> Result<(), JsValue> {
+        log::debug!(
+            "Decoding audio packet: sequence={}, frame_type={}",
+            packet.audio_metadata.sequence,
+            packet.frame_type
+        );
         AudioDecoderTrait::decode(self, packet)
     }
 
     fn state(&self) -> CodecState {
-        self.0.state()
+        let state = self.0.state();
+        info!("Audio decoder state (MediaDecoderTrait): {:?}", state);
+        state
     }
 
     fn get_sequence_number(&self, packet: &MediaPacket) -> u64 {

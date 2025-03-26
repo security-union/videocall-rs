@@ -11,7 +11,7 @@
 //
 
 use super::super::wrappers::EncodedVideoChunkTypeWrapper;
-use super::audio_decoder_wrapper::AudioDecoderWrapper;
+use super::audio_decoder_wrapper::{AudioDecoderTrait, AudioDecoderWrapper};
 use super::config::configure_audio_context;
 use super::media_decoder_with_buffer::{AudioDecoderWithBuffer, VideoDecoderWithBuffer};
 use super::video_decoder_wrapper::VideoDecoderWrapper;
@@ -154,7 +154,13 @@ impl PeerDecode for VideoPeerDecoder {
 ///
 /// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
-pub type AudioPeerDecoder = PeerDecoder<AudioDecoderWithBuffer<AudioDecoderWrapper>, AudioData>;
+pub struct AudioPeerDecoder {
+    pub decoder: AudioDecoderWrapper,
+    decoded: bool,
+    _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
+    _output: Closure<dyn FnMut(AudioData)>, // member exists to keep the closure in scope for the life of the struct
+    _audio_context: web_sys::AudioContext,  // Keep audio context alive
+}
 
 impl AudioPeerDecoder {
     pub fn new() -> Result<Self, JsValue> {
@@ -164,7 +170,7 @@ impl AudioPeerDecoder {
         let audio_stream_generator =
             MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
         // The audio context is used to reproduce audio.
-        let _audio_context = configure_audio_context(&audio_stream_generator).unwrap();
+        let audio_context = configure_audio_context(&audio_stream_generator).unwrap();
 
         let output = Closure::wrap(Box::new(move |audio_data: AudioData| {
             let writable = audio_stream_generator.writable();
@@ -185,11 +191,10 @@ impl AudioPeerDecoder {
                 error!("error {:?}", e);
             }
         }) as Box<dyn FnMut(AudioData)>);
-        let decoder = AudioDecoderWithBuffer::new(&AudioDecoderInit::new(
+        let decoder = AudioDecoderWrapper::new(&AudioDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
-        ))
-        .unwrap();
+        ))?;
         decoder.configure(&AudioDecoderConfig::new(
             AUDIO_CODEC,
             AUDIO_CHANNELS,
@@ -197,10 +202,10 @@ impl AudioPeerDecoder {
         ))?;
         Ok(Self {
             decoder,
-            waiting_for_keyframe: true,
             decoded: false,
             _error: error,
             _output: output,
+            _audio_context: audio_context,
         })
     }
 
@@ -212,19 +217,42 @@ impl AudioPeerDecoder {
 impl PeerDecode for AudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let first_frame = !self.decoded;
-        let chunk_type = self.get_chunk_type(packet);
+        let current_state = self.decoder.state();
+        log::debug!("Audio decoder state before decode: {:?}", current_state);
 
-        if !self.waiting_for_keyframe || chunk_type == EncodedAudioChunkType::Key {
-            match self.decoder.state() {
-                CodecState::Configured => {
-                    self.decoder.decode(packet.clone());
-                    self.waiting_for_keyframe = false;
-                    self.decoded = true;
+        match current_state {
+            CodecState::Configured => {
+                log::debug!(
+                    "Decoding audio packet with sequence: {}",
+                    packet.audio_metadata.sequence
+                );
+                if let Err(e) = self.decoder.decode(packet.clone()) {
+                    log::error!("Error decoding audio packet: {:?}", e);
+                    return Err(anyhow::anyhow!("Failed to decode audio packet"));
                 }
-                CodecState::Closed => {
-                    return Err(anyhow::anyhow!("decoder closed"));
+                self.decoded = true;
+                log::debug!(
+                    "Audio packet decoded, new state: {:?}",
+                    self.decoder.state()
+                );
+            }
+            CodecState::Closed => {
+                log::error!("Audio decoder closed unexpectedly");
+                return Err(anyhow::anyhow!("decoder closed"));
+            }
+            CodecState::Unconfigured => {
+                log::warn!("Audio decoder unconfigured, attempting to reconfigure");
+                if let Err(e) = self.decoder.configure(&AudioDecoderConfig::new(
+                    AUDIO_CODEC,
+                    AUDIO_CHANNELS,
+                    AUDIO_SAMPLE_RATE,
+                )) {
+                    log::error!("Failed to reconfigure audio decoder: {:?}", e);
+                    return Err(anyhow::anyhow!("Failed to reconfigure audio decoder"));
                 }
-                _ => {}
+            }
+            _ => {
+                log::warn!("Unexpected audio decoder state: {:?}", current_state);
             }
         }
 

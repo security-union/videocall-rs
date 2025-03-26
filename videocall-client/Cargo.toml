@@ -39,6 +39,7 @@ version = "0.3.72"
 features = [
     "AudioTrack",
     "AudioData",
+    "AudioParam",
     "AudioEncoder",
     "AudioEncoderInit",
     "AudioEncoderConfig",

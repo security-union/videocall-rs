@@ -1,6 +1,6 @@
 [package]
 name = "videocall-types"
-version = "0.2.1"
+version = "1.0.0"
 edition = "2021"
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"

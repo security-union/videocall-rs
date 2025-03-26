@@ -5,7 +5,7 @@ use wasm_bindgen::JsValue;
 use web_sys::CodecState;
 
 // Minimum number of frames to buffer before decoding
-pub const MIN_BUFFER_SIZE: usize = 5;
+pub const MIN_BUFFER_SIZE: usize = 3;
 // Maximum buffer size to prevent excessive memory usage
 pub const MAX_BUFFER_SIZE: usize = 20;
 // Maximum allowed sequence gap before resetting

@@ -5384,7 +5384,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5407,7 +5407,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes",
  "anyhow",

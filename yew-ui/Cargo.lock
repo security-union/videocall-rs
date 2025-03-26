@@ -1503,7 +1503,7 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 
 [[package]]
 name = "videocall-client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -1534,6 +1534,28 @@ dependencies = [
  "serde",
  "serde_json",
  "yew-websocket",
+]
+
+[[package]]
+name = "videocall-ui"
+version = "1.0.0"
+dependencies = [
+ "console_error_panic_hook",
+ "console_log",
+ "enum-display",
+ "futures",
+ "gloo-timers 0.2.6",
+ "gloo-utils 0.1.7",
+ "lazy_static",
+ "log",
+ "videocall-client",
+ "videocall-types",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+ "yew",
+ "yew-router",
 ]
 
 [[package]]
@@ -1734,28 +1756,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.100",
-]
-
-[[package]]
-name = "yew-ui"
-version = "1.0.0"
-dependencies = [
- "console_error_panic_hook",
- "console_log",
- "enum-display",
- "futures",
- "gloo-timers 0.2.6",
- "gloo-utils 0.1.7",
- "lazy_static",
- "log",
- "videocall-client",
- "videocall-types",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
- "yew",
- "yew-router",
 ]
 
 [[package]]

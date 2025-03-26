@@ -1,4 +1,3 @@
-#![feature(future_join)]
 #[allow(non_camel_case_types)]
 mod components;
 mod constants;

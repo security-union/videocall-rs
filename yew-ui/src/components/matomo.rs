@@ -1,11 +1,11 @@
 #![allow(non_upper_case_globals)]
 
 use gloo_utils::window;
-use js_sys::Array;
 use js_sys::Reflect;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsValue;
 use web_sys::js_sys;
+use web_sys::js_sys::Array;
 
 #[wasm_bindgen]
 extern "C" {

@@ -31,6 +31,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          LOGIN_URL: ""
+          ACTIX_UI_BACKEND_URL: "wss://api.rustlemania.com"
+          WEBTRANSPORT_HOST: "https://transport.rustlemania.com"
 
   release-plz-pr:
     name: Release-plz PR
@@ -60,3 +63,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          LOGIN_URL: ""
+          ACTIX_UI_BACKEND_URL: "wss://api.rustlemania.com"
+          WEBTRANSPORT_HOST: "https://transport.rustlemania.com"

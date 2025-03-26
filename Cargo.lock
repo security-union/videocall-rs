@@ -5433,7 +5433,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa"
-version = "0.10.7"
+version = "0.10.8"
 dependencies = [
  "flume",
  "image",
@@ -5459,7 +5459,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-bindings-linux"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "v4l",
  "videocall-nokhwa-core",
@@ -5482,7 +5482,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-bindings-windows"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "once_cell",
  "videocall-nokhwa-core",
@@ -5491,7 +5491,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytemuck",
  "bytes",

@@ -1,6 +1,6 @@
 [package]
 name = "videocall-nokhwa-bindings-linux"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["l1npengtul <l1npengtul@protonmail.com>", "Dario Lencina <dario@securityunion.dev>"]

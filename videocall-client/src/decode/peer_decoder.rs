@@ -208,10 +208,6 @@ impl AudioPeerDecoder {
             _audio_context: audio_context,
         })
     }
-
-    fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedAudioChunkType {
-        EncodedAudioChunkType::from_js_value(&JsValue::from(packet.frame_type.clone())).unwrap()
-    }
 }
 
 impl PeerDecode for AudioPeerDecoder {

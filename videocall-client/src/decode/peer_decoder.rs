@@ -210,6 +210,14 @@ impl AudioPeerDecoder {
     }
 }
 
+impl Drop for AudioPeerDecoder {
+    fn drop(&mut self) {
+        if let Err(e) = self._audio_context.close() {
+            log::error!("Error closing audio context: {:?}", e);
+        }
+    }
+}
+
 impl PeerDecode for AudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let first_frame = !self.decoded;

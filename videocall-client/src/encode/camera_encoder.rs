@@ -179,7 +179,7 @@ impl CameraEncoder {
                 if now - last_chunk_time >= 1000.0 {
                     let fps = chunks_in_last_second;
                     current_fps.store(fps, Ordering::Relaxed);
-                    log::info!("Encoder output FPS: {}", fps);
+                    log::debug!("Encoder output FPS: {}", fps);
                     chunks_in_last_second = 0;
                     last_chunk_time = now;
                 }
@@ -303,7 +303,7 @@ impl CameraEncoder {
                     && (new_current_bitrate as f64) / (local_bitrate as f64) > 0.9
                     && (new_current_bitrate as f64) / (local_bitrate as f64) < 1.1
                 {
-                    log::info!("Updating video bitrate to {}", new_current_bitrate);
+                    log:: debug!("Updating video bitrate to {}", new_current_bitrate);
                     local_bitrate = new_current_bitrate;
                     video_encoder_config.set_bitrate(local_bitrate as f64);
                     if let Err(e) = video_encoder.configure(&video_encoder_config) {

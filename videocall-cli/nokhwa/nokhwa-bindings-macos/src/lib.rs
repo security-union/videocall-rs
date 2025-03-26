@@ -1,3 +1,7 @@
+#![allow(clippy::all)] // Ignores all Clippy warnings
+#![allow(warnings)]
+// Overrides --deny warnings
+
 /*
 * Copyright 2022 l1npengtul <l1npengtul@protonmail.com> / The Nokhwa Contributors
 *
@@ -13,13 +17,11 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 */
-
 // hello, future peng here
 // whatever is written here will induce horrors uncomprehendable.
 // save yourselves. write apple code in swift and bind it to rust.
 
 // <some change so we can call this 0.10.4>
-
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]

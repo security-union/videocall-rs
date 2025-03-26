@@ -1,6 +1,6 @@
 [package]
 name = "videocall-nokhwa"
-version = "0.10.7"
+version = "0.10.8"
 authors = ["l1npengtul <l1npengtul@protonmail.com>", "Dario Lencina <dario@securityunion.dev>"]
 edition = "2021"
 description = "A Simple-to-use, cross-platform Rust Webcam Capture Library"

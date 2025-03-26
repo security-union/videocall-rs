@@ -28,10 +28,10 @@ git_release_enable = true
 
 [[package]]
 name = "bot"
-publish = false
-changelog_update = false
-git_release_enable = false
-release = false
+publish = true
+changelog_update = true
+git_release_enable = true
+release = true
 
 [[package]]
 name = "videocall-api"

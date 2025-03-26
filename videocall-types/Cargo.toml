@@ -12,7 +12,6 @@ authors = [
 keywords = ["quic", "webtransport", "zoom", "webrtc"]
 categories = ["network-programming", "multimedia"]
 description = "types for the videocall streaming platform"
-release = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

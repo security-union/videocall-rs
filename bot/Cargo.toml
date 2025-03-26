@@ -2,7 +2,6 @@
 name = "bot"
 version = "1.0.0"
 edition = "2018"
-release = false
 license = "MIT OR Apache-2.0"
 description = "A bot for the videocall project"
 homepage = "https://github.com/security-union/videocall-rs"

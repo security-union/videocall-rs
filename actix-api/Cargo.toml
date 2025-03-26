@@ -4,7 +4,6 @@ version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A secure API for the videocall project"
-release = false
 keywords = ["webtransport", "quic", "webrtc", "videocall", "http3"]
 categories = ["network-programming", "multimedia"]
 

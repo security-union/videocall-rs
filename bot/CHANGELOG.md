@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1](https://github.com/security-union/videocall-rs/compare/bot-v1.0.0...bot-v1.0.1) - 2025-03-26
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.1.0](https://github.com/security-union/videocall-rs/releases/tag/bot-v0.1.0) - 2025-03-24
 
 ### Added

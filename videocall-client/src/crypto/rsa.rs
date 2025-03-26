@@ -13,15 +13,12 @@ impl RsaWrapper {
         if enabled {
             Self::new_random()
         } else {
-            let dummy_key = RsaPrivateKey::from_components(
-                0u8.into(),
-                0u8.into(),
-                0u8.into(),
-                [13u32.into(), 257u32.into()].to_vec(),
-            )
-            .unwrap();
+            // When disabled, create a minimal valid key that won't be used
+            let mut rng = rand::thread_rng();
+            // Use minimum possible bits (1024) to minimize overhead
+            let dummy_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
             Self {
-                enabled,
+                enabled: false, // explicitly set to false
                 pub_key: dummy_key.to_public_key(),
                 key: dummy_key,
             }
@@ -41,7 +38,6 @@ impl RsaWrapper {
 
     pub fn decrypt(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
         if !self.enabled {
-            // XXX: Don't make a new copy of data.
             return Ok(data.to_vec());
         }
         Ok(self.key.decrypt(Pkcs1v15Encrypt, data)?)
@@ -49,7 +45,6 @@ impl RsaWrapper {
 
     pub fn encrypt_with_key(&self, data: &[u8], key: &RsaPublicKey) -> anyhow::Result<Vec<u8>> {
         if !self.enabled {
-            // XXX: Don't make a new copy of data.
             return Ok(data.to_vec());
         }
         let mut rng = rand::thread_rng();
@@ -74,8 +69,10 @@ mod test {
     #[wasm_bindgen_test]
     fn test_rsa_disabled() {
         let key = RsaWrapper::new(false);
+        assert!(!key.enabled); // verify it's actually disabled
         let data = b"hello world";
         let encrypted = key.encrypt_with_key(data, &key.pub_key).unwrap();
+        assert_eq!(data, &encrypted[..]); // verify no encryption happened
         let decrypted = key.decrypt(&encrypted).unwrap();
         assert_eq!(data, decrypted.as_slice());
     }

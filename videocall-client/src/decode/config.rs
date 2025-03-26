@@ -1,7 +1,7 @@
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use js_sys::Array;
-use log::{error, info};
+use log::info;
 use web_sys::{AudioContext, AudioContextOptions};
 use web_sys::{MediaStream, MediaStreamTrackGenerator};
 

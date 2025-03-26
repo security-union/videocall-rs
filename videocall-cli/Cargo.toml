@@ -16,10 +16,6 @@ description = "Effortlessly stream video from the CLI with our native client, de
 include = ["src/**/*", "assets/**/*"]
 release = true
 
-[workspace]
-members = ["nokhwa", "nokhwa/nokhwa-bindings-macos", "nokhwa/nokhwa-bindings-windows", "nokhwa/nokhwa-bindings-linux", "nokhwa/nokhwa-core"]
-
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [package.metadata.deb]

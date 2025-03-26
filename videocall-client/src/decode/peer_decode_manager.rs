@@ -51,7 +51,6 @@ impl Display for PeerDecodeError {
     }
 }
 
-#[derive(Debug)]
 pub struct Peer {
     pub audio: AudioPeerDecoder,
     pub video: VideoPeerDecoder,
@@ -61,6 +60,18 @@ pub struct Peer {
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
     heartbeat_count: u8,
+}
+
+use std::fmt::Debug;
+
+impl Debug for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Peer {{ email: {}, video_canvas_id: {}, screen_canvas_id: {} }}",
+            self.email, self.video_canvas_id, self.screen_canvas_id
+        )
+    }
 }
 
 impl Peer {

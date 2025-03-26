@@ -86,6 +86,9 @@ services:
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
+      - LOGIN_URL="" # needed for UI CI tests
+      - ACTIX_UI_BACKEND_URL="" # needed for UI CI tests
+      - WEBTRANSPORT_HOST="" # needed for UI CI tests
     ports:
       - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
     volumes:

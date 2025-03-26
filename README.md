@@ -318,7 +318,7 @@ cat > .git/hooks/post-commit << 'EOF'
 
 # Run cargo clippy after the commit
 echo "Running cargo clippy..."
-cargo clippy -- -D warnings
+ACTIX_UI_BACKEND_URL="" WEBTRANSPORT_HOST="" LOGIN_URL="" WEBTRANSPORT_URL="" ACTIX_API_URL="" cargo clippy -- -D warnings
 
 # Check the exit code of cargo clippy
 if [ $? -ne 0 ]; then

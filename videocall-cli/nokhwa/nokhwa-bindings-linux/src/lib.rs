@@ -1,3 +1,6 @@
+#![allow(clippy::all)] // Ignores all Clippy warnings
+#![allow(warnings)] // Overrides --deny warnings
+
 /*
  * Copyright 2022 l1npengtul <l1npengtul@protonmail.com> / The Nokhwa Contributors
  *

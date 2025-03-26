@@ -6,7 +6,7 @@ use vpx_sys::*;
 macro_rules! vpx {
     ($f:expr) => {{
         let res = unsafe { $f };
-        let res_int = unsafe { std::mem::transmute::<_, i32>(res) };
+        let res_int = unsafe { std::mem::transmute::<vpx_sys::vpx_codec_err_t, i32>(res) };
         if res_int != 0 {
             return Err(anyhow!("vpx function error code ({}).", res_int));
         }

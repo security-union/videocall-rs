@@ -1,4 +1,7 @@
 FROM docker.io/securityunion/rustlemania-api-base:fix-ci-7d7323a2
 
+RUN apt-get update && apt-get install -y pkg-config libclang-dev \
+    libvpx-dev libasound2-dev libv4l-dev cmake
+
 RUN rustup component add clippy
 RUN rustup component add rustfmt

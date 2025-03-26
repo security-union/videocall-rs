@@ -1,6 +1,6 @@
 [package]
 name = "videocall-cli"
-version = "0.3.2"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
@@ -14,11 +14,6 @@ keywords = ["quic", "webtransport", "zoom"]
 categories = ["network-programming", "multimedia"]
 description = "Effortlessly stream video from the CLI with our native client, designed for your desktop, robot, or Raspberry Pi."
 include = ["src/**/*", "assets/**/*"]
-release = true
-
-[workspace]
-members = ["nokhwa", "nokhwa/nokhwa-bindings-macos", "nokhwa/nokhwa-bindings-windows", "nokhwa/nokhwa-bindings-linux", "nokhwa/nokhwa-core"]
-
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -48,5 +43,5 @@ videocall-nokhwa = { path = "nokhwa", version = "0.10.7", features = ["input-nat
 
 [dependencies.videocall-types]
 path = "../videocall-types"
-version = "0.2.*"
+version = "1.0.0"
 

@@ -14,12 +14,11 @@ publish = true
 changelog_update = true
 git_release_enable = true
 
-# TOFIX: CLI is not published
-# [[package]]
-# name = "videocall-cli"
-# publish = true
-# changelog_update = true
-# git_release_enable = true
+[[package]]
+name = "videocall-cli"
+publish = true
+changelog_update = true
+git_release_enable = true
 
 [[package]]
 name = "videocall-types"

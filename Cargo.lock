@@ -756,7 +756,7 @@ checksum = "cfa8873f51c92e232f9bac4065cddef41b714152812bfc5f7672ba16d6ef8cd9"
 
 [[package]]
 name = "bot"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "chrono",
  "dotenv",
@@ -5728,7 +5728,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -5751,7 +5751,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -5859,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.0.1...videocall-client-v1.1.0) - 2025-03-26
+
+### Added
+
+- Publish UI as a standalone crate and incorporate into single videocall workspace ([#228](https://github.com/security-union/videocall-rs/pull/228))
+
 ## [1.0.1](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.0.0...videocall-client-v1.0.1) - 2025-03-26
 
 ### Fixed

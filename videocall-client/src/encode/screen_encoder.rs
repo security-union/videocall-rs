@@ -43,9 +43,10 @@ use crate::diagnostics::EncoderControlSender;
 /// * [CameraEncoder](crate::CameraEncoder)
 /// * [MicrophoneEncoder](crate::MicrophoneEncoder)
 ///
+#[derive(Debug)]
 pub struct ScreenEncoder {
     client: VideoCallClient,
-    state: EncoderState,
+    pub state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
     on_encoder_settings_update: Option<Callback<String>>,

@@ -19,6 +19,7 @@ pub struct MediaDecoderWithBuffer<D: MediaDecoderTrait> {
     pub sequence: Option<u64>,
     pub min_jitter_buffer_size: usize,
     pub max_sequence_gap: u64,
+    pub canvas_id: String,
 }
 
 impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
@@ -29,6 +30,7 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
             sequence: None,
             min_jitter_buffer_size: MIN_BUFFER_SIZE,
             max_sequence_gap: MAX_SEQUENCE_GAP,
+            canvas_id: String::new(),
         })
     }
 
@@ -113,6 +115,10 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
 
     pub fn state(&self) -> CodecState {
         self.decoder.state()
+    }
+
+    pub fn get_canvas_id(&self) -> String {
+        self.canvas_id.clone()
     }
 }
 
@@ -213,7 +219,7 @@ mod tests {
             duration: 0.0,
             audio_metadata: Default::default(),
             video_metadata: Some(video_metadata).into(),
-            special_fields: Default::default(),
+            ..Default::default()
         })
     }
 
@@ -233,8 +239,7 @@ mod tests {
             timestamp: 0.0,
             duration: 0.0,
             audio_metadata: Some(audio_metadata).into(),
-            video_metadata: Default::default(),
-            special_fields: Default::default(),
+            ..Default::default()
         })
     }
 

@@ -59,6 +59,7 @@ impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
 
 pub trait PeerDecode {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
+    fn reset(&mut self) -> anyhow::Result<()>;
 }
 
 ///
@@ -145,6 +146,35 @@ impl PeerDecode for VideoPeerDecoder {
             first_frame,
         })
     }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.waiting_for_keyframe = true;
+        self.decoded = false;
+
+        // Clear the canvas content
+        if let Some(window) = web_sys::window() {
+            if let Some(document) = window.document() {
+                if let Some(canvas) = document.get_element_by_id(&self.decoder.get_canvas_id()) {
+                    if let Some(canvas) = canvas.dyn_into::<web_sys::HtmlCanvasElement>().ok() {
+                        if let Some(ctx) = canvas.get_context("2d").ok().flatten() {
+                            if let Some(ctx) =
+                                ctx.dyn_into::<web_sys::CanvasRenderingContext2d>().ok()
+                            {
+                                ctx.clear_rect(
+                                    0.0,
+                                    0.0,
+                                    canvas.width() as f64,
+                                    canvas.height() as f64,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 ///
@@ -208,6 +238,10 @@ impl AudioPeerDecoder {
             _audio_context: audio_context,
         })
     }
+
+    pub fn is_waiting_for_keyframe(&self) -> bool {
+        !self.decoded
+    }
 }
 
 impl Drop for AudioPeerDecoder {
@@ -264,5 +298,10 @@ impl PeerDecode for AudioPeerDecoder {
             _rendered: true,
             first_frame,
         })
+    }
+
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.decoded = false;
+        Ok(())
     }
 }

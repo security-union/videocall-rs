@@ -7,7 +7,7 @@ use std::sync::Arc;
 // for working with them.
 //
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EncoderState {
     pub(super) destroy: Arc<AtomicBool>,
     pub(super) enabled: Arc<AtomicBool>,
@@ -52,5 +52,10 @@ impl EncoderState {
     pub fn stop(&mut self) {
         self.destroy.store(true, Ordering::Release);
         self.enabled.store(false, Ordering::Release);
+    }
+
+    // Sets the enabled flag to use an external Arc<AtomicBool>
+    pub fn set_external_enabled(&mut self, external_enabled: Arc<AtomicBool>) {
+        self.enabled = external_enabled;
     }
 }

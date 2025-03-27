@@ -2,6 +2,7 @@ use crate::components::icons::push_pin::PushPinIcon;
 use crate::constants::USERS_ALLOWED_TO_STREAM;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
+use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsCast;
 use web_sys::{window, CanvasRenderingContext2d, HtmlCanvasElement};
 use yew::prelude::*;
@@ -22,6 +23,16 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
             } else {
                 "grid-item"
             };
+            let peer_video_css = if client.is_peer_stream_enabled(key, MediaType::VIDEO) {
+                "grid-item"
+            } else {
+                "grid-item hidden"
+            };
+            let peer_audio_css = if client.is_peer_stream_enabled(key, MediaType::AUDIO) {
+                "grid-item"
+            } else {
+                "grid-item hidden"
+            };
             let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
             let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
             html! {
@@ -38,7 +49,7 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
                             </button>
                         </div>
                     </div>
-                    <div class="grid-item" id={(*peer_video_div_id).clone()}>
+                    <div class={peer_video_css} id={(*peer_video_div_id).clone()}>
                         // One canvas for the User Video
                         <div class="canvas-container">
                             <UserVideo id={key.clone()}></UserVideo>

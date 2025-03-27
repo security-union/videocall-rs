@@ -44,6 +44,8 @@ pub struct MediaPacket {
     pub audio_metadata: ::protobuf::MessageField<AudioMetadata>,
     // @@protoc_insertion_point(field:MediaPacket.video_metadata)
     pub video_metadata: ::protobuf::MessageField<VideoMetadata>,
+    // @@protoc_insertion_point(field:MediaPacket.heartbeat_metadata)
+    pub heartbeat_metadata: ::protobuf::MessageField<HeartbeatMetadata>,
     // special fields
     // @@protoc_insertion_point(special_field:MediaPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -61,7 +63,7 @@ impl MediaPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(8);
+        let mut fields = ::std::vec::Vec::with_capacity(9);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "media_type",
@@ -102,6 +104,11 @@ impl MediaPacket {
             "video_metadata",
             |m: &MediaPacket| { &m.video_metadata },
             |m: &mut MediaPacket| { &mut m.video_metadata },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_message_field_accessor::<_, HeartbeatMetadata>(
+            "heartbeat_metadata",
+            |m: &MediaPacket| { &m.heartbeat_metadata },
+            |m: &mut MediaPacket| { &mut m.heartbeat_metadata },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<MediaPacket>(
             "MediaPacket",
@@ -145,6 +152,9 @@ impl ::protobuf::Message for MediaPacket {
                 66 => {
                     ::protobuf::rt::read_singular_message_into_field(is, &mut self.video_metadata)?;
                 },
+                74 => {
+                    ::protobuf::rt::read_singular_message_into_field(is, &mut self.heartbeat_metadata)?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -183,6 +193,10 @@ impl ::protobuf::Message for MediaPacket {
             let len = v.compute_size();
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
         }
+        if let Some(v) = self.heartbeat_metadata.as_ref() {
+            let len = v.compute_size();
+            my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -213,6 +227,9 @@ impl ::protobuf::Message for MediaPacket {
         if let Some(v) = self.video_metadata.as_ref() {
             ::protobuf::rt::write_message_field_with_cached_size(8, v, os)?;
         }
+        if let Some(v) = self.heartbeat_metadata.as_ref() {
+            ::protobuf::rt::write_message_field_with_cached_size(9, v, os)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -238,6 +255,7 @@ impl ::protobuf::Message for MediaPacket {
         self.duration = 0.;
         self.audio_metadata.clear();
         self.video_metadata.clear();
+        self.heartbeat_metadata.clear();
         self.special_fields.clear();
     }
 
@@ -251,6 +269,7 @@ impl ::protobuf::Message for MediaPacket {
             duration: 0.,
             audio_metadata: ::protobuf::MessageField::none(),
             video_metadata: ::protobuf::MessageField::none(),
+            heartbeat_metadata: ::protobuf::MessageField::none(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -665,24 +684,148 @@ impl ::protobuf::reflect::ProtobufValue for VideoMetadata {
     type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
 }
 
+// @@protoc_insertion_point(message:HeartbeatMetadata)
+#[derive(PartialEq,Clone,Default,Debug)]
+pub struct HeartbeatMetadata {
+    // message fields
+    // @@protoc_insertion_point(field:HeartbeatMetadata.enabled_streams)
+    pub enabled_streams: ::std::vec::Vec<::protobuf::EnumOrUnknown<media_packet::MediaType>>,
+    // special fields
+    // @@protoc_insertion_point(special_field:HeartbeatMetadata.special_fields)
+    pub special_fields: ::protobuf::SpecialFields,
+}
+
+impl<'a> ::std::default::Default for &'a HeartbeatMetadata {
+    fn default() -> &'a HeartbeatMetadata {
+        <HeartbeatMetadata as ::protobuf::Message>::default_instance()
+    }
+}
+
+impl HeartbeatMetadata {
+    pub fn new() -> HeartbeatMetadata {
+        ::std::default::Default::default()
+    }
+
+    fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
+        let mut fields = ::std::vec::Vec::with_capacity(1);
+        let mut oneofs = ::std::vec::Vec::with_capacity(0);
+        fields.push(::protobuf::reflect::rt::v2::make_vec_simpler_accessor::<_, _>(
+            "enabled_streams",
+            |m: &HeartbeatMetadata| { &m.enabled_streams },
+            |m: &mut HeartbeatMetadata| { &mut m.enabled_streams },
+        ));
+        ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HeartbeatMetadata>(
+            "HeartbeatMetadata",
+            fields,
+            oneofs,
+        )
+    }
+}
+
+impl ::protobuf::Message for HeartbeatMetadata {
+    const NAME: &'static str = "HeartbeatMetadata";
+
+    fn is_initialized(&self) -> bool {
+        true
+    }
+
+    fn merge_from(&mut self, is: &mut ::protobuf::CodedInputStream<'_>) -> ::protobuf::Result<()> {
+        while let Some(tag) = is.read_raw_tag_or_eof()? {
+            match tag {
+                8 => {
+                    self.enabled_streams.push(is.read_enum_or_unknown()?);
+                },
+                10 => {
+                    ::protobuf::rt::read_repeated_packed_enum_or_unknown_into(is, &mut self.enabled_streams)?
+                },
+                tag => {
+                    ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
+                },
+            };
+        }
+        ::std::result::Result::Ok(())
+    }
+
+    // Compute sizes of nested messages
+    #[allow(unused_variables)]
+    fn compute_size(&self) -> u64 {
+        let mut my_size = 0;
+        my_size += ::protobuf::rt::vec_packed_enum_or_unknown_size(1, &self.enabled_streams);
+        my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
+        self.special_fields.cached_size().set(my_size as u32);
+        my_size
+    }
+
+    fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
+        os.write_repeated_packed_enum_or_unknown(1, &self.enabled_streams)?;
+        os.write_unknown_fields(self.special_fields.unknown_fields())?;
+        ::std::result::Result::Ok(())
+    }
+
+    fn special_fields(&self) -> &::protobuf::SpecialFields {
+        &self.special_fields
+    }
+
+    fn mut_special_fields(&mut self) -> &mut ::protobuf::SpecialFields {
+        &mut self.special_fields
+    }
+
+    fn new() -> HeartbeatMetadata {
+        HeartbeatMetadata::new()
+    }
+
+    fn clear(&mut self) {
+        self.enabled_streams.clear();
+        self.special_fields.clear();
+    }
+
+    fn default_instance() -> &'static HeartbeatMetadata {
+        static instance: HeartbeatMetadata = HeartbeatMetadata {
+            enabled_streams: ::std::vec::Vec::new(),
+            special_fields: ::protobuf::SpecialFields::new(),
+        };
+        &instance
+    }
+}
+
+impl ::protobuf::MessageFull for HeartbeatMetadata {
+    fn descriptor() -> ::protobuf::reflect::MessageDescriptor {
+        static descriptor: ::protobuf::rt::Lazy<::protobuf::reflect::MessageDescriptor> = ::protobuf::rt::Lazy::new();
+        descriptor.get(|| file_descriptor().message_by_package_relative_name("HeartbeatMetadata").unwrap()).clone()
+    }
+}
+
+impl ::std::fmt::Display for HeartbeatMetadata {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        ::protobuf::text_format::fmt(self, f)
+    }
+}
+
+impl ::protobuf::reflect::ProtobufValue for HeartbeatMetadata {
+    type RuntimeType = ::protobuf::reflect::rt::RuntimeTypeMessage<Self>;
+}
+
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x18types/media_packet.proto\"\xf3\x02\n\x0bMediaPacket\x125\n\nmedia_\
+    \n\x18types/media_packet.proto\"\xb6\x03\n\x0bMediaPacket\x125\n\nmedia_\
     type\x18\x01\x20\x01(\x0e2\x16.MediaPacket.MediaTypeR\tmediaType\x12\x14\
     \n\x05email\x18\x02\x20\x01(\tR\x05email\x12\x12\n\x04data\x18\x03\x20\
     \x01(\x0cR\x04data\x12\x1d\n\nframe_type\x18\x04\x20\x01(\tR\tframeType\
     \x12\x1c\n\ttimestamp\x18\x05\x20\x01(\x01R\ttimestamp\x12\x1a\n\x08dura\
     tion\x18\x06\x20\x01(\x01R\x08duration\x125\n\x0eaudio_metadata\x18\x07\
     \x20\x01(\x0b2\x0e.AudioMetadataR\raudioMetadata\x125\n\x0evideo_metadat\
-    a\x18\x08\x20\x01(\x0b2\x0e.VideoMetadataR\rvideoMetadata\"<\n\tMediaTyp\
-    e\x12\t\n\x05VIDEO\x10\0\x12\t\n\x05AUDIO\x10\x01\x12\n\n\x06SCREEN\x10\
-    \x02\x12\r\n\tHEARTBEAT\x10\x03\"\xe8\x01\n\rAudioMetadata\x12!\n\x0caud\
-    io_format\x18\x01\x20\x01(\tR\x0baudioFormat\x127\n\x18audio_number_of_c\
-    hannels\x18\x02\x20\x01(\rR\x15audioNumberOfChannels\x123\n\x16audio_num\
-    ber_of_frames\x18\x03\x20\x01(\rR\x13audioNumberOfFrames\x12*\n\x11audio\
-    _sample_rate\x18\x04\x20\x01(\x02R\x0faudioSampleRate\x12\x1a\n\x08seque\
-    nce\x18\x05\x20\x01(\x04R\x08sequence\"+\n\rVideoMetadata\x12\x1a\n\x08s\
-    equence\x18\x01\x20\x01(\x04R\x08sequenceJ\xb4\x08\n\x06\x12\x04\0\0\x1d\
-    \x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x11\
+    a\x18\x08\x20\x01(\x0b2\x0e.VideoMetadataR\rvideoMetadata\x12A\n\x12hear\
+    tbeat_metadata\x18\t\x20\x01(\x0b2\x12.HeartbeatMetadataR\x11heartbeatMe\
+    tadata\"<\n\tMediaType\x12\t\n\x05VIDEO\x10\0\x12\t\n\x05AUDIO\x10\x01\
+    \x12\n\n\x06SCREEN\x10\x02\x12\r\n\tHEARTBEAT\x10\x03\"\xe8\x01\n\rAudio\
+    Metadata\x12!\n\x0caudio_format\x18\x01\x20\x01(\tR\x0baudioFormat\x127\
+    \n\x18audio_number_of_channels\x18\x02\x20\x01(\rR\x15audioNumberOfChann\
+    els\x123\n\x16audio_number_of_frames\x18\x03\x20\x01(\rR\x13audioNumberO\
+    fFrames\x12*\n\x11audio_sample_rate\x18\x04\x20\x01(\x02R\x0faudioSample\
+    Rate\x12\x1a\n\x08sequence\x18\x05\x20\x01(\x04R\x08sequence\"+\n\rVideo\
+    Metadata\x12\x1a\n\x08sequence\x18\x01\x20\x01(\x04R\x08sequence\"T\n\
+    \x11HeartbeatMetadata\x12?\n\x0fenabled_streams\x18\x01\x20\x03(\x0e2\
+    \x16.MediaPacket.MediaTypeR\x0eenabledStreamsJ\xc8\t\n\x06\x12\x04\0\0\"\
+    \x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x12\
     \x01\n\n\n\x03\x04\0\x01\x12\x03\x02\x08\x13\n\x0c\n\x04\x04\0\x04\0\x12\
     \x04\x03\x02\x08\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x03\x07\x10\n\r\
     \n\x06\x04\0\x04\0\x02\0\x12\x03\x04\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\
@@ -715,25 +858,32 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x06\x03\x12\x03\x0f!\"\n\x0b\n\x04\x04\0\x02\x07\x12\x03\x10\x02#\n\x0c\
     \n\x05\x04\0\x02\x07\x06\x12\x03\x10\x02\x0f\n\x0c\n\x05\x04\0\x02\x07\
     \x01\x12\x03\x10\x10\x1e\n\x0c\n\x05\x04\0\x02\x07\x03\x12\x03\x10!\"\n\
-    \n\n\x02\x04\x01\x12\x04\x13\0\x19\x01\n\n\n\x03\x04\x01\x01\x12\x03\x13\
-    \x08\x15\n\x0b\n\x04\x04\x01\x02\0\x12\x03\x14\x02\x1a\n\x0c\n\x05\x04\
-    \x01\x02\0\x05\x12\x03\x14\x02\x08\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03\
-    \x14\t\x15\n\x0c\n\x05\x04\x01\x02\0\x03\x12\x03\x14\x18\x19\n\x0b\n\x04\
-    \x04\x01\x02\x01\x12\x03\x15\x02&\n\x0c\n\x05\x04\x01\x02\x01\x05\x12\
-    \x03\x15\x02\x08\n\x0c\n\x05\x04\x01\x02\x01\x01\x12\x03\x15\t!\n\x0c\n\
-    \x05\x04\x01\x02\x01\x03\x12\x03\x15$%\n\x0b\n\x04\x04\x01\x02\x02\x12\
-    \x03\x16\x02$\n\x0c\n\x05\x04\x01\x02\x02\x05\x12\x03\x16\x02\x08\n\x0c\
-    \n\x05\x04\x01\x02\x02\x01\x12\x03\x16\t\x1f\n\x0c\n\x05\x04\x01\x02\x02\
-    \x03\x12\x03\x16\"#\n\x0b\n\x04\x04\x01\x02\x03\x12\x03\x17\x02\x1e\n\
-    \x0c\n\x05\x04\x01\x02\x03\x05\x12\x03\x17\x02\x07\n\x0c\n\x05\x04\x01\
-    \x02\x03\x01\x12\x03\x17\x08\x19\n\x0c\n\x05\x04\x01\x02\x03\x03\x12\x03\
-    \x17\x1c\x1d\n\x0b\n\x04\x04\x01\x02\x04\x12\x03\x18\x02\x16\n\x0c\n\x05\
-    \x04\x01\x02\x04\x05\x12\x03\x18\x02\x08\n\x0c\n\x05\x04\x01\x02\x04\x01\
-    \x12\x03\x18\t\x11\n\x0c\n\x05\x04\x01\x02\x04\x03\x12\x03\x18\x14\x15\n\
-    \n\n\x02\x04\x02\x12\x04\x1b\0\x1d\x01\n\n\n\x03\x04\x02\x01\x12\x03\x1b\
-    \x08\x15\n\x0b\n\x04\x04\x02\x02\0\x12\x03\x1c\x02\x16\n\x0c\n\x05\x04\
-    \x02\x02\0\x05\x12\x03\x1c\x02\x08\n\x0c\n\x05\x04\x02\x02\0\x01\x12\x03\
-    \x1c\t\x11\n\x0c\n\x05\x04\x02\x02\0\x03\x12\x03\x1c\x14\x15b\x06proto3\
+    \x0b\n\x04\x04\0\x02\x08\x12\x03\x11\x02+\n\x0c\n\x05\x04\0\x02\x08\x06\
+    \x12\x03\x11\x02\x13\n\x0c\n\x05\x04\0\x02\x08\x01\x12\x03\x11\x14&\n\
+    \x0c\n\x05\x04\0\x02\x08\x03\x12\x03\x11)*\n\n\n\x02\x04\x01\x12\x04\x14\
+    \0\x1a\x01\n\n\n\x03\x04\x01\x01\x12\x03\x14\x08\x15\n\x0b\n\x04\x04\x01\
+    \x02\0\x12\x03\x15\x02\x1a\n\x0c\n\x05\x04\x01\x02\0\x05\x12\x03\x15\x02\
+    \x08\n\x0c\n\x05\x04\x01\x02\0\x01\x12\x03\x15\t\x15\n\x0c\n\x05\x04\x01\
+    \x02\0\x03\x12\x03\x15\x18\x19\n\x0b\n\x04\x04\x01\x02\x01\x12\x03\x16\
+    \x02&\n\x0c\n\x05\x04\x01\x02\x01\x05\x12\x03\x16\x02\x08\n\x0c\n\x05\
+    \x04\x01\x02\x01\x01\x12\x03\x16\t!\n\x0c\n\x05\x04\x01\x02\x01\x03\x12\
+    \x03\x16$%\n\x0b\n\x04\x04\x01\x02\x02\x12\x03\x17\x02$\n\x0c\n\x05\x04\
+    \x01\x02\x02\x05\x12\x03\x17\x02\x08\n\x0c\n\x05\x04\x01\x02\x02\x01\x12\
+    \x03\x17\t\x1f\n\x0c\n\x05\x04\x01\x02\x02\x03\x12\x03\x17\"#\n\x0b\n\
+    \x04\x04\x01\x02\x03\x12\x03\x18\x02\x1e\n\x0c\n\x05\x04\x01\x02\x03\x05\
+    \x12\x03\x18\x02\x07\n\x0c\n\x05\x04\x01\x02\x03\x01\x12\x03\x18\x08\x19\
+    \n\x0c\n\x05\x04\x01\x02\x03\x03\x12\x03\x18\x1c\x1d\n\x0b\n\x04\x04\x01\
+    \x02\x04\x12\x03\x19\x02\x16\n\x0c\n\x05\x04\x01\x02\x04\x05\x12\x03\x19\
+    \x02\x08\n\x0c\n\x05\x04\x01\x02\x04\x01\x12\x03\x19\t\x11\n\x0c\n\x05\
+    \x04\x01\x02\x04\x03\x12\x03\x19\x14\x15\n\n\n\x02\x04\x02\x12\x04\x1c\0\
+    \x1e\x01\n\n\n\x03\x04\x02\x01\x12\x03\x1c\x08\x15\n\x0b\n\x04\x04\x02\
+    \x02\0\x12\x03\x1d\x02\x16\n\x0c\n\x05\x04\x02\x02\0\x05\x12\x03\x1d\x02\
+    \x08\n\x0c\n\x05\x04\x02\x02\0\x01\x12\x03\x1d\t\x11\n\x0c\n\x05\x04\x02\
+    \x02\0\x03\x12\x03\x1d\x14\x15\n\n\n\x02\x04\x03\x12\x04\x20\0\"\x01\n\n\
+    \n\x03\x04\x03\x01\x12\x03\x20\x08\x19\n\x0b\n\x04\x04\x03\x02\0\x12\x03\
+    !\x025\n\x0c\n\x05\x04\x03\x02\0\x04\x12\x03!\x02\n\n\x0c\n\x05\x04\x03\
+    \x02\0\x06\x12\x03!\x0b\x20\n\x0c\n\x05\x04\x03\x02\0\x01\x12\x03!!0\n\
+    \x0c\n\x05\x04\x03\x02\0\x03\x12\x03!34b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file
@@ -751,10 +901,11 @@ pub fn file_descriptor() -> &'static ::protobuf::reflect::FileDescriptor {
     file_descriptor.get(|| {
         let generated_file_descriptor = generated_file_descriptor_lazy.get(|| {
             let mut deps = ::std::vec::Vec::with_capacity(0);
-            let mut messages = ::std::vec::Vec::with_capacity(3);
+            let mut messages = ::std::vec::Vec::with_capacity(4);
             messages.push(MediaPacket::generated_message_descriptor_data());
             messages.push(AudioMetadata::generated_message_descriptor_data());
             messages.push(VideoMetadata::generated_message_descriptor_data());
+            messages.push(HeartbeatMetadata::generated_message_descriptor_data());
             let mut enums = ::std::vec::Vec::with_capacity(1);
             enums.push(media_packet::MediaType::generated_enum_descriptor_data());
             ::protobuf::reflect::GeneratedFileDescriptor::new_generated(

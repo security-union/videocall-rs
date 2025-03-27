@@ -3,6 +3,7 @@ use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
+use crate::encode::{CameraEncoder, MicrophoneEncoder, ScreenEncoder};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 use log::{debug, error, info};
@@ -11,6 +12,8 @@ use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -91,6 +94,12 @@ struct Inner {
     peer_decode_manager: PeerDecodeManager,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
+    camera: Option<CameraEncoder>,
+    microphone: Option<MicrophoneEncoder>,
+    screen: Option<ScreenEncoder>,
+    video_enabled: Arc<AtomicBool>,
+    audio_enabled: Arc<AtomicBool>,
+    screen_enabled: Arc<AtomicBool>,
 }
 
 /// The client struct for a video call connection.
@@ -185,6 +194,12 @@ impl VideoCallClient {
                 ),
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
+                camera: None,
+                microphone: None,
+                screen: None,
+                video_enabled: Arc::new(AtomicBool::new(false)),
+                audio_enabled: Arc::new(AtomicBool::new(false)),
+                screen_enabled: Arc::new(AtomicBool::new(false)),
             })),
             aes,
             _diagnostics: diagnostics.clone(),
@@ -282,10 +297,16 @@ impl VideoCallClient {
         );
 
         let mut borrowed = self.inner.try_borrow_mut()?;
+        let video_enabled = borrowed.video_enabled.clone();
+        let audio_enabled = borrowed.audio_enabled.clone();
+        let screen_enabled = borrowed.screen_enabled.clone();
         borrowed.connection.replace(Connection::connect(
             self.options.enable_webtransport,
             options,
             self.aes.clone(),
+            video_enabled,
+            audio_enabled,
+            screen_enabled,
         )?);
         info!("Connected to server");
         Ok(())
@@ -406,6 +427,75 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(sender_diagnostics) = &inner.sender_diagnostics {
                 sender_diagnostics.add_sender_channel(tx, media_type);
+            }
+        }
+    }
+
+    /// Returns true if the given peer has the specified stream type enabled
+    pub fn is_peer_stream_enabled(&self, peer_id: &str, media_type: MediaType) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(&peer_id.to_string()) {
+                peer.is_stream_enabled(media_type)
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Returns true if the given stream type is enabled
+    pub fn is_stream_enabled(&self, media_type: MediaType) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            match media_type {
+                MediaType::VIDEO => inner
+                    .video_enabled
+                    .load(std::sync::atomic::Ordering::Acquire),
+                MediaType::AUDIO => inner
+                    .audio_enabled
+                    .load(std::sync::atomic::Ordering::Acquire),
+                MediaType::SCREEN => inner
+                    .screen_enabled
+                    .load(std::sync::atomic::Ordering::Acquire),
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Sets the camera encoder
+    pub fn set_camera(&mut self, camera: CameraEncoder) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            let video_enabled = inner.video_enabled.clone();
+            inner.camera = Some(camera);
+            // Set up a callback to update the enabled flag when the camera state changes
+            if let Some(camera) = &mut inner.camera {
+                camera.state.set_external_enabled(video_enabled);
+            }
+        }
+    }
+
+    /// Sets the microphone encoder
+    pub fn set_microphone(&mut self, microphone: MicrophoneEncoder) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            let audio_enabled = inner.audio_enabled.clone();
+            inner.microphone = Some(microphone);
+            // Set up a callback to update the enabled flag when the microphone state changes
+            if let Some(microphone) = &mut inner.microphone {
+                microphone.state.set_external_enabled(audio_enabled);
+            }
+        }
+    }
+
+    /// Sets the screen encoder
+    pub fn set_screen(&mut self, screen: ScreenEncoder) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            let screen_enabled = inner.screen_enabled.clone();
+            inner.screen = Some(screen);
+            // Set up a callback to update the enabled flag when the screen state changes
+            if let Some(screen) = &mut inner.screen {
+                screen.state.set_external_enabled(screen_enabled);
             }
         }
     }

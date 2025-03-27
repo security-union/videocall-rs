@@ -4,7 +4,7 @@ use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
-use protobuf::Message;
+use protobuf::{EnumOrUnknown, Message};
 use std::rc::Rc;
 use std::{fmt::Display, sync::Arc};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -170,8 +170,23 @@ impl Peer {
         }
     }
 
-    fn on_heartbeat(&mut self) {
+    fn on_heartbeat(&mut self, enabled_streams: &[EnumOrUnknown<MediaType>]) {
         self.heartbeat_count += 1;
+
+        // Check if video stream is disabled
+        if !enabled_streams.contains(&MediaType::VIDEO.into()) {
+            self.video.reset();
+        }
+
+        // Check if audio stream is disabled
+        if !enabled_streams.contains(&MediaType::AUDIO.into()) {
+            self.audio.reset();
+        }
+
+        // Check if screen stream is disabled
+        if !enabled_streams.contains(&MediaType::SCREEN.into()) {
+            self.screen.reset();
+        }
     }
 
     pub fn check_heartbeat(&mut self) -> bool {
@@ -184,6 +199,11 @@ impl Peer {
             self.email.clone()
         );
         false
+    }
+
+    /// Returns true if the peer has received a heartbeat and the specified stream type is enabled
+    pub fn is_stream_enabled(&self, media_type: MediaType) -> bool {
+        self.heartbeat_count > 0
     }
 }
 
@@ -248,7 +268,12 @@ impl PeerDecodeManager {
         if let Some(peer) = self.connected_peers.get_mut(&email) {
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
-                    peer.on_heartbeat();
+                    // Parse the heartbeat metadata
+                    if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet.data) {
+                        let enabled_streams =
+                            media_packet.heartbeat_metadata.enabled_streams.clone();
+                        peer.on_heartbeat(&enabled_streams);
+                    }
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {

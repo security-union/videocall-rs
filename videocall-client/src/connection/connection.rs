@@ -4,13 +4,16 @@
 ///
 use super::task::Task;
 use super::ConnectOptions;
+use crate::client::VideoCallClient;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use protobuf::Message;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use yew::prelude::Callback;
@@ -29,6 +32,9 @@ pub struct Connection {
     heartbeat_monitor: Option<Interval>,
     status: Rc<Cell<Status>>,
     aes: Rc<Aes128State>,
+    video_enabled: Arc<AtomicBool>,
+    audio_enabled: Arc<AtomicBool>,
+    screen_enabled: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -36,6 +42,9 @@ impl Connection {
         webtransport: bool,
         options: ConnectOptions,
         aes: Rc<Aes128State>,
+        video_enabled: Arc<AtomicBool>,
+        audio_enabled: Arc<AtomicBool>,
+        screen_enabled: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         let mut options = options;
         let userid = options.userid.clone();
@@ -63,6 +72,9 @@ impl Connection {
             })),
             status,
             aes,
+            video_enabled,
+            audio_enabled,
+            screen_enabled,
         };
         connection.start_heartbeat(userid);
 
@@ -77,12 +89,35 @@ impl Connection {
         let task = Rc::clone(&self.task);
         let status = Rc::clone(&self.status);
         let aes = Rc::clone(&self.aes);
+        let video_enabled = self.video_enabled.clone();
+        let audio_enabled = self.audio_enabled.clone();
+        let screen_enabled = self.screen_enabled.clone();
 
         self.heartbeat = Some(Interval::new(1000, move || {
+            let mut enabled_streams = Vec::new();
+
+            // Check if video is enabled
+            if video_enabled.load(std::sync::atomic::Ordering::Acquire) {
+                enabled_streams.push(MediaType::VIDEO);
+            }
+            if audio_enabled.load(std::sync::atomic::Ordering::Acquire) {
+                enabled_streams.push(MediaType::AUDIO);
+            }
+            if screen_enabled.load(std::sync::atomic::Ordering::Acquire) {
+                enabled_streams.push(MediaType::SCREEN);
+            }
+
+            let mut heartbeat_metadata = HeartbeatMetadata::new();
+            heartbeat_metadata.enabled_streams = enabled_streams
+                .into_iter()
+                .map(|t| ::protobuf::EnumOrUnknown::new(t))
+                .collect();
+
             let packet = MediaPacket {
                 media_type: MediaType::HEARTBEAT.into(),
                 email: userid.clone(),
                 timestamp: js_sys::Date::now(),
+                heartbeat_metadata: ::protobuf::MessageField::some(heartbeat_metadata),
                 ..Default::default()
             };
             let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();

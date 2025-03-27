@@ -50,10 +50,11 @@ use futures::StreamExt;
 /// * [MicrophoneEncoder](crate::MicrophoneEncoder)
 /// * [ScreenEncoder](crate::ScreenEncoder)
 ///
+#[derive(Debug)]
 pub struct CameraEncoder {
     client: VideoCallClient,
     video_elem_id: String,
-    state: EncoderState,
+    pub state: EncoderState,
     current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
     on_encoder_settings_update: Callback<String>,

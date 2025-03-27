@@ -124,7 +124,11 @@ impl Component for Host {
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
             self.share_screen = ctx.props().share_screen;
-            ctx.link().send_message(Msg::EnableScreenShare);
+            let link = ctx.link().clone();
+            let timeout = Timeout::new(1000, move || {
+                link.send_message(Msg::EnableScreenShare);
+            });
+            timeout.forget();
         } else if self.share_screen != ctx.props().share_screen {
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::DisableScreenShare);

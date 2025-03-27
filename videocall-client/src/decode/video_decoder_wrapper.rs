@@ -51,6 +51,15 @@ impl VideoDecoderTrait for VideoDecoderWrapper {
     }
 }
 
+impl Drop for VideoDecoderWrapper {
+    fn drop(&mut self) {
+        log::info!("Dropping VideoDecoderWrapper");
+        if let Err(e) = self.0.close() {
+            log::error!("Error closing VideoDecoderWrapper: {:?}", e);
+        }
+    }
+}
+
 // Implement the general media decoder trait
 impl MediaDecoderTrait for VideoDecoderWrapper {
     type InitType = VideoDecoderInit;

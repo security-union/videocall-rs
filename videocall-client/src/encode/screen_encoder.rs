@@ -267,7 +267,6 @@ impl ScreenEncoder {
                 .unchecked_into::<ReadableStreamDefaultReader>();
 
             let mut screen_frame_counter = 0;
-            log::info!("Screen reader: {:?}", screen_reader);
             loop {
                 // Check if we should stop encoding
                 if destroy.load(Ordering::Acquire)

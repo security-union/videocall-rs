@@ -123,3 +123,12 @@ impl MediaDecoderTrait for AudioDecoderWrapper {
         chunk_type == EncodedAudioChunkType::Key
     }
 }
+
+impl Drop for AudioDecoderWrapper {
+    fn drop(&mut self) {
+        log::info!("Dropping AudioDecoderWrapper");
+        if let Err(e) = self.0.close() {
+            log::error!("Error closing AudioDecoderWrapper: {:?}", e);
+        }
+    }
+}

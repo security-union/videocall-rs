@@ -5,7 +5,7 @@ use wasm_bindgen::JsValue;
 use web_sys::CodecState;
 
 // Minimum number of frames to buffer before decoding
-pub const MIN_BUFFER_SIZE: usize = 3;
+pub const MIN_BUFFER_SIZE: usize = 5;
 // Maximum buffer size to prevent excessive memory usage
 pub const MAX_BUFFER_SIZE: usize = 20;
 // Maximum allowed sequence gap before resetting
@@ -38,7 +38,6 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
 
     pub fn decode(&mut self, packet: Arc<MediaPacket>) -> Vec<Arc<MediaPacket>> {
         let new_sequence = self.decoder.get_sequence_number(&packet);
-        let is_keyframe = self.decoder.is_keyframe(&packet);
 
         // Check for sequence reset
         let sequence_reset_detected = self.sequence.is_some_and(|seq| {
@@ -46,51 +45,35 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
         });
 
         // Reset on keyframe or sequence reset
-        if (is_keyframe && self.should_reset_on_keyframe(&packet, new_sequence))
-            || sequence_reset_detected
-        {
-            // Clear buffer and reset sequence
+        if sequence_reset_detected {
             self.buffer.clear();
             self.sequence = None;
         }
 
-        // Add packet to buffer
         self.buffer.insert(new_sequence, packet);
 
-        // Try to decode from buffer
         self.attempt_decode_from_buffer()
-    }
-
-    // Determines if we should reset the buffer based on keyframe
-    fn should_reset_on_keyframe(&self, _packet: &MediaPacket, new_sequence: u64) -> bool {
-        if let Some(current_seq) = self.sequence {
-            // Reset if keyframe is newer and buffer is stale or we've been waiting too long
-            new_sequence > current_seq
-                && (self.buffer.len() < self.min_jitter_buffer_size
-                    || self.buffer.len() > MAX_BUFFER_SIZE / 2)
-        } else {
-            // Always reset if we haven't started decoding yet
-            true
-        }
     }
 
     // Decode available frames from the buffer
     fn attempt_decode_from_buffer(&mut self) -> Vec<Arc<MediaPacket>> {
+        log::debug!("attempt_decode_from_buffer");
         let mut decoded_frames = Vec::new();
 
         // Process frames while we have enough in the buffer
         while self.buffer.len() > self.min_jitter_buffer_size {
             if let Some(&next_sequence) = self.buffer.keys().next() {
+                log::debug!("next_sequence: {:?}", next_sequence);
                 // Initialize sequence if this is the first frame
                 if self.sequence.is_none() {
+                    log::debug!("initialize sequence");
                     if let Some(frame) = self.decode_next_frame(next_sequence) {
                         decoded_frames.push(frame);
                     }
                     continue;
                 }
-
                 let current_sequence = self.sequence.unwrap();
-
+                log::debug!("current_sequence: {:?}", current_sequence);
                 // Remove older frames
                 if next_sequence < current_sequence {
                     self.buffer.remove(&next_sequence);
@@ -116,6 +99,7 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
 
     // Decode a specific frame and update sequence
     fn decode_next_frame(&mut self, next_sequence: u64) -> Option<Arc<MediaPacket>> {
+        log::debug!("decode_next_frame: {:?}", next_sequence);
         if let Some(frame) = self.buffer.remove(&next_sequence) {
             if let Err(e) = self.decoder.decode(frame.clone()) {
                 log::error!("Error decoding frame: {:?}", e);

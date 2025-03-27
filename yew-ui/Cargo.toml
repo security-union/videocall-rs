@@ -27,6 +27,7 @@ yew-router = "0.18"
 wasm-bindgen-futures = "0.4.30"
 enum-display = "0.1.4"
 futures = "0.3.31"
+web-time = "1.1.0"
 
 [dependencies.web-sys]
 version = "0.3.72"

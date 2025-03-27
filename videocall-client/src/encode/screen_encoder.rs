@@ -130,8 +130,7 @@ impl ScreenEncoder {
     /// Start encoding and sending the data to the client connection (if it's currently connected).
     /// The user is prompted by the browser to select which window or screen to encode.
     ///
-    /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
-    /// called.
+    /// This will toggle the enabled state of the encoder.
     pub fn start(&mut self) {
         let EncoderState {
             enabled,
@@ -139,6 +138,11 @@ impl ScreenEncoder {
             switching,
             ..
         } = self.state.clone();
+        // enable the encoder
+        // patch the destroy flag to false
+        enabled.store(true, Ordering::Release);
+        destroy.store(false, Ordering::Release);
+
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
@@ -147,12 +151,29 @@ impl ScreenEncoder {
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
-            let media_devices = navigator.media_devices().unwrap();
-            let screen_to_share: MediaStream =
-                JsFuture::from(media_devices.get_display_media().unwrap())
-                    .await
-                    .unwrap()
-                    .unchecked_into::<MediaStream>();
+            let media_devices = navigator.media_devices().unwrap_or_else(|_| {
+                error!("Failed to get media devices - browser may not support screen sharing");
+                panic!("MediaDevices not available");
+            });
+
+            let screen_to_share: MediaStream = match media_devices.get_display_media() {
+                Ok(promise) => match JsFuture::from(promise).await {
+                    Ok(stream) => stream.unchecked_into::<MediaStream>(),
+                    Err(e) => {
+                        error!(
+                            "User denied screen sharing permission or error occurred: {:?}",
+                            e
+                        );
+                        return;
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to get display media: {:?}", e);
+                    return;
+                }
+            };
+
+            log::info!("Screen to share: {:?}", screen_to_share);
 
             let screen_track = screen_to_share
                 .get_video_tracks()
@@ -165,11 +186,17 @@ impl ScreenEncoder {
             let screen_output_handler = {
                 let mut buffer: [u8; 150000] = [0; 150000];
                 let mut sequence_number = 0;
-                let mut last_chunk_time = window().performance().unwrap().now();
+                let performance = window()
+                    .performance()
+                    .expect("Performance API not available");
+                let mut last_chunk_time = performance.now();
                 let mut chunks_in_last_second = 0;
 
                 Box::new(move |chunk: JsValue| {
-                    let now = window().performance().unwrap().now();
+                    let now = window()
+                        .performance()
+                        .expect("Performance API not available")
+                        .now();
                     let chunk = web_sys::EncodedVideoChunk::from(chunk);
 
                     // Update FPS calculation
@@ -194,7 +221,7 @@ impl ScreenEncoder {
             };
 
             let screen_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                error!("error_handler error {:?}", e);
+                error!("Screen encoder error: {:?}", e);
             }) as Box<dyn FnMut(JsValue)>);
 
             let screen_output_handler =
@@ -205,7 +232,13 @@ impl ScreenEncoder {
                 screen_output_handler.as_ref().unchecked_ref(),
             );
 
-            let screen_encoder = Box::new(VideoEncoder::new(&screen_encoder_init).unwrap());
+            let screen_encoder = match VideoEncoder::new(&screen_encoder_init) {
+                Ok(encoder) => Box::new(encoder),
+                Err(e) => {
+                    error!("Failed to create video encoder: {:?}", e);
+                    return;
+                }
+            };
 
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
@@ -215,11 +248,18 @@ impl ScreenEncoder {
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
                 error!("Error configuring screen encoder: {:?}", e);
+                return;
             }
 
-            let screen_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(&media_track))
-                    .unwrap();
+            let screen_processor = match MediaStreamTrackProcessor::new(
+                &MediaStreamTrackProcessorInit::new(&media_track),
+            ) {
+                Ok(processor) => processor,
+                Err(e) => {
+                    error!("Failed to create media stream track processor: {:?}", e);
+                    return;
+                }
+            };
 
             let screen_reader = screen_processor
                 .readable()
@@ -227,7 +267,6 @@ impl ScreenEncoder {
                 .unchecked_into::<ReadableStreamDefaultReader>();
 
             let mut screen_frame_counter = 0;
-
             loop {
                 // Check if we should stop encoding
                 if destroy.load(Ordering::Acquire)
@@ -260,24 +299,43 @@ impl ScreenEncoder {
                 }
 
                 match JsFuture::from(screen_reader.read()).await {
-                    Ok(js_frame) => match Reflect::get(&js_frame, &JsString::from("value")) {
-                        Ok(value) => {
-                            let video_frame = value.unchecked_into::<VideoFrame>();
-                            let opts = VideoEncoderEncodeOptions::new();
-                            screen_frame_counter = (screen_frame_counter + 1) % 50;
-                            opts.set_key_frame(screen_frame_counter == 0);
-                            if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts)
-                            {
-                                error!("Error encoding screen frame: {:?}", e);
+                    Ok(js_frame) => {
+                        let value = match Reflect::get(&js_frame, &JsString::from("value")) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                error!("Failed to get frame value: {:?}", e);
+                                continue;
                             }
-                            video_frame.close();
+                        };
+
+                        if value.is_undefined() {
+                            error!("Screen share stream ended");
+                            break;
                         }
-                        Err(e) => {
-                            error!("Error getting frame value: {:?}", e);
+
+                        let video_frame = value.unchecked_into::<VideoFrame>();
+                        let opts = VideoEncoderEncodeOptions::new();
+                        screen_frame_counter = (screen_frame_counter + 1) % 50;
+                        opts.set_key_frame(screen_frame_counter == 0);
+
+                        if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
+                            error!("Error encoding screen frame: {:?}", e);
                         }
-                    },
+                        video_frame.close();
+                    }
                     Err(e) => {
-                        error!("Error reading frame: {:?}", e);
+                        error!("Error reading screen frame: {:?}", e);
+                        break;
+                    }
+                }
+            }
+
+            // At the end of the loop, ensure proper cleanup
+            media_track.stop();
+            if let Some(tracks) = screen_to_share.get_tracks().dyn_ref::<Array>() {
+                for i in 0..tracks.length() {
+                    if let Some(track) = tracks.get(i).dyn_into::<MediaStreamTrack>().ok() {
+                        track.stop();
                     }
                 }
             }

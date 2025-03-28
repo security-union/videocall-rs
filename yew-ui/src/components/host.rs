@@ -150,6 +150,12 @@ impl Component for Host {
             ctx.link().send_message(Msg::DisableVideo)
         }
 
+        // Update videocallclient with the encoder settings
+        // TODO: use atomic bools for the encoders
+        ctx.props().client.set_audio_enabled(self.mic_enabled);
+        ctx.props().client.set_video_enabled(self.video_enabled);
+        ctx.props().client.set_screen_enabled(self.share_screen);
+
         if first_render {
             ctx.link().send_message(Msg::Start);
         }

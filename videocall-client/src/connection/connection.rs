@@ -9,8 +9,9 @@ use gloo::timers::callback::Interval;
 use protobuf::Message;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use yew::prelude::Callback;
@@ -29,6 +30,9 @@ pub struct Connection {
     heartbeat_monitor: Option<Interval>,
     status: Rc<Cell<Status>>,
     aes: Rc<Aes128State>,
+    video_enabled: Rc<AtomicBool>,
+    audio_enabled: Rc<AtomicBool>,
+    screen_enabled: Rc<AtomicBool>,
 }
 
 impl Connection {
@@ -63,6 +67,9 @@ impl Connection {
             })),
             status,
             aes,
+            audio_enabled: Rc::new(AtomicBool::new(false)),
+            video_enabled: Rc::new(AtomicBool::new(false)),
+            screen_enabled: Rc::new(AtomicBool::new(false)),
         };
         connection.start_heartbeat(userid);
 
@@ -77,12 +84,22 @@ impl Connection {
         let task = Rc::clone(&self.task);
         let status = Rc::clone(&self.status);
         let aes = Rc::clone(&self.aes);
-
+        let video_enabled = Rc::clone(&self.video_enabled);
+        let audio_enabled = Rc::clone(&self.audio_enabled);
+        let screen_enabled = Rc::clone(&self.screen_enabled);
         self.heartbeat = Some(Interval::new(1000, move || {
+            let heartbeat_metadata = HeartbeatMetadata {
+                video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                ..Default::default()
+            };
+
             let packet = MediaPacket {
                 media_type: MediaType::HEARTBEAT.into(),
                 email: userid.clone(),
                 timestamp: js_sys::Date::now(),
+                heartbeat_metadata: Some(heartbeat_metadata).into(),
                 ..Default::default()
             };
             let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();
@@ -111,6 +128,21 @@ impl Connection {
         if let Status::Connected = self.status.get() {
             self.task.send_packet(packet);
         }
+    }
+
+    pub fn set_video_enabled(&self, enabled: bool) {
+        self.video_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        self.audio_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_screen_enabled(&self, enabled: bool) {
+        self.screen_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

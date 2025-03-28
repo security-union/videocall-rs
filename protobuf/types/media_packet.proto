@@ -15,6 +15,7 @@ message MediaPacket {
   double duration = 6;
   AudioMetadata audio_metadata = 7;
   VideoMetadata video_metadata = 8;
+  HeartbeatMetadata heartbeat_metadata = 9;
 }
 
 message AudioMetadata {
@@ -27,4 +28,10 @@ message AudioMetadata {
 
 message VideoMetadata {
   uint64 sequence = 1;
+}
+
+message HeartbeatMetadata {
+  bool video_enabled = 1;
+  bool audio_enabled = 2;
+  bool screen_enabled = 3;
 }

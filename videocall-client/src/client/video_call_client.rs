@@ -356,6 +356,33 @@ impl VideoCallClient {
         false
     }
 
+    pub fn is_video_enabled_for_peer(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(key) {
+                return peer.video_enabled;
+            }
+        }
+        false
+    }
+
+    pub fn is_screen_share_enabled_for_peer(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(key) {
+                return peer.screen_enabled;
+            }
+        }
+        false
+    }
+
+    pub fn is_audio_enabled_for_peer(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(peer) = inner.peer_decode_manager.get(key) {
+                return peer.audio_enabled;
+            }
+        }
+        false
+    }
+
     pub(crate) fn aes(&self) -> Rc<Aes128State> {
         self.aes.clone()
     }
@@ -406,6 +433,30 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(sender_diagnostics) = &inner.sender_diagnostics {
                 sender_diagnostics.add_sender_channel(tx, media_type);
+            }
+        }
+    }
+
+    pub fn set_video_enabled(&self, enabled: bool) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(connection) = &inner.connection {
+                connection.set_video_enabled(enabled);
+            }
+        }
+    }
+
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(connection) = &inner.connection {
+                connection.set_audio_enabled(enabled);
+            }
+        }
+    }
+
+    pub fn set_screen_enabled(&self, enabled: bool) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(connection) = &inner.connection {
+                connection.set_screen_enabled(enabled);
             }
         }
     }

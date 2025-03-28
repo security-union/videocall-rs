@@ -60,6 +60,9 @@ pub struct Peer {
     pub screen_canvas_id: String,
     pub aes: Option<Aes128State>,
     heartbeat_count: u8,
+    pub video_enabled: bool,
+    pub audio_enabled: bool,
+    pub screen_enabled: bool,
 }
 
 use std::fmt::Debug;
@@ -91,6 +94,9 @@ impl Peer {
             screen_canvas_id,
             aes,
             heartbeat_count: 1,
+            video_enabled: false,
+            audio_enabled: false,
+            screen_enabled: false,
         })
     }
 
@@ -160,13 +166,21 @@ impl Peer {
                     .decode(&packet)
                     .map_err(|_| PeerDecodeError::ScreenDecodeError)?,
             )),
-            MediaType::HEARTBEAT => Ok((
-                media_type,
-                DecodeStatus {
-                    _rendered: false,
-                    first_frame: false,
-                },
-            )),
+            MediaType::HEARTBEAT => {
+                // update state using heartbeat metadata
+                packet.heartbeat_metadata.as_ref().map(|metadata| {
+                    self.video_enabled = metadata.video_enabled;
+                    self.audio_enabled = metadata.audio_enabled;
+                    self.screen_enabled = metadata.screen_enabled;
+                });
+                Ok((
+                    media_type,
+                    DecodeStatus {
+                        _rendered: false,
+                        first_frame: false,
+                    },
+                ))
+            }
         }
     }
 

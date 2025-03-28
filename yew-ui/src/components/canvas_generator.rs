@@ -22,11 +22,14 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
             } else {
                 "grid-item"
             };
+            let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
+            let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
+            let is_microphone_enabled_for_peer = client.is_audio_enabled_for_peer(key);
             let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
             let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
             html! {
                 <>
-                    <div class={screen_share_css} id={(*screen_share_div_id).clone()}>
+                    <div class={screen_share_css} id={(*screen_share_div_id).clone()} hidden={!is_screen_share_enabled_for_peer}>
                         // Canvas for Screen share.
                         <div class="canvas-container">
                             <canvas id={format!("screen-share-{}", &key)}></canvas>
@@ -41,7 +44,7 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
                     <div class="grid-item" id={(*peer_video_div_id).clone()}>
                         // One canvas for the User Video
                         <div class="canvas-container">
-                            <UserVideo id={key.clone()}></UserVideo>
+                            <UserVideo id={key.clone()} hidden={!is_video_enabled_for_peer}></UserVideo>
                             <h4 class="floating-name">{key.clone()}</h4>
                             <button onclick={
                                 Callback::from(move |_| {
@@ -61,6 +64,7 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
 #[derive(Properties, Debug, PartialEq)]
 struct UserVideoProps {
     pub id: String,
+    pub hidden: bool,
 }
 
 // user video functional component
@@ -83,7 +87,7 @@ fn user_video(props: &UserVideoProps) -> Html {
     });
 
     html! {
-        <canvas ref={(*video_ref).clone()} id={props.id.clone()}></canvas>
+        <canvas ref={(*video_ref).clone()} id={props.id.clone()} hidden={props.hidden}></canvas>
     }
 }
 

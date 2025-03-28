@@ -32,9 +32,10 @@ canvas {
 
 #main-container {
   display: flex;
-  height: 100vh;
+  flex: 1;
   width: 100%;
   overflow: hidden;
+  position: relative;
 }
 
 /* Updated Peer List Container Styles */
@@ -303,6 +304,7 @@ select {
   background-color: black;
   color: white;
   padding: 8px;
+  flex-shrink: 0;
 }
 
 .video-placeholder {

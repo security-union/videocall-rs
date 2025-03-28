@@ -246,8 +246,6 @@ impl ScreenEncoder {
 
             let width = track_settings.get_width().expect("width is None");
             let height = track_settings.get_height().expect("height is None");
-
-            log::info!("Screen width: {}, height: {}", width, height);
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
             let screen_encoder_config =

@@ -213,7 +213,7 @@ mod tests {
             duration: 0.0,
             audio_metadata: Default::default(),
             video_metadata: Some(video_metadata).into(),
-            special_fields: Default::default(),
+            ..Default::default()
         })
     }
 
@@ -233,8 +233,7 @@ mod tests {
             timestamp: 0.0,
             duration: 0.0,
             audio_metadata: Some(audio_metadata).into(),
-            video_metadata: Default::default(),
-            special_fields: Default::default(),
+            ..Default::default()
         })
     }
 

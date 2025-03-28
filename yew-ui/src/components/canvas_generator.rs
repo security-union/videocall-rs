@@ -24,7 +24,8 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
             };
             let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
             let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
-            let is_microphone_enabled_for_peer = client.is_audio_enabled_for_peer(key);
+            // TODO: wire this up
+            // let is_microphone_enabled_for_peer = client.is_audio_enabled_for_peer(key);
             let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
             let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
             html! {

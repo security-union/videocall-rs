@@ -1,4 +1,5 @@
 pub mod attendants;
+pub mod browser_compatibility;
 pub mod device_selector;
 pub mod host;
 pub mod icons;

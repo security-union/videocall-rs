@@ -173,11 +173,12 @@ impl ScreenEncoder {
 
             log::info!("Screen to share: {:?}", screen_to_share);
 
-            let screen_track = Box::new(screen_to_share
-                .get_video_tracks()
-                .find(&mut |_: JsValue, _: u32, _: Array| true)
-                .unchecked_into::<VideoTrack>());
-
+            let screen_track = Box::new(
+                screen_to_share
+                    .get_video_tracks()
+                    .find(&mut |_: JsValue, _: u32, _: Array| true)
+                    .unchecked_into::<VideoTrack>(),
+            );
 
             // Setup FPS tracking and screen output handler
             let screen_output_handler = {
@@ -237,7 +238,10 @@ impl ScreenEncoder {
                 }
             };
 
-            let media_track = screen_track.as_ref().clone().unchecked_into::<MediaStreamTrack>();
+            let media_track = screen_track
+                .as_ref()
+                .clone()
+                .unchecked_into::<MediaStreamTrack>();
             let track_settings = media_track.get_settings();
 
             let width = track_settings.get_width().expect("width is None");
@@ -296,8 +300,11 @@ impl ScreenEncoder {
                 {
                     info!("📊 Updating screen bitrate to {}", new_bitrate);
                     local_bitrate = new_bitrate;
-                    let new_config =
-                        VideoEncoderConfig::new(VIDEO_CODEC, current_encoder_height, current_encoder_width);
+                    let new_config = VideoEncoderConfig::new(
+                        VIDEO_CODEC,
+                        current_encoder_height,
+                        current_encoder_width,
+                    );
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     if let Err(e) = screen_encoder.configure(&new_config) {
@@ -323,21 +330,40 @@ impl ScreenEncoder {
                         let video_frame = value.unchecked_into::<VideoFrame>();
                         let frame_width = video_frame.display_width();
                         let frame_height = video_frame.display_height();
-                        let frame_width = if frame_width > 0 { frame_width as u32 } else { 0 };
-                        let frame_height = if frame_height > 0 { frame_height as u32 } else { 0 };
+                        let frame_width = if frame_width > 0 {
+                            frame_width as u32
+                        } else {
+                            0
+                        };
+                        let frame_height = if frame_height > 0 {
+                            frame_height as u32
+                        } else {
+                            0
+                        };
 
-                        if frame_width > 0 && frame_height > 0 && (frame_width != current_encoder_width || frame_height != current_encoder_height) {
+                        if frame_width > 0
+                            && frame_height > 0
+                            && (frame_width != current_encoder_width
+                                || frame_height != current_encoder_height)
+                        {
                             info!("Frame dimensions changed from {}x{} to {}x{}, reconfiguring encoder", 
                                 current_encoder_width, current_encoder_height, frame_width, frame_height);
-                            
+
                             current_encoder_width = frame_width;
                             current_encoder_height = frame_height;
-                            
-                            let new_config = VideoEncoderConfig::new(VIDEO_CODEC, current_encoder_height, current_encoder_width);
+
+                            let new_config = VideoEncoderConfig::new(
+                                VIDEO_CODEC,
+                                current_encoder_height,
+                                current_encoder_width,
+                            );
                             new_config.set_bitrate(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             if let Err(e) = screen_encoder.configure(&new_config) {
-                                error!("Error reconfiguring screen encoder with new dimensions: {:?}", e);
+                                error!(
+                                    "Error reconfiguring screen encoder with new dimensions: {:?}",
+                                    e
+                                );
                             }
                         }
 

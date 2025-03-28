@@ -102,11 +102,7 @@ impl VideoPeerDecoder {
 
             // Clear the canvas and draw the frame
             ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
-            if let Err(e) = ctx.draw_image_with_video_frame(
-                &video_chunk,
-                0.0,
-                0.0,
-            ) {
+            if let Err(e) = ctx.draw_image_with_video_frame(&video_chunk, 0.0, 0.0) {
                 error!("Error drawing video frame: {:?}", e);
             }
 

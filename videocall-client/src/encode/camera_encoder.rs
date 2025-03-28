@@ -249,13 +249,17 @@ impl CameraEncoder {
             let video_encoder = Box::new(VideoEncoder::new(&video_encoder_init).unwrap());
 
             // Get track settings to get actual width and height
-            let media_track = video_track.as_ref().clone().unchecked_into::<MediaStreamTrack>();
+            let media_track = video_track
+                .as_ref()
+                .clone()
+                .unchecked_into::<MediaStreamTrack>();
             let track_settings = media_track.get_settings();
 
             let width = track_settings.get_width().expect("width is None");
             let height = track_settings.get_height().expect("height is None");
 
-            let video_encoder_config = VideoEncoderConfig::new(VIDEO_CODEC, height as u32, width as u32);
+            let video_encoder_config =
+                VideoEncoderConfig::new(VIDEO_CODEC, height as u32, width as u32);
             video_encoder_config
                 .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
             video_encoder_config.set_latency_mode(LatencyMode::Realtime);

@@ -23,15 +23,18 @@ input {
 }
 
 canvas {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  aspect-ratio: 16/9;
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
 }
 
 #main-container {
   display: flex;
   height: 100vh;
+  width: 100%;
+  overflow: hidden;
 }
 
 /* Updated Peer List Container Styles */
@@ -154,33 +157,89 @@ h3 {
 
 #grid-container {
   position: relative;
-  margin: 48px 16px 16px 16px;
+  width: 100%;
+  height: 100%;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-  grid-gap: 8px;
-  align-items: start;
-  justify-content: center;
-  transition: width 0.3s;
-  flex-grow: 1;
-  overflow: auto;
-  max-height: calc(100vh - 64px);
+  gap: 8px;
+  padding: 16px;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .grid-item {
   position: relative;
   width: 100%;
-  height: 0;
-  padding-bottom: 56.25%; /* 16:9 aspect ratio */
+  height: 100%;
+  aspect-ratio: 16/9;
 }
 
-.grid-item-pinned {
-  position: fixed;
+.canvas-container {
+  position: absolute;
   top: 0;
   left: 0;
   width: 100%;
   height: 100%;
-  z-index: 1;
-  background-color: #111;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* Peer count specific layouts */
+#grid-container[data-peers="1"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+#grid-container[data-peers="1"] .grid-item {
+  max-width: min(100%, calc(100vh * 16/9 - 64px));
+  max-height: calc(100vh - 64px);
+}
+
+#grid-container[data-peers="2"] {
+  grid-template-columns: repeat(2, 1fr);
+  align-items: center;
+}
+
+#grid-container[data-peers="3"],
+#grid-container[data-peers="4"] {
+  grid-template-columns: repeat(4, 1fr);
+  align-items: center;
+}
+
+#grid-container[data-peers="5"],
+#grid-container[data-peers="6"] {
+  grid-template-columns: repeat(4, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  align-items: center;
+}
+
+#grid-container[data-peers="7"],
+#grid-container[data-peers="8"] {
+  grid-template-columns: repeat(4, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+  align-items: center;
+}
+
+/* Force single column on very narrow screens */
+@media (max-width: 480px) {
+  #grid-container {
+    padding: 8px;
+    gap: 4px;
+  }
+  
+  #grid-container[data-peers]:not([data-peers="1"]) {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
 }
 
 /* Host camera frame rendered in the bottom right corner */
@@ -244,16 +303,6 @@ select {
   background-color: black;
   color: white;
   padding: 8px;
-}
-
-.canvas-container {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
 }
 
 .video-placeholder {
@@ -515,5 +564,57 @@ select {
     font-style: italic;
     margin: 10px 0;
     text-align: center;
+}
+
+/* Media queries for responsive grid */
+@media (min-width: 640px) {
+  #grid-container {
+    /* 2 columns for medium screens */
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1024px) {
+  #grid-container {
+    /* 3 columns for large screens */
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1536px) {
+  #grid-container {
+    /* 4 columns for extra large screens */
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+/* Adjust grid based on number of peers */
+#grid-container[data-peers="1"] {
+  grid-template-columns: minmax(0, 800px); /* Single centered column with max width */
+}
+
+#grid-container[data-peers="2"] {
+  grid-template-columns: repeat(2, minmax(0, 600px));
+}
+
+#grid-container[data-peers="3"],
+#grid-container[data-peers="4"] {
+  grid-template-columns: repeat(2, minmax(0, 500px));
+  grid-template-rows: repeat(2, 1fr);
+}
+
+#grid-container[data-peers="5"],
+#grid-container[data-peers="6"] {
+  grid-template-columns: repeat(3, minmax(0, 400px));
+  grid-template-rows: repeat(2, 1fr);
+}
+
+/* Force single column on very narrow screens regardless of peer count */
+@media (max-width: 480px) {
+  #grid-container {
+    grid-template-columns: 1fr !important;
+    padding: 8px;
+    gap: 4px;
+  }
 }
 

@@ -28,9 +28,9 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 use web_sys::EncodedVideoChunkType;
+use web_sys::HtmlCanvasElement;
 use web_sys::{AudioData, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
-use web_sys::{HtmlCanvasElement, HtmlImageElement};
 use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 
@@ -92,26 +92,22 @@ impl VideoPeerDecoder {
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
 
-            // Get the video frame's original dimensions
-            let video_width = video_chunk.coded_width() as f64;
-            let video_height = video_chunk.coded_height() as f64;
+            // Get the video frame's dimensions from its settings
+            let width = video_chunk.display_width() as u32;
+            let height = video_chunk.display_height() as u32;
 
             // Set canvas dimensions to match video frame
-            render_canvas.set_width(video_width as u32);
-            render_canvas.set_height(video_height as u32);
+            render_canvas.set_width(width);
+            render_canvas.set_height(height);
 
-            // Clear the canvas
-            ctx.clear_rect(0.0, 0.0, video_width, video_height);
-
-            // Draw the video frame at its original size
-            if let Err(e) = ctx.draw_image_with_video_frame_and_dw_and_dh(
+            // Clear the canvas and draw the frame
+            ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
+            if let Err(e) = ctx.draw_image_with_video_frame(
                 &video_chunk,
                 0.0,
                 0.0,
-                video_width,
-                video_height,
             ) {
-                error!("error {:?}", e);
+                error!("Error drawing video frame: {:?}", e);
             }
 
             video_chunk.close();

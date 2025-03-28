@@ -32,8 +32,6 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
-use crate::constants::SCREEN_HEIGHT;
-use crate::constants::SCREEN_WIDTH;
 use crate::constants::VIDEO_CODEC;
 use crate::diagnostics::EncoderControlSender;
 
@@ -175,12 +173,11 @@ impl ScreenEncoder {
 
             log::info!("Screen to share: {:?}", screen_to_share);
 
-            let screen_track = screen_to_share
+            let screen_track = Box::new(screen_to_share
                 .get_video_tracks()
                 .find(&mut |_: JsValue, _: u32, _: Array| true)
-                .unchecked_into::<VideoTrack>();
+                .unchecked_into::<VideoTrack>());
 
-            let media_track = screen_track.unchecked_into::<MediaStreamTrack>();
 
             // Setup FPS tracking and screen output handler
             let screen_output_handler = {
@@ -240,10 +237,17 @@ impl ScreenEncoder {
                 }
             };
 
+            let media_track = screen_track.as_ref().clone().unchecked_into::<MediaStreamTrack>();
+            let track_settings = media_track.get_settings();
+
+            let width = track_settings.get_width().expect("width is None");
+            let height = track_settings.get_height().expect("height is None");
+
+            log::info!("Screen width: {}, height: {}", width, height);
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
             let screen_encoder_config =
-                VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
+                VideoEncoderConfig::new(VIDEO_CODEC, height as u32, width as u32);
             screen_encoder_config.set_bitrate(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
@@ -267,6 +271,9 @@ impl ScreenEncoder {
                 .unchecked_into::<ReadableStreamDefaultReader>();
 
             let mut screen_frame_counter = 0;
+            let mut current_encoder_width = width as u32;
+            let mut current_encoder_height = height as u32;
+
             loop {
                 // Check if we should stop encoding
                 if destroy.load(Ordering::Acquire)
@@ -290,7 +297,7 @@ impl ScreenEncoder {
                     info!("📊 Updating screen bitrate to {}", new_bitrate);
                     local_bitrate = new_bitrate;
                     let new_config =
-                        VideoEncoderConfig::new(VIDEO_CODEC, SCREEN_HEIGHT, SCREEN_WIDTH);
+                        VideoEncoderConfig::new(VIDEO_CODEC, current_encoder_height, current_encoder_width);
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     if let Err(e) = screen_encoder.configure(&new_config) {
@@ -314,6 +321,26 @@ impl ScreenEncoder {
                         }
 
                         let video_frame = value.unchecked_into::<VideoFrame>();
+                        let frame_width = video_frame.display_width();
+                        let frame_height = video_frame.display_height();
+                        let frame_width = if frame_width > 0 { frame_width as u32 } else { 0 };
+                        let frame_height = if frame_height > 0 { frame_height as u32 } else { 0 };
+
+                        if frame_width > 0 && frame_height > 0 && (frame_width != current_encoder_width || frame_height != current_encoder_height) {
+                            info!("Frame dimensions changed from {}x{} to {}x{}, reconfiguring encoder", 
+                                current_encoder_width, current_encoder_height, frame_width, frame_height);
+                            
+                            current_encoder_width = frame_width;
+                            current_encoder_height = frame_height;
+                            
+                            let new_config = VideoEncoderConfig::new(VIDEO_CODEC, current_encoder_height, current_encoder_width);
+                            new_config.set_bitrate(local_bitrate as f64);
+                            new_config.set_latency_mode(LatencyMode::Realtime);
+                            if let Err(e) = screen_encoder.configure(&new_config) {
+                                error!("Error reconfiguring screen encoder with new dimensions: {:?}", e);
+                            }
+                        }
+
                         let opts = VideoEncoderEncodeOptions::new();
                         screen_frame_counter = (screen_frame_counter + 1) % 50;
                         opts.set_key_frame(screen_frame_counter == 0);

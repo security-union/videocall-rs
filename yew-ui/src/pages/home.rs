@@ -2,6 +2,7 @@ use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew_router::prelude::*;
 
+use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::Route;
 
 const TEXT_INPUT_CLASSES: &str = "bg-background-light/20 backdrop-filter-blur text-white border border-white/10 outline-none focus:ring-2 focus:ring-primary rounded-xl p-4 w-full placeholder:text-foreground-subtle transition-all duration-300 hover:border-white/20";
@@ -44,6 +45,7 @@ pub fn home() -> Html {
 
     html! {
         <div class="hero-container">
+            <BrowserCompatibility/>
             <div class="floating-element floating-element-1"></div>
             <div class="floating-element floating-element-2"></div>
             <div class="floating-element floating-element-3"></div>

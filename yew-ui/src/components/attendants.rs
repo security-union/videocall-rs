@@ -1,4 +1,6 @@
-use crate::components::{canvas_generator, peer_list::PeerList};
+use crate::components::{
+    browser_compatibility::BrowserCompatibility, canvas_generator, peer_list::PeerList,
+};
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::{debug, error, warn};
@@ -203,6 +205,7 @@ impl Component for AttendantsComponent {
                     if self.client.is_connected() {
                         return false;
                     }
+
                     if let Err(e) = self.client.connect() {
                         ctx.link()
                             .send_message(WsAction::Log(format!("Connection failed: {e}")));
@@ -343,15 +346,8 @@ impl Component for AttendantsComponent {
 
         html! {
             <div id="main-container" class="meeting-page">
+                <BrowserCompatibility/>
                 <div id="grid-container" style={if self.peer_list_open || self.diagnostics_open {"width: 80%;"} else {"width: 100%;"}}>
-                    {
-                        self.error.as_ref().map(|error| html! {
-                            <div class="error-container">
-                                <p class="error-message">{ error }</p>
-                                <img src="/assets/instructions.gif" alt="Permission instructions" class="instructions-gif" />
-                            </div>
-                        })
-                    }
                     { rows }
                     {
                         if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {

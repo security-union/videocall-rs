@@ -79,9 +79,6 @@ impl VideoPeerDecoder {
         let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
             let chunk = Box::new(original_chunk);
             let video_chunk = chunk.unchecked_into::<VideoFrame>();
-            let width = video_chunk.coded_width();
-            let height = video_chunk.coded_height();
-            let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
             let render_canvas = window()
                 .unwrap()
                 .document()
@@ -94,12 +91,30 @@ impl VideoPeerDecoder {
                 .unwrap()
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
-            render_canvas.set_width(width);
-            render_canvas.set_height(height);
-            if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
+
+            // Get the video frame's original dimensions
+            let video_width = video_chunk.coded_width() as f64;
+            let video_height = video_chunk.coded_height() as f64;
+
+            // Set canvas dimensions to match video frame
+            render_canvas.set_width(video_width as u32);
+            render_canvas.set_height(video_height as u32);
+
+            // Clear the canvas
+            ctx.clear_rect(0.0, 0.0, video_width, video_height);
+
+            // Draw the video frame at its original size
+            if let Err(e) = ctx.draw_image_with_video_frame_and_dw_and_dh(
+                &video_chunk,
+                0.0,
+                0.0,
+                video_width,
+                video_height,
+            ) {
                 error!("error {:?}", e);
             }
-            video_chunk.unchecked_into::<VideoFrame>().close();
+
+            video_chunk.close();
         }) as Box<dyn FnMut(JsValue)>);
         let decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
             error.as_ref().unchecked_ref(),

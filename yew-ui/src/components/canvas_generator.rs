@@ -1,4 +1,6 @@
 use crate::components::icons::push_pin::PushPinIcon;
+use crate::components::icons::peer::PeerIcon;
+use crate::components::icons::mic::MicIcon;
 use crate::constants::USERS_ALLOWED_TO_STREAM;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
@@ -24,8 +26,7 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
             };
             let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
             let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
-            // TODO: wire this up
-            // let is_microphone_enabled_for_peer = client.is_audio_enabled_for_peer(key);
+            let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
             let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
             let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
             html! {
@@ -45,8 +46,20 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
                     <div class="grid-item" id={(*peer_video_div_id).clone()}>
                         // One canvas for the User Video
                         <div class="canvas-container">
-                            <UserVideo id={key.clone()} hidden={!is_video_enabled_for_peer}></UserVideo>
+                            if is_video_enabled_for_peer {
+                                <UserVideo id={key.clone()} hidden={false}></UserVideo>
+                            } else {
+                                <div class="video-placeholder">
+                                    <div class="placeholder-content">
+                                        <PeerIcon/>
+                                        <span class="placeholder-text">{"Video Disabled"}</span>
+                                    </div>
+                                </div>
+                            }
                             <h4 class="floating-name">{key.clone()}</h4>
+                            <div class="audio-indicator">
+                                <MicIcon muted={!is_audio_enabled_for_peer}/>
+                            </div>
                             <button onclick={
                                 Callback::from(move |_| {
                                 toggle_pinned_div(&(*peer_video_div_id).clone());

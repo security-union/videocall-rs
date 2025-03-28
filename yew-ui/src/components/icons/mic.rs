@@ -26,4 +26,4 @@ pub fn mic_icon(props: &MicIconProps) -> Html {
             </svg>
         }
     }
-} 
+}

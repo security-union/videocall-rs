@@ -154,7 +154,7 @@ h3 {
 
 #grid-container {
   position: relative;
-  margin: 16px 16px;
+  margin: 48px 16px 16px 16px;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   grid-gap: 8px;
@@ -163,7 +163,7 @@ h3 {
   transition: width 0.3s;
   flex-grow: 1;
   overflow: auto;
-  max-height: calc(100vh - 32px); /* Account for margins */
+  max-height: calc(100vh - 64px);
 }
 
 .grid-item {

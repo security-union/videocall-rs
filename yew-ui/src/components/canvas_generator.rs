@@ -1,6 +1,6 @@
-use crate::components::icons::push_pin::PushPinIcon;
-use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::mic::MicIcon;
+use crate::components::icons::peer::PeerIcon;
+use crate::components::icons::push_pin::PushPinIcon;
 use crate::constants::USERS_ALLOWED_TO_STREAM;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;

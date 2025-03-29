@@ -1,4 +1,3 @@
-@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
@@ -162,8 +161,8 @@ h3 {
   width: 100%;
   height: 100%;
   
-  /* Add visible debugging borders */
-  border: 3px solid red;
+  /* Add visible debugging borders
+  border: 3px solid red; */
   
   /* Auto-fill grid that prevents horizontal overflow */
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
@@ -183,11 +182,10 @@ h3 {
   width: 100%;
   height: 100%;
   min-height: 150px;
-  max-height: 500px;
   
   /* Debug styling */
-  background-color: rgba(0, 0, 255, 0.2);
-  border: 1px solid yellow;
+  /* background-color: rgba(0, 0, 255, 0.2);
+  border: 1px solid yellow; */
   
   /* Center content */
   display: flex;
@@ -201,32 +199,67 @@ h3 {
 }
 
 #grid-container[data-peers="1"] .grid-item {
-  max-width: 900px;
+  max-width: 90%;
+  height: 80vh; /* Relative to viewport height */
   max-height: 80vh;
 }
 
 /* Two peers */
 #grid-container[data-peers="2"] {
   grid-template-columns: repeat(2, 1fr);
+  /* Set row height relative to viewport */
+  grid-auto-rows: minmax(150px, calc(80vh - 32px)); /* Account for container padding */
 }
 
-/* 3-4 peers */
-#grid-container[data-peers="3"],
+/* 3 peers: More balanced, pyramid-style layout */
+#grid-container[data-peers="3"] {
+  /* Define a 2-column grid */
+  grid-template-columns: repeat(2, 1fr);
+  /* Ensure we have 2 rows with equal height */
+  grid-template-rows: repeat(2, minmax(150px, calc((80vh - 32px - 10px) / 2)));
+  /* Create named template areas for better placement */
+  grid-template-areas: 
+    "peer1 peer2"
+    "peer3 peer3";
+}
+
+/* Specific placement for each peer in the 3-peer layout */
+#grid-container[data-peers="3"] .grid-item:nth-child(1) {
+  grid-area: peer1;
+}
+
+#grid-container[data-peers="3"] .grid-item:nth-child(2) {
+  grid-area: peer2;
+}
+
+#grid-container[data-peers="3"] .grid-item:nth-child(3) {
+  grid-area: peer3;
+  max-width: 80%; /* Constrain width to prevent stretching */
+  justify-self: center; /* Center in the grid cell */
+}
+
+/* 4 peers: 2×2 grid */
 #grid-container[data-peers="4"] {
   grid-template-columns: repeat(2, 1fr);
+  /* Height for 2 rows */
+  grid-auto-rows: minmax(150px, calc((80vh - 32px - 10px) / 2)); /* Account for container padding and gap */
 }
 
-/* 5-6 peers */
+/* 5-6 peers: 3×2 grid */
 #grid-container[data-peers="5"],
 #grid-container[data-peers="6"] {
   grid-template-columns: repeat(3, 1fr);
+  /* Height for 2 rows */
+  grid-auto-rows: minmax(150px, calc((80vh - 32px - 10px) / 2));
 }
 
-/* 7-9 peers */
+/* 7-9 peers: 3×3 grid */
 #grid-container[data-peers="7"],
 #grid-container[data-peers="8"],
 #grid-container[data-peers="9"] {
   grid-template-columns: repeat(3, 1fr);
+  /* Height for 3 rows */
+  grid-auto-rows: minmax(150px, calc((80vh - 32px - 20px) / 3)); /* Account for two row gaps */
 }
 
 /* Mobile override */

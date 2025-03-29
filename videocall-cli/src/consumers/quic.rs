@@ -11,7 +11,7 @@ use tokio::{
 use tracing::info;
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
-    media_packet::{media_packet::MediaType, MediaPacket},
+    media_packet::{media_packet::MediaType, HeartbeatMetadata, MediaPacket, VideoMetadata},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 
@@ -80,6 +80,11 @@ impl QUICClient {
                     media_type: MediaType::HEARTBEAT.into(),
                     email: email.clone(),
                     timestamp: now_ms as f64,
+                    heartbeat_metadata: Some(HeartbeatMetadata {
+                        video_enabled: true,
+                        ..Default::default()
+                    })
+                    .into(),
                     ..Default::default()
                 };
 

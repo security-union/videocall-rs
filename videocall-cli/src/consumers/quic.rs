@@ -11,7 +11,7 @@ use tokio::{
 use tracing::info;
 use videocall_types::protos::{
     connection_packet::ConnectionPacket,
-    media_packet::{media_packet::MediaType, HeartbeatMetadata, MediaPacket, VideoMetadata},
+    media_packet::{media_packet::MediaType, HeartbeatMetadata, MediaPacket},
     packet_wrapper::{packet_wrapper::PacketType, PacketWrapper},
 };
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.6](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.5...videocall-ui-v1.0.6) - 2025-03-29
+
+### Fixed
+
+- UI Prevent constant updates due to minor bitrate changes. ([#240](https://github.com/security-union/videocall-rs/pull/240))
+
 ## [1.0.5](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.4...videocall-ui-v1.0.5) - 2025-03-29
 
 ### Other

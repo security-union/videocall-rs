@@ -54,8 +54,12 @@ impl VideoDecoderTrait for VideoDecoderWrapper {
 impl Drop for VideoDecoderWrapper {
     fn drop(&mut self) {
         log::info!("Dropping VideoDecoderWrapper");
-        if let Err(e) = self.0.close() {
-            log::error!("Error closing VideoDecoderWrapper: {:?}", e);
+        // only close if it's not already closed
+        let encoder: &web_sys::VideoDecoder = &self.0;
+        if encoder.state() != CodecState::Closed {
+            if let Err(e) = encoder.close() {
+                log::error!("Error closing VideoDecoderWrapper: {:?}", e);
+            }
         }
     }
 }

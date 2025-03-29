@@ -7,8 +7,8 @@ pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lo
 pub const CANVAS_LIMIT: usize = 20;
 
 pub const AUDIO_BITRATE_KBPS: u32 = 65u32;
-pub const VIDEO_BITRATE_KBPS: u32 = 500u32;
-pub const SCREEN_BITRATE_KBPS: u32 = 500u32;
+pub const VIDEO_BITRATE_KBPS: u32 = 1_000u32;
+pub const SCREEN_BITRATE_KBPS: u32 = 1_000u32;
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {
     if let Some(s) = s {

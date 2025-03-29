@@ -28,9 +28,9 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
 use web_sys::EncodedVideoChunkType;
+use web_sys::HtmlCanvasElement;
 use web_sys::{AudioData, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
-use web_sys::{HtmlCanvasElement, HtmlImageElement};
 use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 
@@ -79,9 +79,6 @@ impl VideoPeerDecoder {
         let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
             let chunk = Box::new(original_chunk);
             let video_chunk = chunk.unchecked_into::<VideoFrame>();
-            let width = video_chunk.coded_width();
-            let height = video_chunk.coded_height();
-            let video_chunk = video_chunk.unchecked_into::<HtmlImageElement>();
             let render_canvas = window()
                 .unwrap()
                 .document()
@@ -94,12 +91,22 @@ impl VideoPeerDecoder {
                 .unwrap()
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
+
+            // Get the video frame's dimensions from its settings
+            let width = video_chunk.display_width() as u32;
+            let height = video_chunk.display_height() as u32;
+
+            // Set canvas dimensions to match video frame
             render_canvas.set_width(width);
             render_canvas.set_height(height);
-            if let Err(e) = ctx.draw_image_with_html_image_element(&video_chunk, 0.0, 0.0) {
-                error!("error {:?}", e);
+
+            // Clear the canvas and draw the frame
+            ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
+            if let Err(e) = ctx.draw_image_with_video_frame(&video_chunk, 0.0, 0.0) {
+                error!("Error drawing video frame: {:?}", e);
             }
-            video_chunk.unchecked_into::<VideoFrame>().close();
+
+            video_chunk.close();
         }) as Box<dyn FnMut(JsValue)>);
         let decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
             error.as_ref().unchecked_ref(),

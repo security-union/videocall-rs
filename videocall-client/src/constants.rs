@@ -13,10 +13,6 @@ pub static VIDEO_CODEC: &str = "vp09.00.10.08"; // profile 0,level 1.0, bit dept
 pub const AUDIO_CHANNELS: u32 = 1u32;
 pub const AUDIO_SAMPLE_RATE: u32 = 48000u32;
 
-pub const VIDEO_HEIGHT: i32 = 720i32;
-pub const VIDEO_WIDTH: i32 = 1280i32;
-pub const SCREEN_HEIGHT: u32 = 1080u32;
-pub const SCREEN_WIDTH: u32 = 1920u32;
 pub const RSA_BITS: usize = 1024;
 
 use videocall_types::protos::media_packet::media_packet::MediaType;

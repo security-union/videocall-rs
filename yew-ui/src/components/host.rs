@@ -11,6 +11,7 @@ use crate::components::device_selector::DeviceSelector;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
+#[derive(Debug)]
 pub enum Msg {
     Start,
     EnableScreenShare,
@@ -162,6 +163,7 @@ impl Component for Host {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
+        log::debug!("Host update: {:?}", msg);
         match msg {
             Msg::EnableScreenShare => {
                 self.screen.start();
@@ -243,7 +245,6 @@ impl Component for Host {
                 true
             }
             Msg::ScreenEncoderSettingsUpdated(settings) => {
-                // update the self.screen settings
                 self.encoder_settings.screen = Some(settings);
                 ctx.props()
                     .on_encoder_settings_update

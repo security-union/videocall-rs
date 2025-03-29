@@ -1,6 +1,6 @@
 [package]
 name = "videocall-cli"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 license = "MIT"
 readme = "README.md"

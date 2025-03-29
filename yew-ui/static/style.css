@@ -36,7 +36,6 @@ canvas {
   width: 100%;
   overflow: hidden;
   position: relative;
-  justify-content: center;
 }
 
 /* Updated Peer List Container Styles */
@@ -158,24 +157,83 @@ h3 {
 }
 
 #grid-container {
-  position: relative;
-  display: inline-grid;
-  gap: 8px;
+  /* Basic grid setup */
+  display: grid;
+  width: 100%;
+  height: 100%;
+  
+  /* Add visible debugging borders */
+  border: 3px solid red;
+  
+  /* Auto-fill grid that prevents horizontal overflow */
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  
+  /* Set reasonable gaps and padding */
+  gap: 10px;
   padding: 16px;
   box-sizing: border-box;
-  overflow: hidden;
-  justify-content: center;
-  height: 100%;
+  
+  /* Ensure content is centered */
+  justify-items: center;
+  align-items: center;
 }
 
 .grid-item {
-  position: relative;
+  /* Item sizing */
   width: 100%;
   height: 100%;
-  aspect-ratio: 16/9;
+  min-height: 150px;
+  max-height: 500px;
+  
+  /* Debug styling */
+  background-color: rgba(0, 0, 255, 0.2);
+  border: 1px solid yellow;
+  
+  /* Center content */
   display: flex;
   justify-content: center;
   align-items: center;
+}
+
+/* Special case for single peer */
+#grid-container[data-peers="1"] {
+  grid-template-columns: 1fr;
+}
+
+#grid-container[data-peers="1"] .grid-item {
+  max-width: 900px;
+  max-height: 80vh;
+}
+
+/* Two peers */
+#grid-container[data-peers="2"] {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+/* 3-4 peers */
+#grid-container[data-peers="3"],
+#grid-container[data-peers="4"] {
+  grid-template-columns: repeat(2, 1fr);
+}
+
+/* 5-6 peers */
+#grid-container[data-peers="5"],
+#grid-container[data-peers="6"] {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+/* 7-9 peers */
+#grid-container[data-peers="7"],
+#grid-container[data-peers="8"],
+#grid-container[data-peers="9"] {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+/* Mobile override */
+@media (max-width: 600px) {
+  #grid-container {
+    grid-template-columns: 1fr !important;
+  }
 }
 
 .canvas-container {
@@ -192,73 +250,6 @@ canvas {
   width: 100%;
   height: 100%;
   object-fit: contain;
-}
-
-/* Peer count specific layouts */
-#grid-container[data-peers="1"] {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 32px;
-}
-
-#grid-container[data-peers="1"] .grid-item {
-  max-width: min(100%, calc(100vh * 16/9 - 64px));
-  max-height: calc(100vh - 64px);
-}
-
-#grid-container[data-peers="2"] {
-  grid-template-columns: repeat(2, minmax(0, 600px));
-}
-
-#grid-container[data-peers="3"],
-#grid-container[data-peers="4"] {
-  grid-template-columns: repeat(2, minmax(0, 500px));
-  grid-template-rows: repeat(2, 1fr);
-}
-
-#grid-container[data-peers="5"],
-#grid-container[data-peers="6"] {
-  grid-template-columns: repeat(3, minmax(0, 400px));
-  grid-template-rows: repeat(2, 1fr);
-}
-
-#grid-container[data-peers="7"],
-#grid-container[data-peers="8"] {
-  grid-template-columns: repeat(4, minmax(0, 400px));
-  grid-template-rows: repeat(2, 1fr);
-}
-
-/* Media queries for responsive grid */
-@media (min-width: 640px) {
-  #grid-container {
-    grid-template-columns: repeat(2, minmax(0, 600px));
-  }
-}
-
-@media (min-width: 1024px) {
-  #grid-container {
-    grid-template-columns: repeat(3, minmax(0, 500px));
-  }
-}
-
-@media (min-width: 1536px) {
-  #grid-container {
-    grid-template-columns: repeat(4, minmax(0, 400px));
-  }
-}
-
-/* Force single column on very narrow screens */
-@media (max-width: 480px) {
-  #grid-container {
-    padding: 8px;
-    gap: 4px;
-  }
-  
-  #grid-container[data-peers]:not([data-peers="1"]) {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto;
-  }
 }
 
 /* Host camera frame rendered in the bottom right corner */
@@ -585,58 +576,6 @@ select {
     font-style: italic;
     margin: 10px 0;
     text-align: center;
-}
-
-/* Media queries for responsive grid */
-@media (min-width: 640px) {
-  #grid-container {
-    /* 2 columns for medium screens */
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
-@media (min-width: 1024px) {
-  #grid-container {
-    /* 3 columns for large screens */
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-}
-
-@media (min-width: 1536px) {
-  #grid-container {
-    /* 4 columns for extra large screens */
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-}
-
-/* Adjust grid based on number of peers */
-#grid-container[data-peers="1"] {
-  grid-template-columns: minmax(0, 800px); /* Single centered column with max width */
-}
-
-#grid-container[data-peers="2"] {
-  grid-template-columns: repeat(2, minmax(0, 600px));
-}
-
-#grid-container[data-peers="3"],
-#grid-container[data-peers="4"] {
-  grid-template-columns: repeat(2, minmax(0, 500px));
-  grid-template-rows: repeat(2, 1fr);
-}
-
-#grid-container[data-peers="5"],
-#grid-container[data-peers="6"] {
-  grid-template-columns: repeat(3, minmax(0, 400px));
-  grid-template-rows: repeat(2, 1fr);
-}
-
-/* Force single column on very narrow screens regardless of peer count */
-@media (max-width: 480px) {
-  #grid-container {
-    grid-template-columns: 1fr !important;
-    padding: 8px;
-    gap: 4px;
-  }
 }
 
 .grid-item-pinned {

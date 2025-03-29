@@ -565,6 +565,14 @@ impl Component for AttendantsComponent {
                                     <p>{"No encoder settings available."}</p>
                                 }
                             </div>
+                            <div class="diagnostics-section">
+                                <h3>{"Media Status"}</h3>
+                                <pre>{format!("Video: {}\nAudio: {}\nScreen Share: {}",
+                                    if self.video_enabled { "Enabled" } else { "Disabled" },
+                                    if self.mic_enabled { "Enabled" } else { "Disabled" },
+                                    if self.share_screen { "Enabled" } else { "Disabled" }
+                                )}</pre>
+                            </div>
                         </div>
                     </div>
                 </div>

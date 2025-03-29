@@ -131,16 +131,19 @@ impl Connection {
     }
 
     pub fn set_video_enabled(&self, enabled: bool) {
+        log::debug!("Setting video enabled to {}", enabled);
         self.video_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {
+        log::debug!("Setting audio enabled to {}", enabled);
         self.audio_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_screen_enabled(&self, enabled: bool) {
+        log::debug!("Setting screen enabled to {}", enabled);
         self.screen_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }

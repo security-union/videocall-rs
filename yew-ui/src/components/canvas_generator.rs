@@ -27,22 +27,28 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
             let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
             let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
             let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
+
             let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
             let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
             html! {
                 <>
-                    <div class={screen_share_css} id={(*screen_share_div_id).clone()} hidden={!is_screen_share_enabled_for_peer}>
-                        // Canvas for Screen share.
-                        <div class="canvas-container">
-                            <canvas id={format!("screen-share-{}", &key)}></canvas>
-                            <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
-                            <button onclick={Callback::from(move |_| {
-                                toggle_pinned_div(&(*screen_share_div_id).clone());
-                            })} class="pin-icon">
-                                <PushPinIcon/>
-                            </button>
+                    // Canvas for Screen share.
+                    if is_screen_share_enabled_for_peer {
+                        <div class={screen_share_css} id={(*screen_share_div_id).clone()}>
+                            <div class="canvas-container">
+                                <canvas id={format!("screen-share-{}", &key)}></canvas>
+                                <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                                <button onclick={Callback::from(move |_| {
+                                    toggle_pinned_div(&(*screen_share_div_id).clone());
+                                })} class="pin-icon">
+                                    <PushPinIcon/>
+                                </button>
+                            </div>
                         </div>
-                    </div>
+                    } else {
+                        <>
+                        </>
+                    }
                     <div class="grid-item" id={(*peer_video_div_id).clone()}>
                         // One canvas for the User Video
                         <div class="canvas-container">

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.4...videocall-ui-v1.0.5) - 2025-03-29
+
+### Other
+
+- Show correct aspect ratio, disable screen while not streaming ([#238](https://github.com/security-union/videocall-rs/pull/238))
+
 ## [1.0.4](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.3...videocall-ui-v1.0.4) - 2025-03-28
 
 ### Added

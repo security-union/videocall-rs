@@ -39,6 +39,9 @@ use crate::diagnostics::EncoderControlSender;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 
+// Threshold for bitrate changes, represents 20% (0.2)
+const BITRATE_CHANGE_THRESHOLD: f64 = 0.20;
+
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
 /// To use this struct, the caller must first create an `HtmlVideoElement` DOM node, to which the
@@ -99,8 +102,16 @@ impl CameraEncoder {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
                     if enabled.load(Ordering::Acquire) {
-                        on_encoder_settings_update.emit(format!("Bitrate: {:.2} kbps", bitrate));
-                        current_bitrate.store(bitrate as u32, Ordering::Relaxed);
+                        // Only update if change is greater than threshold
+                        let current = current_bitrate.load(Ordering::Relaxed) as f64;
+                        let new = bitrate as f64;
+                        let percent_change = (new - current).abs() / current;
+
+                        if percent_change > BITRATE_CHANGE_THRESHOLD {
+                            on_encoder_settings_update
+                                .emit(format!("Bitrate: {:.2} kbps", bitrate));
+                            current_bitrate.store(bitrate as u32, Ordering::Relaxed);
+                        }
                     } else {
                         on_encoder_settings_update.emit("Disabled".to_string());
                     }
@@ -298,13 +309,10 @@ impl CameraEncoder {
                     return;
                 }
 
-                // Update the bitrate if it has changed more than 10%
+                // Update the bitrate if it has changed more than the threshold percentage
                 let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_current_bitrate != local_bitrate
-                    && (new_current_bitrate as f64) / (local_bitrate as f64) > 0.9
-                    && (new_current_bitrate as f64) / (local_bitrate as f64) < 1.1
-                {
-                    log::debug!("Updating video bitrate to {}", new_current_bitrate);
+                if new_current_bitrate != local_bitrate {
+                    log::info!("Updating video bitrate to {}", new_current_bitrate);
                     local_bitrate = new_current_bitrate;
                     video_encoder_config.set_bitrate(local_bitrate as f64);
                     if let Err(e) = video_encoder.configure(&video_encoder_config) {

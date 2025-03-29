@@ -164,7 +164,7 @@ impl Component for Host {
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         log::debug!("Host update: {:?}", msg);
-        match msg {
+        let should_update = match msg {
             Msg::EnableScreenShare => {
                 self.screen.start();
                 true
@@ -229,29 +229,44 @@ impl Component for Host {
                 false
             }
             Msg::CameraEncoderSettingsUpdated(settings) => {
-                // update the self.camera settings
-                self.encoder_settings.camera = Some(settings);
-                ctx.props()
-                    .on_encoder_settings_update
-                    .emit(self.encoder_settings.to_string());
-                true
+                // Only update if settings have changed
+                if self.encoder_settings.camera.as_ref() != Some(&settings) {
+                    self.encoder_settings.camera = Some(settings);
+                    ctx.props()
+                        .on_encoder_settings_update
+                        .emit(self.encoder_settings.to_string());
+                    true
+                } else {
+                    false
+                }
             }
             Msg::MicrophoneEncoderSettingsUpdated(settings) => {
-                // update the self.microphone settings
-                self.encoder_settings.microphone = Some(settings);
-                ctx.props()
-                    .on_encoder_settings_update
-                    .emit(self.encoder_settings.to_string());
-                true
+                // Only update if settings have changed
+                if self.encoder_settings.microphone.as_ref() != Some(&settings) {
+                    self.encoder_settings.microphone = Some(settings);
+                    ctx.props()
+                        .on_encoder_settings_update
+                        .emit(self.encoder_settings.to_string());
+                    true
+                } else {
+                    false
+                }
             }
             Msg::ScreenEncoderSettingsUpdated(settings) => {
-                self.encoder_settings.screen = Some(settings);
-                ctx.props()
-                    .on_encoder_settings_update
-                    .emit(self.encoder_settings.to_string());
-                true
+                // Only update if settings have changed
+                if self.encoder_settings.screen.as_ref() != Some(&settings) {
+                    self.encoder_settings.screen = Some(settings);
+                    ctx.props()
+                        .on_encoder_settings_update
+                        .emit(self.encoder_settings.to_string());
+                    true
+                } else {
+                    false
+                }
             }
-        }
+        };
+        log::debug!("Host update: {:?}", should_update);
+        should_update
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {

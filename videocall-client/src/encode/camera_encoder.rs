@@ -106,9 +106,10 @@ impl CameraEncoder {
                         let current = current_bitrate.load(Ordering::Relaxed) as f64;
                         let new = bitrate as f64;
                         let percent_change = (new - current).abs() / current;
-                        
+
                         if percent_change > BITRATE_CHANGE_THRESHOLD {
-                            on_encoder_settings_update.emit(format!("Bitrate: {:.2} kbps", bitrate));
+                            on_encoder_settings_update
+                                .emit(format!("Bitrate: {:.2} kbps", bitrate));
                             current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                         }
                     } else {
@@ -310,7 +311,7 @@ impl CameraEncoder {
 
                 // Update the bitrate if it has changed more than the threshold percentage
                 let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_current_bitrate != local_bitrate {              
+                if new_current_bitrate != local_bitrate {
                     log::info!("Updating video bitrate to {}", new_current_bitrate);
                     local_bitrate = new_current_bitrate;
                     video_encoder_config.set_bitrate(local_bitrate as f64);

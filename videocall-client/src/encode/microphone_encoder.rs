@@ -94,10 +94,10 @@ impl MicrophoneEncoder {
                         let current = current_bitrate.load(Ordering::Relaxed) as f64;
                         let new = bitrate as f64;
                         let percent_change = (new - current).abs() / current;
-                        
-                    if percent_change > BITRATE_CHANGE_THRESHOLD {
-                        if let Some(callback) = &on_encoder_settings_update {
-                            callback.emit(format!("Bitrate: {:.2} kbps", bitrate));
+
+                        if percent_change > BITRATE_CHANGE_THRESHOLD {
+                            if let Some(callback) = &on_encoder_settings_update {
+                                callback.emit(format!("Bitrate: {:.2} kbps", bitrate));
                             }
                             current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                         }

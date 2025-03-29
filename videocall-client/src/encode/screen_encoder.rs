@@ -35,6 +35,9 @@ use super::transform::transform_screen_chunk;
 use crate::constants::VIDEO_CODEC;
 use crate::diagnostics::EncoderControlSender;
 
+// Threshold for bitrate changes, represents 20% (0.2)
+const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
+
 /// [ScreenEncoder] encodes the user's screen and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
 /// See also:
@@ -86,10 +89,17 @@ impl ScreenEncoder {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
                     if enabled.load(Ordering::Acquire) {
-                        if let Some(callback) = &on_encoder_settings_update {
-                            callback.emit(format!("Bitrate: {:.2} kbps", bitrate));
+                        // Only update if change is greater than threshold
+                        let current = current_bitrate.load(Ordering::Relaxed) as f64;
+                        let new = bitrate as f64;
+                        let percent_change = (new - current).abs() / current;
+                        
+                        if percent_change > BITRATE_CHANGE_THRESHOLD {
+                            if let Some(callback) = &on_encoder_settings_update {
+                                callback.emit(format!("Bitrate: {:.2} kbps", bitrate));
+                            }
+                            current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                         }
-                        current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                     } else if let Some(callback) = &on_encoder_settings_update {
                         callback.emit("Disabled".to_string());
                     }
@@ -292,10 +302,7 @@ impl ScreenEncoder {
 
                 // Update the bitrate if it has changed from diagnostics system
                 let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_bitrate != local_bitrate
-                    && (new_bitrate as f64) / (local_bitrate as f64) > 0.9
-                    && (new_bitrate as f64) / (local_bitrate as f64) < 1.1
-                {
+                if new_bitrate != local_bitrate {
                     info!("📊 Updating screen bitrate to {}", new_bitrate);
                     local_bitrate = new_bitrate;
                     let new_config = VideoEncoderConfig::new(

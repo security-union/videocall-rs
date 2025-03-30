@@ -21,10 +21,7 @@ impl NativeMediaFrameReader {
             .get_reader()
             .unchecked_into::<ReadableStreamDefaultReader>();
 
-        Ok(Self {
-            reader,
-            track_kind,
-        })
+        Ok(Self { reader, track_kind })
     }
 }
 
@@ -37,8 +34,8 @@ impl MediaFrameReader for NativeMediaFrameReader {
         let _ = self.reader.cancel();
         Ok(())
     }
-    
+
     fn track_kind(&self) -> &str {
         &self.track_kind
     }
-} 
+}

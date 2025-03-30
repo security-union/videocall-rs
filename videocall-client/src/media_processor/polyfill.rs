@@ -1,12 +1,12 @@
 use futures::future::FutureExt;
-use js_sys::{Function, JsString, Object, Reflect, Promise};
+use js_sys::{Function, JsString, Object, Promise, Reflect};
 use std::future::Future;
 use std::pin::Pin;
 use wasm_bindgen::{prelude::*, JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AudioContext, AudioData, HtmlVideoElement, MediaStream, MediaStreamTrack,
-    ReadableStream, ReadableStreamDefaultReader, VideoFrame,
+    AudioContext, AudioData, HtmlVideoElement, MediaStream, MediaStreamTrack, ReadableStream,
+    ReadableStreamDefaultReader, VideoFrame,
 };
 
 use crate::media_processor::{MediaFrame, MediaFrameReader};
@@ -158,16 +158,16 @@ impl PolyfillMediaFrameReader {
     pub fn new(track: &MediaStreamTrack) -> Result<Self, JsValue> {
         // Initialize the polyfill if it hasn't been already
         Self::ensure_polyfill_initialized()?;
-        
+
         let track_kind = track.kind();
         let id = format!("polyfill_{}", js_sys::Math::random().to_string());
-        
+
         // Create the polyfill processor
         let window = web_sys::window().expect("no global window exists");
         let polyfill = js_sys::Reflect::get(&window, &JsValue::from_str("__videoCallPolyfill"))?;
         let create_fn = Reflect::get(&polyfill, &JsValue::from_str("createProcessor"))?
             .dyn_into::<Function>()?;
-        
+
         let success = create_fn
             .call3(
                 &JsValue::NULL,
@@ -177,51 +177,48 @@ impl PolyfillMediaFrameReader {
             )?
             .as_bool()
             .unwrap_or(false);
-            
+
         if !success {
             return Err(JsValue::from_str("Failed to create polyfill processor"));
         }
-        
+
         // Get the registry and processor
-        let registry = js_sys::Reflect::get(
-            &window,
-            &JsValue::from_str("__videoCallPolyfillRegistry"),
-        )?;
+        let registry =
+            js_sys::Reflect::get(&window, &JsValue::from_str("__videoCallPolyfillRegistry"))?;
         let processor = Reflect::get(&registry, &JsValue::from_str(&id))?;
-        
+
         // Get the readable stream
         let readable = Reflect::get(&processor, &JsValue::from_str("readable"))?
             .dyn_into::<ReadableStream>()?;
         let reader = readable
             .get_reader()
             .unchecked_into::<ReadableStreamDefaultReader>();
-            
+
         Ok(Self {
             id,
             reader,
             track_kind,
         })
     }
-    
+
     fn ensure_polyfill_initialized() -> Result<(), JsValue> {
         let window = web_sys::window().expect("no global window exists");
-        let has_polyfill = js_sys::Reflect::has(&window, &JsValue::from_str("__videoCallPolyfill"))?;
-        
+        let has_polyfill =
+            js_sys::Reflect::has(&window, &JsValue::from_str("__videoCallPolyfill"))?;
+
         if !has_polyfill {
             // Inject the polyfill
-            let document = window
-                .document()
-                .expect("no document exists");
-                
+            let document = window.document().expect("no document exists");
+
             let script = document.create_element("script")?;
             script.set_text_content(Some(POLYFILL_JS));
             let head = document.head().expect("no head element");
             head.append_child(&script)?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Get the track kind (audio or video)
     pub fn track_kind(&self) -> &str {
         &self.track_kind
@@ -232,23 +229,22 @@ impl MediaFrameReader for PolyfillMediaFrameReader {
     fn read_frame(&self) -> JsValue {
         self.reader.read().into()
     }
-    
+
     fn close(&self) -> Result<(), JsValue> {
         // We don't try to handle the Promise result, just initiate the cancel
         let _ = self.reader.cancel();
-        
+
         // Clean up the polyfill processor
         let window = web_sys::window().expect("no global window exists");
         let polyfill = js_sys::Reflect::get(&window, &JsValue::from_str("__videoCallPolyfill"))?;
         let destroy_fn = Reflect::get(&polyfill, &JsValue::from_str("destroyProcessor"))?
             .dyn_into::<Function>()?;
-            
-        destroy_fn
-            .call1(&JsValue::NULL, &JsValue::from_str(&self.id))?;
-            
+
+        destroy_fn.call1(&JsValue::NULL, &JsValue::from_str(&self.id))?;
+
         Ok(())
     }
-    
+
     fn track_kind(&self) -> &str {
         &self.track_kind
     }
@@ -257,16 +253,16 @@ impl MediaFrameReader for PolyfillMediaFrameReader {
 /// Creates a polyfill processor for a MediaStreamTrack and returns its reader
 pub fn create_processor(track: &MediaStreamTrack) -> Result<ReadableStreamDefaultReader, JsValue> {
     ensure_polyfill_initialized()?;
-    
+
     let track_kind = track.kind();
     let id = format!("polyfill_{}", js_sys::Math::random().to_string());
-    
+
     // Create the polyfill processor
     let window = web_sys::window().expect("no global window exists");
     let polyfill = js_sys::Reflect::get(&window, &JsValue::from_str("__videoCallPolyfill"))?;
-    let create_fn = Reflect::get(&polyfill, &JsValue::from_str("createProcessor"))?
-        .dyn_into::<Function>()?;
-    
+    let create_fn =
+        Reflect::get(&polyfill, &JsValue::from_str("createProcessor"))?.dyn_into::<Function>()?;
+
     let success = create_fn
         .call3(
             &JsValue::NULL,
@@ -276,25 +272,23 @@ pub fn create_processor(track: &MediaStreamTrack) -> Result<ReadableStreamDefaul
         )?
         .as_bool()
         .unwrap_or(false);
-        
+
     if !success {
         return Err(JsValue::from_str("Failed to create polyfill processor"));
     }
-    
+
     // Get the registry and processor
-    let registry = js_sys::Reflect::get(
-        &window,
-        &JsValue::from_str("__videoCallPolyfillRegistry"),
-    )?;
+    let registry =
+        js_sys::Reflect::get(&window, &JsValue::from_str("__videoCallPolyfillRegistry"))?;
     let processor = Reflect::get(&registry, &JsValue::from_str(&id))?;
-    
+
     // Get the readable stream
-    let readable = Reflect::get(&processor, &JsValue::from_str("readable"))?
-        .dyn_into::<ReadableStream>()?;
+    let readable =
+        Reflect::get(&processor, &JsValue::from_str("readable"))?.dyn_into::<ReadableStream>()?;
     let reader = readable
         .get_reader()
         .unchecked_into::<ReadableStreamDefaultReader>();
-        
+
     Ok(reader)
 }
 
@@ -302,18 +296,16 @@ pub fn create_processor(track: &MediaStreamTrack) -> Result<ReadableStreamDefaul
 fn ensure_polyfill_initialized() -> Result<(), JsValue> {
     let window = web_sys::window().expect("no global window exists");
     let has_polyfill = js_sys::Reflect::has(&window, &JsValue::from_str("__videoCallPolyfill"))?;
-    
+
     if !has_polyfill {
         // Inject the polyfill
-        let document = window
-            .document()
-            .expect("no document exists");
-            
+        let document = window.document().expect("no document exists");
+
         let script = document.create_element("script")?;
         script.set_text_content(Some(POLYFILL_JS));
         let head = document.head().expect("no head element");
         head.append_child(&script)?;
     }
-    
+
     Ok(())
-} 
+}

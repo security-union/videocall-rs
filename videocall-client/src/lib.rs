@@ -78,9 +78,10 @@ pub mod decode;
 pub mod diagnostics;
 mod encode;
 mod media_devices;
+pub mod media_processor;
 mod wrappers;
-mod media_processor;
 
 pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use encode::{CameraEncoder, MicrophoneEncoder, ScreenEncoder};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};
+pub use media_processor::{MediaFrameProcessor, MediaProcessorDemo};

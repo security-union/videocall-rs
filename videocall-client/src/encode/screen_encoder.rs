@@ -91,7 +91,7 @@ impl ScreenEncoder {
                     if enabled.load(Ordering::Acquire) {
                         // Only update if change is greater than threshold
                         let current = current_bitrate.load(Ordering::Relaxed) as f64;
-                        let new = bitrate as f64;
+                        let new = bitrate;
                         let percent_change = (new - current).abs() / current;
 
                         if percent_change > BITRATE_CHANGE_THRESHOLD {
@@ -392,7 +392,7 @@ impl ScreenEncoder {
             media_track.stop();
             if let Some(tracks) = screen_to_share.get_tracks().dyn_ref::<Array>() {
                 for i in 0..tracks.length() {
-                    if let Some(track) = tracks.get(i).dyn_into::<MediaStreamTrack>().ok() {
+                    if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
                         track.stop();
                     }
                 }

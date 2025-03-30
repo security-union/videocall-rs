@@ -1,15 +1,11 @@
-use futures::future::FutureExt;
-use js_sys::{Function, JsString, Object, Promise, Reflect};
-use std::future::Future;
-use std::pin::Pin;
-use wasm_bindgen::{prelude::*, JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
+use js_sys::{Function, Reflect};
+use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{
-    AudioContext, AudioData, HtmlVideoElement, MediaStream, MediaStreamTrack, ReadableStream,
-    ReadableStreamDefaultReader, VideoFrame,
+    MediaStreamTrack, ReadableStream,
+    ReadableStreamDefaultReader,
 };
 
-use crate::media_processor::{MediaFrame, MediaFrameReader};
+use crate::media_processor::MediaFrameReader;
 
 // JavaScript polyfill to be injected into the page
 const POLYFILL_JS: &str = r#"
@@ -160,7 +156,7 @@ impl PolyfillMediaFrameReader {
         Self::ensure_polyfill_initialized()?;
 
         let track_kind = track.kind();
-        let id = format!("polyfill_{}", js_sys::Math::random().to_string());
+        let id = format!("polyfill_{}", js_sys::Math::random());
 
         // Create the polyfill processor
         let window = web_sys::window().expect("no global window exists");
@@ -255,7 +251,7 @@ pub fn create_processor(track: &MediaStreamTrack) -> Result<ReadableStreamDefaul
     ensure_polyfill_initialized()?;
 
     let track_kind = track.kind();
-    let id = format!("polyfill_{}", js_sys::Math::random().to_string());
+    let id = format!("polyfill_{}", js_sys::Math::random());
 
     // Create the polyfill processor
     let window = web_sys::window().expect("no global window exists");

@@ -1,12 +1,10 @@
-use js_sys::{Array, JsString, Object, Promise, Reflect};
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use js_sys::{JsString, Object, Promise, Reflect};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AudioData, MediaStream, MediaStreamTrack, MediaStreamTrackProcessor,
-    MediaStreamTrackProcessorInit, ReadableStream, ReadableStreamDefaultReader, VideoFrame,
+    AudioData, MediaStreamTrack, MediaStreamTrackProcessor,
+    MediaStreamTrackProcessorInit, ReadableStreamDefaultReader, VideoFrame,
 };
 
 mod native;

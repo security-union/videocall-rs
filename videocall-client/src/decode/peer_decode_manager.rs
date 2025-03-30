@@ -304,13 +304,11 @@ impl PeerDecodeManager {
     pub fn ensure_peer(&mut self, email: &String) -> PeerStatus {
         if self.connected_peers.contains_key(email) {
             PeerStatus::NoChange
+        } else if let Err(e) = self.add_peer(email, None) {
+            log::error!("Error adding peer: {:?}", e);
+            PeerStatus::NoChange
         } else {
-            if let Err(e) = self.add_peer(email, None) {
-                log::error!("Error adding peer: {:?}", e);
-                PeerStatus::NoChange
-            } else {
-                PeerStatus::Added(email.clone())
-            }
+            PeerStatus::Added(email.clone())
         }
     }
 

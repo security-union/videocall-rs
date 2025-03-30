@@ -112,7 +112,8 @@ impl Peer {
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {
-        let (audio, video, screen) = Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id)?;
+        let (audio, video, screen) =
+            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id)?;
         self.audio = audio;
         self.video = video;
         self.screen = screen;

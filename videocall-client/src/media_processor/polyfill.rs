@@ -1,9 +1,6 @@
 use js_sys::{Function, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{
-    MediaStreamTrack, ReadableStream,
-    ReadableStreamDefaultReader,
-};
+use web_sys::{MediaStreamTrack, ReadableStream, ReadableStreamDefaultReader};
 
 use crate::media_processor::MediaFrameReader;
 

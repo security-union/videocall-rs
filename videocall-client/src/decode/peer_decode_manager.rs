@@ -52,7 +52,7 @@ impl Display for PeerDecodeError {
 }
 
 pub struct Peer {
-    pub audio: AudioPeerDecoder,
+    // pub audio: AudioPeerDecoder,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
     pub email: String,
@@ -84,9 +84,9 @@ impl Peer {
         email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
-        let (audio, video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id)?;
+        let (video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id)?;
         Ok(Self {
-            audio,
+            // audio,
             video,
             screen,
             email,
@@ -103,18 +103,18 @@ impl Peer {
     fn new_decoders(
         video_canvas_id: &str,
         screen_canvas_id: &str,
-    ) -> Result<(AudioPeerDecoder, VideoPeerDecoder, VideoPeerDecoder), JsValue> {
+    ) -> Result<(VideoPeerDecoder, VideoPeerDecoder), JsValue> {
         Ok((
-            AudioPeerDecoder::new()?,
+            // AudioPeerDecoder::new()?,
             VideoPeerDecoder::new(video_canvas_id)?,
             VideoPeerDecoder::new(screen_canvas_id)?,
         ))
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {
-        let (audio, video, screen) =
+        let (video, screen) =
             Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id)?;
-        self.audio = audio;
+        // self.audio = audio;
         self.video = video;
         self.screen = screen;
         Ok(())
@@ -156,9 +156,13 @@ impl Peer {
             )),
             MediaType::AUDIO => Ok((
                 media_type,
-                self.audio
-                    .decode(&packet)
-                    .map_err(|_| PeerDecodeError::AudioDecodeError)?,
+                // self.audio
+                //     .decode(&packet)
+                //     .map_err(|_| PeerDecodeError::AudioDecodeError)?,
+                DecodeStatus {
+                    _rendered: false,
+                    first_frame: false,
+                },
             )),
             MediaType::SCREEN => Ok((
                 media_type,

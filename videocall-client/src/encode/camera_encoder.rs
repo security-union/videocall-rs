@@ -18,9 +18,6 @@ use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
-use web_sys::MediaStreamTrackProcessor;
-use web_sys::MediaStreamTrackProcessorInit;
-use web_sys::ReadableStreamDefaultReader;
 use web_sys::VideoEncoder;
 use web_sys::VideoEncoderConfig;
 use web_sys::VideoEncoderEncodeOptions;
@@ -35,6 +32,7 @@ use super::transform::transform_video_chunk;
 
 use crate::constants::VIDEO_CODEC;
 use crate::diagnostics::EncoderBitrateController;
+use crate::media_processor::MediaFrameProcessor;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
@@ -279,15 +277,13 @@ impl CameraEncoder {
                 error!("Error configuring video encoder: {:?}", e);
             }
 
-            let video_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
-                    &video_track.clone().unchecked_into::<MediaStreamTrack>(),
-                ))
-                .unwrap();
-            let video_reader = video_processor
-                .readable()
-                .get_reader()
-                .unchecked_into::<ReadableStreamDefaultReader>();
+            let video_processor = match MediaFrameProcessor::new(&media_track) {
+                Ok(processor) => processor,
+                Err(e) => {
+                    error!("Error creating MediaFrameProcessor: {:?}", e);
+                    return;
+                }
+            };
 
             // Start encoding video and audio.
             let mut video_frame_counter = 0;
@@ -306,6 +302,10 @@ impl CameraEncoder {
                     if let Err(e) = video_encoder.close() {
                         error!("Error closing video encoder: {:?}", e);
                     }
+                    // Close the processor
+                    if let Err(e) = video_processor.close() {
+                        error!("Error closing video processor: {:?}", e);
+                    }
                     return;
                 }
 
@@ -320,20 +320,23 @@ impl CameraEncoder {
                     }
                 }
 
-                match JsFuture::from(video_reader.read()).await {
+                // Use our MediaFrameProcessor to read frames
+                let read_promise = video_processor.read_frame();
+                match JsFuture::from(js_sys::Promise::from(read_promise)).await {
                     Ok(js_frame) => {
-                        let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                            .unwrap()
-                            .unchecked_into::<VideoFrame>();
-                        let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
-                        video_encoder_encode_options.set_key_frame(video_frame_counter % 150 == 0);
-                        if let Err(e) = video_encoder
-                            .encode_with_options(&video_frame, &video_encoder_encode_options)
-                        {
-                            error!("Error encoding video frame: {:?}", e);
+                        let value = Reflect::get(&js_frame, &JsString::from("value")).unwrap();
+                        if !value.is_undefined() {
+                            let video_frame = value.unchecked_into::<VideoFrame>();
+                            let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
+                            video_encoder_encode_options.set_key_frame(video_frame_counter % 150 == 0);
+                            if let Err(e) = video_encoder
+                                .encode_with_options(&video_frame, &video_encoder_encode_options)
+                            {
+                                error!("Error encoding video frame: {:?}", e);
+                            }
+                            video_frame.close();
+                            video_frame_counter += 1;
                         }
-                        video_frame.close();
-                        video_frame_counter += 1;
                     }
                     Err(e) => {
                         error!("error {:?}", e);

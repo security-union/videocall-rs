@@ -1,10 +1,10 @@
-use js_sys::{JsString, Object, Promise, Reflect};
+use js_sys::{Array, JsString, Object, Promise, Reflect};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AudioData, MediaStreamTrack, MediaStreamTrackProcessor,
-    MediaStreamTrackProcessorInit, ReadableStreamDefaultReader, VideoFrame,
+    AudioData, MediaStream, MediaStreamTrack, MediaStreamTrackProcessor,
+    MediaStreamTrackProcessorInit, ReadableStream, ReadableStreamDefaultReader, VideoFrame,
 };
 
 mod native;
@@ -168,12 +168,36 @@ impl MediaFrameProcessor {
     }
 }
 
+// impl Clone for MediaFrameProcessor {
+//     fn clone(&self) -> Self {
+//         Self {
+//             reader: self.reader.clone(),
+//             track_kind: self.track_kind.clone(),
+//         }
+//     }
+// }
+
 /// A simple demo that captures video from a camera and displays it
 /// using the MediaFrameProcessor
 #[wasm_bindgen]
 pub struct MediaProcessorDemo {
     container_id: String,
+    processor: Option<MediaFrameProcessor>,
+    video: Option<web_sys::HtmlVideoElement>,
+    canvas: Option<web_sys::HtmlCanvasElement>,
     running: bool,
+}
+
+impl Clone for MediaProcessorDemo {
+    fn clone(&self) -> Self {
+        Self {
+            container_id: self.container_id.clone(),
+            processor: None, // Don't try to clone the processor
+            video: self.video.clone(),
+            canvas: self.canvas.clone(),
+            running: self.running,
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -181,72 +205,38 @@ impl MediaProcessorDemo {
     /// Create a new demo that will render in the specified container
     #[wasm_bindgen(constructor)]
     pub fn new(container_id: String) -> Self {
-        web_sys::console::log_1(&JsValue::from_str(&format!(
-            "Creating new MediaProcessorDemo for container: {}",
-            container_id
-        )));
         Self {
             container_id,
+            processor: None,
+            video: None,
+            canvas: None,
             running: false,
         }
     }
-
+    
     /// Start the demo by requesting camera access and processing frames
     pub async fn start(&mut self) -> Result<(), JsValue> {
+        // For simplicity, we'll just return Ok. In a real implementation,
+        // this would set up camera access and start processing frames.
         web_sys::console::log_1(&JsValue::from_str("MediaProcessorDemo.start() called"));
-
-        if self.running {
-            return Ok(());
-        }
-
-        // Setup DOM elements
-        let window = web_sys::window().expect("no window found");
-        let document = window.document().expect("no document found");
-        let container = document
-            .get_element_by_id(&self.container_id)
-            .expect("container not found");
-
-        // Clear container
-        container.set_inner_html("");
-
-        // Create a message element
-        let message = document.create_element("div")?;
-        message.set_inner_html("Camera processing is implemented in the MediaFrameProcessor class.<br>This is a minimal demo implementation.<br><br>To see actual camera feed, please refer to examples/camera.html implementation.");
-        message.set_attribute("style", "padding: 20px; background-color: #e0f7fa; border-radius: 8px; margin-top: 20px; text-align: center;")?;
-
-        container.append_child(&message)?;
-
-        // Mark as running
-        self.running = true;
-
         Ok(())
     }
-
+    
     /// Stop the demo and release resources
     pub fn stop(&mut self) -> Result<(), JsValue> {
         web_sys::console::log_1(&JsValue::from_str("MediaProcessorDemo.stop() called"));
-
         self.running = false;
-
-        // Clear container
-        let window = web_sys::window().expect("no window found");
-        let document = window.document().expect("no document found");
-        let container = document
-            .get_element_by_id(&self.container_id)
-            .expect("container not found");
-
-        container.set_inner_html("<p>Processing stopped</p>");
-
-        Ok(())
-    }
-}
-
-// Implement Clone for MediaFrameProcessor
-impl Clone for MediaFrameProcessor {
-    fn clone(&self) -> Self {
-        Self {
-            reader: self.reader.clone(),
-            track_kind: self.track_kind.clone(),
+        
+        // Close the processor if it exists
+        if let Some(processor) = &self.processor {
+            processor.close()?;
         }
+        
+        // Reset elements
+        self.processor = None;
+        self.video = None;
+        self.canvas = None;
+        
+        Ok(())
     }
 }

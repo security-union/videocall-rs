@@ -1,8 +1,8 @@
 use js_sys::{Array, JsString, Object, Promise, Reflect};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     AudioData, MediaStream, MediaStreamTrack, MediaStreamTrackProcessor,
@@ -183,59 +183,62 @@ impl MediaProcessorDemo {
     /// Create a new demo that will render in the specified container
     #[wasm_bindgen(constructor)]
     pub fn new(container_id: String) -> Self {
-        web_sys::console::log_1(&JsValue::from_str(&format!("Creating new MediaProcessorDemo for container: {}", container_id)));
+        web_sys::console::log_1(&JsValue::from_str(&format!(
+            "Creating new MediaProcessorDemo for container: {}",
+            container_id
+        )));
         Self {
             container_id,
             running: false,
         }
     }
-    
+
     /// Start the demo by requesting camera access and processing frames
     pub async fn start(&mut self) -> Result<(), JsValue> {
         web_sys::console::log_1(&JsValue::from_str("MediaProcessorDemo.start() called"));
-        
+
         if self.running {
             return Ok(());
         }
-        
+
         // Setup DOM elements
         let window = web_sys::window().expect("no window found");
         let document = window.document().expect("no document found");
         let container = document
             .get_element_by_id(&self.container_id)
             .expect("container not found");
-        
+
         // Clear container
         container.set_inner_html("");
-        
+
         // Create a message element
         let message = document.create_element("div")?;
         message.set_inner_html("Camera processing is implemented in the MediaFrameProcessor class.<br>This is a minimal demo implementation.<br><br>To see actual camera feed, please refer to examples/camera.html implementation.");
         message.set_attribute("style", "padding: 20px; background-color: #e0f7fa; border-radius: 8px; margin-top: 20px; text-align: center;")?;
-        
+
         container.append_child(&message)?;
-        
+
         // Mark as running
         self.running = true;
-        
+
         Ok(())
     }
-    
+
     /// Stop the demo and release resources
     pub fn stop(&mut self) -> Result<(), JsValue> {
         web_sys::console::log_1(&JsValue::from_str("MediaProcessorDemo.stop() called"));
-        
+
         self.running = false;
-        
+
         // Clear container
         let window = web_sys::window().expect("no window found");
         let document = window.document().expect("no document found");
         let container = document
             .get_element_by_id(&self.container_id)
             .expect("container not found");
-        
+
         container.set_inner_html("<p>Processing stopped</p>");
-        
+
         Ok(())
     }
 }

@@ -7,6 +7,9 @@ use js_sys::Date;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
+const WINDOW_DURATION_SEC: u32 = 10;
+const INACTIVE_TIMEOUT_SEC: u32 = 20;
+
 /// EncoderControl is responsible for bridging the gap between the encoder and the
 /// diagnostics system.
 /// It closes the loop by allowing the encoder to adjust its settings based on
@@ -220,7 +223,7 @@ impl EncoderBitrateController {
         let pid = pidgeon::PidController::new(controller_config);
 
         // Create diagnostic packets manager with 10-second window and 30-second timeout
-        let diagnostic_packets = DiagnosticPackets::new(10, 30);
+        let diagnostic_packets = DiagnosticPackets::new(WINDOW_DURATION_SEC, INACTIVE_TIMEOUT_SEC);
 
         Self {
             pid,

@@ -15,7 +15,7 @@ pub enum EncoderControl {
     UpdateBitrate { target_bitrate_kbps: u32 },
 }
 
-pub struct EncoderControlSender {
+pub struct EncoderBitrateController {
     pid: pidgeon::PidController,
     last_update: f64,
     _ideal_bitrate_kbps: u32,
@@ -26,7 +26,7 @@ pub struct EncoderControlSender {
     initialization_complete: bool,                // Flag to handle startup conditions
 }
 
-impl EncoderControlSender {
+impl EncoderBitrateController {
     pub fn new(ideal_bitrate_kbps: u32, current_fps: Rc<AtomicU32>) -> Self {
         // Configure the PID controller for stable bitrate control
         // Lower gains make the controller more gentle and less prone to overreaction
@@ -192,7 +192,7 @@ mod tests {
     // wasm_bindgen_test_configure!(run_in_browser);
 
     // Helper to simulate time passing more reliably
-    fn simulate_time_passing(controller: &mut EncoderControlSender, ms: f64) {
+    fn simulate_time_passing(controller: &mut EncoderBitrateController, ms: f64) {
         let now = js_sys::Date::now();
         controller.last_update = now - ms;
     }
@@ -219,7 +219,7 @@ mod tests {
         let target_fps = Rc::new(AtomicU32::new(30));
         // Use 500 kbps as the ideal bitrate
         let ideal_bitrate_kbps = 500;
-        let mut controller = EncoderControlSender::new(ideal_bitrate_kbps, target_fps.clone());
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
         // Generate a series of packets with perfect conditions
         // FPS matches the target exactly, no jitter
@@ -259,7 +259,7 @@ mod tests {
         let target_fps = Rc::new(AtomicU32::new(30));
         // Use 500 kbps as the ideal bitrate
         let ideal_bitrate_kbps = 500;
-        let mut controller = EncoderControlSender::new(ideal_bitrate_kbps, target_fps.clone());
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
         // First get a baseline with perfect conditions
         let good_packet = create_test_packet(30.0, 500); // Perfect FPS
@@ -315,7 +315,7 @@ mod tests {
         // Setup with standard parameters
         let target_fps = Rc::new(AtomicU32::new(30));
         let ideal_bitrate_kbps = 500;
-        let mut controller = EncoderControlSender::new(ideal_bitrate_kbps, target_fps.clone());
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
         // Simulation time control
         let start_time = 1000.0;
@@ -612,7 +612,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_calculate_jitter() {
         let target_fps = Rc::new(AtomicU32::new(30));
-        let mut controller = EncoderControlSender::new(500, target_fps);
+        let mut controller = EncoderBitrateController::new(500, target_fps);
 
         // Test empty history
         assert_eq!(

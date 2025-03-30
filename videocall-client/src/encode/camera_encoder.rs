@@ -34,7 +34,7 @@ use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
 use crate::constants::VIDEO_CODEC;
-use crate::diagnostics::EncoderControlSender;
+use crate::diagnostics::EncoderBitrateController;
 
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
@@ -94,7 +94,7 @@ impl CameraEncoder {
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderControlSender::new(
+            let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
                 current_fps.clone(),
             );

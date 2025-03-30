@@ -34,7 +34,7 @@ use super::transform::transform_audio_chunk;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::diagnostics::EncoderControlSender;
+use crate::diagnostics::EncoderBitrateController;
 
 // Threshold for bitrate changes, represents 20% (0.2)
 const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
@@ -82,7 +82,7 @@ impl MicrophoneEncoder {
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderControlSender::new(
+            let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
                 dummy_fps.clone(),
             );

@@ -3,10 +3,11 @@ use crate::constants::AUDIO_SAMPLE_RATE;
 use js_sys::Array;
 use log::info;
 use web_sys::{AudioContext, AudioContextOptions};
-use web_sys::{MediaStream, MediaStreamTrackGenerator};
+use web_sys::{MediaStream, MediaStreamTrack};
+use wasm_bindgen::JsValue;
 
 pub fn configure_audio_context(
-    audio_stream_generator: &MediaStreamTrackGenerator,
+    audio_track: &JsValue,
 ) -> anyhow::Result<AudioContext> {
     info!(
         "Configuring audio context with sample rate: {}",
@@ -14,7 +15,7 @@ pub fn configure_audio_context(
     );
 
     let js_tracks = Array::new();
-    js_tracks.push(audio_stream_generator);
+    js_tracks.push(audio_track);
     let media_stream = MediaStream::new_with_tracks(&js_tracks)
         .map_err(|e| anyhow::anyhow!("Failed to create media stream: {:?}", e))?;
     info!("Created media stream with audio track");

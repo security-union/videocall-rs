@@ -31,8 +31,9 @@ use web_sys::EncodedVideoChunkType;
 use web_sys::HtmlCanvasElement;
 use web_sys::{AudioData, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
-use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
+use js_sys::{Array, JsString, Reflect, Boolean};
+use crate::media_generator::MediaFrameGenerator;
 
 pub struct DecodeStatus {
     pub _rendered: bool,
@@ -174,12 +175,17 @@ impl AudioPeerDecoder {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
-        let audio_stream_generator =
-            MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
+        
+        // Replace MediaStreamTrackGenerator with our MediaFrameGenerator
+        let audio_stream_generator = MediaFrameGenerator::new("audio")?;
+        
         // The audio context is used to reproduce audio.
-        let audio_context = configure_audio_context(&audio_stream_generator).unwrap();
+        // Pass the track to configure_audio_context
+        let audio_context = configure_audio_context(&audio_stream_generator.track())
+            .map_err(|e| JsValue::from_str(&format!("Failed to configure audio context: {}", e)))?;
 
         let output = Closure::wrap(Box::new(move |audio_data: AudioData| {
+            // Use the writable property of our MediaFrameGenerator
             let writable = audio_stream_generator.writable();
             if writable.locked() {
                 return;
@@ -198,6 +204,8 @@ impl AudioPeerDecoder {
                 error!("error {:?}", e);
             }
         }) as Box<dyn FnMut(AudioData)>);
+        
+        // Rest of the implementation remains the same
         let decoder = AudioDecoderWrapper::new(&AudioDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),

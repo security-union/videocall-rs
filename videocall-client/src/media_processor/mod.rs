@@ -213,7 +213,7 @@ impl MediaProcessorDemo {
             running: false,
         }
     }
-    
+
     /// Start the demo by requesting camera access and processing frames
     pub async fn start(&mut self) -> Result<(), JsValue> {
         // For simplicity, we'll just return Ok. In a real implementation,
@@ -221,22 +221,22 @@ impl MediaProcessorDemo {
         web_sys::console::log_1(&JsValue::from_str("MediaProcessorDemo.start() called"));
         Ok(())
     }
-    
+
     /// Stop the demo and release resources
     pub fn stop(&mut self) -> Result<(), JsValue> {
         web_sys::console::log_1(&JsValue::from_str("MediaProcessorDemo.stop() called"));
         self.running = false;
-        
+
         // Close the processor if it exists
         if let Some(processor) = &self.processor {
             processor.close()?;
         }
-        
+
         // Reset elements
         self.processor = None;
         self.video = None;
         self.canvas = None;
-        
+
         Ok(())
     }
 }

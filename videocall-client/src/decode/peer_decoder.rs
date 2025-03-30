@@ -19,6 +19,8 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::media_generator::MediaFrameGenerator;
+use js_sys::{Array, Boolean, JsString, Reflect};
 use log::error;
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -32,8 +34,6 @@ use web_sys::HtmlCanvasElement;
 use web_sys::{AudioData, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
-use js_sys::{Array, JsString, Reflect, Boolean};
-use crate::media_generator::MediaFrameGenerator;
 
 pub struct DecodeStatus {
     pub _rendered: bool,
@@ -175,10 +175,10 @@ impl AudioPeerDecoder {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
-        
+
         // Replace MediaStreamTrackGenerator with our MediaFrameGenerator
         let audio_stream_generator = MediaFrameGenerator::new("audio")?;
-        
+
         // The audio context is used to reproduce audio.
         // Pass the track to configure_audio_context
         let audio_context = configure_audio_context(&audio_stream_generator.track())
@@ -204,7 +204,7 @@ impl AudioPeerDecoder {
                 error!("error {:?}", e);
             }
         }) as Box<dyn FnMut(AudioData)>);
-        
+
         // Rest of the implementation remains the same
         let decoder = AudioDecoderWrapper::new(&AudioDecoderInit::new(
             error.as_ref().unchecked_ref(),

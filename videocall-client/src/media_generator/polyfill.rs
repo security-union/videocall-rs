@@ -1,7 +1,7 @@
 use js_sys::{Function, Object, Reflect};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{WritableStream, MediaStreamTrack};
+use web_sys::{MediaStreamTrack, WritableStream};
 
 /// Result structure for the polyfill generator creation
 #[derive(Clone)]
@@ -20,40 +20,42 @@ pub struct PolyfillMediaFrameGenerator {
 impl PolyfillMediaFrameGenerator {
     pub fn new(kind: &str) -> Result<Self, JsValue> {
         ensure_polyfill_initialized()?;
-        
+
         // Create a MediaStreamTrackGenerator polyfill instance
         let polyfill = js_sys::eval(
             r#"
             window.__mediaFrameGeneratorPolyfill.createGenerator(arguments[0])
             "#,
         )?;
-        
+
         // Call the polyfill with the track kind
         let js_generator = js_sys::Reflect::apply(
             &polyfill.dyn_into::<Function>()?,
             &JsValue::NULL,
             &js_sys::Array::of1(&JsValue::from_str(kind)),
         )?;
-        
+
         // Extract the track and writable properties
         let js_generator_obj = js_generator.dyn_into::<Object>()?;
         let track = Reflect::get(&js_generator_obj, &JsValue::from_str("track"))?;
         let writable = Reflect::get(&js_generator_obj, &JsValue::from_str("writable"))?
             .dyn_into::<WritableStream>()?;
-        
+
         Ok(Self { track, writable })
     }
 
     pub fn track(&self) -> JsValue {
         self.track.clone()
     }
-    
+
     pub fn writable(&self) -> WritableStream {
         self.writable.clone()
     }
-    
+
     pub fn track_kind(&self) -> Result<String, JsValue> {
-        let track = self.track.dyn_ref::<MediaStreamTrack>()
+        let track = self
+            .track
+            .dyn_ref::<MediaStreamTrack>()
             .ok_or_else(|| JsValue::from_str("Failed to cast to MediaStreamTrack"))?;
         Ok(track.kind())
     }
@@ -62,7 +64,7 @@ impl PolyfillMediaFrameGenerator {
 /// Create a polyfill generator with the specified kind
 pub fn create_generator(kind: &str) -> Result<PolyfillGeneratorResult, JsValue> {
     let generator = PolyfillMediaFrameGenerator::new(kind)?;
-    
+
     Ok(PolyfillGeneratorResult {
         track: generator.track(),
         writable: generator.writable(),
@@ -72,8 +74,10 @@ pub fn create_generator(kind: &str) -> Result<PolyfillGeneratorResult, JsValue> 
 /// Initialize the polyfill code if it hasn't been initialized yet
 fn ensure_polyfill_initialized() -> Result<(), JsValue> {
     let window = web_sys::window().expect("no global window exists");
-    
-    if js_sys::Reflect::get(&window, &JsValue::from_str("__mediaFrameGeneratorPolyfill"))?.is_undefined() {
+
+    if js_sys::Reflect::get(&window, &JsValue::from_str("__mediaFrameGeneratorPolyfill"))?
+        .is_undefined()
+    {
         // Initialize the polyfill
         js_sys::eval(
             r#"
@@ -116,6 +120,6 @@ fn ensure_polyfill_initialized() -> Result<(), JsValue> {
             "#,
         )?;
     }
-    
+
     Ok(())
-} 
+}

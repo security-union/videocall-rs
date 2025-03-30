@@ -10,7 +10,7 @@ impl NativeMediaFrameGenerator {
     pub fn new(kind: &str) -> Result<Self, JsValue> {
         // Create a new generator with the specified kind
         let generator = MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new(kind))?;
-        
+
         Ok(Self { generator })
     }
 
@@ -21,4 +21,4 @@ impl NativeMediaFrameGenerator {
     pub fn writable(&self) -> WritableStream {
         self.generator.writable()
     }
-} 
+}

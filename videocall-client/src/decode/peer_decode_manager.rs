@@ -52,7 +52,7 @@ impl Display for PeerDecodeError {
 }
 
 pub struct Peer {
-    // pub audio: AudioPeerDecoder,
+    pub audio: AudioPeerDecoder,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
     pub email: String,
@@ -84,9 +84,9 @@ impl Peer {
         email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
-        let (video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id)?;
+        let (audio, video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id)?;
         Ok(Self {
-            // audio,
+            audio,
             video,
             screen,
             email,
@@ -103,17 +103,17 @@ impl Peer {
     fn new_decoders(
         video_canvas_id: &str,
         screen_canvas_id: &str,
-    ) -> Result<(VideoPeerDecoder, VideoPeerDecoder), JsValue> {
+    ) -> Result<(AudioPeerDecoder, VideoPeerDecoder, VideoPeerDecoder), JsValue> {
         Ok((
-            // AudioPeerDecoder::new()?,
+            AudioPeerDecoder::new()?,
             VideoPeerDecoder::new(video_canvas_id)?,
             VideoPeerDecoder::new(screen_canvas_id)?,
         ))
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {
-        let (video, screen) = Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id)?;
-        // self.audio = audio;
+        let (audio, video, screen) = Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id)?;
+        self.audio = audio;
         self.video = video;
         self.screen = screen;
         Ok(())

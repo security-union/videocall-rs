@@ -3,8 +3,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AudioData, MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit, 
-    VideoFrame, WritableStream, WritableStreamDefaultWriter,
+    AudioData, MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit, VideoFrame,
+    WritableStream, WritableStreamDefaultWriter,
 };
 
 mod native;
@@ -38,13 +38,14 @@ impl MediaFrameGenerator {
         }
 
         let is_supported = Self::is_supported();
-        
+
         if is_supported {
             // Use native implementation
-            let generator = MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new(kind))?;
+            let generator =
+                MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new(kind))?;
             let track = generator.clone().dyn_into::<JsValue>()?;
             let writable = generator.writable();
-            
+
             Ok(Self {
                 track,
                 writable,
@@ -79,24 +80,26 @@ impl MediaFrameGenerator {
     /// Writes a frame to the generator
     pub async fn write_frame(&self, frame: &JsValue) -> Result<(), JsValue> {
         let writer = self.writable.get_writer()?;
-        
+
         // Wait for the writer to be ready
         JsFuture::from(writer.ready()).await?;
-        
+
         // Write the frame
         if self.track_kind == "audio" {
-            let audio_data = frame.dyn_ref::<AudioData>()
+            let audio_data = frame
+                .dyn_ref::<AudioData>()
                 .ok_or_else(|| JsValue::from_str("Expected AudioData"))?;
             JsFuture::from(writer.write_with_chunk(audio_data)).await?;
         } else {
-            let video_frame = frame.dyn_ref::<VideoFrame>()
+            let video_frame = frame
+                .dyn_ref::<VideoFrame>()
                 .ok_or_else(|| JsValue::from_str("Expected VideoFrame"))?;
             JsFuture::from(writer.write_with_chunk(video_frame)).await?;
         }
-        
+
         // Release the lock
         writer.release_lock();
-        
+
         Ok(())
     }
 
@@ -104,4 +107,4 @@ impl MediaFrameGenerator {
     pub fn create_writer(&self) -> Result<WritableStreamDefaultWriter, JsValue> {
         self.writable.get_writer()
     }
-} 
+}

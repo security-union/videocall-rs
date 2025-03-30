@@ -2,13 +2,11 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use js_sys::Array;
 use log::info;
+use wasm_bindgen::JsValue;
 use web_sys::{AudioContext, AudioContextOptions};
 use web_sys::{MediaStream, MediaStreamTrack};
-use wasm_bindgen::JsValue;
 
-pub fn configure_audio_context(
-    audio_track: &JsValue,
-) -> anyhow::Result<AudioContext> {
+pub fn configure_audio_context(audio_track: &JsValue) -> anyhow::Result<AudioContext> {
     info!(
         "Configuring audio context with sample rate: {}",
         AUDIO_SAMPLE_RATE

@@ -200,6 +200,8 @@ pub struct EncoderBitrateController {
     last_error: f64,                              // Track the previous error for stability checks
     initialization_complete: bool,                // Flag to handle startup conditions
     diagnostic_packets: DiagnosticPackets,        // Manager for multiple peers' diagnostic data
+    last_correction_time: f64,                    // Timestamp of last bitrate correction
+    correction_throttle_ms: f64,                  // Minimum time between corrections in ms
 }
 
 impl EncoderBitrateController {
@@ -230,6 +232,8 @@ impl EncoderBitrateController {
             last_error: 0.0,
             initialization_complete: false,
             diagnostic_packets,
+            last_correction_time: 0.0, // Initialize to 0 to ensure first correction is sent
+            correction_throttle_ms: 1000.0, // Default to 1Hz (1000ms)
         }
     }
 
@@ -261,6 +265,17 @@ impl EncoderBitrateController {
         // Add the packet to our diagnostic packet manager
         self.diagnostic_packets.process_packet(packet.clone(), now);
 
+        // Apply throttling - check if sufficient time has passed since last correction
+        let time_since_last_correction = now - self.last_correction_time;
+        if time_since_last_correction < self.correction_throttle_ms {
+            log::debug!(
+                "Throttling bitrate correction: {:.0}ms since last correction (throttle: {:.0}ms)",
+                time_since_last_correction,
+                self.correction_throttle_ms
+            );
+            return None; // Too soon since last correction, don't emit a new one
+        }
+
         // Get the worst performing peer's FPS
         let worst_fps = match self.diagnostic_packets.get_worst_fps_peer() {
             Some((_, fps)) => fps,
@@ -273,6 +288,8 @@ impl EncoderBitrateController {
         // Correct fps_received max to be the target fps
         let fps_received = worst_fps.min(target_fps);
         if target_fps <= 0.0 {
+            // Update last correction time
+            self.last_correction_time = now;
             return Some(self._ideal_bitrate_kbps as f64); // Default bitrate in bps if target FPS is invalid
         }
 
@@ -301,6 +318,8 @@ impl EncoderBitrateController {
             } else {
                 // During initialization, just track the error but don't react strongly
                 self.last_error = current_error;
+                // Update last correction time
+                self.last_correction_time = now;
                 return Some(self._ideal_bitrate_kbps as f64); // Return default bitrate in bps during initialization
             }
         }
@@ -345,18 +364,25 @@ impl EncoderBitrateController {
         );
 
         // Ensure we have a reasonable bitrate (between min_bitrate and max_bitrate)
-        if !(min_bitrate..=max_bitrate).contains(&corrected_bitrate) || corrected_bitrate.is_nan() {
+        let final_bitrate = if !(min_bitrate..=max_bitrate).contains(&corrected_bitrate)
+            || corrected_bitrate.is_nan()
+        {
             log::warn!(
                 "Bitrate out of bounds or NaN: {:.0} kbps (min: {:.0} kbps, max: {:.0} kbps)",
                 corrected_bitrate,
                 min_bitrate,
                 max_bitrate
             );
-            // Return a safe default value instead of None to maintain stability
-            return Some(f64::max(min_bitrate, f64::min(base_bitrate, max_bitrate)));
-        }
+            // Use a safe default value instead
+            f64::max(min_bitrate, f64::min(base_bitrate, max_bitrate))
+        } else {
+            corrected_bitrate
+        };
 
-        Some(corrected_bitrate)
+        // Update last correction time
+        self.last_correction_time = now;
+
+        Some(final_bitrate)
     }
 
     pub fn process_diagnostics_packet(&mut self, packet: DiagnosticsPacket) -> Option<f64> {
@@ -386,12 +412,6 @@ mod tests {
 
     // Remove browser-only configuration and make tests run in any environment
     // wasm_bindgen_test_configure!(run_in_browser);
-
-    // Helper to simulate time passing more reliably
-    fn simulate_time_passing(controller: &mut EncoderBitrateController, ms: f64) {
-        let now = js_sys::Date::now();
-        controller.last_update = now - ms;
-    }
 
     fn create_test_packet(
         sender_id: &str,
@@ -443,14 +463,20 @@ mod tests {
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
+        // Use fixed timesteps to ensure we're over the throttle time
+        let base_time = 1000.0;
+
         // Generate a series of packets with perfect conditions
         // FPS matches the target exactly, no jitter
-        for _ in 0..10 {
+        for i in 0..10 {
             let packet = create_test_packet("peer1", "self", 30.0, 500);
-            let result = controller.process_diagnostics_packet(packet);
+            // Each packet is sent 1100ms apart to avoid throttling
+            let result = controller
+                .process_diagnostics_packet_with_time(packet, base_time + (i as f64 * 1100.0));
 
             // With perfect conditions (no error, no jitter),
             // the bitrate should stay close to the ideal
+            assert!(result.is_some(), "Packet should return a bitrate");
             if let Some(bitrate) = result {
                 // Should be close to base bitrate (in kbps)
                 assert!(
@@ -460,9 +486,6 @@ mod tests {
                     bitrate
                 );
             }
-
-            // Simulate time passing for the next packet
-            simulate_time_passing(&mut controller, 100.0); // 100ms ago
         }
 
         // Check history shows stable FPS
@@ -487,19 +510,26 @@ mod tests {
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
         // Base time for simulation
-        let base_time = js_sys::Date::now();
+        let base_time = 1000.0;
 
-        // First peer with good FPS (30 fps)
+        // First peer with good FPS (30 fps) - should get a result
         let good_peer_packet = create_test_packet("good_sender", "peer1", 30.0, 500);
-        controller.process_diagnostics_packet_with_time(good_peer_packet, base_time);
+        let result1 = controller.process_diagnostics_packet_with_time(good_peer_packet, base_time);
+        assert!(result1.is_some(), "First packet should return a bitrate");
+
+        // Send packets from other peers spaced out beyond throttle period
 
         // Second peer with average FPS (20 fps)
         let avg_peer_packet = create_test_packet("avg_sender", "peer2", 20.0, 500);
-        controller.process_diagnostics_packet_with_time(avg_peer_packet, base_time);
+        let result2 =
+            controller.process_diagnostics_packet_with_time(avg_peer_packet, base_time + 1100.0);
+        assert!(result2.is_some(), "Second packet should return a bitrate");
 
         // Third peer with poor FPS (5 fps)
         let poor_peer_packet = create_test_packet("poor_sender", "peer3", 5.0, 500);
-        controller.process_diagnostics_packet_with_time(poor_peer_packet, base_time);
+        let result3 =
+            controller.process_diagnostics_packet_with_time(poor_peer_packet, base_time + 2200.0);
+        assert!(result3.is_some(), "Third packet should return a bitrate");
 
         // Verify we have three peers
         assert_eq!(controller.peer_count(), 3);
@@ -507,29 +537,17 @@ mod tests {
         assert!(controller.peer_ids().contains(&"peer2".to_string()));
         assert!(controller.peer_ids().contains(&"peer3".to_string()));
 
-        // Process another set of packets for good measure
-        controller.process_diagnostics_packet_with_time(
-            create_test_packet("good_sender", "peer1", 29.0, 500),
-            base_time + 100.0,
-        );
-        controller.process_diagnostics_packet_with_time(
-            create_test_packet("avg_sender", "peer2", 21.0, 500),
-            base_time + 100.0,
-        );
-        controller.process_diagnostics_packet_with_time(
-            create_test_packet("poor_sender", "peer3", 6.0, 500),
-            base_time + 100.0,
-        );
-
         // The controller should adjust bitrate based on the worst peer (peer3)
         // Process one more packet to check the behavior
-        let result = controller.process_diagnostics_packet_with_time(
+        let result4 = controller.process_diagnostics_packet_with_time(
             create_test_packet("test_sender", "test_target", 30.0, 500),
-            base_time + 200.0,
+            base_time + 3300.0,
         );
 
+        assert!(result4.is_some(), "Fourth packet should return a bitrate");
+
         // With one very poor peer, the bitrate should be significantly reduced
-        if let Some(bitrate) = result {
+        if let Some(bitrate) = result4 {
             // Should be much lower than ideal due to the poor peer
             assert!(
                 bitrate < ideal_bitrate_kbps as f64 * 0.7, // 70% of ideal or less
@@ -537,8 +555,6 @@ mod tests {
                 bitrate,
                 ideal_bitrate_kbps
             );
-        } else {
-            panic!("Expected a bitrate result");
         }
     }
 
@@ -550,20 +566,20 @@ mod tests {
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
         // Base time for simulation
-        let base_time = js_sys::Date::now();
+        let base_time = 1000.0;
 
-        // Add three peers
+        // Add three peers, spacing packets to avoid throttling
         controller.process_diagnostics_packet_with_time(
             create_test_packet("sender1", "peer1", 30.0, 500),
             base_time,
         );
         controller.process_diagnostics_packet_with_time(
             create_test_packet("sender2", "peer2", 28.0, 500),
-            base_time,
+            base_time + 1100.0,
         );
         controller.process_diagnostics_packet_with_time(
             create_test_packet("sender3", "peer3", 25.0, 500),
-            base_time,
+            base_time + 2200.0,
         );
 
         // Verify we have three peers
@@ -577,7 +593,7 @@ mod tests {
         );
         controller.process_diagnostics_packet_with_time(
             create_test_packet("sender2", "peer2", 27.0, 500),
-            base_time + 20_000.0,
+            base_time + 21_100.0, // Add 1100ms to avoid throttling
         );
 
         // Peer3 is still in the window (hasn't timed out yet)
@@ -657,29 +673,34 @@ mod tests {
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
         // Base time for simulation
-        let base_time = js_sys::Date::now();
+        let base_time = 1000.0;
 
-        // Mix of video and audio packets
-        controller.process_diagnostics_packet_with_time(
+        // Mix of video and audio packets, spaced out to avoid throttling
+        // First packet (video)
+        let result1 = controller.process_diagnostics_packet_with_time(
             create_test_packet("sender1", "peer1", 30.0, 500), // Video
             base_time,
         );
-        controller.process_diagnostics_packet_with_time(
+        assert!(result1.is_some(), "First packet should return a bitrate");
+
+        // Second packet (audio), beyond throttle period
+        let result2 = controller.process_diagnostics_packet_with_time(
             create_test_audio_packet("sender2", "peer2", 40.0, 100), // Audio
-            base_time,
+            base_time + 1100.0,
         );
+        assert!(result2.is_some(), "Second packet should return a bitrate");
 
         // Verify both peers are tracked
         assert_eq!(controller.peer_count(), 2);
 
         // Process a new packet and verify the result
-        let result = controller.process_diagnostics_packet_with_time(
+        let result3 = controller.process_diagnostics_packet_with_time(
             create_test_packet("sender3", "peer3", 25.0, 400),
-            base_time + 100.0,
+            base_time + 2200.0,
         );
 
         // We should get a sensible bitrate
-        assert!(result.is_some());
+        assert!(result3.is_some(), "Third packet should return a bitrate");
     }
 
     #[wasm_bindgen_test]
@@ -690,29 +711,36 @@ mod tests {
         let ideal_bitrate_kbps = 500;
         let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
 
+        // Use fixed base time for testing
+        let base_time = 1000.0;
+
         // First get a baseline with perfect conditions
         let good_packet = create_test_packet("good_sender", "peer1", 30.0, 500); // Perfect FPS
-        simulate_time_passing(&mut controller, 100.0);
-        let good_bitrate = match controller.process_diagnostics_packet(good_packet) {
-            Some(bitrate) => bitrate,
-            None => panic!("Failed to get initial bitrate"),
-        };
+        let good_result = controller.process_diagnostics_packet_with_time(good_packet, base_time);
+        assert!(
+            good_result.is_some(),
+            "First packet should return a bitrate"
+        );
+        let good_bitrate = good_result.unwrap();
 
-        // Now simulate a significant drop in FPS
-        for _ in 0..5 {
+        // Now simulate a significant drop in FPS, spacing packets to avoid throttling
+        for i in 0..5 {
             // Feed multiple poor FPS packets to build up effect
             let bad_packet = create_test_packet("poor_sender", "peer2", 5.0, 500); // Very low FPS
-            simulate_time_passing(&mut controller, 100.0);
-            controller.process_diagnostics_packet(bad_packet);
+            let time = base_time + 1100.0 * (i as f64 + 1.0);
+            let result = controller.process_diagnostics_packet_with_time(bad_packet, time);
+            assert!(result.is_some(), "Packet should return a bitrate");
         }
 
         // One more poor FPS packet and get the resulting bitrate
         let final_packet = create_test_packet("test_sender", "test_peer", 15.0, 500);
-        simulate_time_passing(&mut controller, 100.0);
-        let poor_bitrate = match controller.process_diagnostics_packet(final_packet) {
-            Some(bitrate) => bitrate,
-            None => panic!("Failed to get final bitrate"),
-        };
+        let final_result =
+            controller.process_diagnostics_packet_with_time(final_packet, base_time + 6600.0);
+        assert!(
+            final_result.is_some(),
+            "Final packet should return a bitrate"
+        );
+        let poor_bitrate = final_result.unwrap();
 
         // Verify that bitrate decreased when FPS decreased
         assert!(
@@ -805,5 +833,45 @@ mod tests {
             expected_jitter,
             actual_jitter
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_throttling_basic() {
+        // Setup
+        let target_fps = Rc::new(AtomicU32::new(30));
+        let ideal_bitrate_kbps = 500;
+        let mut controller = EncoderBitrateController::new(ideal_bitrate_kbps, target_fps.clone());
+
+        // Use fixed timestamps for deterministic testing
+        let base_time = 1000.0;
+
+        // First packet should produce a result (no throttling yet)
+        let packet1 = create_test_packet("sender1", "peer1", 25.0, 500);
+        let result1 = controller.process_diagnostics_packet_with_time(packet1, base_time);
+        assert!(result1.is_some(), "First packet should return a bitrate");
+
+        // Add a second peer to make sure peer tracking still works during throttling
+        let packet2 = create_test_packet("sender2", "peer2", 20.0, 500);
+
+        // Second packet within throttle period should not produce a result
+        let result2 = controller.process_diagnostics_packet_with_time(packet2, base_time + 500.0);
+        assert!(
+            result2.is_none(),
+            "Packet within throttle period should not return a bitrate"
+        );
+
+        // Verify both peers are tracked despite throttling
+        assert_eq!(controller.peer_count(), 2);
+
+        // Third packet after throttle period should produce a result
+        let packet3 = create_test_packet("sender3", "peer3", 15.0, 500);
+        let result3 = controller.process_diagnostics_packet_with_time(packet3, base_time + 1100.0);
+        assert!(
+            result3.is_some(),
+            "Packet after throttle period should return a bitrate"
+        );
+
+        // Verify all peers are tracked
+        assert_eq!(controller.peer_count(), 3);
     }
 }

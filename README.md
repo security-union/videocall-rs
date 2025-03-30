@@ -1,6 +1,5 @@
 # videocall.rs
 
-[![GitHub Stars](https://img.shields.io/github/stars/security-union/videocall-rs?style=social)](https://github.com/security-union/videocall-rs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Chat-7289DA?logo=discord&logoColor=white)](https://discord.gg/JP38NRe4CJ)
 

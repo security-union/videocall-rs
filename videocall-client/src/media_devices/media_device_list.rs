@@ -42,12 +42,15 @@ impl MediaDevicesProvider for BrowserMediaDevicesProvider {
     }
 }
 
+#[cfg(test)]
+type DeviceChangeHandler = Rc<RefCell<Option<Closure<dyn FnMut(Event)>>>>;
+
 /// Mock provider for testing purposes
 #[cfg(test)]
 #[derive(Clone)]
 pub struct MockMediaDevicesProvider {
     devices: Rc<RefCell<Vec<MediaDeviceInfo>>>,
-    device_change_handler: Rc<RefCell<Option<Closure<dyn FnMut(Event)>>>>,
+    device_change_handler: DeviceChangeHandler,
 }
 
 #[cfg(test)]
@@ -66,7 +69,6 @@ impl MockMediaDevicesProvider {
 
         // Trigger the event handler if it exists
         if let Some(handler) = self.device_change_handler.borrow().as_ref() {
-            let event = web_sys::Event::new("devicechange").unwrap();
             let handler_js = handler.as_ref().unchecked_ref::<js_sys::Function>();
             let _ = handler_js.call0(&JsValue::NULL);
         }
@@ -471,10 +473,10 @@ impl<P: MediaDevicesProvider + Clone> Clone for MediaDeviceList<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use js_sys::{Function, Object};
+    use js_sys::Function;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use wasm_bindgen::{closure::Closure, JsValue};
+    use wasm_bindgen::JsValue;
     use wasm_bindgen_test::*;
 
     // Helper to create mock device for tests

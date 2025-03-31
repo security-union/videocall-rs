@@ -29,7 +29,7 @@ pub fn configure_audio_context(
         .create_gain()
         .map_err(|e| anyhow::anyhow!("Failed to create gain node: {:?}", e))?;
     gain_node.gain().set_value(1.0);
-    gain_node.set_channel_count(AUDIO_CHANNELS as u32);
+    gain_node.set_channel_count(AUDIO_CHANNELS);
     info!("Created gain node with {} channels", AUDIO_CHANNELS);
 
     // Create media stream source

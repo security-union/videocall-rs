@@ -19,21 +19,17 @@ pub struct PolyfillMediaFrameGenerator {
 
 impl PolyfillMediaFrameGenerator {
     pub fn new(kind: &str) -> Result<Self, JsValue> {
+        log::info!("new PolyfillMediaFrameGenerator {}", kind);
         ensure_polyfill_initialized()?;
 
         // Create a MediaStreamTrackGenerator polyfill instance
-        let polyfill = js_sys::eval(
-            r#"
-            window.__mediaFrameGeneratorPolyfill.createGenerator(arguments[0])
-            "#,
-        )?;
+        let window = web_sys::window().expect("no global window exists");
+        let polyfill = js_sys::Reflect::get(&window, &JsValue::from_str("__mediaFrameGeneratorPolyfill"))?;
+        let create_fn = Reflect::get(&polyfill, &JsValue::from_str("createGenerator"))?
+            .dyn_into::<Function>()?;
 
-        // Call the polyfill with the track kind
-        let js_generator = js_sys::Reflect::apply(
-            &polyfill.dyn_into::<Function>()?,
-            &JsValue::NULL,
-            &js_sys::Array::of1(&JsValue::from_str(kind)),
-        )?;
+        let js_generator = create_fn
+            .call1(&JsValue::NULL, &JsValue::from_str(kind))?;
 
         // Extract the track and writable properties
         let js_generator_obj = js_generator.dyn_into::<Object>()?;
@@ -45,6 +41,8 @@ impl PolyfillMediaFrameGenerator {
     }
 
     pub fn track(&self) -> JsValue {
+        // Add explicit debugging to help diagnose issues
+        log::debug!("Returning polyfill track of type: {:?}", js_typeof(&self.track));
         self.track.clone()
     }
 
@@ -83,6 +81,7 @@ fn ensure_polyfill_initialized() -> Result<(), JsValue> {
             r#"
             window.__mediaFrameGeneratorPolyfill = {
                 createGenerator: function(kind) {
+                    console.log("Creating polyfill generator for", kind);
                     if (kind !== 'audio' && kind !== 'video') {
                         throw new Error('Kind must be "audio" or "video"');
                     }
@@ -100,19 +99,31 @@ fn ensure_polyfill_initialized() -> Result<(), JsValue> {
                         }
                     });
                     
-                    // Create dummy MediaStreamTrack
-                    const dummyTrack = {
-                        kind: kind,
-                        addEventListener: function() {},
-                        removeEventListener: function() {},
-                        // Add other MediaStreamTrack methods as needed
-                    };
+                    // Create a real MediaStreamTrack from a dummy MediaStream
+                    const dummyStream = new MediaStream();
                     
-                    // Store the readable stream on the track for internal use
-                    dummyTrack._readable = readable;
+                    // Get a real track from the correct track collection
+                    let track;
+                    if (kind === 'audio') {
+                        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                        const oscillator = audioCtx.createOscillator();
+                        oscillator.frequency.value = 0; // Silent
+                        const dest = audioCtx.createMediaStreamDestination();
+                        oscillator.connect(dest);
+                        track = dest.stream.getAudioTracks()[0];
+                    } else {
+                        // For video, create a canvas and get its track
+                        const canvas = document.createElement('canvas');
+                        canvas.width = 2;
+                        canvas.height = 2;
+                        track = canvas.captureStream().getVideoTracks()[0];
+                    }
+                    
+                    // Store the readable stream on the track for our internal use
+                    track._readable = readable;
                     
                     return {
-                        track: dummyTrack,
+                        track: track,
                         writable: writable
                     };
                 }
@@ -122,4 +133,19 @@ fn ensure_polyfill_initialized() -> Result<(), JsValue> {
     }
 
     Ok(())
+}
+
+// Helper function to get JavaScript typeof
+fn js_typeof(val: &JsValue) -> String {
+    let window = web_sys::window().expect("no global window exists");
+    let typeof_fn = r#"
+    function(obj) {
+        return typeof obj;
+    }
+    "#;
+    
+    match js_sys::Function::new_with_args("obj", typeof_fn).call1(&JsValue::NULL, val) {
+        Ok(js_type) => js_type.as_string().unwrap_or_else(|| "unknown".to_string()),
+        Err(_) => "error".to_string(),
+    }
 }

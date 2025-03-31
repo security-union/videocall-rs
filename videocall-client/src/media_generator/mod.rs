@@ -64,6 +64,8 @@ impl MediaFrameGenerator {
 
     /// Returns the MediaStreamTrack
     pub fn track(&self) -> JsValue {
+        // Since we're guaranteed to have a MediaStreamTrack in both native and polyfill case,
+        // we can just return the track directly
         self.track.clone()
     }
 

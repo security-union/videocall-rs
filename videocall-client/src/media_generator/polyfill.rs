@@ -24,12 +24,12 @@ impl PolyfillMediaFrameGenerator {
 
         // Create a MediaStreamTrackGenerator polyfill instance
         let window = web_sys::window().expect("no global window exists");
-        let polyfill = js_sys::Reflect::get(&window, &JsValue::from_str("__mediaFrameGeneratorPolyfill"))?;
+        let polyfill =
+            js_sys::Reflect::get(&window, &JsValue::from_str("__mediaFrameGeneratorPolyfill"))?;
         let create_fn = Reflect::get(&polyfill, &JsValue::from_str("createGenerator"))?
             .dyn_into::<Function>()?;
 
-        let js_generator = create_fn
-            .call1(&JsValue::NULL, &JsValue::from_str(kind))?;
+        let js_generator = create_fn.call1(&JsValue::NULL, &JsValue::from_str(kind))?;
 
         // Extract the track and writable properties
         let js_generator_obj = js_generator.dyn_into::<Object>()?;
@@ -42,7 +42,10 @@ impl PolyfillMediaFrameGenerator {
 
     pub fn track(&self) -> JsValue {
         // Add explicit debugging to help diagnose issues
-        log::debug!("Returning polyfill track of type: {:?}", js_typeof(&self.track));
+        log::debug!(
+            "Returning polyfill track of type: {:?}",
+            js_typeof(&self.track)
+        );
         self.track.clone()
     }
 
@@ -143,7 +146,7 @@ fn js_typeof(val: &JsValue) -> String {
         return typeof obj;
     }
     "#;
-    
+
     match js_sys::Function::new_with_args("obj", typeof_fn).call1(&JsValue::NULL, val) {
         Ok(js_type) => js_type.as_string().unwrap_or_else(|| "unknown".to_string()),
         Err(_) => "error".to_string(),

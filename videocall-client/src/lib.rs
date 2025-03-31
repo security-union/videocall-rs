@@ -1,5 +1,3 @@
-#![allow(clippy::all)]
-
 //! This crate provides a client-side (browser) interface to the videocall protocol.  The purpose is to
 //! take care of the media I/O both for the encoding the current participant and for rendering the
 //! media from the remote peers.  It also provides tools for listing available media devices and

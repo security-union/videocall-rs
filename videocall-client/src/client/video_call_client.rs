@@ -493,11 +493,11 @@ impl Inner {
                                     self.options.enable_e2ee,
                                 ),
                             ) {
-                                error!("Failed to set peer aes: {}", e.to_string());
+                                error!("Failed to set peer aes: {}", e);
                             }
                         }
                         Err(e) => {
-                            error!("Failed to parse aes packet: {}", e.to_string());
+                            error!("Failed to parse aes packet: {}", e);
                         }
                     }
                 }
@@ -527,14 +527,14 @@ impl Inner {
                         });
                     }
                     Err(e) => {
-                        error!("Failed to send AES_KEY to peer: {}", e.to_string());
+                        error!("Failed to send AES_KEY to peer: {}", e);
                     }
                 }
             }
             Ok(PacketType::MEDIA) => {
                 let email = response.email.clone();
                 if let Err(e) = self.peer_decode_manager.decode(response) {
-                    error!("error decoding packet: {}", e.to_string());
+                    error!("error decoding packet: {}", e);
                     self.peer_decode_manager.delete_peer(&email);
                 }
             }
@@ -554,7 +554,7 @@ impl Inner {
                 }
             }
             Err(e) => {
-                error!("Failed to parse diagnostics packet: {}", e.to_string());
+                error!("Failed to parse diagnostics packet: {}", e);
             }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {
@@ -588,12 +588,12 @@ impl Inner {
                         });
                     }
                     Err(e) => {
-                        error!("Failed to serialize rsa packet: {}", e.to_string());
+                        error!("Failed to serialize rsa packet: {}", e);
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to export rsa public key to der: {}", e.to_string());
+                error!("Failed to export rsa public key to der: {}", e);
             }
         }
     }

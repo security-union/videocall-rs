@@ -104,7 +104,7 @@ impl CameraEncoder {
                     if enabled.load(Ordering::Acquire) {
                         // Only update if change is greater than threshold
                         let current = current_bitrate.load(Ordering::Relaxed) as f64;
-                        let new = bitrate as f64;
+                        let new = bitrate;
                         let percent_change = (new - current).abs() / current;
 
                         if percent_change > BITRATE_CHANGE_THRESHOLD {

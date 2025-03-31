@@ -93,8 +93,8 @@ impl VideoPeerDecoder {
                 .unchecked_into::<CanvasRenderingContext2d>();
 
             // Get the video frame's dimensions from its settings
-            let width = video_chunk.display_width() as u32;
-            let height = video_chunk.display_height() as u32;
+            let width = video_chunk.display_width();
+            let height = video_chunk.display_height();
 
             // Set canvas dimensions to match video frame
             render_canvas.set_width(width);

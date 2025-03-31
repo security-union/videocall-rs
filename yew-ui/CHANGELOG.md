@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.8](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.7...videocall-ui-v1.0.8) - 2025-03-31
+
+### Added
+
+- Subscribe to device changes and enable clippy in videocall-client ([#245](https://github.com/security-union/videocall-rs/pull/245))
+
 ## [1.0.7](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.6...videocall-ui-v1.0.7) - 2025-03-30
 
 ### Other

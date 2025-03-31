@@ -172,11 +172,11 @@ impl Peer {
             )),
             MediaType::HEARTBEAT => {
                 // update state using heartbeat metadata
-                packet.heartbeat_metadata.as_ref().map(|metadata| {
+                if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
-                });
+                }
                 Ok((
                     media_type,
                     DecodeStatus {

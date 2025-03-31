@@ -28,18 +28,20 @@ impl DeviceSelector {
         let on_camera_select = ctx.props().on_camera_select.clone();
         {
             let link = link.clone();
-            media_devices.on_loaded = Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
+            media_devices.on_loaded =
+                Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
         }
         {
             let link = link.clone();
-            media_devices.on_devices_changed = Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
+            media_devices.on_devices_changed =
+                Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
         }
         let on_microphone_select = on_microphone_select.clone();
         media_devices.audio_inputs.on_selected =
             Callback::from(move |device_id| on_microphone_select.emit(device_id));
         let on_camera_select = on_camera_select.clone();
         media_devices.video_inputs.on_selected =
-        Callback::from(move |device_id| on_camera_select.emit(device_id));
+            Callback::from(move |device_id| on_camera_select.emit(device_id));
         media_devices
     }
 }

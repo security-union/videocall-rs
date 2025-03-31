@@ -14,6 +14,7 @@ use super::super::wrappers::EncodedVideoChunkTypeWrapper;
 use super::audio_decoder_wrapper::{AudioDecoderTrait, AudioDecoderWrapper};
 use super::config::configure_audio_context;
 use super::media_decoder_with_buffer::VideoDecoderWithBuffer;
+use super::safari_audio_decoder::SafariAudioDecoder;
 use super::video_decoder_wrapper::VideoDecoderWrapper;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
@@ -163,7 +164,8 @@ impl PeerDecode for VideoPeerDecoder {
 /// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
 pub struct AudioPeerDecoder {
-    pub decoder: AudioDecoderWrapper,
+    // Use either AudioDecoderWrapper or SafariAudioDecoder depending on browser
+    pub decoder: Box<dyn AudioDecoderTrait>,
     decoded: bool,
     _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
     _output: Closure<dyn FnMut(AudioData)>, // member exists to keep the closure in scope for the life of the struct
@@ -205,16 +207,28 @@ impl AudioPeerDecoder {
             }
         }) as Box<dyn FnMut(AudioData)>);
 
-        // Rest of the implementation remains the same
-        let decoder = AudioDecoderWrapper::new(&AudioDecoderInit::new(
+        // Create the decoder init
+        let decoder_init = AudioDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
-        ))?;
+        );
+
+        // Create a compatible decoder based on browser
+        let decoder: Box<dyn AudioDecoderTrait> = if SafariAudioDecoder::is_safari() {
+            log::info!("Using SafariAudioDecoder for better compatibility");
+            Box::new(SafariAudioDecoder::new(&decoder_init)?)
+        } else {
+            log::info!("Using native AudioDecoderWrapper");
+            Box::new(AudioDecoderWrapper::new(&decoder_init)?)
+        };
+
+        // Configure the decoder
         decoder.configure(&AudioDecoderConfig::new(
             AUDIO_CODEC,
             AUDIO_CHANNELS,
             AUDIO_SAMPLE_RATE,
         ))?;
+
         Ok(Self {
             decoder,
             decoded: false,

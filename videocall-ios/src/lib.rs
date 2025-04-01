@@ -1,6 +1,9 @@
 // Include the generated bindings
 uniffi::include_scaffolding!("videocall");
 
+use crate::videocall::get_version;
+use crate::videocall::hello_world;
+
 // Module that implements the UDL interface
 pub mod videocall {
     use log::info;

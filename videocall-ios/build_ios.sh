@@ -3,9 +3,6 @@ set -e
 
 echo "Building for iOS and macOS..."
 
-# Change to project root directory
-cd "$(dirname "$0")/.."
-
 # Ensure target directories exist
 mkdir -p target/swift
 mkdir -p target/swift/include

@@ -3,6 +3,8 @@ set -e
 
 echo "Building for iOS and macOS..."
 
+pushd ../
+
 # Ensure target directories exist
 mkdir -p target/swift
 mkdir -p target/swift/include
@@ -43,6 +45,8 @@ xcodebuild -create-xcframework \
   -library target/aarch64-apple-darwin/release/libvideocall_ios.a \
   -headers target/swift/include \
   -output target/VideoCallIOS.xcframework
+
+popd
 
 echo "Build completed successfully!"
 

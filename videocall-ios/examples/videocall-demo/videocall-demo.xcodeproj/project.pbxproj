@@ -7,8 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		06A776882D9BA431008E1E95 /* VideoCallIOS.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 06A7764B2D9BA093008E1E95 /* VideoCallIOS.xcframework */; };
-		06A776892D9BA431008E1E95 /* VideoCallIOS.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 06A7764B2D9BA093008E1E95 /* VideoCallIOS.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		067C300F2D9C3ABB0095F8FA /* VideoCallIOS.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 067C300E2D9C3ABB0095F8FA /* VideoCallIOS.xcframework */; };
+		067C30102D9C3ABB0095F8FA /* VideoCallIOS.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 067C300E2D9C3ABB0095F8FA /* VideoCallIOS.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -29,13 +29,13 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		06A7768A2D9BA431008E1E95 /* Embed Frameworks */ = {
+		067C300D2D9C36530095F8FA /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
 			dstPath = "";
 			dstSubfolderSpec = 10;
 			files = (
-				06A776892D9BA431008E1E95 /* VideoCallIOS.xcframework in Embed Frameworks */,
+				067C30102D9C3ABB0095F8FA /* VideoCallIOS.xcframework in Embed Frameworks */,
 			);
 			name = "Embed Frameworks";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -43,10 +43,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		067C300E2D9C3ABB0095F8FA /* VideoCallIOS.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = VideoCallIOS.xcframework; path = ../../../target/VideoCallIOS.xcframework; sourceTree = "<group>"; };
 		06A7761C2D9B9F66008E1E95 /* videocall-demo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "videocall-demo.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		06A7762D2D9B9F67008E1E95 /* videocall-demoTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "videocall-demoTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		06A776372D9B9F67008E1E95 /* videocall-demoUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "videocall-demoUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
-		06A7764B2D9BA093008E1E95 /* VideoCallIOS.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = VideoCallIOS.xcframework; path = Frameworks/VideoCallIOS.xcframework; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -72,7 +72,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				06A776882D9BA431008E1E95 /* VideoCallIOS.xcframework in Frameworks */,
+				067C300F2D9C3ABB0095F8FA /* VideoCallIOS.xcframework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -117,7 +117,7 @@
 		06A7764A2D9BA093008E1E95 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				06A7764B2D9BA093008E1E95 /* VideoCallIOS.xcframework */,
+				067C300E2D9C3ABB0095F8FA /* VideoCallIOS.xcframework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -132,7 +132,7 @@
 				06A776182D9B9F66008E1E95 /* Sources */,
 				06A776192D9B9F66008E1E95 /* Frameworks */,
 				06A7761A2D9B9F66008E1E95 /* Resources */,
-				06A7768A2D9BA431008E1E95 /* Embed Frameworks */,
+				067C300D2D9C36530095F8FA /* Embed Frameworks */,
 			);
 			buildRules = (
 			);

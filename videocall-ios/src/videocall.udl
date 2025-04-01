@@ -4,9 +4,19 @@ namespace videocall {
 }; 
 
 [Error]
-enum QuicError {
+enum WebTransportError {
     "ConnectionFailed",
     "InvalidUrl",
     "StreamError",
+    "HttpError",
+    "TlsError",
     "Unknown",
+};
+
+interface WebTransportClient {
+    constructor(string url);
+    [Throws=WebTransportError]
+    void connect();
+    [Throws=WebTransportError]
+    sequence<u8> send_datagram(sequence<u8> data);
 };

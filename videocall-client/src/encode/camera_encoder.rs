@@ -18,8 +18,6 @@ use web_sys::LatencyMode;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
-use web_sys::MediaStreamTrackProcessor;
-use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
 use web_sys::VideoEncoder;
 use web_sys::VideoEncoderConfig;
@@ -27,11 +25,14 @@ use web_sys::VideoEncoderEncodeOptions;
 use web_sys::VideoEncoderInit;
 use web_sys::VideoFrame;
 use web_sys::VideoTrack;
+use web_sys::VideoFrameBufferInit;
+use web_sys::VideoPixelFormat;
 use yew::Callback;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
+use super::camera_bridge::VideoProcessorCompat;
 
 use crate::constants::VIDEO_CODEC;
 use crate::diagnostics::EncoderBitrateController;
@@ -41,6 +42,8 @@ use futures::StreamExt;
 
 // Threshold for bitrate changes, represents 20% (0.2)
 const BITRATE_CHANGE_THRESHOLD: f64 = 0.20;
+// Frame processing interval in milliseconds
+const FRAME_PROCESSING_INTERVAL: f64 = 1000.0 / 30.0; // 30fps default
 
 /// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
@@ -93,6 +96,8 @@ impl CameraEncoder {
         let current_fps = self.current_fps.clone();
         let on_encoder_settings_update = self.on_encoder_settings_update.clone();
         let enabled = self.state.enabled.clone();
+        let destroy = self.state.destroy.clone();
+        let switching = self.state.switching.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -165,12 +170,7 @@ impl CameraEncoder {
         let userid = client.userid().clone();
         let aes = client.aes();
         let video_elem_id = self.video_elem_id.clone();
-        let EncoderState {
-            destroy,
-            enabled,
-            switching,
-            ..
-        } = self.state.clone();
+        let state = self.state.clone();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let video_output_handler = {
@@ -178,6 +178,7 @@ impl CameraEncoder {
             let mut sequence_number = 0;
             let mut last_chunk_time = window().performance().unwrap().now();
             let mut chunks_in_last_second = 0;
+            let state = state.clone();
 
             Box::new(move |chunk: JsValue| {
                 let now = window().performance().unwrap().now();
@@ -211,6 +212,10 @@ impl CameraEncoder {
         };
 
         wasm_bindgen_futures::spawn_local(async move {
+            let enabled = state.enabled.clone();
+            let destroy = state.destroy.clone();
+            let switching = state.switching.clone();
+            
             let navigator = window().navigator();
             let video_element = window()
                 .document()
@@ -268,6 +273,7 @@ impl CameraEncoder {
 
             let width = track_settings.get_width().expect("width is None");
             let height = track_settings.get_height().expect("height is None");
+            let frame_rate = track_settings.get_frame_rate().unwrap_or(30.0);
 
             let video_encoder_config =
                 VideoEncoderConfig::new(VIDEO_CODEC, height as u32, width as u32);
@@ -279,67 +285,151 @@ impl CameraEncoder {
                 error!("Error configuring video encoder: {:?}", e);
             }
 
-            let video_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(
-                    &video_track.clone().unchecked_into::<MediaStreamTrack>(),
-                ))
-                .unwrap();
-            let video_reader = video_processor
-                .readable()
-                .get_reader()
-                .unchecked_into::<ReadableStreamDefaultReader>();
+            // Use our compatibility layer instead of MediaStreamTrackProcessor
+            let mut video_processor_compat = match VideoProcessorCompat::new(&media_track) {
+                Ok(processor) => processor,
+                Err(e) => {
+                    error!("Failed to create video processor compatibility layer: {:?}", e);
+                    return;
+                }
+            };
 
-            // Start encoding video and audio.
-            let mut video_frame_counter = 0;
-
+            // Counter for keyframe generation
+            let video_frame_counter = Rc::new(std::cell::RefCell::new(0));
+            
             // Cache the initial bitrate
-            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
+            let local_bitrate = Rc::new(std::cell::RefCell::new(current_bitrate.load(Ordering::Relaxed) * 1000));
 
-            loop {
-                if !enabled.load(Ordering::Acquire)
-                    || destroy.load(Ordering::Acquire)
-                    || switching.load(Ordering::Acquire)
+            // Start processing frames
+            let encoder_clone = video_encoder.clone();
+            let frame_counter = video_frame_counter.clone();
+            let target_frame_rate = frame_rate as u32;
+            let local_bitrate_clone = local_bitrate.clone();
+            let enabled_for_frame = enabled.clone();
+            let destroy_for_frame = destroy.clone();
+            let switching_for_frame = switching.clone();
+            
+            // Create a closure that processes video frames
+            let on_frame = Closure::wrap(Box::new(move |frame: JsValue| {
+                // Extract frame data from the canvas buffer
+                let width = js_sys::Reflect::get(&frame, &"width".into())
+                    .unwrap()
+                    .as_f64()
+                    .unwrap() as u32;
+                let height = js_sys::Reflect::get(&frame, &"height".into())
+                    .unwrap()
+                    .as_f64()
+                    .unwrap() as u32;
+                let buffer = js_sys::Reflect::get(&frame, &"data".into())
+                    .unwrap()
+                    .dyn_into::<js_sys::ArrayBuffer>()
+                    .unwrap();
+                
+                // Create VideoFrameBufferInit with all required arguments
+                let init = web_sys::VideoFrameBufferInit::new(
+                    width,
+                    height,
+                    web_sys::VideoPixelFormat::Rgba,
+                    0f64 // timestamp
+                );
+                
+                // Create a VideoFrame from the buffer
+                let video_frame = web_sys::VideoFrame::new_with_buffer_source_and_video_frame_buffer_init(
+                    &buffer,
+                    &init
+                ).unwrap();
+                
+                // Create encoding options
+                let encode_options = VideoEncoderEncodeOptions::new();
+                
+                // Check if we should quit
+                if !enabled_for_frame.load(Ordering::Acquire)
+                    || destroy_for_frame.load(Ordering::Acquire)
+                    || switching_for_frame.load(Ordering::Acquire)
                 {
-                    switching.store(false, Ordering::Release);
+                    video_frame.close();
+                    return;
+                }
+                
+                // Update the bitrate if needed
+                let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
+                let mut current_local_bitrate = local_bitrate_clone.borrow_mut();
+                if *current_local_bitrate != new_current_bitrate {
+                    log::info!("Updating video bitrate to {}", new_current_bitrate);
+                    *current_local_bitrate = new_current_bitrate;
+                    video_encoder_config.set_bitrate(new_current_bitrate as f64);
+                    if let Err(e) = encoder_clone.configure(&video_encoder_config) {
+                        error!("Error configuring video encoder: {:?}", e);
+                    }
+                }
+                
+                // Generate keyframes regularly
+                let mut counter = frame_counter.borrow_mut();
+                if *counter % (target_frame_rate * 3) == 0 {
+                    encode_options.set_key_frame(true);
+                }
+                *counter += 1;
+                
+                // Encode the frame
+                if let Err(e) = encoder_clone.encode_with_options(&video_frame, &encode_options) {
+                    error!("Error encoding video frame: {:?}", e);
+                }
+                
+                // Close the frame
+                video_frame.close();
+            }) as Box<dyn FnMut(JsValue)>);
+
+            // Start the processor
+            if let Err(e) = video_processor_compat.start(on_frame) {
+                error!("Failed to start video processor: {:?}", e);
+                return;
+            }
+
+            // Keep things running until stop is called
+            let quit_check_interval = Rc::new(std::cell::RefCell::new(None));
+            let quit_interval = quit_check_interval.clone();
+            
+            let enabled_for_quit = enabled.clone();
+            let destroy_for_quit = destroy.clone();
+            let switching_for_quit = switching.clone();
+            
+            let check_quit = Closure::wrap(Box::new(move || {
+                if !enabled_for_quit.load(Ordering::Acquire)
+                    || destroy_for_quit.load(Ordering::Acquire)
+                    || switching_for_quit.load(Ordering::Acquire)
+                {
+                    switching_for_quit.store(false, Ordering::Release);
                     let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                     video_track.stop();
                     if let Err(e) = video_encoder.close() {
                         error!("Error closing video encoder: {:?}", e);
                     }
-                    return;
-                }
-
-                // Update the bitrate if it has changed more than the threshold percentage
-                let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_current_bitrate != local_bitrate {
-                    log::info!("Updating video bitrate to {}", new_current_bitrate);
-                    local_bitrate = new_current_bitrate;
-                    video_encoder_config.set_bitrate(local_bitrate as f64);
-                    if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                        error!("Error configuring video encoder: {:?}", e);
+                    
+                    // Clear the interval
+                    if let Some(handle_id) = *quit_check_interval.borrow() {
+                        window().clear_interval_with_handle(handle_id);
                     }
                 }
-
-                match JsFuture::from(video_reader.read()).await {
-                    Ok(js_frame) => {
-                        let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
-                            .unwrap()
-                            .unchecked_into::<VideoFrame>();
-                        let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
-                        video_encoder_encode_options.set_key_frame(video_frame_counter % 150 == 0);
-                        if let Err(e) = video_encoder
-                            .encode_with_options(&video_frame, &video_encoder_encode_options)
-                        {
-                            error!("Error encoding video frame: {:?}", e);
-                        }
-                        video_frame.close();
-                        video_frame_counter += 1;
-                    }
-                    Err(e) => {
-                        error!("error {:?}", e);
-                    }
-                }
-            }
+            }) as Box<dyn FnMut()>);
+            
+            // Set up an interval to check if we need to quit
+            let handle_id = window().set_interval_with_callback_and_timeout_and_arguments(
+                check_quit.as_ref().unchecked_ref(),
+                500, // Check every 500ms
+                &js_sys::Array::new(),
+            ).unwrap();
+            
+            *quit_interval.borrow_mut() = Some(handle_id);
+            
+            // Keep closures alive
+            check_quit.forget();
         });
     }
+}
+
+// Helper function to request animation frame
+fn request_animation_frame(f: &Closure<dyn FnMut()>) {
+    window()
+        .request_animation_frame(f.as_ref().unchecked_ref())
+        .expect("should register `requestAnimationFrame` OK");
 }

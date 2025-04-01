@@ -66,6 +66,7 @@ features = [
     "AudioDataCopyToOptions",
     "HtmlCanvasElement",
     "HtmlImageElement",
+    "ImageData",
     "Navigator",
     "MediaDevices",
     "MediaStream",
@@ -90,6 +91,8 @@ features = [
     "VideoFrame",
     "VideoTrack",
     "VideoDecoder",
+    "VideoFrameBufferInit",
+    "VideoPixelFormat",
     "VideoDecoderConfig",
     "VideoDecoderInit",
     "LatencyMode",
@@ -101,7 +104,9 @@ features = [
     "MediaDeviceKind",
     "MediaTrackConstraints",
     "CanvasRenderingContext2d",
-    "Performance"
+    "Performance",
+    "OffscreenCanvas",
+    "WebGl2RenderingContext",
 ]
 
 [dependencies.pidgeon]

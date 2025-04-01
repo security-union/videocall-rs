@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Discord](https://img.shields.io/badge/Discord-Join%20Chat-7289DA?logo=discord&logoColor=white)](https://discord.gg/JP38NRe4CJ)
 
-An open-source, high-performance video conferencing platform built with Rust, providing real-time communication with low latency and end-to-end encryption.
+An open-source, high-performance video conferencing platform built with Rust, providing real-time communication with low latency.
 
 **[Website](https://videocall.rs)** | **[Discord Community](https://discord.gg/JP38NRe4CJ)**
 

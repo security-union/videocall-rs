@@ -1,0 +1,25 @@
+[package]
+name = "videocall-ios"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "iOS/macOS library for videocall"
+
+[lib]
+name = "videocall_ios"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# UniFFI for Swift/Rust bridging
+uniffi = { version = "0.25.3", features = ["cli"] }
+uniffi_macros = "0.25.3"
+
+# Logging
+log = "0.4.20"
+
+[build-dependencies]
+uniffi_build = { version = "0.25.3", features = ["builtin-bindgen"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs" 

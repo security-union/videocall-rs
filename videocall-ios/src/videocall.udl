@@ -1,0 +1,4 @@
+namespace videocall {
+    string hello_world();
+    string get_version();
+}; 

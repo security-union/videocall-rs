@@ -12,6 +12,11 @@ cargo-leptos is now the easiest and most featureful way to build server side ren
 ```bash
 cargo install --locked cargo-leptos
 ``` 
+2. Install wasm-bindegen
+```bash
+cargo install wasm-bindgen-cli@0.2.100 --locked
+```
+
 2. Build the site in watch mode, recompiling on file changes
 ```bash
 cargo leptos watch

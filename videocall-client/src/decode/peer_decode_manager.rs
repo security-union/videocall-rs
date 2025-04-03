@@ -156,9 +156,13 @@ impl Peer {
             )),
             MediaType::AUDIO => Ok((
                 media_type,
-                self.audio
-                    .decode(&packet)
-                    .map_err(|_| PeerDecodeError::AudioDecodeError)?,
+                // self.audio
+                //     .decode(&packet)
+                //     .map_err(|_| PeerDecodeError::AudioDecodeError)?,
+                DecodeStatus {
+                    _rendered: false,
+                    first_frame: false,
+                },
             )),
             MediaType::SCREEN => Ok((
                 media_type,

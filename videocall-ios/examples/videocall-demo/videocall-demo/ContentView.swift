@@ -39,40 +39,27 @@ struct WebTransportView: View {
             }
             .disabled(isConnecting)
             
-            Text(connectionStatus)
-                .padding()
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(connectionStatus == "Connected successfully!" ? Color.green.opacity(0.2) : 
-                              connectionStatus == "Not connected" ? Color.gray.opacity(0.2) : 
-                              Color.red.opacity(0.2))
-                )
+            TextField("Message", text: $message)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .padding(.horizontal)
             
-            if connectionStatus == "Connected successfully!" {
-                TextField("Message to send", text: $message)
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .padding(.horizontal)
-                
-                Button(action: {
-                    sendDatagram()
-                }) {
-                    Text("Send Datagram")
-                        .frame(minWidth: 200)
-                        .padding()
-                        .background(Color.green)
-                        .foregroundColor(.white)
-                        .cornerRadius(10)
-                }
-                
-                if !responseText.isEmpty {
-                    Text("Response: \(responseText)")
-                        .padding()
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color.blue.opacity(0.1))
-                        )
-                }
+            Button(action: {
+                sendDatagram()
+            }) {
+                Text("Send Datagram")
+                    .frame(minWidth: 200)
+                    .padding()
+                    .background(Color.green)
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
             }
+            
+            Text(responseText)
+                .padding()
+                .frame(maxWidth: .infinity)
+                .background(Color.gray.opacity(0.2))
+                .cornerRadius(10)
+                .padding(.horizontal)
         }
         .padding()
     }
@@ -86,11 +73,11 @@ struct WebTransportView: View {
         // Use DispatchQueue to avoid blocking the UI
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                print("🔍 Creating WebTransportClient with URL: \(url)")
-                let client = WebTransportClient(url: url)
+                print("🔍 Creating WebTransportClient")
+                let client = WebTransportClient()
                 
                 print("🚀 Calling connect() method")
-                try client.connect()
+                try client.connect(url: url)
                 
                 print("✅ Connection successful!")
                 
@@ -100,39 +87,19 @@ struct WebTransportView: View {
                     connectionStatus = "Connected successfully!"
                     isConnecting = false
                 }
+                
             } catch let error as WebTransportError {
-                // Handle specific WebTransportError types
-                print("❌ Caught WebTransportError: \(error)")
+                print("❌ Connection error: \(error)")
                 
                 DispatchQueue.main.async {
-                    switch error {
-                    case .ConnectionFailed(let message):
-                        print("⚠️ Connection failed: \(message)")
-                        connectionStatus = "Connection failed: \(message)"
-                    case .InvalidUrl(let message):
-                        print("⚠️ Invalid URL: \(message)")
-                        connectionStatus = "Invalid URL: \(message)"
-                    case .StreamError(let message):
-                        print("⚠️ Stream error: \(message)")
-                        connectionStatus = "Stream error: \(message)"
-                    case .HttpError(let message):
-                        print("⚠️ HTTP error: \(message)")
-                        connectionStatus = "HTTP error: \(message)"
-                    case .TlsError(let message):
-                        print("⚠️ TLS error: \(message)")
-                        connectionStatus = "TLS error: \(message)"
-                    case .Unknown(let message):
-                        print("⚠️ Unknown error: \(message)")
-                        connectionStatus = "Unknown error: \(message)"
-                    }
+                    connectionStatus = "Connection failed: \(error)"
                     isConnecting = false
                 }
             } catch {
                 print("❓ Unexpected error: \(error)")
                 
-                // Update UI on the main thread
                 DispatchQueue.main.async {
-                    connectionStatus = "Error: \(error.localizedDescription)"
+                    connectionStatus = "Unexpected error: \(error.localizedDescription)"
                     isConnecting = false
                 }
             }
@@ -144,31 +111,20 @@ struct WebTransportView: View {
         
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let client = WebTransportClient(url: url)
+                let client = WebTransportClient()
                 
                 // We need to connect first since our implementation doesn't store the session
-                try client.connect()
+                try client.connect(url: url)
                 
                 // Convert string to bytes
                 if let data = message.data(using: .utf8) {
                     let bytes = [UInt8](data)
                     
                     print("📦 Sending \(bytes.count) bytes")
-                    let response = try client.sendDatagram(data: bytes)
+                    try client.sendDatagram(data: bytes)
                     
-                    // Convert response bytes back to string if possible
-                    if let responseString = String(data: Data(response), encoding: .utf8) {
-                        print("📥 Received response: \(responseString)")
-                        
-                        DispatchQueue.main.async {
-                            responseText = responseString
-                        }
-                    } else {
-                        print("⚠️ Could not decode response as string")
-                        
-                        DispatchQueue.main.async {
-                            responseText = "Binary data received (\(response.count) bytes)"
-                        }
+                    DispatchQueue.main.async {
+                        responseText = "Datagram sent successfully"
                     }
                 }
             } catch let error as WebTransportError {

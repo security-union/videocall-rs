@@ -19,13 +19,16 @@ log = "0.4.20"
 
 # Networking dependencies
 web-transport-quinn = "0.5.0"
-h3 = "0.0.3"
-h3-quinn = "0.0.3"
+rustls-native-certs = "0.6"
 thiserror = "1.0.50"
 url = "2.4.1"
 tokio = { version = "1.32.0", features = ["full"] }
 anyhow = "1.0.75"
 bytes = "1.4.0"
+rustls = { version = "0.23.10", default-features = false, features = ["ring", "std"] }
+quinn = { version = "0.11", features = ["ring"] }
+quinn-proto = { version = "0.11", features = ["ring"] }
+aws-lc-sys = { version = "0.27.1", features = ["bindgen"] }
 
 # Async runtime
 futures = "0.3.31"

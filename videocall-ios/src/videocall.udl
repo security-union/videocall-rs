@@ -10,6 +10,8 @@ enum WebTransportError {
     "StreamError",
     "InvalidUrl",
     "RuntimeError",
+    "CertificateError",
+    "ClientError",
 };
 
 interface WebTransportClient {

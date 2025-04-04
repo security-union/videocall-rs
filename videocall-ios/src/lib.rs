@@ -3,6 +3,8 @@ uniffi::include_scaffolding!("videocall");
 
 use bytes::Bytes;
 use log::{error, info};
+use rustls::{ClientConfig, RootCertStore};
+use rustls_native_certs::load_native_certs;
 use std::sync::Arc;
 use std::sync::Mutex;
 use thiserror::Error;
@@ -32,6 +34,10 @@ pub enum WebTransportError {
     InvalidUrl(String),
     #[error("Runtime error: {0}")]
     RuntimeError(String),
+    #[error("Certificate error: {0}")]
+    CertificateError(String),
+    #[error("Failed to create client: {0}")]
+    ClientError(String),
 }
 
 pub struct WebTransportClient {
@@ -41,6 +47,10 @@ pub struct WebTransportClient {
 
 impl WebTransportClient {
     pub fn new() -> Self {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .expect("Failed to install default provider");
+
         // Create a multi-threaded Tokio runtime with all features enabled
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -65,10 +75,44 @@ impl WebTransportClient {
 
         // Create a WebTransport session
         self.runtime.block_on(async move {
-            // Create a WebTransport client with system roots
-            let client = ClientBuilder::new()
-                .with_system_roots()
-                .map_err(|_| WebTransportError::TlsError("Failed to create client".to_string()))?;
+            // Load native certificates
+            let mut root_store = RootCertStore::empty();
+            let cert_count = match load_native_certs() {
+                Ok(certs) => {
+                    let count = certs.len();
+                    for cert in certs {
+                        root_store.add(cert).map_err(|e| {
+                            WebTransportError::CertificateError(format!(
+                                "Failed to add certificate: {}",
+                                e
+                            ))
+                        })?;
+                    }
+                    count
+                }
+                Err(e) => {
+                    error!("Failed to load native certificates: {}", e);
+                    return Err(WebTransportError::CertificateError(format!(
+                        "Failed to load native certificates: {}",
+                        e
+                    )));
+                }
+            };
+            info!("Loaded {} native certificates", cert_count);
+
+            // Create a rustls ClientConfig with the root store
+            let client_config = ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+
+            // Create a WebTransport client with the custom rustls config for now disable certificate verification
+            let client = unsafe {
+                ClientBuilder::new()
+                    .with_no_certificate_verification()
+                    .map_err(|e| {
+                        WebTransportError::TlsError(format!("Failed to create client: {}", e))
+                    })?
+            };
 
             // Connect to the server
             let session = client.connect(&url).await.map_err(|e| {

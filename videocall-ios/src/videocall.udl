@@ -5,18 +5,17 @@ namespace videocall {
 
 [Error]
 enum WebTransportError {
-    "ConnectionFailed",
-    "InvalidUrl",
-    "StreamError",
-    "HttpError",
+    "ConnectionError",
     "TlsError",
-    "Unknown",
+    "StreamError",
+    "InvalidUrl",
+    "RuntimeError",
 };
 
 interface WebTransportClient {
-    constructor(string url);
+    constructor();
     [Throws=WebTransportError]
-    void connect();
+    void connect(string url);
     [Throws=WebTransportError]
-    sequence<u8> send_datagram(sequence<u8> data);
+    void send_datagram(sequence<u8> data);
 };

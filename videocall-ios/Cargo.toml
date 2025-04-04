@@ -29,6 +29,8 @@ rustls = { version = "0.23.10", default-features = false, features = ["ring", "s
 quinn = { version = "0.11", features = ["ring"] }
 quinn-proto = { version = "0.11", features = ["ring"] }
 aws-lc-sys = { version = "0.27.1", features = ["bindgen"] }
+ring = { version = "0.17", default-features = false }
+
 
 # Async runtime
 futures = "0.3.31"

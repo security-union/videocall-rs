@@ -20,4 +20,8 @@ interface WebTransportClient {
     void connect(string url);
     [Throws=WebTransportError]
     void send_datagram(sequence<u8> data);
+    [Throws=WebTransportError]
+    void subscribe_to_datagrams();
+    [Throws=WebTransportError]
+    void stop_datagram_listener();
 };

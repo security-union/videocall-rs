@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use thiserror::Error;
 use tokio::runtime::Runtime;
+use tokio::task;
 use url::Url;
 use web_transport_quinn::{ClientBuilder, Session};
 
@@ -43,14 +44,14 @@ pub enum WebTransportError {
 pub struct WebTransportClient {
     runtime: Arc<Runtime>,
     session: Arc<Mutex<Option<Session>>>,
+    datagram_listener: Arc<Mutex<Option<task::JoinHandle<()>>>>,
 }
 
 impl WebTransportClient {
     pub fn new() -> Self {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("Failed to install default provider");
-
+        if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+            error!("Failed to install default provider: {:?}", e);
+        }
         // Create a multi-threaded Tokio runtime with all features enabled
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -60,6 +61,7 @@ impl WebTransportClient {
         Self {
             runtime: Arc::new(runtime),
             session: Arc::new(Mutex::new(None)),
+            datagram_listener: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -154,11 +156,91 @@ impl WebTransportClient {
             Ok(())
         })
     }
+
+    pub fn subscribe_to_datagrams(&self) -> Result<(), WebTransportError> {
+        info!("Subscribing to inbound datagrams");
+
+        // Clone Arc for move into async block
+        let session_mutex = self.session.clone();
+        let datagram_listener_mutex = self.datagram_listener.clone();
+
+        // Stop any existing listener
+        self.stop_datagram_listener()?;
+
+        // Start a new listener
+        let handle = self.runtime.spawn(async move {
+            loop {
+                // Get a clone of the session outside the async block
+                let session = {
+                    let session_guard = match session_mutex.lock() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            error!("Failed to acquire session lock: {}", e);
+                            break;
+                        }
+                    };
+
+                    match session_guard.as_ref() {
+                        Some(session) => session.clone(),
+                        None => {
+                            error!("Not connected to server");
+                            break;
+                        }
+                    }
+                }; // session_guard is dropped here
+
+                // Receive a datagram
+                match session.read_datagram().await {
+                    Ok(datagram) => {
+                        let data = datagram.to_vec();
+                        info!("Received datagram of size {} bytes: {:?}", data.len(), data);
+
+                        // Print the datagram content
+                        if let Ok(string) = String::from_utf8(data.clone()) {
+                            println!("Received datagram: {}", string);
+                        } else {
+                            println!("Received binary datagram: {:?}", data);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error receiving datagram: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Store the listener handle
+        let mut listener_guard = datagram_listener_mutex.lock().map_err(|e| {
+            WebTransportError::RuntimeError(format!("Failed to acquire lock: {}", e))
+        })?;
+        *listener_guard = Some(handle);
+
+        info!("Successfully subscribed to inbound datagrams");
+        Ok(())
+    }
+
+    pub fn stop_datagram_listener(&self) -> Result<(), WebTransportError> {
+        let mut listener_guard = self.datagram_listener.lock().map_err(|e| {
+            WebTransportError::RuntimeError(format!("Failed to acquire lock: {}", e))
+        })?;
+
+        if let Some(handle) = listener_guard.take() {
+            handle.abort();
+            info!("Stopped datagram listener");
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for WebTransportClient {
     fn drop(&mut self) {
         info!("Shutting down WebTransportClient");
+        // Stop the datagram listener if it's running
+        if let Err(e) = self.stop_datagram_listener() {
+            error!("Failed to stop datagram listener: {}", e);
+        }
         // The runtime will be dropped automatically when the Arc's reference count reaches zero
     }
 }

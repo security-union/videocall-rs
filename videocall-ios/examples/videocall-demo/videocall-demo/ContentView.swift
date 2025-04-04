@@ -9,11 +9,13 @@ import SwiftUI
 import videocallFFI
 
 struct WebTransportView: View {
-    @State private var url: String = "https://transport.rustlemania.com"
+    @State private var url: String = "https://echo.webtransport.rs"
     @State private var connectionStatus: String = "Not connected"
     @State private var isConnecting: Bool = false
     @State private var message: String = "Hello WebTransport!"
     @State private var responseText: String = ""
+    @State private var receivedDatagrams: [String] = []
+    @State private var isSubscribed: Bool = false
     
     var body: some View {
         VStack(spacing: 20) {
@@ -53,6 +55,42 @@ struct WebTransportView: View {
                     .foregroundColor(.white)
                     .cornerRadius(10)
             }
+            
+            Button(action: {
+                if isSubscribed {
+                    stopDatagramListener()
+                } else {
+                    subscribeToDatagrams()
+                }
+            }) {
+                Text(isSubscribed ? "Stop Listening" : "Listen for Datagrams")
+                    .frame(minWidth: 200)
+                    .padding()
+                    .background(isSubscribed ? Color.red : Color.orange)
+                    .foregroundColor(.white)
+                    .cornerRadius(10)
+            }
+            
+            Text("Received Datagrams:")
+                .font(.headline)
+                .padding(.top)
+            
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(receivedDatagrams, id: \.self) { datagram in
+                        Text(datagram)
+                            .padding(8)
+                            .background(Color.blue.opacity(0.1))
+                            .cornerRadius(5)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+            }
+            .frame(height: 200)
+            .background(Color.gray.opacity(0.1))
+            .cornerRadius(10)
+            .padding(.horizontal)
             
             Text(responseText)
                 .padding()
@@ -135,6 +173,75 @@ struct WebTransportView: View {
                 }
             } catch {
                 print("❓ Unexpected error sending datagram: \(error)")
+                
+                DispatchQueue.main.async {
+                    responseText = "Unexpected error: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+    
+    private func subscribeToDatagrams() {
+        print("👂 Subscribing to datagrams")
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let client = WebTransportClient()
+                
+                // We need to connect first since our implementation doesn't store the session
+                try client.connect(url: url)
+                
+                // Subscribe to datagrams
+                try client.subscribeToDatagrams()
+                
+                DispatchQueue.main.async {
+                    isSubscribed = true
+                    responseText = "Listening for datagrams..."
+                    
+                    // Add a placeholder to show we're listening
+                    receivedDatagrams.append("Listening for datagrams...")
+                }
+            } catch let error as WebTransportError {
+                print("❌ Error subscribing to datagrams: \(error)")
+                
+                DispatchQueue.main.async {
+                    responseText = "Error subscribing to datagrams: \(error)"
+                }
+            } catch {
+                print("❓ Unexpected error subscribing to datagrams: \(error)")
+                
+                DispatchQueue.main.async {
+                    responseText = "Unexpected error: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+    
+    private func stopDatagramListener() {
+        print("🛑 Stopping datagram listener")
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let client = WebTransportClient()
+                
+                // We need to connect first since our implementation doesn't store the session
+                try client.connect(url: url)
+                
+                // Stop the datagram listener
+                try client.stopDatagramListener()
+                
+                DispatchQueue.main.async {
+                    isSubscribed = false
+                    responseText = "Stopped listening for datagrams"
+                }
+            } catch let error as WebTransportError {
+                print("❌ Error stopping datagram listener: \(error)")
+                
+                DispatchQueue.main.async {
+                    responseText = "Error stopping datagram listener: \(error)"
+                }
+            } catch {
+                print("❓ Unexpected error stopping datagram listener: \(error)")
                 
                 DispatchQueue.main.async {
                     responseText = "Unexpected error: \(error.localizedDescription)"

@@ -60,9 +60,16 @@ xcodebuild -create-xcframework \
 #     -headers target/swift/include \
 #   -output target/VideoCallIOS.xcframework
 
+# Copy XCFramework and Swift bindings to VideoCallKit package
+echo "Copying XCFramework and Swift bindings to VideoCallKit package..."
+mkdir -p videocall-ios/VideoCallKit/Frameworks
+cp -R target/VideoCallIOS.xcframework videocall-ios/VideoCallKit/Frameworks/
+cp target/swift/videocall.swift videocall-ios/VideoCallKit/Sources/VideoCallKit/
+
 # Build Swift package
 echo "Building Swift package..."
 cd videocall-ios/VideoCallKit
+swift package resolve
 swift build
 
 popd

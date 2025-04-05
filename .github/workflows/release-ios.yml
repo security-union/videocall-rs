@@ -1,4 +1,4 @@
-name: videocall-ios-release
+name: Release iOS Library
 
 on:
   push:
@@ -7,37 +7,33 @@ on:
 
 jobs:
   build-and-release:
+    name: Build and Release
     runs-on: macos-latest
+    
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-darwin
       
-      - name: Build XCFramework
+      - name: Install cargo-lipo
         run: |
-          cd videocall-ios
           cargo install cargo-lipo
           cargo install bindgen-cli --force --locked
-          ./build_ios.sh
       
-      - name: Prepare Release Package
+      - name: Build iOS library
         run: |
           cd videocall-ios
-          mkdir -p VideoCallKit-Dist/Frameworks
-          cp ../target/VideoCallIOS.xcframework VideoCallKit-Dist/Frameworks/
-          cd VideoCallKit-Dist
-          swift package resolve
-          swift build
+          ./build_ios.sh
       
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            videocall-ios/VideoCallKit-Dist/Frameworks/VideoCallIOS.xcframework
-            videocall-ios/target/swift/videocall.swift
+            videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

@@ -19,6 +19,8 @@ jobs:
       - name: Build XCFramework
         run: |
           cd videocall-ios
+          cargo install cargo-lipo
+          cargo install bindgen-cli --force --locked
           ./build_ios.sh
       
       - name: Prepare Release Package

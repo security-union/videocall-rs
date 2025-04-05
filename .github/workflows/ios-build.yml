@@ -21,7 +21,9 @@ jobs:
           targets: aarch64-apple-ios,aarch64-apple-darwin
       
       - name: Install cargo-lipo
-        run: cargo install cargo-lipo
+        run: |
+          cargo install cargo-lipo
+          cargo install bindgen-cli --force --locked
       
       - name: Build iOS library
         run: |

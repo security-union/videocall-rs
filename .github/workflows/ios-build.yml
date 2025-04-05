@@ -1,0 +1,41 @@
+name: iOS Build Check
+
+on:
+  pull_request:
+    paths:
+      - 'videocall-ios/**'
+      - '.github/workflows/ios-build.yml'
+
+jobs:
+  build-ios:
+    name: Build iOS Library
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-darwin
+      
+      - name: Install cargo-lipo
+        run: cargo install cargo-lipo
+      
+      - name: Build iOS library
+        run: |
+          cd videocall-ios
+          ./build_ios.sh
+      
+      - name: Check XCFramework
+        run: |
+          if [ ! -d "videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework" ]; then
+            echo "XCFramework was not created successfully"
+            exit 1
+          fi
+          
+          # Check the structure
+          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework
+          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64
+          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64/Headers 

@@ -48,6 +48,12 @@ pub struct DatagramQueue {
     queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
+impl Default for DatagramQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DatagramQueue {
     pub fn new() -> Self {
         Self {
@@ -97,6 +103,12 @@ pub struct WebTransportClient {
     runtime: Arc<Runtime>,
     session: Arc<Mutex<Option<Session>>>,
     datagram_listener: Arc<Mutex<Option<task::JoinHandle<()>>>>,
+}
+
+impl Default for WebTransportClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WebTransportClient {

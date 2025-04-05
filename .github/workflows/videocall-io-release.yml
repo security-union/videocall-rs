@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'videocall-ios-v*'
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-darwin
+      
+      - name: Build XCFramework
+        run: |
+          cd videocall-ios
+          ./build_ios.sh
+      
+      - name: Prepare Release Package
+        run: |
+          cd videocall-ios
+          mkdir -p VideoCallKit-Dist/Frameworks
+          cp ../target/VideoCallIOS.xcframework VideoCallKit-Dist/Frameworks/
+          cd VideoCallKit-Dist
+          swift package resolve
+          swift build
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            videocall-ios/VideoCallKit-Dist/Frameworks/VideoCallIOS.xcframework
+            videocall-ios/target/swift/videocall.swift
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 

@@ -1,6 +1,24 @@
-import Testing
+import XCTest
 @testable import VideoCallKit
 
-@Test func example() async throws {
-    // Write your test here and use APIs like `#expect(...)` to check expected conditions.
+final class VideoCallKitTests: XCTestCase {
+    func testWebTransportClientWrapper() throws {
+        let client = WebTransportClientWrapper()
+        
+        // Test initialization
+        XCTAssertNotNil(client)
+        
+        // Test connection
+        XCTAssertNoThrow(try client.connect(url: "wss://example.com"))
+        
+        // Test datagram operations
+        XCTAssertNoThrow(try client.subscribeToDatagrams())
+        XCTAssertNoThrow(try client.stopDatagramListener())
+        
+        // Test message sending
+        XCTAssertNoThrow(try client.sendTextMessage("test"))
+        
+        // Test disconnection
+        client.disconnect()
+    }
 }

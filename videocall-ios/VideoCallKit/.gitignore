@@ -1,3 +1,7 @@
+# Generated frameworks
+Frameworks/
+
+# Xcode
 .DS_Store
 /.build
 /Packages
@@ -6,3 +10,9 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcworkspace/xcshareddata/
+
+# Swift Package Manager
+.swiftpm/

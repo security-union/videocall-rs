@@ -16,6 +16,9 @@ struct WebTransportView: View {
     @State private var responseText: String = ""
     @State private var receivedDatagrams: [String] = []
     @State private var isSubscribed: Bool = false
+    @State private var client: WebTransportClient? = nil
+    @State private var datagramQueue: DatagramQueue? = nil
+    @State private var datagramTimer: Timer? = nil
     
     var body: some View {
         VStack(spacing: 20) {
@@ -100,6 +103,9 @@ struct WebTransportView: View {
                 .padding(.horizontal)
         }
         .padding()
+        .onDisappear {
+            stopDatagramTimer()
+        }
     }
     
     private func connectToServer() {
@@ -112,15 +118,16 @@ struct WebTransportView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 print("🔍 Creating WebTransportClient")
-                let client = WebTransportClient()
+                let newClient = WebTransportClient()
                 
                 print("🚀 Calling connect() method")
-                try client.connect(url: url)
+                try newClient.connect(url: url)
                 
                 print("✅ Connection successful!")
                 
-                // Update UI on the main thread
+                // Store the client instance
                 DispatchQueue.main.async {
+                    self.client = newClient
                     print("📱 Updating UI - connection successful")
                     connectionStatus = "Connected successfully!"
                     isConnecting = false
@@ -147,13 +154,16 @@ struct WebTransportView: View {
     private func sendDatagram() {
         print("📤 Sending datagram: \(message)")
         
+        guard let client = client else {
+            print("❌ No active client connection")
+            DispatchQueue.main.async {
+                responseText = "Error: Not connected to server"
+            }
+            return
+        }
+        
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let client = WebTransportClient()
-                
-                // We need to connect first since our implementation doesn't store the session
-                try client.connect(url: url)
-                
                 // Convert string to bytes
                 if let data = message.data(using: .utf8) {
                     let bytes = [UInt8](data)
@@ -181,25 +191,65 @@ struct WebTransportView: View {
         }
     }
     
-    private func subscribeToDatagrams() {
-        print("👂 Subscribing to datagrams")
+    private func startDatagramTimer() {
+        // Create a timer that checks for new datagrams every 100ms
+        datagramTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+            checkForDatagrams()
+        }
+    }
+    
+    private func stopDatagramTimer() {
+        datagramTimer?.invalidate()
+        datagramTimer = nil
+    }
+    
+    private func checkForDatagrams() {
+        guard let queue = datagramQueue else { return }
         
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let client = WebTransportClient()
-                
-                // We need to connect first since our implementation doesn't store the session
-                try client.connect(url: url)
-                
-                // Subscribe to datagrams
-                try client.subscribeToDatagrams()
+                while try queue.hasDatagrams() {
+                    let data = try queue.receiveDatagram()
+                    if let string = String(data: Data(data), encoding: .utf8) {
+                        DispatchQueue.main.async {
+                            self.receivedDatagrams.append(string)
+                        }
+                    } else {
+                        DispatchQueue.main.async {
+                            self.receivedDatagrams.append("Binary data: \(data.count) bytes")
+                        }
+                    }
+                }
+            } catch {
+                print("Error checking datagrams: \(error)")
+            }
+        }
+    }
+    
+    private func subscribeToDatagrams() {
+        print("👂 Subscribing to datagrams")
+        
+        guard let client = client else {
+            print("❌ No active client connection")
+            DispatchQueue.main.async {
+                responseText = "Error: Not connected to server"
+            }
+            return
+        }
+        
+        // Create a new datagram queue
+        let queue = DatagramQueue()
+        datagramQueue = queue
+        
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                // Subscribe to datagrams with the queue
+                try client.subscribeToDatagrams(queue: queue)
                 
                 DispatchQueue.main.async {
                     isSubscribed = true
                     responseText = "Listening for datagrams..."
-                    
-                    // Add a placeholder to show we're listening
-                    receivedDatagrams.append("Listening for datagrams...")
+                    startDatagramTimer()
                 }
             } catch let error as WebTransportError {
                 print("❌ Error subscribing to datagrams: \(error)")
@@ -220,15 +270,15 @@ struct WebTransportView: View {
     private func stopDatagramListener() {
         print("🛑 Stopping datagram listener")
         
+        guard let client = client else {
+            print("❌ No active client connection")
+            return
+        }
+        
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let client = WebTransportClient()
-                
-                // We need to connect first since our implementation doesn't store the session
-                try client.connect(url: url)
-                
-                // Stop the datagram listener
                 try client.stopDatagramListener()
+                stopDatagramTimer()
                 
                 DispatchQueue.main.async {
                     isSubscribed = false

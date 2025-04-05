@@ -2,9 +2,10 @@
 uniffi::include_scaffolding!("videocall");
 
 use bytes::Bytes;
-use log::{error, info};
+use log::{debug, error, info, LevelFilter};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_native_certs::load_native_certs;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use thiserror::Error;
@@ -39,6 +40,57 @@ pub enum WebTransportError {
     CertificateError(String),
     #[error("Failed to create client: {0}")]
     ClientError(String),
+    #[error("Queue error: {0}")]
+    QueueError(String),
+}
+
+pub struct DatagramQueue {
+    queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+}
+
+impl DatagramQueue {
+    pub fn new() -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    pub fn add_datagram(&self, data: Vec<u8>) -> Result<(), WebTransportError> {
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {}", e)))?;
+
+        queue.push_back(data);
+        info!("Added datagram to queue, queue size: {}", queue.len());
+        Ok(())
+    }
+
+    pub fn receive_datagram(&self) -> Result<Vec<u8>, WebTransportError> {
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {}", e)))?;
+
+        match queue.pop_front() {
+            Some(data) => {
+                info!("Received datagram from queue, remaining: {}", queue.len());
+                Ok(data)
+            }
+            None => Err(WebTransportError::QueueError(
+                "No datagrams available".to_string(),
+            )),
+        }
+    }
+
+    pub fn has_datagrams(&self) -> Result<bool, WebTransportError> {
+        let queue = self
+            .queue
+            .lock()
+            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {}", e)))?;
+
+        Ok(!queue.is_empty())
+    }
 }
 
 pub struct WebTransportClient {
@@ -49,6 +101,11 @@ pub struct WebTransportClient {
 
 impl WebTransportClient {
     pub fn new() -> Self {
+        // Initialize logger with debug level
+        let _ = env_logger::Builder::new()
+            .filter_level(LevelFilter::Debug)
+            .try_init();
+
         if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
             error!("Failed to install default provider: {:?}", e);
         }
@@ -103,7 +160,7 @@ impl WebTransportClient {
             info!("Loaded {} native certificates", cert_count);
 
             // Create a rustls ClientConfig with the root store
-            let client_config = ClientConfig::builder()
+            let _client_config = ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
 
@@ -157,49 +214,52 @@ impl WebTransportClient {
         })
     }
 
-    pub fn subscribe_to_datagrams(&self) -> Result<(), WebTransportError> {
+    pub fn subscribe_to_datagrams(
+        &self,
+        queue: Arc<DatagramQueue>,
+    ) -> Result<(), WebTransportError> {
         info!("Subscribing to inbound datagrams");
 
         // Clone Arc for move into async block
-        let session_mutex = self.session.clone();
-        let datagram_listener_mutex = self.datagram_listener.clone();
+        let session_mutex = Arc::clone(&self.session);
+        let datagram_listener_mutex = Arc::clone(&self.datagram_listener);
 
         // Stop any existing listener
         self.stop_datagram_listener()?;
 
-        // Start a new listener
+        // Create a new listener
         let handle = self.runtime.spawn(async move {
-            loop {
-                // Get a clone of the session outside the async block
-                let session = {
-                    let session_guard = match session_mutex.lock() {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            error!("Failed to acquire session lock: {}", e);
-                            break;
-                        }
-                    };
-
-                    match session_guard.as_ref() {
-                        Some(session) => session.clone(),
-                        None => {
-                            error!("Not connected to server");
-                            break;
-                        }
+            // Get a clone of the session outside the async block
+            let session = {
+                let session_guard = match session_mutex.lock() {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        error!("Failed to acquire lock: {}", e);
+                        return;
                     }
-                }; // session_guard is dropped here
+                };
 
-                // Receive a datagram
+                match session_guard.as_ref() {
+                    Some(session) => session.clone(),
+                    None => {
+                        error!("Not connected");
+                        return;
+                    }
+                }
+            }; // session_guard is dropped here
+
+            info!("Starting to listen for datagrams");
+
+            loop {
                 match session.read_datagram().await {
                     Ok(datagram) => {
                         let data = datagram.to_vec();
-                        info!("Received datagram of size {} bytes: {:?}", data.len(), data);
+                        info!("Received datagram of size {} bytes", data.len());
+                        debug!("Datagram content: {:?}", data);
 
-                        // Print the datagram content
-                        if let Ok(string) = String::from_utf8(data.clone()) {
-                            println!("Received datagram: {}", string);
-                        } else {
-                            println!("Received binary datagram: {:?}", data);
+                        // Add the datagram to the queue
+                        if let Err(e) = queue.add_datagram(data) {
+                            error!("Failed to add datagram to queue: {}", e);
                         }
                     }
                     Err(e) => {

@@ -416,6 +416,30 @@ fileprivate struct FfiConverterUInt8: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -457,6 +481,153 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 
 
+public protocol DatagramQueueProtocol: AnyObject, Sendable {
+    
+    func addDatagram(data: [UInt8]) throws
+    
+    func hasDatagrams() throws  -> Bool
+    
+    func receiveDatagram() throws  -> [UInt8]
+    
+}
+open class DatagramQueue: DatagramQueueProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_videocall_ios_fn_clone_datagramqueue(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_videocall_ios_fn_constructor_datagramqueue_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_videocall_ios_fn_free_datagramqueue(pointer, $0) }
+    }
+
+    
+
+    
+open func addDatagram(data: [UInt8])throws   {try rustCallWithError(FfiConverterTypeWebTransportError_lift) {
+    uniffi_videocall_ios_fn_method_datagramqueue_add_datagram(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt8.lower(data),$0
+    )
+}
+}
+    
+open func hasDatagrams()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeWebTransportError_lift) {
+    uniffi_videocall_ios_fn_method_datagramqueue_has_datagrams(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func receiveDatagram()throws  -> [UInt8]  {
+    return try  FfiConverterSequenceUInt8.lift(try rustCallWithError(FfiConverterTypeWebTransportError_lift) {
+    uniffi_videocall_ios_fn_method_datagramqueue_receive_datagram(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDatagramQueue: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = DatagramQueue
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> DatagramQueue {
+        return DatagramQueue(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: DatagramQueue) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DatagramQueue {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: DatagramQueue, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDatagramQueue_lift(_ pointer: UnsafeMutableRawPointer) throws -> DatagramQueue {
+    return try FfiConverterTypeDatagramQueue.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDatagramQueue_lower(_ value: DatagramQueue) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeDatagramQueue.lower(value)
+}
+
+
+
+
+
+
 public protocol WebTransportClientProtocol: AnyObject, Sendable {
     
     func connect(url: String) throws
@@ -465,7 +636,7 @@ public protocol WebTransportClientProtocol: AnyObject, Sendable {
     
     func stopDatagramListener() throws
     
-    func subscribeToDatagrams() throws
+    func subscribeToDatagrams(queue: DatagramQueue) throws
     
 }
 open class WebTransportClient: WebTransportClientProtocol, @unchecked Sendable {
@@ -547,8 +718,9 @@ open func stopDatagramListener()throws   {try rustCallWithError(FfiConverterType
 }
 }
     
-open func subscribeToDatagrams()throws   {try rustCallWithError(FfiConverterTypeWebTransportError_lift) {
-    uniffi_videocall_ios_fn_method_webtransportclient_subscribe_to_datagrams(self.uniffiClonePointer(),$0
+open func subscribeToDatagrams(queue: DatagramQueue)throws   {try rustCallWithError(FfiConverterTypeWebTransportError_lift) {
+    uniffi_videocall_ios_fn_method_webtransportclient_subscribe_to_datagrams(self.uniffiClonePointer(),
+        FfiConverterTypeDatagramQueue_lower(queue),$0
     )
 }
 }
@@ -627,6 +799,8 @@ public enum WebTransportError: Swift.Error {
     
     case ClientError(message: String)
     
+    case QueueError(message: String)
+    
 }
 
 
@@ -671,6 +845,10 @@ public struct FfiConverterTypeWebTransportError: FfiConverterRustBuffer {
             message: try FfiConverterString.read(from: &buf)
         )
         
+        case 8: return .QueueError(
+            message: try FfiConverterString.read(from: &buf)
+        )
+        
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -696,6 +874,8 @@ public struct FfiConverterTypeWebTransportError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(6))
         case .ClientError(_ /* message is ignored*/):
             writeInt(&buf, Int32(7))
+        case .QueueError(_ /* message is ignored*/):
+            writeInt(&buf, Int32(8))
 
         
         }
@@ -787,6 +967,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_videocall_ios_checksum_func_hello_world() != 26460) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_videocall_ios_checksum_method_datagramqueue_add_datagram() != 60555) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_videocall_ios_checksum_method_datagramqueue_has_datagrams() != 18594) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_videocall_ios_checksum_method_datagramqueue_receive_datagram() != 2344) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_videocall_ios_checksum_method_webtransportclient_connect() != 7709) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -796,7 +985,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_videocall_ios_checksum_method_webtransportclient_stop_datagram_listener() != 41813) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_videocall_ios_checksum_method_webtransportclient_subscribe_to_datagrams() != 48082) {
+    if (uniffi_videocall_ios_checksum_method_webtransportclient_subscribe_to_datagrams() != 51570) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_videocall_ios_checksum_constructor_datagramqueue_new() != 61722) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_videocall_ios_checksum_constructor_webtransportclient_new() != 33792) {

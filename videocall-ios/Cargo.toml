@@ -16,6 +16,7 @@ uniffi_macros = "0.29"
 
 # Logging
 log = "0.4.20"
+env_logger = "0.10.0"
 
 # Networking dependencies
 web-transport-quinn = "0.5.0"

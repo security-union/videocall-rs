@@ -12,6 +12,17 @@ enum WebTransportError {
     "RuntimeError",
     "CertificateError",
     "ClientError",
+    "QueueError",
+};
+
+interface DatagramQueue {
+    constructor();
+    [Throws=WebTransportError]
+    sequence<u8> receive_datagram();
+    [Throws=WebTransportError]
+    void add_datagram(sequence<u8> data);
+    [Throws=WebTransportError]
+    boolean has_datagrams();
 };
 
 interface WebTransportClient {
@@ -21,7 +32,7 @@ interface WebTransportClient {
     [Throws=WebTransportError]
     void send_datagram(sequence<u8> data);
     [Throws=WebTransportError]
-    void subscribe_to_datagrams();
+    void subscribe_to_datagrams(DatagramQueue queue);
     [Throws=WebTransportError]
     void stop_datagram_listener();
 };

@@ -4,7 +4,8 @@
 import Foundation
 import videocallFFI
 
-/// A Swift wrapper for the WebTransport client
+/// A Swift wrapper for the WebTransport client that provides a high-level interface
+/// for WebTransport operations.
 public class WebTransportClientWrapper {
     private let client: WebTransportClient
     private let datagramQueue: DatagramQueue

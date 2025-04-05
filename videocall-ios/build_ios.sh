@@ -57,8 +57,13 @@ xcodebuild -create-xcframework \
 #     -library target/aarch64-apple-ios-sim/release/libvideocall_ios.a \
 #     -headers target/swift/include \
 #   -library target/aarch64-apple-darwin/release/libvideocall_ios.a \
-#   -headers target/swift/include \
+#     -headers target/swift/include \
 #   -output target/VideoCallIOS.xcframework
+
+# Build Swift package
+echo "Building Swift package..."
+cd videocall-ios/VideoCallKit
+swift build
 
 popd
 

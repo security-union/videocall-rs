@@ -7,6 +7,7 @@ members = [
     "videocall-client",
     "videocall-cli",
     "yew-ui",
+    "videocall-ios",
 ]
 exclude = [
     "src-tauri",

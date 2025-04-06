@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install cargo-leptos and wasm-bindgen-cli with specific versions
-RUN cargo install cargo-leptos --version 0.2.20
+RUN cargo install cargo-leptos --version 0.2.29
 RUN cargo install -f wasm-bindgen-cli --version 0.2.100
 
 # Verify installations

@@ -1,0 +1,51 @@
+[package]
+name = "videocall-uniffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Cross-platform FFI bindings for videocall"
+
+[lib]
+name = "videocall_uniffi"
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# UniFFI for Swift/Kotlin/Rust bridging
+uniffi = { version = "0.29", features = ["cli"] }
+uniffi_macros = "0.29"
+
+# Logging
+log = "0.4.20"
+env_logger = "0.10.0"
+
+# Networking dependencies
+web-transport-quinn = { git = "https://github.com/kixelated/web-transport-rs.git", branch = "main", default-features = false, features = ["ring"] }
+rustls-native-certs = "0.7"
+thiserror = "1.0.50"
+url = "2.4.1"
+tokio = { version = "1.32.0", features = ["full"] }
+anyhow = "1.0.75"
+bytes = "1.4.0"
+rustls = { version = "0.23.10", default-features = false, features = ["ring", "std"] }
+quinn = { version = "0.11", features = ["ring"] }
+quinn-proto = { version = "0.11", features = ["ring"] }
+ring = { version = "0.17", default-features = false }
+
+# Async runtime
+futures = "0.3.31"
+
+# Types
+videocall-types = { path = "../videocall-types", version = "1.0.1" }
+
+[build-dependencies]
+uniffi_build = { version = "0.29", features = ["builtin-bindgen"] }
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21.1"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+# iOS-specific dependencies if needed 

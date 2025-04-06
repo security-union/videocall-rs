@@ -5,7 +5,6 @@ use bytes::Bytes;
 use log::{debug, error, info, LevelFilter};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_native_certs::load_native_certs;
-use web_transport_quinn::ClientBuilder;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -13,7 +12,8 @@ use thiserror::Error;
 use tokio::runtime::Runtime;
 use tokio::task;
 use url::Url;
-use web_transport_quinn::{Session};
+use web_transport_quinn::ClientBuilder;
+use web_transport_quinn::Session;
 
 // A simple function that returns a greeting
 pub fn hello_world() -> String {

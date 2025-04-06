@@ -7,9 +7,6 @@ echo "Building for Android..."
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 ROOT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 
-# Change to the root directory where Cargo.toml is
-cd "$ROOT_DIR"
-
 # Install Android targets if not already installed
 echo "Installing Android targets..."
 rustup target add aarch64-linux-android
@@ -17,8 +14,8 @@ rustup target add armv7-linux-androideabi
 rustup target add x86_64-linux-android
 
 # Ensure target directories exist
-mkdir -p target/kotlin
-mkdir -p target/kotlin/include
+mkdir -p "$SCRIPT_DIR/target/kotlin"
+mkdir -p "$SCRIPT_DIR/target/kotlin/include"
 
 # Set environment variables for Android
 # Try to find Android NDK in common locations
@@ -106,6 +103,7 @@ echo "Android NDK setup complete. Proceeding with build..."
 
 # Build for Android arm64-v8a
 echo "Building for Android arm64-v8a..."
+cd "$ROOT_DIR"
 RUSTFLAGS="-C link-arg=-landroid" cargo build -p videocall-uniffi --release --target aarch64-linux-android
 
 # Build for Android armeabi-v7a
@@ -118,7 +116,15 @@ RUSTFLAGS="-C link-arg=-landroid" cargo build -p videocall-uniffi --release --ta
 
 # Generate Kotlin bindings
 echo "Generating Kotlin bindings..."
-cargo run -p videocall-uniffi --bin uniffi-bindgen -- generate --library target/aarch64-linux-android/release/libvideocall_uniffi.so --language kotlin --out-dir target/kotlin
+cd "$SCRIPT_DIR"
+mkdir -p target/kotlin
+cargo run -p videocall-uniffi --bin uniffi-bindgen -- generate --library "$ROOT_DIR/target/aarch64-linux-android/release/libvideocall_uniffi.so" --language kotlin --out-dir target/kotlin
+
+# Verify Kotlin bindings were generated
+if [ ! -f "target/kotlin/com/videocall/uniffi/videocall.kt" ]; then
+    echo "Error: Kotlin bindings generation failed. videocall.kt not found."
+    exit 1
+fi
 
 # Create AAR structure
 echo "Creating AAR structure..."
@@ -128,12 +134,17 @@ mkdir -p target/aar/jni/armeabi-v7a
 mkdir -p target/aar/jni/x86_64
 
 # Copy libraries to AAR structure
-cp target/aarch64-linux-android/release/libvideocall_uniffi.so target/aar/jni/arm64-v8a/
-cp target/armv7-linux-androideabi/release/libvideocall_uniffi.so target/aar/jni/armeabi-v7a/
-cp target/x86_64-linux-android/release/libvideocall_uniffi.so target/aar/jni/x86_64/
+cp "$ROOT_DIR/target/aarch64-linux-android/release/libvideocall_uniffi.so" target/aar/jni/arm64-v8a/
+cp "$ROOT_DIR/target/armv7-linux-androideabi/release/libvideocall_uniffi.so" target/aar/jni/armeabi-v7a/
+cp "$ROOT_DIR/target/x86_64-linux-android/release/libvideocall_uniffi.so" target/aar/jni/x86_64/
 
-# Copy Kotlin bindings
-cp target/kotlin/videocall.kt target/aar/
+# Copy Kotlin bindings with error checking
+if [ -f "target/kotlin/com/videocall/uniffi/videocall.kt" ]; then
+    cp target/kotlin/com/videocall/uniffi/videocall.kt target/aar/
+else
+    echo "Error: Failed to copy Kotlin bindings. videocall.kt not found."
+    exit 1
+fi
 
 # Create AndroidManifest.xml
 cat > target/aar/AndroidManifest.xml << EOF
@@ -184,8 +195,8 @@ echo "Build completed successfully!"
 
 echo ""
 echo "=== Build completed successfully ==="
-echo "AAR created at: $ROOT_DIR/target/videocall-uniffi.aar"
-echo "Kotlin bindings file: $ROOT_DIR/target/kotlin/videocall.kt"
+echo "AAR created at: $SCRIPT_DIR/target/videocall-uniffi.aar"
+echo "Kotlin bindings file: $SCRIPT_DIR/target/kotlin/com/videocall/uniffi/videocall.kt"
 echo ""
 echo "To use in your Android project:"
 echo "1. Add the AAR to your project's libs directory"

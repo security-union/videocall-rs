@@ -3432,7 +3432,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20c1bb65186718d348306bf1afdeb20d9ab45b2ab80fb793c0fdcf59ffbb4f38"
 dependencies = [
  "lazy_static",
- "rand 0.9.0",
+ "rand 0.8.5",
 ]
 
 [[package]]

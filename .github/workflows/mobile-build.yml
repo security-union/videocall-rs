@@ -48,7 +48,7 @@ jobs:
       
       - name: Upload iOS artifacts
         if: startsWith(github.ref, 'refs/tags/videocall-uniffi-')
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ios-build
           path: |
@@ -101,7 +101,7 @@ jobs:
       
       - name: Upload Android artifacts
         if: startsWith(github.ref, 'refs/tags/videocall-uniffi-')
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: android-build
           path: |

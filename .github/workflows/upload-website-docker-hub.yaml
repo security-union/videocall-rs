@@ -1,19 +1,20 @@
 name: Publish Website to Docker image
 
 on:
-  # pull_request:
-  #   paths:
-  #     - '*'
+  pull_request:
+    paths:
+      - 'leptos-website/**'
+      - 'docker/Dockerfile.website'
   push:
     branches:
       - main
     paths:
       - 'leptos-website/**'
-      - docker/Dockerfile.website
+      - 'docker/Dockerfile.website'
       
 jobs:
-  push_to_registry:
-    name: Push Website Docker image to Docker Hub
+  build_and_push:
+    name: Build and Push Website Docker image
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo
@@ -21,6 +22,7 @@ jobs:
         id: checkout
 
       - name: Log in to Docker Hub
+        if: github.event_name == 'push'
         uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -34,12 +36,12 @@ jobs:
         id: extract_branch
         run: echo "::set-output name=branch::${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
 
-      - name: Build and push  UI Docker image
+      - name: Build and push Website Docker image
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
         with:
           context: ./leptos-website
           file: docker/Dockerfile.website
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: |
             securityunion/video-call-rs-website:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
             securityunion/video-call-rs-website:latest

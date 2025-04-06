@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN cargo install cargo-leptos --version 0.2.20
+RUN cargo install -f wasm-bindgen-cli --version 0.2.100
 
 WORKDIR /app
 
@@ -23,7 +24,7 @@ FROM debian:bookworm-slim
 COPY --from=builder /app/target/release/leptos_website /app/
 # /target/site contains our JS/WASM/CSS, etc.
 COPY --from=builder /app/target/site /app/site
-# Copy Cargo.toml if it’s needed at runtime
+# Copy Cargo.toml if it's needed at runtime
 COPY --from=builder /app/Cargo.toml /app/
 WORKDIR /app
 ENV RUST_LOG="info"

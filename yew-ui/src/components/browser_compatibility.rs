@@ -43,13 +43,21 @@ impl BrowserCompatibility {
         let window = web_sys::window().unwrap();
         let mut missing_features = Vec::new();
 
-        // Check for MediaStreamTrackProcessor
-        if js_sys::Reflect::get(&window, &JsValue::from_str("MediaStreamTrackProcessor"))
-            .unwrap()
-            .is_undefined()
-        {
-            missing_features.push("MediaStreamTrackProcessor");
-        }
+        // // Check for MediaStreamTrackProcessor
+        // if js_sys::Reflect::get(&window, &JsValue::from_str("MediaStreamTrackProcessor"))
+        //     .unwrap()
+        //     .is_undefined()
+        // {
+        //     missing_features.push("MediaStreamTrackProcessor");
+        // }
+
+        // Check for MediaStreamTrackGenerator
+        // if js_sys::Reflect::get(&window, &JsValue::from_str("MediaStreamTrackGenerator"))
+        //     .unwrap()
+        //     .is_undefined()
+        // {
+        //     missing_features.push("MediaStreamTrackGenerator");
+        // }
 
         // Check for VideoEncoder
         if js_sys::Reflect::get(&window, &JsValue::from_str("VideoEncoder"))

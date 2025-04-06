@@ -49,3 +49,34 @@ pub fn configure_audio_context(
 
     Ok(audio_context)
 }
+
+// New function that doesn't rely on MediaStreamTrackGenerator
+// This creates an audio context with audio processing capabilities 
+// that can be used to play audio data directly
+pub fn create_standalone_audio_context() -> anyhow::Result<(AudioContext, web_sys::GainNode)> {
+    info!(
+        "Creating standalone audio context with sample rate: {}",
+        AUDIO_SAMPLE_RATE
+    );
+
+    let audio_context_options = AudioContextOptions::new();
+    audio_context_options.set_sample_rate(AUDIO_SAMPLE_RATE as f32);
+    let audio_context = AudioContext::new_with_context_options(&audio_context_options)
+        .map_err(|e| anyhow::anyhow!("Failed to create audio context: {:?}", e))?;
+    
+    // Create gain node for volume control
+    let gain_node = audio_context
+        .create_gain()
+        .map_err(|e| anyhow::anyhow!("Failed to create gain node: {:?}", e))?;
+    gain_node.gain().set_value(1.0);
+    gain_node.set_channel_count(AUDIO_CHANNELS);
+    
+    // Connect gain to destination
+    gain_node
+        .connect_with_audio_node(&audio_context.destination())
+        .map_err(|e| anyhow::anyhow!("Failed to connect gain to destination: {:?}", e))?;
+    
+    info!("Created standalone audio processing chain");
+    
+    Ok((audio_context, gain_node))
+}

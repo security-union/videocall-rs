@@ -76,21 +76,32 @@ impl VideoPeerDecoder {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
+        
+        // Direct canvas rendering implementation
         let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
             let chunk = Box::new(original_chunk);
             let video_chunk = chunk.unchecked_into::<VideoFrame>();
-            let render_canvas = window()
+            let render_canvas = match window()
                 .unwrap()
                 .document()
                 .unwrap()
-                .get_element_by_id(&id)
-                .unwrap()
-                .unchecked_into::<HtmlCanvasElement>();
-            let ctx = render_canvas
-                .get_context("2d")
-                .unwrap()
-                .unwrap()
-                .unchecked_into::<CanvasRenderingContext2d>();
+                .get_element_by_id(&id) {
+                    Some(canvas) => canvas.unchecked_into::<HtmlCanvasElement>(),
+                    None => {
+                        error!("Canvas element not found: {}", id);
+                        video_chunk.close();
+                        return;
+                    }
+                };
+                
+            let ctx = match render_canvas.get_context("2d") {
+                Ok(Some(ctx)) => ctx.unchecked_into::<CanvasRenderingContext2d>(),
+                _ => {
+                    error!("Failed to get 2d context for canvas");
+                    video_chunk.close();
+                    return;
+                }
+            };
 
             // Get the video frame's dimensions from its settings
             let width = video_chunk.display_width();
@@ -108,12 +119,15 @@ impl VideoPeerDecoder {
 
             video_chunk.close();
         }) as Box<dyn FnMut(JsValue)>);
+        
+        // Create and configure the video decoder
         let decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
         ))
         .unwrap();
         decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC))?;
+        
         Ok(Self {
             decoder,
             waiting_for_keyframe: true,

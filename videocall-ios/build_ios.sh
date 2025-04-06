@@ -3,7 +3,12 @@ set -e
 
 echo "Building for iOS and macOS..."
 
-pushd ../
+# Get the directory of this script
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+ROOT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
+
+# Change to the root directory where Cargo.toml is
+cd "$ROOT_DIR"
 
 # Ensure target directories exist
 mkdir -p target/swift
@@ -62,24 +67,22 @@ xcodebuild -create-xcframework \
 
 # Copy XCFramework and Swift bindings to VideoCallKit package
 echo "Copying XCFramework and Swift bindings to VideoCallKit package..."
-mkdir -p videocall-ios/VideoCallKit/Frameworks
-cp -R target/VideoCallIOS.xcframework videocall-ios/VideoCallKit/Frameworks/
-cp target/swift/videocall.swift videocall-ios/VideoCallKit/Sources/VideoCallKit/
+mkdir -p "$SCRIPT_DIR/VideoCallKit/Frameworks"
+cp -R target/VideoCallIOS.xcframework "$SCRIPT_DIR/VideoCallKit/Frameworks/"
+cp target/swift/videocall.swift "$SCRIPT_DIR/VideoCallKit/Sources/VideoCallKit/"
 
 # Build Swift package
 echo "Building Swift package..."
-cd videocall-ios/VideoCallKit
+cd "$SCRIPT_DIR/VideoCallKit"
 swift package resolve
 swift build
-
-popd
 
 echo "Build completed successfully!"
 
 echo ""
 echo "=== Build completed successfully ==="
-echo "XCFramework created at: ${ROOT_DIR}/target/VideoCallIOS.xcframework"
-echo "Swift bindings file: ${ROOT_DIR}/target/swift/videocall.swift"
+echo "XCFramework created at: $ROOT_DIR/target/VideoCallIOS.xcframework"
+echo "Swift bindings file: $ROOT_DIR/target/swift/videocall.swift"
 echo ""
 echo "To use in your Swift project:"
 echo "1. Add the XCFramework to your Xcode project"

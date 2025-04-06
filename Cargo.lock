@@ -3432,7 +3432,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20c1bb65186718d348306bf1afdeb20d9ab45b2ab80fb793c0fdcf59ffbb4f38"
 dependencies = [
  "lazy_static",
- "rand 0.8.5",
+ "rand 0.9.0",
 ]
 
 [[package]]
@@ -6238,7 +6238,7 @@ dependencies = [
  "uniffi_macros",
  "url",
  "videocall-types",
- "web-transport-quinn 0.5.0",
+ "web-transport-quinn 0.5.1",
 ]
 
 [[package]]
@@ -6418,17 +6418,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "web-transport-proto"
-version = "0.2.4"
-source = "git+https://github.com/kixelated/web-transport-rs.git?branch=main#cc7b6d3542b3159591adf2dfdb49d61ba9807523"
-dependencies = [
- "bytes",
- "http 1.3.1",
- "thiserror 2.0.12",
- "url",
-]
-
-[[package]]
 name = "web-transport-quinn"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6443,13 +6432,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "web-transport-proto 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "web-transport-proto",
 ]
 
 [[package]]
 name = "web-transport-quinn"
-version = "0.5.0"
-source = "git+https://github.com/kixelated/web-transport-rs.git?branch=main#cc7b6d3542b3159591adf2dfdb49d61ba9807523"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5edbbbd8de66e931f5c8a5c9b6e660db7623f1e9042f5f03964ffa1f03c0b9b1"
 dependencies = [
  "bytes",
  "futures",
@@ -6463,7 +6453,7 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "url",
- "web-transport-proto 0.2.4 (git+https://github.com/kixelated/web-transport-rs.git?branch=main)",
+ "web-transport-proto",
 ]
 
 [[package]]

@@ -19,7 +19,7 @@ log = "0.4.20"
 env_logger = "0.10.0"
 
 # Networking dependencies
-web-transport-quinn = { git = "https://github.com/kixelated/web-transport-rs.git", branch = "main", default-features = false, features = ["ring"] }
+web-transport-quinn = { version = "0.5.1", default-features = false, features = ["ring"] }
 rustls-native-certs = "0.7"
 thiserror = "1.0.50"
 url = "2.4.1"

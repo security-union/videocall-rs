@@ -9,12 +9,15 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-leptos --version 0.2.20
 RUN cargo install -f wasm-bindgen-cli --version 0.2.100
+
+RUN wasm-bindgen --version
 
 WORKDIR /app
 
 COPY . .
+
+RUN cargo update -p wasm-bindgen --precise 0.2.100
 
 RUN cargo leptos build --release
 

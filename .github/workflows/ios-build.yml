@@ -27,23 +27,18 @@ jobs:
       
       - name: Build iOS library
         run: |
-          cd videocall-ios
-          ./build_ios.sh
+          # Run from the root directory since build_ios.sh uses pushd ../
+          ./videocall-ios/build_ios.sh
       
       - name: Check XCFramework
         run: |
-          echo "Checking XCFramework..."
-          
-          # Check the structure
-          ls -la videocall-ios
-          ls -la videocall-ios/VideoCallKit
-          ls -la videocall-ios/VideoCallKit/Frameworks
-          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework
-          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64
-          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64/Headers 
-          
           if [ ! -d "videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework" ]; then
             echo "XCFramework was not created successfully"
             exit 1
           fi
+          
+          # Check the structure
+          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework
+          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64
+          ls -la videocall-ios/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64/Headers
           

@@ -15,7 +15,7 @@ WORKDIR /app/leptos-website
 
 COPY leptos-website .
 
-RUN cargo install -f wasm-bindgen-cli --version 0.2.93
+RUN cargo install -f wasm-bindgen-cli --version 0.2.100
 RUN cargo leptos build --release
 
 FROM debian:bookworm-slim

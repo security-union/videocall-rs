@@ -9,22 +9,13 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Install cargo-leptos and wasm-bindgen-cli with specific versions
-RUN cargo install cargo-leptos --version 0.2.29
+RUN cargo install cargo-leptos --version 0.2.20
 RUN cargo install -f wasm-bindgen-cli --version 0.2.100
-
-# Verify installations
-RUN wasm-bindgen --version
-RUN cargo leptos --version
 
 WORKDIR /app
 
 COPY . .
 
-# Update wasm-bindgen dependency to match CLI version
-RUN cargo update -p wasm-bindgen --precise 0.2.100
-
-# Build with cargo-leptos
 RUN cargo leptos build --release
 
 FROM debian:bookworm-slim

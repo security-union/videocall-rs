@@ -39,7 +39,7 @@ jobs:
       - name: Build and push Website Docker image
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
         with:
-          context: ./leptos-website
+          context: .
           file: docker/Dockerfile.website
           push: ${{ github.event_name == 'push' }}
           tags: |

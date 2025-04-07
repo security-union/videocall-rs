@@ -4,11 +4,11 @@ on:
   pull_request:
     paths:
       - 'videocall-ios/**'
-      - 'videocall-uniffi/**'
+      - 'videocall-sdk/**'
       - '.github/workflows/mobile-build.yml'
   push:
     tags:
-      - 'videocall-uniffi-*'
+      - 'videocall-sdk-*'
 
 jobs:
   build-ios:
@@ -31,29 +31,29 @@ jobs:
       
       - name: Build iOS library
         run: |
-          cd videocall-uniffi
+          cd videocall-sdk
           ./build_ios.sh
       
       - name: Check XCFramework
         run: |
-          if [ ! -d "videocall-uniffi/VideoCallKit/Frameworks/VideoCallIOS.xcframework" ]; then
+          if [ ! -d "videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework" ]; then
             echo "XCFramework was not created successfully"
             exit 1
           fi
           
           # Check the structure
-          ls -la videocall-uniffi/VideoCallKit/Frameworks/VideoCallIOS.xcframework
-          ls -la videocall-uniffi/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64
-          ls -la videocall-uniffi/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64/Headers
+          ls -la videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework
+          ls -la videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64
+          ls -la videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework/ios-arm64/Headers
       
       - name: Upload iOS artifacts
-        if: startsWith(github.ref, 'refs/tags/videocall-uniffi-')
+        if: startsWith(github.ref, 'refs/tags/videocall-sdk-')
         uses: actions/upload-artifact@v4
         with:
           name: ios-build
           path: |
-            videocall-uniffi/VideoCallKit/Frameworks/VideoCallIOS.xcframework
-            videocall-uniffi/VideoCallKit/Sources/VideoCallKit/videocall.swift
+            videocall-sdk/VideoCallKit/Frameworks/VideoCallIOS.xcframework
+            videocall-sdk/VideoCallKit/Sources/VideoCallKit/videocall.swift
 
   build-android:
     name: Build Android Library
@@ -84,26 +84,26 @@ jobs:
       
       - name: Build Android library
         run: |
-          cd videocall-uniffi
+          cd videocall-sdk
           ./build_android.sh
       
       - name: Check AAR and Kotlin bindings
         run: |
-          if [ ! -f "videocall-uniffi/target/videocall-uniffi.aar" ]; then
+          if [ ! -f "videocall-sdk/target/videocall-sdk.aar" ]; then
             echo "AAR was not created successfully"
             exit 1
           fi
           
-          if [ ! -f "videocall-uniffi/target/kotlin/com/videocall/uniffi/videocall.kt" ]; then
+          if [ ! -f "videocall-sdk/target/kotlin/com/videocall/uniffi/videocall.kt" ]; then
             echo "Kotlin bindings were not created successfully"
             exit 1
           fi
       
       - name: Upload Android artifacts
-        if: startsWith(github.ref, 'refs/tags/videocall-uniffi-')
+        if: startsWith(github.ref, 'refs/tags/videocall-sdk-')
         uses: actions/upload-artifact@v4
         with:
           name: android-build
           path: |
-            videocall-uniffi/target/videocall-uniffi.aar
-            videocall-uniffi/target/kotlin/com/videocall/uniffi/videocall.kt 
+            videocall-sdk/target/videocall-sdk.aar
+            videocall-sdk/target/kotlin/com/videocall/uniffi/videocall.kt 

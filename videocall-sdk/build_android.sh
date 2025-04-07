@@ -104,21 +104,21 @@ echo "Android NDK setup complete. Proceeding with build..."
 # Build for Android arm64-v8a
 echo "Building for Android arm64-v8a..."
 cd "$ROOT_DIR"
-RUSTFLAGS="-C link-arg=-landroid" cargo build -p videocall-uniffi --release --target aarch64-linux-android
+RUSTFLAGS="-C link-arg=-landroid" cargo build -p videocall-sdk --release --target aarch64-linux-android
 
 # Build for Android armeabi-v7a
 echo "Building for Android armeabi-v7a..."
-RUSTFLAGS="-C link-arg=-landroid" cargo build -p videocall-uniffi --release --target armv7-linux-androideabi
+RUSTFLAGS="-C link-arg=-landroid" cargo build -p videocall-sdk --release --target armv7-linux-androideabi
 
 # Build for Android x86_64
 echo "Building for Android x86_64..."
-RUSTFLAGS="-C link-arg=-landroid" cargo build -p videocall-uniffi --release --target x86_64-linux-android
+RUSTFLAGS="-C link-arg=-landroid" cargo build -p videocall-sdk --release --target x86_64-linux-android
 
 # Generate Kotlin bindings
 echo "Generating Kotlin bindings..."
 cd "$SCRIPT_DIR"
 mkdir -p target/kotlin
-cargo run -p videocall-uniffi --bin uniffi-bindgen -- generate --library "$ROOT_DIR/target/aarch64-linux-android/release/libvideocall_uniffi.so" --language kotlin --out-dir target/kotlin
+cargo run -p videocall-sdk --bin uniffi-bindgen -- generate --library "$ROOT_DIR/target/aarch64-linux-android/release/libvideocall_uniffi.so" --language kotlin --out-dir target/kotlin
 
 # Verify Kotlin bindings were generated
 if [ ! -f "target/kotlin/com/videocall/uniffi/videocall.kt" ]; then
@@ -189,13 +189,13 @@ EOF
 # Package as AAR
 echo "Packaging as AAR..."
 cd target/aar
-zip -r ../videocall-uniffi.aar *
+zip -r ../videocall-sdk.aar *
 
 echo "Build completed successfully!"
 
 echo ""
 echo "=== Build completed successfully ==="
-echo "AAR created at: $SCRIPT_DIR/target/videocall-uniffi.aar"
+echo "AAR created at: $SCRIPT_DIR/target/videocall-sdk.aar"
 echo "Kotlin bindings file: $SCRIPT_DIR/target/kotlin/com/videocall/uniffi/videocall.kt"
 echo ""
 echo "To use in your Android project:"

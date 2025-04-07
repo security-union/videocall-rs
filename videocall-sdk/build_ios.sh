@@ -24,19 +24,19 @@ export BINDGEN_EXTRA_CLANG_ARGS="-isysroot $(xcrun --sdk iphonesimulator --show-
 
 # Build for iOS device (arm64)
 echo "Building for iOS device (arm64)..."
-RUSTFLAGS="-C link-arg=-mios-version-min=18.0" cargo build -p videocall-uniffi --release --target aarch64-apple-ios
+RUSTFLAGS="-C link-arg=-mios-version-min=18.0" cargo build -p videocall-sdk --release --target aarch64-apple-ios
 
 # Build for iOS simulator (arm64)
 echo "Building for iOS simulator (arm64)..."
-RUSTFLAGS="-C link-arg=-mios-simulator-version-min=18.0" cargo build -p videocall-uniffi --release --target aarch64-apple-ios-sim
+RUSTFLAGS="-C link-arg=-mios-simulator-version-min=18.0" cargo build -p videocall-sdk --release --target aarch64-apple-ios-sim
 
 # Build for macOS (arm64)
 echo "Building for macOS (arm64)..."
-RUSTFLAGS="-C link-arg=-mmacosx-version-min=14.0" cargo build -p videocall-uniffi --release --target aarch64-apple-darwin
+RUSTFLAGS="-C link-arg=-mmacosx-version-min=14.0" cargo build -p videocall-sdk --release --target aarch64-apple-darwin
 
 # Generate Swift bindings
 echo "Generating Swift bindings..."
-cargo run -p videocall-uniffi --bin uniffi-bindgen -- generate --library target/aarch64-apple-ios/release/libvideocall_uniffi.a --language swift --out-dir target/swift
+cargo run -p videocall-sdk --bin uniffi-bindgen -- generate --library target/aarch64-apple-ios/release/libvideocall_uniffi.a --language swift --out-dir target/swift
 
 # Copy header file to include directory
 cp target/swift/videocallFFI.h target/swift/include/

@@ -6184,6 +6184,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "videocall-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "env_logger",
+ "futures",
+ "jni",
+ "log",
+ "quinn 0.11.7",
+ "quinn-proto 0.11.10",
+ "ring 0.17.14",
+ "rustls 0.23.25",
+ "rustls-native-certs 0.7.3",
+ "thiserror 1.0.69",
+ "tokio",
+ "uniffi",
+ "uniffi_build",
+ "uniffi_macros",
+ "url",
+ "videocall-types",
+ "web-transport-quinn 0.5.1",
+]
+
+[[package]]
 name = "videocall-types"
 version = "1.0.1"
 dependencies = [
@@ -6214,31 +6239,6 @@ dependencies = [
  "web-time",
  "yew",
  "yew-router",
-]
-
-[[package]]
-name = "videocall-uniffi"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "env_logger",
- "futures",
- "jni",
- "log",
- "quinn 0.11.7",
- "quinn-proto 0.11.10",
- "ring 0.17.14",
- "rustls 0.23.25",
- "rustls-native-certs 0.7.3",
- "thiserror 1.0.69",
- "tokio",
- "uniffi",
- "uniffi_build",
- "uniffi_macros",
- "url",
- "videocall-types",
- "web-transport-quinn 0.5.1",
 ]
 
 [[package]]

@@ -99,7 +99,7 @@ if (queue.hasDatagrams()) {
 ### Building for iOS
 
 ```bash
-cd videocall-uniffi
+cd videocall-sdk
 ./build_ios.sh
 ```
 
@@ -110,12 +110,12 @@ This will generate:
 ### Building for Android
 
 ```bash
-cd videocall-uniffi
+cd videocall-sdk
 ./build_android.sh
 ```
 
 This will generate:
-- An AAR file at `target/videocall-uniffi.aar`
+- An AAR file at `target/videocall-sdk.aar`
 - Kotlin bindings at `target/kotlin/com/videocall/uniffi/videocall.kt`
 
 ## How It Works

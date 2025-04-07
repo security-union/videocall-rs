@@ -41,7 +41,7 @@ git_release_enable = false
 release = false
 
 [[package]]
-name = "videocall-uniffi"
+name = "videocall-sdk"
 publish = false
 changelog_update = true
 git_release_enable = false

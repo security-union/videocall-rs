@@ -14,11 +14,14 @@ use super::super::wrappers::EncodedVideoChunkTypeWrapper;
 use super::audio_decoder_wrapper::{AudioDecoderTrait, AudioDecoderWrapper};
 use super::config::configure_audio_context;
 use super::media_decoder_with_buffer::VideoDecoderWithBuffer;
+use super::safari_audio_decoder::SafariAudioDecoder;
 use super::video_decoder_wrapper::VideoDecoderWrapper;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::constants::VIDEO_CODEC;
+use crate::media_generator::MediaFrameGenerator;
+use js_sys::{Array, Boolean, JsString, Reflect};
 use log::error;
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -31,7 +34,6 @@ use web_sys::EncodedVideoChunkType;
 use web_sys::HtmlCanvasElement;
 use web_sys::{AudioData, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
-use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
 use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 
 pub struct DecodeStatus {
@@ -162,7 +164,8 @@ impl PeerDecode for VideoPeerDecoder {
 /// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
 pub struct AudioPeerDecoder {
-    pub decoder: AudioDecoderWrapper,
+    // Use either AudioDecoderWrapper or SafariAudioDecoder depending on browser
+    pub decoder: Box<dyn AudioDecoderTrait>,
     decoded: bool,
     _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
     _output: Closure<dyn FnMut(AudioData)>, // member exists to keep the closure in scope for the life of the struct
@@ -174,12 +177,17 @@ impl AudioPeerDecoder {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
-        let audio_stream_generator =
-            MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
+
+        // Replace MediaStreamTrackGenerator with our MediaFrameGenerator
+        let audio_stream_generator = MediaFrameGenerator::new("audio")?;
+
         // The audio context is used to reproduce audio.
-        let audio_context = configure_audio_context(&audio_stream_generator).unwrap();
+        // Pass the track to configure_audio_context
+        let audio_context = configure_audio_context(&audio_stream_generator.track())
+            .map_err(|e| JsValue::from_str(&format!("Failed to configure audio context: {}", e)))?;
 
         let output = Closure::wrap(Box::new(move |audio_data: AudioData| {
+            // Use the writable property of our MediaFrameGenerator
             let writable = audio_stream_generator.writable();
             if writable.locked() {
                 return;
@@ -198,15 +206,29 @@ impl AudioPeerDecoder {
                 error!("error {:?}", e);
             }
         }) as Box<dyn FnMut(AudioData)>);
-        let decoder = AudioDecoderWrapper::new(&AudioDecoderInit::new(
+
+        // Create the decoder init
+        let decoder_init = AudioDecoderInit::new(
             error.as_ref().unchecked_ref(),
             output.as_ref().unchecked_ref(),
-        ))?;
+        );
+
+        // Create a compatible decoder based on browser
+        let decoder: Box<dyn AudioDecoderTrait> = if SafariAudioDecoder::is_safari() {
+            log::info!("Using SafariAudioDecoder for better compatibility");
+            Box::new(SafariAudioDecoder::new(&decoder_init)?)
+        } else {
+            log::info!("Using native AudioDecoderWrapper");
+            Box::new(AudioDecoderWrapper::new(&decoder_init)?)
+        };
+
+        // Configure the decoder
         decoder.configure(&AudioDecoderConfig::new(
             AUDIO_CODEC,
             AUDIO_CHANNELS,
             AUDIO_SAMPLE_RATE,
         ))?;
+
         Ok(Self {
             decoder,
             decoded: false,

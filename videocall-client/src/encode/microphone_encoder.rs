@@ -22,8 +22,6 @@ use web_sys::AudioTrack;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
-use web_sys::MediaStreamTrackProcessor;
-use web_sys::MediaStreamTrackProcessorInit;
 use web_sys::ReadableStreamDefaultReader;
 use yew::Callback;
 
@@ -35,6 +33,7 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::diagnostics::EncoderBitrateController;
+use crate::MediaFrameProcessor;
 
 // Threshold for bitrate changes, represents 20% (0.2)
 const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
@@ -230,13 +229,7 @@ impl MicrophoneEncoder {
                 error!("Error configuring microphone encoder: {:?}", e);
             }
 
-            let audio_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(&media_track))
-                    .unwrap();
-            let audio_reader = audio_processor
-                .readable()
-                .get_reader()
-                .unchecked_into::<ReadableStreamDefaultReader>();
+            let audio_processor = MediaFrameProcessor::new(&media_track).unwrap();
 
             // Start encoding audio with dynamic bitrate control
             loop {
@@ -266,8 +259,8 @@ impl MicrophoneEncoder {
                         error!("Error configuring microphone encoder: {:?}", e);
                     }
                 }
-
-                match JsFuture::from(audio_reader.read()).await {
+                let read_promise = audio_processor.read_frame();
+                match JsFuture::from(js_sys::Promise::from(read_promise)).await {
                     Ok(js_frame) => match Reflect::get(&js_frame, &JsString::from("value")) {
                         Ok(value) => {
                             let audio_frame = value.unchecked_into::<web_sys::AudioData>();

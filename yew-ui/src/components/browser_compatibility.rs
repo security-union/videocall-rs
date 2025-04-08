@@ -44,12 +44,12 @@ impl BrowserCompatibility {
         let mut missing_features = Vec::new();
 
         // Check for MediaStreamTrackProcessor
-        if js_sys::Reflect::get(&window, &JsValue::from_str("MediaStreamTrackProcessor"))
-            .unwrap()
-            .is_undefined()
-        {
-            missing_features.push("MediaStreamTrackProcessor");
-        }
+        // if js_sys::Reflect::get(&window, &JsValue::from_str("MediaStreamTrackProcessor"))
+        //     .unwrap()
+        //     .is_undefined()
+        // {
+        //     missing_features.push("MediaStreamTrackProcessor");
+        // }
 
         // Check for VideoEncoder
         if js_sys::Reflect::get(&window, &JsValue::from_str("VideoEncoder"))
@@ -60,12 +60,12 @@ impl BrowserCompatibility {
         }
 
         // Check for AudioEncoder
-        if js_sys::Reflect::get(&window, &JsValue::from_str("AudioEncoder"))
-            .unwrap()
-            .is_undefined()
-        {
-            missing_features.push("AudioEncoder");
-        }
+        // if js_sys::Reflect::get(&window, &JsValue::from_str("AudioEncoder"))
+        //     .unwrap()
+        //     .is_undefined()
+        // {
+        //     missing_features.push("AudioEncoder");
+        // }
 
         if !missing_features.is_empty() {
             Some(format!(

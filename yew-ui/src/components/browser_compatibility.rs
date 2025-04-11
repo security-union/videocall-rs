@@ -59,13 +59,13 @@ impl BrowserCompatibility {
             missing_features.push("VideoEncoder");
         }
 
-        // Check for AudioEncoder
-        if js_sys::Reflect::get(&window, &JsValue::from_str("AudioEncoder"))
-            .unwrap()
-            .is_undefined()
-        {
-            missing_features.push("AudioEncoder");
-        }
+        // // Check for AudioEncoder
+        // if js_sys::Reflect::get(&window, &JsValue::from_str("AudioEncoder"))
+        //     .unwrap()
+        //     .is_undefined()
+        // {
+        //     missing_features.push("AudioEncoder");
+        // }
 
         if !missing_features.is_empty() {
             Some(format!(

@@ -48,10 +48,10 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
         let new_sequence = self.decoder.get_sequence_number(&packet);
         let is_keyframe = self.decoder.is_keyframe(&packet);
 
-        log::info!("Received frame with sequence: {}", new_sequence);
-        log::info!("Current buffer size: {}", self.buffer.len());
-        log::info!("Current sequence: {:?}", self.sequence);
-        log::info!("Is keyframe: {}", is_keyframe);
+        log::debug!("Received frame with sequence: {}", new_sequence);
+        log::debug!("Current buffer size: {}", self.buffer.len());
+        log::debug!("Current sequence: {:?}", self.sequence);
+        log::debug!("Is keyframe: {}", is_keyframe);
 
         // Check for sequence reset or keyframe
         let sequence_reset_detected = self.sequence.is_some_and(|seq| {

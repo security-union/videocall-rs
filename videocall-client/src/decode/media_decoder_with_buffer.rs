@@ -71,6 +71,7 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
             self.buffer.clear();
             self.sequence = None;
             self.missing_frame_count = 0;
+            self.last_processed_sequence = None;
         }
 
         // Only add the frame if it's not already in the buffer
@@ -120,6 +121,47 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
                 } else {
                     // Reset missing frame count if we're not missing any frames
                     self.missing_frame_count = 0;
+                }
+            }
+        }
+
+        // Special handling for the first frame after a keyframe
+        if self.sequence.is_none() && self.buffer.len() >= self.min_jitter_buffer_size {
+            // If we have a keyframe and the next frame is missing, look for the next keyframe
+            if let Some(&first_seq) = self.buffer.keys().next() {
+                if self
+                    .decoder
+                    .is_keyframe(self.buffer.get(&first_seq).unwrap())
+                {
+                    // Check if there's a gap after the keyframe
+                    let mut has_gap = false;
+                    let mut next_expected_seq = first_seq + 1;
+
+                    for &seq in self.buffer.keys().skip(1) {
+                        if seq != next_expected_seq {
+                            has_gap = true;
+                            break;
+                        }
+                        next_expected_seq = seq + 1;
+                    }
+
+                    if has_gap {
+                        log::info!("Gap detected after keyframe, looking for next keyframe");
+
+                        // Find the next keyframe in the buffer
+                        if let Some(next_keyframe_seq) = self.find_next_keyframe(first_seq) {
+                            log::info!(
+                                "Found next keyframe at sequence {}, skipping ahead",
+                                next_keyframe_seq
+                            );
+
+                            // Clear the buffer up to the keyframe
+                            self.clear_buffer_up_to(next_keyframe_seq);
+
+                            // Try to decode the keyframe
+                            return self.attempt_decode_from_buffer();
+                        }
+                    }
                 }
             }
         }

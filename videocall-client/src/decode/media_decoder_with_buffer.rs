@@ -1,5 +1,8 @@
+use super::buffer_manager::{BufferConfig, BufferManager};
+use super::decoder_state::DecoderState;
 use super::media_decoder_trait::MediaDecoderTrait;
-use std::{collections::BTreeMap, sync::Arc};
+use log::{debug, error, info, warn};
+use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::JsValue;
 use web_sys::CodecState;
@@ -18,194 +21,190 @@ pub const MAX_WAIT_FOR_MISSING_FRAME: u64 = 20;
 /// A wrapper for media decoders that handles frames being out of order using a jitter buffer.
 #[derive(Debug)]
 pub struct MediaDecoderWithBuffer<D: MediaDecoderTrait> {
+    /// The underlying decoder
     pub decoder: D,
-    pub buffer: BTreeMap<u64, Arc<MediaPacket>>,
-    pub sequence: Option<u64>,
-    pub min_jitter_buffer_size: usize,
-    pub max_sequence_gap: u64,
-    pub missing_frame_count: u64,
-    pub last_processed_sequence: Option<u64>,
+
+    /// The buffer manager for handling frame buffering
+    buffer_manager: BufferManager,
+
+    /// The current state of the decoder
+    state: DecoderState,
 }
 
 impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
+    /// Create a new media decoder with buffer
     pub fn new(init: &D::InitType) -> Result<Self, JsValue> {
-        D::new(init).map(|decoder| MediaDecoderWithBuffer {
-            decoder,
-            buffer: BTreeMap::new(),
-            sequence: None,
-            min_jitter_buffer_size: MIN_BUFFER_SIZE,
-            max_sequence_gap: MAX_SEQUENCE_GAP,
-            missing_frame_count: 0,
-            last_processed_sequence: None,
+        D::new(init).map(|decoder| {
+            let config = BufferConfig::default();
+            MediaDecoderWithBuffer {
+                decoder,
+                buffer_manager: BufferManager::new(config),
+                state: DecoderState::Initializing,
+            }
         })
     }
 
+    /// Configure the decoder
     pub fn configure(&self, config: &D::ConfigType) -> Result<(), JsValue> {
         self.decoder.configure(config)
     }
 
+    /// Process a new media packet
+    ///
+    /// Returns a vector of decoded frames that are ready to be displayed
     pub fn decode(&mut self, packet: Arc<MediaPacket>) -> Vec<Arc<MediaPacket>> {
         let new_sequence = self.decoder.get_sequence_number(&packet);
         let is_keyframe = self.decoder.is_keyframe(&packet);
 
-        log::debug!("Received frame with sequence: {}", new_sequence);
-        log::debug!("Current buffer size: {}", self.buffer.len());
-        log::debug!("Current sequence: {:?}", self.sequence);
-        log::debug!("Is keyframe: {}", is_keyframe);
+        debug!("Received frame with sequence: {}", new_sequence);
+        debug!("Current buffer size: {}", self.buffer_manager.size());
+        debug!("Current state: {:?}", self.state);
+        debug!("Is keyframe: {}", is_keyframe);
 
-        // Check for sequence reset or keyframe
-        let sequence_reset_detected = self.sequence.is_some_and(|seq| {
-            (seq as i64 - new_sequence as i64).abs() > self.max_sequence_gap as i64
-        });
-
-        // Reset on keyframe, sequence reset, or if we have a large gap
-        if sequence_reset_detected || is_keyframe {
-            log::debug!(
-                "{} detected, clearing buffer",
-                if sequence_reset_detected {
-                    "Sequence reset"
-                } else {
-                    "Keyframe"
-                }
-            );
-            self.buffer.clear();
-            self.sequence = None;
-            self.missing_frame_count = 0;
-            self.last_processed_sequence = None;
+        // Check if we need to reset the buffer
+        if self.should_reset_buffer(new_sequence, is_keyframe) {
+            self.reset_buffer();
         }
 
-        // Only add the frame if it's not already in the buffer
-        if let std::collections::btree_map::Entry::Vacant(e) = self.buffer.entry(new_sequence) {
-            e.insert(packet);
-            log::debug!(
-                "Added frame {} to buffer, new size: {}",
-                new_sequence,
-                self.buffer.len()
-            );
-        } else {
-            log::debug!("Frame {} already in buffer, skipping", new_sequence);
-        }
+        // Add the frame to the buffer
+        self.buffer_manager
+            .add_frame(new_sequence, packet, is_keyframe);
 
-        // Check if we've been waiting too long for a missing frame
-        if let Some(current_seq) = self.sequence {
-            if let Some(next_seq) = self.buffer.keys().next() {
-                if *next_seq > current_seq + 1 {
-                    self.missing_frame_count += 1;
-                    log::debug!("Missing frame count: {}", self.missing_frame_count);
+        // Handle missing frames
+        if let Some(current_seq) = self.state.last_sequence() {
+            if let Some(next_seq) = self.buffer_manager.next_sequence() {
+                if next_seq > current_seq + 1 {
+                    self.buffer_manager.increment_missing_frame_count();
 
-                    // If we've been waiting too long for a missing frame, find the next keyframe and skip to it
-                    if self.missing_frame_count >= MAX_WAIT_FOR_MISSING_FRAME {
-                        log::debug!("Waited too long for missing frame, looking for next keyframe");
+                    // If we've been waiting too long for a missing frame, find the next keyframe
+                    if self
+                        .buffer_manager
+                        .should_force_decode(MAX_WAIT_FOR_MISSING_FRAME)
+                    {
+                        debug!("Waited too long for missing frame, looking for next keyframe");
 
-                        // Find the next keyframe in the buffer
-                        if let Some(next_keyframe_seq) = self.find_next_keyframe(current_seq) {
-                            log::debug!(
+                        if let Some(next_keyframe_seq) =
+                            self.buffer_manager.find_next_keyframe(current_seq)
+                        {
+                            debug!(
                                 "Found next keyframe at sequence {}, skipping ahead",
                                 next_keyframe_seq
                             );
-
-                            // Clear the buffer up to the keyframe
-                            self.clear_buffer_up_to(next_keyframe_seq);
-
-                            // Reset missing frame count
-                            self.missing_frame_count = 0;
-
-                            // Try to decode the keyframe
+                            self.buffer_manager.clear_up_to(next_keyframe_seq);
+                            self.buffer_manager.reset_missing_frame_count();
                             return self.attempt_decode_from_buffer();
                         } else {
-                            log::debug!(
-                                "No keyframe found, forcing decode of next available frame"
-                            );
-                            self.missing_frame_count = 0;
+                            debug!("No keyframe found, forcing decode of next available frame");
+                            self.buffer_manager.reset_missing_frame_count();
                             return self.attempt_decode_from_buffer();
                         }
                     }
                 } else {
                     // Reset missing frame count if we're not missing any frames
-                    self.missing_frame_count = 0;
+                    self.buffer_manager.reset_missing_frame_count();
                 }
             }
         }
 
         // Special handling for the first frame after a keyframe
-        if self.sequence.is_none() && self.buffer.len() >= self.min_jitter_buffer_size {
-            // If we have a keyframe and the next frame is missing, look for the next keyframe
-            if let Some(&first_seq) = self.buffer.keys().next() {
-                if self
-                    .decoder
-                    .is_keyframe(self.buffer.get(&first_seq).unwrap())
-                {
-                    // Check if there's a gap after the keyframe
-                    let mut has_gap = false;
-                    let mut next_expected_seq = first_seq + 1;
+        if self.state.last_sequence().is_none() && self.buffer_manager.has_minimum_frames() {
+            if let Some(first_seq) = self.buffer_manager.next_sequence() {
+                if let Some(frame) = self.buffer_manager.get_frame(first_seq) {
+                    if self.decoder.is_keyframe(frame) {
+                        // Check if there's a gap after the keyframe
+                        let mut has_gap = false;
+                        let mut next_expected_seq = first_seq + 1;
 
-                    for &seq in self.buffer.keys().skip(1) {
-                        if seq != next_expected_seq {
-                            has_gap = true;
-                            break;
+                        for &seq in self.buffer_manager.frames().keys().skip(1) {
+                            if seq != next_expected_seq {
+                                has_gap = true;
+                                break;
+                            }
+                            next_expected_seq = seq + 1;
                         }
-                        next_expected_seq = seq + 1;
-                    }
 
-                    if has_gap {
-                        log::debug!("Gap detected after keyframe, looking for next keyframe");
+                        if has_gap {
+                            debug!("Gap detected after keyframe, looking for next keyframe");
 
-                        // Find the next keyframe in the buffer
-                        if let Some(next_keyframe_seq) = self.find_next_keyframe(first_seq) {
-                            log::debug!(
-                                "Found next keyframe at sequence {}, skipping ahead",
-                                next_keyframe_seq
-                            );
-
-                            // Clear the buffer up to the keyframe
-                            self.clear_buffer_up_to(next_keyframe_seq);
-
-                            // Try to decode the keyframe
-                            return self.attempt_decode_from_buffer();
+                            if let Some(next_keyframe_seq) =
+                                self.buffer_manager.find_next_keyframe(first_seq)
+                            {
+                                debug!(
+                                    "Found next keyframe at sequence {}, skipping ahead",
+                                    next_keyframe_seq
+                                );
+                                self.buffer_manager.clear_up_to(next_keyframe_seq);
+                                return self.attempt_decode_from_buffer();
+                            }
                         }
                     }
                 }
             }
         }
 
+        // Attempt to decode frames from the buffer
         self.attempt_decode_from_buffer()
     }
 
-    // Decode available frames from the buffer
+    /// Check if we should reset the buffer based on the new frame
+    fn should_reset_buffer(&self, new_sequence: u64, is_keyframe: bool) -> bool {
+        // Reset on keyframe
+        if is_keyframe {
+            return true;
+        }
+
+        // Reset on sequence gap
+        if let Some(current_seq) = self.state.last_sequence() {
+            return self.buffer_manager.has_large_gap(current_seq);
+        }
+
+        false
+    }
+
+    /// Reset the buffer and decoder state
+    fn reset_buffer(&mut self) {
+        debug!("Resetting buffer and decoder state");
+        self.buffer_manager.clear();
+        self.state = DecoderState::Initializing;
+    }
+
+    /// Attempt to decode frames from the buffer
     fn attempt_decode_from_buffer(&mut self) -> Vec<Arc<MediaPacket>> {
-        log::debug!("attempt_decode_from_buffer");
+        debug!("Attempting to decode frames from buffer");
         let mut decoded_frames = Vec::new();
 
         // Process frames while we have enough in the buffer
-        while self.buffer.len() >= self.min_jitter_buffer_size {
-            if let Some(&next_sequence) = self.buffer.keys().next() {
-                log::debug!("next_sequence: {:?}", next_sequence);
+        while self.buffer_manager.has_minimum_frames() {
+            if let Some(next_sequence) = self.buffer_manager.next_sequence() {
+                debug!("Next sequence: {:?}", next_sequence);
 
                 // Initialize sequence if this is the first frame
-                if self.sequence.is_none() {
-                    log::debug!("Starting decoding with buffer size: {}", self.buffer.len());
+                if self.state.last_sequence().is_none() {
+                    debug!(
+                        "Starting decoding with buffer size: {}",
+                        self.buffer_manager.size()
+                    );
                     if let Some(frame) = self.decode_next_frame(next_sequence) {
                         decoded_frames.push(frame);
                     }
                     continue;
                 }
 
-                let current_sequence = self.sequence.unwrap();
-                log::debug!("current_sequence: {:?}", current_sequence);
+                let current_sequence = self.state.last_sequence().unwrap();
+                debug!("Current sequence: {:?}", current_sequence);
 
                 // Remove older frames
                 if next_sequence < current_sequence {
-                    log::debug!("Removing older frame with sequence: {}", next_sequence);
-                    self.buffer.remove(&next_sequence);
+                    debug!("Removing older frame with sequence: {}", next_sequence);
+                    self.buffer_manager.remove_frame(next_sequence);
                     continue;
                 }
 
                 // Process next frame in sequence
                 if next_sequence == current_sequence + 1 {
-                    log::debug!(
+                    debug!(
                         "Processing next frame in sequence: {} (current: {})",
-                        next_sequence,
-                        current_sequence
+                        next_sequence, current_sequence
                     );
                     if let Some(frame) = self.decode_next_frame(next_sequence) {
                         decoded_frames.push(frame);
@@ -214,10 +213,11 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
                 }
 
                 // Process frames if buffer is getting too large or gap is small enough
-                if self.buffer.len() >= MAX_BUFFER_SIZE
-                    || (next_sequence - current_sequence) <= MAX_GAP_BEFORE_FORCE_DECODE
+                if self.buffer_manager.is_full()
+                    || (next_sequence - current_sequence)
+                        <= self.buffer_manager.config().max_gap_before_force_decode
                 {
-                    log::debug!(
+                    debug!(
                         "Processing frame {} despite gap of {} (current: {})",
                         next_sequence,
                         next_sequence - current_sequence,
@@ -233,10 +233,9 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
                 if let Some(earliest_decodable) =
                     self.find_earliest_decodable_frame(current_sequence)
                 {
-                    log::debug!(
+                    debug!(
                         "Found earliest decodable frame: {} (current: {})",
-                        earliest_decodable,
-                        current_sequence
+                        earliest_decodable, current_sequence
                     );
                     if let Some(frame) = self.decode_next_frame(earliest_decodable) {
                         decoded_frames.push(frame);
@@ -245,9 +244,9 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
                 }
 
                 // Wait for more frames
-                log::debug!(
+                debug!(
                     "Buffer size: {}, waiting for more frames to fill gap between {} and {}",
-                    self.buffer.len(),
+                    self.buffer_manager.size(),
                     current_sequence,
                     next_sequence
                 );
@@ -258,88 +257,67 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
         }
 
         if !decoded_frames.is_empty() {
-            log::debug!(
+            debug!(
                 "Decoded {} frames, buffer size now: {}",
                 decoded_frames.len(),
-                self.buffer.len()
+                self.buffer_manager.size()
             );
         }
 
         decoded_frames
     }
 
-    // Find the earliest frame in the buffer that can be decoded with minimal gap
+    /// Find the earliest frame in the buffer that can be decoded with minimal gap
     fn find_earliest_decodable_frame(&self, current_sequence: u64) -> Option<u64> {
         // Look for frames that are close to the current sequence
-        for &seq in self.buffer.keys() {
-            if seq > current_sequence && (seq - current_sequence) <= MAX_GAP_BEFORE_FORCE_DECODE {
+        for &seq in self.buffer_manager.frames().keys() {
+            if seq > current_sequence
+                && (seq - current_sequence)
+                    <= self.buffer_manager.config().max_gap_before_force_decode
+            {
                 return Some(seq);
             }
         }
 
         // If we have a keyframe in the buffer, we can start decoding from there
-        for (_, packet) in self.buffer.iter() {
+        for (seq, packet) in self.buffer_manager.frames().iter() {
             if self.decoder.is_keyframe(packet) {
-                return Some(self.decoder.get_sequence_number(packet));
+                return Some(*seq);
             }
         }
 
         None
     }
 
-    // Decode a specific frame and update sequence
+    /// Decode a specific frame and update sequence
     fn decode_next_frame(&mut self, next_sequence: u64) -> Option<Arc<MediaPacket>> {
-        log::debug!("decode_next_frame: {:?}", next_sequence);
-        if let Some(frame) = self.buffer.remove(&next_sequence) {
-            log::debug!("Decoding frame with sequence: {}", next_sequence);
+        debug!("Decoding frame: {:?}", next_sequence);
+        if let Some(frame) = self.buffer_manager.remove_frame(next_sequence) {
+            debug!("Decoding frame with sequence: {}", next_sequence);
             if let Err(e) = self.decoder.decode(frame.clone()) {
-                log::error!("Error decoding frame: {:?}", e);
+                error!("Error decoding frame: {:?}", e);
             } else {
-                log::debug!(
+                debug!(
                     "Successfully decoded frame with sequence: {}",
                     next_sequence
                 );
             }
-            self.sequence = Some(next_sequence);
+
+            // Update state
+            self.state = DecoderState::Decoding {
+                last_sequence: next_sequence,
+            };
+
             Some(frame)
         } else {
-            log::warn!("Frame with sequence {} not found in buffer", next_sequence);
+            warn!("Frame with sequence {} not found in buffer", next_sequence);
             None
         }
     }
 
+    /// Get the current state of the decoder
     pub fn state(&self) -> CodecState {
         self.decoder.state()
-    }
-
-    // Find the next keyframe in the buffer after the given sequence
-    fn find_next_keyframe(&self, after_sequence: u64) -> Option<u64> {
-        for (seq, packet) in self.buffer.iter() {
-            if *seq > after_sequence && self.decoder.is_keyframe(packet) {
-                return Some(*seq);
-            }
-        }
-        None
-    }
-
-    // Clear the buffer up to the given sequence (inclusive)
-    fn clear_buffer_up_to(&mut self, up_to_sequence: u64) {
-        let keys_to_remove: Vec<u64> = self
-            .buffer
-            .keys()
-            .filter(|&&seq| seq <= up_to_sequence)
-            .cloned()
-            .collect();
-
-        for key in keys_to_remove {
-            self.buffer.remove(&key);
-        }
-
-        log::debug!(
-            "Cleared buffer up to sequence {}, new size: {}",
-            up_to_sequence,
-            self.buffer.len()
-        );
     }
 }
 
@@ -349,10 +327,8 @@ pub type AudioDecoderWithBuffer<T> = MediaDecoderWithBuffer<T>;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::decode::media_decoder_trait::MediaDecoderTrait;
-    use crate::decode::media_decoder_with_buffer::{
-        MediaDecoderWithBuffer, MAX_BUFFER_SIZE, MIN_BUFFER_SIZE,
-    };
     use crate::wrappers::EncodedVideoChunkTypeWrapper;
     use std::sync::{Arc, Mutex};
     use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket, VideoMetadata};
@@ -513,7 +489,10 @@ mod tests {
         }
 
         // Verify buffer state - we should have buffered at least some frames
-        assert!(!decoder.buffer.is_empty(), "Buffer should contain frames");
+        assert!(
+            !decoder.buffer_manager.is_empty(),
+            "Buffer should contain frames"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -595,7 +574,7 @@ mod tests {
 
         // Check buffer contains the keyframe
         assert!(
-            decoder.buffer.contains_key(&20),
+            decoder.buffer_manager.get_frame(20).is_some(),
             "Buffer should contain the keyframe after reset"
         );
 
@@ -643,9 +622,6 @@ mod tests {
             ));
         }
 
-        // Save current buffer state (not used but kept for clarity)
-        let _buffer_before = decoder.buffer.len();
-
         // Add a frame with a large sequence gap
         let large_sequence = 1000;
         decoder.decode(create_mock_video_packet(
@@ -656,21 +632,21 @@ mod tests {
 
         // Verify buffer state
         assert!(
-            decoder.buffer.contains_key(&large_sequence),
+            decoder.buffer_manager.get_frame(large_sequence).is_some(),
             "Buffer should contain the high-sequence frame"
         );
 
         // Either the buffer was reset and only contains the new frame,
         // or it contains the new frame plus some old ones
         assert!(
-            !decoder.buffer.is_empty(),
+            !decoder.buffer_manager.is_empty(),
             "Buffer should contain at least the new frame"
         );
 
-        if decoder.buffer.len() == 1 {
+        if decoder.buffer_manager.size() == 1 {
             // If reset happened, only the new frame should be there
             assert!(
-                decoder.buffer.keys().next() == Some(&large_sequence),
+                decoder.buffer_manager.next_sequence() == Some(large_sequence),
                 "Buffer should only contain the new frame"
             );
         }
@@ -771,7 +747,7 @@ mod tests {
 
         // Verify buffer size doesn't exceed MAX_BUFFER_SIZE
         assert!(
-            decoder.buffer.len() <= MAX_BUFFER_SIZE,
+            decoder.buffer_manager.size() <= MAX_BUFFER_SIZE,
             "Buffer size should not exceed MAX_BUFFER_SIZE ({})",
             MAX_BUFFER_SIZE
         );
@@ -786,11 +762,11 @@ mod tests {
 
         // Verify buffer was reset and contains keyframe
         assert!(
-            decoder.buffer.contains_key(&keyframe_seq),
+            decoder.buffer_manager.get_frame(keyframe_seq).is_some(),
             "Buffer should contain keyframe after max size reset"
         );
         assert!(
-            decoder.buffer.len() < MAX_BUFFER_SIZE,
+            decoder.buffer_manager.size() < MAX_BUFFER_SIZE,
             "Buffer should be smaller after keyframe reset"
         );
 
@@ -804,7 +780,7 @@ mod tests {
         }
 
         assert!(
-            decoder.buffer.len() <= MAX_BUFFER_SIZE,
+            decoder.buffer_manager.size() <= MAX_BUFFER_SIZE,
             "Buffer size should remain bounded by MAX_BUFFER_SIZE"
         );
     }
@@ -832,7 +808,10 @@ mod tests {
         }
 
         // Verify buffer state - we should have buffered at least some frames
-        assert!(!decoder.buffer.is_empty(), "Buffer should contain frames");
+        assert!(
+            !decoder.buffer_manager.is_empty(),
+            "Buffer should contain frames"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -890,7 +869,7 @@ mod tests {
 
         // Check buffer contains the keyframe
         assert!(
-            decoder.buffer.contains_key(&20),
+            decoder.buffer_manager.get_frame(20).is_some(),
             "Buffer should contain the keyframe after reset"
         );
 
@@ -930,30 +909,27 @@ mod tests {
             decoder.decode(create_mock_audio_packet(i as u64, false, vec![i as u8]));
         }
 
-        // Save current buffer state (not used but kept for clarity)
-        let _buffer_before = decoder.buffer.len();
-
         // Add a frame with a large sequence gap
         let large_sequence = 1000;
         decoder.decode(create_mock_audio_packet(large_sequence, false, vec![100]));
 
         // Verify buffer state
         assert!(
-            decoder.buffer.contains_key(&large_sequence),
+            decoder.buffer_manager.get_frame(large_sequence).is_some(),
             "Buffer should contain the high-sequence frame"
         );
 
         // Either the buffer was reset and only contains the new frame,
         // or it contains the new frame plus some old ones
         assert!(
-            !decoder.buffer.is_empty(),
+            !decoder.buffer_manager.is_empty(),
             "Buffer should contain at least the new frame"
         );
 
-        if decoder.buffer.len() == 1 {
+        if decoder.buffer_manager.size() == 1 {
             // If reset happened, only the new frame should be there
             assert!(
-                decoder.buffer.keys().next() == Some(&large_sequence),
+                decoder.buffer_manager.next_sequence() == Some(large_sequence),
                 "Buffer should only contain the new frame"
             );
         }

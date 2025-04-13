@@ -1,5 +1,7 @@
 pub mod audio_decoder_wrapper;
+pub mod buffer_manager;
 pub mod config;
+pub mod decoder_state;
 pub mod hash_map_with_ordered_keys;
 pub mod media_decoder_trait;
 pub mod media_decoder_with_buffer;

@@ -1,7 +1,6 @@
 // yew-ui/src/components/host.rs
 use crate::components::device_selector::DeviceSelector;
 use crate::constants::*; // Assuming bitrate constants are defined here now
-use crate::utils::is_ios; // Assuming utils module exists at crate root
 use futures::channel::mpsc::{self, UnboundedReceiver}; // For MPSC channel
 use gloo_timers::callback::Timeout;
 use log::{debug, error, info}; // Use info/error where appropriate
@@ -9,14 +8,14 @@ use std::fmt::{self, Debug, Display};
 use videocall_client::{
     // Import concrete types for instantiation
     CameraEncoder,
-    MicrophoneEncoder,
-    ScreenEncoder,
-    VideoCallClient,
-    // Import the new iOS encoder
-    IosCameraEncoder,
     // Assume EncoderControlMessage enum/struct is defined in videocall-client
     // E.g., pub enum EncoderControlMessage { SetBitrate(u32), RequestKeyframe }
     EncoderControlMessage,
+    // Import the new iOS encoder
+    IosCameraEncoder,
+    MicrophoneEncoder,
+    ScreenEncoder,
+    VideoCallClient,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
@@ -114,7 +113,7 @@ pub struct Host {
     // TODO: Define and implement MicrophoneEncoderTrait and ScreenEncoderTrait if needed
     pub camera: Box<dyn CameraEncoderTrait>,
     pub microphone: MicrophoneEncoder, // Keep concrete for now, assume no iOS issue
-    pub screen: ScreenEncoder,       // Keep concrete for now
+    pub screen: ScreenEncoder,         // Keep concrete for now
     // State flags
     pub share_screen: bool,
     pub mic_enabled: bool,
@@ -156,36 +155,21 @@ impl Component for Host {
             info!("Platform detected as iOS. Using IosCameraEncoder.");
             // Ensure IosCameraEncoder::new signature matches required parameters
             // Assuming new signature is new(client, element_id, bitrate_kbps, settings_callback)
-            match IosCameraEncoder::new(
+            IosCameraEncoder::new(
                 client.clone(),
                 VIDEO_ELEMENT_ID,
                 VIDEO_BITRATE_KBPS, // Pass bitrate constant
                 camera_callback,    // Pass settings callback
-            ) {
-                Ok(encoder) => Box::new(encoder),
-                Err(e) => {
-                    error!("Failed to create IosCameraEncoder: {:?}", e);
-                    // Fallback to a dummy/non-functional encoder to avoid panic
-                    // TODO: Implement a proper dummy encoder or handle error gracefully
-                    Box::new(DummyCameraEncoder::new())
-                }
-            }
+            )
         } else {
             info!("Platform detected as non-iOS. Using standard CameraEncoder.");
             // Ensure CameraEncoder::new signature matches required parameters
-            match CameraEncoder::new(
+            Box::new(CameraEncoder::new(
                 client.clone(),
                 VIDEO_ELEMENT_ID,
                 VIDEO_BITRATE_KBPS, // Pass bitrate constant
                 camera_callback,    // Pass settings callback
-            ) {
-                 Ok(encoder) => Box::new(encoder),
-                 Err(e) => {
-                    error!("Failed to create CameraEncoder: {:?}", e);
-                    // Fallback to a dummy/non-functional encoder
-                     Box::new(DummyCameraEncoder::new())
-                 }
-            }
+            ))
         };
 
         // --- Standard Microphone and Screen Encoder Creation ---
@@ -194,48 +178,38 @@ impl Component for Host {
             client.clone(),
             AUDIO_BITRATE_KBPS, // Pass bitrate constant
             microphone_callback,
-        )
-        .expect("Failed to create MicrophoneEncoder"); // Handle potential errors
-
+        );
         let mut screen = ScreenEncoder::new(
             client.clone(),
             SCREEN_BITRATE_KBPS, // Pass bitrate constant
             screen_callback,
-        )
-        .expect("Failed to create ScreenEncoder"); // Handle potential errors
+        ); // Handle potential errors
 
         // --- Setup Encoder Control Channels ---
         // Setup requires mutable access, do it after initial creation
 
         // Camera Control Channel
-        { // Scope to contain mutable borrow of camera
+        {
+            // Scope to contain mutable borrow of camera
             let mut camera_mut = camera; // Rebind as mutable, Note: Box is implicitly DerefMut if needed inside scope
             let (tx_cam, rx_cam) = mpsc::unbounded::<EncoderControlMessage>();
             // Assuming subscribe_diagnostics is infallible or returns Result
-            client
-                .subscribe_diagnostics(tx_cam, MediaType::VIDEO)
-                .expect("Failed to subscribe video diagnostics");
+            client.subscribe_diagnostics(tx_cam, MediaType::VIDEO);
             camera_mut.set_encoder_control(rx_cam); // Call method on the trait object
-             // Explicitly drop mutable borrow before camera is moved into Self struct
-             // Although moving it should also drop the temporary mutable borrow implicitly.
+                                                    // Explicitly drop mutable borrow before camera is moved into Self struct
+                                                    // Although moving it should also drop the temporary mutable borrow implicitly.
             drop(camera_mut);
         }
 
-
         // Microphone Control Channel
         let (tx_mic, rx_mic) = mpsc::unbounded::<EncoderControlMessage>();
-        client
-            .subscribe_diagnostics(tx_mic, MediaType::AUDIO)
-            .expect("Failed to subscribe audio diagnostics");
+        client.subscribe_diagnostics(tx_mic, MediaType::AUDIO);
         microphone.set_encoder_control(rx_mic); // Assuming method exists
 
         // Screen Control Channel
         let (tx_screen, rx_screen) = mpsc::unbounded::<EncoderControlMessage>();
-        client
-            .subscribe_diagnostics(tx_screen, MediaType::SCREEN)
-            .expect("Failed to subscribe screen diagnostics");
+        client.subscribe_diagnostics(tx_screen, MediaType::SCREEN);
         screen.set_encoder_control(rx_screen); // Assuming method exists
-
 
         info!("Host component created and encoders initialized.");
 
@@ -254,43 +228,48 @@ impl Component for Host {
         // --- Screen Share Logic ---
         let target_screen_enabled = ctx.props().share_screen;
         // Use set_enabled result *and* compare state to avoid redundant messages
-        if self.screen.set_enabled(target_screen_enabled) || self.share_screen != target_screen_enabled {
+        if self.screen.set_enabled(target_screen_enabled)
+            || self.share_screen != target_screen_enabled
+        {
             self.share_screen = target_screen_enabled; // Update internal state
             if target_screen_enabled {
-                 // Delay before starting screen share to allow user prompt etc.
-                 let link = ctx.link().clone();
-                 let timeout = Timeout::new(1000, move || {
-                     link.send_message(Msg::EnableScreenShare);
-                 });
-                 timeout.forget();
+                // Delay before starting screen share to allow user prompt etc.
+                let link = ctx.link().clone();
+                let timeout = Timeout::new(1000, move || {
+                    link.send_message(Msg::EnableScreenShare);
+                });
+                timeout.forget();
             } else {
-                 ctx.link().send_message(Msg::DisableScreenShare);
+                ctx.link().send_message(Msg::DisableScreenShare);
             }
         }
 
         // --- Microphone Logic ---
         let target_mic_enabled = ctx.props().mic_enabled;
-         if self.microphone.set_enabled(target_mic_enabled) || self.mic_enabled != target_mic_enabled {
+        if self.microphone.set_enabled(target_mic_enabled) || self.mic_enabled != target_mic_enabled
+        {
             self.mic_enabled = target_mic_enabled; // Update internal state
-            // EnableMicrophone msg handles start, DisableMicrophone handles stop
-             ctx.link().send_message(if target_mic_enabled {
-                 Msg::EnableMicrophone(true)
-             } else {
-                 Msg::DisableMicrophone
-             });
-         }
+                                                   // EnableMicrophone msg handles start, DisableMicrophone handles stop
+            ctx.link().send_message(if target_mic_enabled {
+                Msg::EnableMicrophone(true)
+            } else {
+                Msg::DisableMicrophone
+            });
+        }
 
         // --- Camera Logic (Uses Trait Object) ---
         let target_video_enabled = ctx.props().video_enabled;
-         if self.camera.set_enabled(target_video_enabled) || self.video_enabled != target_video_enabled {
+        if self.camera.set_enabled(target_video_enabled)
+            || self.video_enabled != target_video_enabled
+        {
             self.video_enabled = target_video_enabled; // Update internal state
-            // EnableVideo msg handles start, DisableVideo handles stop
-             ctx.link().send_message(if target_video_enabled {
-                 Msg::EnableVideo(true)
-             } else {
-                 Msg::DisableVideo
-             });
-         }
+                                                       // EnableVideo msg handles start, DisableVideo handles stop
+            ctx.link().send_message(if target_video_enabled {
+                Msg::EnableVideo(true)
+            } else {
+                Msg::DisableVideo
+            });
+        }
 
         // --- Update Client State ---
         // TODO: Confirm if these methods exist on VideoCallClient and if they are necessary
@@ -317,7 +296,8 @@ impl Component for Host {
             Msg::DisableScreenShare => {
                 info!("Stopping screen share encoder...");
                 self.screen.stop();
-                if self.encoder_settings.screen.take().is_some() { // Clear settings if stopping
+                if self.encoder_settings.screen.take().is_some() {
+                    // Clear settings if stopping
                     ctx.props()
                         .on_encoder_settings_update
                         .emit(self.encoder_settings.to_string());
@@ -329,18 +309,20 @@ impl Component for Host {
                 // Initial setup actions could go here if needed beyond `rendered`
             }
             Msg::EnableMicrophone(should_enable) => {
-                if should_enable && self.mic_enabled { // Ensure it's actually enabled
+                if should_enable && self.mic_enabled {
+                    // Ensure it's actually enabled
                     info!("Starting microphone encoder...");
                     self.microphone.start();
                 } else if !should_enable {
-                     // This case might be handled by DisableMicrophone message now
-                     info!("EnableMicrophone(false) called but handled by DisableMicrophone path.");
+                    // This case might be handled by DisableMicrophone message now
+                    info!("EnableMicrophone(false) called but handled by DisableMicrophone path.");
                 }
             }
             Msg::DisableMicrophone => {
                 info!("Stopping microphone encoder...");
                 self.microphone.stop();
-                if self.encoder_settings.microphone.take().is_some() { // Clear settings
+                if self.encoder_settings.microphone.take().is_some() {
+                    // Clear settings
                     ctx.props()
                         .on_encoder_settings_update
                         .emit(self.encoder_settings.to_string());
@@ -348,17 +330,19 @@ impl Component for Host {
                 }
             }
             Msg::EnableVideo(should_enable) => {
-                if should_enable && self.video_enabled { // Ensure it's actually enabled
+                if should_enable && self.video_enabled {
+                    // Ensure it's actually enabled
                     info!("Starting camera encoder...");
                     self.camera.start(); // Call method on trait object
                 } else if !should_enable {
-                     info!("EnableVideo(false) called but handled by DisableVideo path.");
+                    info!("EnableVideo(false) called but handled by DisableVideo path.");
                 }
             }
             Msg::DisableVideo => {
                 info!("Stopping camera encoder...");
                 self.camera.stop(); // Call method on trait object
-                if self.encoder_settings.camera.take().is_some() { // Clear settings
+                if self.encoder_settings.camera.take().is_some() {
+                    // Clear settings
                     ctx.props()
                         .on_encoder_settings_update
                         .emit(self.encoder_settings.to_string());
@@ -384,16 +368,16 @@ impl Component for Host {
                 info!("Video device selection changed to: {}", video_device_id);
                 // Pass the selected device ID to the camera encoder (trait object)
                 if self.camera.select(video_device_id) && self.video_enabled {
-                     // If selection changed AND video is currently enabled, restart it after delay
-                     info!("Camera selection changed, restarting encoder...");
-                     let link = ctx.link().clone();
-                     // Short delay to allow device switch
-                     let timeout = Timeout::new(500, move || {
-                         link.send_message(Msg::EnableVideo(true));
-                     });
+                    // If selection changed AND video is currently enabled, restart it after delay
+                    info!("Camera selection changed, restarting encoder...");
+                    let link = ctx.link().clone();
+                    // Short delay to allow device switch
+                    let timeout = Timeout::new(500, move || {
+                        link.send_message(Msg::EnableVideo(true));
+                    });
                     timeout.forget();
                 }
-                 // No direct render change needed
+                // No direct render change needed
             }
             Msg::CameraEncoderSettingsUpdated(settings) => {
                 debug!("Received camera settings update: {}", settings);
@@ -406,8 +390,8 @@ impl Component for Host {
                 }
             }
             Msg::MicrophoneEncoderSettingsUpdated(settings) => {
-                 debug!("Received microphone settings update: {}", settings);
-                 if self.encoder_settings.microphone.as_ref() != Some(&settings) {
+                debug!("Received microphone settings update: {}", settings);
+                if self.encoder_settings.microphone.as_ref() != Some(&settings) {
                     self.encoder_settings.microphone = Some(settings);
                     ctx.props()
                         .on_encoder_settings_update
@@ -416,8 +400,8 @@ impl Component for Host {
                 }
             }
             Msg::ScreenEncoderSettingsUpdated(settings) => {
-                 debug!("Received screen settings update: {}", settings);
-                 if self.encoder_settings.screen.as_ref() != Some(&settings) {
+                debug!("Received screen settings update: {}", settings);
+                if self.encoder_settings.screen.as_ref() != Some(&settings) {
                     self.encoder_settings.screen = Some(settings);
                     ctx.props()
                         .on_encoder_settings_update
@@ -453,27 +437,33 @@ impl Component for Host {
     }
 }
 
-
 // --- Dummy Encoder Implementation (for fallback / trait example) ---
 // TODO: Place this appropriately, perhaps in its own module or conditionally compiled
 #[derive(Debug, Default)]
 pub struct DummyCameraEncoder {}
 
 impl DummyCameraEncoder {
-    pub fn new() -> Self { Self {} }
+    pub fn new() -> Self {
+        Self {}
+    }
 }
 
 // Make dummy implement the trait so Box<dyn> works even on error
 impl CameraEncoderTrait for DummyCameraEncoder {
-    fn set_enabled(&mut self, _value: bool) -> bool { false }
-    fn select(&mut self, _device_id: String) -> bool { false }
-    fn start(&mut self) { error!("DummyCameraEncoder cannot start - check for initialization errors."); }
+    fn set_enabled(&mut self, _value: bool) -> bool {
+        false
+    }
+    fn select(&mut self, _device_id: String) -> bool {
+        false
+    }
+    fn start(&mut self) {
+        error!("DummyCameraEncoder cannot start - check for initialization errors.");
+    }
     fn stop(&mut self) {}
     fn set_encoder_control(&mut self, _rx: UnboundedReceiver<EncoderControlMessage>) {
-         warn!("DummyCameraEncoder received encoder control channel - ignoring.");
+        log::warn!("DummyCameraEncoder received encoder control channel - ignoring.");
     }
 }
-
 
 // NOTE: You will need to define the `CameraEncoderTrait` in a place accessible
 // by both `host.rs` and the actual encoder implementations (`CameraEncoder`, `IosCameraEncoder`)

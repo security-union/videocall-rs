@@ -1,6 +1,6 @@
 mod camera_encoder;
 mod encoder_state;
-mod ios_camera_encoder;
+pub mod ios_camera_encoder;
 mod microphone_encoder;
 mod screen_encoder;
 mod transform;

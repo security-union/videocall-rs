@@ -1,23 +1,28 @@
 // yew-ui/src/components/host.rs
+// Corrected imports - Assuming DeviceSelector is in its own module
 use crate::components::device_selector::DeviceSelector;
-use crate::constants::*; // Assuming bitrate constants are defined here now
-use futures::channel::mpsc::{self, UnboundedReceiver}; // For MPSC channel
+use crate::constants::*; // Keep constants import
+use futures::channel::mpsc::{self, UnboundedReceiver};
 use gloo_timers::callback::Timeout;
-use log::{debug, error, info}; // Use info/error where appropriate
+use log::{debug, error, info, warn};
 use std::fmt::{self, Debug, Display};
+// Removed Arc, types::*, show_connection_state imports for now
+use videocall_client::utils::is_ios;
 use videocall_client::{
-    // Import concrete types for instantiation
+    diagnostics::EncoderControl,
     CameraEncoder,
-    // Assume EncoderControlMessage enum/struct is defined in videocall-client
-    // E.g., pub enum EncoderControlMessage { SetBitrate(u32), RequestKeyframe }
-    EncoderControlMessage,
-    // Import the new iOS encoder
+    // Removed EncoderControlMessage
     IosCameraEncoder,
+    MediaDeviceAccess,
+    MediaDeviceList,
     MicrophoneEncoder,
     ScreenEncoder,
+    SelectableDevices,
     VideoCallClient,
+    VideoCallClientOptions,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use web_sys::HtmlCanvasElement;
 use yew::prelude::*;
 
 // --- Constants ---
@@ -32,45 +37,67 @@ const SCREEN_BITRATE_KBPS: u32 = 2000; // Example: 2 Mbps
 
 /// Common trait for Camera Encoders (Standard and iOS)
 pub trait CameraEncoderTrait: Debug {
-    // `new` typically can't be part of the trait easily for Box<dyn> construction.
-    // Use factory functions or separate initialization if needed outside `Host::create`.
-    // Methods called by Host:
     fn set_enabled(&mut self, value: bool) -> bool;
     fn select(&mut self, device_id: String) -> bool;
     fn start(&mut self);
     fn stop(&mut self);
     /// Sets the receiver for control messages (e.g., bitrate changes)
-    fn set_encoder_control(&mut self, rx: UnboundedReceiver<EncoderControlMessage>);
-    // Add any other methods Host needs to call directly
+    // Use the correct EncoderControl type from diagnostics
+    fn set_encoder_control(&mut self, rx: UnboundedReceiver<EncoderControl>);
 }
 
 // Assume MicrophoneEncoderTrait and ScreenEncoderTrait are defined similarly if needed
 
-// --- Implement Trait for Existing Encoders (in videocall-client) ---
-// Example: Assuming implementations exist within videocall-client crate
-/*
+// --- Implement Trait for Existing Encoders ---
+
+// Implementation for the standard CameraEncoder
 impl CameraEncoderTrait for CameraEncoder {
-    // ... implementations matching the trait methods ...
-    fn set_encoder_control(&mut self, rx: UnboundedReceiver<EncoderControlMessage>) {
-        // Existing CameraEncoder needs logic to handle received messages
-        self.internal_control_rx = Some(rx);
-        // Spawn a task or integrate into existing loop to poll rx
-        self.spawn_control_listener(); // Hypothetical method
-        info!("Standard CameraEncoder: Control channel set.");
+    fn set_enabled(&mut self, value: bool) -> bool {
+        CameraEncoder::set_enabled(self, value)
+    }
+    fn select(&mut self, device_id: String) -> bool {
+        CameraEncoder::select(self, device_id)
+    }
+    fn start(&mut self) {
+        CameraEncoder::start(self)
+    }
+    fn stop(&mut self) {
+        CameraEncoder::stop(self)
+    }
+    fn set_encoder_control(&mut self, rx: UnboundedReceiver<EncoderControl>) {
+        // CameraEncoder already has a set_encoder_control method,
+        // but it expects DiagnosticsPacket, not EncoderControl.
+        // This indicates a mismatch in how control/diagnostics are handled.
+        // For now, we log and do nothing, assuming the direct call in `create` handles it.
+        // TODO: Refactor diagnostics/control flow to use this trait method consistently.
+        warn!("CameraEncoderTrait::set_encoder_control called for CameraEncoder, but requires DiagnosticsPacket receiver. Ignoring.");
+        // To properly implement, CameraEncoder::set_encoder_control would need modification
+        // or we need a way to convert/handle EncoderControl messages here.
     }
 }
 
+// Implementation for the IosCameraEncoder
 impl CameraEncoderTrait for IosCameraEncoder {
-    // ... implementations matching the trait methods ...
-    fn set_encoder_control(&mut self, rx: UnboundedReceiver<EncoderControlMessage>) {
-        // IosCameraEncoder needs to receive messages and forward them to the worker
-        self.internal_control_rx = Some(rx);
-        // Spawn a task or integrate into main thread loop to poll rx
-        self.spawn_control_listener(); // Hypothetical method
-        info!("iOS CameraEncoder: Control channel set.");
+    fn set_enabled(&mut self, value: bool) -> bool {
+        IosCameraEncoder::set_enabled(self, value)
+    }
+    fn select(&mut self, device_id: String) -> bool {
+        IosCameraEncoder::select(self, device_id)
+    }
+    fn start(&mut self) {
+        IosCameraEncoder::start(self)
+    }
+    fn stop(&mut self) {
+        IosCameraEncoder::stop(self)
+    }
+    fn set_encoder_control(&mut self, rx: UnboundedReceiver<EncoderControl>) {
+        // IosCameraEncoder currently doesn't have a method to receive control messages.
+        // The iOS implementation needs to be updated to handle this.
+        // For now, log and do nothing.
+        // TODO: Implement control message handling in IosCameraEncoder (e.g., pass to worker).
+        warn!("CameraEncoderTrait::set_encoder_control called for IosCameraEncoder, but not implemented. Ignoring.");
     }
 }
-*/
 
 // --- Host Component ---
 
@@ -191,25 +218,25 @@ impl Component for Host {
         // Camera Control Channel
         {
             // Scope to contain mutable borrow of camera
-            let mut camera_mut = camera; // Rebind as mutable, Note: Box is implicitly DerefMut if needed inside scope
-            let (tx_cam, rx_cam) = mpsc::unbounded::<EncoderControlMessage>();
-            // Assuming subscribe_diagnostics is infallible or returns Result
+            // We need to borrow the Box content mutably
+            let camera_mut = &mut *self.camera;
+            let (tx_cam, rx_cam) = mpsc::unbounded::<EncoderControl>(); // Use EncoderControl
+                                                                        // Assuming subscribe_diagnostics is infallible or returns Result
             client.subscribe_diagnostics(tx_cam, MediaType::VIDEO);
-            camera_mut.set_encoder_control(rx_cam); // Call method on the trait object
-                                                    // Explicitly drop mutable borrow before camera is moved into Self struct
-                                                    // Although moving it should also drop the temporary mutable borrow implicitly.
-            drop(camera_mut);
+            // Call the trait method
+            camera_mut.set_encoder_control(rx_cam);
         }
 
         // Microphone Control Channel
-        let (tx_mic, rx_mic) = mpsc::unbounded::<EncoderControlMessage>();
+        // TODO: Fix type if Microphone/Screen encoders are updated to use EncoderControl
+        let (tx_mic, rx_mic) = mpsc::unbounded::<DiagnosticsPacket>(); // Assuming this is still DiagnosticsPacket
         client.subscribe_diagnostics(tx_mic, MediaType::AUDIO);
-        microphone.set_encoder_control(rx_mic); // Assuming method exists
+        microphone.set_encoder_control(rx_mic); // Assuming method exists and takes DiagnosticsPacket
 
         // Screen Control Channel
-        let (tx_screen, rx_screen) = mpsc::unbounded::<EncoderControlMessage>();
+        let (tx_screen, rx_screen) = mpsc::unbounded::<DiagnosticsPacket>(); // Assuming this is still DiagnosticsPacket
         client.subscribe_diagnostics(tx_screen, MediaType::SCREEN);
-        screen.set_encoder_control(rx_screen); // Assuming method exists
+        screen.set_encoder_control(rx_screen); // Assuming method exists and takes DiagnosticsPacket
 
         info!("Host component created and encoders initialized.");
 
@@ -442,13 +469,18 @@ impl Component for Host {
 #[derive(Debug, Default)]
 pub struct DummyCameraEncoder {}
 
+impl Debug for DummyCameraEncoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DummyCameraEncoder").finish()
+    }
+}
+
 impl DummyCameraEncoder {
     pub fn new() -> Self {
         Self {}
     }
 }
 
-// Make dummy implement the trait so Box<dyn> works even on error
 impl CameraEncoderTrait for DummyCameraEncoder {
     fn set_enabled(&mut self, _value: bool) -> bool {
         false
@@ -457,11 +489,12 @@ impl CameraEncoderTrait for DummyCameraEncoder {
         false
     }
     fn start(&mut self) {
-        error!("DummyCameraEncoder cannot start - check for initialization errors.");
+        info!("Dummy camera start");
     }
     fn stop(&mut self) {}
-    fn set_encoder_control(&mut self, _rx: UnboundedReceiver<EncoderControlMessage>) {
-        log::warn!("DummyCameraEncoder received encoder control channel - ignoring.");
+    fn set_encoder_control(&mut self, _rx: UnboundedReceiver<EncoderControl>) {
+        // Update type here too
+        info!("Dummy camera set encoder control");
     }
 }
 

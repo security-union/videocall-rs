@@ -76,8 +76,10 @@ pub mod decode;
 pub mod diagnostics;
 mod encode;
 mod media_devices;
+pub mod utils;
 mod wrappers;
 
 pub use client::{VideoCallClient, VideoCallClientOptions};
+pub use encode::ios_camera_encoder::IosCameraEncoder;
 pub use encode::{CameraEncoder, MicrophoneEncoder, ScreenEncoder};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};

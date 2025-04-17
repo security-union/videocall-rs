@@ -2,7 +2,7 @@
 use crate::client::VideoCallClient;
 use crate::crypto::aes::Aes128State;
 use crate::encode::encoder_state::EncoderState;
-use crate::encode::transform::transform_video_chunk; // Use existing transform function
+// use crate::encode::transform::transform_video_chunk; // Use existing transform function - Removed as unused
 use crate::utils::is_ios; // Use the actual utility
 use gloo_utils::window;
 use log::{error, info};
@@ -11,14 +11,19 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{self, MediaPacket, VideoMetadata};
+use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
 use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    CanvasRenderingContext2d, HtmlCanvasElement, HtmlVideoElement, MediaStream,
-    MediaStreamConstraints, MessageEvent, Worker, WorkerOptions,
+    CanvasRenderingContext2d,
+    HtmlCanvasElement,
+    HtmlVideoElement,
+    MediaStream,
+    MediaStreamConstraints,
+    MessageEvent,
+    Worker, // Removed WorkerOptions
 };
 
 // Structure matching the output from the Worker/WASM encoder
@@ -161,6 +166,8 @@ impl IosCameraEncoder {
     }
 
     pub fn start(&mut self) {
+        // Keep device_id, video_elem_id, inner_rc, client_clone, even if unused for now
+        // Their presence might be necessary when the commented-out code is re-enabled
         let device_id = match &self.state.selected {
             Some(id) if self.state.enabled.load(Ordering::Acquire) => id.clone(),
             _ => {
@@ -182,20 +189,22 @@ impl IosCameraEncoder {
         // Spawn the main async task for setting up and running the loop
         wasm_bindgen_futures::spawn_local(async move {
             // The implementation of the encoder is commented out, to be completed later
+            // Prevent unused variable warnings for now
+            let _ = (device_id, video_elem_id, inner_rc, client_clone);
         });
     }
 
     // --- Helper: Get MediaStream ---
     async fn get_media_stream(device_id: &str) -> Result<MediaStream, JsValue> {
-        let win = window();
+        let win = window(); // Directly use the returned Window
 
         let navigator = win.navigator();
         let media_devices = navigator
             .media_devices()
             .map_err(|_| JsValue::from_str("MediaDevices not available"))?;
 
-        let mut constraints = MediaStreamConstraints::new();
-        let mut media_info = web_sys::MediaTrackConstraints::new();
+        let constraints = MediaStreamConstraints::new();
+        let media_info = web_sys::MediaTrackConstraints::new();
         media_info.set_device_id(&JsValue::from_str(device_id));
         // Request specific resolution for capture if desired
         media_info.set_width(&JsValue::from(640)); // Example: Request 640 width
@@ -213,10 +222,11 @@ impl IosCameraEncoder {
         video_elem_id: &str,
         stream: &MediaStream,
     ) -> Result<HtmlVideoElement, JsValue> {
-        let win = window();
+        let win = window(); // Directly use the returned Window
+
         let document = win
             .document()
-            .ok_or_else(|| JsValue::from_str("No document"))?;
+            .ok_or_else(|| JsValue::from_str("Document not available"))?; // Document can be None
 
         let video_element = document
             .get_element_by_id(video_elem_id)
@@ -250,13 +260,13 @@ pub fn transform_video_bytes(
     duration: Option<f64>,
     is_keyframe: bool,
     sequence: u64,
-    buffer: &mut [u8], // Re-purpose buffer for MediaPacket serialization if needed, or remove if unused
+    _buffer: &mut [u8], // Mark buffer as unused for now
     email: &str,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
     let frame_type = if is_keyframe { "key" } else { "delta" }.to_string();
 
-    let mut media_packet = MediaPacket {
+    let media_packet = MediaPacket {
         data: encoded_data.to_vec(), // Copy encoded data directly
         frame_type,
         email: email.to_owned(),

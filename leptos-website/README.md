@@ -10,7 +10,7 @@ cargo-leptos is now the easiest and most featureful way to build server side ren
 
 1. Install cargo-leptos
 ```bash
-cargo install --locked cargo-leptos
+cargo install --locked cargo-leptos@0.2.29
 ``` 
 2. Install wasm-bindgen
 ```bash

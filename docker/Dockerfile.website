@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-leptos --version 0.2.20
+RUN cargo install --locked cargo-leptos@0.2.29
 
 WORKDIR /app/leptos-website
 

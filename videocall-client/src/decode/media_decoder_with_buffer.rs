@@ -74,15 +74,15 @@ impl<D: MediaDecoderTrait> MediaDecoderWithBuffer<D> {
         }
 
         // Only add the frame if it's not already in the buffer
-        if !self.buffer.contains_key(&new_sequence) {
-            self.buffer.insert(new_sequence, packet);
-            log::info!(
+        if let std::collections::btree_map::Entry::Vacant(e) = self.buffer.entry(new_sequence) {
+            e.insert(packet);
+            log::debug!(
                 "Added frame {} to buffer, new size: {}",
                 new_sequence,
                 self.buffer.len()
             );
         } else {
-            log::info!("Frame {} already in buffer, skipping", new_sequence);
+            log::debug!("Frame {} already in buffer, skipping", new_sequence);
         }
 
         // Check if we've been waiting too long for a missing frame

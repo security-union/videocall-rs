@@ -14,7 +14,7 @@ cargo install --locked cargo-leptos
 ``` 
 2. Install wasm-bindgen
 ```bash
-cargo install wasm-bindgen-cli@0.2.93 --locked
+cargo install wasm-bindgen-cli@0.2.100 --locked
 ```
 
 2. Build the site in watch mode, recompiling on file changes

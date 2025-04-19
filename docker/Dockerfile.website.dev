@@ -1,7 +1,6 @@
-FROM rust:1.80-slim-bookworm
+FROM rust:1.83-slim-bookworm
 
-RUN rustup default nightly-2024-08-21
-RUN rustup target add wasm32-unknown-unknown
+RUN rustup default nightly-2024-11-01
 
 RUN apt-get update && apt-get install -y \
     libssl-dev \

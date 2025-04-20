@@ -2,6 +2,7 @@
 
 use crate::components::SecondaryButton;
 use crate::components::SphereLogo::*;
+use crate::icons::DigitalOceanIcon;
 use leptos::*;
 use leptos_meta::Style;
 use leptos_router::A;
@@ -59,7 +60,7 @@ pub fn HeroHeader() -> impl IntoView {
                                 </div>
                             </ShowWhenOpen>
                             <div>
-                                <div class="flex gap-5 md:gap-8 justify-center items-center">
+                                <div class="flex gap-4 md:gap-6 justify-center items-center">
                                     <a href="https://discord.gg/XRdt6WfZyf">
                                         <img
                                             class="block h-6 w-6"
@@ -73,6 +74,9 @@ pub fn HeroHeader() -> impl IntoView {
                                             src="/images/github_logo.svg"
                                             alt="GitHub"
                                         />
+                                    </a>
+                                    <a href="https://m.do.co/c/6de4e19c5193" class="block h-8 w-24">
+                                        <DigitalOceanIcon />
                                     </a>
                                     <DarkModeToggle/>
                                 </div>

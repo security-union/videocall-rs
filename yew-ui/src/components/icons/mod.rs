@@ -1,3 +1,4 @@
+pub mod digital_ocean;
 pub mod discord;
 pub mod mic;
 pub mod peer;

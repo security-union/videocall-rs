@@ -1,7 +1,6 @@
-FROM rust:1.80-slim-bookworm
+FROM rust:1.83-slim-bookworm
 
-RUN rustup default nightly-2024-08-21
-RUN rustup target add wasm32-unknown-unknown
+RUN rustup default nightly-2024-11-01
 
 RUN apt-get update && apt-get install -y \
     libssl-dev \
@@ -9,8 +8,8 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install cargo-leptos --version 0.2.29
-RUN cargo install wasm-bindgen-cli --version 0.2.93
+RUN cargo install --locked cargo-leptos@0.2.29
+RUN cargo install wasm-bindgen-cli@0.2.100 --locked
 
 RUN cargo install trunk --version 0.17.5
 

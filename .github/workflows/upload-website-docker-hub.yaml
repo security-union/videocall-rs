@@ -27,13 +27,6 @@ jobs:
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v3
       
       - name: Extract SHA
         id: extract_sha
@@ -52,7 +45,3 @@ jobs:
           tags: |
             securityunion/video-call-rs-website:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
             securityunion/video-call-rs-website:latest
-          # Enable build cache using GitHub Actions cache backend
-          cache-from: type=gha
-          # Export cache for future runs, using max mode for potentially better cache hits
-          cache-to: type=gha,mode=max

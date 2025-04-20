@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.9](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.8...videocall-ui-v1.0.9) - 2025-04-20
+
+### Other
+
+- Add digital ocean both in the readme and main page ([#260](https://github.com/security-union/videocall-rs/pull/260))
+
+### Removed
+
+- removed E2E encryption from description ([#249](https://github.com/security-union/videocall-rs/pull/249))
+
 ## [1.0.8](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.7...videocall-ui-v1.0.8) - 2025-03-31
 
 ### Added

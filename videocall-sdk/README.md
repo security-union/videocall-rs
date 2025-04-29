@@ -6,6 +6,8 @@ Native mobile bindings for the VideoCall project, providing iOS (Swift) and Andr
 
 ## Overview
 
+**Disclaimer:** This crate is currently intended for internal use within the VideoCall project. It is a work in progress, and API stability or long-term compatibility is not guaranteed at this stage.
+
 This crate extends the VideoCall project by providing native bindings for iOS and Android platforms using the [UniFFI](https://github.com/mozilla/uniffi-rs) library. It allows mobile developers to easily integrate the VideoCall WebTransport functionality into their iOS and Android applications.
 
 The bindings expose the core VideoCall functionality through platform-specific interfaces, handling the complexities of cross-language communication while maintaining the performance benefits of the Rust implementation.

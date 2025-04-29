@@ -1,4 +1,6 @@
-use crate::components::icons::{discord::DiscordIcon, youtube::YoutubeIcon};
+use crate::components::icons::{
+    digital_ocean::DigitalOceanIcon, discord::DiscordIcon, youtube::YoutubeIcon,
+};
 use yew::prelude::*;
 
 #[function_component(TopBar)]
@@ -17,6 +19,11 @@ pub fn top_bar() -> Html {
                 <a href="https://discord.gg/JP38NRe4CJ" class="m-auto" target="_blank">
                     <div class="w-8">
                         <DiscordIcon />
+                    </div>
+                </a>
+                <a href="https://m.do.co/c/6de4e19c5193" class="m-auto" target="_blank">
+                    <div class="w-16">
+                        <DigitalOceanIcon />
                     </div>
                 </a>
             </div>

@@ -3,7 +3,8 @@ use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
 use std::fmt::Debug;
-use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
+use videocall_client::encode::safari::microphone_encoder::MicrophoneEncoder as SafariMicrophoneEncoder;
+use videocall_client::{CameraEncoder, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
@@ -29,7 +30,7 @@ pub enum Msg {
 
 pub struct Host {
     pub camera: CameraEncoder,
-    pub microphone: MicrophoneEncoder,
+    pub microphone: SafariMicrophoneEncoder,
     pub screen: ScreenEncoder,
     pub share_screen: bool,
     pub mic_enabled: bool,
@@ -92,7 +93,7 @@ impl Component for Host {
             camera_callback,
         );
         let mut microphone =
-            MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+            SafariMicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
         let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS, screen_callback);
 
         let (tx, rx) = mpsc::unbounded();

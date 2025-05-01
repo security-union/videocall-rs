@@ -68,13 +68,14 @@
 //!
 //! ```
 
+pub mod audio_worklet_codec;
 mod client;
 mod connection;
 pub mod constants;
 pub mod crypto;
 pub mod decode;
 pub mod diagnostics;
-mod encode;
+pub mod encode;
 mod media_devices;
 mod wrappers;
 

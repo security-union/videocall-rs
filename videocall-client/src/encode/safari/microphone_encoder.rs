@@ -210,8 +210,10 @@ impl MicrophoneEncoder {
 
             let _ = codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
+                    encoder_frame_size: Some(20),
                     original_sample_rate: Some(input_rate),
-                    encoder_bit_rate: Some(AUDIO_BITRATE_KBPS as u32),
+                    encoder_bit_rate: Some(50_000 as u32),
+                    encoder_sample_rate: Some(AUDIO_SAMPLE_RATE as u32),
                     ..Default::default()
                 }),
             });

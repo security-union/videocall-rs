@@ -60,12 +60,12 @@ impl BrowserCompatibility {
         }
 
         // Check for AudioEncoder
-        if js_sys::Reflect::get(&window, &JsValue::from_str("AudioEncoder"))
-            .unwrap()
-            .is_undefined()
-        {
-            missing_features.push("AudioEncoder");
-        }
+        // if js_sys::Reflect::get(&window, &JsValue::from_str("AudioEncoder"))
+        //     .unwrap()
+        //     .is_undefined()
+        // {
+        //     missing_features.push("AudioEncoder");
+        // }
 
         if !missing_features.is_empty() {
             Some(format!(

@@ -2,10 +2,11 @@ use crate::constants::*;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
-use std::fmt::Debug;
-use videocall_client::encode::safari::microphone_encoder::MicrophoneEncoder as SafariMicrophoneEncoder;
+use std::fmt;
+use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use web_sys::window;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
@@ -30,7 +31,7 @@ pub enum Msg {
 
 pub struct Host {
     pub camera: CameraEncoder,
-    pub microphone: SafariMicrophoneEncoder,
+    pub microphone: Box<dyn MicrophoneEncoderTrait>,
     pub screen: ScreenEncoder,
     pub share_screen: bool,
     pub mic_enabled: bool,
@@ -92,8 +93,11 @@ impl Component for Host {
             VIDEO_BITRATE_KBPS,
             camera_callback,
         );
+
+        // Use the factory function to create the appropriate microphone encoder
         let mut microphone =
-            SafariMicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+            create_microphone_encoder(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+
         let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS, screen_callback);
 
         let (tx, rx) = mpsc::unbounded();

@@ -161,7 +161,7 @@ impl PeerDecode for VideoPeerDecoder {
 ///
 /// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
-pub struct AudioPeerDecoder {
+pub struct StandardAudioPeerDecoder {
     pub decoder: AudioDecoderWrapper,
     decoded: bool,
     _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
@@ -169,7 +169,7 @@ pub struct AudioPeerDecoder {
     _audio_context: web_sys::AudioContext,  // Keep audio context alive
 }
 
-impl AudioPeerDecoder {
+impl StandardAudioPeerDecoder {
     pub fn new() -> Result<Self, JsValue> {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
@@ -217,7 +217,7 @@ impl AudioPeerDecoder {
     }
 }
 
-impl Drop for AudioPeerDecoder {
+impl Drop for StandardAudioPeerDecoder {
     fn drop(&mut self) {
         if let Err(e) = self._audio_context.close() {
             log::error!("Error closing audio context: {:?}", e);
@@ -225,7 +225,7 @@ impl Drop for AudioPeerDecoder {
     }
 }
 
-impl PeerDecode for AudioPeerDecoder {
+impl PeerDecode for StandardAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let first_frame = !self.decoded;
         let current_state = self.decoder.state();

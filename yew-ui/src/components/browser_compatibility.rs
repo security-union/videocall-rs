@@ -81,17 +81,21 @@ impl BrowserCompatibility {
         if let Some(window) = web_sys::window() {
             if let Ok(user_agent) = window.navigator().user_agent() {
                 let ua_lower = user_agent.to_lowercase();
+
                 // Check for Firefox user agent patterns
-                // Firefox typically has "firefox" in the user agent and "gecko" but not "chrome"
                 let has_firefox = ua_lower.contains("firefox");
                 let has_gecko = ua_lower.contains("gecko");
                 let has_chrome = ua_lower.contains("chrome");
+                let has_safari = ua_lower.contains("safari");
+                let has_like_gecko = ua_lower.contains("like gecko");
 
-                // Firefox detection: has "firefox" OR (has "gecko" but not "chrome")
-                let is_firefox = has_firefox || (has_gecko && !has_chrome);
+                // Firefox detection: has "firefox" OR (has "gecko" but NOT "chrome" AND NOT "safari" AND NOT "like gecko")
+                // The "like gecko" check is important because Safari and Chrome include "like Gecko" in their user agents
+                let is_firefox =
+                    has_firefox || (has_gecko && !has_chrome && !has_safari && !has_like_gecko);
 
-                log::info!("Firefox detection: UA='{}', HasFirefox={}, HasGecko={}, HasChrome={}, IsFirefox={}", 
-                    user_agent, has_firefox, has_gecko, has_chrome, is_firefox);
+                log::info!("Firefox detection: UA='{}', HasFirefox={}, HasGecko={}, HasChrome={}, HasSafari={}, HasLikeGecko={}, IsFirefox={}", 
+                    user_agent, has_firefox, has_gecko, has_chrome, has_safari, has_like_gecko, is_firefox);
 
                 return is_firefox;
             }
@@ -106,8 +110,10 @@ impl BrowserCompatibility {
         let has_firefox = ua_lower.contains("firefox");
         let has_gecko = ua_lower.contains("gecko");
         let has_chrome = ua_lower.contains("chrome");
+        let has_safari = ua_lower.contains("safari");
+        let has_like_gecko = ua_lower.contains("like gecko");
 
-        has_firefox || (has_gecko && !has_chrome)
+        has_firefox || (has_gecko && !has_chrome && !has_safari && !has_like_gecko)
     }
 }
 
@@ -147,6 +153,20 @@ mod tests {
         // Test Safari user agents (should not be detected as Firefox)
         assert!(!BrowserCompatibility::is_firefox_from_ua(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Safari/605.1.15"
+        ));
+
+        // Test the specific Safari user agent that was incorrectly detected as Firefox
+        assert!(!BrowserCompatibility::is_firefox_from_ua(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+        ));
+
+        // Test more Safari variants to ensure robustness
+        assert!(!BrowserCompatibility::is_firefox_from_ua(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
+        ));
+
+        assert!(!BrowserCompatibility::is_firefox_from_ua(
+            "Mozilla/5.0 (iPad; CPU OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1"
         ));
     }
 }

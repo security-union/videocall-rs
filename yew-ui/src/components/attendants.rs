@@ -94,6 +94,7 @@ pub struct AttendantsComponent {
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
+    pub meeting_joined: bool,
 }
 
 impl AttendantsComponent {
@@ -188,12 +189,13 @@ impl Component for AttendantsComponent {
             pending_video_enable: false,
             pending_screen_share: false,
             encoder_settings: None,
+            meeting_joined: false,
         }
     }
 
-    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+    fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
         if first_render {
-            ctx.link().send_message(WsAction::Connect);
+            // Don't auto-connect anymore
         }
     }
 
@@ -211,6 +213,7 @@ impl Component for AttendantsComponent {
                             .send_message(WsAction::Log(format!("Connection failed: {e}")));
                     }
                     log::info!("Connected in attendants");
+                    self.meeting_joined = true;
                     true
                 }
                 WsAction::Connected => true,
@@ -343,6 +346,42 @@ impl Component for AttendantsComponent {
         );
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
+
+        // Show Join Meeting button if user hasn't joined yet
+        if !self.meeting_joined {
+            return html! {
+                <div id="main-container" class="meeting-page">
+                    <BrowserCompatibility/>
+                    <div id="join-meeting-container" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #1a1a1a;">
+                        <div style="text-align: center; color: white; margin-bottom: 2rem;">
+                            <h1>{"Ready to join the meeting?"}</h1>
+                            <p>{"Click the button below to join and start listening to others."}</p>
+                            {if let Some(error) = &self.error {
+                                html! { <p style="color: #ff6b6b; margin-top: 1rem;">{error}</p> }
+                            } else {
+                                html! {}
+                            }}
+                        </div>
+                        <button
+                            class="join-meeting-button"
+                            style="
+                                background: #4CAF50; 
+                                color: white; 
+                                border: none; 
+                                padding: 1rem 2rem; 
+                                font-size: 1.2rem; 
+                                border-radius: 8px; 
+                                cursor: pointer;
+                                transition: background 0.3s ease;
+                            "
+                            onclick={ctx.link().callback(|_| WsAction::Connect)}
+                        >
+                            {"Join Meeting"}
+                        </button>
+                    </div>
+                </div>
+            };
+        }
 
         html! {
             <div id="main-container" class="meeting-page">

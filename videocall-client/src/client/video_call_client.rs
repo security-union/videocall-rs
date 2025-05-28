@@ -460,6 +460,24 @@ impl VideoCallClient {
             }
         }
     }
+
+    /// Updates the speaker device for all connected peers
+    ///
+    /// This will recreate all audio decoders to use the specified speaker device.
+    /// Pass None to use the default system speaker.
+    pub fn update_speaker_device(&self, speaker_device_id: Option<String>) -> Result<(), JsValue> {
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .peer_decode_manager
+                .update_speaker_device(speaker_device_id),
+            Err(_) => {
+                error!("Failed to borrow inner for updating speaker device");
+                Err(JsValue::from_str(
+                    "Failed to borrow inner for updating speaker device",
+                ))
+            }
+        }
+    }
 }
 
 impl Inner {

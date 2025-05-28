@@ -9,7 +9,7 @@ rustlemania-ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: test-MediaTrackStreamProcessor-add-wasm-opus-encoder-5a97f2f9  # Using latest since staging tag doesn't exist yet
+    tag: test-MediaTrackStreamProcessor-add-wasm-opus-encoder-86ac22d8 # Using latest since staging tag doesn't exist yet
   
   resources:
     limits:

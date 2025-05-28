@@ -80,6 +80,6 @@ mod media_devices;
 mod utils;
 mod wrappers;
 pub use client::{VideoCallClient, VideoCallClientOptions};
-pub use decode::{create_audio_peer_decoder, AudioPeerDecoderTrait, VideoPeerDecoder};
+pub use decode::{create_audio_peer_decoder, AudioPeerDecoderTrait, VideoPeerDecoder, PeerDecodeManager};
 pub use encode::{create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};

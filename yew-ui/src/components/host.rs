@@ -24,6 +24,7 @@ pub enum Msg {
     DisableVideo,
     AudioDeviceChanged(String),
     VideoDeviceChanged(String),
+    SpeakerDeviceChanged(String),
     CameraEncoderSettingsUpdated(String),
     MicrophoneEncoderSettingsUpdated(String),
     ScreenEncoderSettingsUpdated(String),
@@ -37,6 +38,7 @@ pub struct Host {
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub encoder_settings: EncoderSettings,
+    pub selected_speaker_id: Option<String>,
 }
 
 pub struct EncoderSettings {
@@ -124,6 +126,7 @@ impl Component for Host {
                 microphone: None,
                 screen: None,
             },
+            selected_speaker_id: None,
         }
     }
 
@@ -233,6 +236,10 @@ impl Component for Host {
                 }
                 false
             }
+            Msg::SpeakerDeviceChanged(speaker) => {
+                self.selected_speaker_id = Some(speaker);
+                true
+            }
             Msg::CameraEncoderSettingsUpdated(settings) => {
                 // Only update if settings have changed
                 if self.encoder_settings.camera.as_ref() != Some(&settings) {
@@ -277,10 +284,15 @@ impl Component for Host {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let mic_callback = ctx.link().callback(Msg::AudioDeviceChanged);
         let cam_callback = ctx.link().callback(Msg::VideoDeviceChanged);
+        let speaker_callback = ctx.link().callback(Msg::SpeakerDeviceChanged);
         html! {
             <>
                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
-                <DeviceSelector on_microphone_select={mic_callback} on_camera_select={cam_callback}/>
+                <DeviceSelector 
+                    on_microphone_select={mic_callback} 
+                    on_camera_select={cam_callback}
+                    on_speaker_select={speaker_callback}
+                />
             </>
         }
     }

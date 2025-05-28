@@ -113,7 +113,7 @@ impl Peer {
         JsValue,
     > {
         Ok((
-            create_audio_peer_decoder()?,
+            create_audio_peer_decoder(None)?,
             VideoPeerDecoder::new(video_canvas_id)?,
             VideoPeerDecoder::new(screen_canvas_id)?,
         ))
@@ -356,5 +356,18 @@ impl PeerDecodeManager {
 
     pub fn get_all_fps_stats(&self) -> Option<String> {
         None
+    }
+
+    /// Updates the speaker device for all connected peers
+    pub fn update_speaker_device(&mut self, speaker_device_id: Option<String>) -> Result<(), JsValue> {
+        let keys: Vec<String> = self.connected_peers.ordered_keys().clone();
+        for key in keys {
+            if let Some(peer) = self.connected_peers.get_mut(&key) {
+                // Create a new audio decoder with the new speaker device
+                let new_audio_decoder = create_audio_peer_decoder(speaker_device_id.clone())?;
+                peer.audio = new_audio_decoder;
+            }
+        }
+        Ok(())
     }
 }

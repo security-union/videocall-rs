@@ -170,14 +170,14 @@ pub struct StandardAudioPeerDecoder {
 }
 
 impl StandardAudioPeerDecoder {
-    pub fn new() -> Result<Self, JsValue> {
+    pub fn new(speaker_device_id: Option<String>) -> Result<Self, JsValue> {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
         let audio_stream_generator =
             MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
         // The audio context is used to reproduce audio.
-        let audio_context = configure_audio_context(&audio_stream_generator).unwrap();
+        let audio_context = configure_audio_context(&audio_stream_generator, speaker_device_id).unwrap();
 
         let output = Closure::wrap(Box::new(move |audio_data: AudioData| {
             let writable = audio_stream_generator.writable();

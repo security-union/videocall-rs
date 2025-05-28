@@ -192,10 +192,14 @@ impl MicrophoneEncoder {
                     .as_f64()
                     .unwrap() as u32;
 
+            log::info!("Microphone input sample rate: {} Hz", input_rate);
+
+            // Use the microphone's sample rate for the AudioContext to avoid Firefox sample rate mismatch
             let mut options = AudioContextOptions::new();
-            options.sample_rate(AUDIO_SAMPLE_RATE as f32);
+            options.sample_rate(input_rate as f32);
 
             let context = AudioContext::new_with_context_options(&options).unwrap();
+            log::info!("Created AudioContext with sample rate: {} Hz", input_rate);
 
             let worklet = codec
                 .create_node(

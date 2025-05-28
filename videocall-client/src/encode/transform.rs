@@ -95,7 +95,6 @@ pub fn transform_audio_chunk(
     sequence: u64,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
-    log::info!("Chunk {:?}", chunk);
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
         log::error!("Error copying audio chunk: {:?}", e);
     }

@@ -1,5 +1,6 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
+use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
+use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
@@ -52,7 +53,7 @@ impl Display for PeerDecodeError {
 }
 
 pub struct Peer {
-    pub audio: AudioPeerDecoder,
+    pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
     pub email: String,
@@ -103,9 +104,16 @@ impl Peer {
     fn new_decoders(
         video_canvas_id: &str,
         screen_canvas_id: &str,
-    ) -> Result<(AudioPeerDecoder, VideoPeerDecoder, VideoPeerDecoder), JsValue> {
+    ) -> Result<
+        (
+            Box<dyn AudioPeerDecoderTrait>,
+            VideoPeerDecoder,
+            VideoPeerDecoder,
+        ),
+        JsValue,
+    > {
         Ok((
-            AudioPeerDecoder::new()?,
+            create_audio_peer_decoder()?,
             VideoPeerDecoder::new(video_canvas_id)?,
             VideoPeerDecoder::new(screen_canvas_id)?,
         ))
@@ -148,24 +156,38 @@ impl Peer {
             .enum_value()
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
-            MediaType::VIDEO => Ok((
-                media_type,
-                self.video
+            MediaType::VIDEO => {
+                let video_status = self
+                    .video
                     .decode(&packet)
-                    .map_err(|_| PeerDecodeError::VideoDecodeError)?,
-            )),
+                    .map_err(|_| PeerDecodeError::VideoDecodeError)?;
+                Ok((
+                    media_type,
+                    DecodeStatus {
+                        rendered: video_status._rendered,
+                        first_frame: video_status.first_frame,
+                    },
+                ))
+            }
             MediaType::AUDIO => Ok((
                 media_type,
                 self.audio
                     .decode(&packet)
                     .map_err(|_| PeerDecodeError::AudioDecodeError)?,
             )),
-            MediaType::SCREEN => Ok((
-                media_type,
-                self.screen
+            MediaType::SCREEN => {
+                let screen_status = self
+                    .screen
                     .decode(&packet)
-                    .map_err(|_| PeerDecodeError::ScreenDecodeError)?,
-            )),
+                    .map_err(|_| PeerDecodeError::ScreenDecodeError)?;
+                Ok((
+                    media_type,
+                    DecodeStatus {
+                        rendered: screen_status._rendered,
+                        first_frame: screen_status.first_frame,
+                    },
+                ))
+            }
             MediaType::HEARTBEAT => {
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
@@ -176,7 +198,7 @@ impl Peer {
                 Ok((
                     media_type,
                     DecodeStatus {
-                        _rendered: false,
+                        rendered: false,
                         first_frame: false,
                     },
                 ))

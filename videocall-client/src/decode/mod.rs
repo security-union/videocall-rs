@@ -53,7 +53,7 @@ impl From<SafariDecodeStatus> for DecodeStatus {
 }
 
 /// Trait to abstract over different audio peer decoder implementations
-pub trait AudioPeerDecoderTrait: Send + Sync {
+pub trait AudioPeerDecoderTrait {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
 }
 

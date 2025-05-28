@@ -132,7 +132,19 @@ impl MicrophoneEncoder {
             let buffer: [u8; 100000] = [0; 100000];
             log::info!("Starting audio encoder");
             let mut sequence_number = 0;
+            
             Box::new(move |chunk: MessageEvent| {
+                // Check if this is an actual audio frame message (not control messages)
+                if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
+                    if let Some(msg_str) = message_type.as_string() {
+                        if msg_str != "page" {
+                            // This is a control message (ready, done, flushed), not an audio frame
+                            log::debug!("Received control message: {}", msg_str);
+                            return;
+                        }
+                    }
+                }
+                
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
                     let packet: PacketWrapper =
@@ -202,7 +214,7 @@ impl MicrophoneEncoder {
 
             let _ = codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
-                    encoder_frame_size: Some(20),
+                    encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
                     original_sample_rate: Some(input_rate),
                     encoder_bit_rate: Some(50_000_u32),
                     encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
@@ -215,9 +227,7 @@ impl MicrophoneEncoder {
             let _ = source_node
                 .connect_with_audio_node(&gain_node)
                 .unwrap()
-                .connect_with_audio_node(&worklet)
-                .unwrap()
-                .connect_with_audio_node(&context.destination());
+                .connect_with_audio_node(&worklet);
         });
     }
 }

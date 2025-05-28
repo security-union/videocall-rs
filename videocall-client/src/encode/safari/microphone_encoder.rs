@@ -132,7 +132,7 @@ impl MicrophoneEncoder {
             let buffer: [u8; 100000] = [0; 100000];
             log::info!("Starting audio encoder");
             let mut sequence_number = 0;
-            
+
             Box::new(move |chunk: MessageEvent| {
                 // Check if this is an actual audio frame message (not control messages)
                 if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
@@ -144,7 +144,7 @@ impl MicrophoneEncoder {
                         }
                     }
                 }
-                
+
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
                     let packet: PacketWrapper =

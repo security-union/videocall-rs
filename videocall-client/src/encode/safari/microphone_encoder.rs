@@ -1,5 +1,6 @@
 use crate::encode::encoder_state::EncoderState;
 use futures::channel::mpsc::UnboundedReceiver;
+use futures::StreamExt;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
@@ -86,10 +87,17 @@ impl MicrophoneEncoder {
 
     pub fn set_encoder_control(
         &mut self,
-        diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
+        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
     ) {
-        // TODO: ignore this for now
-        // self.client.subscribe_diagnostics(diagnostics_receiver, MediaType::AUDIO);
+        // Consume the diagnostics receiver in an async task to prevent "receiver is gone" errors
+        // For Safari encoder, we'll just consume the packets without processing them for now
+        // since Safari encoder doesn't support dynamic bitrate control yet
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(_packet) = diagnostics_receiver.next().await {
+                // TODO: Implement bitrate control for Safari encoder if needed
+                // For now, just consume the packets to prevent the "receiver is gone" error
+            }
+        });
     }
 
     // delegates to self.state
@@ -99,7 +107,10 @@ impl MicrophoneEncoder {
             if value {
                 let _ = self.codec.start();
             } else {
+                // First stop the codec to prevent new audio frames
                 let _ = self.codec.stop();
+                // The monitoring loop in start() will detect the enabled flag change
+                // and stop the microphone capture within 100ms
             };
         }
         is_changed
@@ -120,6 +131,13 @@ impl MicrophoneEncoder {
         } else {
             return;
         };
+
+        // Don't start if not enabled - this is the key fix
+        if !self.state.is_enabled() {
+            log::debug!("Safari encoder start() called but encoder is not enabled");
+            return;
+        }
+
         if self.state.switching.load(Ordering::Acquire) && self.codec.is_instantiated() {
             self.stop();
         }
@@ -127,13 +145,35 @@ impl MicrophoneEncoder {
             return;
         }
         let aes = client.aes();
-        let EncoderState { .. } = self.state.clone();
+        let EncoderState {
+            destroy,
+            enabled,
+            switching,
+            ..
+        } = self.state.clone();
+
+        // Clone atomic values for use in different closures
+        let destroy_for_handler = destroy.clone();
+        let enabled_for_handler = enabled.clone();
+
         let audio_output_handler = {
             let buffer: [u8; 100000] = [0; 100000];
-            log::info!("Starting audio encoder");
+            log::info!("Starting Safari audio encoder");
             let mut sequence_number = 0;
 
             Box::new(move |chunk: MessageEvent| {
+                // Check if encoder should stop
+                if destroy_for_handler.load(Ordering::Acquire)
+                    || !enabled_for_handler.load(Ordering::Acquire)
+                {
+                    log::debug!(
+                        "Audio handler stopping: destroy={}, enabled={}",
+                        destroy_for_handler.load(Ordering::Acquire),
+                        enabled_for_handler.load(Ordering::Acquire)
+                    );
+                    return;
+                }
+
                 // Check if this is an actual audio frame message (not control messages)
                 if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
                     if let Some(msg_str) = message_type.as_string() {
@@ -151,6 +191,7 @@ impl MicrophoneEncoder {
                         transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
                     client.send_packet(packet);
                     sequence_number += 1;
+                    log::debug!("Sent audio frame with sequence: {}", sequence_number - 1);
                 } else {
                     log::error!("Received non-MessageEvent: {:?}", chunk);
                 }
@@ -161,7 +202,6 @@ impl MicrophoneEncoder {
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let media_devices = navigator.media_devices().unwrap();
-            // TODO: Add dropdown so that user can select the device that they want to use.
             let mut constraints = MediaStreamConstraints::new();
             let mut media_info = web_sys::MediaTrackConstraints::new();
             media_info.device_id(&device_id.into());
@@ -232,6 +272,48 @@ impl MicrophoneEncoder {
                 .connect_with_audio_node(&gain_node)
                 .unwrap()
                 .connect_with_audio_node(&worklet);
+
+            // Monitor for stop conditions and clean up when needed
+            let check_interval = 100; // Check every 100ms
+            let destroy_check = destroy.clone();
+            let enabled_check = enabled.clone();
+            let switching_check = switching.clone();
+            loop {
+                // Wait for the check interval
+                let delay_promise = js_sys::Promise::new(&mut |resolve, _| {
+                    web_sys::window()
+                        .unwrap()
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &resolve,
+                            check_interval,
+                        )
+                        .unwrap();
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(delay_promise).await;
+
+                // Check if we should stop
+                if destroy_check.load(Ordering::Acquire)
+                    || !enabled_check.load(Ordering::Acquire)
+                    || switching_check.load(Ordering::Acquire)
+                {
+                    log::info!("Stopping Safari audio encoder");
+                    switching_check.store(false, Ordering::Release);
+
+                    // Stop the media track
+                    audio_track.stop();
+
+                    // Close the AudioContext
+                    if let Err(e) = context.close() {
+                        log::error!("Error closing AudioContext: {:?}", e);
+                    }
+
+                    // Destroy the codec
+                    codec.destroy();
+
+                    log::info!("Safari audio encoder stopped and cleaned up");
+                    break;
+                }
+            }
         });
     }
 }

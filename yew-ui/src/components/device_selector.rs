@@ -1,3 +1,4 @@
+use videocall_client::utils::is_ios;
 use videocall_client::MediaDeviceList;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlSelectElement;
@@ -101,6 +102,8 @@ impl Component for DeviceSelector {
         let selected_mic = self.media_devices.audio_inputs.selected();
         let selected_camera = self.media_devices.video_inputs.selected();
         let selected_speaker = self.media_devices.audio_outputs.selected();
+        let is_ios_safari = is_ios();
+
         fn selection(event: Event) -> String {
             event
                 .target()
@@ -134,15 +137,27 @@ impl Component for DeviceSelector {
                 </select>
                 <br/>
                 <label for={"speaker-select"}>{ "Speaker:" }</label>
-                <select id={"speaker-select"} class={"device-selector"}
-                        onchange={ctx.link().callback(|e: Event| Msg::OnSpeakerSelect(selection(e)))}
-                >
-                    { for speakers.iter().map(|device| html! {
-                        <option value={device.device_id()} selected={selected_speaker == device.device_id()}>
-                            { device.label() }
-                        </option>
-                    }) }
-                </select>
+                {
+                    if is_ios_safari {
+                        html! {
+                            <select id={"speaker-select"} class={"device-selector"} disabled={true}>
+                                <option selected={true}>{ "System Default (iOS/Safari)" }</option>
+                            </select>
+                        }
+                    } else {
+                        html! {
+                            <select id={"speaker-select"} class={"device-selector"}
+                                    onchange={ctx.link().callback(|e: Event| Msg::OnSpeakerSelect(selection(e)))}
+                            >
+                                { for speakers.iter().map(|device| html! {
+                                    <option value={device.device_id()} selected={selected_speaker == device.device_id()}>
+                                        { device.label() }
+                                    </option>
+                                }) }
+                            </select>
+                        }
+                    }
+                }
             </div>
         }
     }

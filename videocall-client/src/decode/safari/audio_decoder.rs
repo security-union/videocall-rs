@@ -17,15 +17,17 @@ use crate::decode::safari::audio_worklet_codec::DecoderInitOptions;
 use crate::decode::safari::audio_worklet_codec::DecoderMessages;
 use js_sys::Uint8Array;
 use log::{error, info, warn};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::AudioContext;
-use web_sys::AudioContextOptions;
 use web_sys::AudioData;
+use web_sys::{AudioContext, AudioContextOptions};
 
+#[derive(Debug, Clone, Copy)]
 pub struct DecodeStatus {
     pub rendered: bool,
     pub first_frame: bool,
@@ -35,11 +37,13 @@ pub struct DecodeStatus {
 // Generic type for decoders captures common functionality.
 //
 pub struct PeerDecoder<WebDecoder, Chunk> {
-    decoder: WebDecoder,
+    decoder: Rc<RefCell<WebDecoder>>,
     waiting_for_keyframe: bool,
     decoded: bool,
     _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
     _output: Closure<dyn FnMut(Chunk)>, // member exists to keep the closure in scope for the life of the struct
+    audio_context: Rc<RefCell<Option<AudioContext>>>, // Store audio context for speaker updates
+    current_speaker_id: Rc<RefCell<Option<String>>>, // Store current speaker device ID
 }
 
 impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
@@ -50,46 +54,6 @@ impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
 
 pub trait PeerDecode {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()>;
-}
-
-///
-/// Implementation of decode(packet) -> Result<DecodeStatus, ()>
-///
-/// (Defined as a macro rather than a trait because traits can't refer to members.)
-///
-macro_rules! impl_decode {
-    ($self: expr, $packet: expr, $ChunkType: ty, $ref: tt) => {{
-        let first_frame = !$self.decoded;
-        let chunk_type = $self.get_chunk_type(&$packet);
-        if !$self.waiting_for_keyframe || chunk_type == <$ChunkType>::Key {
-            match $self.decoder.state() {
-                CodecState::Configured => {
-                    $self
-                        .decoder
-                        .decode(opt_ref!($self.get_chunk($packet, chunk_type), $ref));
-                    $self.waiting_for_keyframe = false;
-                    $self.decoded = true;
-                }
-                CodecState::Closed => {
-                    return Err(());
-                }
-                _ => {}
-            }
-        }
-        Ok(DecodeStatus {
-            rendered: true,
-            first_frame,
-        })
-    }};
-}
-
-macro_rules! opt_ref {
-    ($val: expr, "ref") => {
-        &$val
-    };
-    ($val: expr, "") => {
-        $val
-    };
 }
 
 ///
@@ -115,85 +79,239 @@ impl AudioPeerDecoder {
 
     pub fn new_with_speaker(speaker_device_id: Option<String>) -> Self {
         let codec = AudioWorkletCodec::default();
+        let audio_context_ref = Rc::new(RefCell::new(None));
+        let current_speaker_id = Rc::new(RefCell::new(speaker_device_id.clone()));
+
         {
             let codec = codec.clone();
+            let audio_context_ref = audio_context_ref.clone();
+            let speaker_id = speaker_device_id.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let mut options = AudioContextOptions::new();
-                options.sample_rate(AUDIO_SAMPLE_RATE as f32);
-                let context = AudioContext::new_with_context_options(&options).unwrap();
+                match Self::create_audio_context_with_speaker(speaker_id).await {
+                    Ok(context) => {
+                        *audio_context_ref.borrow_mut() = Some(context.clone());
 
-                // Set the audio output device if specified and supported
-                if let Some(device_id) = speaker_device_id {
-                    // Check if setSinkId is supported
-                    if js_sys::Reflect::has(&context, &JsValue::from_str("setSinkId"))
-                        .unwrap_or(false)
-                    {
-                        match JsFuture::from(context.set_sink_id_with_str(&device_id)).await {
-                            Ok(_) => {
-                                info!(
-                                    "Successfully set Safari audio output device to: {}",
-                                    device_id
-                                );
-                            }
-                            Err(e) => {
-                                warn!("Failed to set Safari audio output device: {:?}", e);
-                            }
+                        // Create the audio worklet node and connect it
+                        if let Err(e) = Self::setup_audio_worklet(&codec, &context).await {
+                            error!("Failed to setup audio worklet: {:?}", e);
+                        } else {
+                            info!(
+                                "Safari audio decoder initialized successfully with speaker device"
+                            );
                         }
-                    } else {
-                        warn!("AudioContext.setSinkId() is not supported in this Safari version");
+                    }
+                    Err(e) => {
+                        error!("Failed to create audio context: {:?}", e);
                     }
                 }
-
-                let gain_node = context.create_gain().unwrap();
-
-                // Add the decoder audio worklet to the context
-                let worklet_node = codec
-                    .create_node(
-                        &context,
-                        "/decoderWorker.min.js",
-                        "decoder-worklet",
-                        AUDIO_CHANNELS,
-                    )
-                    .await
-                    .unwrap();
-
-                let _ = worklet_node
-                    .connect_with_audio_node(&gain_node)
-                    .unwrap()
-                    .connect_with_audio_node(&context.destination());
-
-                let _ = codec.send_message(DecoderMessages::Init {
-                    options: Some(DecoderInitOptions {
-                        output_buffer_sample_rate: Some(AUDIO_SAMPLE_RATE),
-                        ..Default::default()
-                    }),
-                });
-            })
+            });
         }
 
-        // These aren't really used, but kept to ensure parity with video decoding
         let error = Closure::wrap(Box::new(move |e: JsValue| {
             error!("{:?}", e);
         }) as Box<dyn FnMut(JsValue)>);
 
-        let output = Closure::wrap(Box::new(move |_| {}) as Box<dyn FnMut(AudioData)>);
+        let output = Closure::wrap(Box::new(move |_audio_data: AudioData| {
+            // Audio data is handled by the worklet
+        }) as Box<dyn FnMut(AudioData)>);
 
         Self {
-            decoder: codec,
-            // There is no keyframe
-            waiting_for_keyframe: false,
+            decoder: Rc::new(RefCell::new(codec)),
+            waiting_for_keyframe: false, // Audio doesn't have keyframes like video
             decoded: false,
             _error: error,
             _output: output,
+            audio_context: audio_context_ref,
+            current_speaker_id,
         }
     }
 
+    /// Creates a new AudioContext with the specified speaker device
+    async fn create_audio_context_with_speaker(
+        speaker_device_id: Option<String>,
+    ) -> Result<AudioContext, JsValue> {
+        let mut options = AudioContextOptions::new();
+        options.sample_rate(AUDIO_SAMPLE_RATE as f32);
+
+        // Set the speaker device if specified
+        if let Some(device_id) = speaker_device_id.clone() {
+            if !device_id.is_empty() {
+                info!("Creating AudioContext with speaker device: {}", device_id);
+                options.sink_id(&JsValue::from_str(&device_id));
+            }
+        }
+
+        let context = AudioContext::new_with_context_options(&options)?;
+
+        // Try to resume the context
+        if let Ok(promise) = context.resume() {
+            match JsFuture::from(promise).await {
+                Ok(_) => info!("AudioContext resumed successfully"),
+                Err(e) => warn!("Failed to resume AudioContext: {:?}", e),
+            }
+        }
+
+        Ok(context)
+    }
+
+    /// Sets up the audio worklet with the given context
+    async fn setup_audio_worklet(
+        codec: &AudioWorkletCodec,
+        context: &AudioContext,
+    ) -> Result<(), JsValue> {
+        // Create the worklet node
+        let worklet_node = codec
+            .create_node(
+                context,
+                "/decoderWorker.min.js",
+                "decoder-worklet",
+                AUDIO_CHANNELS,
+            )
+            .await?;
+
+        // Create a gain node and connect the worklet to the destination
+        let gain_node = context.create_gain()?;
+        worklet_node.connect_with_audio_node(&gain_node)?;
+        gain_node.connect_with_audio_node(&context.destination())?;
+
+        // Send initialization message
+        let init_message = DecoderMessages::Init {
+            options: Some(DecoderInitOptions {
+                decoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
+                output_buffer_sample_rate: Some(AUDIO_SAMPLE_RATE),
+                number_of_channels: Some(AUDIO_CHANNELS),
+                resample_quality: Some(0),
+            }),
+        };
+
+        codec.send_message(init_message)?;
+
+        Ok(())
+    }
+
+    /// Updates the speaker device by recreating the AudioContext
+    pub fn update_speaker_device(&self, speaker_device_id: Option<String>) {
+        let current_id = self.current_speaker_id.borrow().clone();
+
+        // Check if the speaker device is actually changing
+        if current_id == speaker_device_id {
+            info!("Speaker device unchanged, skipping update");
+            return;
+        }
+
+        info!(
+            "Updating Safari audio decoder speaker device to: {:?}",
+            speaker_device_id
+        );
+
+        let audio_context_ref = self.audio_context.clone();
+        let current_speaker_id = self.current_speaker_id.clone();
+        let decoder_ref = self.decoder.clone();
+        let old_codec = self.decoder.borrow().clone();
+        let new_speaker_id = speaker_device_id.clone();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            // Update the stored speaker ID
+            *current_speaker_id.borrow_mut() = new_speaker_id.clone();
+
+            // First, destroy the old worklet to stop audio processing
+            info!("Destroying old audio worklet");
+            old_codec.destroy();
+
+            // Close the old context if it exists and wait for it to fully close
+            let old_context_option = {
+                let borrowed = audio_context_ref.borrow();
+                borrowed.clone()
+            };
+
+            if let Some(old_context) = old_context_option {
+                info!("Closing old AudioContext");
+
+                if let Ok(promise) = old_context.close() {
+                    match JsFuture::from(promise).await {
+                        Ok(_) => {
+                            info!("Old AudioContext closed successfully");
+                        }
+                        Err(e) => {
+                            error!("Failed to close old AudioContext: {:?}", e);
+                        }
+                    }
+                } else {
+                    warn!("Failed to get close promise from old AudioContext");
+                }
+
+                // Clear the old context reference
+                *audio_context_ref.borrow_mut() = None;
+                info!("Cleared old AudioContext reference");
+            } else {
+                info!("No old AudioContext to close");
+            }
+
+            // Add a small delay to ensure cleanup is complete
+            let delay_promise = js_sys::Promise::new(&mut |resolve, _| {
+                web_sys::window()
+                    .unwrap()
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100)
+                    .unwrap();
+            });
+            let _ = JsFuture::from(delay_promise).await;
+            info!("Completed cleanup delay");
+
+            // Create a new codec instance
+            let new_codec = AudioWorkletCodec::default();
+            info!("Created new AudioWorkletCodec");
+
+            // Create the new AudioContext with the new speaker device
+            match Self::create_audio_context_with_speaker(new_speaker_id.clone()).await {
+                Ok(new_context) => {
+                    info!("New AudioContext created successfully");
+
+                    // Store the new context
+                    *audio_context_ref.borrow_mut() = Some(new_context.clone());
+                    info!("Stored new AudioContext reference");
+
+                    // Try to resume the context if it's not already running
+                    if let Ok(resume_promise) = new_context.resume() {
+                        match JsFuture::from(resume_promise).await {
+                            Ok(_) => {
+                                info!("New AudioContext resumed successfully");
+                            }
+                            Err(e) => {
+                                warn!("Failed to resume new AudioContext: {:?}", e);
+                            }
+                        }
+                    }
+
+                    // Setup the audio worklet with the new context and new codec
+                    info!("Setting up audio worklet with new context");
+                    match Self::setup_audio_worklet(&new_codec, &new_context).await {
+                        Ok(_) => {
+                            // Update the decoder with the new codec
+                            *decoder_ref.borrow_mut() = new_codec;
+                            info!("Successfully updated Safari audio decoder speaker device");
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to setup audio worklet with new AudioContext: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to create new AudioContext for speaker update: {:?}",
+                        e
+                    );
+                }
+            }
+        });
+    }
+
     fn get_chunk(&self, packet: &Arc<MediaPacket>) -> Uint8Array {
-        let audio_data = &packet.data;
-        let audio_data_js: js_sys::Uint8Array =
-            js_sys::Uint8Array::new_with_length(audio_data.len() as u32);
-        audio_data_js.copy_from(audio_data.as_slice());
-        audio_data_js
+        let data = Uint8Array::new_with_length(packet.data.len() as u32);
+        data.copy_from(&packet.data);
+        data
     }
 }
 
@@ -202,14 +320,22 @@ impl PeerDecode for AudioPeerDecoder {
         let buffer = self.get_chunk(packet);
         let first_frame = !self.decoded;
 
-        let rendered = if self.decoder.is_instantiated() {
-            let _ = self.decoder.send_message(&DecoderMessages::Decode {
-                pages: buffer.to_vec(),
-            });
-            self.decoded = true;
-            true
-        } else {
-            false
+        let rendered = {
+            let decoder = self.decoder.borrow();
+            if decoder.is_instantiated() {
+                // Drop the immutable borrow before getting a mutable one
+                drop(decoder);
+                let _ = self
+                    .decoder
+                    .borrow_mut()
+                    .send_message(DecoderMessages::Decode {
+                        pages: buffer.to_vec(),
+                    });
+                self.decoded = true;
+                true
+            } else {
+                false
+            }
         };
 
         Ok(DecodeStatus {

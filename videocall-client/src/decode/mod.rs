@@ -55,12 +55,21 @@ impl From<SafariDecodeStatus> for DecodeStatus {
 /// Trait to abstract over different audio peer decoder implementations
 pub trait AudioPeerDecoderTrait {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
+
+    /// Updates the speaker device for this audio decoder
+    fn update_speaker_device(&self, speaker_device_id: Option<String>);
 }
 
 // Implement trait for standard audio peer decoder
 impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         StandardPeerDecodeTrait::decode(self, packet).map(|status| status.into())
+    }
+
+    fn update_speaker_device(&self, _speaker_device_id: Option<String>) {
+        // StandardAudioPeerDecoder does not support dynamic speaker updates
+        // The audio context is created during initialization and cannot be changed
+        log::warn!("Dynamic speaker updates not supported for Chrome/standard audio decoder");
     }
 }
 
@@ -70,6 +79,11 @@ impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
         SafariPeerDecodeTrait::decode(self, packet)
             .map_err(|_| anyhow::anyhow!("Safari audio decoder failed"))
             .map(|status| status.into())
+    }
+
+    fn update_speaker_device(&self, speaker_device_id: Option<String>) {
+        // SafariAudioPeerDecoder supports dynamic speaker updates
+        self.update_speaker_device(speaker_device_id);
     }
 }
 

@@ -366,9 +366,8 @@ impl PeerDecodeManager {
         let keys: Vec<String> = self.connected_peers.ordered_keys().clone();
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {
-                // Create a new audio decoder with the new speaker device
-                let new_audio_decoder = create_audio_peer_decoder(speaker_device_id.clone())?;
-                peer.audio = new_audio_decoder;
+                // Update the speaker device on the existing audio decoder
+                peer.audio.update_speaker_device(speaker_device_id.clone());
             }
         }
         Ok(())

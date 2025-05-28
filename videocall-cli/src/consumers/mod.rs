@@ -9,7 +9,7 @@ pub mod quic;
 
 pub enum CameraSynks {
     DeadSynk(DeadSynk),
-    CameraSynk(QUICClient),
+    CameraSynk(Box<QUICClient>),
     // LocalWindowSynk(LocalWindowSynk)
 }
 

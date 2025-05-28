@@ -67,20 +67,20 @@ pub fn transform_audio_chunk(
 pub struct MicrophoneEncoder {
     client: VideoCallClient,
     state: EncoderState,
-    on_encoder_settings_update: Option<Callback<String>>,
+    _on_encoder_settings_update: Option<Callback<String>>,
     codec: AudioWorkletCodec,
 }
 
 impl MicrophoneEncoder {
     pub fn new(
         client: VideoCallClient,
-        bitrate_kbps: u32,
+        _bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
     ) -> Self {
         Self {
             client,
             state: EncoderState::new(),
-            on_encoder_settings_update: Some(on_encoder_settings_update),
+            _on_encoder_settings_update: Some(on_encoder_settings_update),
             codec: AudioWorkletCodec::default(),
         }
     }
@@ -157,7 +157,6 @@ impl MicrophoneEncoder {
         let enabled_for_handler = enabled.clone();
 
         let audio_output_handler = {
-            let buffer: [u8; 100000] = [0; 100000];
             log::info!("Starting Safari audio encoder");
             let mut sequence_number = 0;
 
@@ -202,12 +201,12 @@ impl MicrophoneEncoder {
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
             let media_devices = navigator.media_devices().unwrap();
-            let mut constraints = MediaStreamConstraints::new();
-            let mut media_info = web_sys::MediaTrackConstraints::new();
-            media_info.device_id(&device_id.into());
+            let constraints = MediaStreamConstraints::new();
+            let media_info = web_sys::MediaTrackConstraints::new();
+            media_info.set_device_id(&device_id.into());
 
-            constraints.audio(&media_info.into());
-            constraints.video(&Boolean::from(false));
+            constraints.set_audio(&media_info.into());
+            constraints.set_video(&Boolean::from(false));
             let devices_query = media_devices
                 .get_user_media_with_constraints(&constraints)
                 .unwrap();
@@ -235,8 +234,8 @@ impl MicrophoneEncoder {
             log::info!("Microphone input sample rate: {} Hz", input_rate);
 
             // Use the microphone's sample rate for the AudioContext to avoid Firefox sample rate mismatch
-            let mut options = AudioContextOptions::new();
-            options.sample_rate(input_rate as f32);
+            let options = AudioContextOptions::new();
+            options.set_sample_rate(input_rate as f32);
 
             let context = AudioContext::new_with_context_options(&options).unwrap();
             log::info!("Created AudioContext with sample rate: {} Hz", input_rate);

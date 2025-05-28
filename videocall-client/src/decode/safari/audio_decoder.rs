@@ -33,6 +33,19 @@ pub struct DecodeStatus {
     pub first_frame: bool,
 }
 
+#[derive(Debug)]
+pub struct DecodeError {
+    pub message: String,
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Decode error: {}", self.message)
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
 //
 // Generic type for decoders captures common functionality.
 //
@@ -53,7 +66,7 @@ impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
 }
 
 pub trait PeerDecode {
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()>;
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, DecodeError>;
 }
 
 ///
@@ -63,7 +76,6 @@ pub trait PeerDecode {
 ///
 /// This is important https://plnkr.co/edit/1yQd8ozGXlV9bwK6?preview
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
-
 pub type AudioPeerDecoder = PeerDecoder<AudioWorkletCodec, AudioData>;
 
 impl Default for AudioPeerDecoder {
@@ -130,14 +142,14 @@ impl AudioPeerDecoder {
     async fn create_audio_context_with_speaker(
         speaker_device_id: Option<String>,
     ) -> Result<AudioContext, JsValue> {
-        let mut options = AudioContextOptions::new();
-        options.sample_rate(AUDIO_SAMPLE_RATE as f32);
+        let options = AudioContextOptions::new();
+        options.set_sample_rate(AUDIO_SAMPLE_RATE as f32);
 
         // Set the speaker device if specified
         if let Some(device_id) = speaker_device_id.clone() {
             if !device_id.is_empty() {
                 info!("Creating AudioContext with speaker device: {}", device_id);
-                options.sink_id(&JsValue::from_str(&device_id));
+                options.set_sink_id(&JsValue::from_str(&device_id));
             }
         }
 
@@ -316,7 +328,7 @@ impl AudioPeerDecoder {
 }
 
 impl PeerDecode for AudioPeerDecoder {
-    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, ()> {
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> Result<DecodeStatus, DecodeError> {
         let buffer = self.get_chunk(packet);
         let first_frame = !self.decoded;
 

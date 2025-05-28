@@ -39,7 +39,7 @@ videocall.rs is a modern, open-source video conferencing system written entirely
 - **Multiple Transport Protocols:** Support for WebSockets and WebTransport 
 - **End-to-End Encryption (E2EE):** Optional secure communications between peers
 - **Scalable Architecture:** Designed with a pub/sub model using NATS for horizontal scaling
-- **Cross-Platform Support:** Works on major browsers (Chrome/Chromium, with Safari support in development)
+- **Cross-Platform Support:** Works on Chromium-based browsers (Chrome, Edge, Brave) with Safari support in development. Firefox is not supported due to incomplete MediaStreamTrackProcessor implementation.
 - **Native Client Support:** CLI tool for headless video streaming from devices like Raspberry Pi
 - **Open Source:** MIT licensed for maximum flexibility
 
@@ -105,7 +105,7 @@ We strongly recommend using the Docker-based setup for development, as it's well
 - Modern Linux distribution, macOS, or Windows 10/11
 - [Docker](https://docs.docker.com/engine/install/) and Docker Compose (for containerized setup)
 - [Rust toolchain](https://rustup.rs/) 1.85+ (for manual setup)
-- Chrome/Chromium browser for frontend access
+- Chromium-based browser (Chrome, Edge, Brave) for frontend access - Firefox is not supported
 
 ### Docker Setup
 

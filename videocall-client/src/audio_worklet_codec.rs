@@ -111,10 +111,10 @@ impl AudioWorkletCodec {
     ) -> Result<AudioWorkletNode, JsValue> {
         let _ = JsFuture::from(context.audio_worklet()?.add_module(script_path)?).await;
 
-        let mut options = AudioWorkletNodeOptions::new();
-        options.number_of_inputs(channels);
-        options.number_of_outputs(channels);
-        options.output_channel_count(
+        let options = AudioWorkletNodeOptions::new();
+        options.set_number_of_inputs(channels);
+        options.set_number_of_outputs(channels);
+        options.set_output_channel_count(
             &vec![channels]
                 .into_iter()
                 .map(JsValue::from)

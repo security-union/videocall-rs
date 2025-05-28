@@ -364,12 +364,18 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
                     let new_video_ids: Vec<String> =
                         video_devices.iter().map(|d| d.device_id()).collect();
 
-                    let old_audio_output_ids: Vec<String> =
-                        old_audio_output_devices.iter().map(|d| d.device_id()).collect();
-                    let new_audio_output_ids: Vec<String> =
-                        audio_output_device_list.iter().map(|d| d.device_id()).collect();
+                    let old_audio_output_ids: Vec<String> = old_audio_output_devices
+                        .iter()
+                        .map(|d| d.device_id())
+                        .collect();
+                    let new_audio_output_ids: Vec<String> = audio_output_device_list
+                        .iter()
+                        .map(|d| d.device_id())
+                        .collect();
 
-                    old_audio_ids != new_audio_ids || old_video_ids != new_video_ids || old_audio_output_ids != new_audio_output_ids
+                    old_audio_ids != new_audio_ids
+                        || old_video_ids != new_video_ids
+                        || old_audio_output_ids != new_audio_output_ids
                 };
 
                 if devices_changed {
@@ -608,7 +614,9 @@ mod tests {
         assert_eq!(*selected_audio.borrow(), "");
         media_device_list.video_inputs.select("non-existent-device");
         assert_eq!(*selected_video.borrow(), "");
-        media_device_list.audio_outputs.select("non-existent-device");
+        media_device_list
+            .audio_outputs
+            .select("non-existent-device");
         assert_eq!(*selected_audio_output.borrow(), "");
     }
 
@@ -618,10 +626,15 @@ mod tests {
         // Create mock devices
         let audio1 = create_mock_device("audio1", MediaDeviceKind::Audioinput, "Mic 1");
         let video1 = create_mock_device("video1", MediaDeviceKind::Videoinput, "Camera 1");
-        let audio_output1 = create_mock_device("audio_output1", MediaDeviceKind::Audiooutput, "Speaker 1");
+        let audio_output1 =
+            create_mock_device("audio_output1", MediaDeviceKind::Audiooutput, "Speaker 1");
 
         // Create a mock provider with initial devices
-        let mock_provider = MockMediaDevicesProvider::new(vec![audio1.clone(), video1.clone(), audio_output1.clone()]);
+        let mock_provider = MockMediaDevicesProvider::new(vec![
+            audio1.clone(),
+            video1.clone(),
+            audio_output1.clone(),
+        ]);
 
         // Create MediaDeviceList with mock provider
         let mut media_device_list = MediaDeviceList::with_provider(mock_provider.clone());

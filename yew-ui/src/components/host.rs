@@ -2,11 +2,9 @@ use crate::constants::*;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
-use std::fmt;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use web_sys::window;
 use yew::prelude::*;
 
 use crate::components::device_selector::DeviceSelector;
@@ -237,7 +235,11 @@ impl Component for Host {
                 false
             }
             Msg::SpeakerDeviceChanged(speaker) => {
-                self.selected_speaker_id = Some(speaker);
+                self.selected_speaker_id = Some(speaker.clone());
+                // Update the speaker device for all connected peers
+                if let Err(e) = ctx.props().client.update_speaker_device(Some(speaker)) {
+                    log::error!("Failed to update speaker device: {:?}", e);
+                }
                 true
             }
             Msg::CameraEncoderSettingsUpdated(settings) => {
@@ -288,8 +290,8 @@ impl Component for Host {
         html! {
             <>
                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
-                <DeviceSelector 
-                    on_microphone_select={mic_callback} 
+                <DeviceSelector
+                    on_microphone_select={mic_callback}
                     on_camera_select={cam_callback}
                     on_speaker_select={speaker_callback}
                 />

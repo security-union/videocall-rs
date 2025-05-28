@@ -16,11 +16,12 @@ use crate::decode::safari::audio_worklet_codec::AudioWorkletCodec;
 use crate::decode::safari::audio_worklet_codec::DecoderInitOptions;
 use crate::decode::safari::audio_worklet_codec::DecoderMessages;
 use js_sys::Uint8Array;
-use log::error;
+use log::{error, info, warn};
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsValue;
+use wasm_bindgen_futures::JsFuture;
 use web_sys::AudioContext;
 use web_sys::AudioContextOptions;
 use web_sys::AudioData;
@@ -109,6 +110,10 @@ impl Default for AudioPeerDecoder {
 
 impl AudioPeerDecoder {
     pub fn new() -> Self {
+        Self::new_with_speaker(None)
+    }
+
+    pub fn new_with_speaker(speaker_device_id: Option<String>) -> Self {
         let codec = AudioWorkletCodec::default();
         {
             let codec = codec.clone();
@@ -116,6 +121,23 @@ impl AudioPeerDecoder {
                 let mut options = AudioContextOptions::new();
                 options.sample_rate(AUDIO_SAMPLE_RATE as f32);
                 let context = AudioContext::new_with_context_options(&options).unwrap();
+
+                // Set the audio output device if specified and supported
+                if let Some(device_id) = speaker_device_id {
+                    // Check if setSinkId is supported
+                    if js_sys::Reflect::has(&context, &JsValue::from_str("setSinkId")).unwrap_or(false) {
+                        match JsFuture::from(context.set_sink_id_with_str(&device_id)).await {
+                            Ok(_) => {
+                                info!("Successfully set Safari audio output device to: {}", device_id);
+                            }
+                            Err(e) => {
+                                warn!("Failed to set Safari audio output device: {:?}", e);
+                            }
+                        }
+                    } else {
+                        warn!("AudioContext.setSinkId() is not supported in this Safari version");
+                    }
+                }
 
                 let gain_node = context.create_gain().unwrap();
 

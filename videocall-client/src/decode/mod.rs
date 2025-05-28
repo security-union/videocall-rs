@@ -74,12 +74,14 @@ impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
 }
 
 /// Factory function to create the appropriate audio peer decoder based on platform detection
-pub fn create_audio_peer_decoder(speaker_device_id: Option<String>) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
+pub fn create_audio_peer_decoder(
+    speaker_device_id: Option<String>,
+) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
     if is_ios() {
         log::info!(
             "Platform detection: Using Safari (AudioWorklet) audio peer decoder for iOS device"
         );
-        Ok(Box::new(SafariAudioPeerDecoder::new()))
+        Ok(Box::new(SafariAudioPeerDecoder::new_with_speaker(speaker_device_id)))
     } else {
         log::info!("Platform detection: Using standard (AudioDecoder API) audio peer decoder");
         StandardAudioPeerDecoder::new(speaker_device_id)

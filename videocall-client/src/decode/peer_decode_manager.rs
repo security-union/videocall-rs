@@ -359,7 +359,10 @@ impl PeerDecodeManager {
     }
 
     /// Updates the speaker device for all connected peers
-    pub fn update_speaker_device(&mut self, speaker_device_id: Option<String>) -> Result<(), JsValue> {
+    pub fn update_speaker_device(
+        &mut self,
+        speaker_device_id: Option<String>,
+    ) -> Result<(), JsValue> {
         let keys: Vec<String> = self.connected_peers.ordered_keys().clone();
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {

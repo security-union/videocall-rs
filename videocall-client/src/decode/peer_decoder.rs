@@ -177,7 +177,8 @@ impl StandardAudioPeerDecoder {
         let audio_stream_generator =
             MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
         // The audio context is used to reproduce audio.
-        let audio_context = configure_audio_context(&audio_stream_generator, speaker_device_id).unwrap();
+        let audio_context =
+            configure_audio_context(&audio_stream_generator, speaker_device_id).unwrap();
 
         let output = Closure::wrap(Box::new(move |audio_data: AudioData| {
             let writable = audio_stream_generator.writable();

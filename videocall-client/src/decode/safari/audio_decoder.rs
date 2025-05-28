@@ -125,10 +125,15 @@ impl AudioPeerDecoder {
                 // Set the audio output device if specified and supported
                 if let Some(device_id) = speaker_device_id {
                     // Check if setSinkId is supported
-                    if js_sys::Reflect::has(&context, &JsValue::from_str("setSinkId")).unwrap_or(false) {
+                    if js_sys::Reflect::has(&context, &JsValue::from_str("setSinkId"))
+                        .unwrap_or(false)
+                    {
                         match JsFuture::from(context.set_sink_id_with_str(&device_id)).await {
                             Ok(_) => {
-                                info!("Successfully set Safari audio output device to: {}", device_id);
+                                info!(
+                                    "Successfully set Safari audio output device to: {}",
+                                    device_id
+                                );
                             }
                             Err(e) => {
                                 warn!("Failed to set Safari audio output device: {:?}", e);

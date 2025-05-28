@@ -81,7 +81,9 @@ pub fn create_audio_peer_decoder(
         log::info!(
             "Platform detection: Using Safari (AudioWorklet) audio peer decoder for iOS device"
         );
-        Ok(Box::new(SafariAudioPeerDecoder::new_with_speaker(speaker_device_id)))
+        Ok(Box::new(SafariAudioPeerDecoder::new_with_speaker(
+            speaker_device_id,
+        )))
     } else {
         log::info!("Platform detection: Using standard (AudioDecoder API) audio peer decoder");
         StandardAudioPeerDecoder::new(speaker_device_id)

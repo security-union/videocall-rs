@@ -147,7 +147,7 @@ impl AudioWorkletCodec {
 
     pub fn set_onmessage(&self, handler: &Function) {
         if let Some(port) = self.get_port() {
-            port.set_onmessage(Some(&handler));
+            port.set_onmessage(Some(handler));
         }
     }
 

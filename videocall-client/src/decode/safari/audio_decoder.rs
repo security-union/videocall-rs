@@ -12,7 +12,6 @@
 
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::constants::VIDEO_CODEC;
 use crate::decode::safari::audio_worklet_codec::AudioWorkletCodec;
 use crate::decode::safari::audio_worklet_codec::DecoderInitOptions;
 use crate::decode::safari::audio_worklet_codec::DecoderMessages;
@@ -21,16 +20,10 @@ use log::error;
 use std::sync::Arc;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use web_sys::window;
 use web_sys::AudioContext;
 use web_sys::AudioContextOptions;
 use web_sys::AudioData;
-use web_sys::EncodedVideoChunkType;
-use web_sys::HtmlCanvasElement;
-use web_sys::{CanvasRenderingContext2d, CodecState};
-use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
 
 pub struct DecodeStatus {
     pub rendered: bool,
@@ -107,6 +100,12 @@ macro_rules! opt_ref {
 /// https://github.com/WebAudio/web-audio-api-v2/issues/133
 
 pub type AudioPeerDecoder = PeerDecoder<AudioWorkletCodec, AudioData>;
+
+impl Default for AudioPeerDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl AudioPeerDecoder {
     pub fn new() -> Self {

@@ -6,7 +6,6 @@ use js_sys::Boolean;
 use js_sys::Uint8Array;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -15,11 +14,11 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::AudioContext;
 use web_sys::AudioContextOptions;
+use web_sys::EncodedAudioChunkType;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
-use web_sys::{EncodedAudioChunk, EncodedAudioChunkType};
 use yew::Callback;
 
 pub const AUDIO_BITRATE_KBPS: u32 = 65u32;
@@ -29,14 +28,12 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
-use crate::wrappers::EncodedVideoChunkTypeWrapper;
 use crate::VideoCallClient;
 use protobuf::Message;
 use videocall_types::protos::{
     media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
     packet_wrapper::packet_wrapper::PacketType,
 };
-use web_sys::EncodedVideoChunk;
 
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
@@ -44,7 +41,7 @@ pub fn transform_audio_chunk(
     sequence: u64,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
-    let mut media_packet: MediaPacket = MediaPacket {
+    let media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),
         media_type: MediaType::AUDIO.into(),
         frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
@@ -89,7 +86,7 @@ impl MicrophoneEncoder {
 
     pub fn set_encoder_control(
         &mut self,
-        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
+        diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
     ) {
         // TODO: ignore this for now
         // self.client.subscribe_diagnostics(diagnostics_receiver, MediaType::AUDIO);
@@ -130,14 +127,9 @@ impl MicrophoneEncoder {
             return;
         }
         let aes = client.aes();
-        let EncoderState {
-            destroy,
-            enabled,
-            switching,
-            ..
-        } = self.state.clone();
+        let EncoderState { .. } = self.state.clone();
         let audio_output_handler = {
-            let mut buffer: [u8; 100000] = [0; 100000];
+            let buffer: [u8; 100000] = [0; 100000];
             log::info!("Starting audio encoder");
             let mut sequence_number = 0;
             Box::new(move |chunk: MessageEvent| {
@@ -183,7 +175,7 @@ impl MicrophoneEncoder {
 
             // Sample Rate hasn't been added to the web_sys crate
             let input_rate: u32 =
-                js_sys::Reflect::get(&track_settings, &JsValue::from_str(&"sampleRate"))
+                js_sys::Reflect::get(&track_settings, &JsValue::from_str("sampleRate"))
                     .unwrap()
                     .as_f64()
                     .unwrap() as u32;
@@ -212,8 +204,8 @@ impl MicrophoneEncoder {
                 options: Some(EncoderInitOptions {
                     encoder_frame_size: Some(20),
                     original_sample_rate: Some(input_rate),
-                    encoder_bit_rate: Some(50_000 as u32),
-                    encoder_sample_rate: Some(AUDIO_SAMPLE_RATE as u32),
+                    encoder_bit_rate: Some(50_000_u32),
+                    encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
                     ..Default::default()
                 }),
             });

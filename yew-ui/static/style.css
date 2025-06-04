@@ -253,7 +253,8 @@ h3 {
 
 /* Desktop Grid for 9+ Peers: Maintain item height from 4-row layout, allow more columns based on width */
 #grid-container[data-peers="9"],
-#grid-container[data-peers^="1"] /* Selects data-peers="10" through "19" (max is CANVAS_LIMIT which is 20, so up to 19 peers) */ {
+#grid-container[data-peers^="1"],
+#grid-container[data-peers="20"] /* Added to include 20 peers */ {
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); 
   grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)); 
 }
@@ -338,7 +339,8 @@ h3 {
   
   /* Specific override for data-peers=9+ in forced mobile mode to ensure 2 columns and consistent row height */
   #grid-container.force-desktop-grid[data-peers="9"],
-  #grid-container.force-desktop-grid[data-peers^="1"] {
+  #grid-container.force-desktop-grid[data-peers^="1"],
+  #grid-container.force-desktop-grid[data-peers="20"] /* Added to include 20 peers */ {
     grid-template-columns: repeat(2, 1fr) !important; /* Explicitly 2 columns */
     grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)) !important; /* Row height from 8-peer layout */
   }

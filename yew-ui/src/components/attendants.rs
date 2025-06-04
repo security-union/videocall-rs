@@ -368,12 +368,9 @@ impl Component for AttendantsComponent {
         let mut display_peers_vec = real_peers_vec.clone();
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
         
-        // Remove duplicates, in case a real peer somehow has an ID matching a fake one (unlikely but safe)
-        // Or if the client itself is in the list and we are adding it as a fake peer.
-        // For simplicity, we'll assume IDs are unique enough for now.
-        // If more robust duplicate handling is needed, we can add it.
-
-        let num_display_peers = display_peers_vec.len();
+        let num_display_peers = display_peers_vec.len(); 
+        // Cap the number of peers used for styling at CANVAS_LIMIT
+        let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
         let rows = canvas_generator::generate(
             &self.client, // canvas_generator is client-aware for real peers' media status
@@ -381,9 +378,10 @@ impl Component for AttendantsComponent {
         );
 
         let container_style = if self.peer_list_open || self.diagnostics_open {
-            format!("width: 80%; --num-peers: {};", num_display_peers.max(1))
+            // Use num_peers_for_styling (capped at CANVAS_LIMIT) for the CSS variable
+            format!("width: 80%; --num-peers: {};", num_peers_for_styling.max(1)) 
         } else {
-            format!("width: 100%; --num-peers: {};", num_display_peers.max(1))
+            format!("width: 100%; --num-peers: {};", num_peers_for_styling.max(1))
         };
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
@@ -434,7 +432,7 @@ impl Component for AttendantsComponent {
                 <BrowserCompatibility/>
                 <div id="grid-container"
                     class={grid_container_classes}
-                    data-peers={num_display_peers.to_string()}
+                    data-peers={num_peers_for_styling.to_string()}
                     style={container_style}>
                     { rows }
                     {

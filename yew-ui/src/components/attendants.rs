@@ -48,6 +48,7 @@ pub enum Msg {
     UserScreenAction(UserScreenAction),
     AddFakePeer,
     RemoveLastFakePeer,
+    ToggleForceDesktopGrid,
 }
 
 impl From<WsAction> for Msg {
@@ -99,6 +100,7 @@ pub struct AttendantsComponent {
     pub meeting_joined: bool,
     fake_peer_ids: Vec<String>,
     next_fake_peer_id_counter: usize,
+    force_desktop_grid_on_mobile: bool,
 }
 
 impl AttendantsComponent {
@@ -196,6 +198,7 @@ impl Component for AttendantsComponent {
             meeting_joined: false,
             fake_peer_ids: Vec::new(),
             next_fake_peer_id_counter: 1,
+            force_desktop_grid_on_mobile: false,
         }
     }
 
@@ -347,6 +350,10 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            Msg::ToggleForceDesktopGrid => {
+                self.force_desktop_grid_on_mobile = !self.force_desktop_grid_on_mobile;
+                true
+            }
         }
     }
 
@@ -380,6 +387,11 @@ impl Component for AttendantsComponent {
         };
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
+
+        let mut grid_container_classes = classes!();
+        if self.force_desktop_grid_on_mobile {
+            grid_container_classes.push("force-desktop-grid");
+        }
 
         // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
@@ -421,6 +433,7 @@ impl Component for AttendantsComponent {
             <div id="main-container" class="meeting-page">
                 <BrowserCompatibility/>
                 <div id="grid-container"
+                    class={grid_container_classes}
                     data-peers={num_display_peers.to_string()}
                     style={container_style}>
                     { rows }
@@ -588,6 +601,23 @@ impl Component for AttendantsComponent {
                                                 onclick={ctx.link().callback(|_| Msg::RemoveLastFakePeer)}>
                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-minus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="23" y1="11" x2="17" y2="11"></line></svg>
                                                 <span class="tooltip">{ "Remove Fake Peer" }</span>
+                                            </button>
+                                            <button
+                                                class={classes!("video-control-button", "test-button", self.force_desktop_grid_on_mobile.then_some("active"))}
+                                                title={if self.force_desktop_grid_on_mobile { "Use Mobile Grid (Stack)" } else { "Force Desktop Grid (Multi-column)" }}
+                                                onclick={ctx.link().callback(|_| Msg::ToggleForceDesktopGrid)}>
+                                                {
+                                                    if self.force_desktop_grid_on_mobile {
+                                                        html!{
+                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                                                        }
+                                                    } else {
+                                                        html!{
+                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+                                                        }
+                                                    }
+                                                }
+                                                <span class="tooltip">{if self.force_desktop_grid_on_mobile { "Use Mobile Grid" } else { "Force Desktop Grid" }}</span>
                                             </button>
                                         </nav>
                                     </div>

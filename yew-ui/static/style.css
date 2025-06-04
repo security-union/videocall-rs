@@ -251,38 +251,74 @@ h3 {
   grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)); /* 4 rows */
 }
 
+/* Desktop Grid for 9+ Peers: Maintain item height from 4-row layout, allow more columns based on width */
+#grid-container[data-peers="9"],
+#grid-container[data-peers^="1"] /* Selects data-peers="10" through "19" (max is CANVAS_LIMIT which is 20, so up to 19 peers) */ {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); 
+  grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)); 
+}
+
 /* Mobile override: Single column, items take significant height */
 @media (max-width: 600px) {
-  #grid-container {
+  #grid-container:not(.force-desktop-grid) {
     grid-template-columns: 1fr !important; /* Force single column */
-    grid-auto-rows: minmax(150px, calc( (100vh - 32px - (var(--num-peers, 1) - 1) * 10px) / var(--num-peers, 1) )) !important; /* Distribute height */
+    /* Simplified and more robust row height for default mobile stacking */
+    grid-auto-rows: minmax(180px, auto) !important; 
     padding: 8px !important; /* Reduce padding on mobile */
     gap: 8px !important; /* Reduce gap on mobile */
   }
 
-  /* Reset grid areas and specific placements for mobile to ensure stacking */
-  #grid-container[data-peers="3"] {
+  /* Reset grid areas and specific placements for mobile to ensure stacking, unless desktop grid is forced */
+  #grid-container[data-peers="3"]:not(.force-desktop-grid) {
     grid-template-areas: unset !important;
   }
-  #grid-container[data-peers="3"] .grid-item {
+  #grid-container[data-peers="3"]:not(.force-desktop-grid) .grid-item {
     grid-area: auto !important;
     max-width: 100% !important; /* Allow full width */
     justify-self: stretch !important;
   }
 
-  /* For other specific peer counts, they will naturally fall into single column due to the above rule */
-  #grid-container[data-peers="1"] .grid-item,
-  #grid-container[data-peers="2"] .grid-item,
-  #grid-container[data-peers="4"] .grid-item,
-  #grid-container[data-peers="5"] .grid-item,
-  #grid-container[data-peers="6"] .grid-item,
-  #grid-container[data-peers="7"] .grid-item,
-  #grid-container[data-peers="8"] .grid-item {
+  /* For other specific peer counts, they will naturally fall into single column due to the above :not(.force-desktop-grid) rule */
+  #grid-container[data-peers="1"]:not(.force-desktop-grid) .grid-item,
+  #grid-container[data-peers="2"]:not(.force-desktop-grid) .grid-item,
+  #grid-container[data-peers="4"]:not(.force-desktop-grid) .grid-item,
+  #grid-container[data-peers="5"]:not(.force-desktop-grid) .grid-item,
+  #grid-container[data-peers="6"]:not(.force-desktop-grid) .grid-item,
+  #grid-container[data-peers="7"]:not(.force-desktop-grid) .grid-item,
+  #grid-container[data-peers="8"]:not(.force-desktop-grid) .grid-item {
      max-width: 100% !important;
      height: auto !important; /* Let content or grid-auto-rows define height */
   }
+  
+  /* This rule applies when forcing desktop grid on mobile, for peer counts NOT handled by more specific rules below 
+     (i.e., for data-peers = 1, 2, 3, 6, 7, 8) */
+  #grid-container.force-desktop-grid {
+    grid-template-columns: repeat(2, 1fr) !important; /* Default to 2 columns */
+    /* Reverted to a more generic and adaptive row height for these cases */
+    grid-auto-rows: minmax(120px, 25vh) !important;   
+    padding: 8px !important;
+    gap: 8px !important;
+  }
+  
+  /* These more specific rules will override the general .force-desktop-grid for these counts (4 and 5 peers) */
+  #grid-container.force-desktop-grid[data-peers="4"] {
+    grid-template-columns: repeat(2, 1fr) !important;
+    grid-auto-rows: minmax(150px, calc((100vh - 32px - 10px - 80px) / 2)) !important;
+  }
 
-  .host { /* Make host video smaller and ensure it doesn't overlap too much */
+  #grid-container.force-desktop-grid[data-peers="5"] {
+    grid-template-columns: repeat(2, 1fr) !important;
+    grid-auto-rows: minmax(150px, calc((100vh - 32px - 20px - 80px) / 3)) !important;
+  }
+  
+  /* Specific override for data-peers=9+ in forced mobile mode to ensure 2 columns and consistent row height */
+  #grid-container.force-desktop-grid[data-peers="9"],
+  #grid-container.force-desktop-grid[data-peers^="1"] {
+    grid-template-columns: repeat(2, 1fr) !important; /* Explicitly 2 columns */
+    grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)) !important; /* Row height from 8-peer layout */
+  }
+  
+  .host { /* Make host video smaller and ensure it doesn't overlap too much on mobile */
     width: 25% !important;
     max-width: 120px !important; 
     bottom: 8px !important; /* Adjust position from bottom */

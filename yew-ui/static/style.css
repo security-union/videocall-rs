@@ -161,11 +161,9 @@ h3 {
   width: 100%;
   height: 100%;
   
-  /* Add visible debugging borders
-  border: 3px solid red; */
-  
-  /* Auto-fill grid that prevents horizontal overflow */
+  /* Default auto-fill grid that prevents horizontal overflow, acts as fallback */
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  grid-auto-rows: minmax(150px, 1fr); /* Default row sizing */
   
   /* Set reasonable gaps and padding */
   gap: 10px;
@@ -175,97 +173,120 @@ h3 {
   /* Ensure content is centered */
   justify-items: center;
   align-items: center;
+  overflow: auto; /* Allow scrolling if content overflows, e.g. many participants on small screen */
 }
 
 .grid-item {
   /* Item sizing */
   width: 100%;
   height: 100%;
-  min-height: 150px;
+  min-height: 150px; /* Minimum height for a video item */
   
-  /* Debug styling */
-  /* background-color: rgba(0, 0, 255, 0.2);
-  border: 1px solid yellow; */
-  
-  /* Center content */
+  /* Center content within grid item */
   display: flex;
   justify-content: center;
   align-items: center;
+  overflow: hidden; /* Prevent content like oversized canvas from breaking layout */
+  background-color: #2d2d2d; /* Slightly different background for items */
+  border-radius: 8px;
 }
 
-/* Special case for single peer */
+/* --- Layouts for specific number of peers --- */
+
+/* 1 peer: Full width/height for the single peer */
 #grid-container[data-peers="1"] {
   grid-template-columns: 1fr;
+  grid-auto-rows: minmax(150px, calc(100vh - 32px - 80px)); /* 100vh minus padding and approx host video height */
 }
 
-#grid-container[data-peers="1"] .grid-item {
-  max-width: 90%;
-  height: 80vh; /* Relative to viewport height */
-  max-height: 80vh;
-}
-
-/* Two peers */
+/* 2 peers: Two columns, one row */
 #grid-container[data-peers="2"] {
   grid-template-columns: repeat(2, 1fr);
-  /* Set row height relative to viewport */
-  grid-auto-rows: minmax(150px, calc(80vh - 32px)); /* Account for container padding */
+  grid-auto-rows: minmax(150px, calc(100vh - 32px - 80px));
 }
 
-/* 3 peers: More balanced, pyramid-style layout */
+/* 3 peers: Pyramid style (2 top, 1 centered below) */
 #grid-container[data-peers="3"] {
-  /* Define a 2-column grid */
   grid-template-columns: repeat(2, 1fr);
-  /* Ensure we have 2 rows with equal height */
-  grid-template-rows: repeat(2, minmax(150px, calc((80vh - 32px - 10px) / 2)));
-  /* Create named template areas for better placement */
+  grid-template-rows: repeat(2, minmax(150px, calc((100vh - 32px - 10px - 80px) / 2))); /* 2 rows */
   grid-template-areas: 
     "peer1 peer2"
     "peer3 peer3";
 }
-
-/* Specific placement for each peer in the 3-peer layout */
-#grid-container[data-peers="3"] .grid-item:nth-child(1) {
-  grid-area: peer1;
-}
-
-#grid-container[data-peers="3"] .grid-item:nth-child(2) {
-  grid-area: peer2;
-}
-
-#grid-container[data-peers="3"] .grid-item:nth-child(3) {
+#grid-container[data-peers="3"] .grid-item:nth-child(1) { grid-area: peer1; }
+#grid-container[data-peers="3"] .grid-item:nth-child(2) { grid-area: peer2; }
+#grid-container[data-peers="3"] .grid-item:nth-child(3) { 
   grid-area: peer3;
-  max-width: 80%; /* Constrain width to prevent stretching */
-  justify-self: center; /* Center in the grid cell */
+  max-width: 75%; /* Make bottom item not stretch full width */
+  justify-self: center;
 }
 
-/* 4 peers: 2×2 grid */
+/* 4 peers: 2x2 grid */
 #grid-container[data-peers="4"] {
   grid-template-columns: repeat(2, 1fr);
-  /* Height for 2 rows */
-  grid-auto-rows: minmax(150px, calc((80vh - 32px - 10px) / 2)); /* Account for container padding and gap */
+  grid-auto-rows: minmax(150px, calc((100vh - 32px - 10px - 80px) / 2)); /* 2 rows */
 }
 
-/* 5-6 peers: 3×2 grid */
-#grid-container[data-peers="5"],
+/* 5 peers: 2 columns, 3 rows (bottom right empty) */
+#grid-container[data-peers="5"] {
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: minmax(150px, calc((100vh - 32px - 20px - 80px) / 3)); /* 3 rows */
+}
+
+/* 6 peers: 2x3 grid (full) */
 #grid-container[data-peers="6"] {
-  grid-template-columns: repeat(3, 1fr);
-  /* Height for 2 rows */
-  grid-auto-rows: minmax(150px, calc((80vh - 32px - 10px) / 2));
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: minmax(150px, calc((100vh - 32px - 20px - 80px) / 3)); /* 3 rows */
 }
 
-/* 7-9 peers: 3×3 grid */
-#grid-container[data-peers="7"],
-#grid-container[data-peers="8"],
-#grid-container[data-peers="9"] {
-  grid-template-columns: repeat(3, 1fr);
-  /* Height for 3 rows */
-  grid-auto-rows: minmax(150px, calc((80vh - 32px - 20px) / 3)); /* Account for two row gaps */
+/* 7 peers: 2 columns, 4 rows (bottom right empty) */
+#grid-container[data-peers="7"] {
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)); /* 4 rows */
 }
 
-/* Mobile override */
+/* 8 peers: 2x4 grid (full) */
+#grid-container[data-peers="8"] {
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)); /* 4 rows */
+}
+
+/* Mobile override: Single column, items take significant height */
 @media (max-width: 600px) {
   #grid-container {
-    grid-template-columns: 1fr !important;
+    grid-template-columns: 1fr !important; /* Force single column */
+    grid-auto-rows: minmax(150px, calc( (100vh - 32px - (var(--num-peers, 1) - 1) * 10px) / var(--num-peers, 1) )) !important; /* Distribute height */
+    padding: 8px !important; /* Reduce padding on mobile */
+    gap: 8px !important; /* Reduce gap on mobile */
+  }
+
+  /* Reset grid areas and specific placements for mobile to ensure stacking */
+  #grid-container[data-peers="3"] {
+    grid-template-areas: unset !important;
+  }
+  #grid-container[data-peers="3"] .grid-item {
+    grid-area: auto !important;
+    max-width: 100% !important; /* Allow full width */
+    justify-self: stretch !important;
+  }
+
+  /* For other specific peer counts, they will naturally fall into single column due to the above rule */
+  #grid-container[data-peers="1"] .grid-item,
+  #grid-container[data-peers="2"] .grid-item,
+  #grid-container[data-peers="4"] .grid-item,
+  #grid-container[data-peers="5"] .grid-item,
+  #grid-container[data-peers="6"] .grid-item,
+  #grid-container[data-peers="7"] .grid-item,
+  #grid-container[data-peers="8"] .grid-item {
+     max-width: 100% !important;
+     height: auto !important; /* Let content or grid-auto-rows define height */
+  }
+
+  .host { /* Make host video smaller and ensure it doesn't overlap too much */
+    width: 25% !important;
+    max-width: 120px !important; 
+    bottom: 8px !important; /* Adjust position from bottom */
+    right: 8px !important; /* Adjust position from right */
   }
 }
 
@@ -288,10 +309,24 @@ canvas {
 /* Host camera frame rendered in the bottom right corner */
 .host {
   position: absolute;
-  bottom: 0;
-  right: 0;
-  width: 20%;
+  bottom: 16px; /* Default spacing from bottom */
+  right: 16px; /* Default spacing from right */
+  width: 20%; /* Default width */
+  max-width: 240px; /* Max width to prevent it from being too large on wide screens */
+  min-width: 100px; /* Min width to ensure it's usable */
   height: auto;
+  aspect-ratio: 16/9; /* Maintain aspect ratio */
+  border: 2px solid #444;
+  border-radius: 8px;
+  overflow: hidden; /* Ensure canvas fits */
+  z-index: 10; /* Make sure it's above the grid items if any overlap occurs */
+  background-color: #111; /* Background in case video is slow to load */
+}
+
+.host canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: cover; /* Cover to fill, might crop slightly */
 }
 
 .hidden {

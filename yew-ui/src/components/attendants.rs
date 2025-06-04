@@ -46,6 +46,8 @@ pub enum Msg {
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
     UserScreenAction(UserScreenAction),
+    AddFakePeer,
+    RemoveLastFakePeer,
 }
 
 impl From<WsAction> for Msg {
@@ -95,6 +97,8 @@ pub struct AttendantsComponent {
     pending_video_enable: bool,
     pending_screen_share: bool,
     pub meeting_joined: bool,
+    fake_peer_ids: Vec<String>,
+    next_fake_peer_id_counter: usize,
 }
 
 impl AttendantsComponent {
@@ -190,6 +194,8 @@ impl Component for AttendantsComponent {
             pending_screen_share: false,
             encoder_settings: None,
             meeting_joined: false,
+            fake_peer_ids: Vec::new(),
+            next_fake_peer_id_counter: 1,
         }
     }
 
@@ -329,6 +335,18 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            Msg::AddFakePeer => {
+                let fake_peer_id = format!("fake-peer-{}", self.next_fake_peer_id_counter);
+                self.fake_peer_ids.push(fake_peer_id);
+                self.next_fake_peer_id_counter += 1;
+                true
+            }
+            Msg::RemoveLastFakePeer => {
+                if !self.fake_peer_ids.is_empty() {
+                    self.fake_peer_ids.pop();
+                }
+                true
+            }
         }
     }
 
@@ -339,11 +357,27 @@ impl Component for AttendantsComponent {
         let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
         let toggle_diagnostics = ctx.link().callback(|_| UserScreenAction::ToggleDiagnostics);
 
-        let peers = self.client.sorted_peer_keys();
+        let real_peers_vec = self.client.sorted_peer_keys();
+        let mut display_peers_vec = real_peers_vec.clone();
+        display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
+        
+        // Remove duplicates, in case a real peer somehow has an ID matching a fake one (unlikely but safe)
+        // Or if the client itself is in the list and we are adding it as a fake peer.
+        // For simplicity, we'll assume IDs are unique enough for now.
+        // If more robust duplicate handling is needed, we can add it.
+
+        let num_display_peers = display_peers_vec.len();
+
         let rows = canvas_generator::generate(
-            &self.client,
-            peers.iter().take(CANVAS_LIMIT).cloned().collect(),
+            &self.client, // canvas_generator is client-aware for real peers' media status
+            display_peers_vec.iter().take(CANVAS_LIMIT).cloned().collect(),
         );
+
+        let container_style = if self.peer_list_open || self.diagnostics_open {
+            format!("width: 80%; --num-peers: {};", num_display_peers.max(1))
+        } else {
+            format!("width: 100%; --num-peers: {};", num_display_peers.max(1))
+        };
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
@@ -386,7 +420,9 @@ impl Component for AttendantsComponent {
         html! {
             <div id="main-container" class="meeting-page">
                 <BrowserCompatibility/>
-                <div id="grid-container" style={if self.peer_list_open || self.diagnostics_open {"width: 80%;"} else {"width: 100%;"}}>
+                <div id="grid-container"
+                    data-peers={num_display_peers.to_string()}
+                    style={container_style}>
                     { rows }
                     {
                         if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
@@ -539,6 +575,20 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            <button
+                                                class="video-control-button test-button"
+                                                title="Add Fake Peer"
+                                                onclick={ctx.link().callback(|_| Msg::AddFakePeer)}>
+                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-plus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="20" y1="8" x2="20" y2="14"></line><line x1="17" y1="11" x2="23" y2="11"></line></svg>
+                                                <span class="tooltip">{ "Add Fake Peer" }</span>
+                                            </button>
+                                            <button
+                                                class="video-control-button test-button"
+                                                title="Remove Fake Peer"
+                                                onclick={ctx.link().callback(|_| Msg::RemoveLastFakePeer)}>
+                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-minus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="23" y1="11" x2="17" y2="11"></line></svg>
+                                                <span class="tooltip">{ "Remove Fake Peer" }</span>
+                                            </button>
                                         </nav>
                                     </div>
                                     {
@@ -571,7 +621,7 @@ impl Component for AttendantsComponent {
                     }
                 </div>
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
-                    <PeerList peers={peers} onclose={toggle_peer_list} />
+                    <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
                 <div id="diagnostics-sidebar" class={if self.diagnostics_open {"visible"} else {""}}>
                     <div class="sidebar-header">

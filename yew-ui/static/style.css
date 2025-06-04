@@ -290,25 +290,50 @@ h3 {
      height: auto !important; /* Let content or grid-auto-rows define height */
   }
   
-  /* This rule applies when forcing desktop grid on mobile, for peer counts NOT handled by more specific rules below 
-     (i.e., for data-peers = 1, 2, 3, 6, 7, 8) */
+  /* This rule is the fallback for .force-desktop-grid on mobile.
+     It will apply to data-peers = 0, 1, 2 (stacking them) */
   #grid-container.force-desktop-grid {
-    grid-template-columns: repeat(2, 1fr) !important; /* Default to 2 columns */
-    /* Reverted to a more generic and adaptive row height for these cases */
-    grid-auto-rows: minmax(120px, 25vh) !important;   
+    grid-template-columns: 1fr !important; /* Default to single column (stacking) for 0,1,2 peers */
+    grid-auto-rows: minmax(180px, auto) !important;   
     padding: 8px !important;
     gap: 8px !important;
   }
+
+  /* Specific 2-column layouts for .force-desktop-grid on mobile when peer count is 3+ */
+  #grid-container.force-desktop-grid[data-peers="3"] { /* 4 attendees total */
+    grid-template-columns: repeat(2, 1fr) !important;
+    /* Re-apply row calculation from desktop pyramid rule, ensuring high precedence */
+    grid-template-rows: repeat(2, minmax(150px, calc((100vh - 32px - 10px - 80px) / 2))) !important;
+    /* Ensure grid-areas are active for pyramid if they were unset by :not selector */
+    grid-template-areas: 
+      "peer1 peer2"
+      "peer3 peer3" !important;
+  }
   
-  /* These more specific rules will override the general .force-desktop-grid for these counts (4 and 5 peers) */
   #grid-container.force-desktop-grid[data-peers="4"] {
     grid-template-columns: repeat(2, 1fr) !important;
     grid-auto-rows: minmax(150px, calc((100vh - 32px - 10px - 80px) / 2)) !important;
   }
-
+  
   #grid-container.force-desktop-grid[data-peers="5"] {
     grid-template-columns: repeat(2, 1fr) !important;
     grid-auto-rows: minmax(150px, calc((100vh - 32px - 20px - 80px) / 3)) !important;
+  }
+  
+  /* Add specific 2-column rules for data-peers=6,7,8 in forced mobile mode */
+  #grid-container.force-desktop-grid[data-peers="6"] {
+    grid-template-columns: repeat(2, 1fr) !important;
+    grid-auto-rows: minmax(150px, calc((100vh - 32px - 20px - 80px) / 3)) !important; /* Consistent with 2x3 desktop row height */
+  }
+
+  #grid-container.force-desktop-grid[data-peers="7"] {
+    grid-template-columns: repeat(2, 1fr) !important;
+    grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)) !important; /* Consistent with 2x4 desktop row height */
+  }
+
+  #grid-container.force-desktop-grid[data-peers="8"] {
+    grid-template-columns: repeat(2, 1fr) !important;
+    grid-auto-rows: minmax(150px, calc((100vh - 32px - 30px - 80px) / 4)) !important; /* Consistent with 2x4 desktop row height */
   }
   
   /* Specific override for data-peers=9+ in forced mobile mode to ensure 2 columns and consistent row height */

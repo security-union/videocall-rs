@@ -351,6 +351,11 @@ h3 {
     bottom: 8px !important; /* Adjust position from bottom */
     right: 8px !important; /* Adjust position from right */
   }
+
+  /* Hide the top bar on mobile screens */
+  .top-bar {
+    display: none !important;
+  }
 }
 
 .canvas-container {
@@ -746,5 +751,13 @@ select {
 
 .grid-item:hover .pin-icon {
   visibility: visible;
+}
+
+/* Style for the simulation info message */
+.simulation-info-message {
+  color: #ffcc00; /* A warning-like yellow color */
+  text-align: center;
+  margin-top: 10px;
+  font-size: 0.9em;
 }
 

@@ -101,6 +101,7 @@ pub struct AttendantsComponent {
     fake_peer_ids: Vec<String>,
     next_fake_peer_id_counter: usize,
     force_desktop_grid_on_mobile: bool,
+    simulation_info_message: Option<String>,
 }
 
 impl AttendantsComponent {
@@ -199,6 +200,7 @@ impl Component for AttendantsComponent {
             fake_peer_ids: Vec::new(),
             next_fake_peer_id_counter: 1,
             force_desktop_grid_on_mobile: false,
+            simulation_info_message: None,
         }
     }
 
@@ -338,20 +340,29 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
-            Msg::AddFakePeer => {
-                let fake_peer_id = format!("fake-peer-{}", self.next_fake_peer_id_counter);
-                self.fake_peer_ids.push(fake_peer_id);
-                self.next_fake_peer_id_counter += 1;
-                true
-            }
             Msg::RemoveLastFakePeer => {
                 if !self.fake_peer_ids.is_empty() {
                     self.fake_peer_ids.pop();
                 }
+                self.simulation_info_message = None;
                 true
+            }
+            Msg::AddFakePeer => {
+                let current_total_peers = self.client.sorted_peer_keys().len() + self.fake_peer_ids.len();
+                if current_total_peers < CANVAS_LIMIT {
+                    let fake_peer_id = format!("fake-peer-{}", self.next_fake_peer_id_counter);
+                    self.fake_peer_ids.push(fake_peer_id);
+                    self.next_fake_peer_id_counter += 1;
+                    self.simulation_info_message = None;
+                } else {
+                    log::warn!("Maximum participants ({}) reached. Cannot add more.", CANVAS_LIMIT);
+                    self.simulation_info_message = Some(format!("Maximum participants ({}) reached.", CANVAS_LIMIT));
+                }
+                true // Re-render to update button state or display message
             }
             Msg::ToggleForceDesktopGrid => {
                 self.force_desktop_grid_on_mobile = !self.force_desktop_grid_on_mobile;
+                self.simulation_info_message = None;
                 true
             }
         }
@@ -371,6 +382,9 @@ impl Component for AttendantsComponent {
         let num_display_peers = display_peers_vec.len(); 
         // Cap the number of peers used for styling at CANVAS_LIMIT
         let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
+
+        // Determine if the "Add Fake Peer" button should be disabled
+        let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
         let rows = canvas_generator::generate(
             &self.client, // canvas_generator is client-aware for real peers' media status
@@ -589,7 +603,9 @@ impl Component for AttendantsComponent {
                                             <button
                                                 class="video-control-button test-button"
                                                 title="Add Fake Peer"
-                                                onclick={ctx.link().callback(|_| Msg::AddFakePeer)}>
+                                                onclick={ctx.link().callback(|_| Msg::AddFakePeer)}
+                                                disabled={add_fake_peer_disabled}
+                                                >
                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-plus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="20" y1="8" x2="20" y2="14"></line><line x1="17" y1="11" x2="23" y2="11"></line></svg>
                                                 <span class="tooltip">{ "Add Fake Peer" }</span>
                                             </button>
@@ -618,6 +634,16 @@ impl Component for AttendantsComponent {
                                                 <span class="tooltip">{if self.force_desktop_grid_on_mobile { "Use Mobile Grid" } else { "Force Desktop Grid" }}</span>
                                             </button>
                                         </nav>
+                                        // Display simulation info message if any
+                                        { 
+                                            if let Some(message) = &self.simulation_info_message {
+                                                html!{
+                                                    <p class="simulation-info-message">{ message }</p>
+                                                }
+                                            } else {
+                                                html!{}
+                                            }
+                                        }
                                     </div>
                                     {
                                         if media_access_granted {

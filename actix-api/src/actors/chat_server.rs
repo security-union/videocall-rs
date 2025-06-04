@@ -184,7 +184,7 @@ fn handle_msg(
 
         session_recipient.try_send(message).map_err(|e| {
             error!("error sending message to session {}: {}", session, e);
-            std::io::Error::new(std::io::ErrorKind::Other, e)
+            std::io::Error::other(e)
         })
     }
 }

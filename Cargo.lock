@@ -6100,6 +6100,7 @@ dependencies = [
  "protobuf",
  "rand 0.8.5",
  "rsa",
+ "serde",
  "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",

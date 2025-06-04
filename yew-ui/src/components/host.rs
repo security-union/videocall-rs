@@ -2,8 +2,8 @@ use crate::constants::*;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
-use std::fmt::Debug;
-use videocall_client::{CameraEncoder, MicrophoneEncoder, ScreenEncoder, VideoCallClient};
+use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
+use videocall_client::{CameraEncoder, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
@@ -22,6 +22,7 @@ pub enum Msg {
     DisableVideo,
     AudioDeviceChanged(String),
     VideoDeviceChanged(String),
+    SpeakerDeviceChanged(String),
     CameraEncoderSettingsUpdated(String),
     MicrophoneEncoderSettingsUpdated(String),
     ScreenEncoderSettingsUpdated(String),
@@ -29,12 +30,13 @@ pub enum Msg {
 
 pub struct Host {
     pub camera: CameraEncoder,
-    pub microphone: MicrophoneEncoder,
+    pub microphone: Box<dyn MicrophoneEncoderTrait>,
     pub screen: ScreenEncoder,
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub encoder_settings: EncoderSettings,
+    pub selected_speaker_id: Option<String>,
 }
 
 pub struct EncoderSettings {
@@ -91,8 +93,11 @@ impl Component for Host {
             VIDEO_BITRATE_KBPS,
             camera_callback,
         );
+
+        // Use the factory function to create the appropriate microphone encoder
         let mut microphone =
-            MicrophoneEncoder::new(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+            create_microphone_encoder(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+
         let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS, screen_callback);
 
         let (tx, rx) = mpsc::unbounded();
@@ -119,6 +124,7 @@ impl Component for Host {
                 microphone: None,
                 screen: None,
             },
+            selected_speaker_id: None,
         }
     }
 
@@ -228,6 +234,14 @@ impl Component for Host {
                 }
                 false
             }
+            Msg::SpeakerDeviceChanged(speaker) => {
+                self.selected_speaker_id = Some(speaker.clone());
+                // Update the speaker device for all connected peers
+                if let Err(e) = ctx.props().client.update_speaker_device(Some(speaker)) {
+                    log::error!("Failed to update speaker device: {:?}", e);
+                }
+                true
+            }
             Msg::CameraEncoderSettingsUpdated(settings) => {
                 // Only update if settings have changed
                 if self.encoder_settings.camera.as_ref() != Some(&settings) {
@@ -272,10 +286,15 @@ impl Component for Host {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let mic_callback = ctx.link().callback(Msg::AudioDeviceChanged);
         let cam_callback = ctx.link().callback(Msg::VideoDeviceChanged);
+        let speaker_callback = ctx.link().callback(Msg::SpeakerDeviceChanged);
         html! {
             <>
                 <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
-                <DeviceSelector on_microphone_select={mic_callback} on_camera_select={cam_callback}/>
+                <DeviceSelector
+                    on_microphone_select={mic_callback}
+                    on_camera_select={cam_callback}
+                    on_speaker_select={speaker_callback}
+                />
             </>
         }
     }

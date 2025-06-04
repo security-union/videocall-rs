@@ -68,16 +68,20 @@
 //!
 //! ```
 
+pub mod audio_worklet_codec;
 mod client;
 mod connection;
 pub mod constants;
 pub mod crypto;
 pub mod decode;
 pub mod diagnostics;
-mod encode;
+pub mod encode;
 mod media_devices;
+pub mod utils;
 mod wrappers;
-
 pub use client::{VideoCallClient, VideoCallClientOptions};
-pub use encode::{CameraEncoder, MicrophoneEncoder, ScreenEncoder};
+pub use decode::{
+    create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
+};
+pub use encode::{create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};

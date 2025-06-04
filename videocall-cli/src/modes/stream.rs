@@ -45,7 +45,7 @@ pub async fn stream(opt: Stream) {
     let mut client: CameraSynks = if local_streaming {
         CameraSynks::DeadSynk(DeadSynk::new(opt))
     } else {
-        CameraSynks::CameraSynk(QUICClient::new(opt))
+        CameraSynks::CameraSynk(Box::new(QUICClient::new(opt)))
     };
     client.connect().await.expect("failed to connect");
     let camera_config = CameraConfig {

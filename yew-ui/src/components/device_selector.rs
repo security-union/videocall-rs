@@ -1,3 +1,4 @@
+use videocall_client::utils::is_ios;
 use videocall_client::MediaDeviceList;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlSelectElement;
@@ -11,6 +12,7 @@ pub enum Msg {
     DevicesLoaded,
     OnCameraSelect(String),
     OnMicSelect(String),
+    OnSpeakerSelect(String),
     LoadDevices(),
 }
 
@@ -18,6 +20,7 @@ pub enum Msg {
 pub struct DeviceSelectorProps {
     pub on_camera_select: Callback<String>,
     pub on_microphone_select: Callback<String>,
+    pub on_speaker_select: Callback<String>,
 }
 
 impl DeviceSelector {
@@ -26,6 +29,7 @@ impl DeviceSelector {
         let link = ctx.link().clone();
         let on_microphone_select = ctx.props().on_microphone_select.clone();
         let on_camera_select = ctx.props().on_camera_select.clone();
+        let on_speaker_select = ctx.props().on_speaker_select.clone();
         {
             let link = link.clone();
             media_devices.on_loaded =
@@ -42,6 +46,9 @@ impl DeviceSelector {
         let on_camera_select = on_camera_select.clone();
         media_devices.video_inputs.on_selected =
             Callback::from(move |device_id| on_camera_select.emit(device_id));
+        let on_speaker_select = on_speaker_select.clone();
+        media_devices.audio_outputs.on_selected =
+            Callback::from(move |device_id| on_speaker_select.emit(device_id));
         media_devices
     }
 }
@@ -81,14 +88,22 @@ impl Component for DeviceSelector {
                 self.media_devices.audio_inputs.select(&mic);
                 true
             }
+            Msg::OnSpeakerSelect(speaker) => {
+                self.media_devices.audio_outputs.select(&speaker);
+                true
+            }
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         let mics = self.media_devices.audio_inputs.devices();
         let cameras = self.media_devices.video_inputs.devices();
+        let speakers = self.media_devices.audio_outputs.devices();
         let selected_mic = self.media_devices.audio_inputs.selected();
         let selected_camera = self.media_devices.video_inputs.selected();
+        let selected_speaker = self.media_devices.audio_outputs.selected();
+        let is_ios_safari = is_ios();
+
         fn selection(event: Event) -> String {
             event
                 .target()
@@ -120,6 +135,29 @@ impl Component for DeviceSelector {
                         </option>
                     }) }
                 </select>
+                <br/>
+                <label for={"speaker-select"}>{ "Speaker:" }</label>
+                {
+                    if is_ios_safari {
+                        html! {
+                            <select id={"speaker-select"} class={"device-selector"} disabled={true}>
+                                <option selected={true}>{ "System Default (iOS/Safari)" }</option>
+                            </select>
+                        }
+                    } else {
+                        html! {
+                            <select id={"speaker-select"} class={"device-selector"}
+                                    onchange={ctx.link().callback(|e: Event| Msg::OnSpeakerSelect(selection(e)))}
+                            >
+                                { for speakers.iter().map(|device| html! {
+                                    <option value={device.device_id()} selected={selected_speaker == device.device_id()}>
+                                        { device.label() }
+                                    </option>
+                                }) }
+                            </select>
+                        }
+                    }
+                }
             </div>
         }
     }

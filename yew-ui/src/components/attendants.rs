@@ -235,8 +235,6 @@ impl AttendantsComponent {
     fn view_grid_toggle(&self, _ctx: &Context<Self>) -> Html {
         html! {} // Empty html when feature is not enabled
     }
-
-
 }
 
 impl Component for AttendantsComponent {
@@ -413,15 +411,20 @@ impl Component for AttendantsComponent {
             }
             #[cfg(feature = "fake-peers")]
             Msg::AddFakePeer => {
-                let current_total_peers = self.client.sorted_peer_keys().len() + self.fake_peer_ids.len();
+                let current_total_peers =
+                    self.client.sorted_peer_keys().len() + self.fake_peer_ids.len();
                 if current_total_peers < CANVAS_LIMIT {
                     let fake_peer_id = format!("fake-peer-{}", self.next_fake_peer_id_counter);
                     self.fake_peer_ids.push(fake_peer_id);
                     self.next_fake_peer_id_counter += 1;
                     self.simulation_info_message = None;
                 } else {
-                    log::warn!("Maximum participants ({}) reached. Cannot add more.", CANVAS_LIMIT);
-                    self.simulation_info_message = Some(format!("Maximum participants ({}) reached.", CANVAS_LIMIT));
+                    log::warn!(
+                        "Maximum participants ({}) reached. Cannot add more.",
+                        CANVAS_LIMIT
+                    );
+                    self.simulation_info_message =
+                        Some(format!("Maximum participants ({}) reached.", CANVAS_LIMIT));
                 }
                 true // Re-render to update button state or display message
             }
@@ -443,8 +446,8 @@ impl Component for AttendantsComponent {
         let real_peers_vec = self.client.sorted_peer_keys();
         let mut display_peers_vec = real_peers_vec.clone();
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
-        
-        let num_display_peers = display_peers_vec.len(); 
+
+        let num_display_peers = display_peers_vec.len();
         // Cap the number of peers used for styling at CANVAS_LIMIT
         let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
@@ -456,14 +459,21 @@ impl Component for AttendantsComponent {
 
         let rows = canvas_generator::generate(
             &self.client, // canvas_generator is client-aware for real peers' media status
-            display_peers_vec.iter().take(CANVAS_LIMIT).cloned().collect(),
+            display_peers_vec
+                .iter()
+                .take(CANVAS_LIMIT)
+                .cloned()
+                .collect(),
         );
 
         let container_style = if self.peer_list_open || self.diagnostics_open {
             // Use num_peers_for_styling (capped at CANVAS_LIMIT) for the CSS variable
-            format!("width: 80%; --num-peers: {};", num_peers_for_styling.max(1)) 
+            format!("width: 80%; --num-peers: {};", num_peers_for_styling.max(1))
         } else {
-            format!("width: 100%; --num-peers: {};", num_peers_for_styling.max(1))
+            format!(
+                "width: 100%; --num-peers: {};",
+                num_peers_for_styling.max(1)
+            )
         };
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
@@ -670,10 +680,10 @@ impl Component for AttendantsComponent {
                                             </button>
                                             { self.view_grid_toggle(ctx) }
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
-                                           
+
                                         </nav>
                                         // Display simulation info message if any
-                                        { 
+                                        {
                                             if let Some(message) = &self.simulation_info_message {
                                                 html!{
                                                     <p class="simulation-info-message">{ message }</p>

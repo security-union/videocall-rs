@@ -46,6 +46,12 @@ pub enum Msg {
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
     UserScreenAction(UserScreenAction),
+    #[cfg(feature = "fake-peers")]
+    AddFakePeer,
+    #[cfg(feature = "fake-peers")]
+    RemoveLastFakePeer,
+    #[cfg(feature = "fake-peers")]
+    ToggleForceDesktopGrid,
 }
 
 impl From<WsAction> for Msg {
@@ -95,6 +101,11 @@ pub struct AttendantsComponent {
     pending_video_enable: bool,
     pending_screen_share: bool,
     pub meeting_joined: bool,
+    fake_peer_ids: Vec<String>,
+    #[cfg(feature = "fake-peers")]
+    next_fake_peer_id_counter: usize,
+    force_desktop_grid_on_mobile: bool,
+    simulation_info_message: Option<String>,
 }
 
 impl AttendantsComponent {
@@ -167,6 +178,65 @@ impl AttendantsComponent {
         };
         media_device_access
     }
+
+    #[cfg(feature = "fake-peers")]
+    fn view_fake_peer_buttons(&self, ctx: &Context<Self>, add_fake_peer_disabled: bool) -> Html {
+        html! {
+            <>
+                <button
+                    class="video-control-button test-button"
+                    title="Add Fake Peer"
+                    onclick={ctx.link().callback(|_| Msg::AddFakePeer)}
+                    disabled={add_fake_peer_disabled}
+                    >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-plus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="20" y1="8" x2="20" y2="14"></line><line x1="17" y1="11" x2="23" y2="11"></line></svg>
+                    <span class="tooltip">{ "Add Fake Peer" }</span>
+                </button>
+                <button
+                    class="video-control-button test-button"
+                    title="Remove Fake Peer"
+                    onclick={ctx.link().callback(|_| Msg::RemoveLastFakePeer)}>
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-minus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="23" y1="11" x2="17" y2="11"></line></svg>
+                    <span class="tooltip">{ "Remove Fake Peer" }</span>
+                </button>
+            </>
+        }
+    }
+
+    #[cfg(not(feature = "fake-peers"))]
+    fn view_fake_peer_buttons(&self, _ctx: &Context<Self>, _add_fake_peer_disabled: bool) -> Html {
+        html! {} // Empty html when feature is not enabled
+    }
+
+    #[cfg(feature = "fake-peers")]
+    fn view_grid_toggle(&self, ctx: &Context<Self>) -> Html {
+        html! {
+            <>
+                <button
+                class={classes!("video-control-button", "test-button", "mobile-only-grid-toggle", self.force_desktop_grid_on_mobile.then_some("active"))}
+                title={if self.force_desktop_grid_on_mobile { "Use Mobile Grid (Stack)" } else { "Force Desktop Grid (Multi-column)" }}
+                onclick={ctx.link().callback(|_| Msg::ToggleForceDesktopGrid)}>
+                {
+                    if self.force_desktop_grid_on_mobile {
+                        html!{
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                        }
+                    } else {
+                        html!{
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+                        }
+                    }
+                }
+                <span class="tooltip">{if self.force_desktop_grid_on_mobile { "Use Mobile Grid" } else { "Force Desktop Grid" }}</span>
+            </button>
+            </>
+        }
+    }
+
+    #[cfg(not(feature = "fake-peers"))]
+    fn view_grid_toggle(&self, _ctx: &Context<Self>) -> Html {
+        html! {} // Empty html when feature is not enabled
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -190,6 +260,11 @@ impl Component for AttendantsComponent {
             pending_screen_share: false,
             encoder_settings: None,
             meeting_joined: false,
+            fake_peer_ids: Vec::new(),
+            #[cfg(feature = "fake-peers")]
+            next_fake_peer_id_counter: 1,
+            force_desktop_grid_on_mobile: true,
+            simulation_info_message: None,
         }
     }
 
@@ -329,6 +404,39 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            #[cfg(feature = "fake-peers")]
+            Msg::RemoveLastFakePeer => {
+                if !self.fake_peer_ids.is_empty() {
+                    self.fake_peer_ids.pop();
+                }
+                self.simulation_info_message = None;
+                true
+            }
+            #[cfg(feature = "fake-peers")]
+            Msg::AddFakePeer => {
+                let current_total_peers =
+                    self.client.sorted_peer_keys().len() + self.fake_peer_ids.len();
+                if current_total_peers < CANVAS_LIMIT {
+                    let fake_peer_id = format!("fake-peer-{}", self.next_fake_peer_id_counter);
+                    self.fake_peer_ids.push(fake_peer_id);
+                    self.next_fake_peer_id_counter += 1;
+                    self.simulation_info_message = None;
+                } else {
+                    log::warn!(
+                        "Maximum participants ({}) reached. Cannot add more.",
+                        CANVAS_LIMIT
+                    );
+                    self.simulation_info_message =
+                        Some(format!("Maximum participants ({}) reached.", CANVAS_LIMIT));
+                }
+                true // Re-render to update button state or display message
+            }
+            #[cfg(feature = "fake-peers")]
+            Msg::ToggleForceDesktopGrid => {
+                self.force_desktop_grid_on_mobile = !self.force_desktop_grid_on_mobile;
+                self.simulation_info_message = None;
+                true
+            }
         }
     }
 
@@ -339,13 +447,42 @@ impl Component for AttendantsComponent {
         let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
         let toggle_diagnostics = ctx.link().callback(|_| UserScreenAction::ToggleDiagnostics);
 
-        let peers = self.client.sorted_peer_keys();
+        let real_peers_vec = self.client.sorted_peer_keys();
+        let mut display_peers_vec = real_peers_vec.clone();
+        display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
+
+        let num_display_peers = display_peers_vec.len();
+        // Cap the number of peers used for styling at CANVAS_LIMIT
+        let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
+
+        // Determine if the "Add Fake Peer" button should be disabled
+        let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
+
         let rows = canvas_generator::generate(
-            &self.client,
-            peers.iter().take(CANVAS_LIMIT).cloned().collect(),
+            &self.client, // canvas_generator is client-aware for real peers' media status
+            display_peers_vec
+                .iter()
+                .take(CANVAS_LIMIT)
+                .cloned()
+                .collect(),
         );
 
+        let container_style = if self.peer_list_open || self.diagnostics_open {
+            // Use num_peers_for_styling (capped at CANVAS_LIMIT) for the CSS variable
+            format!("width: 80%; --num-peers: {};", num_peers_for_styling.max(1))
+        } else {
+            format!(
+                "width: 100%; --num-peers: {};",
+                num_peers_for_styling.max(1)
+            )
+        };
+
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
+
+        let mut grid_container_classes = classes!();
+        if self.force_desktop_grid_on_mobile {
+            grid_container_classes.push("force-desktop-grid");
+        }
 
         // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
@@ -386,7 +523,10 @@ impl Component for AttendantsComponent {
         html! {
             <div id="main-container" class="meeting-page">
                 <BrowserCompatibility/>
-                <div id="grid-container" style={if self.peer_list_open || self.diagnostics_open {"width: 80%;"} else {"width: 100%;"}}>
+                <div id="grid-container"
+                    class={grid_container_classes}
+                    data-peers={num_peers_for_styling.to_string()}
+                    style={container_style}>
                     { rows }
                     {
                         if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
@@ -539,7 +679,20 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            { self.view_grid_toggle(ctx) }
+                                            { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
+
                                         </nav>
+                                        // Display simulation info message if any
+                                        {
+                                            if let Some(message) = &self.simulation_info_message {
+                                                html!{
+                                                    <p class="simulation-info-message">{ message }</p>
+                                                }
+                                            } else {
+                                                html!{}
+                                            }
+                                        }
                                     </div>
                                     {
                                         if media_access_granted {
@@ -571,7 +724,7 @@ impl Component for AttendantsComponent {
                     }
                 </div>
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
-                    <PeerList peers={peers} onclose={toggle_peer_list} />
+                    <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
                 <div id="diagnostics-sidebar" class={if self.diagnostics_open {"visible"} else {""}}>
                     <div class="sidebar-header">

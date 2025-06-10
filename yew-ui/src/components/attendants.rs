@@ -431,6 +431,7 @@ impl Component for AttendantsComponent {
                 }
                 true // Re-render to update button state or display message
             }
+            #[cfg(feature = "fake-peers")]
             Msg::ToggleForceDesktopGrid => {
                 self.force_desktop_grid_on_mobile = !self.force_desktop_grid_on_mobile;
                 self.simulation_info_message = None;

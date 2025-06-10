@@ -46,7 +46,9 @@ pub enum Msg {
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
     UserScreenAction(UserScreenAction),
+    #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
     AddFakePeer,
+    #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
     RemoveLastFakePeer,
     ToggleForceDesktopGrid,
 }
@@ -174,6 +176,35 @@ impl AttendantsComponent {
         };
         media_device_access
     }
+
+    #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
+    fn view_fake_peer_buttons(&self, ctx: &Context<Self>, add_fake_peer_disabled: bool) -> Html {
+        html! {
+            <>
+                <button
+                    class="video-control-button test-button"
+                    title="Add Fake Peer"
+                    onclick={ctx.link().callback(|_| Msg::AddFakePeer)}
+                    disabled={add_fake_peer_disabled}
+                    >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-plus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="20" y1="8" x2="20" y2="14"></line><line x1="17" y1="11" x2="23" y2="11"></line></svg>
+                    <span class="tooltip">{ "Add Fake Peer" }</span>
+                </button>
+                <button
+                    class="video-control-button test-button"
+                    title="Remove Fake Peer"
+                    onclick={ctx.link().callback(|_| Msg::RemoveLastFakePeer)}>
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-minus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="23" y1="11" x2="17" y2="11"></line></svg>
+                    <span class="tooltip">{ "Remove Fake Peer" }</span>
+                </button>
+            </>
+        }
+    }
+
+    #[cfg(not(env_var_set = "ENABLE_FAKE_PEERS"))]
+    fn view_fake_peer_buttons(&self, _ctx: &Context<Self>, _add_fake_peer_disabled: bool) -> Html {
+        html! {} // Empty html when feature is not enabled
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -199,7 +230,7 @@ impl Component for AttendantsComponent {
             meeting_joined: false,
             fake_peer_ids: Vec::new(),
             next_fake_peer_id_counter: 1,
-            force_desktop_grid_on_mobile: false,
+            force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
         }
     }
@@ -340,6 +371,7 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
             Msg::RemoveLastFakePeer => {
                 if !self.fake_peer_ids.is_empty() {
                     self.fake_peer_ids.pop();
@@ -347,6 +379,7 @@ impl Component for AttendantsComponent {
                 self.simulation_info_message = None;
                 true
             }
+            #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
             Msg::AddFakePeer => {
                 let current_total_peers = self.client.sorted_peer_keys().len() + self.fake_peer_ids.len();
                 if current_total_peers < CANVAS_LIMIT {
@@ -600,24 +633,9 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
                                             <button
-                                                class="video-control-button test-button"
-                                                title="Add Fake Peer"
-                                                onclick={ctx.link().callback(|_| Msg::AddFakePeer)}
-                                                disabled={add_fake_peer_disabled}
-                                                >
-                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-plus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="20" y1="8" x2="20" y2="14"></line><line x1="17" y1="11" x2="23" y2="11"></line></svg>
-                                                <span class="tooltip">{ "Add Fake Peer" }</span>
-                                            </button>
-                                            <button
-                                                class="video-control-button test-button"
-                                                title="Remove Fake Peer"
-                                                onclick={ctx.link().callback(|_| Msg::RemoveLastFakePeer)}>
-                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-minus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="23" y1="11" x2="17" y2="11"></line></svg>
-                                                <span class="tooltip">{ "Remove Fake Peer" }</span>
-                                            </button>
-                                            <button
-                                                class={classes!("video-control-button", "test-button", self.force_desktop_grid_on_mobile.then_some("active"))}
+                                                class={classes!("video-control-button", "test-button", "mobile-only-grid-toggle", self.force_desktop_grid_on_mobile.then_some("active"))}
                                                 title={if self.force_desktop_grid_on_mobile { "Use Mobile Grid (Stack)" } else { "Force Desktop Grid (Multi-column)" }}
                                                 onclick={ctx.link().callback(|_| Msg::ToggleForceDesktopGrid)}>
                                                 {

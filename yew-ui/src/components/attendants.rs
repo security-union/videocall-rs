@@ -50,6 +50,7 @@ pub enum Msg {
     AddFakePeer,
     #[cfg(feature = "fake-peers")]
     RemoveLastFakePeer,
+    #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
 }
 
@@ -101,6 +102,7 @@ pub struct AttendantsComponent {
     pending_screen_share: bool,
     pub meeting_joined: bool,
     fake_peer_ids: Vec<String>,
+    #[cfg(feature = "fake-peers")]
     next_fake_peer_id_counter: usize,
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
@@ -259,6 +261,7 @@ impl Component for AttendantsComponent {
             encoder_settings: None,
             meeting_joined: false,
             fake_peer_ids: Vec::new(),
+            #[cfg(feature = "fake-peers")]
             next_fake_peer_id_counter: 1,
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
@@ -452,9 +455,6 @@ impl Component for AttendantsComponent {
         let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
         // Determine if the "Add Fake Peer" button should be disabled
-        let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
-
-        // Set default grid to desktop toggle
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
         let rows = canvas_generator::generate(

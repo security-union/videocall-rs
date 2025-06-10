@@ -46,9 +46,9 @@ pub enum Msg {
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
     UserScreenAction(UserScreenAction),
-    #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
+    #[cfg(feature = "fake-peers")]
     AddFakePeer,
-    #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
+    #[cfg(feature = "fake-peers")]
     RemoveLastFakePeer,
     ToggleForceDesktopGrid,
 }
@@ -177,7 +177,7 @@ impl AttendantsComponent {
         media_device_access
     }
 
-    #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
+    #[cfg(feature = "fake-peers")]
     fn view_fake_peer_buttons(&self, ctx: &Context<Self>, add_fake_peer_disabled: bool) -> Html {
         html! {
             <>
@@ -201,10 +201,42 @@ impl AttendantsComponent {
         }
     }
 
-    #[cfg(not(env_var_set = "ENABLE_FAKE_PEERS"))]
+    #[cfg(not(feature = "fake-peers"))]
     fn view_fake_peer_buttons(&self, _ctx: &Context<Self>, _add_fake_peer_disabled: bool) -> Html {
         html! {} // Empty html when feature is not enabled
     }
+
+    #[cfg(feature = "fake-peers")]
+    fn view_grid_toggle(&self, ctx: &Context<Self>) -> Html {
+        html! {
+            <>
+                <button
+                class={classes!("video-control-button", "test-button", "mobile-only-grid-toggle", self.force_desktop_grid_on_mobile.then_some("active"))}
+                title={if self.force_desktop_grid_on_mobile { "Use Mobile Grid (Stack)" } else { "Force Desktop Grid (Multi-column)" }}
+                onclick={ctx.link().callback(|_| Msg::ToggleForceDesktopGrid)}>
+                {
+                    if self.force_desktop_grid_on_mobile {
+                        html!{
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                        }
+                    } else {
+                        html!{
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+                        }
+                    }
+                }
+                <span class="tooltip">{if self.force_desktop_grid_on_mobile { "Use Mobile Grid" } else { "Force Desktop Grid" }}</span>
+            </button>
+            </>
+        }
+    }
+
+    #[cfg(not(feature = "fake-peers"))]
+    fn view_grid_toggle(&self, _ctx: &Context<Self>) -> Html {
+        html! {} // Empty html when feature is not enabled
+    }
+
+
 }
 
 impl Component for AttendantsComponent {
@@ -371,7 +403,7 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
-            #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
+            #[cfg(feature = "fake-peers")]
             Msg::RemoveLastFakePeer => {
                 if !self.fake_peer_ids.is_empty() {
                     self.fake_peer_ids.pop();
@@ -379,7 +411,7 @@ impl Component for AttendantsComponent {
                 self.simulation_info_message = None;
                 true
             }
-            #[cfg(env_var_set = "ENABLE_FAKE_PEERS")]
+            #[cfg(feature = "fake-peers")]
             Msg::AddFakePeer => {
                 let current_total_peers = self.client.sorted_peer_keys().len() + self.fake_peer_ids.len();
                 if current_total_peers < CANVAS_LIMIT {
@@ -417,6 +449,9 @@ impl Component for AttendantsComponent {
         let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
         // Determine if the "Add Fake Peer" button should be disabled
+        let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
+
+        // Set default grid to desktop toggle
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
         let rows = canvas_generator::generate(
@@ -633,24 +668,9 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            { self.view_grid_toggle(ctx) }
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
-                                            <button
-                                                class={classes!("video-control-button", "test-button", "mobile-only-grid-toggle", self.force_desktop_grid_on_mobile.then_some("active"))}
-                                                title={if self.force_desktop_grid_on_mobile { "Use Mobile Grid (Stack)" } else { "Force Desktop Grid (Multi-column)" }}
-                                                onclick={ctx.link().callback(|_| Msg::ToggleForceDesktopGrid)}>
-                                                {
-                                                    if self.force_desktop_grid_on_mobile {
-                                                        html!{
-                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
-                                                        }
-                                                    } else {
-                                                        html!{
-                                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
-                                                        }
-                                                    }
-                                                }
-                                                <span class="tooltip">{if self.force_desktop_grid_on_mobile { "Use Mobile Grid" } else { "Force Desktop Grid" }}</span>
-                                            </button>
+                                           
                                         </nav>
                                         // Display simulation info message if any
                                         { 

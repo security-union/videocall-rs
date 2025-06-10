@@ -41,5 +41,7 @@ features = [
 wasm-bindgen-test = "0.3.37"
 
 [features]
+fake-peers = []
 
 debugAssertions = []
+

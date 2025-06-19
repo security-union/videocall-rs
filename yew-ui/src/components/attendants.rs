@@ -489,7 +489,7 @@ impl Component for AttendantsComponent {
             return html! {
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
-                    <div id="join-meeting-container" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #1a1a1a;">
+                    <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #1a1a1a; z-index: 1000;">
                         <div style="text-align: center; color: white; margin-bottom: 2rem;">
                             <h1>{"Ready to join the meeting?"}</h1>
                             <p>{"Click the button below to join and start listening to others."}</p>

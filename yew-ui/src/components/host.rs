@@ -7,7 +7,9 @@ use videocall_client::{CameraEncoder, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
-use crate::components::device_selector::DeviceSelector;
+use crate::components::{
+    device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
+};
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -26,6 +28,8 @@ pub enum Msg {
     CameraEncoderSettingsUpdated(String),
     MicrophoneEncoderSettingsUpdated(String),
     ScreenEncoderSettingsUpdated(String),
+    ToggleDeviceSettings,
+    CloseDeviceSettings,
 }
 
 pub struct Host {
@@ -37,6 +41,7 @@ pub struct Host {
     pub video_enabled: bool,
     pub encoder_settings: EncoderSettings,
     pub selected_speaker_id: Option<String>,
+    pub device_settings_open: bool,
 }
 
 pub struct EncoderSettings {
@@ -49,13 +54,17 @@ pub struct EncoderSettings {
 /// Keep in mind that this should contain 1 line per encoder.
 impl std::fmt::Display for EncoderSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Camera: {}\nMic: {}\nScreen: {}",
-            self.camera.clone().unwrap_or("None".to_string()),
-            self.microphone.clone().unwrap_or("None".to_string()),
-            self.screen.clone().unwrap_or("None".to_string())
-        )
+        let mut settings = Vec::new();
+        if let Some(camera) = &self.camera {
+            settings.push(format!("Camera: {}", camera));
+        }
+        if let Some(microphone) = &self.microphone {
+            settings.push(format!("Microphone: {}", microphone));
+        }
+        if let Some(screen) = &self.screen {
+            settings.push(format!("Screen: {}", screen));
+        }
+        write!(f, "{}", settings.join(", "))
     }
 }
 
@@ -125,6 +134,7 @@ impl Component for Host {
                 screen: None,
             },
             selected_speaker_id: None,
+            device_settings_open: false,
         }
     }
 
@@ -278,6 +288,14 @@ impl Component for Host {
                     false
                 }
             }
+            Msg::ToggleDeviceSettings => {
+                self.device_settings_open = !self.device_settings_open;
+                true
+            }
+            Msg::CloseDeviceSettings => {
+                self.device_settings_open = false;
+                true
+            }
         };
         log::debug!("Host update: {:?}", should_update);
         should_update
@@ -287,13 +305,58 @@ impl Component for Host {
         let mic_callback = ctx.link().callback(Msg::AudioDeviceChanged);
         let cam_callback = ctx.link().callback(Msg::VideoDeviceChanged);
         let speaker_callback = ctx.link().callback(Msg::SpeakerDeviceChanged);
+        let close_settings_callback = ctx.link().callback(|_| Msg::CloseDeviceSettings);
+        
         html! {
             <>
-                <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
-                <DeviceSelector
+                {
+                    if ctx.props().video_enabled {
+                        html! {
+                            <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
+                        }
+                    } else {
+                        html! {
+                            <div class="video-placeholder">
+                                <div class="placeholder-content">
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
+                                        <line x1="1" y1="1" x2="23" y2="23"></line>
+                                    </svg>
+                                    <span class="placeholder-text">{"Camera Off"}</span>
+                                </div>
+                            </div>
+                        }
+                    }
+                }
+                
+                // Device Settings Menu Button (positioned outside the host video)
+                <button
+                    class="device-settings-menu-button"
+                    onclick={ctx.link().callback(|_| Msg::ToggleDeviceSettings)}
+                    title="Device Settings"
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                </button>
+                
+                // Desktop Device Selector (hidden on mobile)
+                <div class="desktop-device-selector">
+                    <DeviceSelector
+                        on_microphone_select={mic_callback.clone()}
+                        on_camera_select={cam_callback.clone()}
+                        on_speaker_select={speaker_callback.clone()}
+                    />
+                </div>
+                
+                // Mobile Device Settings Modal
+                <DeviceSettingsModal
                     on_microphone_select={mic_callback}
                     on_camera_select={cam_callback}
                     on_speaker_select={speaker_callback}
+                    visible={self.device_settings_open}
+                    on_close={close_settings_callback}
                 />
             </>
         }

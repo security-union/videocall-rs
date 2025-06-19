@@ -703,17 +703,8 @@ impl Component for AttendantsComponent {
                                     }
                                     <h4 class="floating-name">{email}</h4>
 
-                                    {if !self.client.is_connected() {
-                                        html! {<h4>{"Connecting"}</h4>}
-                                    } else {
-                                        html! {<h4>{"Connected"}</h4>}
-                                    }}
+                                    <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
 
-                                    {if ctx.props().e2ee_enabled {
-                                        html! {<h4>{"End to End Encryption Enabled"}</h4>}
-                                    } else {
-                                        html! {<h4>{"End to End Encryption Disabled"}</h4>}
-                                    }}
                                 </nav>
                             }
                         } else {

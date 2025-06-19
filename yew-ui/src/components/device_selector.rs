@@ -136,26 +136,24 @@ impl Component for DeviceSelector {
                     }) }
                 </select>
                 <br/>
-                <label for={"speaker-select"}>{ "Speaker:" }</label>
                 {
-                    if is_ios_safari {
+                    if !is_ios_safari {
                         html! {
-                            <select id={"speaker-select"} class={"device-selector"} disabled={true}>
-                                <option selected={true}>{ "System Default (iOS/Safari)" }</option>
-                            </select>
+                            <>
+                                <label for={"speaker-select"}>{ "Speaker:" }</label>
+                                <select id={"speaker-select"} class={"device-selector"}
+                                        onchange={ctx.link().callback(|e: Event| Msg::OnSpeakerSelect(selection(e)))}
+                                >
+                                    { for speakers.iter().map(|device| html! {
+                                        <option value={device.device_id()} selected={selected_speaker == device.device_id()}>
+                                            { device.label() }
+                                        </option>
+                                    }) }
+                                </select>
+                            </>
                         }
                     } else {
-                        html! {
-                            <select id={"speaker-select"} class={"device-selector"}
-                                    onchange={ctx.link().callback(|e: Event| Msg::OnSpeakerSelect(selection(e)))}
-                            >
-                                { for speakers.iter().map(|device| html! {
-                                    <option value={device.device_id()} selected={selected_speaker == device.device_id()}>
-                                        { device.label() }
-                                    </option>
-                                }) }
-                            </select>
-                        }
+                        html! {}
                     }
                 }
             </div>

@@ -352,14 +352,13 @@ These hooks help maintain code quality by ensuring proper formatting and checkin
 <table>
 <tr>
 <td align="center"><a href="https://github.com/darioalessandro"><img src="https://avatars0.githubusercontent.com/u/1176339?s=400&v=4" width="100" alt=""/><br /><sub><b>Dario Lencina</b></sub></a></td>
+<td align="center"><a href="https://github.com/majorrawdawg"><img src="https://avatars.githubusercontent.com/u/106711326?v=4" width="100" alt=""/><br /><sub><b>Seth Reid</b></sub></a></td>
 <td align="center"><a href="https://github.com/griffobeid"><img src="https://avatars1.githubusercontent.com/u/12220672?s=400&u=639c5cafe1c504ee9c68ad3a5e09d1b2c186462c&v=4" width="100" alt=""/><br /><sub><b>Griffin Obeid</b></sub></a></td>    
 <td align="center"><a href="https://github.com/ronen"><img src="https://avatars.githubusercontent.com/u/125620?v=4" width="100" alt=""/><br /><sub><b>Ronen Barzel</b></sub></a></td>
 <td align="center"><a href="https://github.com/leon3s"><img src="https://avatars.githubusercontent.com/u/7750950?v=4" width="100" alt=""/><br /><sub><b>Leone</b></sub></a></td>
 <td align="center"><a href="https://github.com/JasterV"><img src="https://avatars3.githubusercontent.com/u/49537445?v=4" width="100" alt=""/><br /><sub><b>Victor Martínez</b></sub></a></td>
 </tr>
 </table>
-
-Special thanks to [JasterV](https://github.com/JasterV) for the Actix websocket implementation which contains fragments from the [chat-rooms-actix](https://github.com/JasterV/chat-rooms-actix) project.
 
 ## License
 

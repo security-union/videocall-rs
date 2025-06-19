@@ -1,5 +1,6 @@
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator, device_settings_modal::DeviceSettingsModal, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility, canvas_generator,
+    device_settings_modal::DeviceSettingsModal, peer_list::PeerList,
 };
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};

@@ -1,3 +1,19 @@
+/* Prevent zooming on iOS */
+/* html, body {
+  touch-action: manipulation;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  -khtml-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+} */
+
+/* Prevent pinch zoom specifically */
+* {
+  touch-action: pan-x pan-y;
+}
+
 /* Base styles */
 html {
   font-size: 16px;

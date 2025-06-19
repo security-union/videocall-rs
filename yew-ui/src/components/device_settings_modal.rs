@@ -15,7 +15,6 @@ pub enum Msg {
     OnMicSelect(String),
     OnSpeakerSelect(String),
     LoadDevices(),
-    ToggleModal,
     CloseModal,
 }
 
@@ -96,10 +95,6 @@ impl Component for DeviceSettingsModal {
             }
             Msg::OnSpeakerSelect(speaker) => {
                 self.media_devices.audio_outputs.select(&speaker);
-                true
-            }
-            Msg::ToggleModal => {
-                self.visible = !self.visible;
                 true
             }
             Msg::CloseModal => {

@@ -40,10 +40,10 @@ canvas {
 /* Updated Peer List Container Styles */
 #peer-list-container {
   position: fixed;
-  left: -20%;
+  left: -400px;
   top: 0;
   height: 100%;
-  width: 20%;
+  width: 400px;
   background-color: #242526;
   color: white;
   transition: left 0.3s ease;
@@ -356,6 +356,112 @@ h3 {
   .top-bar {
     display: none !important;
   }
+
+  /* Mobile Modal Styles for Sidebars */
+  /* Peer List Modal */
+  #peer-list-container {
+    position: fixed !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    background-color: #242526 !important;
+    color: white !important;
+    transition: transform 0.3s ease !important;
+    z-index: 1000 !important;
+    overflow-y: auto !important;
+    transform: translateX(-100%) !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+
+  #peer-list-container.visible {
+    transform: translateX(0) !important;
+    visibility: visible !important;
+  }
+
+  /* Diagnostics Modal */
+  #diagnostics-sidebar {
+    position: fixed !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    background-color: #242526 !important;
+    color: white !important;
+    transition: transform 0.3s ease !important;
+    z-index: 1000 !important;
+    overflow-y: auto !important;
+    transform: translateX(100%) !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+
+  #diagnostics-sidebar.visible {
+    transform: translateX(0) !important;
+    visibility: visible !important;
+  }
+
+  /* Make headers more prominent on mobile */
+  #peer-list-container .sidebar-header,
+  #diagnostics-sidebar .sidebar-header {
+    padding: 20px !important;
+    background-color: #18191a !important;
+    border-bottom: 2px solid #3a3b3c !important;
+  }
+
+  #peer-list-container .sidebar-header h2,
+  #diagnostics-sidebar .sidebar-header h2 {
+    font-size: 20px !important;
+    font-weight: 600 !important;
+  }
+
+  /* Larger close button for mobile */
+  #peer-list-container .close-button,
+  #diagnostics-sidebar .close-button {
+    font-size: 28px !important;
+    padding: 5px 10px !important;
+    background-color: rgba(255, 255, 255, 0.1) !important;
+    border-radius: 50% !important;
+    width: 40px !important;
+    height: 40px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+  }
+
+  /* Better content spacing for mobile */
+  #peer-list-container .sidebar-content,
+  #diagnostics-sidebar .sidebar-content {
+    padding: 20px !important;
+  }
+
+  /* Improve peer list items for mobile */
+  .peer_item {
+    padding: 15px !important;
+    margin-bottom: 8px !important;
+    border-radius: 8px !important;
+    background-color: rgba(255, 255, 255, 0.05) !important;
+  }
+
+  .peer_item_text {
+    font-size: 16px !important;
+    padding: 0 15px !important;
+  }
+
+  /* Better diagnostics display on mobile */
+  #diagnostics-sidebar .diagnostics-section {
+    margin-bottom: 25px !important;
+    padding: 15px !important;
+    background-color: rgba(255, 255, 255, 0.05) !important;
+    border-radius: 8px !important;
+  }
+
+  #diagnostics-sidebar .diagnostics-data pre {
+    font-size: 12px !important;
+    padding: 15px !important;
+    max-height: 30vh !important;
+  }
 }
 
 /* Hide the mobile-only grid toggle button on desktop */
@@ -579,10 +685,10 @@ select {
 /* Diagnostics Sidebar */
 #diagnostics-sidebar {
   position: fixed;
-  right: -20%;
+  right: -400px;
   top: 0;
   height: 100%;
-  width: 20%;
+  width: 400px;
   background-color: #242526;
   color: white;
   transition: right 0.3s ease;

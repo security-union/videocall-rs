@@ -1,3 +1,8 @@
+/* Prevent pinch zoom specifically */
+* {
+  touch-action: pan-x pan-y;
+}
+
 /* Base styles */
 html {
   font-size: 16px;

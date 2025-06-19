@@ -32,7 +32,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - updating base images ([#160](https://github.com/security-union/videocall-rs/pull/160))
 - Video daemon ([#144](https://github.com/security-union/videocall-rs/pull/144))
 - Implement allow list ([#143](https://github.com/security-union/videocall-rs/pull/143))
-- End to end encryption ([#107](https://github.com/security-union/videocall-rs/pull/107))
 - Use cargo workspace ([#113](https://github.com/security-union/videocall-rs/pull/113))
 - Video 2 version ([#42](https://github.com/security-union/videocall-rs/pull/42))
 - Add bots ([#21](https://github.com/security-union/videocall-rs/pull/21))

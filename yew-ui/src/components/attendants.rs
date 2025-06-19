@@ -1,5 +1,6 @@
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility, canvas_generator,
+    device_settings_modal::DeviceSettingsModal, peer_list::PeerList,
 };
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
@@ -34,9 +35,10 @@ pub enum MeetingAction {
 }
 
 #[derive(Debug)]
-pub enum UserScreenAction {
-    TogglePeerList,
-    ToggleDiagnostics,
+pub enum UserScreenToggleAction {
+    PeerList,
+    Diagnostics,
+    DeviceSettings,
 }
 
 #[derive(Debug)]
@@ -45,7 +47,7 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
-    UserScreenAction(UserScreenAction),
+    UserScreenAction(UserScreenToggleAction),
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
     #[cfg(feature = "fake-peers")]
@@ -60,8 +62,8 @@ impl From<WsAction> for Msg {
     }
 }
 
-impl From<UserScreenAction> for Msg {
-    fn from(action: UserScreenAction) -> Self {
+impl From<UserScreenToggleAction> for Msg {
+    fn from(action: UserScreenToggleAction) -> Self {
         Msg::UserScreenAction(action)
     }
 }
@@ -93,6 +95,7 @@ pub struct AttendantsComponent {
     pub video_enabled: bool,
     pub peer_list_open: bool,
     pub diagnostics_open: bool,
+    pub device_settings_open: bool,
     pub error: Option<String>,
     pub diagnostics_data: Option<String>,
     pub sender_stats: Option<String>,
@@ -252,6 +255,7 @@ impl Component for AttendantsComponent {
             video_enabled: false,
             peer_list_open: false,
             diagnostics_open: false,
+            device_settings_open: false,
             error: None,
             diagnostics_data: None,
             sender_stats: None,
@@ -303,7 +307,6 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::RequestMediaPermissions => {
                     self.media_device_access.request();
-                    ctx.link().send_message(WsAction::Connect);
                     false
                 }
                 WsAction::MediaPermissionsGranted => {
@@ -329,6 +332,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsError(error) => {
                     self.error = Some(error);
+                    self.meeting_joined = false; // Stay on join screen if permissions denied
                     true
                 }
                 WsAction::DiagnosticsUpdated(stats) => {
@@ -389,16 +393,23 @@ impl Component for AttendantsComponent {
             }
             Msg::UserScreenAction(action) => {
                 match action {
-                    UserScreenAction::TogglePeerList => {
+                    UserScreenToggleAction::PeerList => {
                         self.peer_list_open = !self.peer_list_open;
                         if self.peer_list_open {
                             self.diagnostics_open = false;
                         }
                     }
-                    UserScreenAction::ToggleDiagnostics => {
+                    UserScreenToggleAction::Diagnostics => {
                         self.diagnostics_open = !self.diagnostics_open;
                         if self.diagnostics_open {
                             self.peer_list_open = false;
+                        }
+                    }
+                    UserScreenToggleAction::DeviceSettings => {
+                        self.device_settings_open = !self.device_settings_open;
+                        if self.device_settings_open {
+                            self.peer_list_open = false;
+                            self.diagnostics_open = false;
                         }
                     }
                 }
@@ -444,8 +455,8 @@ impl Component for AttendantsComponent {
         let email = ctx.props().email.clone();
         let media_access_granted = self.media_device_access.is_granted();
 
-        let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
-        let toggle_diagnostics = ctx.link().callback(|_| UserScreenAction::ToggleDiagnostics);
+        let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
+        let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
         let mut display_peers_vec = real_peers_vec.clone();
@@ -511,7 +522,7 @@ impl Component for AttendantsComponent {
                                 cursor: pointer;
                                 transition: background 0.3s ease;
                             "
-                            onclick={ctx.link().callback(|_| WsAction::Connect)}
+                            onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}
                         >
                             {"Join Meeting"}
                         </button>
@@ -679,6 +690,34 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            <button
+                                                class={classes!("video-control-button", "mobile-only-device-settings", self.device_settings_open.then_some("active"))}
+                                                onclick={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}>
+                                                {
+                                                    if self.device_settings_open {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <circle cx="12" cy="12" r="3"></circle>
+                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                                                    <line x1="3" y1="3" x2="21" y2="21"></line>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Close Settings" }</span>
+                                                            </>
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <circle cx="12" cy="12" r="3"></circle>
+                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Device Settings" }</span>
+                                                            </>
+                                                        }
+                                                    }
+                                                }
+                                            </button>
                                             { self.view_grid_toggle(ctx) }
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
 
@@ -703,17 +742,8 @@ impl Component for AttendantsComponent {
                                     }
                                     <h4 class="floating-name">{email}</h4>
 
-                                    {if !self.client.is_connected() {
-                                        html! {<h4>{"Connecting"}</h4>}
-                                    } else {
-                                        html! {<h4>{"Connected"}</h4>}
-                                    }}
+                                    <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
 
-                                    {if ctx.props().e2ee_enabled {
-                                        html! {<h4>{"End to End Encryption Enabled"}</h4>}
-                                    } else {
-                                        html! {<h4>{"End to End Encryption Disabled"}</h4>}
-                                    }}
                                 </nav>
                             }
                         } else {
@@ -768,6 +798,25 @@ impl Component for AttendantsComponent {
                         </div>
                     </div>
                 </div>
+                <DeviceSettingsModal
+                    on_microphone_select={ctx.link().callback(|device_id: String| {
+                        // Handle microphone device selection
+                        log::info!("Microphone device selected: {}", device_id);
+                        Msg::WsAction(WsAction::Log(format!("Microphone device selected: {}", device_id)))
+                    })}
+                    on_camera_select={ctx.link().callback(|device_id: String| {
+                        // Handle camera device selection
+                        log::info!("Camera device selected: {}", device_id);
+                        Msg::WsAction(WsAction::Log(format!("Camera device selected: {}", device_id)))
+                    })}
+                    on_speaker_select={ctx.link().callback(|device_id: String| {
+                        // Handle speaker device selection
+                        log::info!("Speaker device selected: {}", device_id);
+                        Msg::WsAction(WsAction::Log(format!("Speaker device selected: {}", device_id)))
+                    })}
+                    visible={self.device_settings_open}
+                    on_close={ctx.link().callback(|_| Msg::UserScreenAction(UserScreenToggleAction::DeviceSettings))}
+                />
             </div>
         }
     }

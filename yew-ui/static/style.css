@@ -464,12 +464,6 @@ h3 {
   }
 }
 
-/* Hide the mobile-only grid toggle button on desktop */
-@media (min-width: 768px) {
-  .mobile-only-grid-toggle {
-    display: none !important;
-  }
-}
 
 .canvas-container {
   position: relative;
@@ -899,5 +893,258 @@ select {
   text-align: center;
   margin-top: 10px;
   font-size: 0.9em;
+}
+
+/* Device Settings Menu Button */
+.device-settings-menu-button {
+  visibility: hidden;
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  width: 40px;
+  height: 40px;
+  background-color: rgba(0, 0, 0, 0.7);
+  border: none;
+  border-radius: 50%;
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 15;
+  transition: background-color 0.3s ease;
+}
+
+.device-settings-menu-button:hover {
+  background-color: rgba(0, 0, 0, 0.9);
+}
+
+.device-settings-menu-button svg {
+  width: 20px;
+  height: 20px;
+}
+
+/* Device Settings Modal */
+.device-settings-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.8);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.device-settings-modal {
+  background-color: #242526;
+  border-radius: 12px;
+  padding: 0;
+  max-width: 90%;
+  max-height: 80%;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.device-settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px;
+  background-color: #18191a;
+  border-bottom: 1px solid #3a3b3c;
+}
+
+.device-settings-header h2 {
+  margin: 0;
+  font-size: 18px;
+  color: white;
+}
+
+.device-settings-content {
+  padding: 20px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.device-setting-group {
+  margin-bottom: 20px;
+}
+
+.device-setting-group label {
+  display: block;
+  color: #e0e0e0;
+  font-size: 14px;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.device-selector-modal {
+  width: 100%;
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid #555;
+  background-color: white;
+  color: black;
+  font-size: 14px;
+}
+
+.ios-speaker-note {
+  color: #888;
+  font-style: italic;
+  font-size: 12px;
+  margin: 0;
+  padding: 8px;
+  background-color: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+}
+
+/* Desktop Device Selector */
+.desktop-device-selector {
+  display: block;
+}
+
+/* Mobile elements are shown by default, hidden on desktop */
+@media (min-width: 600px) {
+  .mobile-only-grid-toggle {
+    display: none !important;
+  }
+  
+  .mobile-only-device-settings {
+    display: none !important;
+  }
+}
+
+/* Mobile Device Selector Hiding */
+@media (max-width: 600px) {
+  .desktop-device-selector {
+    display: none !important;
+  }
+  
+  .device-settings-menu-button {
+    bottom: 8px;
+    left: 8px;
+    width: 36px;
+    height: 36px;
+  }
+  
+  .device-settings-menu-button svg {
+    width: 18px;
+    height: 18px;
+  }
+  
+  /* Mobile Device Settings Modal - Full Screen */
+  .device-settings-modal-overlay {
+    visibility: visible !important;
+    position: fixed !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    background-color: #242526 !important;
+    color: white !important;
+    transition: transform 0.3s ease !important;
+    z-index: 1000 !important;
+    overflow-y: auto !important;
+    transform: translateX(100%) !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+
+  .device-settings-modal-overlay.visible {
+    transform: translateX(0) !important;
+    visibility: visible !important;
+  }
+  
+  .device-settings-modal {
+    position: fixed !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    max-width: none !important;
+    max-height: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+  
+  .device-settings-header {
+    padding: 20px !important;
+    background-color: #18191a !important;
+    border-bottom: 2px solid #3a3b3c !important;
+  }
+  
+  .device-settings-header h2 {
+    font-size: 20px !important;
+    font-weight: 600 !important;
+  }
+  
+  .device-settings-content {
+    padding: 20px !important;
+    max-height: none !important;
+  }
+  
+  .device-setting-group {
+    margin-bottom: 25px !important;
+    padding: 15px !important;
+    background-color: rgba(255, 255, 255, 0.05) !important;
+    border-radius: 8px !important;
+  }
+  
+  .device-selector-modal {
+    font-size: 16px !important;
+    padding: 15px !important;
+  }
+}
+
+/* Connection LED Indicator */
+.connection-led {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  z-index: 5;
+  transition: all 0.3s ease;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.connection-led.connected {
+  background-color: #4CAF50;
+  box-shadow: 0 0 8px rgba(76, 175, 80, 0.6);
+}
+
+.connection-led.connecting {
+  background-color: #FF9800;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.7;
+    transform: scale(1.1);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Mobile adjustments for LED */
+@media (max-width: 600px) {
+  .connection-led {
+    width: 10px;
+    height: 10px;
+    top: 6px;
+    right: 6px;
+  }
 }
 

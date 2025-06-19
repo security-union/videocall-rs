@@ -20,7 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Video daemon ([#144](https://github.com/security-union/videocall-rs/pull/144))
 - Form validation ([#141](https://github.com/security-union/videocall-rs/pull/141))
 - Async nats ([#135](https://github.com/security-union/videocall-rs/pull/135))
-- End to end encryption ([#107](https://github.com/security-union/videocall-rs/pull/107))
 - Fix fmt & clippy on ci ([#124](https://github.com/security-union/videocall-rs/pull/124))
 - Use cargo workspace ([#113](https://github.com/security-union/videocall-rs/pull/113))
 - Remove spots that websocket API looks at packets to prep for e2ee ([#109](https://github.com/security-union/videocall-rs/pull/109))

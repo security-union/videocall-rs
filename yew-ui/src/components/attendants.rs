@@ -35,10 +35,10 @@ pub enum MeetingAction {
 }
 
 #[derive(Debug)]
-pub enum UserScreenAction {
-    TogglePeerList,
-    ToggleDiagnostics,
-    ToggleDeviceSettings,
+pub enum UserScreenToggleAction {
+    PeerList,
+    Diagnostics,
+    DeviceSettings,
 }
 
 #[derive(Debug)]
@@ -47,7 +47,7 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
-    UserScreenAction(UserScreenAction),
+    UserScreenAction(UserScreenToggleAction),
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
     #[cfg(feature = "fake-peers")]
@@ -62,8 +62,8 @@ impl From<WsAction> for Msg {
     }
 }
 
-impl From<UserScreenAction> for Msg {
-    fn from(action: UserScreenAction) -> Self {
+impl From<UserScreenToggleAction> for Msg {
+    fn from(action: UserScreenToggleAction) -> Self {
         Msg::UserScreenAction(action)
     }
 }
@@ -393,19 +393,19 @@ impl Component for AttendantsComponent {
             }
             Msg::UserScreenAction(action) => {
                 match action {
-                    UserScreenAction::TogglePeerList => {
+                    UserScreenToggleAction::PeerList => {
                         self.peer_list_open = !self.peer_list_open;
                         if self.peer_list_open {
                             self.diagnostics_open = false;
                         }
                     }
-                    UserScreenAction::ToggleDiagnostics => {
+                    UserScreenToggleAction::Diagnostics => {
                         self.diagnostics_open = !self.diagnostics_open;
                         if self.diagnostics_open {
                             self.peer_list_open = false;
                         }
                     }
-                    UserScreenAction::ToggleDeviceSettings => {
+                    UserScreenToggleAction::DeviceSettings => {
                         self.device_settings_open = !self.device_settings_open;
                         if self.device_settings_open {
                             self.peer_list_open = false;
@@ -455,8 +455,8 @@ impl Component for AttendantsComponent {
         let email = ctx.props().email.clone();
         let media_access_granted = self.media_device_access.is_granted();
 
-        let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
-        let toggle_diagnostics = ctx.link().callback(|_| UserScreenAction::ToggleDiagnostics);
+        let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
+        let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
         let mut display_peers_vec = real_peers_vec.clone();
@@ -692,7 +692,7 @@ impl Component for AttendantsComponent {
                                             </button>
                                             <button
                                                 class={classes!("video-control-button", "mobile-only-device-settings", self.device_settings_open.then_some("active"))}
-                                                onclick={ctx.link().callback(|_| UserScreenAction::ToggleDeviceSettings)}>
+                                                onclick={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}>
                                                 {
                                                     if self.device_settings_open {
                                                         html! {
@@ -815,7 +815,7 @@ impl Component for AttendantsComponent {
                         Msg::WsAction(WsAction::Log(format!("Speaker device selected: {}", device_id)))
                     })}
                     visible={self.device_settings_open}
-                    on_close={ctx.link().callback(|_| Msg::UserScreenAction(UserScreenAction::ToggleDeviceSettings))}
+                    on_close={ctx.link().callback(|_| Msg::UserScreenAction(UserScreenToggleAction::DeviceSettings))}
                 />
             </div>
         }

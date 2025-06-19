@@ -360,8 +360,6 @@ These hooks help maintain code quality by ensuring proper formatting and checkin
 </tr>
 </table>
 
-Special thanks to [JasterV](https://github.com/JasterV) for the Actix websocket implementation which contains fragments from the [chat-rooms-actix](https://github.com/JasterV/chat-rooms-actix) project.
-
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.

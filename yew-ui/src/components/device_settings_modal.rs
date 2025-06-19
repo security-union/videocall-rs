@@ -151,7 +151,7 @@ impl Component for DeviceSettingsModal {
                                 }) }
                             </select>
                         </div>
-                        
+
                         <div class="device-setting-group">
                             <label for={"modal-video-select"}>{ "Camera:" }</label>
                             <select id={"modal-video-select"} class={"device-selector-modal"}
@@ -164,7 +164,7 @@ impl Component for DeviceSettingsModal {
                                 }) }
                             </select>
                         </div>
-                        
+
                         {
                             if !is_ios_safari {
                                 html! {
@@ -194,4 +194,4 @@ impl Component for DeviceSettingsModal {
             </div>
         }
     }
-} 
+}

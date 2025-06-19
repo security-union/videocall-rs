@@ -303,7 +303,6 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::RequestMediaPermissions => {
                     self.media_device_access.request();
-                    ctx.link().send_message(WsAction::Connect);
                     false
                 }
                 WsAction::MediaPermissionsGranted => {
@@ -329,6 +328,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsError(error) => {
                     self.error = Some(error);
+                    self.meeting_joined = false; // Stay on join screen if permissions denied
                     true
                 }
                 WsAction::DiagnosticsUpdated(stats) => {
@@ -511,7 +511,7 @@ impl Component for AttendantsComponent {
                                 cursor: pointer;
                                 transition: background 0.3s ease;
                             "
-                            onclick={ctx.link().callback(|_| WsAction::Connect)}
+                            onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}
                         >
                             {"Join Meeting"}
                         </button>

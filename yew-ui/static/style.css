@@ -464,12 +464,6 @@ h3 {
   }
 }
 
-/* Hide the mobile-only grid toggle button on desktop */
-@media (min-width: 768px) {
-  .mobile-only-grid-toggle {
-    display: none !important;
-  }
-}
 
 .canvas-container {
   position: relative;
@@ -903,6 +897,7 @@ select {
 
 /* Device Settings Menu Button */
 .device-settings-menu-button {
+  visibility: hidden;
   position: absolute;
   bottom: 16px;
   left: 16px;
@@ -1011,6 +1006,17 @@ select {
   display: block;
 }
 
+/* Mobile elements are shown by default, hidden on desktop */
+@media (min-width: 600px) {
+  .mobile-only-grid-toggle {
+    display: none !important;
+  }
+  
+  .mobile-only-device-settings {
+    display: none !important;
+  }
+}
+
 /* Mobile Device Selector Hiding */
 @media (max-width: 600px) {
   .desktop-device-selector {
@@ -1029,17 +1035,67 @@ select {
     height: 18px;
   }
   
+  /* Mobile Device Settings Modal - Full Screen */
+  .device-settings-modal-overlay {
+    visibility: visible !important;
+    position: fixed !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    background-color: #242526 !important;
+    color: white !important;
+    transition: transform 0.3s ease !important;
+    z-index: 1000 !important;
+    overflow-y: auto !important;
+    transform: translateX(100%) !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+
+  .device-settings-modal-overlay.visible {
+    transform: translateX(0) !important;
+    visibility: visible !important;
+  }
+  
   .device-settings-modal {
-    max-width: 95%;
-    max-height: 85%;
+    position: fixed !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    max-width: none !important;
+    max-height: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+  
+  .device-settings-header {
+    padding: 20px !important;
+    background-color: #18191a !important;
+    border-bottom: 2px solid #3a3b3c !important;
+  }
+  
+  .device-settings-header h2 {
+    font-size: 20px !important;
+    font-weight: 600 !important;
   }
   
   .device-settings-content {
-    padding: 15px;
+    padding: 20px !important;
+    max-height: none !important;
   }
   
   .device-setting-group {
-    margin-bottom: 15px;
+    margin-bottom: 25px !important;
+    padding: 15px !important;
+    background-color: rgba(255, 255, 255, 0.05) !important;
+    border-radius: 8px !important;
+  }
+  
+  .device-selector-modal {
+    font-size: 16px !important;
+    padding: 15px !important;
   }
 }
 

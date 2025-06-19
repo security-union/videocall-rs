@@ -110,6 +110,11 @@ impl Component for DeviceSettingsModal {
         }
     }
 
+    fn changed(&mut self, ctx: &Context<Self>, _old_props: &Self::Properties) -> bool {
+        self.visible = ctx.props().visible;
+        true
+    }
+
     fn view(&self, ctx: &Context<Self>) -> Html {
         let mics = self.media_devices.audio_inputs.devices();
         let cameras = self.media_devices.video_inputs.devices();
@@ -127,12 +132,12 @@ impl Component for DeviceSettingsModal {
                 .value()
         }
 
-        if !self.visible {
+        if !ctx.props().visible {
             return html! {};
         }
 
         html! {
-            <div class="device-settings-modal-overlay" onclick={ctx.link().callback(|_| Msg::CloseModal)}>
+            <div class={classes!("device-settings-modal-overlay", ctx.props().visible.then_some("visible"))} onclick={ctx.link().callback(|_| Msg::CloseModal)}>
                 <div class="device-settings-modal" onclick={|e: MouseEvent| e.stop_propagation()}>
                     <div class="device-settings-header">
                         <h2>{"Device Settings"}</h2>

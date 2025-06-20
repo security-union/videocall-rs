@@ -7,10 +7,10 @@ on:
   push:
     branches:
       - main
-      - fix-rotation-ios
     paths:
       - 'yew-ui/**'
       - 'types/**'
+      - 'videocall-client/**'
       - Dockerfile.yew
       - nginx.conf
 

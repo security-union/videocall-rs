@@ -45,6 +45,8 @@ pub struct Host {
     pub encoder_settings: EncoderSettings,
     pub selected_speaker_id: Option<String>,
     pub device_settings_open: bool,
+    pub current_microphone_id: Option<String>,
+    pub current_camera_id: Option<String>,
 }
 
 pub struct EncoderSettings {
@@ -142,6 +144,8 @@ impl Component for Host {
             },
             selected_speaker_id: None,
             device_settings_open: ctx.props().device_settings_open,
+            current_microphone_id: None,
+            current_camera_id: None,
         }
     }
 
@@ -232,6 +236,7 @@ impl Component for Host {
                 true
             }
             Msg::AudioDeviceChanged(audio) => {
+                self.current_microphone_id = Some(audio.clone());
                 if self.microphone.select(audio) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
@@ -242,6 +247,7 @@ impl Component for Host {
                 false
             }
             Msg::VideoDeviceChanged(video) => {
+                self.current_camera_id = Some(video.clone());
                 if self.camera.select(video) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
@@ -394,6 +400,9 @@ impl Component for Host {
                     on_speaker_select={speaker_callback}
                     visible={ctx.props().device_settings_open}
                     on_close={close_settings_callback}
+                    current_microphone_id={self.current_microphone_id.clone()}
+                    current_camera_id={self.current_camera_id.clone()}
+                    current_speaker_id={self.selected_speaker_id.clone()}
                 />
             </>
         }

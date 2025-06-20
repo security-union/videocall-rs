@@ -22,6 +22,9 @@ pub struct DeviceSettingsModalProps {
     pub on_speaker_select: Callback<String>,
     pub visible: bool,
     pub on_close: Callback<MouseEvent>,
+    pub current_microphone_id: Option<String>,
+    pub current_camera_id: Option<String>,
+    pub current_speaker_id: Option<String>,
 }
 
 impl Component for DeviceSettingsModal {
@@ -94,9 +97,9 @@ impl Component for DeviceSettingsModal {
         let mics = self.media_devices.audio_inputs.devices();
         let cameras = self.media_devices.video_inputs.devices();
         let speakers = self.media_devices.audio_outputs.devices();
-        let selected_mic = self.media_devices.audio_inputs.selected();
-        let selected_camera = self.media_devices.video_inputs.selected();
-        let selected_speaker = self.media_devices.audio_outputs.selected();
+        let selected_mic = ctx.props().current_microphone_id.as_deref();
+        let selected_camera = ctx.props().current_camera_id.as_deref();
+        let selected_speaker = ctx.props().current_speaker_id.as_deref();
 
         html! {
             <div class={classes!("device-settings-modal-overlay", ctx.props().visible.then_some("visible"))} onclick={ctx.props().on_close.clone()}>
@@ -116,7 +119,7 @@ impl Component for DeviceSettingsModal {
                                     })}
                             >
                                 { for mics.iter().map(|device| html! {
-                                    <option value={device.device_id()} selected={selected_mic == device.device_id()}>
+                                    <option value={device.device_id()} selected={selected_mic.map_or(false, |id| id == device.device_id())}>
                                         { device.label() }
                                     </option>
                                 }) }
@@ -133,7 +136,7 @@ impl Component for DeviceSettingsModal {
                                     })}
                             >
                                 { for cameras.iter().map(|device| html! {
-                                    <option value={device.device_id()} selected={selected_camera == device.device_id()}>
+                                    <option value={device.device_id()} selected={selected_camera.map_or(false, |id| id == device.device_id())}>
                                         { device.label() }
                                     </option>
                                 }) }
@@ -153,7 +156,7 @@ impl Component for DeviceSettingsModal {
                                                 })}
                                         >
                                             { for speakers.iter().map(|device| html! {
-                                                <option value={device.device_id()} selected={selected_speaker == device.device_id()}>
+                                                <option value={device.device_id()} selected={selected_speaker.map_or(false, |id| id == device.device_id())}>
                                                     { device.label() }
                                                 </option>
                                             }) }

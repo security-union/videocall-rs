@@ -239,23 +239,19 @@ async fn handle_session(
                     continue;
                 }
                 let session = session.read().await;
-                if msg.payload.len() > 400 {
-                    let stream = session.open_uni().await;
-                    tokio::spawn(async move {
-                        match stream {
-                            Ok(mut uni_stream) => {
-                                if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                    error!("Error writing to unidirectional stream: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error opening unidirectional stream: {}", e);
+                let stream = session.open_uni().await;
+                tokio::spawn(async move {
+                    match stream {
+                        Ok(mut uni_stream) => {
+                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
+                                error!("Error writing to unidirectional stream: {}", e);
                             }
                         }
-                    });
-                } else if let Err(e) = session.send_datagram(msg.payload) {
-                    error!("Error sending datagram: {}", e);
-                }
+                        Err(e) => {
+                            error!("Error opening unidirectional stream: {}", e);
+                        }
+                    }
+                });
             }
         })
     };
@@ -353,23 +349,20 @@ async fn handle_quic_connection(
                     continue;
                 }
                 let session = session.read().await;
-                if msg.payload.len() > 400 {
-                    let stream = session.open_uni().await;
-                    tokio::spawn(async move {
-                        match stream {
-                            Ok(mut uni_stream) => {
-                                if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                    error!("Error writing to unidirectional stream: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error opening unidirectional stream: {}", e);
+
+                let stream = session.open_uni().await;
+                tokio::spawn(async move {
+                    match stream {
+                        Ok(mut uni_stream) => {
+                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
+                                error!("Error writing to unidirectional stream: {}", e);
                             }
                         }
-                    });
-                } else if let Err(e) = session.send_datagram(msg.payload) {
-                    error!("Error sending datagram: {}", e);
-                }
+                        Err(e) => {
+                            error!("Error opening unidirectional stream: {}", e);
+                        }
+                    }
+                });
             }
         })
     };

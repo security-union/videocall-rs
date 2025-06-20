@@ -3,7 +3,7 @@ use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
-use videocall_client::{CameraEncoder, ScreenEncoder, VideoCallClient};
+use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, VideoCallClient};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
@@ -28,12 +28,15 @@ pub enum Msg {
     CameraEncoderSettingsUpdated(String),
     MicrophoneEncoderSettingsUpdated(String),
     ScreenEncoderSettingsUpdated(String),
+    DevicesLoaded,
+    DevicesChanged,
 }
 
 pub struct Host {
     pub camera: CameraEncoder,
     pub microphone: Box<dyn MicrophoneEncoderTrait>,
     pub screen: ScreenEncoder,
+    pub media_devices: MediaDeviceList,
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
@@ -124,10 +127,28 @@ impl Component for Host {
         client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
         screen.set_encoder_control(rx);
 
+        // Create and configure MediaDeviceList
+        let mut media_devices = MediaDeviceList::new();
+
+        // Set up callbacks for device list updates
+        media_devices.on_loaded = {
+            let link = ctx.link().clone();
+            Callback::from(move |_| link.send_message(Msg::DevicesLoaded))
+        };
+
+        media_devices.on_devices_changed = {
+            let link = ctx.link().clone();
+            Callback::from(move |_| link.send_message(Msg::DevicesChanged))
+        };
+
+        // Load devices
+        media_devices.load();
+
         Self {
             camera,
             microphone,
             screen,
+            media_devices,
             share_screen: ctx.props().share_screen,
             mic_enabled: ctx.props().mic_enabled,
             video_enabled: ctx.props().video_enabled,
@@ -230,6 +251,8 @@ impl Component for Host {
             }
             Msg::AudioDeviceChanged(audio) => {
                 self.current_microphone_id = Some(audio.clone());
+                // Update the MediaDeviceList selection
+                self.media_devices.audio_inputs.select(&audio);
                 if self.microphone.select(audio) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
@@ -237,10 +260,12 @@ impl Component for Host {
                     });
                     timeout.forget();
                 }
-                false
+                true // Need to re-render to update device selector displays
             }
             Msg::VideoDeviceChanged(video) => {
                 self.current_camera_id = Some(video.clone());
+                // Update the MediaDeviceList selection
+                self.media_devices.video_inputs.select(&video);
                 if self.camera.select(video) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
@@ -248,10 +273,12 @@ impl Component for Host {
                     });
                     timeout.forget();
                 }
-                false
+                true // Need to re-render to update device selector displays
             }
             Msg::SpeakerDeviceChanged(speaker) => {
                 self.selected_speaker_id = Some(speaker.clone());
+                // Update the MediaDeviceList selection
+                self.media_devices.audio_outputs.select(&speaker);
                 // Update the speaker device for all connected peers
                 if let Err(e) = ctx.props().client.update_speaker_device(Some(speaker)) {
                     log::error!("Failed to update speaker device: {:?}", e);
@@ -294,6 +321,8 @@ impl Component for Host {
                     false
                 }
             }
+            Msg::DevicesLoaded => true,
+            Msg::DevicesChanged => true,
         };
         log::debug!("Host update: {:?}", should_update);
         should_update
@@ -304,6 +333,11 @@ impl Component for Host {
         let cam_callback = ctx.link().callback(Msg::VideoDeviceChanged);
         let speaker_callback = ctx.link().callback(Msg::SpeakerDeviceChanged);
         let close_settings_callback = ctx.props().on_device_settings_toggle.clone();
+
+        // Get device data from the centralized MediaDeviceList
+        let microphones = self.media_devices.audio_inputs.devices();
+        let cameras = self.media_devices.video_inputs.devices();
+        let speakers = self.media_devices.audio_outputs.devices();
 
         html! {
             <>
@@ -342,6 +376,12 @@ impl Component for Host {
                 // Desktop Device Selector (hidden on mobile)
                 <div class="desktop-device-selector">
                     <DeviceSelector
+                        microphones={microphones.clone()}
+                        cameras={cameras.clone()}
+                        speakers={speakers.clone()}
+                        selected_microphone_id={self.current_microphone_id.clone()}
+                        selected_camera_id={self.current_camera_id.clone()}
+                        selected_speaker_id={self.selected_speaker_id.clone()}
                         on_microphone_select={mic_callback.clone()}
                         on_camera_select={cam_callback.clone()}
                         on_speaker_select={speaker_callback.clone()}
@@ -350,14 +390,17 @@ impl Component for Host {
 
                 // Mobile Device Settings Modal
                 <DeviceSettingsModal
+                    microphones={microphones}
+                    cameras={cameras}
+                    speakers={speakers}
+                    selected_microphone_id={self.current_microphone_id.clone()}
+                    selected_camera_id={self.current_camera_id.clone()}
+                    selected_speaker_id={self.selected_speaker_id.clone()}
                     on_microphone_select={mic_callback}
                     on_camera_select={cam_callback}
                     on_speaker_select={speaker_callback}
                     visible={ctx.props().device_settings_open}
                     on_close={close_settings_callback}
-                    current_microphone_id={self.current_microphone_id.clone()}
-                    current_camera_id={self.current_camera_id.clone()}
-                    current_speaker_id={self.selected_speaker_id.clone()}
                 />
             </>
         }

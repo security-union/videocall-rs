@@ -4,9 +4,7 @@ use crate::components::{
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::{debug, error, warn};
-use videocall_client::{
-    MediaDeviceAccess, MediaDeviceList, VideoCallClient, VideoCallClientOptions,
-};
+use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -91,7 +89,6 @@ pub struct AttendantsComponentProps {
 pub struct AttendantsComponent {
     pub client: VideoCallClient,
     pub media_device_access: MediaDeviceAccess,
-    pub media_device_list: MediaDeviceList,
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
@@ -184,25 +181,6 @@ impl AttendantsComponent {
         media_device_access
     }
 
-    fn create_media_device_list(_ctx: &Context<Self>) -> MediaDeviceList {
-        let mut media_device_list = MediaDeviceList::new();
-
-        // Set up callbacks for device list updates
-        media_device_list.on_loaded = {
-            Callback::from(move |_| {
-                log::info!("Media devices loaded");
-            })
-        };
-
-        media_device_list.on_devices_changed = {
-            Callback::from(move |_| {
-                log::info!("Media devices changed");
-            })
-        };
-
-        media_device_list
-    }
-
     #[cfg(feature = "fake-peers")]
     fn view_fake_peer_buttons(&self, ctx: &Context<Self>, add_fake_peer_disabled: bool) -> Html {
         html! {
@@ -271,7 +249,6 @@ impl Component for AttendantsComponent {
         Self {
             client: Self::create_video_call_client(ctx),
             media_device_access: Self::create_media_device_access(ctx),
-            media_device_list: Self::create_media_device_list(ctx),
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
@@ -333,9 +310,6 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
-
-                    // Load the media device list now that permissions are granted
-                    self.media_device_list.load();
 
                     if self.pending_mic_enable {
                         self.mic_enabled = true;

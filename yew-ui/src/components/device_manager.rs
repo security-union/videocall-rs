@@ -90,13 +90,3 @@ impl Component for DeviceManager {
         }
     }
 }
-
-impl DeviceManager {
-    pub fn get_media_devices(&self) -> Rc<MediaDeviceList> {
-        self.media_devices.clone()
-    }
-
-    pub fn is_devices_loaded(&self) -> bool {
-        self.devices_loaded
-    }
-}

@@ -28,11 +28,6 @@ pub enum Msg {
     CameraEncoderSettingsUpdated(String),
     MicrophoneEncoderSettingsUpdated(String),
     ScreenEncoderSettingsUpdated(String),
-    ToggleDeviceSettings,
-    CloseDeviceSettings,
-    SwitchCameraDevice(String),
-    SwitchMicrophoneDevice(String),
-    SwitchSpeakerDevice(String),
 }
 
 pub struct Host {
@@ -44,7 +39,6 @@ pub struct Host {
     pub video_enabled: bool,
     pub encoder_settings: EncoderSettings,
     pub selected_speaker_id: Option<String>,
-    pub device_settings_open: bool,
     pub current_microphone_id: Option<String>,
     pub current_camera_id: Option<String>,
 }
@@ -143,7 +137,6 @@ impl Component for Host {
                 screen: None,
             },
             selected_speaker_id: None,
-            device_settings_open: ctx.props().device_settings_open,
             current_microphone_id: None,
             current_camera_id: None,
         }
@@ -300,44 +293,6 @@ impl Component for Host {
                 } else {
                     false
                 }
-            }
-            Msg::ToggleDeviceSettings => {
-                self.device_settings_open = !self.device_settings_open;
-                true
-            }
-            Msg::CloseDeviceSettings => {
-                self.device_settings_open = false;
-                true
-            }
-            Msg::SwitchCameraDevice(device) => {
-                if self.camera.select(device.clone()) {
-                    self.video_enabled = true;
-                    true
-                } else {
-                    self.video_enabled = false;
-                    true
-                }
-            }
-            Msg::SwitchMicrophoneDevice(device) => {
-                if self.microphone.select(device.clone()) {
-                    self.mic_enabled = true;
-                    true
-                } else {
-                    self.mic_enabled = false;
-                    true
-                }
-            }
-            Msg::SwitchSpeakerDevice(device) => {
-                self.selected_speaker_id = Some(device.clone());
-                // Update the speaker device for all connected peers
-                if let Err(e) = ctx
-                    .props()
-                    .client
-                    .update_speaker_device(Some(device.clone()))
-                {
-                    log::error!("Failed to update speaker device: {:?}", e);
-                }
-                true
             }
         };
         log::debug!("Host update: {:?}", should_update);

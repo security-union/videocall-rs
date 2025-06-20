@@ -9,10 +9,10 @@ pub struct DeviceSettingsModal {
     visible: bool,
 }
 
-pub enum Msg {
-    OnCameraSelect(String),
-    OnMicSelect(String),
-    OnSpeakerSelect(String),
+pub enum MsgOn {
+    CameraSelect(String),
+    MicSelect(String),
+    SpeakerSelect(String),
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -28,7 +28,7 @@ pub struct DeviceSettingsModalProps {
 }
 
 impl Component for DeviceSettingsModal {
-    type Message = Msg;
+    type Message = MsgOn;
     type Properties = DeviceSettingsModalProps;
 
     fn create(ctx: &Context<Self>) -> Self {
@@ -56,15 +56,15 @@ impl Component for DeviceSettingsModal {
 
     fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            Msg::OnCameraSelect(_camera) => {
+            MsgOn::CameraSelect(_camera) => {
                 // Device selection is handled by the callback passed from Host
                 true
             }
-            Msg::OnMicSelect(_mic) => {
+            MsgOn::MicSelect(_mic) => {
                 // Device selection is handled by the callback passed from Host
                 true
             }
-            Msg::OnSpeakerSelect(_speaker) => {
+            MsgOn::SpeakerSelect(_speaker) => {
                 // Device selection is handled by the callback passed from Host
                 true
             }
@@ -115,11 +115,11 @@ impl Component for DeviceSettingsModal {
                                     onchange={ctx.link().callback(move |e: Event| {
                                         let device_id = selection(e);
                                         on_microphone_select.emit(device_id.clone());
-                                        Msg::OnMicSelect(device_id)
+                                        MsgOn::MicSelect(device_id)
                                     })}
                             >
                                 { for mics.iter().map(|device| html! {
-                                    <option value={device.device_id()} selected={selected_mic.map_or(false, |id| id == device.device_id())}>
+                                    <option value={device.device_id()} selected={selected_mic.is_some_and(|id| id == device.device_id())}>
                                         { device.label() }
                                     </option>
                                 }) }
@@ -132,11 +132,11 @@ impl Component for DeviceSettingsModal {
                                     onchange={ctx.link().callback(move |e:Event| {
                                         let device_id = selection(e);
                                         on_camera_select.emit(device_id.clone());
-                                        Msg::OnCameraSelect(device_id)
+                                        MsgOn::CameraSelect(device_id)
                                     })}
                             >
                                 { for cameras.iter().map(|device| html! {
-                                    <option value={device.device_id()} selected={selected_camera.map_or(false, |id| id == device.device_id())}>
+                                    <option value={device.device_id()} selected={selected_camera.is_some_and(|id| id == device.device_id())}>
                                         { device.label() }
                                     </option>
                                 }) }
@@ -152,11 +152,11 @@ impl Component for DeviceSettingsModal {
                                                 onchange={ctx.link().callback(move |e: Event| {
                                                     let device_id = selection(e);
                                                     on_speaker_select.emit(device_id.clone());
-                                                    Msg::OnSpeakerSelect(device_id)
+                                                    MsgOn::SpeakerSelect(device_id)
                                                 })}
                                         >
                                             { for speakers.iter().map(|device| html! {
-                                                <option value={device.device_id()} selected={selected_speaker.map_or(false, |id| id == device.device_id())}>
+                                                <option value={device.device_id()} selected={selected_speaker.is_some_and(|id| id == device.device_id())}>
                                                     { device.label() }
                                                 </option>
                                             }) }

@@ -1,123 +1,61 @@
 use videocall_client::utils::is_ios;
-use videocall_client::MediaDeviceList;
 use wasm_bindgen::JsCast;
-use web_sys::HtmlSelectElement;
+use web_sys::{HtmlSelectElement, MediaDeviceInfo};
 use yew::prelude::*;
 
-pub struct DeviceSettingsModal {
-    media_devices: MediaDeviceList,
-    visible: bool,
-}
+pub struct DeviceSettingsModal;
 
-pub enum Msg {
-    DevicesLoaded,
-    OnCameraSelect(String),
-    OnMicSelect(String),
-    OnSpeakerSelect(String),
-    LoadDevices(),
-    CloseModal,
+pub enum MsgOnSelect {
+    Camera(String),
+    Mic(String),
+    Speaker(String),
 }
 
 #[derive(Properties, Debug, PartialEq)]
 pub struct DeviceSettingsModalProps {
+    pub microphones: Vec<MediaDeviceInfo>,
+    pub cameras: Vec<MediaDeviceInfo>,
+    pub speakers: Vec<MediaDeviceInfo>,
+    pub selected_microphone_id: Option<String>,
+    pub selected_camera_id: Option<String>,
+    pub selected_speaker_id: Option<String>,
     pub on_camera_select: Callback<String>,
     pub on_microphone_select: Callback<String>,
     pub on_speaker_select: Callback<String>,
     pub visible: bool,
-    pub on_close: Callback<()>,
-}
-
-impl DeviceSettingsModal {
-    fn create_media_device_list(ctx: &Context<DeviceSettingsModal>) -> MediaDeviceList {
-        let mut media_devices = MediaDeviceList::new();
-        let link = ctx.link().clone();
-        let on_microphone_select = ctx.props().on_microphone_select.clone();
-        let on_camera_select = ctx.props().on_camera_select.clone();
-        let on_speaker_select = ctx.props().on_speaker_select.clone();
-        {
-            let link = link.clone();
-            media_devices.on_loaded =
-                Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
-        }
-        {
-            let link = link.clone();
-            media_devices.on_devices_changed =
-                Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
-        }
-        let on_microphone_select = on_microphone_select.clone();
-        media_devices.audio_inputs.on_selected =
-            Callback::from(move |device_id| on_microphone_select.emit(device_id));
-        let on_camera_select = on_camera_select.clone();
-        media_devices.video_inputs.on_selected =
-            Callback::from(move |device_id| on_camera_select.emit(device_id));
-        let on_speaker_select = on_speaker_select.clone();
-        media_devices.audio_outputs.on_selected =
-            Callback::from(move |device_id| on_speaker_select.emit(device_id));
-        media_devices
-    }
+    pub on_close: Callback<MouseEvent>,
 }
 
 impl Component for DeviceSettingsModal {
-    type Message = Msg;
+    type Message = MsgOnSelect;
     type Properties = DeviceSettingsModalProps;
 
-    fn create(ctx: &Context<Self>) -> Self {
-        let link = ctx.link().clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            link.send_message(Msg::LoadDevices());
-        });
-        Self {
-            media_devices: Self::create_media_device_list(ctx),
-            visible: ctx.props().visible,
-        }
+    fn create(_ctx: &Context<Self>) -> Self {
+        Self
     }
 
-    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            ctx.link().send_message(Msg::LoadDevices());
-        }
-    }
-
-    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
+    fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            Msg::LoadDevices() => {
-                self.media_devices.load();
-                false
-            }
-            Msg::DevicesLoaded => true,
-            Msg::OnCameraSelect(camera) => {
-                self.media_devices.video_inputs.select(&camera);
+            MsgOnSelect::Camera(_camera) => {
+                // Device selection is handled by the callback passed from Host
                 true
             }
-            Msg::OnMicSelect(mic) => {
-                self.media_devices.audio_inputs.select(&mic);
+            MsgOnSelect::Mic(_mic) => {
+                // Device selection is handled by the callback passed from Host
                 true
             }
-            Msg::OnSpeakerSelect(speaker) => {
-                self.media_devices.audio_outputs.select(&speaker);
-                true
-            }
-            Msg::CloseModal => {
-                self.visible = false;
-                ctx.props().on_close.emit(());
+            MsgOnSelect::Speaker(_speaker) => {
+                // Device selection is handled by the callback passed from Host
                 true
             }
         }
-    }
-
-    fn changed(&mut self, ctx: &Context<Self>, _old_props: &Self::Properties) -> bool {
-        self.visible = ctx.props().visible;
-        true
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let mics = self.media_devices.audio_inputs.devices();
-        let cameras = self.media_devices.video_inputs.devices();
-        let speakers = self.media_devices.audio_outputs.devices();
-        let selected_mic = self.media_devices.audio_inputs.selected();
-        let selected_camera = self.media_devices.video_inputs.selected();
-        let selected_speaker = self.media_devices.audio_outputs.selected();
         let is_ios_safari = is_ios();
+        let on_microphone_select = ctx.props().on_microphone_select.clone();
+        let on_camera_select = ctx.props().on_camera_select.clone();
+        let on_speaker_select = ctx.props().on_speaker_select.clone();
 
         fn selection(event: Event) -> String {
             event
@@ -132,20 +70,24 @@ impl Component for DeviceSettingsModal {
         }
 
         html! {
-            <div class={classes!("device-settings-modal-overlay", ctx.props().visible.then_some("visible"))} onclick={ctx.link().callback(|_| Msg::CloseModal)}>
+            <div class={classes!("device-settings-modal-overlay", ctx.props().visible.then_some("visible"))} onclick={ctx.props().on_close.clone()}>
                 <div class="device-settings-modal" onclick={|e: MouseEvent| e.stop_propagation()}>
                     <div class="device-settings-header">
                         <h2>{"Device Settings"}</h2>
-                        <button class="close-button" onclick={ctx.link().callback(|_| Msg::CloseModal)}>{"×"}</button>
+                        <button class="close-button" onclick={ctx.props().on_close.clone()}>{"×"}</button>
                     </div>
                     <div class="device-settings-content">
                         <div class="device-setting-group">
                             <label for={"modal-audio-select"}>{ "Microphone:" }</label>
                             <select id={"modal-audio-select"} class={"device-selector-modal"}
-                                    onchange={ctx.link().callback(|e: Event| Msg::OnMicSelect(selection(e)))}
+                                    onchange={ctx.link().callback(move |e: Event| {
+                                        let device_id = selection(e);
+                                        on_microphone_select.emit(device_id.clone());
+                                        MsgOnSelect::Mic(device_id)
+                                    })}
                             >
-                                { for mics.iter().map(|device| html! {
-                                    <option value={device.device_id()} selected={selected_mic == device.device_id()}>
+                                { for ctx.props().microphones.iter().map(|device| html! {
+                                    <option value={device.device_id()} selected={ctx.props().selected_microphone_id.as_deref() == Some(&device.device_id())}>
                                         { device.label() }
                                     </option>
                                 }) }
@@ -155,10 +97,14 @@ impl Component for DeviceSettingsModal {
                         <div class="device-setting-group">
                             <label for={"modal-video-select"}>{ "Camera:" }</label>
                             <select id={"modal-video-select"} class={"device-selector-modal"}
-                                    onchange={ctx.link().callback(|e:Event| Msg::OnCameraSelect(selection(e))) }
+                                    onchange={ctx.link().callback(move |e:Event| {
+                                        let device_id = selection(e);
+                                        on_camera_select.emit(device_id.clone());
+                                        MsgOnSelect::Camera(device_id)
+                                    })}
                             >
-                                { for cameras.iter().map(|device| html! {
-                                    <option value={device.device_id()} selected={selected_camera == device.device_id()}>
+                                { for ctx.props().cameras.iter().map(|device| html! {
+                                    <option value={device.device_id()} selected={ctx.props().selected_camera_id.as_deref() == Some(&device.device_id())}>
                                         { device.label() }
                                     </option>
                                 }) }
@@ -171,10 +117,14 @@ impl Component for DeviceSettingsModal {
                                     <div class="device-setting-group">
                                         <label for={"modal-speaker-select"}>{ "Speaker:" }</label>
                                         <select id={"modal-speaker-select"} class={"device-selector-modal"}
-                                                onchange={ctx.link().callback(|e: Event| Msg::OnSpeakerSelect(selection(e)))}
+                                                onchange={ctx.link().callback(move |e: Event| {
+                                                    let device_id = selection(e);
+                                                    on_speaker_select.emit(device_id.clone());
+                                                    MsgOnSelect::Speaker(device_id)
+                                                })}
                                         >
-                                            { for speakers.iter().map(|device| html! {
-                                                <option value={device.device_id()} selected={selected_speaker == device.device_id()}>
+                                            { for ctx.props().speakers.iter().map(|device| html! {
+                                                <option value={device.device_id()} selected={ctx.props().selected_speaker_id.as_deref() == Some(&device.device_id())}>
                                                     { device.label() }
                                                 </option>
                                             }) }

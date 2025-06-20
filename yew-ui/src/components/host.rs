@@ -365,7 +365,7 @@ impl Component for Host {
                 {
                     if ctx.props().video_enabled {
                         html! {
-                            <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID}></video>
+                            <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
                         }
                     } else {
                         html! {

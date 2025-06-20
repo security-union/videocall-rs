@@ -358,16 +358,31 @@ impl PeerDecodeManager {
         None
     }
 
-    /// Updates the speaker device for all connected peers
+    /// Updates the speaker device for all connected peers by rebuilding their audio decoders
     pub fn update_speaker_device(
         &mut self,
         speaker_device_id: Option<String>,
     ) -> Result<(), JsValue> {
         let keys: Vec<String> = self.connected_peers.ordered_keys().clone();
+
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {
-                // Update the speaker device on the existing audio decoder
-                peer.audio.update_speaker_device(speaker_device_id.clone());
+                // Create a new audio decoder with the new speaker device
+                match create_audio_peer_decoder(speaker_device_id.clone()) {
+                    Ok(new_audio_decoder) => {
+                        // Replace the old decoder with the new one
+                        peer.audio = new_audio_decoder;
+                        log::info!("Successfully rebuilt audio decoder for peer: {} with new speaker device", key);
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to rebuild audio decoder for peer: {}, error: {:?}",
+                            key,
+                            e
+                        );
+                        // Keep the old decoder rather than breaking audio completely
+                    }
+                }
             }
         }
         Ok(())

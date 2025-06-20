@@ -1,6 +1,5 @@
 pub mod attendants;
 pub mod browser_compatibility;
-pub mod device_manager;
 pub mod device_selector;
 pub mod device_settings_modal;
 pub mod host;

@@ -7,7 +7,7 @@ on:
   push:
     branches:
       - main
-      - test-MediaTrackStreamProcessor-add-wasm-opus-encoder
+      - fix-rotation-ios
     paths:
       - 'yew-ui/**'
       - 'types/**'

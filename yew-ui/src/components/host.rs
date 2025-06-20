@@ -41,9 +41,6 @@ pub struct Host {
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub encoder_settings: EncoderSettings,
-    pub selected_speaker_id: Option<String>,
-    pub current_microphone_id: Option<String>,
-    pub current_camera_id: Option<String>,
 }
 
 pub struct EncoderSettings {
@@ -133,11 +130,13 @@ impl Component for Host {
         // Set up callbacks for device list updates
         media_devices.on_loaded = {
             let link = ctx.link().clone();
+            log::info!("Devices loaded 1");
             Callback::from(move |_| link.send_message(Msg::DevicesLoaded))
         };
 
         media_devices.on_devices_changed = {
             let link = ctx.link().clone();
+            log::info!("Devices changed");
             Callback::from(move |_| link.send_message(Msg::DevicesChanged))
         };
 
@@ -157,9 +156,6 @@ impl Component for Host {
                 microphone: None,
                 screen: None,
             },
-            selected_speaker_id: None,
-            current_microphone_id: None,
-            current_camera_id: None,
         }
     }
 
@@ -250,7 +246,7 @@ impl Component for Host {
                 true
             }
             Msg::AudioDeviceChanged(audio) => {
-                self.current_microphone_id = Some(audio.clone());
+                log::info!("Audio device changed: {}", audio);
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_inputs.select(&audio);
                 if self.microphone.select(audio) {
@@ -263,7 +259,7 @@ impl Component for Host {
                 true // Need to re-render to update device selector displays
             }
             Msg::VideoDeviceChanged(video) => {
-                self.current_camera_id = Some(video.clone());
+                log::info!("Video device changed: {}", video);
                 // Update the MediaDeviceList selection
                 self.media_devices.video_inputs.select(&video);
                 if self.camera.select(video) {
@@ -276,7 +272,6 @@ impl Component for Host {
                 true // Need to re-render to update device selector displays
             }
             Msg::SpeakerDeviceChanged(speaker) => {
-                self.selected_speaker_id = Some(speaker.clone());
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_outputs.select(&speaker);
                 // Update the speaker device for all connected peers
@@ -321,8 +316,30 @@ impl Component for Host {
                     false
                 }
             }
-            Msg::DevicesLoaded => true,
-            Msg::DevicesChanged => true,
+            Msg::DevicesLoaded => {
+                ctx.link().send_message(Msg::AudioDeviceChanged(
+                    self.media_devices.audio_inputs.selected(),
+                ));
+                ctx.link().send_message(Msg::VideoDeviceChanged(
+                    self.media_devices.video_inputs.selected(),
+                ));
+                ctx.link().send_message(Msg::SpeakerDeviceChanged(
+                    self.media_devices.audio_outputs.selected(),
+                ));
+                true
+            }
+            Msg::DevicesChanged => {
+                ctx.link().send_message(Msg::AudioDeviceChanged(
+                    self.media_devices.audio_inputs.selected(),
+                ));
+                ctx.link().send_message(Msg::VideoDeviceChanged(
+                    self.media_devices.video_inputs.selected(),
+                ));
+                ctx.link().send_message(Msg::SpeakerDeviceChanged(
+                    self.media_devices.audio_outputs.selected(),
+                ));
+                true
+            }
         };
         log::debug!("Host update: {:?}", should_update);
         should_update
@@ -338,6 +355,10 @@ impl Component for Host {
         let microphones = self.media_devices.audio_inputs.devices();
         let cameras = self.media_devices.video_inputs.devices();
         let speakers = self.media_devices.audio_outputs.devices();
+
+        let selected_microphone_id = self.media_devices.audio_inputs.selected();
+        let selected_camera_id = self.media_devices.video_inputs.selected();
+        let selected_speaker_id = self.media_devices.audio_outputs.selected();
 
         html! {
             <>
@@ -379,9 +400,9 @@ impl Component for Host {
                         microphones={microphones.clone()}
                         cameras={cameras.clone()}
                         speakers={speakers.clone()}
-                        selected_microphone_id={self.current_microphone_id.clone()}
-                        selected_camera_id={self.current_camera_id.clone()}
-                        selected_speaker_id={self.selected_speaker_id.clone()}
+                        selected_microphone_id={selected_microphone_id.clone()}
+                        selected_camera_id={selected_camera_id.clone()}
+                        selected_speaker_id={selected_speaker_id.clone()}
                         on_microphone_select={mic_callback.clone()}
                         on_camera_select={cam_callback.clone()}
                         on_speaker_select={speaker_callback.clone()}
@@ -393,9 +414,9 @@ impl Component for Host {
                     microphones={microphones}
                     cameras={cameras}
                     speakers={speakers}
-                    selected_microphone_id={self.current_microphone_id.clone()}
-                    selected_camera_id={self.current_camera_id.clone()}
-                    selected_speaker_id={self.selected_speaker_id.clone()}
+                    selected_microphone_id={selected_microphone_id.clone()}
+                    selected_camera_id={selected_camera_id.clone()}
+                    selected_speaker_id={selected_speaker_id.clone()}
                     on_microphone_select={mic_callback}
                     on_camera_select={cam_callback}
                     on_speaker_select={speaker_callback}

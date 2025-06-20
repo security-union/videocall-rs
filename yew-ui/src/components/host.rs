@@ -30,6 +30,9 @@ pub enum Msg {
     ScreenEncoderSettingsUpdated(String),
     ToggleDeviceSettings,
     CloseDeviceSettings,
+    SwitchCameraDevice(String),
+    SwitchMicrophoneDevice(String),
+    SwitchSpeakerDevice(String),
 }
 
 pub struct Host {
@@ -82,6 +85,10 @@ pub struct MeetingProps {
     pub video_enabled: bool,
 
     pub on_encoder_settings_update: Callback<String>,
+
+    pub device_settings_open: bool,
+
+    pub on_device_settings_toggle: Callback<MouseEvent>,
 }
 
 impl Component for Host {
@@ -134,7 +141,7 @@ impl Component for Host {
                 screen: None,
             },
             selected_speaker_id: None,
-            device_settings_open: false,
+            device_settings_open: ctx.props().device_settings_open,
         }
     }
 
@@ -296,6 +303,36 @@ impl Component for Host {
                 self.device_settings_open = false;
                 true
             }
+            Msg::SwitchCameraDevice(device) => {
+                if self.camera.select(device.clone()) {
+                    self.video_enabled = true;
+                    true
+                } else {
+                    self.video_enabled = false;
+                    true
+                }
+            }
+            Msg::SwitchMicrophoneDevice(device) => {
+                if self.microphone.select(device.clone()) {
+                    self.mic_enabled = true;
+                    true
+                } else {
+                    self.mic_enabled = false;
+                    true
+                }
+            }
+            Msg::SwitchSpeakerDevice(device) => {
+                self.selected_speaker_id = Some(device.clone());
+                // Update the speaker device for all connected peers
+                if let Err(e) = ctx
+                    .props()
+                    .client
+                    .update_speaker_device(Some(device.clone()))
+                {
+                    log::error!("Failed to update speaker device: {:?}", e);
+                }
+                true
+            }
         };
         log::debug!("Host update: {:?}", should_update);
         should_update
@@ -305,7 +342,7 @@ impl Component for Host {
         let mic_callback = ctx.link().callback(Msg::AudioDeviceChanged);
         let cam_callback = ctx.link().callback(Msg::VideoDeviceChanged);
         let speaker_callback = ctx.link().callback(Msg::SpeakerDeviceChanged);
-        let close_settings_callback = ctx.link().callback(|_| Msg::CloseDeviceSettings);
+        let close_settings_callback = ctx.props().on_device_settings_toggle.clone();
 
         html! {
             <>
@@ -332,12 +369,12 @@ impl Component for Host {
                 // Device Settings Menu Button (positioned outside the host video)
                 <button
                     class="device-settings-menu-button"
-                    onclick={ctx.link().callback(|_| Msg::ToggleDeviceSettings)}
+                    onclick={ctx.props().on_device_settings_toggle.clone()}
                     title="Device Settings"
                 >
                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <circle cx="12" cy="12" r="3"></circle>
-                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
                     </svg>
                 </button>
 
@@ -355,7 +392,7 @@ impl Component for Host {
                     on_microphone_select={mic_callback}
                     on_camera_select={cam_callback}
                     on_speaker_select={speaker_callback}
-                    visible={self.device_settings_open}
+                    visible={ctx.props().device_settings_open}
                     on_close={close_settings_callback}
                 />
             </>

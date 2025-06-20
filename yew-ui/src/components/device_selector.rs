@@ -8,14 +8,6 @@ pub struct DeviceSelector {
     media_devices: MediaDeviceList,
 }
 
-pub enum Msg {
-    DevicesLoaded,
-    OnCameraSelect(String),
-    OnMicSelect(String),
-    OnSpeakerSelect(String),
-    LoadDevices(),
-}
-
 #[derive(Properties, Debug, PartialEq)]
 pub struct DeviceSelectorProps {
     pub on_camera_select: Callback<String>,
@@ -23,76 +15,28 @@ pub struct DeviceSelectorProps {
     pub on_speaker_select: Callback<String>,
 }
 
-impl DeviceSelector {
-    fn create_media_device_list(ctx: &Context<DeviceSelector>) -> MediaDeviceList {
-        let mut media_devices = MediaDeviceList::new();
-        let link = ctx.link().clone();
-        let on_microphone_select = ctx.props().on_microphone_select.clone();
-        let on_camera_select = ctx.props().on_camera_select.clone();
-        let on_speaker_select = ctx.props().on_speaker_select.clone();
-        {
-            let link = link.clone();
-            media_devices.on_loaded =
-                Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
-        }
-        {
-            let link = link.clone();
-            media_devices.on_devices_changed =
-                Callback::from(move |_| link.send_message(Msg::DevicesLoaded));
-        }
-        let on_microphone_select = on_microphone_select.clone();
-        media_devices.audio_inputs.on_selected =
-            Callback::from(move |device_id| on_microphone_select.emit(device_id));
-        let on_camera_select = on_camera_select.clone();
-        media_devices.video_inputs.on_selected =
-            Callback::from(move |device_id| on_camera_select.emit(device_id));
-        let on_speaker_select = on_speaker_select.clone();
-        media_devices.audio_outputs.on_selected =
-            Callback::from(move |device_id| on_speaker_select.emit(device_id));
-        media_devices
-    }
-}
-
 impl Component for DeviceSelector {
-    type Message = Msg;
+    type Message = ();
     type Properties = DeviceSelectorProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let link = ctx.link().clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            link.send_message(Msg::LoadDevices());
-        });
-        Self {
-            media_devices: Self::create_media_device_list(ctx),
-        }
-    }
+        let mut media_devices = MediaDeviceList::new();
+        let on_microphone_select = ctx.props().on_microphone_select.clone();
+        let on_camera_select = ctx.props().on_camera_select.clone();
+        let on_speaker_select = ctx.props().on_speaker_select.clone();
 
-    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            ctx.link().send_message(Msg::LoadDevices());
-        }
-    }
+        // Set up callbacks for device selection
+        media_devices.audio_inputs.on_selected =
+            Callback::from(move |device_id| on_microphone_select.emit(device_id));
+        media_devices.video_inputs.on_selected =
+            Callback::from(move |device_id| on_camera_select.emit(device_id));
+        media_devices.audio_outputs.on_selected =
+            Callback::from(move |device_id| on_speaker_select.emit(device_id));
 
-    fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
-        match msg {
-            Msg::LoadDevices() => {
-                self.media_devices.load();
-                false
-            }
-            Msg::DevicesLoaded => true,
-            Msg::OnCameraSelect(camera) => {
-                self.media_devices.video_inputs.select(&camera);
-                true
-            }
-            Msg::OnMicSelect(mic) => {
-                self.media_devices.audio_inputs.select(&mic);
-                true
-            }
-            Msg::OnSpeakerSelect(speaker) => {
-                self.media_devices.audio_outputs.select(&speaker);
-                true
-            }
-        }
+        // Load devices
+        media_devices.load();
+
+        Self { media_devices }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
@@ -103,6 +47,9 @@ impl Component for DeviceSelector {
         let selected_camera = self.media_devices.video_inputs.selected();
         let selected_speaker = self.media_devices.audio_outputs.selected();
         let is_ios_safari = is_ios();
+        let on_microphone_select = ctx.props().on_microphone_select.clone();
+        let on_camera_select = ctx.props().on_camera_select.clone();
+        let on_speaker_select = ctx.props().on_speaker_select.clone();
 
         fn selection(event: Event) -> String {
             event
@@ -116,7 +63,10 @@ impl Component for DeviceSelector {
             <div class={"device-selector-wrapper"}>
                 <label for={"audio-select"}>{ "Audio:" }</label>
                 <select id={"audio-select"} class={"device-selector"}
-                        onchange={ctx.link().callback(|e: Event| Msg::OnMicSelect(selection(e)))}
+                        onchange={ctx.link().callback(move |e: Event| {
+                            let device_id = selection(e);
+                            on_microphone_select.emit(device_id);
+                        })}
                 >
                     { for mics.iter().map(|device| html! {
                         <option value={device.device_id()} selected={selected_mic == device.device_id()}>
@@ -127,7 +77,10 @@ impl Component for DeviceSelector {
                 <br/>
                 <label for={"video-select"}>{ "Video:" }</label>
                 <select id={"video-select"} class={"device-selector"}
-                        onchange={ctx.link().callback(|e:Event| Msg::OnCameraSelect(selection(e))) }
+                        onchange={ctx.link().callback(move |e:Event| {
+                            let device_id = selection(e);
+                            on_camera_select.emit(device_id);
+                        })}
                 >
                     { for cameras.iter().map(|device| html! {
                         <option value={device.device_id()} selected={selected_camera == device.device_id()}>
@@ -142,7 +95,10 @@ impl Component for DeviceSelector {
                             <>
                                 <label for={"speaker-select"}>{ "Speaker:" }</label>
                                 <select id={"speaker-select"} class={"device-selector"}
-                                        onchange={ctx.link().callback(|e: Event| Msg::OnSpeakerSelect(selection(e)))}
+                                        onchange={ctx.link().callback(move |e: Event| {
+                                            let device_id = selection(e);
+                                            on_speaker_select.emit(device_id);
+                                        })}
                                 >
                                     { for speakers.iter().map(|device| html! {
                                         <option value={device.device_id()} selected={selected_speaker == device.device_id()}>

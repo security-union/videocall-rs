@@ -1,11 +1,12 @@
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator,
-    device_settings_modal::DeviceSettingsModal, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility, canvas_generator, peer_list::PeerList,
 };
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::{debug, error, warn};
-use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_client::{
+    MediaDeviceAccess, MediaDeviceList, VideoCallClient, VideoCallClientOptions,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -90,6 +91,7 @@ pub struct AttendantsComponentProps {
 pub struct AttendantsComponent {
     pub client: VideoCallClient,
     pub media_device_access: MediaDeviceAccess,
+    pub media_device_list: MediaDeviceList,
     pub share_screen: bool,
     pub mic_enabled: bool,
     pub video_enabled: bool,
@@ -182,6 +184,25 @@ impl AttendantsComponent {
         media_device_access
     }
 
+    fn create_media_device_list(_ctx: &Context<Self>) -> MediaDeviceList {
+        let mut media_device_list = MediaDeviceList::new();
+
+        // Set up callbacks for device list updates
+        media_device_list.on_loaded = {
+            Callback::from(move |_| {
+                log::info!("Media devices loaded");
+            })
+        };
+
+        media_device_list.on_devices_changed = {
+            Callback::from(move |_| {
+                log::info!("Media devices changed");
+            })
+        };
+
+        media_device_list
+    }
+
     #[cfg(feature = "fake-peers")]
     fn view_fake_peer_buttons(&self, ctx: &Context<Self>, add_fake_peer_disabled: bool) -> Html {
         html! {
@@ -250,6 +271,7 @@ impl Component for AttendantsComponent {
         Self {
             client: Self::create_video_call_client(ctx),
             media_device_access: Self::create_media_device_access(ctx),
+            media_device_list: Self::create_media_device_list(ctx),
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
@@ -311,6 +333,9 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsGranted => {
                     self.error = None;
+
+                    // Load the media device list now that permissions are granted
+                    self.media_device_list.load();
 
                     if self.pending_mic_enable {
                         self.mic_enabled = true;
@@ -699,7 +724,7 @@ impl Component for AttendantsComponent {
                                                             <>
                                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                                                     <circle cx="12" cy="12" r="3"></circle>
-                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
                                                                     <line x1="3" y1="3" x2="21" y2="21"></line>
                                                                 </svg>
                                                                 <span class="tooltip">{ "Close Settings" }</span>
@@ -710,7 +735,7 @@ impl Component for AttendantsComponent {
                                                             <>
                                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                                                     <circle cx="12" cy="12" r="3"></circle>
-                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
                                                                 </svg>
                                                                 <span class="tooltip">{ "Device Settings" }</span>
                                                             </>
@@ -735,7 +760,15 @@ impl Component for AttendantsComponent {
                                     </div>
                                     {
                                         if media_access_granted {
-                                            html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} on_encoder_settings_update={on_encoder_settings_update} />}
+                                            html! {<Host
+                                                client={self.client.clone()}
+                                                share_screen={self.share_screen}
+                                                mic_enabled={self.mic_enabled}
+                                                video_enabled={self.video_enabled}
+                                                on_encoder_settings_update={on_encoder_settings_update}
+                                                device_settings_open={self.device_settings_open}
+                                                on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                            />}
                                         } else {
                                             html! {<></>}
                                         }
@@ -798,25 +831,6 @@ impl Component for AttendantsComponent {
                         </div>
                     </div>
                 </div>
-                <DeviceSettingsModal
-                    on_microphone_select={ctx.link().callback(|device_id: String| {
-                        // Handle microphone device selection
-                        log::info!("Microphone device selected: {}", device_id);
-                        Msg::WsAction(WsAction::Log(format!("Microphone device selected: {}", device_id)))
-                    })}
-                    on_camera_select={ctx.link().callback(|device_id: String| {
-                        // Handle camera device selection
-                        log::info!("Camera device selected: {}", device_id);
-                        Msg::WsAction(WsAction::Log(format!("Camera device selected: {}", device_id)))
-                    })}
-                    on_speaker_select={ctx.link().callback(|device_id: String| {
-                        // Handle speaker device selection
-                        log::info!("Speaker device selected: {}", device_id);
-                        Msg::WsAction(WsAction::Log(format!("Speaker device selected: {}", device_id)))
-                    })}
-                    visible={self.device_settings_open}
-                    on_close={ctx.link().callback(|_| Msg::UserScreenAction(UserScreenToggleAction::DeviceSettings))}
-                />
             </div>
         }
     }

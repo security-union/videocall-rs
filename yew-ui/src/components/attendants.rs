@@ -4,6 +4,7 @@ use crate::components::{
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use log::{debug, error, warn};
+use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
@@ -601,36 +602,46 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
-                                            <button
-                                                class={classes!("video-control-button", self.share_screen.then_some("active"))}
-                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
-                                                {
-                                                    if self.share_screen {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-                                                                    <line x1="8" y1="21" x2="16" y2="21"></line>
-                                                                    <line x1="12" y1="17" x2="12" y2="21"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Stop Screen Share" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M13 3H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-3"></path>
-                                                                    <polyline points="8 21 12 17 16 21"></polyline>
-                                                                    <polyline points="16 7 20 7 20 3"></polyline>
-                                                                    <line x1="10" y1="14" x2="21" y2="3"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Share Screen" }</span>
-                                                            </>
-                                                        }
+
+                                            // Hide screen share button on Safari/iOS devices
+                                            {
+                                                if !is_ios() {
+                                                    html! {
+                                                        <button
+                                                            class={classes!("video-control-button", self.share_screen.then_some("active"))}
+                                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
+                                                            {
+                                                                if self.share_screen {
+                                                                    html! {
+                                                                        <>
+                                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                                <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                                                                                <line x1="8" y1="21" x2="16" y2="21"></line>
+                                                                                <line x1="12" y1="17" x2="12" y2="21"></line>
+                                                                            </svg>
+                                                                            <span class="tooltip">{ "Stop Screen Share" }</span>
+                                                                        </>
+                                                                    }
+                                                                } else {
+                                                                    html! {
+                                                                        <>
+                                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                                <path d="M13 3H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-3"></path>
+                                                                                <polyline points="8 21 12 17 16 21"></polyline>
+                                                                                <polyline points="16 7 20 7 20 3"></polyline>
+                                                                                <line x1="10" y1="14" x2="21" y2="3"></line>
+                                                                            </svg>
+                                                                            <span class="tooltip">{ "Share Screen" }</span>
+                                                                        </>
+                                                                    }
+                                                                }
+                                                            }
+                                                        </button>
                                                     }
+                                                } else {
+                                                    html! {}
                                                 }
-                                            </button>
+                                            }
                                             <button
                                                 class={classes!("video-control-button", self.peer_list_open.then_some("active"))}
                                                 onclick={toggle_peer_list.clone()}>

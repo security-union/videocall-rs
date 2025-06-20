@@ -5,10 +5,10 @@ use yew::prelude::*;
 
 pub struct DeviceSettingsModal;
 
-pub enum MsgOn {
-    CameraSelect(String),
-    MicSelect(String),
-    SpeakerSelect(String),
+pub enum MsgOnSelect {
+    Camera(String),
+    Mic(String),
+    Speaker(String),
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -27,7 +27,7 @@ pub struct DeviceSettingsModalProps {
 }
 
 impl Component for DeviceSettingsModal {
-    type Message = MsgOn;
+    type Message = MsgOnSelect;
     type Properties = DeviceSettingsModalProps;
 
     fn create(_ctx: &Context<Self>) -> Self {
@@ -36,15 +36,15 @@ impl Component for DeviceSettingsModal {
 
     fn update(&mut self, _ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
-            MsgOn::CameraSelect(_camera) => {
+            MsgOnSelect::Camera(_camera) => {
                 // Device selection is handled by the callback passed from Host
                 true
             }
-            MsgOn::MicSelect(_mic) => {
+            MsgOnSelect::Mic(_mic) => {
                 // Device selection is handled by the callback passed from Host
                 true
             }
-            MsgOn::SpeakerSelect(_speaker) => {
+            MsgOnSelect::Speaker(_speaker) => {
                 // Device selection is handled by the callback passed from Host
                 true
             }
@@ -83,7 +83,7 @@ impl Component for DeviceSettingsModal {
                                     onchange={ctx.link().callback(move |e: Event| {
                                         let device_id = selection(e);
                                         on_microphone_select.emit(device_id.clone());
-                                        MsgOn::MicSelect(device_id)
+                                        MsgOnSelect::Mic(device_id)
                                     })}
                             >
                                 { for ctx.props().microphones.iter().map(|device| html! {
@@ -100,7 +100,7 @@ impl Component for DeviceSettingsModal {
                                     onchange={ctx.link().callback(move |e:Event| {
                                         let device_id = selection(e);
                                         on_camera_select.emit(device_id.clone());
-                                        MsgOn::CameraSelect(device_id)
+                                        MsgOnSelect::Camera(device_id)
                                     })}
                             >
                                 { for ctx.props().cameras.iter().map(|device| html! {
@@ -120,7 +120,7 @@ impl Component for DeviceSettingsModal {
                                                 onchange={ctx.link().callback(move |e: Event| {
                                                     let device_id = selection(e);
                                                     on_speaker_select.emit(device_id.clone());
-                                                    MsgOn::SpeakerSelect(device_id)
+                                                    MsgOnSelect::Speaker(device_id)
                                                 })}
                                         >
                                             { for ctx.props().speakers.iter().map(|device| html! {

@@ -295,6 +295,10 @@ impl CameraEncoder {
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
 
+            // Track current encoder dimensions for dynamic reconfiguration
+            let mut current_encoder_width = width as u32;
+            let mut current_encoder_height = height as u32;
+
             loop {
                 if !enabled.load(Ordering::Acquire)
                     || destroy.load(Ordering::Acquire)
@@ -325,6 +329,37 @@ impl CameraEncoder {
                         let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
                             .unwrap()
                             .unchecked_into::<VideoFrame>();
+
+                        // Check for dimension changes (rotation, camera switch)
+                        let frame_width = video_frame.display_width();
+                        let frame_height = video_frame.display_height();
+
+                        if frame_width > 0
+                            && frame_height > 0
+                            && (frame_width != current_encoder_width
+                                || frame_height != current_encoder_height)
+                        {
+                            log::info!("Camera dimensions changed from {}x{} to {}x{}, reconfiguring encoder", 
+                                current_encoder_width, current_encoder_height, frame_width, frame_height);
+
+                            current_encoder_width = frame_width;
+                            current_encoder_height = frame_height;
+
+                            let new_config = VideoEncoderConfig::new(
+                                VIDEO_CODEC,
+                                current_encoder_height,
+                                current_encoder_width,
+                            );
+                            new_config.set_bitrate(local_bitrate as f64);
+                            new_config.set_latency_mode(LatencyMode::Realtime);
+                            if let Err(e) = video_encoder.configure(&new_config) {
+                                error!(
+                                    "Error reconfiguring camera encoder with new dimensions: {:?}",
+                                    e
+                                );
+                            }
+                        }
+
                         let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
                         video_encoder_encode_options.set_key_frame(video_frame_counter % 150 == 0);
                         if let Err(e) = video_encoder

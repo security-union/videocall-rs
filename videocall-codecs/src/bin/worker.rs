@@ -45,7 +45,9 @@ pub fn main() {
         DECODER.with(|decoder_cell| {
             let mut decoder = decoder_cell.borrow_mut();
             if decoder.is_none() {
-                *decoder = Some(initialize_decoder());
+                let decoder_private =
+                    initialize_decoder().expect("[WORKER] Failed to initialize decoder");
+                *decoder = Some(decoder_private);
             }
             let decoder = decoder.as_ref().unwrap();
 
@@ -72,7 +74,7 @@ pub fn main() {
     on_message.forget();
 }
 
-fn initialize_decoder() -> VideoDecoder {
+fn initialize_decoder() -> anyhow::Result<VideoDecoder> {
     let self_scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .unwrap();

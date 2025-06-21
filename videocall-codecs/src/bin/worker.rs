@@ -63,7 +63,7 @@ pub fn main() {
 
             let chunk = EncodedVideoChunk::new(&init).unwrap();
             if let Err(e) = decoder.decode(&chunk) {
-                log::info!(&format!("[WORKER] Decoder error: {:?}", e));
+                log::info!("[WORKER] Decoder error: {:?}", e);
             }
         });
     }) as Box<dyn FnMut(_)>);

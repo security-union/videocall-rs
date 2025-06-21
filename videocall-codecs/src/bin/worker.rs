@@ -109,7 +109,12 @@ fn initialize_decoder() -> anyhow::Result<VideoDecoder> {
 
     let decoder = VideoDecoder::new(&init).unwrap();
     let config = VideoDecoderConfig::new("vp9");
-    decoder.configure(&config);
+    let Err(e) = decoder.configure(&config) else {
+        return Err(anyhow::anyhow!(
+            "[WORKER] Failed to configure decoder: {:?}",
+            e
+        ));
+    };
 
     on_output.forget();
     on_error.forget();

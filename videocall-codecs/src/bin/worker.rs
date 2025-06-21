@@ -16,7 +16,6 @@
 
 //! The entry point and main loop for the Web Worker.
 
-use js_sys;
 use js_sys::Uint8Array;
 use std::cell::RefCell;
 use videocall_codecs::{decoder::DecodedFrame, frame::FrameBuffer, frame::FrameType};
@@ -31,7 +30,7 @@ use web_sys::{
 // Use a thread-local static RefCell to hold the decoder.
 // This is a common pattern for managing state in a WASM worker.
 thread_local! {
-    static DECODER: RefCell<Option<VideoDecoder>> = RefCell::new(None);
+    static DECODER: RefCell<Option<VideoDecoder>> = const { RefCell::new(None) };
 }
 
 #[wasm_bindgen]

@@ -113,9 +113,7 @@ impl JitterBuffer {
         let raw_target = jitter_estimate * JITTER_MULTIPLIER;
 
         // Clamp the target to our defined min/max bounds.
-        let clamped_target = raw_target
-            .max(MIN_PLAYOUT_DELAY_MS)
-            .min(MAX_PLAYOUT_DELAY_MS);
+        let clamped_target = raw_target.clamp(MIN_PLAYOUT_DELAY_MS, MAX_PLAYOUT_DELAY_MS);
 
         // Smooth the transition to the new target to avoid sudden changes.
         self.target_playout_delay_ms = (self.target_playout_delay_ms * DELAY_SMOOTHING_FACTOR)

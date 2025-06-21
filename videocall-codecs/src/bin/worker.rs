@@ -114,7 +114,7 @@ fn initialize_decoder() -> anyhow::Result<VideoDecoder> {
     on_output.forget();
     on_error.forget();
 
-    decoder
+    Ok(decoder)
 }
 
 async fn copy_video_frame_data(video_frame: &VideoFrame) -> Result<Vec<u8>, JsValue> {

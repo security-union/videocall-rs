@@ -239,6 +239,11 @@ impl JitterBuffer {
         self.decoder.decode(frame);
     }
 
+    /// Checks if the jitter buffer is currently waiting for a keyframe to continue.
+    pub fn is_waiting_for_keyframe(&self) -> bool {
+        self.last_decoded_sequence_number.is_none()
+    }
+
     /// Removes all frames from the buffer with a sequence number less than the given one.
     fn drop_frames_before(&mut self, sequence_number: u64) {
         let keys_to_drop: Vec<u64> = self
@@ -289,22 +294,43 @@ mod tests {
         decoded_frames: Arc<Mutex<Vec<DecodedFrame>>>,
     }
 
+    // This impl is for native targets
+    #[cfg(not(target_arch = "wasm32"))]
     impl Decodable for MockDecoder {
         fn new(
             _codec: crate::decoder::VideoCodec,
             _on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
         ) -> Self {
-            // The mock doesn't use the callback or codec, it stores frames directly.
-            // This is a simplification for testing the JitterBuffer's output.
             panic!("Use `new_with_vec` for this mock.");
         }
-
         fn decode(&self, frame: FrameBuffer) {
-            let decoded = DecodedFrame {
+            let mut frames = self.decoded_frames.lock().unwrap();
+            frames.push(DecodedFrame {
                 sequence_number: frame.sequence_number(),
-                data: frame.frame.data.clone(),
-            };
-            self.decoded_frames.lock().unwrap().push(decoded);
+                width: 0,
+                height: 0,
+                data: frame.frame.data.to_vec(),
+            });
+        }
+    }
+
+    // This impl is for wasm targets
+    #[cfg(target_arch = "wasm32")]
+    impl Decodable for MockDecoder {
+        fn new(
+            _codec: crate::decoder::VideoCodec,
+            _on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
+        ) -> Self {
+            panic!("Use `new_with_vec` for this mock.");
+        }
+        fn decode(&self, frame: FrameBuffer) {
+            let mut frames = self.decoded_frames.lock().unwrap();
+            frames.push(DecodedFrame {
+                sequence_number: frame.sequence_number(),
+                width: 0,
+                height: 0,
+                data: frame.frame.data.to_vec(),
+            });
         }
     }
 

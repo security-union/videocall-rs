@@ -16,90 +16,113 @@
 
 //! The entry point and main loop for the Web Worker.
 
+use js_sys;
+use js_sys::Uint8Array;
 use std::cell::RefCell;
-use video_decoder::{frame::FrameBuffer, libvpx_decoder::DecodedFrame};
+use videocall_codecs::{decoder::DecodedFrame, frame::FrameBuffer, frame::FrameType};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    console, EncodedVideoChunk, EncodedVideoChunkInit, VideoDecoder, VideoDecoderConfig,
-    VideoDecoderInit, VideoFrame,
+    console, DedicatedWorkerGlobalScope, EncodedVideoChunk, EncodedVideoChunkInit,
+    EncodedVideoChunkType, VideoDecoder, VideoDecoderConfig, VideoDecoderInit, VideoFrame,
 };
 
-// Thread-local static variables to hold the state within the worker.
+// Use a thread-local static RefCell to hold the decoder.
+// This is a common pattern for managing state in a WASM worker.
 thread_local! {
-    // The WebCodecs decoder.
     static DECODER: RefCell<Option<VideoDecoder>> = RefCell::new(None);
 }
 
-/// The main entry point for the worker, called from JavaScript.
 #[wasm_bindgen]
-pub fn worker_entry(js_frame: JsValue) {
-    // Deserialize the frame from the main thread.
-    let frame: FrameBuffer = match serde_wasm_bindgen::from_value(js_frame) {
-        Ok(frame) => frame,
-        Err(e) => {
-            console::error_1(&format!("[WORKER] Failed to deserialize frame: {:?}", e).into());
-            return;
-        }
-    };
+pub fn main() {
+    let self_scope = js_sys::global()
+        .dyn_into::<DedicatedWorkerGlobalScope>()
+        .unwrap();
 
-    // If the decoder isn't initialized, do it now.
-    DECODER.with(|decoder_cell| {
-        let mut decoder_opt = decoder_cell.borrow_mut();
-        if decoder_opt.is_none() {
-            *decoder_opt = Some(initialize_decoder());
-        }
+    let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+        let frame: FrameBuffer = serde_wasm_bindgen::from_value(event.data()).unwrap();
 
-        // Now we know the decoder exists.
-        if let Some(decoder) = decoder_opt.as_ref() {
-            let chunk = EncodedVideoChunk::new(&EncodedVideoChunkInit::new(
-                &frame.frame.data,
-                frame.frame.sequence_number as f64, // timestamp
-                frame.frame.frame_type == video_decoder::frame::FrameType::KeyFrame,
-            ))
-            .expect("Failed to create EncodedVideoChunk");
+        DECODER.with(|decoder_cell| {
+            let mut decoder = decoder_cell.borrow_mut();
+            if decoder.is_none() {
+                *decoder = Some(initialize_decoder());
+            }
+            let decoder = decoder.as_ref().unwrap();
 
+            let chunk_type = match frame.frame.frame_type {
+                FrameType::KeyFrame => EncodedVideoChunkType::Key,
+                FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
+            };
+
+            let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
+            let init = EncodedVideoChunkInit::new(
+                &data.into(),
+                frame.frame.sequence_number as f64,
+                chunk_type,
+            );
+
+            let chunk = EncodedVideoChunk::new(&init).unwrap();
             decoder.decode(&chunk);
-        }
-    });
+        });
+    }) as Box<dyn FnMut(_)>);
+
+    self_scope.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    on_message.forget();
 }
 
 fn initialize_decoder() -> VideoDecoder {
-    // Define the output handler for the decoder.
-    let on_output = Closure::wrap(Box::new(move |chunk: JsValue| {
-        let video_frame = VideoFrame::from(chunk);
-        let decoded_frame = DecodedFrame {
-            sequence_number: video_frame.timestamp() as u64,
-            // In a real scenario, you'd copy the YUV data out.
-            // For this simulation, we'll just send back an empty Vec.
-            data: Vec::new(),
+    let self_scope = js_sys::global()
+        .dyn_into::<DedicatedWorkerGlobalScope>()
+        .unwrap();
+
+    let on_output = Closure::wrap(Box::new(move |video_frame: JsValue| {
+        let video_frame = video_frame.dyn_into::<VideoFrame>().unwrap();
+        let self_scope_clone = self_scope.clone();
+
+        let future = async move {
+            let frame_data = copy_video_frame_data(&video_frame).await.unwrap();
+            let decoded_frame = DecodedFrame {
+                sequence_number: video_frame.timestamp().unwrap_or(0.0) as u64,
+                width: video_frame.coded_width(),
+                height: video_frame.coded_height(),
+                data: frame_data,
+            };
+            let js_decoded = serde_wasm_bindgen::to_value(&decoded_frame).unwrap();
+            self_scope_clone.post_message(&js_decoded).unwrap();
         };
+        wasm_bindgen_futures::spawn_local(future);
+    }) as Box<dyn FnMut(_)>);
 
-        if let Ok(js_decoded) = serde_wasm_bindgen::to_value(&decoded_frame) {
-            // Post the decoded frame back to the main thread.
-            js_sys::global()
-                .dyn_into::<web_sys::WorkerGlobalScope>()
-                .unwrap()
-                .post_message(&js_decoded)
-                .unwrap();
-        }
-    }) as Box<dyn FnMut(JsValue)>);
-
-    // Define the error handler.
     let on_error = Closure::wrap(Box::new(move |e: JsValue| {
         console::error_1(&"[WORKER] Decoder error:".into());
         console::error_1(&e);
-    }) as Box<dyn FnMut(JsValue)>);
+    }) as Box<dyn FnMut(_)>);
 
-    let config = VideoDecoderConfig::new(
-        "vp8",
+    let init = VideoDecoderInit::new(
         on_output.as_ref().unchecked_ref(),
         on_error.as_ref().unchecked_ref(),
     );
 
-    // The closures must be forgotten to keep them alive.
+    let decoder = VideoDecoder::new(&init).unwrap();
+    let config = VideoDecoderConfig::new("vp9");
+    decoder.configure(&config);
+
     on_output.forget();
     on_error.forget();
 
-    VideoDecoder::new(&config).expect("Failed to create VideoDecoder")
+    decoder
+}
+
+async fn copy_video_frame_data(video_frame: &VideoFrame) -> Result<Vec<u8>, JsValue> {
+    let size = video_frame.allocation_size()? as usize;
+    let mut buffer = vec![0; size];
+    let promise = video_frame.copy_to_with_u8_array(&buffer_to_uint8array(&mut buffer));
+    JsFuture::from(promise).await?;
+    Ok(buffer)
+}
+
+pub fn buffer_to_uint8array(buf: &mut [u8]) -> Uint8Array {
+    // Convert &mut [u8] to a Uint8Array
+    unsafe { Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len()) }
 }

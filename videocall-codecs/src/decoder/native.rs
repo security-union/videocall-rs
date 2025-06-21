@@ -160,6 +160,8 @@ impl ThreadDecodable for SendableVp9Decoder {
 
             decoded_frames.push(DecodedFrame {
                 sequence_number: frame_buffer.sequence_number(),
+                width: 0,
+                height: 0,
                 data: image_data,
             });
         }

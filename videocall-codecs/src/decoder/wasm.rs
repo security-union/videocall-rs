@@ -19,28 +19,43 @@
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::JsCast;
 use web_sys::{console, Worker};
 
 pub struct WasmDecoder {
     worker: Worker,
     // The closure that handles messages from the worker.
     // We must store it to keep it alive.
-    _on_message_closure: Closure<dyn FnMut(JsValue)>,
+    _on_message_closure: Closure<dyn FnMut(web_sys::MessageEvent)>,
 }
 
 impl Decodable for WasmDecoder {
-    fn new(on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>) -> Self {
+    fn new(
+        _codec: crate::decoder::VideoCodec,
+        on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
+    ) -> Self {
+        // Find the worker script URL from the link tag added by Trunk.
+        let worker_url = web_sys::window()
+            .expect("no window")
+            .document()
+            .expect("no document")
+            .get_element_by_id("codecs-worker")
+            .expect("worker link tag with id 'codecs-worker' not found")
+            .get_attribute("href")
+            .expect("worker link tag has no href attribute");
+
         // Create the worker.
-        let worker = Worker::new("./worker.js").expect("Failed to create worker");
+        let worker = Worker::new(&worker_url).expect("Failed to create worker");
 
         // Create a closure to handle messages from the worker.
-        let on_message_closure = Closure::new(move |event: JsValue| {
-            match serde_wasm_bindgen::from_value::<DecodedFrame>(event) {
+        let on_message_closure = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+            match serde_wasm_bindgen::from_value::<DecodedFrame>(event.data()) {
                 Ok(frame) => on_decoded_frame(frame),
-                Err(e) => console::error_1(&format!("Error deserializing frame: {:?}", e).into()),
+                Err(e) => {
+                    console::error_1(&format!("[MAIN] Error deserializing frame: {:?}", e).into())
+                }
             }
-        });
+        }) as Box<dyn FnMut(_)>);
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
 

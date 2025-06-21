@@ -23,7 +23,7 @@ license-file = ["../LICENSE.md", "4"]
 depends = "libvpx7 (>= 1.11.0), libvpx-dev (>= 1.11.0), libc6 (>= 2.34), libasound2-dev (>=1.2.8), libv4l-dev (>=1.22.1), libssl-dev(>=3.3.1)"
 
 [dependencies]
-anyhow = "1.0.75"
+anyhow = { workspace = true }
 clap = { version = "4.0.32", features = ["derive"] }
 protobuf = "3.3.0"
 quinn = "0.10.2"

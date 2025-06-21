@@ -17,6 +17,7 @@
 //! A high-fidelity, cross-platform video decoder jitter buffer implementation in Rust.
 
 pub mod decoder;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod encoder;
 pub mod frame;
 pub mod jitter_buffer;

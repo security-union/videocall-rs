@@ -22,7 +22,9 @@ wasm = [
     "wasm-bindgen",
     "web-sys",
     "console_error_panic_hook",
-    "serde-wasm-bindgen"
+    "serde-wasm-bindgen",
+    "js-sys",
+    "wasm-bindgen-futures"
 ]
 
 [dependencies]
@@ -31,9 +33,17 @@ serde = { version = "1.0", features = ["derive"] }
 wasm-bindgen = { version = "0.2.92", optional = true }
 console_error_panic_hook = { version = "0.1.7", optional = true }
 serde-wasm-bindgen = { version = "0.6.5", optional = true }
-env-libvpx-sys = { version = "5.1.3", features = ["generate"] }
-anyhow = "1.0"
+env-libvpx-sys = { workspace = true, optional = true }
+anyhow = { workspace = true }
 image = { version = "0.24", features = ["png", "jpeg"] }
+js-sys = { version = "0.3.69", optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env-libvpx-sys = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dependencies.web-sys]
 version = "0.3.69"
@@ -47,9 +57,17 @@ features = [
   'VideoDecoderInit',
   'EncodedVideoChunk',
   'EncodedVideoChunkInit',
+  'EncodedVideoChunkType',
   'VideoFrame',
   'CodecState',
   'console',
+  'MessageEvent',
+  'Window',
+  'Document',
+  'Element',
+  'HtmlElement',
+  'WorkerGlobalScope',
+  'DedicatedWorkerGlobalScope',
 ]
 optional = true
 

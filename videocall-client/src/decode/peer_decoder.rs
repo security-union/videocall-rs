@@ -10,29 +10,29 @@
 // and each one's new() contains the type-specific creation/configuration code.
 //
 
-use super::super::wrappers::EncodedVideoChunkTypeWrapper;
 use super::audio_decoder_wrapper::{AudioDecoderTrait, AudioDecoderWrapper};
 use super::config::configure_audio_context;
-use super::media_decoder_with_buffer::VideoDecoderWithBuffer;
-use super::video_decoder_wrapper::VideoDecoderWrapper;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::constants::VIDEO_CODEC;
+use gloo_timers::callback::Interval;
 use log::error;
 use std::sync::Arc;
+use std::sync::Mutex;
+use videocall_codecs::decoder::{Decodable, DecodedFrame, Decoder, VideoCodec};
+use videocall_codecs::frame::{FrameType, VideoFrame as CodecVideoFrame};
+use videocall_codecs::jitter_buffer::JitterBuffer;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::window;
-use web_sys::EncodedVideoChunkType;
 use web_sys::HtmlCanvasElement;
 use web_sys::{AudioData, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
 use web_sys::{MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit};
-use web_sys::{VideoDecoderConfig, VideoDecoderInit, VideoFrame};
+use web_time;
 
 pub struct DecodeStatus {
     pub _rendered: bool,
@@ -68,17 +68,18 @@ pub trait PeerDecode {
 /// rendered. The size of the canvas is set at decode time to match the image size from the media
 /// data.
 ///
-pub type VideoPeerDecoder = PeerDecoder<VideoDecoderWithBuffer<VideoDecoderWrapper>, JsValue>;
+pub struct VideoPeerDecoder {
+    jitter_buffer: Arc<Mutex<JitterBuffer>>,
+    _polling_interval: Interval,
+}
 
 impl VideoPeerDecoder {
     pub fn new(canvas_id: &str) -> Result<Self, JsValue> {
         let id = canvas_id.to_owned();
-        let error = Closure::wrap(Box::new(move |e: JsValue| {
-            error!("{:?}", e);
-        }) as Box<dyn FnMut(JsValue)>);
-        let output = Closure::wrap(Box::new(move |original_chunk: JsValue| {
-            let chunk = Box::new(original_chunk);
-            let video_chunk = chunk.unchecked_into::<VideoFrame>();
+
+        let on_decoded_frame = move |frame: DecodedFrame| {
+            // This closure is called from the WasmDecoder, which runs in a worker.
+            // It receives the decoded frame and renders it to the canvas.
             let render_canvas = window()
                 .unwrap()
                 .document()
@@ -92,64 +93,75 @@ impl VideoPeerDecoder {
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
 
-            // Get the video frame's dimensions from its settings
-            let width = video_chunk.display_width();
-            let height = video_chunk.display_height();
+            render_canvas.set_width(frame.width);
+            render_canvas.set_height(frame.height);
 
-            // Set canvas dimensions to match video frame
-            render_canvas.set_width(width);
-            render_canvas.set_height(height);
+            // TODO: Render the frame.data (which is likely YUV or similar) to the canvas.
+            // This will require a conversion from the raw format to something Canvas can draw,
+            // like an ImageData object. For now, we'll just clear the canvas.
+            ctx.clear_rect(0.0, 0.0, frame.width as f64, frame.height as f64);
+            log::info!("Rendered frame {}", frame.sequence_number);
+        };
 
-            // Clear the canvas and draw the frame
-            ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
-            if let Err(e) = ctx.draw_image_with_video_frame(&video_chunk, 0.0, 0.0) {
-                error!("Error drawing video frame: {:?}", e);
-            }
+        let decoder = Decoder::new(
+            VideoCodec::VP9, // Or whichever codec you are using
+            Box::new(on_decoded_frame),
+        );
 
-            video_chunk.close();
-        }) as Box<dyn FnMut(JsValue)>);
-        let decoder = VideoDecoderWithBuffer::new(&VideoDecoderInit::new(
-            error.as_ref().unchecked_ref(),
-            output.as_ref().unchecked_ref(),
-        ))
-        .unwrap();
-        decoder.configure(&VideoDecoderConfig::new(VIDEO_CODEC))?;
+        let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::new(Box::new(decoder))));
+
+        let jb_clone = jitter_buffer.clone();
+        // Poll the jitter buffer to check for frames that are ready for playout.
+        let polling_interval = Interval::new(20, move || {
+            let now = web_time::SystemTime::now()
+                .duration_since(web_time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let mut jb = jb_clone.lock().unwrap();
+            jb.find_and_move_continuous_frames(now);
+        });
+
         Ok(Self {
-            decoder,
-            waiting_for_keyframe: true,
-            decoded: false,
-            _error: error,
-            _output: output,
+            jitter_buffer,
+            _polling_interval: polling_interval,
         })
     }
 
-    fn get_chunk_type(&self, packet: &Arc<MediaPacket>) -> EncodedVideoChunkType {
-        EncodedVideoChunkTypeWrapper::from(packet.frame_type.as_str()).0
+    fn get_frame_type(&self, packet: &Arc<MediaPacket>) -> FrameType {
+        match packet.frame_type.as_str() {
+            "key" => FrameType::KeyFrame,
+            _ => FrameType::DeltaFrame,
+        }
+    }
+
+    pub fn is_waiting_for_keyframe(&self) -> bool {
+        self.jitter_buffer.lock().unwrap().is_waiting_for_keyframe()
     }
 }
 
 impl PeerDecode for VideoPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
-        let first_frame = !self.decoded;
-        let chunk_type = self.get_chunk_type(packet);
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
 
-        if !self.waiting_for_keyframe || chunk_type == EncodedVideoChunkType::Key {
-            match self.decoder.state() {
-                CodecState::Configured => {
-                    self.decoder.decode(packet.clone());
-                    self.waiting_for_keyframe = false;
-                    self.decoded = true;
-                }
-                CodecState::Closed => {
-                    return Err(anyhow::anyhow!("decoder closed"));
-                }
-                _ => {}
-            }
+        if let Some(video_metadata) = packet.video_metadata.as_ref() {
+            let video_frame = CodecVideoFrame {
+                sequence_number: video_metadata.sequence,
+                frame_type: self.get_frame_type(packet),
+                data: packet.data.clone(),
+            };
+
+            self.jitter_buffer
+                .lock()
+                .unwrap()
+                .insert_frame(video_frame, now);
         }
 
         Ok(DecodeStatus {
-            _rendered: true,
-            first_frame,
+            _rendered: true,    // This is now optimistic; rendering happens asynchronously.
+            first_frame: false, // We can't easily know this synchronously anymore.
         })
     }
 }

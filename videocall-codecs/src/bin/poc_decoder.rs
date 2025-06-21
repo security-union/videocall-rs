@@ -1,12 +1,6 @@
 use anyhow::Result;
 use image::{ImageBuffer, Rgb};
-use std::ffi::{c_int, CStr};
 use std::fs;
-use std::mem::MaybeUninit;
-use std::os::raw::c_char;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use videocall_codecs::decoder::{Decodable, DecodedFrame, Decoder, VideoCodec};
 use videocall_codecs::encoder::Vp9Encoder;
 use videocall_codecs::frame::{FrameType, VideoFrame};
@@ -14,8 +8,6 @@ use videocall_codecs::jitter_buffer::JitterBuffer;
 
 // Use the full vpx_sys crate
 use vpx_sys::*;
-
-const FPS: u64 = 30;
 
 // --- Main Simulation Logic ---
 

@@ -20,12 +20,11 @@ use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use std::ffi::c_void;
 use std::ptr;
-use std::slice;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use vpx_sys::{
     vpx_codec_ctx_t, vpx_codec_dec_init_ver, vpx_codec_decode, vpx_codec_destroy,
-    vpx_codec_get_frame, vpx_codec_vp9_dx, vpx_image_t, VPX_CODEC_OK, VPX_DECODER_ABI_VERSION,
+    vpx_codec_get_frame, vpx_codec_vp9_dx, VPX_CODEC_OK, VPX_DECODER_ABI_VERSION,
 };
 
 // --- Vp9Decoder implementation, now living inside the native module ---

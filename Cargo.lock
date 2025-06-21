@@ -411,6 +411,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d301b3b94cb4b2f23d7917810addbbaff90738e0ca2be692bd027e70d7e0330c"
 
 [[package]]
+name = "approx"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2762,6 +2771,24 @@ dependencies = [
 
 [[package]]
 name = "image"
+version = "0.24.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5690139d2f55868e080017335e4b94cb7414274c74f1669c84fb5feba2c9f69d"
+dependencies = [
+ "bytemuck",
+ "byteorder",
+ "color_quant",
+ "exr",
+ "gif",
+ "jpeg-decoder",
+ "num-traits",
+ "png",
+ "qoi",
+ "tiff",
+]
+
+[[package]]
+name = "image"
 version = "0.25.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db35664ce6b9810857a38a906215e75a9c879f0696556a39f59c62829710251a"
@@ -2949,6 +2976,9 @@ name = "jpeg-decoder"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5d4a7da358eff58addd2877a45865158f0d78c911d43a5784ceb7bbf52833b0"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "js-sys"
@@ -3432,7 +3462,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20c1bb65186718d348306bf1afdeb20d9ab45b2ab80fb793c0fdcf59ffbb4f38"
 dependencies = [
  "lazy_static",
- "rand 0.8.5",
+ "rand 0.9.0",
 ]
 
 [[package]]
@@ -6069,7 +6099,7 @@ dependencies = [
  "clap",
  "cpal",
  "env-libvpx-sys",
- "image",
+ "image 0.25.6",
  "opus",
  "protobuf",
  "quinn 0.10.2",
@@ -6113,11 +6143,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "videocall-codecs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "console_error_panic_hook",
+ "env-libvpx-sys",
+ "image 0.24.9",
+ "rand 0.8.5",
+ "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+ "web-sys",
+]
+
+[[package]]
 name = "videocall-nokhwa"
 version = "0.10.8"
 dependencies = [
  "flume",
- "image",
+ "image 0.25.6",
  "js-sys",
  "opencv",
  "parking_lot",
@@ -6176,7 +6223,7 @@ version = "0.1.6"
 dependencies = [
  "bytemuck",
  "bytes",
- "image",
+ "image 0.25.6",
  "mozjpeg",
  "opencv",
  "serde",

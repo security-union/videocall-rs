@@ -1,0 +1,59 @@
+[package]
+name = "videocall-codecs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "videocall_codecs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "worker"
+path = "src/bin/worker.rs"
+required-features = ["wasm"]
+
+[[bin]]
+name = "poc_decoder"
+path = "src/bin/poc_decoder.rs"
+
+[features]
+default = []
+wasm = [
+    "wasm-bindgen",
+    "web-sys",
+    "console_error_panic_hook",
+    "serde-wasm-bindgen"
+]
+
+[dependencies]
+rand = "0.8.5"
+serde = { version = "1.0", features = ["derive"] }
+wasm-bindgen = { version = "0.2.92", optional = true }
+console_error_panic_hook = { version = "0.1.7", optional = true }
+serde-wasm-bindgen = { version = "0.6.5", optional = true }
+env-libvpx-sys = { version = "5.1.3", features = ["generate"] }
+anyhow = "1.0"
+image = { version = "0.24", features = ["png", "jpeg"] }
+
+[dependencies.web-sys]
+version = "0.3.69"
+features = [
+  'Worker',
+  'Blob',
+  'Url',
+  'BlobPropertyBag',
+  'VideoDecoder',
+  'VideoDecoderConfig',
+  'VideoDecoderInit',
+  'EncodedVideoChunk',
+  'EncodedVideoChunkInit',
+  'VideoFrame',
+  'CodecState',
+  'console',
+]
+optional = true
+
+[dev-dependencies]
+approx = "0.5.1"
+wasm-bindgen-test = "0.3.42"
+

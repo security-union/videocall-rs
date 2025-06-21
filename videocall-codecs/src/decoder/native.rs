@@ -52,34 +52,6 @@ impl Vp9Decoder {
         }
         Ok(Self { context })
     }
-
-    /// Decodes a single frame, returning a vector of raw VPX images.
-    fn decode_vpx_frame(&mut self, frame_data: &[u8]) -> Result<Vec<*mut vpx_image_t>, String> {
-        let mut decoded_frames = Vec::new();
-        let ret = unsafe {
-            vpx_codec_decode(
-                &mut self.context,
-                frame_data.as_ptr(),
-                frame_data.len() as u32,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        if ret != VPX_CODEC_OK {
-            return Err(format!("Failed to decode frame: {:?}", ret));
-        }
-        let mut iter = ptr::null_mut::<c_void>();
-        loop {
-            let img = unsafe {
-                vpx_codec_get_frame(&mut self.context, &mut iter as *mut _ as *mut *const c_void)
-            };
-            if img.is_null() {
-                break;
-            }
-            decoded_frames.push(img);
-        }
-        Ok(decoded_frames)
-    }
 }
 
 impl Drop for Vp9Decoder {

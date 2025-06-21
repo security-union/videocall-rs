@@ -38,6 +38,7 @@ anyhow = { workspace = true }
 image = { version = "0.24", features = ["png", "jpeg"] }
 js-sys = { version = "0.3.69", optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
+log = "0.4.27"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env-libvpx-sys = { workspace = true }

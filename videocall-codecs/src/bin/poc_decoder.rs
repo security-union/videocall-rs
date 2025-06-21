@@ -141,7 +141,7 @@ fn main() -> Result<()> {
 
         for entry in sorted_paths {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "jpg") {
+            if path.extension().is_some_and(|e| e == "jpg") {
                 println!("[MAIN] Loading image: {:?}", path);
                 let img = image::open(&path)?.to_rgb8();
                 // Convert to I420 format for the encoder.

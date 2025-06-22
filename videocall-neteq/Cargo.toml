@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "videocall-neteq"
+version = "0.1.0"
+edition = "2021"
+description = "NetEQ-inspired adaptive jitter buffer for audio decoding"
+license = "MIT"
+
+[dependencies]
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+ringbuf = "0.3"
+hound = { version = "3.5", optional = true }
+
+[features]
+default = []
+audio_files = ["hound"]
+
+[dev-dependencies]
+env_logger = "0.10" 

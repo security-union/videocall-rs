@@ -7,14 +7,13 @@
         <link data-trunk rel="copy-dir" href="./assets" />
         <!-- TODO: Uncomment this when we have a way to pass features to the build -->
         <!-- <link data-trunk rel="rust" href="Cargo.toml" data-cargo-features="fake-peers" data-cargo-no-default-features /> -->
+
         <link data-trunk rel="css" href="./static/leptos-style.css" />
         <link data-trunk rel="css" href="./static/tailwind.css" />
         <link data-trunk rel="css" href="./static/style.css" />
         <link data-trunk rel="css" href="./static/global.css">
         <link data-trunk rel="copy-file" href="./scripts/encoderWorker.min.js" />
         <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
-        <!-- <link data-trunk rel="rust" data-bin="videocall-ui" /> -->
-        <!-- <link data-trunk rel="rust" data-bin="videocall_codecs_worker" data-type="worker" id="videocall_codecs_worker" data-cargo-package="videocall-codecs"  data-cargo-no-default-features data-cargo-features="wasm"/> -->
         <script>	
             if (!self.MediaStreamTrackProcessor) {	
             self.MediaStreamTrackProcessor = class MediaStreamTrackProcessor {

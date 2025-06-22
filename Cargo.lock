@@ -6312,7 +6312,6 @@ dependencies = [
  "console_log",
  "enum-display",
  "futures",
- "getrandom 0.2.15",
  "gloo-timers 0.2.6",
  "gloo-utils 0.1.7",
  "lazy_static",

@@ -41,10 +41,12 @@ pub struct DecodedFrame {
 /// A trait that abstracts over the platform-specific decoder implementation
 /// (e.g., `std::thread` on native, Web Workers + WebCodecs in WASM).
 pub trait Decodable: Send + Sync {
+    /// The type of frame passed to the callback when a frame is decoded.
+    type Frame;
+
     /// Creates a new decoder and starts its underlying thread or worker.
-    /// The `on_decoded_frame` callback will be invoked on the main thread
-    /// whenever a frame is successfully decoded.
-    fn new(codec: VideoCodec, on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>) -> Self
+    /// The `on_decoded_frame` callback will be invoked whenever a frame is successfully decoded.
+    fn new(codec: VideoCodec, on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>) -> Self
     where
         Self: Sized;
 

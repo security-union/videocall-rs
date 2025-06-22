@@ -54,11 +54,11 @@ pub struct JitterBuffer {
 
     // --- Decoder Interface ---
     /// The abstract decoder that will receive frames ready for decoding.
-    decoder: Box<dyn Decodable>,
+    decoder: Box<dyn Decodable<Frame = crate::decoder::DecodedFrame>>,
 }
 
 impl JitterBuffer {
-    pub fn new(decoder: Box<dyn Decodable>) -> Self {
+    pub fn new(decoder: Box<dyn Decodable<Frame = crate::decoder::DecodedFrame>>) -> Self {
         Self {
             buffered_frames: BTreeMap::new(),
             last_decoded_sequence_number: None,
@@ -295,6 +295,8 @@ mod tests {
     // This impl is for native targets
     #[cfg(not(target_arch = "wasm32"))]
     impl Decodable for MockDecoder {
+        /// The decoded frame type for mock decoder in tests.
+        type Frame = crate::decoder::DecodedFrame;
         fn new(
             _codec: crate::decoder::VideoCodec,
             _on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
@@ -315,6 +317,8 @@ mod tests {
     // This impl is for wasm targets
     #[cfg(target_arch = "wasm32")]
     impl Decodable for MockDecoder {
+        /// The decoded frame type for mock decoder in tests.
+        type Frame = crate::decoder::DecodedFrame;
         fn new(
             _codec: crate::decoder::VideoCodec,
             _on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
@@ -351,6 +355,7 @@ mod tests {
             sequence_number: seq,
             frame_type,
             data: vec![0; 10],
+            timestamp: 0.0,
         }
     }
 

@@ -17,6 +17,7 @@
 
 //! The entry point and main loop for the Web Worker.
 
+use console_error_panic_hook;
 use std::cell::RefCell;
 use videocall_codecs::{decoder::DecodedFrame, frame::FrameBuffer, frame::FrameType};
 use wasm_bindgen::prelude::*;
@@ -33,19 +34,34 @@ thread_local! {
     static DECODER: RefCell<Option<VideoDecoder>> = const { RefCell::new(None) };
 }
 
-#[wasm_bindgen]
+#[wasm_bindgen(start)]
 pub fn main() {
+    // Set up panic hook to get Rust panics in the console
+    console_error_panic_hook::set_once();
+    // Initialize Rust log to console logging
+    log::set_max_level(log::LevelFilter::Debug);
+    log::info!("Starting worker");
     let self_scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .unwrap();
 
+    // Global error handler
+    let on_global_error = Closure::wrap(Box::new(move |err: JsValue| {
+        console::error_1(&"[WORKER] Uncaught error:".into());
+        console::error_1(&err);
+    }) as Box<dyn FnMut(JsValue)>);
+    self_scope.set_onerror(Some(on_global_error.as_ref().unchecked_ref()));
+    on_global_error.forget();
+    let mut waiting_for_key = true;
+
     let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-        log::info!("Received message");
+        console::log_1(&"[WORKER] Received message".into());
         let frame: FrameBuffer = serde_wasm_bindgen::from_value(event.data()).unwrap();
 
         DECODER.with(|decoder_cell| {
             let mut decoder = decoder_cell.borrow_mut();
             if decoder.is_none() {
+                console::log_1(&"[WORKER] Initializing decoder".into());
                 let decoder_private =
                     initialize_decoder().expect("[WORKER] Failed to initialize decoder");
                 *decoder = Some(decoder_private);
@@ -57,15 +73,22 @@ pub fn main() {
                 FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
             };
 
-            let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
-            let init = EncodedVideoChunkInit::new(
-                &data.into(),
-                frame.frame.sequence_number as f64,
-                chunk_type,
-            );
+            if waiting_for_key && chunk_type == EncodedVideoChunkType::Key {
+                console::log_1(&"[WORKER] Found key frame".into());
+                waiting_for_key = false;
+            }
 
-            let chunk = EncodedVideoChunk::new(&init).unwrap();
-            log::info!("Decoding chunk");
+            if waiting_for_key {
+                console::log_1(&"[WORKER] Waiting for key frame".into());
+                return;
+            }
+
+            let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
+            let init = EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
+
+            let mut chunk = EncodedVideoChunk::new(&init).unwrap();
+            // chunk.set_duration(1);
+            console::log_1(&"[WORKER] Decoding chunk".into());
             if let Err(e) = decoder.decode(&chunk) {
                 log::info!("[WORKER] Decoder error: {:?}", e);
             }
@@ -84,34 +107,36 @@ fn initialize_decoder() -> anyhow::Result<VideoDecoder> {
 
     let on_output = Closure::wrap(Box::new(move |video_frame: JsValue| {
         let video_frame = video_frame.dyn_into::<VideoFrame>().unwrap();
-        let self_scope_clone = self_scope.clone();
+        // let self_scope_clone = self_scope.clone();
 
-        let future = async move {
-            let frame_data = copy_video_frame_data(&video_frame).await.unwrap();
-            let decoded_frame = DecodedFrame {
-                sequence_number: video_frame.timestamp().unwrap_or(0.0) as u64,
-                width: video_frame.coded_width(),
-                height: video_frame.coded_height(),
-                data: frame_data,
-            };
-            let js_decoded = serde_wasm_bindgen::to_value(&decoded_frame).unwrap();
-            self_scope_clone.post_message(&js_decoded).unwrap();
-        };
-        wasm_bindgen_futures::spawn_local(future);
+        // let future = async move {
+        //     let frame_data = copy_video_frame_data(&video_frame).await.unwrap();
+        //     let decoded_frame = DecodedFrame {
+        //         sequence_number: video_frame.timestamp().unwrap_or(0.0) as u64,
+        //         width: video_frame.coded_width(),
+        //         height: video_frame.coded_height(),
+        //         data: frame_data,
+        //     };
+        //     let js_decoded = serde_wasm_bindgen::to_value(&decoded_frame).unwrap();
+        //     console::log_1(&"[WORKER] Posting message".into());
+        //     self_scope_clone.post_message(&video_frame).unwrap();
+        // };
+        // wasm_bindgen_futures::spawn_local(future);
+        self_scope.post_message(&video_frame).unwrap();
     }) as Box<dyn FnMut(_)>);
 
     let on_error = Closure::wrap(Box::new(move |e: JsValue| {
-        console::error_1(&"[WORKER] Decoder error:".into());
+        console::error_1(&"[WORKER] on error Decoder error:".into());
         console::error_1(&e);
     }) as Box<dyn FnMut(_)>);
 
     let init = VideoDecoderInit::new(
-        on_output.as_ref().unchecked_ref(),
         on_error.as_ref().unchecked_ref(),
+        on_output.as_ref().unchecked_ref(),
     );
 
     let decoder = VideoDecoder::new(&init).unwrap();
-    let config = VideoDecoderConfig::new("vp9");
+    let config = VideoDecoderConfig::new("vp09.00.10.08");
     if let Err(e) = decoder.configure(&config) {
         return Err(anyhow::anyhow!(
             "[WORKER] Failed to configure decoder: {:?}",

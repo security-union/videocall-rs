@@ -8,8 +8,8 @@ name = "videocall_codecs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "worker"
-path = "src/bin/worker.rs"
+name = "worker_decoder"
+path = "src/bin/worker_decoder.rs"
 required-features = ["wasm"]
 
 [[bin]]

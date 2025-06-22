@@ -208,9 +208,12 @@ pub struct NativeDecoder {
 }
 
 impl Decodable for NativeDecoder {
+    /// The decoded frame type for native decoding.
+    type Frame = DecodedFrame;
+
     fn new(
         codec: crate::decoder::VideoCodec,
-        on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
+        on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
 

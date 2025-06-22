@@ -77,9 +77,10 @@ impl VideoPeerDecoder {
     pub fn new(canvas_id: &str) -> Result<Self, JsValue> {
         let id = canvas_id.to_owned();
 
-        let on_decoded_frame = move |frame: DecodedFrame| {
+        let on_decoded_frame = move |video_chunk: web_sys::VideoFrame| {
             // This closure is called from the WasmDecoder, which runs in a worker.
             // It receives the decoded frame and renders it to the canvas.
+            log::info!("[MAIN] Received message");
             let render_canvas = window()
                 .unwrap()
                 .document()
@@ -93,14 +94,21 @@ impl VideoPeerDecoder {
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
 
-            render_canvas.set_width(frame.width);
-            render_canvas.set_height(frame.height);
+            // Get the video frame's dimensions from its settings
+            let width = video_chunk.display_width();
+            let height = video_chunk.display_height();
 
-            // TODO: Render the frame.data (which is likely YUV or similar) to the canvas.
-            // This will require a conversion from the raw format to something Canvas can draw,
-            // like an ImageData object. For now, we'll just clear the canvas.
-            ctx.clear_rect(0.0, 0.0, frame.width as f64, frame.height as f64);
-            log::info!("Rendered frame {}", frame.sequence_number);
+            // Set canvas dimensions to match video frame
+            render_canvas.set_width(width);
+            render_canvas.set_height(height);
+
+            // Clear the canvas and draw the frame
+            ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
+            if let Err(e) = ctx.draw_image_with_video_frame(&video_chunk, 0.0, 0.0) {
+                error!("Error drawing video frame: {:?}", e);
+            }
+
+            video_chunk.close();
         };
 
         let decoder = Decoder::new(
@@ -149,6 +157,7 @@ impl PeerDecode for VideoPeerDecoder {
         if let Some(video_metadata) = packet.video_metadata.as_ref() {
             let video_frame = CodecVideoFrame {
                 sequence_number: video_metadata.sequence,
+                timestamp: packet.timestamp,
                 frame_type: self.get_frame_type(packet),
                 data: packet.data.clone(),
             };

@@ -37,6 +37,8 @@ pub struct VideoFrame {
     pub frame_type: FrameType,
     /// The encoded video data.
     pub data: Vec<u8>,
+    /// The timestamp of the frame.
+    pub timestamp: f64,
 }
 
 /// A wrapper for a `VideoFrame` that includes metadata used by the jitter buffer.

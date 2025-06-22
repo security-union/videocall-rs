@@ -16,17 +16,17 @@
         <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
         <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
         <link
-          data-trunk
-          rel="rust"
-          href="../videocall-codecs/Cargo.toml"
-          data-trunk-bin="worker"
-          data-cargo-no-default-features
-          data-cargo-features="wasm"
-          data-bin="worker"
-          data-type="worker"
-        />
+            data-trunk
+            rel="rust"
+            href="../videocall-codecs/Cargo.toml"
+            data-bin="worker_decoder"
+            data-type="worker"
+            data-cargo-features="wasm"
+            data-cargo-no-default-features
+            data-loader-shim
+        /> 
         <!-- Runtime link so the wasm decoder can find the built worker URL -->
-        <link id="codecs-worker" href="/worker.js" />
+        <link id="codecs-worker" href="/worker_decoder_loader.js" />
         <!-- Load wasm worker scripts from the videocall-codecs crate -->
         <script>	
             if (!self.MediaStreamTrackProcessor) {	

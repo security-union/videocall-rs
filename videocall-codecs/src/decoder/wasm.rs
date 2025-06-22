@@ -16,11 +16,11 @@
 
 //! The WASM decoder implementation using a Web Worker and WebCodecs.
 
-use super::{Decodable, DecodedFrame};
+use super::Decodable;
 use crate::frame::FrameBuffer;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{console, Worker};
+use web_sys::{console, VideoFrame, Worker};
 
 unsafe impl Send for WasmDecoder {}
 unsafe impl Sync for WasmDecoder {}
@@ -33,9 +33,12 @@ pub struct WasmDecoder {
 }
 
 impl Decodable for WasmDecoder {
+    /// The decoded frame type for WASM decoding (a JS VideoFrame).
+    type Frame = VideoFrame;
+
     fn new(
         _codec: crate::decoder::VideoCodec,
-        on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
+        on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>,
     ) -> Self {
         log::info!("Creating WASM decoder");
         // Find the worker script URL from the link tag added by Trunk.
@@ -53,12 +56,11 @@ impl Decodable for WasmDecoder {
 
         // Create a closure to handle messages from the worker.
         let on_message_closure = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-            match serde_wasm_bindgen::from_value::<DecodedFrame>(event.data()) {
-                Ok(frame) => on_decoded_frame(frame),
-                Err(e) => {
-                    console::error_1(&format!("[MAIN] Error deserializing frame: {:?}", e).into())
-                }
-            }
+            log::info!("[MAIN] Received message");
+            // event.data() is a transferred VideoFrame
+            let js_val = event.data();
+            let video_frame: VideoFrame = js_val.dyn_into().expect("Expected VideoFrame");
+            on_decoded_frame(video_frame);
         }) as Box<dyn FnMut(_)>);
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));

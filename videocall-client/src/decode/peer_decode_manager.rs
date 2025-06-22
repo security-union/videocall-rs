@@ -191,9 +191,21 @@ impl Peer {
             MediaType::HEARTBEAT => {
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
+                    // Check if video is being turned off (on -> off transition)
+                    let video_turned_off = self.video_enabled && !metadata.video_enabled;
+
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
+
+                    // Flush video decoder when video is turned off
+                    if video_turned_off {
+                        self.video.flush();
+                        debug!(
+                            "Flushed video decoder for peer {} (video turned off)",
+                            self.email
+                        );
+                    }
                 }
                 Ok((
                     media_type,

@@ -113,6 +113,10 @@ impl VideoPeerDecoder {
     pub fn is_waiting_for_keyframe(&self) -> bool {
         self.jitter_buffer.lock().unwrap().is_waiting_for_keyframe()
     }
+
+    pub fn flush(&self) {
+        self.jitter_buffer.lock().unwrap().flush();
+    }
 }
 
 impl PeerDecode for VideoPeerDecoder {

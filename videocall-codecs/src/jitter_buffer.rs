@@ -276,7 +276,7 @@ impl<T> JitterBuffer<T> {
     }
 
     /// Removes all frames from the buffer. Used when a keyframe arrives and the buffer is full.
-    fn drop_all_frames(&mut self) {
+    pub fn drop_all_frames(&mut self) {
         let num_dropped = self.buffered_frames.len() as u64;
         self.buffered_frames.clear();
         self.dropped_frames_count += num_dropped;
@@ -284,7 +284,7 @@ impl<T> JitterBuffer<T> {
     }
 
     /// Flushes the jitter buffer, resetting its state completely.
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         self.drop_all_frames();
         self.last_decoded_sequence_number = None;
         self.num_consecutive_old_frames = 0;

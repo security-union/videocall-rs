@@ -1,3 +1,6 @@
+// Add conditional compilation for WebAssembly
+#![cfg(target_arch = "wasm32")]
+
 // This submodule defines two pub types:
 //
 //      AudioPeerDecoder
@@ -19,8 +22,8 @@ use gloo_timers::callback::Interval;
 use log::error;
 use std::sync::Arc;
 use std::sync::Mutex;
-use videocall_codecs::decoder::{Decodable, DecodedFrame, Decoder, VideoCodec};
-use videocall_codecs::frame::{FrameType, VideoFrame as CodecVideoFrame};
+use videocall_codecs::decoder::{Decodable, Decoder, VideoCodec};
+use videocall_codecs::frame::{FrameBuffer, FrameType, VideoFrame as CodecVideoFrame};
 use videocall_codecs::jitter_buffer::JitterBuffer;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
@@ -39,24 +42,6 @@ pub struct DecodeStatus {
     pub first_frame: bool,
 }
 
-//
-// Generic type for decoders captures common functionality.
-//
-#[derive(Debug)]
-pub struct PeerDecoder<WebDecoder, Chunk> {
-    pub decoder: WebDecoder,
-    waiting_for_keyframe: bool,
-    decoded: bool,
-    _error: Closure<dyn FnMut(JsValue)>, // member exists to keep the closure in scope for the life of the struct
-    _output: Closure<dyn FnMut(Chunk)>, // member exists to keep the closure in scope for the life of the struct
-}
-
-impl<WebDecoder, ChunkType> PeerDecoder<WebDecoder, ChunkType> {
-    pub fn is_waiting_for_keyframe(&self) -> bool {
-        self.waiting_for_keyframe
-    }
-}
-
 pub trait PeerDecode {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
 }
@@ -69,7 +54,7 @@ pub trait PeerDecode {
 /// data.
 ///
 pub struct VideoPeerDecoder {
-    jitter_buffer: Arc<Mutex<JitterBuffer>>,
+    jitter_buffer: Arc<Mutex<JitterBuffer<web_sys::VideoFrame>>>,
     _polling_interval: Interval,
 }
 
@@ -78,9 +63,6 @@ impl VideoPeerDecoder {
         let id = canvas_id.to_owned();
 
         let on_decoded_frame = move |video_chunk: web_sys::VideoFrame| {
-            // This closure is called from the WasmDecoder, which runs in a worker.
-            // It receives the decoded frame and renders it to the canvas.
-            log::info!("[MAIN] Received message");
             let render_canvas = window()
                 .unwrap()
                 .document()
@@ -93,33 +75,20 @@ impl VideoPeerDecoder {
                 .unwrap()
                 .unwrap()
                 .unchecked_into::<CanvasRenderingContext2d>();
-
-            // Get the video frame's dimensions from its settings
             let width = video_chunk.display_width();
             let height = video_chunk.display_height();
-
-            // Set canvas dimensions to match video frame
             render_canvas.set_width(width);
             render_canvas.set_height(height);
-
-            // Clear the canvas and draw the frame
             ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
             if let Err(e) = ctx.draw_image_with_video_frame(&video_chunk, 0.0, 0.0) {
                 error!("Error drawing video frame: {:?}", e);
             }
-
             video_chunk.close();
         };
 
-        let decoder = Decoder::new(
-            VideoCodec::VP9, // Or whichever codec you are using
-            Box::new(on_decoded_frame),
-        );
-
+        let decoder = Decoder::new(VideoCodec::VP9, Box::new(on_decoded_frame));
         let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::new(Box::new(decoder))));
-
         let jb_clone = jitter_buffer.clone();
-        // Poll the jitter buffer to check for frames that are ready for playout.
         let polling_interval = Interval::new(20, move || {
             let now = web_time::SystemTime::now()
                 .duration_since(web_time::SystemTime::UNIX_EPOCH)
@@ -128,7 +97,6 @@ impl VideoPeerDecoder {
             let mut jb = jb_clone.lock().unwrap();
             jb.find_and_move_continuous_frames(now);
         });
-
         Ok(Self {
             jitter_buffer,
             _polling_interval: polling_interval,
@@ -161,16 +129,13 @@ impl PeerDecode for VideoPeerDecoder {
                 frame_type: self.get_frame_type(packet),
                 data: packet.data.clone(),
             };
-
-            self.jitter_buffer
-                .lock()
-                .unwrap()
-                .insert_frame(video_frame, now);
+            let mut jb = self.jitter_buffer.lock().unwrap();
+            jb.insert_frame(video_frame, now);
         }
 
         Ok(DecodeStatus {
-            _rendered: true,    // This is now optimistic; rendering happens asynchronously.
-            first_frame: false, // We can't easily know this synchronously anymore.
+            _rendered: true,
+            first_frame: false,
         })
     }
 }

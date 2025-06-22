@@ -56,8 +56,6 @@ impl Decodable for WasmDecoder {
 
         // Create a closure to handle messages from the worker.
         let on_message_closure = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-            log::info!("[MAIN] Received message");
-            // event.data() is a transferred VideoFrame
             let js_val = event.data();
             let video_frame: VideoFrame = js_val.dyn_into().expect("Expected VideoFrame");
             on_decoded_frame(video_frame);

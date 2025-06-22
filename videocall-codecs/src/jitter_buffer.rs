@@ -35,7 +35,7 @@ const DELAY_SMOOTHING_FACTOR: f64 = 0.99;
 /// The maximum number of frames the buffer will hold before rejecting new ones.
 const MAX_BUFFER_SIZE: usize = 200;
 
-pub struct JitterBuffer {
+pub struct JitterBuffer<T> {
     /// Frames that have been received but are not yet continuous with the last decoded frame.
     /// A BTreeMap is used to keep them sorted by sequence number automatically.
     buffered_frames: BTreeMap<u64, FrameBuffer>,
@@ -54,11 +54,11 @@ pub struct JitterBuffer {
 
     // --- Decoder Interface ---
     /// The abstract decoder that will receive frames ready for decoding.
-    decoder: Box<dyn Decodable<Frame = crate::decoder::DecodedFrame>>,
+    decoder: Box<dyn Decodable<Frame = T>>,
 }
 
-impl JitterBuffer {
-    pub fn new(decoder: Box<dyn Decodable<Frame = crate::decoder::DecodedFrame>>) -> Self {
+impl<T> JitterBuffer<T> {
+    pub fn new(decoder: Box<dyn Decodable<Frame = T>>) -> Self {
         Self {
             buffered_frames: BTreeMap::new(),
             last_decoded_sequence_number: None,
@@ -343,7 +343,10 @@ mod tests {
     }
 
     /// A helper to create a JitterBuffer with a mock decoder for testing.
-    fn create_test_jitter_buffer() -> (JitterBuffer, Arc<Mutex<Vec<DecodedFrame>>>) {
+    fn create_test_jitter_buffer() -> (
+        JitterBuffer<crate::decoder::DecodedFrame>,
+        Arc<Mutex<Vec<DecodedFrame>>>,
+    ) {
         let decoded_frames = Arc::new(Mutex::new(Vec::new()));
         let mock_decoder = Box::new(MockDecoder::new_with_vec(decoded_frames.clone()));
         let jitter_buffer = JitterBuffer::new(mock_decoder);

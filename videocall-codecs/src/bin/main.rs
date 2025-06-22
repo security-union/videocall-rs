@@ -37,7 +37,9 @@ fn main() {
 
     // The simulation now requests the lightweight Mock codec.
     let decoder = Decoder::new(VideoCodec::Mock, Box::new(on_decoded_frame));
-    let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::new(Box::new(decoder))));
+    let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::<
+        videocall_codecs::decoder::DecodedFrame,
+    >::new(Box::new(decoder))));
 
     // --- Network Simulation Loop ---
     let network_thread = std::thread::spawn(move || {

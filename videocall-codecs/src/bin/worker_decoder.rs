@@ -55,7 +55,6 @@ pub fn main() {
     let mut waiting_for_key = true;
 
     let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-        console::log_1(&"[WORKER] Received message".into());
         let frame: FrameBuffer = serde_wasm_bindgen::from_value(event.data()).unwrap();
 
         DECODER.with(|decoder_cell| {
@@ -74,7 +73,6 @@ pub fn main() {
             };
 
             if waiting_for_key && chunk_type == EncodedVideoChunkType::Key {
-                console::log_1(&"[WORKER] Found key frame".into());
                 waiting_for_key = false;
             }
 
@@ -86,9 +84,8 @@ pub fn main() {
             let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
             let init = EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
 
-            let mut chunk = EncodedVideoChunk::new(&init).unwrap();
+            let chunk = EncodedVideoChunk::new(&init).unwrap();
             // chunk.set_duration(1);
-            console::log_1(&"[WORKER] Decoding chunk".into());
             if let Err(e) = decoder.decode(&chunk) {
                 log::info!("[WORKER] Decoder error: {:?}", e);
             }
@@ -107,22 +104,8 @@ fn initialize_decoder() -> anyhow::Result<VideoDecoder> {
 
     let on_output = Closure::wrap(Box::new(move |video_frame: JsValue| {
         let video_frame = video_frame.dyn_into::<VideoFrame>().unwrap();
-        // let self_scope_clone = self_scope.clone();
-
-        // let future = async move {
-        //     let frame_data = copy_video_frame_data(&video_frame).await.unwrap();
-        //     let decoded_frame = DecodedFrame {
-        //         sequence_number: video_frame.timestamp().unwrap_or(0.0) as u64,
-        //         width: video_frame.coded_width(),
-        //         height: video_frame.coded_height(),
-        //         data: frame_data,
-        //     };
-        //     let js_decoded = serde_wasm_bindgen::to_value(&decoded_frame).unwrap();
-        //     console::log_1(&"[WORKER] Posting message".into());
-        //     self_scope_clone.post_message(&video_frame).unwrap();
-        // };
-        // wasm_bindgen_futures::spawn_local(future);
         self_scope.post_message(&video_frame).unwrap();
+        video_frame.close();
     }) as Box<dyn FnMut(_)>);
 
     let on_error = Closure::wrap(Box::new(move |e: JsValue| {

@@ -129,7 +129,8 @@ fn main() -> Result<()> {
         }
     };
     let decoder = Decoder::new(VideoCodec::VP9, Box::new(on_decoded_frame));
-    let mut jitter_buffer = JitterBuffer::new(Box::new(decoder));
+    let mut jitter_buffer =
+        JitterBuffer::<videocall_codecs::decoder::DecodedFrame>::new(Box::new(decoder));
 
     // 2. Load real image frames from disk
     println!("Loading YUV frames from disk...");

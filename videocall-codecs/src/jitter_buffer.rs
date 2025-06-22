@@ -34,6 +34,8 @@ const DELAY_SMOOTHING_FACTOR: f64 = 0.99;
 
 /// The maximum number of frames the buffer will hold before rejecting new ones.
 const MAX_BUFFER_SIZE: usize = 200;
+// From libwebrtc's jitter_buffer_common.h
+const MAX_CONSECUTIVE_OLD_FRAMES: u64 = 300;
 
 pub struct JitterBuffer<T> {
     /// Frames that have been received but are not yet continuous with the last decoded frame.
@@ -52,6 +54,9 @@ pub struct JitterBuffer<T> {
     /// A counter for frames that were dropped due to being stale.
     dropped_frames_count: u64,
 
+    /// A counter for consecutive old frames to detect stream corruption.
+    num_consecutive_old_frames: u64,
+
     // --- Decoder Interface ---
     /// The abstract decoder that will receive frames ready for decoding.
     decoder: Box<dyn Decodable<Frame = T>>,
@@ -65,6 +70,7 @@ impl<T> JitterBuffer<T> {
             jitter_estimator: JitterEstimator::new(),
             target_playout_delay_ms: MIN_PLAYOUT_DELAY_MS,
             dropped_frames_count: 0,
+            num_consecutive_old_frames: 0,
             decoder,
         }
     }
@@ -78,9 +84,20 @@ impl<T> JitterBuffer<T> {
         if let Some(last_decoded) = self.last_decoded_sequence_number {
             if seq <= last_decoded {
                 println!("[JITTER_BUFFER] Ignoring old frame: {}", seq);
+                self.num_consecutive_old_frames += 1;
+                if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
+                    println!(
+                        "[JITTER_BUFFER] Received {} consecutive old frames. Flushing buffer.",
+                        self.num_consecutive_old_frames
+                    );
+                    self.flush();
+                }
                 return;
             }
         }
+
+        // If we received a valid frame, reset the counter.
+        self.num_consecutive_old_frames = 0;
 
         // 2. Check if the buffer is full.
         if self.buffered_frames.len() >= MAX_BUFFER_SIZE {
@@ -264,6 +281,15 @@ impl<T> JitterBuffer<T> {
         self.buffered_frames.clear();
         self.dropped_frames_count += num_dropped;
         println!("[JITTER_BUFFER] Dropped all {} frames.", num_dropped);
+    }
+
+    /// Flushes the jitter buffer, resetting its state completely.
+    fn flush(&mut self) {
+        self.drop_all_frames();
+        self.last_decoded_sequence_number = None;
+        self.num_consecutive_old_frames = 0;
+        // Consider resetting jitter estimator as well if needed
+        self.jitter_estimator = JitterEstimator::new();
     }
 
     pub fn get_jitter_estimate_ms(&self) -> f64 {
@@ -657,5 +683,83 @@ mod tests {
             0,
             "No frames should have been dropped"
         );
+    }
+
+    #[test]
+    fn sequence_starting_at_high_number() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+        let start_seq = 10000;
+
+        // Insert frames starting from a high sequence number
+        jb.insert_frame(create_test_frame(start_seq, FrameType::KeyFrame), time);
+        jb.insert_frame(
+            create_test_frame(start_seq + 2, FrameType::DeltaFrame),
+            time,
+        );
+        jb.insert_frame(
+            create_test_frame(start_seq + 1, FrameType::DeltaFrame),
+            time,
+        );
+
+        // Advance time enough for all frames to pass the playout delay.
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].sequence_number, start_seq);
+        assert_eq!(queue[1].sequence_number, start_seq + 1);
+        assert_eq!(queue[2].sequence_number, start_seq + 2);
+    }
+
+    #[test]
+    fn flush_on_too_many_consecutive_old_frames() {
+        let (mut jb, decoded_frames) = create_test_jitter_buffer();
+        let mut time = 1000;
+
+        // Decode sequence 1 and 2
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), time);
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), time);
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        assert_eq!(jb.last_decoded_sequence_number, Some(2));
+        assert_eq!(jb.buffered_frames.len(), 0);
+
+        // Insert a frame into the buffer that won't be decoded
+        jb.insert_frame(create_test_frame(4, FrameType::DeltaFrame), time);
+        assert_eq!(jb.buffered_frames.len(), 1);
+
+        // Send a stream of old packets
+        for _ in 0..=MAX_CONSECUTIVE_OLD_FRAMES {
+            // Send old frame with sequence number 1
+            jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), time);
+        }
+
+        // The buffer should now be flushed
+        assert_eq!(
+            jb.last_decoded_sequence_number, None,
+            "Last decoded sequence number should be reset"
+        );
+        assert_eq!(
+            jb.buffered_frames.len(),
+            0,
+            "Buffer should be empty after flush"
+        );
+        assert_eq!(
+            jb.num_consecutive_old_frames, 0,
+            "Consecutive old frames counter should be reset"
+        );
+
+        // It should now be waiting for a keyframe again
+        assert!(jb.is_waiting_for_keyframe());
+
+        // Verify that even if we send another delta frame, it doesn't get decoded
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), time);
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        assert!(decoded_frames.lock().unwrap().len() <= 2); // Should not have increased
     }
 }

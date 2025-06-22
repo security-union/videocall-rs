@@ -32,6 +32,7 @@ use web_sys::{
 // This is a common pattern for managing state in a WASM worker.
 thread_local! {
     static DECODER: RefCell<Option<VideoDecoder>> = const { RefCell::new(None) };
+    static WAITING_FOR_KEY: RefCell<bool> = const { RefCell::new(true) };
 }
 
 #[wasm_bindgen(start)]
@@ -52,43 +53,48 @@ pub fn main() {
     }) as Box<dyn FnMut(JsValue)>);
     self_scope.set_onerror(Some(on_global_error.as_ref().unchecked_ref()));
     on_global_error.forget();
-    let mut waiting_for_key = true;
 
     let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
         let frame: FrameBuffer = serde_wasm_bindgen::from_value(event.data()).unwrap();
 
-        DECODER.with(|decoder_cell| {
-            let mut decoder = decoder_cell.borrow_mut();
-            if decoder.is_none() {
-                console::log_1(&"[WORKER] Initializing decoder".into());
-                let decoder_private =
-                    initialize_decoder().expect("[WORKER] Failed to initialize decoder");
-                *decoder = Some(decoder_private);
-            }
-            let decoder = decoder.as_ref().unwrap();
+        WAITING_FOR_KEY.with(|waiting_cell| {
+            let mut waiting_for_key = waiting_cell.borrow_mut();
 
-            let chunk_type = match frame.frame.frame_type {
-                FrameType::KeyFrame => EncodedVideoChunkType::Key,
-                FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
-            };
+            DECODER.with(|decoder_cell| {
+                let mut decoder_opt = decoder_cell.borrow_mut();
+                if decoder_opt.is_none() {
+                    console::log_1(&"[WORKER] Initializing decoder".into());
+                    let decoder_private =
+                        initialize_decoder().expect("[WORKER] Failed to initialize decoder");
+                    *decoder_opt = Some(decoder_private);
+                }
+                let decoder = decoder_opt.as_ref().unwrap();
 
-            if waiting_for_key && chunk_type == EncodedVideoChunkType::Key {
-                waiting_for_key = false;
-            }
+                let chunk_type = match frame.frame.frame_type {
+                    FrameType::KeyFrame => EncodedVideoChunkType::Key,
+                    FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
+                };
 
-            if waiting_for_key {
-                console::log_1(&"[WORKER] Waiting for key frame".into());
-                return;
-            }
+                if *waiting_for_key {
+                    if chunk_type == EncodedVideoChunkType::Key {
+                        *waiting_for_key = false;
+                    } else {
+                        console::log_1(&"[WORKER] Waiting for key frame, dropping delta.".into());
+                        return;
+                    }
+                }
 
-            let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
-            let init = EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
+                let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
+                let init =
+                    EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
 
-            let chunk = EncodedVideoChunk::new(&init).unwrap();
-            // chunk.set_duration(1);
-            if let Err(e) = decoder.decode(&chunk) {
-                log::info!("[WORKER] Decoder error: {:?}", e);
-            }
+                let chunk = EncodedVideoChunk::new(&init).unwrap();
+                if let Err(e) = decoder.decode(&chunk) {
+                    log::info!("[WORKER] Decoder error: {:?}. Resetting.", e);
+                    *decoder_opt = None;
+                    *waiting_for_key = true;
+                }
+            });
         });
     }) as Box<dyn FnMut(_)>);
 
@@ -111,6 +117,12 @@ fn initialize_decoder() -> anyhow::Result<VideoDecoder> {
     let on_error = Closure::wrap(Box::new(move |e: JsValue| {
         console::error_1(&"[WORKER] on error Decoder error:".into());
         console::error_1(&e);
+        DECODER.with(|decoder_cell| {
+            *decoder_cell.borrow_mut() = None;
+        });
+        WAITING_FOR_KEY.with(|waiting_cell| {
+            *waiting_cell.borrow_mut() = true;
+        });
     }) as Box<dyn FnMut(_)>);
 
     let init = VideoDecoderInit::new(

@@ -72,10 +72,10 @@ impl JitterEstimator {
 
             // J(i) = J(i-1) + (|D(i-1, i)| - J(i-1))/16
             self.jitter += (transit_diff.abs() - self.jitter) / 16.0;
-        }
 
-        self.last_arrival_time_ms = arrival_time_ms;
-        self.last_sequence_number = sequence_number;
+            self.last_arrival_time_ms = arrival_time_ms;
+            self.last_sequence_number = sequence_number;
+        }
     }
 
     /// Returns the current jitter estimate in milliseconds.

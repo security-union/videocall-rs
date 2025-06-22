@@ -15,9 +15,16 @@ required-features = ["wasm"]
 [[bin]]
 name = "poc_decoder"
 path = "src/bin/poc_decoder.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "main"
+path = "src/bin/main.rs"
+required-features = ["native"]
 
 [features]
-default = []
+default = ["native"]
+native = []
 wasm = [
     "wasm-bindgen",
     "web-sys",
@@ -30,7 +37,7 @@ wasm = [
 [dependencies]
 rand = "0.8.5"
 serde = { version = "1.0", features = ["derive"] }
-wasm-bindgen = { version = "0.2.92", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
 console_error_panic_hook = { version = "0.1.7", optional = true }
 serde-wasm-bindgen = { version = "0.6.5", optional = true }
 env-libvpx-sys = { workspace = true, optional = true }

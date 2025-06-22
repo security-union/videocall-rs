@@ -1,3 +1,4 @@
+#![no_main]
 /*
  * Copyright 2025 Security Union LLC
  *
@@ -130,7 +131,7 @@ async fn copy_video_frame_data(video_frame: &VideoFrame) -> Result<Vec<u8>, JsVa
     Ok(buffer)
 }
 
-pub fn buffer_to_uint8array(buf: &mut [u8]) -> Uint8Array {
+pub fn buffer_to_uint8array(buf: &mut [u8]) -> js_sys::Uint8Array {
     // Convert &mut [u8] to a Uint8Array
-    unsafe { Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len()) }
+    unsafe { js_sys::Uint8Array::view_mut_raw(buf.as_mut_ptr(), buf.len()) }
 }

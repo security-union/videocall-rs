@@ -22,6 +22,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{console, Worker};
 
+unsafe impl Send for WasmDecoder {}
+unsafe impl Sync for WasmDecoder {}
+
 pub struct WasmDecoder {
     worker: Worker,
     // The closure that handles messages from the worker.
@@ -32,7 +35,7 @@ pub struct WasmDecoder {
 impl Decodable for WasmDecoder {
     fn new(
         _codec: crate::decoder::VideoCodec,
-        on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
+        on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
     ) -> Self {
         // Find the worker script URL from the link tag added by Trunk.
         let worker_url = web_sys::window()

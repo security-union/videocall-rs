@@ -17,7 +17,6 @@
 
 //! The entry point and main loop for the Web Worker.
 
-use js_sys::Uint8Array;
 use std::cell::RefCell;
 use videocall_codecs::{decoder::DecodedFrame, frame::FrameBuffer, frame::FrameType};
 use wasm_bindgen::prelude::*;
@@ -41,6 +40,7 @@ pub fn main() {
         .unwrap();
 
     let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
+        log::info!("Received message");
         let frame: FrameBuffer = serde_wasm_bindgen::from_value(event.data()).unwrap();
 
         DECODER.with(|decoder_cell| {
@@ -65,6 +65,7 @@ pub fn main() {
             );
 
             let chunk = EncodedVideoChunk::new(&init).unwrap();
+            log::info!("Decoding chunk");
             if let Err(e) = decoder.decode(&chunk) {
                 log::info!("[WORKER] Decoder error: {:?}", e);
             }
@@ -76,6 +77,7 @@ pub fn main() {
 }
 
 fn initialize_decoder() -> anyhow::Result<VideoDecoder> {
+    log::info!("Initializing decoder");
     let self_scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .unwrap();

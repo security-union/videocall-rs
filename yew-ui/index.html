@@ -7,13 +7,27 @@
         <link data-trunk rel="copy-dir" href="./assets" />
         <!-- TODO: Uncomment this when we have a way to pass features to the build -->
         <!-- <link data-trunk rel="rust" href="Cargo.toml" data-cargo-features="fake-peers" data-cargo-no-default-features /> -->
-
+        <link data-trunk rel="rust" href="Cargo.toml"/> 
         <link data-trunk rel="css" href="./static/leptos-style.css" />
         <link data-trunk rel="css" href="./static/tailwind.css" />
         <link data-trunk rel="css" href="./static/style.css" />
         <link data-trunk rel="css" href="./static/global.css">
         <link data-trunk rel="copy-file" href="./scripts/encoderWorker.min.js" />
         <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
+        <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
+        <link
+          data-trunk
+          rel="rust"
+          href="../videocall-codecs/Cargo.toml"
+          data-trunk-bin="worker"
+          data-cargo-no-default-features
+          data-cargo-features="wasm"
+          data-bin="worker"
+          data-type="worker"
+        />
+        <!-- Runtime link so the wasm decoder can find the built worker URL -->
+        <link id="codecs-worker" href="/worker.js" />
+        <!-- Load wasm worker scripts from the videocall-codecs crate -->
         <script>	
             if (!self.MediaStreamTrackProcessor) {	
             self.MediaStreamTrackProcessor = class MediaStreamTrackProcessor {

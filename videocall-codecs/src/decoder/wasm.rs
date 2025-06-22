@@ -37,6 +37,7 @@ impl Decodable for WasmDecoder {
         _codec: crate::decoder::VideoCodec,
         on_decoded_frame: Box<dyn Fn(DecodedFrame) + Send + Sync>,
     ) -> Self {
+        log::info!("Creating WASM decoder");
         // Find the worker script URL from the link tag added by Trunk.
         let worker_url = web_sys::window()
             .expect("no window")
@@ -69,14 +70,16 @@ impl Decodable for WasmDecoder {
     }
 
     fn decode(&self, frame: FrameBuffer) {
+        // log::info!("Decoding frame");
         match serde_wasm_bindgen::to_value(&frame) {
             Ok(js_frame) => {
+                // log::info!("Posting message to worker");
                 if let Err(e) = self.worker.post_message(&js_frame) {
-                    console::error_1(&format!("Error posting message to worker: {:?}", e).into());
+                    log::error!("Error posting message to worker: {:?}", e);
                 }
             }
             Err(e) => {
-                console::error_1(&format!("Error serializing frame: {:?}", e).into());
+                log::error!("Error serializing frame: {:?}", e);
             }
         }
     }

@@ -16,9 +16,6 @@
  * conditions.
  */
 
-// Add conditional compilation for WebAssembly
-#![cfg(target_arch = "wasm32")]
-
 // This submodule defines two pub types:
 //
 //      AudioPeerDecoder
@@ -41,7 +38,7 @@ use log::error;
 use std::sync::Arc;
 use std::sync::Mutex;
 use videocall_codecs::decoder::{Decodable, Decoder, VideoCodec};
-use videocall_codecs::frame::{FrameBuffer, FrameType, VideoFrame as CodecVideoFrame};
+use videocall_codecs::frame::{FrameType, VideoFrame as CodecVideoFrame};
 use videocall_codecs::jitter_buffer::JitterBuffer;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;

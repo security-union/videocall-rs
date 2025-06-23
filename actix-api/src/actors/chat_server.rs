@@ -192,7 +192,11 @@ fn handle_msg(
     session: SessionId,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
-        if msg.subject == format!("room.{}.{}", room, session).replace(' ', "_") {
+        if msg.subject
+            == format!("room.{}.{}", room, session)
+                .replace(' ', "_")
+                .into()
+        {
             return Ok(());
         }
 

@@ -17,6 +17,7 @@
  */
 
 use anyhow::{anyhow, Context, Result};
+use async_nats::Subject;
 use futures::StreamExt;
 use protobuf::Message;
 use quinn::crypto::rustls::HandshakeData;
@@ -227,9 +228,11 @@ async fn handle_session(
     let should_run = Arc::new(AtomicBool::new(true));
 
     let subject = format!("room.{}.*", lobby_id).replace(' ', "_");
-    let specific_subject = format!("room.{}.{}", lobby_id, username).replace(' ', "_");
+    let specific_subject: Subject = format!("room.{}.{}", lobby_id, username)
+        .replace(' ', "_")
+        .into();
     let mut sub = match nc
-        .queue_subscribe(subject.clone(), specific_subject.clone())
+        .queue_subscribe(subject.clone(), specific_subject.to_string())
         .await
     {
         Ok(sub) => {
@@ -332,7 +335,7 @@ async fn handle_quic_connection(
     let _session_id = conn.stable_id();
     let session = Arc::new(RwLock::new(conn));
     let should_run = Arc::new(AtomicBool::new(true));
-    let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<String>>(None);
+    let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<Subject>>(None);
 
     let nats_task = {
         let session = session.clone();
@@ -346,7 +349,7 @@ async fn handle_quic_connection(
             let specific_subject = specific_subject_rx.borrow().clone().unwrap();
             let subject = session_subject_to_lobby_subject(&specific_subject);
             let mut sub = match nc
-                .queue_subscribe(subject.clone(), specific_subject.clone())
+                .queue_subscribe(subject.clone(), specific_subject.to_string())
                 .await
             {
                 Ok(sub) => {
@@ -412,7 +415,7 @@ async fn handle_quic_connection(
                                     .replace(' ', "_");
                                     info!("Specific subject: {}", specific_subject);
                                     specific_subject_tx_clone
-                                        .send(Some(specific_subject.clone()))
+                                        .send(Some(specific_subject.into()))
                                         .unwrap();
                                 }
                             }

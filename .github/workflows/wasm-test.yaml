@@ -5,10 +5,12 @@ on:
     branches: [ main ]
     paths:
       - 'videocall-client/**'
+      - 'videocall-codecs/**'
       - 'types/**'
   pull_request:
     paths:
       - 'videocall-client/**'
+      - 'videocall-codecs/**'
       - 'types/**'
 
 jobs:
@@ -40,5 +42,8 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Run wasm-pack tests
-        run: cd videocall-client && wasm-pack test --node 
+      - name: Run wasm-pack tests for videocall-client
+        run: cd videocall-client && wasm-pack test --node
+
+      - name: Run wasm-pack tests for videocall-codecs
+        run: cd videocall-codecs && cargo test

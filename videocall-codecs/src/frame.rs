@@ -45,7 +45,7 @@ pub struct VideoFrame {
 
 /// A wrapper for a `VideoFrame` that includes metadata used by the jitter buffer.
 /// This is the object that is stored and managed within the buffer itself.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameBuffer {
     /// The underlying video frame data and properties.
     pub frame: VideoFrame,

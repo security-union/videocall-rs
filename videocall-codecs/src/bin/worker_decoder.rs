@@ -33,9 +33,10 @@
  * limitations under the License.
  */
 
-//! Simple web worker decoder that directly processes frames without complex jitter buffer for now.
+//! Web worker decoder that handles both frame data and control messages.
 
 use console_error_panic_hook;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use videocall_codecs::frame::FrameBuffer;
 use wasm_bindgen::prelude::*;
@@ -44,6 +45,17 @@ use web_sys::{
     console, DedicatedWorkerGlobalScope, EncodedVideoChunk, EncodedVideoChunkInit,
     EncodedVideoChunkType, VideoDecoder, VideoDecoderConfig, VideoDecoderInit, VideoFrame,
 };
+
+/// Messages that can be sent to the web worker
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorkerMessage {
+    /// Decode a frame
+    DecodeFrame(FrameBuffer),
+    /// Flush the decoder buffer and reset state
+    Flush,
+    /// Reset decoder to initial state (waiting for keyframe)
+    Reset,
+}
 
 // Thread-local storage for the decoder
 thread_local! {
@@ -57,19 +69,41 @@ pub fn main() {
     console_error_panic_hook::set_once();
     // Initialize Rust log to console logging
     log::set_max_level(log::LevelFilter::Debug);
-    log::info!("Starting simple worker decoder");
+    log::info!("Starting worker decoder with message handling");
 
     let self_scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .unwrap();
 
     let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-        let frame: FrameBuffer = serde_wasm_bindgen::from_value(event.data()).unwrap();
-        decode_frame_direct(frame);
+        match serde_wasm_bindgen::from_value::<WorkerMessage>(event.data()) {
+            Ok(message) => handle_worker_message(message),
+            Err(e) => {
+                console::error_1(
+                    &format!("[WORKER] Failed to deserialize message: {:?}", e).into(),
+                );
+            }
+        }
     }) as Box<dyn FnMut(_)>);
 
     self_scope.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     on_message.forget();
+}
+
+fn handle_worker_message(message: WorkerMessage) {
+    match message {
+        WorkerMessage::DecodeFrame(frame) => {
+            decode_frame_direct(frame);
+        }
+        WorkerMessage::Flush => {
+            console::log_1(&"[WORKER] Flushing decoder buffer".into());
+            flush_decoder();
+        }
+        WorkerMessage::Reset => {
+            console::log_1(&"[WORKER] Resetting decoder state".into());
+            reset_decoder();
+        }
+    }
 }
 
 fn decode_frame_direct(frame: FrameBuffer) {
@@ -127,6 +161,29 @@ fn decode_frame_direct(frame: FrameBuffer) {
             }
         });
     });
+}
+
+fn flush_decoder() {
+    DECODER.with(|decoder_cell| {
+        let decoder_opt = decoder_cell.borrow();
+        if let Some(decoder) = decoder_opt.as_ref() {
+            // Flush the WebCodecs decoder
+            let _ = decoder.flush();
+            console::log_1(&"[WORKER] Decoder buffer flushed".into());
+        } else {
+            console::log_1(&"[WORKER] No decoder to flush".into());
+        }
+    });
+}
+
+fn reset_decoder() {
+    DECODER.with(|decoder_cell| {
+        *decoder_cell.borrow_mut() = None;
+    });
+    WAITING_FOR_KEY.with(|waiting_cell| {
+        *waiting_cell.borrow_mut() = true;
+    });
+    console::log_1(&"[WORKER] Decoder reset to initial state".into());
 }
 
 fn initialize_decoder() -> Result<VideoDecoder, String> {

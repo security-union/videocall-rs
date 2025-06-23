@@ -20,9 +20,21 @@
 
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{console, window, VideoFrame, Worker};
+
+/// Messages that can be sent to the web worker
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorkerMessage {
+    /// Decode a frame
+    DecodeFrame(FrameBuffer),
+    /// Flush the decoder buffer and reset state
+    Flush,
+    /// Reset decoder to initial state (waiting for keyframe)
+    Reset,
+}
 
 unsafe impl Send for WasmDecoder {}
 unsafe impl Sync for WasmDecoder {}
@@ -33,7 +45,7 @@ pub struct WasmDecoder {
     // We must store it to keep it alive.
     _on_message_closure: Closure<dyn FnMut(web_sys::MessageEvent)>,
     // Store the user's callback
-    on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
+    _on_decoded_frame: Box<dyn Fn(DecodedFrame)>,
 }
 
 impl Decodable for WasmDecoder {
@@ -106,7 +118,7 @@ impl Decodable for WasmDecoder {
         WasmDecoder {
             worker,
             _on_message_closure: on_message_closure,
-            on_decoded_frame: dummy_callback,
+            _on_decoded_frame: dummy_callback,
         }
     }
 
@@ -163,20 +175,21 @@ impl WasmDecoder {
         WasmDecoder {
             worker,
             _on_message_closure: on_message_closure,
-            on_decoded_frame: dummy_callback,
+            _on_decoded_frame: dummy_callback,
         }
     }
 
     /// New ergonomic API: simply push a frame and let the decoder handle the rest
     pub fn push_frame(&self, frame: FrameBuffer) {
-        match serde_wasm_bindgen::to_value(&frame) {
-            Ok(js_frame) => {
-                if let Err(e) = self.worker.post_message(&js_frame) {
-                    log::error!("Error posting frame to worker: {:?}", e);
+        let message = WorkerMessage::DecodeFrame(frame);
+        match serde_wasm_bindgen::to_value(&message) {
+            Ok(js_message) => {
+                if let Err(e) = self.worker.post_message(&js_message) {
+                    log::error!("Error posting message to worker: {:?}", e);
                 }
             }
             Err(e) => {
-                log::error!("Error serializing frame: {:?}", e);
+                log::error!("Error serializing message: {:?}", e);
             }
         }
     }
@@ -189,11 +202,38 @@ impl WasmDecoder {
         false
     }
 
-    /// Flush the internal jitter buffer
-    /// Note: This could be implemented by sending a special message to the worker
+    /// Flush the internal decoder buffer
     pub fn flush(&self) {
-        // TODO: Implement by sending a "flush" message to the worker
-        log::warn!("flush() not yet implemented for WasmDecoder");
+        let message = WorkerMessage::Flush;
+        match serde_wasm_bindgen::to_value(&message) {
+            Ok(js_message) => {
+                if let Err(e) = self.worker.post_message(&js_message) {
+                    log::error!("Error posting flush message to worker: {:?}", e);
+                } else {
+                    log::debug!("Sent flush message to worker");
+                }
+            }
+            Err(e) => {
+                log::error!("Error serializing flush message: {:?}", e);
+            }
+        }
+    }
+
+    /// Reset the decoder to initial state (waiting for keyframe)
+    pub fn reset(&self) {
+        let message = WorkerMessage::Reset;
+        match serde_wasm_bindgen::to_value(&message) {
+            Ok(js_message) => {
+                if let Err(e) = self.worker.post_message(&js_message) {
+                    log::error!("Error posting reset message to worker: {:?}", e);
+                } else {
+                    log::debug!("Sent reset message to worker");
+                }
+            }
+            Err(e) => {
+                log::error!("Error serializing reset message: {:?}", e);
+            }
+        }
     }
 }
 

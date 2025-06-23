@@ -57,15 +57,13 @@ pub trait Decodable: Send + Sync {
 }
 
 // Conditionally compile and expose the native implementation
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "native")]
 mod native;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "native")]
 pub use self::native::NativeDecoder as Decoder;
 
 // Conditionally compile and expose the WASM implementation
-#[cfg(target_arch = "wasm32")]
+#[cfg(feature = "wasm")]
 mod wasm;
-#[cfg(target_arch = "wasm32")]
-pub use self::wasm::WasmDecoder as Decoder;
-#[cfg(target_arch = "wasm32")]
+#[cfg(feature = "wasm")]
 pub use self::wasm::WasmDecoder; // Export WasmDecoder directly for VideoFrame callbacks

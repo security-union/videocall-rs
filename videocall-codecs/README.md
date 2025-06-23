@@ -170,13 +170,11 @@ graph TB
         APP["🔧 Your Application<br/>push_frame(), decode()"]
     end
     
-    subgraph "videocall-codecs Core"
-        JB["📦 Jitter Buffer<br/>Frame Reordering<br/>Adaptive Delay<br/>Gap Recovery"]
-        CORE["🎯 Shared Logic<br/>Cross-platform Rust"]
-    end
-    
     subgraph "Native Platform"
-        NATIVE_DEC["🖥️ Native Decoder<br/>libvpx (VP9)<br/>Direct System Access"]
+        subgraph "Native Runtime"
+            NATIVE_JB["📦 Jitter Buffer<br/>Frame Reordering<br/>Adaptive Delay<br/>Gap Recovery"]
+            NATIVE_DEC["🖥️ Native Decoder<br/>libvpx (VP9)<br/>Direct System Access"]
+        end
         NATIVE_OUT["📺 Native Output<br/>Direct Memory<br/>No GC Overhead"]
     end
     
@@ -187,33 +185,30 @@ graph TB
         end
         
         subgraph "Web Worker Thread"
-            WORKER["⚙️ Decoder Worker<br/>WebCodecs API<br/>Isolated Processing"]
-            WASM_CORE["🦀 WASM Core<br/>Jitter Buffer<br/>Frame Management"]
+            WORKER_JB["📦 WASM Jitter Buffer<br/>Frame Reordering<br/>Adaptive Delay<br/>Gap Recovery"]
+            WORKER_DEC["⚙️ WebCodecs Decoder<br/>Browser API<br/>Isolated Processing"]
         end
     end
     
-    APP --> JB
-    JB --> CORE
+    APP --> NATIVE_JB
+    APP --> WASM_API
     
-    CORE --> NATIVE_DEC
+    NATIVE_JB --> NATIVE_DEC
     NATIVE_DEC --> NATIVE_OUT
     
-    CORE --> WASM_API
-    WASM_API --> WORKER
-    WORKER --> WASM_CORE
-    WASM_CORE --> JS_APP
+    WASM_API --> WORKER_JB
+    WORKER_JB --> WORKER_DEC
+    WORKER_DEC --> JS_APP
     
     classDef appBox fill:#4A5568,stroke:#2D3748,stroke-width:2px,color:#ffffff
-    classDef coreBox fill:#2D3748,stroke:#1A202C,stroke-width:2px,color:#ffffff
     classDef nativeBox fill:#166534,stroke:#15803D,stroke-width:2px,color:#ffffff
     classDef webBox fill:#1E3A8A,stroke:#1E40AF,stroke-width:2px,color:#ffffff
     classDef workerBox fill:#7C2D12,stroke:#9A3412,stroke-width:2px,color:#ffffff
     
     class APP appBox
-    class JB,CORE coreBox
-    class NATIVE_DEC,NATIVE_OUT nativeBox
+    class NATIVE_JB,NATIVE_DEC,NATIVE_OUT nativeBox
     class WASM_API,JS_APP webBox
-    class WORKER,WASM_CORE workerBox
+    class WORKER_JB,WORKER_DEC workerBox
 ```
 
 **Architecture Benefits:**

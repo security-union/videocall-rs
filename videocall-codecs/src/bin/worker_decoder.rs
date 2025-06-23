@@ -33,34 +33,145 @@
  * limitations under the License.
  */
 
-//! Web worker decoder that handles both frame data and control messages.
+//! Web worker decoder that handles both frame data and control messages using a JitterBuffer.
 
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use videocall_codecs::frame::FrameBuffer;
+use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
+use videocall_codecs::frame::{FrameBuffer, VideoFrame};
+use videocall_codecs::jitter_buffer::JitterBuffer;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
     console, DedicatedWorkerGlobalScope, EncodedVideoChunk, EncodedVideoChunkInit,
-    EncodedVideoChunkType, VideoDecoder, VideoDecoderConfig, VideoDecoderInit, VideoFrame,
+    EncodedVideoChunkType, VideoDecoder, VideoDecoderConfig, VideoDecoderInit,
+    VideoFrame as WebVideoFrame,
 };
 
 /// Messages that can be sent to the web worker
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    /// Decode a frame
+    /// Decode a frame using the jitter buffer
     DecodeFrame(FrameBuffer),
-    /// Flush the decoder buffer and reset state
+    /// Flush the jitter buffer and decoder
     Flush,
-    /// Reset decoder to initial state (waiting for keyframe)
+    /// Reset jitter buffer and decoder to initial state
     Reset,
 }
 
-// Thread-local storage for the decoder
-thread_local! {
-    static DECODER: RefCell<Option<VideoDecoder>> = const { RefCell::new(None) };
-    static WAITING_FOR_KEY: RefCell<bool> = const { RefCell::new(true) };
+/// WebDecoder implementation that wraps WebCodecs VideoDecoder
+struct WebDecoder {
+    decoder: RefCell<Option<VideoDecoder>>,
+    self_scope: DedicatedWorkerGlobalScope,
 }
+
+// Safety: These are safe because we're in a single-threaded web worker context
+unsafe impl Send for WebDecoder {}
+unsafe impl Sync for WebDecoder {}
+
+impl WebDecoder {
+    fn new(self_scope: DedicatedWorkerGlobalScope) -> Self {
+        Self {
+            decoder: RefCell::new(None),
+            self_scope,
+        }
+    }
+
+    fn initialize_decoder(&self) -> Result<(), String> {
+        let mut decoder_ref = self.decoder.borrow_mut();
+        if decoder_ref.is_some() {
+            return Ok(());
+        }
+
+        let self_scope = self.self_scope.clone();
+        let on_output = {
+            let global_scope = self_scope.clone();
+            Closure::wrap(Box::new(move |video_frame: JsValue| {
+                let video_frame = video_frame.dyn_into::<WebVideoFrame>().unwrap();
+                // Post the VideoFrame back to the main thread
+                if let Err(e) = global_scope.post_message(&video_frame) {
+                    console::error_1(
+                        &format!("[WORKER] Error posting decoded frame: {:?}", e).into(),
+                    );
+                }
+                video_frame.close();
+            }) as Box<dyn FnMut(_)>)
+        };
+
+        let on_error = Closure::wrap(Box::new(move |e: JsValue| {
+            console::error_1(&"[WORKER] WebCodecs decoder error:".into());
+            console::error_1(&e);
+        }) as Box<dyn FnMut(_)>);
+
+        let init = VideoDecoderInit::new(
+            on_error.as_ref().unchecked_ref(),
+            on_output.as_ref().unchecked_ref(),
+        );
+
+        let decoder =
+            VideoDecoder::new(&init).map_err(|e| format!("Failed to create decoder: {:?}", e))?;
+        let config = VideoDecoderConfig::new("vp09.00.10.08");
+        decoder
+            .configure(&config)
+            .map_err(|e| format!("Failed to configure decoder: {:?}", e))?;
+
+        on_output.forget();
+        on_error.forget();
+
+        *decoder_ref = Some(decoder);
+        console::log_1(&"[WORKER] WebCodecs decoder initialized".into());
+        Ok(())
+    }
+}
+
+impl Decodable for WebDecoder {
+    type Frame = DecodedFrame;
+
+    fn new(_codec: VideoCodec, _on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>) -> Self {
+        // This is not used in the worker context, decoder is created manually
+        panic!("Use WebDecoder::new(self_scope) in worker context");
+    }
+
+    fn decode(&self, frame: FrameBuffer) {
+        // Initialize decoder if needed
+        if self.decoder.borrow().is_none() {
+            if let Err(e) = self.initialize_decoder() {
+                console::error_1(&format!("[WORKER] Failed to initialize decoder: {:?}", e).into());
+                return;
+            }
+        }
+
+        let decoder_ref = self.decoder.borrow();
+        if let Some(decoder) = decoder_ref.as_ref() {
+            let chunk_type = match frame.frame.frame_type {
+                videocall_codecs::frame::FrameType::KeyFrame => EncodedVideoChunkType::Key,
+                videocall_codecs::frame::FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
+            };
+
+            let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
+            let init = EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
+
+            match EncodedVideoChunk::new(&init) {
+                Ok(chunk) => {
+                    if let Err(e) = decoder.decode(&chunk) {
+                        console::error_1(&format!("[WORKER] Decoder error: {:?}", e).into());
+                    }
+                }
+                Err(e) => {
+                    console::error_1(&format!("[WORKER] Failed to create chunk: {:?}", e).into());
+                }
+            }
+        }
+    }
+}
+
+// Thread-local storage for the jitter buffer and related state
+thread_local! {
+    static JITTER_BUFFER: RefCell<Option<JitterBuffer<DecodedFrame>>> = const { RefCell::new(None) };
+    static INTERVAL_ID: RefCell<Option<i32>> = const { RefCell::new(None) };
+}
+
+const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
 
 #[wasm_bindgen(start)]
 pub fn main() {
@@ -68,7 +179,7 @@ pub fn main() {
     console_error_panic_hook::set_once();
     // Initialize Rust log to console logging
     log::set_max_level(log::LevelFilter::Debug);
-    log::info!("Starting worker decoder with message handling");
+    log::info!("Starting worker decoder with jitter buffer and message handling");
 
     let self_scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
@@ -87,148 +198,128 @@ pub fn main() {
 
     self_scope.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     on_message.forget();
+
+    // Start the jitter buffer check interval
+    start_jitter_buffer_interval();
 }
 
 fn handle_worker_message(message: WorkerMessage) {
     match message {
         WorkerMessage::DecodeFrame(frame) => {
-            decode_frame_direct(frame);
+            insert_frame_to_jitter_buffer(frame);
         }
         WorkerMessage::Flush => {
-            console::log_1(&"[WORKER] Flushing decoder buffer".into());
-            flush_decoder();
+            console::log_1(&"[WORKER] Flushing jitter buffer and decoder".into());
+            flush_jitter_buffer();
         }
         WorkerMessage::Reset => {
-            console::log_1(&"[WORKER] Resetting decoder state".into());
-            reset_decoder();
+            console::log_1(&"[WORKER] Resetting jitter buffer and decoder state".into());
+            reset_jitter_buffer();
         }
     }
 }
 
-fn decode_frame_direct(frame: FrameBuffer) {
-    DECODER.with(|decoder_cell| {
-        let mut decoder_opt = decoder_cell.borrow_mut();
-        if decoder_opt.is_none() {
-            console::log_1(&"[WORKER] Initializing decoder".into());
-            match initialize_decoder() {
-                Ok(decoder) => *decoder_opt = Some(decoder),
+fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
+    JITTER_BUFFER.with(|jb_cell| {
+        let mut jb_opt = jb_cell.borrow_mut();
+
+        if jb_opt.is_none() {
+            match initialize_jitter_buffer() {
+                Ok(jb) => *jb_opt = Some(jb),
                 Err(e) => {
                     console::error_1(
-                        &format!("[WORKER] Failed to initialize decoder: {:?}", e).into(),
+                        &format!("[WORKER] Failed to initialize jitter buffer: {:?}", e).into(),
                     );
                     return;
                 }
             }
         }
 
-        WAITING_FOR_KEY.with(|waiting_cell| {
-            let mut waiting_for_key = waiting_cell.borrow_mut();
-
-            let chunk_type = match frame.frame.frame_type {
-                videocall_codecs::frame::FrameType::KeyFrame => EncodedVideoChunkType::Key,
-                videocall_codecs::frame::FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
+        if let Some(jb) = jb_opt.as_mut() {
+            // Convert FrameBuffer to VideoFrame
+            let video_frame = VideoFrame {
+                sequence_number: frame.sequence_number(),
+                frame_type: frame.frame.frame_type,
+                data: frame.frame.data.clone(),
+                timestamp: frame.frame.timestamp,
             };
 
-            if *waiting_for_key {
-                if chunk_type == EncodedVideoChunkType::Key {
-                    *waiting_for_key = false;
-                } else {
-                    console::log_1(&"[WORKER] Waiting for key frame, dropping delta.".into());
-                    return;
-                }
-            }
+            // Get current time in milliseconds
+            let current_time_ms = js_sys::Date::now() as u128;
 
-            let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
-            let init = EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
-
-            match EncodedVideoChunk::new(&init) {
-                Ok(chunk) => {
-                    // Get a fresh reference to the decoder inside the closure to avoid borrowing conflicts
-                    if let Some(decoder) = decoder_opt.as_ref() {
-                        if let Err(e) = decoder.decode(&chunk) {
-                            console::log_1(
-                                &format!("[WORKER] Decoder error: {:?}. Resetting.", e).into(),
-                            );
-                            *decoder_opt = None;
-                            *waiting_for_key = true;
-                        }
-                    }
-                }
-                Err(e) => {
-                    console::error_1(&format!("[WORKER] Failed to create chunk: {:?}", e).into());
-                }
-            }
-        });
-    });
-}
-
-fn flush_decoder() {
-    DECODER.with(|decoder_cell| {
-        let decoder_opt = decoder_cell.borrow();
-        if let Some(decoder) = decoder_opt.as_ref() {
-            // Flush the WebCodecs decoder
-            let _ = decoder.flush();
-            console::log_1(&"[WORKER] Decoder buffer flushed".into());
-        } else {
-            console::log_1(&"[WORKER] No decoder to flush".into());
+            jb.insert_frame(video_frame, current_time_ms);
         }
     });
 }
 
-fn reset_decoder() {
-    DECODER.with(|decoder_cell| {
-        *decoder_cell.borrow_mut() = None;
-    });
-    WAITING_FOR_KEY.with(|waiting_cell| {
-        *waiting_cell.borrow_mut() = true;
-    });
-    console::log_1(&"[WORKER] Decoder reset to initial state".into());
-}
-
-fn initialize_decoder() -> Result<VideoDecoder, String> {
-    log::info!("Initializing decoder");
+fn start_jitter_buffer_interval() {
     let self_scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .unwrap();
 
-    let on_output = {
-        let global_scope = self_scope.clone();
-        Closure::wrap(Box::new(move |video_frame: JsValue| {
-            let video_frame = video_frame.dyn_into::<VideoFrame>().unwrap();
+    let interval_callback = Closure::wrap(Box::new(move || {
+        check_jitter_buffer_for_ready_frames();
+    }) as Box<dyn FnMut()>);
 
-            // Post the VideoFrame back to the main thread
-            if let Err(e) = global_scope.post_message(&video_frame) {
-                console::error_1(&format!("[WORKER] Error posting decoded frame: {:?}", e).into());
-            }
-            video_frame.close();
-        }) as Box<dyn FnMut(_)>)
-    };
+    let interval_id = self_scope
+        .set_interval_with_callback_and_timeout_and_arguments_0(
+            interval_callback.as_ref().unchecked_ref(),
+            JITTER_BUFFER_CHECK_INTERVAL_MS,
+        )
+        .expect("Failed to set interval");
 
-    let on_error = Closure::wrap(Box::new(move |e: JsValue| {
-        console::error_1(&"[WORKER] Decoder error:".into());
-        console::error_1(&e);
-        DECODER.with(|decoder_cell| {
-            *decoder_cell.borrow_mut() = None;
-        });
-        WAITING_FOR_KEY.with(|waiting_cell| {
-            *waiting_cell.borrow_mut() = true;
-        });
-    }) as Box<dyn FnMut(_)>);
+    interval_callback.forget();
 
-    let init = VideoDecoderInit::new(
-        on_error.as_ref().unchecked_ref(),
-        on_output.as_ref().unchecked_ref(),
+    INTERVAL_ID.with(|id_cell| {
+        *id_cell.borrow_mut() = Some(interval_id);
+    });
+
+    console::log_1(
+        &format!(
+            "[WORKER] Started jitter buffer check interval ({}ms)",
+            JITTER_BUFFER_CHECK_INTERVAL_MS
+        )
+        .into(),
     );
+}
 
-    let decoder =
-        VideoDecoder::new(&init).map_err(|e| format!("Failed to create decoder: {:?}", e))?;
-    let config = VideoDecoderConfig::new("vp09.00.10.08");
-    decoder
-        .configure(&config)
-        .map_err(|e| format!("Failed to configure decoder: {:?}", e))?;
+fn check_jitter_buffer_for_ready_frames() {
+    JITTER_BUFFER.with(|jb_cell| {
+        let mut jb_opt = jb_cell.borrow_mut();
+        if let Some(jb) = jb_opt.as_mut() {
+            let current_time_ms = js_sys::Date::now() as u128;
+            jb.find_and_move_continuous_frames(current_time_ms);
+        }
+    });
+}
 
-    on_output.forget();
-    on_error.forget();
+fn initialize_jitter_buffer() -> Result<JitterBuffer<DecodedFrame>, String> {
+    let self_scope = js_sys::global()
+        .dyn_into::<DedicatedWorkerGlobalScope>()
+        .unwrap();
 
-    Ok(decoder)
+    let web_decoder = WebDecoder::new(self_scope);
+    let boxed_decoder = Box::new(web_decoder);
+
+    console::log_1(&"[WORKER] Initializing jitter buffer with WebCodecs decoder".into());
+    Ok(JitterBuffer::new(boxed_decoder))
+}
+
+fn flush_jitter_buffer() {
+    JITTER_BUFFER.with(|jb_cell| {
+        let mut jb_opt = jb_cell.borrow_mut();
+        if let Some(jb) = jb_opt.as_mut() {
+            jb.flush();
+            console::log_1(&"[WORKER] Jitter buffer flushed".into());
+        } else {
+            console::log_1(&"[WORKER] No jitter buffer to flush".into());
+        }
+    });
+}
+
+fn reset_jitter_buffer() {
+    JITTER_BUFFER.with(|jb_cell| {
+        *jb_cell.borrow_mut() = None;
+    });
+    console::log_1(&"[WORKER] Jitter buffer reset to initial state".into());
 }

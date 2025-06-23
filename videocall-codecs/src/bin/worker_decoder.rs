@@ -88,8 +88,6 @@ fn decode_frame_direct(frame: FrameBuffer) {
             }
         }
 
-        let decoder = decoder_opt.as_ref().unwrap();
-
         WAITING_FOR_KEY.with(|waiting_cell| {
             let mut waiting_for_key = waiting_cell.borrow_mut();
 
@@ -112,16 +110,20 @@ fn decode_frame_direct(frame: FrameBuffer) {
 
             match EncodedVideoChunk::new(&init) {
                 Ok(chunk) => {
-                    if let Err(e) = decoder.decode(&chunk) {
-                        console::log_1(
-                            &format!("[WORKER] Decoder error: {:?}. Resetting.", e).into(),
-                        );
-                        *decoder_opt = None;
-                        *waiting_for_key = true;
-                    } else {
-                        console::log_1(
-                            &format!("[WORKER] Decoded frame: {}", frame.sequence_number()).into(),
-                        );
+                    // Get a fresh reference to the decoder inside the closure to avoid borrowing conflicts
+                    if let Some(decoder) = decoder_opt.as_ref() {
+                        if let Err(e) = decoder.decode(&chunk) {
+                            console::log_1(
+                                &format!("[WORKER] Decoder error: {:?}. Resetting.", e).into(),
+                            );
+                            *decoder_opt = None;
+                            *waiting_for_key = true;
+                        } else {
+                            console::log_1(
+                                &format!("[WORKER] Decoded frame: {}", frame.sequence_number())
+                                    .into(),
+                            );
+                        }
                     }
                 }
                 Err(e) => {

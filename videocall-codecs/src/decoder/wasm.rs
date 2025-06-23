@@ -63,34 +63,50 @@ impl Decodable for WasmDecoder {
 
         // Create a closure to handle messages from the worker.
         let on_message_closure = {
-            let callback = callback.clone();
+            // We need to use Rc<RefCell<>> to share the callback since trait objects can't be cloned
+            use std::cell::RefCell;
+            use std::rc::Rc;
+            let callback_rc = Rc::new(RefCell::new(callback));
+            let callback_for_closure = callback_rc.clone();
+
             Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
                 let js_val = event.data();
 
-                // Try to convert to VideoFrame (the actual decoded frame)
-                if let Ok(video_frame) = js_val.dyn_into::<VideoFrame>() {
-                    // Convert VideoFrame to DecodedFrame for consistency
-                    let decoded_frame = DecodedFrame {
-                        sequence_number: 0, // Note: sequence number tracking happens in jitter buffer
-                        width: video_frame.display_width(),
-                        height: video_frame.display_height(),
-                        data: vec![], // For now, we don't copy the actual video data
-                    };
+                // Clone js_val before trying to convert it to avoid move issues
+                match js_val.clone().dyn_into::<VideoFrame>() {
+                    Ok(video_frame) => {
+                        // Convert VideoFrame to DecodedFrame for consistency
+                        let decoded_frame = DecodedFrame {
+                            sequence_number: 0, // Note: sequence number tracking happens in jitter buffer
+                            width: video_frame.display_width(),
+                            height: video_frame.display_height(),
+                            data: vec![], // For now, we don't copy the actual video data
+                        };
 
-                    callback(decoded_frame);
-                    video_frame.close();
-                } else {
-                    log::warn!("Received unexpected message from worker: {:?}", js_val);
+                        // Call the callback through RefCell
+                        if let Ok(cb) = callback_for_closure.try_borrow() {
+                            cb(decoded_frame);
+                        }
+                        video_frame.close();
+                    }
+                    Err(_) => {
+                        log::warn!("Received unexpected message from worker: {:?}", js_val);
+                    }
                 }
             }) as Box<dyn FnMut(_)>)
         };
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
 
+        // Create a dummy callback for the struct field since the real one is in Rc<RefCell<>>
+        let dummy_callback = Box::new(|_: DecodedFrame| {
+            // The actual callback is handled through the Rc<RefCell<>> in the closure
+        });
+
         WasmDecoder {
             worker,
             _on_message_closure: on_message_closure,
-            on_decoded_frame: callback,
+            on_decoded_frame: dummy_callback,
         }
     }
 
@@ -125,11 +141,14 @@ impl WasmDecoder {
             Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
                 let js_val = event.data();
 
-                // Try to convert to VideoFrame (the actual decoded frame)
-                if let Ok(video_frame) = js_val.dyn_into::<VideoFrame>() {
-                    callback(video_frame);
-                } else {
-                    log::warn!("Received unexpected message from worker: {:?}", js_val);
+                // Clone js_val before trying to convert it to avoid move issues
+                match js_val.clone().dyn_into::<VideoFrame>() {
+                    Ok(video_frame) => {
+                        callback(video_frame);
+                    }
+                    Err(_) => {
+                        log::warn!("Received unexpected message from worker: {:?}", js_val);
+                    }
                 }
             }) as Box<dyn FnMut(_)>)
         };

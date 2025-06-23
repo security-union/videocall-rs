@@ -33,19 +33,15 @@ use super::config::configure_audio_context;
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
-use gloo_timers::callback::Interval;
 use log::error;
 use std::sync::Arc;
-use std::sync::Mutex;
-use videocall_codecs::decoder::{Decodable, Decoder, VideoCodec};
+use videocall_codecs::decoder::WasmDecoder;
 use videocall_codecs::frame::{FrameBuffer, FrameType, VideoFrame as CodecVideoFrame};
-use videocall_codecs::jitter_buffer::JitterBuffer;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::window;
 use web_sys::HtmlCanvasElement;
 use web_sys::{AudioData, AudioDecoderConfig, AudioDecoderInit};
 use web_sys::{CanvasRenderingContext2d, CodecState};
@@ -80,10 +76,12 @@ trait VideoFrameDecoder {
 }
 
 // WASM implementation that handles VideoFrame callbacks
+#[cfg(target_arch = "wasm32")]
 struct WasmVideoFrameDecoder {
-    decoder: videocall_codecs::decoder::WasmDecoder,
+    decoder: WasmDecoder,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl VideoFrameDecoder for WasmVideoFrameDecoder {
     fn push_frame(&self, frame: FrameBuffer) {
         self.decoder.push_frame(frame);

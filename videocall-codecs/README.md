@@ -52,42 +52,6 @@ let video_frame = VideoFrame {
 decoder.decode(FrameBuffer::new(video_frame, current_time_ms));
 ```
 
-### Web/WASM Usage
-
-```bash
-# 1. Build for web  
-wasm-pack build --target web --features wasm
-
-# 2. Install in your project
-npm install ./pkg
-```
-
-```javascript
-// 3. Use in JavaScript
-import init, { WasmDecoder, VideoCodec } from './pkg/videocall_codecs.js';
-
-await init();
-
-const canvas = document.getElementById('video-canvas');
-const ctx = canvas.getContext('2d');
-
-const decoder = new WasmDecoder(
-    VideoCodec.VP9,
-    (videoFrame) => {
-        ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
-        videoFrame.close(); // Important: release memory
-    }
-);
-
-// Push frames from your video stream
-decoder.push_frame({
-    sequence_number: 1,
-    frame_type: 'KeyFrame', // or 'DeltaFrame'
-    data: frameData, // Uint8Array of VP9 data
-    timestamp: Date.now()
-});
-```
-
 ## Web Worker Setup (WASM)
 
 For WASM builds, the decoder runs in a Web Worker for better performance. Add this to your `index.html`:
@@ -111,26 +75,164 @@ For WASM builds, the decoder runs in a Web Worker for better performance. Add th
 
 ## Architecture
 
-### Jitter Buffer
+### Jitter Buffer & Temporal Smoothing
 
-The built-in jitter buffer automatically handles:
+The jitter buffer is the heart of smooth video playback, working with the jitter estimator to adaptively handle network variability:
+
+#### How Temporal Jitter Buffering Works
+
+Real-time video streams suffer from network jitter - frames arrive at irregular intervals even though they were sent at regular intervals. The jitter buffer solves this by:
+
+1. **Measuring Network Jitter**: Tracks arrival time variations vs expected timing
+2. **Adaptive Buffering**: Dynamically adjusts how long to buffer frames based on network conditions  
+3. **Smooth Playout**: Releases frames at regular intervals for consistent video playback
+
+#### Jitter Buffer Components
 
 - **Frame Reordering**: Out-of-order frames are buffered and played in sequence
 - **Gap Recovery**: Jumps to keyframes when frames are lost
-- **Adaptive Delay**: Adjusts playout delay based on network jitter
-- **Buffer Management**: Prevents buffer overflow with configurable limits
+- **Adaptive Delay**: Adjusts playout delay based on network jitter (10ms-500ms range)
+- **Buffer Management**: Prevents buffer overflow with configurable limits (200 frames max)
 
-### Cross-Platform Design
+#### Temporal Smoothing Flow
 
+Here's how the jitter buffer and estimator work together to transform irregular network arrivals into smooth video:
+
+```mermaid
+graph TB
+    subgraph "Network Layer"
+        NET["🌐 Network Stream<br/>VP9 Frames"]
+        JITTER["⚡ Network Jitter<br/>Irregular Arrival Times"]
+    end
+    
+    subgraph "Jitter Estimator"
+        ARRIVAL["📥 Frame Arrival<br/>sequence_number: 42<br/>arrival_time: 1000ms"]
+        CALC["🧮 Jitter Calculation<br/>Expected: 33.3ms intervals<br/>Actual: 45ms interval<br/>Delta: +11.7ms"]
+        ESTIMATE["📊 Jitter Estimate<br/>Running Average: 8.5ms<br/>(EWMA with 1/16 smoothing)"]
+    end
+    
+    subgraph "Jitter Buffer"
+        BUFFER["📦 Frame Buffer<br/>Reorder & Store<br/>Max: 200 frames"]
+        DELAY["⏱️ Adaptive Playout Delay<br/>Target: jitter × 3.0<br/>Range: 10ms - 500ms<br/>Current: 25.5ms"]
+        READY["✅ Ready Queue<br/>Frames past delay threshold"]
+    end
+    
+    subgraph "Output"
+        DECODE["🎬 Decoder<br/>Smooth Frame Stream"]
+        DISPLAY["📺 Video Display<br/>Consistent 30fps"]
+    end
+    
+    NET --> JITTER
+    JITTER --> ARRIVAL
+    ARRIVAL --> CALC
+    CALC --> ESTIMATE
+    ESTIMATE --> DELAY
+    
+    ARRIVAL --> BUFFER
+    BUFFER --> READY
+    DELAY --> READY
+    READY --> DECODE
+    DECODE --> DISPLAY
+    
+    classDef networkBox fill:#8B0000,stroke:#660000,stroke-width:2px,color:#ffffff
+    classDef jitterEstBox fill:#1E3A8A,stroke:#1E40AF,stroke-width:2px,color:#ffffff
+    classDef bufferBox fill:#166534,stroke:#15803D,stroke-width:2px,color:#ffffff
+    classDef outputBox fill:#B45309,stroke:#C2410C,stroke-width:2px,color:#ffffff
+    
+    class NET,JITTER networkBox
+    class ARRIVAL,CALC,ESTIMATE jitterEstBox
+    class BUFFER,DELAY,READY bufferBox
+    class DECODE,DISPLAY outputBox
 ```
-┌─────────────────┐    ┌───────────────────┐    ┌─────────────────┐
-│   Your App      │    │  videocall-codecs │    │   Platform      │
-│                 │    │                   │    │                 │
-│ decoder.decode()│───▶│  JitterBuffer     │───▶│ Native: libvpx  │
-│                 │    │  FrameReordering  │    │ WASM: WebCodecs │
-│                 │    │  AdaptiveDelay    │    │                 │
-└─────────────────┘    └───────────────────┘    └─────────────────┘
+
+**Key Insights:**
+
+1. **🔴 Network Jitter Problem**: Frames arrive irregularly due to network congestion, routing changes, and variable latency
+2. **🔵 Jitter Measurement**: The estimator tracks arrival time variations using an exponentially weighted moving average (EWMA)
+3. **🟢 Adaptive Buffering**: Buffer delay automatically adjusts based on measured jitter (3x safety margin)
+4. **🟠 Smooth Output**: Frames are released only after sufficient buffering time, ensuring consistent playout
+
+**Example Scenario:**
+- Expected frame interval: 33.3ms (30fps)
+- Measured jitter: 8.5ms average
+- Adaptive delay: 8.5ms × 3.0 = 25.5ms
+- Result: Frames buffer for ~25ms then play smoothly
+
+This approach trades a small amount of latency (10-500ms) for significantly improved video quality and eliminates stuttering caused by network jitter.
+
+### Cross-Platform Architecture
+
+The crate provides unified jitter buffering across native and web platforms, with platform-specific decoder implementations:
+
+```mermaid
+graph TB
+    subgraph "Application Layer"
+        APP["🔧 Your Application<br/>push_frame(), decode()"]
+    end
+    
+    subgraph "videocall-codecs Core"
+        JB["📦 Jitter Buffer<br/>Frame Reordering<br/>Adaptive Delay<br/>Gap Recovery"]
+        CORE["🎯 Shared Logic<br/>Cross-platform Rust"]
+    end
+    
+    subgraph "Native Platform"
+        NATIVE_DEC["🖥️ Native Decoder<br/>libvpx (VP9)<br/>Direct System Access"]
+        NATIVE_OUT["📺 Native Output<br/>Direct Memory<br/>No GC Overhead"]
+    end
+    
+    subgraph "Web Platform"
+        subgraph "Main Thread"
+            WASM_API["🌐 WASM API<br/>WasmDecoder<br/>JavaScript Bindings"]
+            JS_APP["📱 Web App<br/>Canvas Rendering<br/>VideoFrame API"]
+        end
+        
+        subgraph "Web Worker Thread"
+            WORKER["⚙️ Decoder Worker<br/>WebCodecs API<br/>Isolated Processing"]
+            WASM_CORE["🦀 WASM Core<br/>Jitter Buffer<br/>Frame Management"]
+        end
+    end
+    
+    APP --> JB
+    JB --> CORE
+    
+    CORE --> NATIVE_DEC
+    NATIVE_DEC --> NATIVE_OUT
+    
+    CORE --> WASM_API
+    WASM_API --> WORKER
+    WORKER --> WASM_CORE
+    WASM_CORE --> JS_APP
+    
+    classDef appBox fill:#4A5568,stroke:#2D3748,stroke-width:2px,color:#ffffff
+    classDef coreBox fill:#2D3748,stroke:#1A202C,stroke-width:2px,color:#ffffff
+    classDef nativeBox fill:#166534,stroke:#15803D,stroke-width:2px,color:#ffffff
+    classDef webBox fill:#1E3A8A,stroke:#1E40AF,stroke-width:2px,color:#ffffff
+    classDef workerBox fill:#7C2D12,stroke:#9A3412,stroke-width:2px,color:#ffffff
+    
+    class APP appBox
+    class JB,CORE coreBox
+    class NATIVE_DEC,NATIVE_OUT nativeBox
+    class WASM_API,JS_APP webBox
+    class WORKER,WASM_CORE workerBox
 ```
+
+**Architecture Benefits:**
+
+🖥️ **Native Performance**: Direct libvpx integration with zero-copy memory access  
+🌐 **Web Compatibility**: WebCodecs API with automatic Web Worker isolation  
+⚙️ **Worker Separation**: Heavy processing moved off main thread for smooth UI  
+🎯 **Unified Logic**: Same jitter buffer and frame management across platforms  
+📦 **Memory Safety**: Rust ownership prevents common C/C++ decoder vulnerabilities
+
+**Platform Comparison:**
+
+| Feature | Native | WASM/Web |
+|---------|--------|----------|
+| **Decoder** | libvpx (C++) | WebCodecs API |
+| **Threading** | OS threads | Web Workers |
+| **Memory** | Direct access | Managed + manual cleanup |
+| **Performance** | Maximum | Near-native |
+| **Deployment** | Binary executable | Browser + CDN |
 
 The crate implements a trait-based abstraction that allows the same jitter buffer logic to work across both native and WASM targets, with platform-specific decoder implementations handling the actual video decoding.
 
@@ -171,36 +273,6 @@ const decoder = new WasmDecoder(VideoCodec.VP9, (videoFrame) => {
 
 ## Framework Integration
 
-### React Example
-
-```typescript
-import { useEffect, useRef } from 'react';
-import init, { WasmDecoder, VideoCodec } from 'videocall-codecs';
-
-export const VideoPlayer = ({ websocketUrl }: { websocketUrl: string }) => {
-    const canvasRef = useRef<HTMLCanvasElement>(null);
-
-    useEffect(() => {
-        const initDecoder = async () => {
-            await init();
-            
-            const canvas = canvasRef.current!;
-            const ctx = canvas.getContext('2d')!;
-            
-            const decoder = new WasmDecoder(VideoCodec.VP9, (videoFrame) => {
-                ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
-                videoFrame.close();
-            });
-            
-            // Connect WebSocket and handle frames...
-        };
-        initDecoder();
-    }, [websocketUrl]);
-
-    return <canvas ref={canvasRef} width={640} height={480} />;
-};
-```
-
 ## Configuration
 
 ### Jitter Buffer Settings
@@ -223,30 +295,6 @@ wasm = ["wasm-bindgen", "web-sys", "js-sys", "wasm-bindgen-futures"]
 
 ## Troubleshooting
 
-**WASM import issues:**
-```javascript
-// Always initialize first
-import init, { WasmDecoder } from './pkg/videocall_codecs.js';
-await init();
-```
-
-**Memory leaks:**
-```javascript
-// Always close VideoFrame objects
-decoder = new WasmDecoder(VideoCodec.VP9, (videoFrame) => {
-    ctx.drawImage(videoFrame, 0, 0);
-    videoFrame.close(); // Required!
-});
-```
-
-**Frame types:**
-```javascript
-// Use exact strings
-decoder.push_frame({
-    frame_type: 'KeyFrame', // Must be 'KeyFrame' or 'DeltaFrame'
-    // ...
-});
-```
 
 ## Performance Tips
 

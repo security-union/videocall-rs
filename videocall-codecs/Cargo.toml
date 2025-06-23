@@ -17,6 +17,7 @@ include = ["src/**/*", "assets/**/*"]
 [lib]
 name = "videocall_codecs"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "worker_decoder"

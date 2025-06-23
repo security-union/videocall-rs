@@ -67,3 +67,5 @@ pub use self::native::NativeDecoder as Decoder;
 mod wasm;
 #[cfg(target_arch = "wasm32")]
 pub use self::wasm::WasmDecoder as Decoder;
+#[cfg(target_arch = "wasm32")]
+pub use self::wasm::WasmDecoder; // Export WasmDecoder directly for VideoFrame callbacks

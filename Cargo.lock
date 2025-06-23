@@ -6268,6 +6268,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde-wasm-bindgen 0.6.5",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

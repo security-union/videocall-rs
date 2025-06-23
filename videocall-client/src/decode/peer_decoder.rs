@@ -93,25 +93,6 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
     }
 }
 
-// Native implementation (placeholder for now)
-#[cfg(not(target_arch = "wasm32"))]
-struct NativeVideoFrameDecoder;
-
-#[cfg(not(target_arch = "wasm32"))]
-impl VideoFrameDecoder for NativeVideoFrameDecoder {
-    fn push_frame(&self, _frame: FrameBuffer) {
-        log::warn!("Native VideoFrame decoder not yet implemented");
-    }
-
-    fn is_waiting_for_keyframe(&self) -> bool {
-        false
-    }
-
-    fn flush(&self) {
-        // No-op for now
-    }
-}
-
 impl VideoPeerDecoder {
     pub fn new(canvas_id: &str) -> Result<Self, JsValue> {
         let canvas_id = canvas_id.to_owned();

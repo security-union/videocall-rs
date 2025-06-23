@@ -821,7 +821,7 @@ checksum = "cfa8873f51c92e232f9bac4065cddef41b714152812bfc5f7672ba16d6ef8cd9"
 
 [[package]]
 name = "bot"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "dotenv",
@@ -6201,7 +6201,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -6224,7 +6224,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "aes",
  "anyhow",
@@ -6277,7 +6277,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa"
-version = "0.10.8"
+version = "0.10.9"
 dependencies = [
  "flume",
  "image 0.25.6",
@@ -6303,7 +6303,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-bindings-linux"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "v4l",
  "videocall-nokhwa-core",
@@ -6326,7 +6326,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-bindings-windows"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "once_cell",
  "videocall-nokhwa-core",
@@ -6335,7 +6335,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -6349,7 +6349,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6374,7 +6374,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-types"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "protobuf",
  "serde",
@@ -6384,7 +6384,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.0.9"
+version = "1.0.10"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

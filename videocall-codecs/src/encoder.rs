@@ -110,7 +110,7 @@ impl Vp9Encoder {
                 VPX_DL_REALTIME as u64,
             );
             if ret != VPX_CODEC_OK {
-                let err_msg = c_str_to_rust_str(vpx_codec_error(&self.ctx));
+                let err_msg = c_str_to_rust_str(vpx_codec_error(&mut self.ctx as *mut _));
                 anyhow::bail!("Failed to encode frame: {}", err_msg);
             }
 

@@ -17,10 +17,11 @@ categories = ["network-programming", "multimedia"]
 
 [dependencies]
 aes = "0.8.3"
-anyhow = "1"
+anyhow = { workspace = true }
 cbc = { version = "0.1.2", features = ["alloc"] }
 futures = "0.3"
 gloo = "0.8.0"
+gloo-timers = { version = "0.3.0", features = ["futures"] }
 gloo-utils = { version = "0.1", features = ["serde"] }
 js-sys = "0.3"
 log = "0.4.19"
@@ -28,13 +29,15 @@ protobuf = "3.3.0"
 rand = { version = "0.8.5", features = ["std_rng", "small_rng"] }
 rsa = "0.9.2"
 videocall-types = { path= "../videocall-types", version = "1.0.1" }
-wasm-bindgen = "0.2.100"
-wasm-bindgen-futures = "0.4.30"
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
 web-time = "1.1.0"
 serde = { version = "1", features = ["derive"] }
 yew = { version = "0.21" }
 yew-websocket = "1.21.0"
 yew-webtransport = "0.21.1"
+prost = "0.11"
+videocall-codecs = { path = "../videocall-codecs", features = ["wasm"] }
 
 [dependencies.web-sys]
 version = "0.3.72"

@@ -4,7 +4,7 @@ version = "1.0.1"
 edition = "2021"
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 authors = [
     "Dario Lencina <dario@securityunion.dev>"

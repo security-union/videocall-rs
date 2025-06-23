@@ -1,3 +1,21 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
@@ -191,9 +209,21 @@ impl Peer {
             MediaType::HEARTBEAT => {
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
+                    // Check if video is being turned off (on -> off transition)
+                    let video_turned_off = self.video_enabled && !metadata.video_enabled;
+
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
+
+                    // Flush video decoder when video is turned off
+                    if video_turned_off {
+                        self.video.flush();
+                        debug!(
+                            "Flushed video decoder for peer {} (video turned off)",
+                            self.email
+                        );
+                    }
                 }
                 Ok((
                     media_type,

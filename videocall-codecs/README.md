@@ -6,6 +6,16 @@
 
 This crate is a core component of the **[videocall.rs](https://github.com/security-union/videocall-rs)** project. It provides a high-fidelity, cross-platform video decoder and jitter buffer, implemented in pure Rust.
 
+## Vision
+
+Currently focused on high-quality video decoding and jitter buffering, `videocall-codecs` is expanding to become a comprehensive multimedia codec solution. **Audio support is coming soon** - we're actively working on integrating audio codecs (Opus, AAC) alongside our existing video capabilities to provide a unified, cross-platform audio/video processing pipeline.
+
+Our roadmap includes:
+- **Audio Codec Integration**: Opus and AAC support with the same cross-platform design
+- **Unified Jitter Buffer**: Combined audio/video synchronization
+- **Enhanced Web Support**: Audio processing in Web Workers alongside video
+- **Real-time Audio Processing**: Low-latency audio decoding optimized for live streaming
+
 ## Features
 
 - **Cross-platform**: Works on native (libvpx) and WASM (WebCodecs) targets

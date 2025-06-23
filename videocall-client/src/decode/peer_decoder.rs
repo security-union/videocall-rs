@@ -75,13 +75,10 @@ trait VideoFrameDecoder {
     fn flush(&self);
 }
 
-// WASM implementation that handles VideoFrame callbacks
-#[cfg(target_arch = "wasm32")]
 struct WasmVideoFrameDecoder {
     decoder: WasmDecoder,
 }
 
-#[cfg(target_arch = "wasm32")]
 impl VideoFrameDecoder for WasmVideoFrameDecoder {
     fn push_frame(&self, frame: FrameBuffer) {
         self.decoder.push_frame(frame);

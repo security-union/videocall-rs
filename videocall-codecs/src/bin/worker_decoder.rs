@@ -118,11 +118,6 @@ fn decode_frame_direct(frame: FrameBuffer) {
                             );
                             *decoder_opt = None;
                             *waiting_for_key = true;
-                        } else {
-                            console::log_1(
-                                &format!("[WORKER] Decoded frame: {}", frame.sequence_number())
-                                    .into(),
-                            );
                         }
                     }
                 }

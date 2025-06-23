@@ -1,3 +1,5 @@
+# WARNING: This is a work in progress and not ready for production use.
+
 # Rust NetEQ - Adaptive Jitter Buffer for Audio
 
 A Rust implementation of a NetEQ-inspired adaptive jitter buffer for real-time audio applications. This library provides robust handling of network jitter, packet loss, and timing variations in audio streaming applications.
@@ -324,3 +326,5 @@ Licensed under MIT license ([LICENSE](LICENSE) or http://opensource.org/licenses
 - [WebRTC NetEQ Documentation](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_coding/neteq/)
 - [RFC 3550 - RTP: A Transport Protocol for Real-Time Applications](https://tools.ietf.org/html/rfc3550)
 - [Adaptive Jitter Buffer for Internet Telephony](https://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.91.5396) 
+
+- [How WebRTC NetEQ works](https://webrtchacks.com/how-webrtcs-neteq-jitter-buffer-provides-smooth-audio/)

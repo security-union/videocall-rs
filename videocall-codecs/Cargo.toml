@@ -23,7 +23,7 @@ path = "src/bin/main.rs"
 required-features = ["native"]
 
 [features]
-default = ["native"]
+default = []
 native = []
 wasm = [
     "wasm-bindgen",

@@ -38,7 +38,7 @@ use log::error;
 use std::sync::Arc;
 use std::sync::Mutex;
 use videocall_codecs::decoder::{Decodable, Decoder, VideoCodec};
-use videocall_codecs::frame::{FrameType, VideoFrame as CodecVideoFrame};
+use videocall_codecs::frame::{FrameBuffer, FrameType, VideoFrame as CodecVideoFrame};
 use videocall_codecs::jitter_buffer::JitterBuffer;
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::Closure;
@@ -69,53 +69,102 @@ pub trait PeerDecode {
 /// data.
 ///
 pub struct VideoPeerDecoder {
-    jitter_buffer: Arc<Mutex<JitterBuffer<web_sys::VideoFrame>>>,
-    _polling_interval: Interval,
+    decoder: Box<dyn VideoFrameDecoder>,
+}
+
+// Trait to handle VideoFrame callbacks in WASM
+trait VideoFrameDecoder {
+    fn push_frame(&self, frame: FrameBuffer);
+    fn is_waiting_for_keyframe(&self) -> bool;
+    fn flush(&self);
+}
+
+// WASM implementation that handles VideoFrame callbacks
+struct WasmVideoFrameDecoder {
+    decoder: videocall_codecs::decoder::WasmDecoder,
+}
+
+impl VideoFrameDecoder for WasmVideoFrameDecoder {
+    fn push_frame(&self, frame: FrameBuffer) {
+        self.decoder.push_frame(frame);
+    }
+
+    fn is_waiting_for_keyframe(&self) -> bool {
+        self.decoder.is_waiting_for_keyframe()
+    }
+
+    fn flush(&self) {
+        self.decoder.flush()
+    }
+}
+
+// Native implementation (placeholder for now)
+#[cfg(not(target_arch = "wasm32"))]
+struct NativeVideoFrameDecoder;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl VideoFrameDecoder for NativeVideoFrameDecoder {
+    fn push_frame(&self, _frame: FrameBuffer) {
+        log::warn!("Native VideoFrame decoder not yet implemented");
+    }
+
+    fn is_waiting_for_keyframe(&self) -> bool {
+        false
+    }
+
+    fn flush(&self) {
+        // No-op for now
+    }
 }
 
 impl VideoPeerDecoder {
     pub fn new(canvas_id: &str) -> Result<Self, JsValue> {
-        let id = canvas_id.to_owned();
+        let canvas_id = canvas_id.to_owned();
 
-        let on_decoded_frame = move |video_chunk: web_sys::VideoFrame| {
-            let render_canvas = window()
-                .unwrap()
-                .document()
-                .unwrap()
-                .get_element_by_id(&id)
-                .unwrap()
-                .unchecked_into::<HtmlCanvasElement>();
-            let ctx = render_canvas
-                .get_context("2d")
-                .unwrap()
-                .unwrap()
-                .unchecked_into::<CanvasRenderingContext2d>();
-            let width = video_chunk.display_width();
-            let height = video_chunk.display_height();
-            render_canvas.set_width(width);
-            render_canvas.set_height(height);
-            ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
-            if let Err(e) = ctx.draw_image_with_video_frame(&video_chunk, 0.0, 0.0) {
-                error!("Error drawing video frame: {:?}", e);
-            }
-            video_chunk.close();
+        let on_video_frame = move |video_frame: web_sys::VideoFrame| {
+            Self::render_to_canvas(&canvas_id, video_frame);
         };
 
-        let decoder = Decoder::new(VideoCodec::VP9, Box::new(on_decoded_frame));
-        let jitter_buffer = Arc::new(Mutex::new(JitterBuffer::new(Box::new(decoder))));
-        let jb_clone = jitter_buffer.clone();
-        let polling_interval = Interval::new(20, move || {
-            let now = web_time::SystemTime::now()
-                .duration_since(web_time::SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_millis();
-            let mut jb = jb_clone.lock().unwrap();
-            jb.find_and_move_continuous_frames(now);
+        let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
+            videocall_codecs::decoder::VideoCodec::VP9,
+            Box::new(on_video_frame),
+        );
+
+        let decoder = Box::new(WasmVideoFrameDecoder {
+            decoder: wasm_decoder,
         });
-        Ok(Self {
-            jitter_buffer,
-            _polling_interval: polling_interval,
-        })
+        Ok(Self { decoder })
+    }
+
+    fn render_to_canvas(canvas_id: &str, video_frame: web_sys::VideoFrame) {
+        if let Some(window) = web_sys::window() {
+            if let Some(document) = window.document() {
+                if let Some(canvas_element) = document.get_element_by_id(canvas_id) {
+                    let canvas = canvas_element.dyn_into::<HtmlCanvasElement>().unwrap();
+                    let ctx = canvas
+                        .get_context("2d")
+                        .unwrap()
+                        .unwrap()
+                        .dyn_into::<CanvasRenderingContext2d>()
+                        .unwrap();
+
+                    let width = video_frame.display_width();
+                    let height = video_frame.display_height();
+                    canvas.set_width(width);
+                    canvas.set_height(height);
+                    ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
+
+                    if let Err(e) = ctx.draw_image_with_video_frame(&video_frame, 0.0, 0.0) {
+                        log::error!("Error drawing video frame: {:?}", e);
+                    } else {
+                        log::debug!("Rendered video frame ({}x{})", width, height);
+                    }
+                } else {
+                    log::error!("Canvas element with id '{}' not found", canvas_id);
+                }
+            }
+        }
+        video_frame.close();
     }
 
     fn get_frame_type(&self, packet: &Arc<MediaPacket>) -> FrameType {
@@ -126,21 +175,16 @@ impl VideoPeerDecoder {
     }
 
     pub fn is_waiting_for_keyframe(&self) -> bool {
-        self.jitter_buffer.lock().unwrap().is_waiting_for_keyframe()
+        self.decoder.is_waiting_for_keyframe()
     }
 
     pub fn flush(&self) {
-        self.jitter_buffer.lock().unwrap().flush();
+        self.decoder.flush()
     }
 }
 
 impl PeerDecode for VideoPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
-        let now = web_time::SystemTime::now()
-            .duration_since(web_time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
         if let Some(video_metadata) = packet.video_metadata.as_ref() {
             let video_frame = CodecVideoFrame {
                 sequence_number: video_metadata.sequence,
@@ -148,8 +192,18 @@ impl PeerDecode for VideoPeerDecoder {
                 frame_type: self.get_frame_type(packet),
                 data: packet.data.clone(),
             };
-            let mut jb = self.jitter_buffer.lock().unwrap();
-            jb.insert_frame(video_frame, now);
+
+            // Create a FrameBuffer and push it to the decoder
+            let current_time_ms = web_time::SystemTime::now()
+                .duration_since(web_time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+
+            let frame_buffer = FrameBuffer::new(video_frame, current_time_ms);
+
+            // Use the new ergonomic API - decoder handles jitter buffer internally,
+            // and calls our VideoFrame callback for rendering
+            self.decoder.push_frame(frame_buffer);
         }
 
         Ok(DecodeStatus {

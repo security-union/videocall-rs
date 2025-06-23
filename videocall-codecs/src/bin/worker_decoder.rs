@@ -35,7 +35,6 @@
 
 //! Web worker decoder that handles both frame data and control messages.
 
-use console_error_panic_hook;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use videocall_codecs::frame::FrameBuffer;

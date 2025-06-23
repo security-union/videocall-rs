@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3](https://github.com/security-union/videocall-rs/compare/bot-v1.0.2...bot-v1.0.3) - 2025-06-23
+
+### Other
+
+- Add new decoder and Add MIT - Apache 2 license to all files ([#285](https://github.com/security-union/videocall-rs/pull/285))
+- move audio, video and speaker settings under a modal #273 ([#278](https://github.com/security-union/videocall-rs/pull/278))
+
 ## [1.0.2](https://github.com/security-union/videocall-rs/compare/bot-v1.0.1...bot-v1.0.2) - 2025-03-28
 
 ### Other

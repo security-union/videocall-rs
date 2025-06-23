@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.10](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.9...videocall-ui-v1.0.10) - 2025-06-23
+
+### Fixed
+
+- fix CSS for attendants and diagnostics ([#277](https://github.com/security-union/videocall-rs/pull/277))
+
+### Other
+
+- Add new decoder and Add MIT - Apache 2 license to all files ([#285](https://github.com/security-union/videocall-rs/pull/285))
+- disable ios controls maybe ([#284](https://github.com/security-union/videocall-rs/pull/284))
+- save ([#283](https://github.com/security-union/videocall-rs/pull/283))
+- save
+- save
+- Fix device modal selection ([#279](https://github.com/security-union/videocall-rs/pull/279))
+- move audio, video and speaker settings under a modal #273 ([#278](https://github.com/security-union/videocall-rs/pull/278))
+- Add the rawdawg to contributors ([#276](https://github.com/security-union/videocall-rs/pull/276))
+- Feature/gh 274 enhance mobile grid layout ([#275](https://github.com/security-union/videocall-rs/pull/275))
+- Test media track stream processor add wasm opus encoder to support Safari for realz ([#266](https://github.com/security-union/videocall-rs/pull/266))
+
 ## [1.0.9](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.8...videocall-ui-v1.0.9) - 2025-04-20
 
 ### Other

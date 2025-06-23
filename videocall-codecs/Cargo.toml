@@ -2,6 +2,17 @@
 name = "videocall-codecs"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>",
+]
+keywords = ["video", "codec", "webrtc", "vpx", "wasm"]
+categories = ["multimedia::video", "wasm", "web-programming"]
+description = "Cross-platform video codec library with VP8/VP9 support for native and WebAssembly environments"
+include = ["src/**/*", "assets/**/*"]
 
 [lib]
 name = "videocall_codecs"

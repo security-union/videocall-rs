@@ -39,6 +39,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-wasm-
 
+      - name: Install libvpx
+        run: sudo apt-get update && sudo apt-get install -y libvpx-dev
+
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 

@@ -5,7 +5,7 @@ name = "videocall-neteq"
 version = "0.1.0"
 edition = "2021"
 description = "NetEQ-inspired adaptive jitter buffer for audio decoding"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 thiserror = "1.0"

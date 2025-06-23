@@ -2,7 +2,7 @@
 name = "videocall-cli"
 version = "1.0.12"
 edition = "2021"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"
@@ -19,7 +19,7 @@ include = ["src/**/*", "assets/**/*"]
 
 [package.metadata.deb]
 maintainer = "Dario Lencina <dario@securityunion.dev>"
-license-file = ["../LICENSE.md", "4"]
+license-file = ["../LICENSE", "4"]
 depends = "libvpx7 (>= 1.11.0), libvpx-dev (>= 1.11.0), libc6 (>= 2.34), libasound2-dev (>=1.2.8), libv4l-dev (>=1.22.1), libssl-dev(>=3.3.1)"
 
 [dependencies]

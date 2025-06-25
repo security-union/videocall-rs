@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.0...videocall-codecs-v0.1.1) - 2025-06-25
+
+### Other
+
+- use jitter buffer in wasm and improve diagrams ([#288](https://github.com/security-union/videocall-rs/pull/288))
+
 ## [0.1.0](https://github.com/security-union/videocall-rs/releases/tag/videocall-codecs-v0.1.0) - 2025-01-01
 
 ### Added

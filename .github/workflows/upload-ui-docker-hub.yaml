@@ -7,12 +7,15 @@ on:
   push:
     branches:
       - main
+      - videocall-codecs-readme
     paths:
       - 'yew-ui/**'
       - 'types/**'
       - 'videocall-client/**'
+      - 'videocall-codecs/**'
       - Dockerfile.yew
       - nginx.conf
+  workflow_dispatch:
 
 jobs:
   push_to_registry:

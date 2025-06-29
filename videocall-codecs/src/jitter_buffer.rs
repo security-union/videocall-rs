@@ -38,6 +38,10 @@ const DELAY_SMOOTHING_FACTOR: f64 = 0.99;
 const MAX_BUFFER_SIZE: usize = 200;
 // From libwebrtc's jitter_buffer_common.h
 const MAX_CONSECUTIVE_OLD_FRAMES: u64 = 300;
+/// If an incoming keyframe is this many sequence numbers behind the last decoded frame, we assume
+/// the stream restarted (e.g., camera switch) and flush immediately. Smaller rollbacks are treated
+/// as harmless reordering.
+const STREAM_RESTART_BACKTRACK_THRESHOLD: u64 = 30;
 
 pub struct JitterBuffer<T> {
     /// Frames that have been received but are not yet continuous with the last decoded frame.
@@ -80,19 +84,33 @@ impl<T> JitterBuffer<T> {
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
+        println!("[JITTER_BUFFER] Inserting frame: {}", seq);
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
         if let Some(last_decoded) = self.last_decoded_sequence_number {
             if seq <= last_decoded {
-                println!("[JITTER_BUFFER] Ignoring old frame: {}", seq);
-                self.num_consecutive_old_frames += 1;
-                if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
+                // Special case: if the old frame is a KEYFRAME, it likely indicates the sender has
+                // restarted (e.g., camera switch). Flush immediately so we can start decoding from
+                // this new keyframe without waiting for the old-frame counter threshold.
+                if frame.frame_type == FrameType::KeyFrame
+                    && last_decoded.saturating_sub(seq) > STREAM_RESTART_BACKTRACK_THRESHOLD
+                {
                     println!(
-                        "[JITTER_BUFFER] Received {} consecutive old frames. Flushing buffer.",
-                        self.num_consecutive_old_frames
+                        "[JITTER_BUFFER] Detected keyframe with older sequence ({} <= {}). Assuming stream restart – flushing buffer.",
+                        seq, last_decoded
                     );
                     self.flush();
+                } else {
+                    println!("[JITTER_BUFFER] Ignoring old frame: {}", seq);
+                    self.num_consecutive_old_frames += 1;
+                    if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
+                        println!(
+                            "[JITTER_BUFFER] Received {} consecutive old frames. Flushing buffer.",
+                            self.num_consecutive_old_frames
+                        );
+                        self.flush();
+                    }
                 }
                 return;
             }

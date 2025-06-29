@@ -122,6 +122,49 @@ impl WebDecoder {
         console::log_1(&"[WORKER] WebCodecs decoder initialized".into());
         Ok(())
     }
+
+    /// Tear down the current decoder instance entirely, releasing all resources so that the next
+    /// decode call will create a fresh `VideoDecoder`. This is required when the decoder enters an
+    /// `InvalidStateError` that cannot be recovered from with `reset()`.
+    fn destroy_decoder(&self) {
+        // Acquire a mutable reference so we can replace the Option with `None`.
+        let mut decoder_ref = self.decoder.borrow_mut();
+
+        if let Some(decoder) = decoder_ref.take() {
+            // Attempt to close the decoder. If it is already closed the call may return an
+            // `InvalidStateError`; we simply log and continue.
+            if let Err(e) = decoder.close() {
+                console::error_1(
+                    &format!("[WORKER] Failed to close decoder cleanly: {:?}", e).into(),
+                );
+            } else {
+                console::log_1(&"[WORKER] Video decoder closed".into());
+            }
+
+            console::log_1(&"[WORKER] Video decoder destroyed".into());
+        }
+    }
+
+    /// High-level helper that tears down the decoder and schedules a jitter-buffer reset on the
+    /// next event-loop tick. This avoids nested borrows and ensures we always start clean, waiting
+    /// for a keyframe.
+    fn reset_pipeline(&self) {
+        // First, drop the current decoder instance (if any)
+        self.destroy_decoder();
+
+        // Schedule jitter-buffer reset asynchronously to avoid borrow conflicts with whatever
+        // call stack triggered this reset.
+        let self_scope = self.self_scope.clone();
+
+        let cb = Closure::once_into_js(move || {
+            reset_jitter_buffer();
+        });
+
+        // Ignore errors from setTimeout – if scheduling fails we'll try again on next frame.
+        let _ = self_scope
+            .set_timeout_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 0);
+        // `cb` moved into JS runtime, no need to forget.
+    }
 }
 
 impl Decodable for WebDecoder {
@@ -155,6 +198,13 @@ impl Decodable for WebDecoder {
                 Ok(chunk) => {
                     if let Err(e) = decoder.decode(&chunk) {
                         console::error_1(&format!("[WORKER] Decoder error: {:?}", e).into());
+
+                        // Release the immutable borrow so we can safely mutate within
+                        // `reset_pipeline()`.
+                        drop(decoder_ref);
+
+                        // Completely reset decoder + jitter buffer in a single abstraction.
+                        self.reset_pipeline();
                     }
                 }
                 Err(e) => {
@@ -246,7 +296,6 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
 
             // Get current time in milliseconds
             let current_time_ms = js_sys::Date::now() as u128;
-
             jb.insert_frame(video_frame, current_time_ms);
         }
     });

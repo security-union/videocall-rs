@@ -210,7 +210,7 @@ impl ScreenEncoder {
 
             // Setup FPS tracking and screen output handler
             let screen_output_handler = {
-                let mut buffer: [u8; 150000] = [0; 150000];
+                let mut buffer: Vec<u8> = Vec::with_capacity(150_000);
                 let mut sequence_number = 0;
                 let performance = window()
                     .performance()
@@ -234,10 +234,16 @@ impl ScreenEncoder {
                         last_chunk_time = now;
                     }
 
+                    // Ensure buffer is large enough for this chunk
+                    let byte_length = chunk.byte_length() as usize;
+                    if buffer.len() < byte_length {
+                        buffer.resize(byte_length, 0);
+                    }
+
                     let packet: PacketWrapper = transform_screen_chunk(
                         chunk,
                         sequence_number,
-                        &mut buffer,
+                        buffer.as_mut_slice(),
                         &userid,
                         aes.clone(),
                     );

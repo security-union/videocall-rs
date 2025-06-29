@@ -581,7 +581,7 @@ impl Component for AttendantsComponent {
                     { // Invitation overlay when there are no connected peers
                         if num_display_peers == 0 {
                             html! {
-                                <div id="invite-overlay" style="position: fixed; top: 20px; right: 20px; background: rgba(0,0,0,0.95); padding: 1rem 1.5rem; border-radius: 8px; max-width: 380px; z-index: 3000; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                                <div id="invite-overlay" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.9); padding: 1.5rem 2rem; border-radius: 8px; width: 90%; max-width: 420px; z-index: 3000; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3); text-align: center;">
                                     <h3 style="margin-top:0;">{"Your meeting's ready"}</h3>
                                     <p style="font-size: 0.9rem; opacity: 0.8;">{"Share this meeting link with others you want in the meeting"}</p>
                                     <div style="display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;">

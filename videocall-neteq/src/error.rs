@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use thiserror::Error;
 
 /// Result type for NetEQ operations

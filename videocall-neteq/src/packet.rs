@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 

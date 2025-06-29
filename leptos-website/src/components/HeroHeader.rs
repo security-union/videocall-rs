@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 #![allow(dead_code)]
 
 use crate::components::SecondaryButton;

@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use crate::components::CTAButton::*;
 use leptos::*;
 

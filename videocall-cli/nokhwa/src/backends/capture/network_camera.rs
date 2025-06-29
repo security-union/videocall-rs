@@ -17,6 +17,7 @@
  */
 
 
+
 use crate::backends::capture::OpenCvCaptureDevice;
 use image::{buffer::ConvertBuffer, ImageBuffer, Rgb, RgbaImage};
 use nokhwa_core::{error::NokhwaError, traits::CaptureBackendTrait};

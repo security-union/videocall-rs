@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use cfg_if::cfg_if;
 
 // boilerplate to run in different modes

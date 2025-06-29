@@ -206,12 +206,6 @@ fn main() -> Result<()> {
                 data: frame.data.to_vec(),
                 timestamp: current_time_ms as f64,
             };
-            println!(
-                "[JB_INSERT] Inserting Frame: {}, Type: {:?}, Size: {}",
-                video_frame.sequence_number,
-                video_frame.frame_type,
-                video_frame.data.len()
-            );
             jitter_buffer.insert_frame(video_frame, current_time_ms);
         }
 

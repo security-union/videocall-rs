@@ -296,7 +296,6 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
 
             // Get current time in milliseconds
             let current_time_ms = js_sys::Date::now() as u128;
-
             jb.insert_frame(video_frame, current_time_ms);
         }
     });

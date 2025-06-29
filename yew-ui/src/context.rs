@@ -47,8 +47,9 @@ pub fn clear_username_from_storage() {
 // Validation helpers
 // -----------------------------------------------------------------------------
 
-/// Regex for `^[a-zA-Z0-9_]*$` compiled once at start-up.
 lazy_static::lazy_static! {
+
+    /// Regex compiled once at start-up.
     static ref USERNAME_RE: regex::Regex = regex::Regex::new(r"^[A-Za-z0-9_]+$").unwrap();
 }
 
@@ -56,12 +57,4 @@ lazy_static::lazy_static! {
 /// allowed pattern.
 pub fn is_valid_username(name: &str) -> bool {
     !name.is_empty() && USERNAME_RE.is_match(name)
-}
-
-/// Helper that reads the string value out of an `InputEvent`.
-pub fn extract_input_value(e: InputEvent) -> String {
-    e.target()
-        .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
-        .map(|input| input.value())
-        .unwrap_or_default()
 }

@@ -19,22 +19,22 @@
 #[allow(non_camel_case_types)]
 mod components;
 mod constants;
+mod context;
 mod pages;
 
-use constants::{E2EE_ENABLED, LOGIN_URL, WEBTRANSPORT_ENABLED};
-use videocall_types::truthy;
+use constants::LOGIN_URL;
 
-use log::info;
 use yew::prelude::*;
 #[macro_use]
 extern crate lazy_static;
-use components::{attendants::AttendantsComponent, matomo::MatomoTracker, top_bar::TopBar};
+use components::matomo::MatomoTracker;
 use enum_display::EnumDisplay;
 use gloo_utils::window;
 use pages::home::Home;
 use yew_router::prelude::*;
 
-use crate::constants::ENABLE_OAUTH;
+use context::{load_username_from_storage, UsernameCtx};
+use pages::meeting::MeetingPage;
 
 /// Videocall UI
 ///
@@ -49,11 +49,10 @@ enum Route {
     Home,
     #[at("/login")]
     Login,
-    #[at("/meeting/:email/:id")]
-    Meeting { email: String, id: String },
-    #[at("/meeting/:email/:id/:webtransport_enabled")]
+    #[at("/meeting/:id")]
+    Meeting { id: String },
+    #[at("/meeting/:id/:webtransport_enabled")]
     Meeting2 {
-        email: String,
         id: String,
         webtransport_enabled: String,
     },
@@ -68,22 +67,11 @@ fn switch(routes: Route) -> Html {
     match routes {
         Route::Home => html! { <Home /> },
         Route::Login => html! { <Login/> },
-        Route::Meeting { email, id } => html! {
-            <>
-                <TopBar/>
-                <AttendantsComponent email={email} id={id} webtransport_enabled={*WEBTRANSPORT_ENABLED} e2ee_enabled={*E2EE_ENABLED} />
-            </>
-        },
+        Route::Meeting { id } => html! { <MeetingPage id={id} /> },
         Route::Meeting2 {
-            email,
             id,
-            webtransport_enabled,
-        } => html! {
-            <>
-                <TopBar/>
-                <AttendantsComponent email={email} id={id} webtransport_enabled={truthy(Some(&webtransport_enabled))} e2ee_enabled={*E2EE_ENABLED} />
-            </>
-        },
+            webtransport_enabled: _,
+        } => html! { <MeetingPage id={id} /> },
         Route::NotFound => html! { <h1>{ "404" }</h1> },
     }
 }
@@ -98,29 +86,15 @@ fn login() -> Html {
     </>}
 }
 
-struct App {}
-
-impl Component for App {
-    type Message = ();
-    type Properties = ();
-
-    fn create(_: &Context<Self>) -> Self {
-        App {}
-    }
-
-    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            ctx.link().send_message(());
-        }
-    }
-
-    fn view(&self, _ctx: &Context<Self>) -> Html {
-        info!("OAuth enabled: {}", *ENABLE_OAUTH);
-        html! {
+#[function_component(AppRoot)]
+fn app_root() -> Html {
+    let username_state = use_state(load_username_from_storage);
+    html! {
+        <ContextProvider<UsernameCtx> context={username_state.clone()}>
             <BrowserRouter>
                 <Switch<Route> render={switch} />
             </BrowserRouter>
-        }
+        </ContextProvider<UsernameCtx>>
     }
 }
 
@@ -135,5 +109,5 @@ fn main() {
     }
 
     console_error_panic_hook::set_once();
-    yew::Renderer::<App>::new().render();
+    yew::Renderer::<AppRoot>::new().render();
 }

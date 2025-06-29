@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use crate::components::SecondaryButton;
 use leptos::*;
 

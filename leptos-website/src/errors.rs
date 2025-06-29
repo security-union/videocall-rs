@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use http::status::StatusCode;
 use thiserror::Error;
 

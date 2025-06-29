@@ -19,10 +19,24 @@
 use crate::components::icons::{
     digital_ocean::DigitalOceanIcon, discord::DiscordIcon, youtube::YoutubeIcon,
 };
+use crate::context::{clear_username_from_storage, UsernameCtx};
+use gloo_utils::window;
 use yew::prelude::*;
 
 #[function_component(TopBar)]
 pub fn top_bar() -> Html {
+    let username_ctx = use_context::<UsernameCtx>();
+    let change_username = if let Some(ctx) = &username_ctx {
+        let ctx = ctx.clone();
+        Some(Callback::from(move |_| {
+            ctx.set(None);
+            clear_username_from_storage();
+            let _ = window().location().reload();
+        }))
+    } else {
+        None
+    };
+
     html! {
         <div class="top-bar">
             <div class="flex space-x-2 align-middle">
@@ -44,6 +58,13 @@ pub fn top_bar() -> Html {
                         <DigitalOceanIcon />
                     </div>
                 </a>
+                {
+                    if let Some(onclick) = change_username {
+                        html! {
+                            <button class="change-username-btn text-sm px-3 py-1 border rounded" onclick={onclick}>{"Change name"}</button>
+                        }
+                    } else { html!{} }
+                }
             </div>
             <span>{ "Made with ❤️ by awesome developers from all over the world 🌏, hosted by Security Union 🛡️." }</span>
         </div>

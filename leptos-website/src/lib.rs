@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 #![allow(non_snake_case)]
 
 use cfg_if::cfg_if;
@@ -25,8 +24,8 @@ pub mod components;
 pub mod error_template;
 pub mod errors;
 pub mod fallback;
-pub mod pages;
 pub mod icons;
+pub mod pages;
 
 cfg_if! {
     if #[cfg(feature = "hydrate")] {

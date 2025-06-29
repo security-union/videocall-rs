@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 //! # Rust NetEQ
 //!
 //! A NetEQ-inspired adaptive jitter buffer implementation for audio decoding.

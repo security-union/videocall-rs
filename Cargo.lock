@@ -821,7 +821,7 @@ checksum = "cfa8873f51c92e232f9bac4065cddef41b714152812bfc5f7672ba16d6ef8cd9"
 
 [[package]]
 name = "bot"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "chrono",
  "dotenv",
@@ -6374,7 +6374,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-types"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "protobuf",
  "serde",
@@ -6392,8 +6392,10 @@ dependencies = [
  "futures",
  "gloo-timers 0.2.6",
  "gloo-utils 0.1.7",
+ "js-sys",
  "lazy_static",
  "log",
+ "regex",
  "videocall-client",
  "videocall-types",
  "wasm-bindgen",

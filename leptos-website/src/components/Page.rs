@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use crate::components::Footer::*;
 // use crate::components::Header::*;
 use leptos::*;

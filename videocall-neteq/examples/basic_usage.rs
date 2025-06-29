@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use rust_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 use std::time::{Duration, Instant};
 

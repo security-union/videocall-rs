@@ -21,7 +21,9 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::components::browser_compatibility::BrowserCompatibility;
+use crate::context::{is_valid_username, save_username_to_storage, UsernameCtx};
 use crate::Route;
+use web_time::SystemTime;
 
 const TEXT_INPUT_CLASSES: &str = "bg-background-light/20 backdrop-filter-blur text-white border border-white/10 outline-none focus:ring-2 focus:ring-primary rounded-xl p-4 w-full placeholder:text-foreground-subtle transition-all duration-300 hover:border-white/20";
 
@@ -35,17 +37,28 @@ pub fn home() -> Html {
     // Tab state for features section
     let active_tab = use_state(|| 0);
 
+    let username_ctx = use_context::<UsernameCtx>().expect("Username context missing");
+
+    let existing_username: String = (*username_ctx).clone().unwrap_or_default();
+
     let onsubmit = {
         let username_ref = username_ref.clone();
         let meeting_id_ref = meeting_id_ref.clone();
+        let navigator = navigator.clone();
+        let username_ctx = username_ctx.clone();
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
             let username = username_ref.cast::<HtmlInputElement>().unwrap().value();
             let meeting_id = meeting_id_ref.cast::<HtmlInputElement>().unwrap().value();
-            navigator.push(&Route::Meeting {
-                id: meeting_id,
-                email: username,
-            })
+            if !is_valid_username(&username) || meeting_id.is_empty() {
+                let _ = web_sys::window().unwrap().alert_with_message(
+                    "Please provide a valid username and meeting id (a-z, A-Z, 0-9, _).",
+                );
+                return;
+            }
+            save_username_to_storage(&username);
+            username_ctx.set(Some(username));
+            navigator.push(&Route::Meeting { id: meeting_id });
         })
     };
 
@@ -58,6 +71,33 @@ pub fn home() -> Html {
         let active_tab = active_tab.clone();
         Callback::from(move |tab: usize| {
             active_tab.set(tab);
+        })
+    };
+
+    fn generate_meeting_id() -> String {
+        let millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        format!("{:x}", millis)
+    }
+
+    let create_meeting = {
+        let username_ref = username_ref.clone();
+        let navigator = navigator.clone();
+        let username_ctx = username_ctx.clone();
+        Callback::from(move |_| {
+            let username = username_ref.cast::<HtmlInputElement>().unwrap().value();
+            if !is_valid_username(&username) {
+                let _ = web_sys::window()
+                    .unwrap()
+                    .alert_with_message("Please enter a valid username before creating a meeting.");
+                return;
+            }
+            let meeting_id = generate_meeting_id();
+            save_username_to_storage(&username);
+            username_ctx.set(Some(username));
+            navigator.push(&Route::Meeting { id: meeting_id });
         })
     };
 
@@ -105,6 +145,7 @@ pub fn home() -> Html {
                                 required={true}
                                 pattern="^[a-zA-Z0-9_]*$"
                                 autofocus={true}
+                                value={existing_username.clone()}
                             />
                         </div>
 
@@ -130,6 +171,12 @@ pub fn home() -> Html {
                                     <path d="m12 5 7 7-7 7"></path>
                                 </svg>
                                 <span class="cta-glow"></span>
+                            </button>
+                        </div>
+
+                        <div class="mt-2">
+                            <button type="button" class="secondary-button w-full flex items-center justify-center gap-2" onclick={create_meeting.clone()}>
+                                <span class="text-lg">{"Create New Meeting"}</span>
                             </button>
                         </div>
                     </div>

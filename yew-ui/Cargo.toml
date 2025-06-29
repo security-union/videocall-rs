@@ -28,6 +28,8 @@ wasm-bindgen-futures = { workspace = true }
 enum-display = "0.1.4"
 futures = "0.3.31"
 web-time = "1.1.0"
+regex = "1.10"
+js-sys = "0.3.72"
 
 [dependencies.web-sys]
 version = "0.3.72"
@@ -35,6 +37,7 @@ features = [
     "HtmlDocument",
     "console",
     "Navigator",
+    "Storage",
 ]
 
 [dev-dependencies]

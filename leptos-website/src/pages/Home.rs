@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use crate::components::sections::Company::CompanySection;
 use crate::components::sections::Customers::CustomersSection;
 use crate::components::sections::Developers::DevelopersSection;

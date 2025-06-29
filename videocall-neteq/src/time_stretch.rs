@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use crate::statistics::TimeStretchOperation;
 use crate::{NetEqError, Result};
 

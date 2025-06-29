@@ -48,8 +48,11 @@ ingress:
             name: rustlemania-ui
             port:
               number: 80
+    # setup redirect from rustlemania.com to app.videocall.rs
+    # NOTE: rustlemania.com is now handled by a separate redirect Ingress defined in templates/redirect-ingress.yaml
   tls:
     - secretName: rustlemania-ui-tls
       hosts:
         - app.videocall.rs
         - transport.rustlemania.com
+        # rustlemania.com cert is still referenced by redirect Ingress

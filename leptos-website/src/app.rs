@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use crate::pages::Home::*;
 use leptos::*;
 use leptos_meta::*;

@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use crate::errors::TodoAppError;
 use leptos::{Errors, *};
 #[cfg(feature = "ssr")]

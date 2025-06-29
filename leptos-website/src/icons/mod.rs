@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 #![allow(dead_code)]
 
 use leptos::*;
@@ -129,5 +128,3 @@ pub fn DigitalOceanIcon() -> impl IntoView {
         </svg>
     }
 }
-
-

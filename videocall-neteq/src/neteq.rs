@@ -16,7 +16,6 @@
  * conditions.
  */
 
-
 use std::time::{Duration, Instant};
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};

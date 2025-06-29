@@ -192,7 +192,7 @@ impl CameraEncoder {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let video_output_handler = {
-            let mut buffer: [u8; 100000] = [0; 100000];
+            let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
             let mut sequence_number = 0;
             let mut last_chunk_time = window().performance().unwrap().now();
             let mut chunks_in_last_second = 0;
@@ -211,10 +211,16 @@ impl CameraEncoder {
                     last_chunk_time = now;
                 }
 
+                // Ensure the backing buffer is large enough for this chunk
+                let byte_length = chunk.byte_length() as usize;
+                if buffer.len() < byte_length {
+                    buffer.resize(byte_length, 0);
+                }
+
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
                     sequence_number,
-                    &mut buffer,
+                    buffer.as_mut_slice(),
                     &userid,
                     aes.clone(),
                 );

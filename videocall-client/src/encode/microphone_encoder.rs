@@ -175,13 +175,19 @@ impl MicrophoneEncoder {
             ..
         } = self.state.clone();
         let audio_output_handler = {
-            let mut buffer: [u8; 100000] = [0; 100000];
+            let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
+                // Ensure buffer can hold the encoded audio data
+                let byte_length = chunk.byte_length() as usize;
+                if buffer.len() < byte_length {
+                    buffer.resize(byte_length, 0);
+                }
+
                 let packet: PacketWrapper = transform_audio_chunk(
                     &chunk,
-                    &mut buffer,
+                    buffer.as_mut_slice(),
                     &userid,
                     sequence_number,
                     aes.clone(),

@@ -21,6 +21,7 @@ use crate::components::{
 };
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
+use gloo_utils::window;
 use log::{debug, error, warn};
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
@@ -508,6 +509,25 @@ impl Component for AttendantsComponent {
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
+        // Compute meeting link for invitation overlay
+        let meeting_link = {
+            let origin_result = window().location().origin();
+            // If obtaining origin fails, fallback to empty string
+            let origin = origin_result.unwrap_or_else(|_| "".to_string());
+            format!("{}/meeting/{}", origin, ctx.props().id)
+        };
+
+        // Callback to copy the meeting link to clipboard
+        let copy_meeting_link = {
+            let meeting_link = meeting_link.clone();
+            Callback::from(move |_| {
+                if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) {
+                    // Try to write text; ignore potential JS promise errors for now
+                    let _ = clipboard.write_text(&meeting_link);
+                }
+            })
+        };
+
         let mut grid_container_classes = classes!();
         if self.force_desktop_grid_on_mobile {
             grid_container_classes.push("force-desktop-grid");
@@ -557,6 +577,33 @@ impl Component for AttendantsComponent {
                     data-peers={num_peers_for_styling.to_string()}
                     style={container_style}>
                     { rows }
+
+                    { // Invitation overlay when there are no connected peers
+                        if num_display_peers == 0 {
+                            html! {
+                                <div id="invite-overlay" style="position: fixed; top: 20px; right: 20px; background: rgba(0,0,0,0.95); padding: 1rem 1.5rem; border-radius: 8px; max-width: 380px; z-index: 3000; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
+                                    <h3 style="margin-top:0;">{"Your meeting's ready"}</h3>
+                                    <p style="font-size: 0.9rem; opacity: 0.8;">{"Share this meeting link with others you want in the meeting"}</p>
+                                    <div style="display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;">
+                                        <input
+                                            id="meeting-link-input"
+                                            value={meeting_link.clone()}
+                                            readonly=true
+                                            style="flex:1; padding: 0.5rem; border: none; border-radius: 4px; background: #333; color: white; font-size: 0.9rem; overflow:hidden; text-overflow: ellipsis;"/>
+                                        <button
+                                            class="copy-link-button"
+                                            style="margin-left: 0.5rem; background: #4CAF50; color: white; border: none; padding: 0.5rem 0.75rem; border-radius: 4px; cursor: pointer;"
+                                            onclick={copy_meeting_link}
+                                        >
+                                            {"Copy"}
+                                        </button>
+                                    </div>
+                                    <p style="font-size: 0.8rem; opacity: 0.7;">{"People who use this meeting link must get your permission before they can join."}</p>
+                                </div>
+                            }
+                        } else { html!{} }
+                    }
+
                     {
                         if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
                             html! {

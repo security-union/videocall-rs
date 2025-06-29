@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3](https://github.com/security-union/videocall-rs/compare/videocall-types-v1.0.2...videocall-types-v1.0.3) - 2025-06-29
+
+### Other
+
+- Fix meeting creation ([#293](https://github.com/security-union/videocall-rs/pull/293))
+
 ## [1.0.2](https://github.com/security-union/videocall-rs/compare/videocall-types-v1.0.1...videocall-types-v1.0.2) - 2025-06-23
 
 ### Other

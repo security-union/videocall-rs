@@ -1,0 +1,30 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "rustlemania.fullname" . }}-redirect
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    kubernetes.io/tls-acme: "true"
+    nginx.ingress.kubernetes.io/permanent-redirect: "https://videocall.rs$request_uri"
+    nginx.ingress.kubernetes.io/permanent-redirect-code: "308"
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - secretName: rustlemania-ui-tls
+      hosts:
+        - rustlemania.com
+  rules:
+    - host: rustlemania.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                # A backend must be specified, but will never be reached because of the redirect.
+                name: {{ include "rustlemania.fullname" . }}
+                port:
+                  number: 80
+{{- end }} 

@@ -155,6 +155,23 @@ impl Decodable for WebDecoder {
                 Ok(chunk) => {
                     if let Err(e) = decoder.decode(&chunk) {
                         console::error_1(&format!("[WORKER] Decoder error: {:?}", e).into());
+
+                        // Attempt to recover by resetting the decoder. According to the WebCodecs
+                        // specification, calling `reset` clears the internal state of the
+                        // `VideoDecoder` while keeping the existing configuration, allowing future
+                        // decode calls to succeed without having to recreate the decoder.
+                        if let Err(reset_err) = decoder.reset() {
+                            console::error_1(
+                                &format!("[WORKER] Failed to reset decoder: {:?}", reset_err)
+                                    .into(),
+                            );
+                        } else {
+                            console::log_1(
+                                &"[WORKER] Video decoder successfully reset after error".into(),
+                            );
+                            // Also reset the jitter buffer so we ignore frames until the next keyframe.
+                            reset_jitter_buffer();
+                        }
                     }
                 }
                 Err(e) => {

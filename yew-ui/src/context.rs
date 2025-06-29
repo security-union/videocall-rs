@@ -34,13 +34,6 @@ pub fn save_username_to_storage(username: &str) {
     }
 }
 
-/// Remove the cached username (used by the "Change username" button).
-pub fn clear_username_from_storage() {
-    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.remove_item(STORAGE_KEY);
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Validation helpers
 // -----------------------------------------------------------------------------

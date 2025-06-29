@@ -38,6 +38,8 @@ features = [
     "console",
     "Navigator",
     "Storage",
+    "Document",
+    "Clipboard",
 ]
 
 [dev-dependencies]

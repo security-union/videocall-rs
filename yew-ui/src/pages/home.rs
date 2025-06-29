@@ -21,7 +21,9 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::components::browser_compatibility::BrowserCompatibility;
-use crate::context::{is_valid_username, save_username_to_storage, UsernameCtx};
+use crate::context::{
+    is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
+};
 use crate::Route;
 use web_time::SystemTime;
 
@@ -39,7 +41,11 @@ pub fn home() -> Html {
 
     let username_ctx = use_context::<UsernameCtx>().expect("Username context missing");
 
-    let existing_username: String = (*username_ctx).clone().unwrap_or_default();
+    let existing_username: String = if let Some(name) = &*username_ctx {
+        name.clone()
+    } else {
+        load_username_from_storage().unwrap_or_default()
+    };
 
     let onsubmit = {
         let username_ref = username_ref.clone();

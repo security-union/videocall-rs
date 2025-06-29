@@ -88,7 +88,7 @@ fn login() -> Html {
 
 #[function_component(AppRoot)]
 fn app_root() -> Html {
-    let username_state = use_state(|| load_username_from_storage());
+    let username_state = use_state(load_username_from_storage);
     html! {
         <ContextProvider<UsernameCtx> context={username_state.clone()}>
             <BrowserRouter>

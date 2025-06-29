@@ -6,8 +6,6 @@
 //! username in `localStorage` and sharing it across the component tree
 //! through Yew's `ContextProvider`.
 
-use wasm_bindgen::JsCast;
-use web_sys::HtmlInputElement;
 use yew::prelude::*;
 
 /// Type alias used throughout the app when accessing the username context.

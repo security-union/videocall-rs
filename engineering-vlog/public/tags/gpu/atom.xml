@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">
+    <title>Videocall Engineering - gpu</title>
+    <subtitle>Videocall Engineering</subtitle>
+    <link rel="self" type="application/atom+xml" href="https://engineering.videocall.rs/tags/gpu/atom.xml"/>
+    <link rel="alternate" type="text/html" href="https://engineering.videocall.rs"/>
+    <generator uri="https://www.getzola.org/">Zola</generator>
+    <updated>2025-03-15T00:00:00+00:00</updated>
+    <id>https://engineering.videocall.rs/tags/gpu/atom.xml</id>
+    <entry xml:lang="en">
+        <title>How I Implemented Hot Reloading for WGSL Shaders in Rust</title>
+        <published>2025-03-15T00:00:00+00:00</published>
+        <updated>2025-03-15T00:00:00+00:00</updated>
+        
+        <author>
+          <name>
+            
+              Unknown
+            
+          </name>
+        </author>
+        
+        <link rel="alternate" type="text/html" href="https://engineering.videocall.rs/posts/hotreload/"/>
+        <id>https://engineering.videocall.rs/posts/hotreload/</id>
+        
+        <content type="html" xml:base="https://engineering.videocall.rs/posts/hotreload/">&lt;p&gt;&lt;span style=&quot;color:orange;&quot;&gt;My solution&lt;&#x2F;span&gt;&lt;&#x2F;p&gt;
+&lt;p&gt;When developing WGSL shaders for my Rust-based graphics engine, I needed a solution to avoid constantly restarting the application to see changes. I built a hot reload system that watches shader files and automatically recompiles them when modifications are detected. The core of this approach uses Rust&#x27;s notify crate to monitor file system events, combined with a debouncing mechanism to prevent multiple reloads during rapid file saves. When a change is detected, the engine creates new shader modules with &lt;code&gt;core.device.create_shader_module()&lt;&#x2F;code&gt; and carefully rebuilds the render pipeline while maintaining the original bind group layouts.&lt;&#x2F;p&gt;
+&lt;p&gt;Important struct:
+&lt;a href=&quot;https:&#x2F;&#x2F;github.com&#x2F;altunenes&#x2F;cuneus&#x2F;blob&#x2F;b068041c7902df29d33c3100ea4b74a1a38164ff&#x2F;src&#x2F;hot.rs#L9-L231&quot;&gt;Source Code&lt;&#x2F;a&gt;&lt;&#x2F;p&gt;
+&lt;pre data-lang=&quot;rust&quot; style=&quot;background-color:#0f1419;color:#bfbab0;&quot; class=&quot;language-rust &quot;&gt;&lt;code class=&quot;language-rust&quot; data-lang=&quot;rust&quot;&gt;&lt;span style=&quot;color:#ff7733;&quot;&gt;pub struct &lt;&#x2F;span&gt;&lt;span style=&quot;color:#59c2ff;&quot;&gt;ShaderHotReload &lt;&#x2F;span&gt;&lt;span&gt;{
+&lt;&#x2F;span&gt;&lt;span&gt;    &lt;&#x2F;span&gt;&lt;span style=&quot;color:#ff7733;&quot;&gt;pub &lt;&#x2F;span&gt;&lt;span&gt;vs_module&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;: &lt;&#x2F;span&gt;&lt;span&gt;wgpu&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;ShaderModule,
+&lt;&#x2F;span&gt;&lt;span&gt;    &lt;&#x2F;span&gt;&lt;span style=&quot;color:#ff7733;&quot;&gt;pub &lt;&#x2F;span&gt;&lt;span&gt;fs_module&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;: &lt;&#x2F;span&gt;&lt;span&gt;wgpu&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;ShaderModule,
+&lt;&#x2F;span&gt;&lt;span&gt;    device&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;: &lt;&#x2F;span&gt;&lt;span&gt;Arc&amp;lt;wgpu&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;Device&amp;gt;,
+&lt;&#x2F;span&gt;&lt;span&gt;    shader_paths&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;: &lt;&#x2F;span&gt;&lt;span style=&quot;font-style:italic;color:#39bae6;&quot;&gt;Vec&lt;&#x2F;span&gt;&lt;span&gt;&amp;lt;PathBuf&amp;gt;,
+&lt;&#x2F;span&gt;&lt;span&gt;    last_vs_content&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;:&lt;&#x2F;span&gt;&lt;span&gt; String,
+&lt;&#x2F;span&gt;&lt;span&gt;    last_fs_content&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;:&lt;&#x2F;span&gt;&lt;span&gt; String,
+&lt;&#x2F;span&gt;&lt;span&gt;    &lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;#&lt;&#x2F;span&gt;&lt;span&gt;[&lt;&#x2F;span&gt;&lt;span style=&quot;color:#ffb454;&quot;&gt;allow&lt;&#x2F;span&gt;&lt;span&gt;(dead_code)]
+&lt;&#x2F;span&gt;&lt;span&gt;    watcher&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;: &lt;&#x2F;span&gt;&lt;span&gt;notify&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;RecommendedWatcher,
+&lt;&#x2F;span&gt;&lt;span&gt;    rx&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;: &lt;&#x2F;span&gt;&lt;span&gt;Receiver&amp;lt;notify&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;Event&amp;gt;,
+&lt;&#x2F;span&gt;&lt;span&gt;    _watcher_tx&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;: &lt;&#x2F;span&gt;&lt;span&gt;std&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;sync&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;mpsc&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;Sender&amp;lt;notify&lt;&#x2F;span&gt;&lt;span style=&quot;color:#f29668;&quot;&gt;::&lt;&#x2F;span&gt;&lt;span&gt;Event&amp;gt;,
+&lt;&#x2F;span&gt;&lt;span&gt;    last_update_times&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;: &lt;&#x2F;span&gt;&lt;span&gt;HashMap&amp;lt;PathBuf, Instant&amp;gt;, &lt;&#x2F;span&gt;&lt;span style=&quot;font-style:italic;color:#5c6773;&quot;&gt;&#x2F;&#x2F;Keeps track of when each shader file was last updated.
+&lt;&#x2F;span&gt;&lt;span&gt;    debounce_duration&lt;&#x2F;span&gt;&lt;span style=&quot;color:#bfbab0cc;&quot;&gt;:&lt;&#x2F;span&gt;&lt;span&gt; Duration, &lt;&#x2F;span&gt;&lt;span style=&quot;font-style:italic;color:#5c6773;&quot;&gt;&#x2F;&#x2F;Defines how long to wait before allowing another reload of the same file. The default is 100ms.
+&lt;&#x2F;span&gt;&lt;span&gt;}
+&lt;&#x2F;span&gt;&lt;&#x2F;code&gt;&lt;&#x2F;pre&gt;
+&lt;p&gt;My ShaderHotReload struct stores references to shader files, tracks the last update times for debouncing, and maintains the original shader content for comparison. When a file change is detected, it reads the new shader content, compares it to the previous version, and only triggers a reload if there&#x27;s an actual change.&lt;&#x2F;p&gt;
+</content>
+        
+    </entry>
+</feed>

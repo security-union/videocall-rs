@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">
+    <title>Videocall Engineering - pareidolia</title>
+    <subtitle>Videocall Engineering</subtitle>
+    <link rel="self" type="application/atom+xml" href="https://engineering.videocall.rs/tags/pareidolia/atom.xml"/>
+    <link rel="alternate" type="text/html" href="https://engineering.videocall.rs"/>
+    <generator uri="https://www.getzola.org/">Zola</generator>
+    <updated>2025-06-22T00:00:00+00:00</updated>
+    <id>https://engineering.videocall.rs/tags/pareidolia/atom.xml</id>
+    <entry xml:lang="en">
+        <title>How LLMs See Illusory Faces</title>
+        <published>2025-06-22T00:00:00+00:00</published>
+        <updated>2025-06-22T00:00:00+00:00</updated>
+        
+        <author>
+          <name>
+            
+              Unknown
+            
+          </name>
+        </author>
+        
+        <link rel="alternate" type="text/html" href="https://engineering.videocall.rs/posts/pareidolia/"/>
+        <id>https://engineering.videocall.rs/posts/pareidolia/</id>
+        
+        <content type="html" xml:base="https://engineering.videocall.rs/posts/pareidolia/">&lt;h4 id=&quot;background&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; Background &lt;&#x2F;span&gt;&lt;&#x2F;h4&gt;
+&lt;p&gt;Seeing faces in inanimate objects —a phenomenon called pareidolia— is a common human experience. With today&#x27;s powerful Vision-Language Models (VLMs), a simple question arises: do they see these illusory faces too? Probing their &quot;vision&quot; this way isn&#x27;t just a fun experiment. It&#x27;s a practical way to understand their inner workings, challenge our assumptions when building with them, and explore the gap between artificial and biological sight.&lt;&#x2F;p&gt;
+&lt;p&gt;This question grew out of my master&#x27;s research, where I used EEG to study how the human brain processes these very illusions, which led to an &lt;a href=&quot;https:&#x2F;&#x2F;papers.ssrn.com&#x2F;sol3&#x2F;papers.cfm?abstract_id=4341900&quot;&gt;ERP paper&lt;&#x2F;a&gt; on the topic.&lt;&#x2F;p&gt;
+&lt;h4 id=&quot;what-is-spatial-frequency-and-coarse-to-fine-theory&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; What is Spatial Frequency and Coarse-to-Fine Theory? &lt;&#x2F;span&gt;&lt;&#x2F;h4&gt;
+&lt;p&gt;So, how do you fairly test an AI&#x27;s perception? My plan was to see if it falls for the same visual shortcuts our brains do.&lt;&#x2F;p&gt;
+&lt;p&gt;This is based on a key idea in human vision called the &lt;strong&gt;Coarse-to-Fine&lt;&#x2F;strong&gt; theory. In short, human brain processes the blurry, general, coarse, &quot;gist&quot; of something first, and then uses that initial guess to figure out the finer details more quickly. The technical way to separate the &quot;gist&quot; from the &quot;details&quot; is with &lt;strong&gt;spatial frequencies&lt;&#x2F;strong&gt;, which can be isolated using techniques like 2D Fourier filtering.&lt;&#x2F;p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;Low Spatial Frequencies (LSF)&lt;&#x2F;strong&gt; are the blurry, large-scale shapes.&lt;&#x2F;li&gt;
+&lt;li&gt;&lt;strong&gt;High Spatial Frequencies (HSF)&lt;&#x2F;strong&gt; are the sharp edges and fine textures.&lt;&#x2F;li&gt;
+&lt;&#x2F;ul&gt;
+&lt;p&gt;You experience this all the time. Think about recognizing someone from across the street—you see their overall shape long before you see their eyes. While not about spatial frequency directly, a study on hierarchical processing shows a similar &quot;general first&quot; principle: people can spot an &lt;em&gt;animal&lt;&#x2F;em&gt; in an image in just 120ms, but need longer to identify it as a &lt;em&gt;dog&lt;&#x2F;em&gt; (&lt;a href=&quot;https:&#x2F;&#x2F;pubmed.ncbi.nlm.nih.gov&#x2F;25208739&#x2F;&quot;&gt;Wu et al., 2014&lt;&#x2F;a&gt;).&lt;&#x2F;p&gt;
+&lt;p&gt;My whole experiment was designed around this: would the AI also see a face in the blur, but get confused by the sharp details? To test this, I needed to isolate these frequencies.&lt;&#x2F;p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th style=&quot;text-align: center&quot;&gt;&lt;img src=&quot;&#x2F;images&#x2F;sf.png&quot; alt=&quot;SF&quot; &#x2F;&gt;&lt;&#x2F;th&gt;&lt;&#x2F;tr&gt;&lt;&#x2F;thead&gt;&lt;tbody&gt;
+&lt;tr&gt;&lt;td style=&quot;text-align: center&quot;&gt;&lt;em&gt;Visualizing the Coarse-to-Fine theory. The left shows an image broken into coarse (Low Frequency) and fine (High Frequency) information. The right shows how the brain processes the coarse &#x27;gist&#x27; first to guide perception.&lt;&#x2F;em&gt;&lt;&#x2F;td&gt;&lt;&#x2F;tr&gt;
+&lt;&#x2F;tbody&gt;&lt;&#x2F;table&gt;
+&lt;p&gt;To do this, I used a Butterworth filter from my own Rust tool, which you can try out here: &lt;a href=&quot;https:&#x2F;&#x2F;altunenes.github.io&#x2F;butter2d&#x2F;&quot;&gt;butter2d&lt;&#x2F;a&gt;.&lt;&#x2F;p&gt;
+&lt;h4 id=&quot;how-llms-see-illusions&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; How LLMs see illusions &lt;&#x2F;span&gt;&lt;&#x2F;h4&gt;
+&lt;p&gt;Research shows that modern VLMs are not objective, infallible observers; they can be &quot;fooled&quot; by classic visual illusions, and their susceptibility often increases with model scale &lt;a href=&quot;https:&#x2F;&#x2F;arxiv.org&#x2F;abs&#x2F;2311.00047&quot;&gt;Shen et al., 2023&lt;&#x2F;a&gt; . This suggests they are learning statistical heuristics from their training data that mimic human perception, rather than developing a deep, structural understanding of the world.&lt;&#x2F;p&gt;
+&lt;p&gt;This makes pareidolia a particularly interesting test. It&#x27;s not a geometric trick, but an illusion driven by a powerful, top-down, and likely evolutionary bias to find faces in our environment.&lt;&#x2F;p&gt;
+&lt;h3 id=&quot;the-experiment&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; The Experiment &lt;&#x2F;span&gt;&lt;&#x2F;h3&gt;
+&lt;p&gt;To test how Gemini handles pareidolia, I took several images and created three versions of each (using butterworth filter): the original &lt;strong&gt;Broadband (BB)&lt;&#x2F;strong&gt;, a blurry &lt;strong&gt;Low Spatial Frequency (LSF)&lt;&#x2F;strong&gt; version, and a sharp-edged &lt;strong&gt;High Spatial Frequency (HSF)&lt;&#x2F;strong&gt; version. I then fed them to the model with a simple prompt. To avoid any &quot;memory&quot; or context-priming effects, each images was processed in a completely separate session.&lt;&#x2F;p&gt;
+&lt;p&gt;Here was the prompt:&lt;&#x2F;p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;&quot;What are the three most prominent objects you see in this image? Respond in a JSON format where each object has a &#x27;name&#x27; and a &#x27;confidence_score&#x27;.&quot;&lt;&#x2F;p&gt;
+&lt;&#x2F;blockquote&gt;
+&lt;p&gt;Here are the results.&lt;&#x2F;p&gt;
+&lt;h4 id=&quot;test-1-the-wire-face&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; Test 1: The Wire Face &lt;&#x2F;span&gt;&lt;&#x2F;h4&gt;
+&lt;p&gt;This image of server cables, which I found on X (formerly Twitter), has an uncanny facial structure. As hypothesized, the LLM completely missed the face in the broadband and HSF versions, describing only the literal content. However, when presented with the LSF version, where only the coarse, global shape remains, it immediately and confidently identified a &lt;strong&gt;&quot;Face&quot;&lt;&#x2F;strong&gt;. So the fine HSF details of the wires and components seem to break the illusion for the model, while the blurry LSF version provides the ideal template for a face.&lt;&#x2F;p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th style=&quot;text-align: center&quot;&gt;&lt;img src=&quot;&#x2F;images&#x2F;W.png&quot; alt=&quot;W&quot; &#x2F;&gt;&lt;&#x2F;th&gt;&lt;&#x2F;tr&gt;&lt;&#x2F;thead&gt;&lt;tbody&gt;
+&lt;tr&gt;&lt;td style=&quot;text-align: center&quot;&gt;&lt;em&gt;LSF (left), Broadband (middle), HSF (right) versions of the &#x27;Wire Face&#x27;.&lt;&#x2F;em&gt;&lt;&#x2F;td&gt;&lt;&#x2F;tr&gt;
+&lt;&#x2F;tbody&gt;&lt;&#x2F;table&gt;
+&lt;h4 id=&quot;test-2-the-church-face&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; Test 2: The Church Face &lt;&#x2F;span&gt;&lt;&#x2F;h4&gt;
+&lt;p&gt;Next, I used one of the most famous pareidolia images on the internet. My rationale was that if the model&#x27;s perception is purely a function of its training data, it would have surely seen this image and would recognize the face (or illusory face). Once again, it failed to see the face in the BB and HSF versions, focusing only on the architecture. But in the LSF version, it correctly identified a &lt;strong&gt;&quot;Face (Pareidolia)&quot;&lt;&#x2F;strong&gt;. This suggests the model&#x27;s failure isn&#x27;t just about a lack of training data. The high-frequency details of the building&#x27;s facade actively mask the illusion for the AI, even for a classic example.&lt;&#x2F;p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th style=&quot;text-align: center&quot;&gt;&lt;img src=&quot;&#x2F;images&#x2F;C.png&quot; alt=&quot;C&quot; &#x2F;&gt;&lt;&#x2F;th&gt;&lt;&#x2F;tr&gt;&lt;&#x2F;thead&gt;&lt;tbody&gt;
+&lt;tr&gt;&lt;td style=&quot;text-align: center&quot;&gt;&lt;em&gt;The famous &#x27;Church Face&#x27; pareidolia.&lt;&#x2F;em&gt;&lt;br&gt;&lt;em&gt;Note that the model only sees a &quot;Face (Pareidolia)&quot; in the LSF version, describing only architectural elements in the others.&lt;&#x2F;em&gt;&lt;&#x2F;td&gt;&lt;&#x2F;tr&gt;
+&lt;&#x2F;tbody&gt;&lt;&#x2F;table&gt;
+&lt;h4 id=&quot;test-3-the-oval-hypothesis&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; Test 3: The Oval Hypothesis &lt;&#x2F;span&gt;&lt;&#x2F;h4&gt;
+&lt;p&gt;The previous results sparked a new idea: perhaps the LLM&#x27;s internal &quot;face template&quot; is strongly biased towards the oval, rounded shapes of human faces? The &quot;Wire Face&quot; is very angular. To test this, I selected two images with a more circular structure.&lt;&#x2F;p&gt;
+&lt;p&gt;The first, an electrical component, followed the now-established pattern. A &lt;strong&gt;&quot;Illusory Face&quot;&lt;&#x2F;strong&gt; was detected in the LSF version, but the BB and HSF versions were seen only as literal machine parts.&lt;&#x2F;p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th style=&quot;text-align: center&quot;&gt;&lt;img src=&quot;&#x2F;images&#x2F;E.png&quot; alt=&quot;E&quot; &#x2F;&gt;&lt;&#x2F;th&gt;&lt;&#x2F;tr&gt;&lt;&#x2F;thead&gt;&lt;tbody&gt;
+&lt;tr&gt;&lt;td style=&quot;text-align: center&quot;&gt;&lt;em&gt;An illusory face in an electrical component.&lt;&#x2F;em&gt;&lt;br&gt;&lt;em&gt;The LSF version triggered a &quot;Pareidolia Face&quot; detection, while the detailed versions only yielded descriptions of machine parts.&lt;&#x2F;em&gt;&lt;&#x2F;td&gt;&lt;&#x2F;tr&gt;
+&lt;&#x2F;tbody&gt;&lt;&#x2F;table&gt;
+&lt;p&gt;The second image, however, gave a breakthrough result. This time, the LLM saw a face in &lt;strong&gt;all three versions!&lt;&#x2F;strong&gt; It identified a &quot;Face&quot; in both LSF and BB, and even a &lt;strong&gt;&quot;Illusory Face&quot;&lt;&#x2F;strong&gt; in the sharp HSF image. This is a brilliant finding. It suggests that when an object&#x27;s structure is a strong enough match for the AI&#x27;s internal face template (a round shape, two distinct &quot;eyes,&quot; a &quot;mouth&quot;), it can overcome the distracting HSF noise. This is also highly consistent with human vision, where HSF information is vital for analyzing the fine features &lt;em&gt;of a face&lt;&#x2F;em&gt; once it has been detected.&lt;&#x2F;p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th style=&quot;text-align: center&quot;&gt;&lt;img src=&quot;&#x2F;images&#x2F;M.png&quot; alt=&quot;M&quot; &#x2F;&gt;&lt;&#x2F;th&gt;&lt;&#x2F;tr&gt;&lt;&#x2F;thead&gt;&lt;tbody&gt;
+&lt;tr&gt;&lt;td style=&quot;text-align: center&quot;&gt;&lt;em&gt;A illusory face on a can or clock mechanism that the LLM saw in all versions.&lt;&#x2F;em&gt;&lt;&#x2F;td&gt;&lt;&#x2F;tr&gt;
+&lt;&#x2F;tbody&gt;&lt;&#x2F;table&gt;
+&lt;h4 id=&quot;test-4-the-illusory-robot&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; Test 4: The Illusory Robot &lt;&#x2F;span&gt;&lt;&#x2F;h4&gt;
+&lt;p&gt;This next test uses a common object that happens to have face-like features: a set of viewpoint binoculars. The results show another interesting form of interpretation by the model. In the LSF version, the blurry shape with two prominent circles triggers an anthropomorphic classification: &lt;strong&gt;&quot;robot&quot;&lt;&#x2F;strong&gt;. The model defaults to a familiar humanoid template. However, once the HSF details are available in the broadband and sharp versions, the model corrects its initial &quot;guess&quot; and accurately identifies the object as &lt;strong&gt;&quot;viewpoint binoculars&quot;&lt;&#x2F;strong&gt;.&lt;&#x2F;p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th style=&quot;text-align: center&quot;&gt;&lt;img src=&quot;&#x2F;images&#x2F;R.png&quot; alt=&quot;R&quot; &#x2F;&gt;&lt;&#x2F;th&gt;&lt;&#x2F;tr&gt;&lt;&#x2F;thead&gt;&lt;tbody&gt;
+&lt;tr&gt;&lt;td style=&quot;text-align: center&quot;&gt;&lt;em&gt;An LSF-induced &quot;robot&quot; is corrected into binoculars with more detail.&lt;&#x2F;em&gt;&lt;&#x2F;td&gt;&lt;&#x2F;tr&gt;
+&lt;&#x2F;tbody&gt;&lt;&#x2F;table&gt;
+&lt;h4 id=&quot;test-5-the-holistic-face-paintings&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; Test 5: The Holistic Face Paintings &lt;&#x2F;span&gt;&lt;&#x2F;h4&gt;
+&lt;p&gt;Finally, I moved from pure pareidolia to a different kind of illusion: composite portraits, famously painted by artists like Giuseppe Arcimboldo. In these images, the face is &lt;strong&gt;intentionally&lt;&#x2F;strong&gt; constructed from other objects. These aren&#x27;t really pareidolia in the same way; they are deliberate artistic constructions where recognizing the face requires &lt;strong&gt;holistic processing&lt;&#x2F;strong&gt;—seeing the overall arrangement rather than just the sum of the individual parts. How would the LLM fare?&lt;&#x2F;p&gt;
+&lt;p&gt;The first painting is a face constructed from a landscape. Interestingly, the model identified a &lt;strong&gt;&quot;large face&quot;&lt;&#x2F;strong&gt; in both the broadband and high-frequency versions. This is a departure from the earlier pareidolia examples. Here, the individual components (trees, rocks) don&#x27;t look like facial features on their own, but their careful arrangement creates a powerful holistic impression that the model was able to perceive, even with all the fine details present.&lt;&#x2F;p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th style=&quot;text-align: center&quot;&gt;&lt;img src=&quot;&#x2F;images&#x2F;P.png&quot; alt=&quot;P&quot; &#x2F;&gt;&lt;&#x2F;th&gt;&lt;&#x2F;tr&gt;&lt;&#x2F;thead&gt;&lt;tbody&gt;
+&lt;tr&gt;&lt;td style=&quot;text-align: center&quot;&gt;&lt;em&gt;A composite face, testing holistic perception.&lt;&#x2F;em&gt;&lt;br&gt;&lt;em&gt;Notably, the model identified the face in all three versions, even describing it as an &#x27;optical illusion&#x27; in the BB.&lt;&#x2F;em&gt;&lt;&#x2F;td&gt;&lt;&#x2F;tr&gt;
+&lt;&#x2F;tbody&gt;&lt;&#x2F;table&gt;
+&lt;p&gt;I tried a second, similar painting of a shepherd in a landscape forming a face. The results were just as intriguing. In the full-detail versions, the model successfully identified both the whole (&lt;strong&gt;&quot;Face&quot;&lt;&#x2F;strong&gt;) and the parts (&lt;strong&gt;&quot;Sheep&quot;&lt;&#x2F;strong&gt;, &lt;strong&gt;&quot;Shepherd&quot;&lt;&#x2F;strong&gt;). It seemed to parse the image on multiple levels simultaneously.&lt;&#x2F;p&gt;
+&lt;p&gt;However, an interesting twist occurred in the LSF version. The blur, which helped reveal faces in the pareidolia examples, seemed to &lt;em&gt;weaken&lt;&#x2F;em&gt; the illusion here. The model&#x27;s top guess for the LSF version was &lt;strong&gt;&quot;Tree&quot;&lt;&#x2F;strong&gt;, not &quot;Face&quot;. This might suggest that for these complex, deliberately constructed images, the precise arrangement and HSF details are actually &lt;em&gt;critical&lt;&#x2F;em&gt; for the holistic face to emerge, and blurring them can break the carefully crafted composition. It&#x27;s a fascinating case where the general rule (LSF reveals faces) is reversed, highlighting the complexity of both human and machine perception.&lt;&#x2F;p&gt;
+&lt;table&gt;&lt;thead&gt;&lt;tr&gt;&lt;th style=&quot;text-align: center&quot;&gt;&lt;img src=&quot;&#x2F;images&#x2F;P2.png&quot; alt=&quot;P2&quot; &#x2F;&gt;&lt;&#x2F;th&gt;&lt;&#x2F;tr&gt;&lt;&#x2F;thead&gt;&lt;tbody&gt;
+&lt;tr&gt;&lt;td style=&quot;text-align: center&quot;&gt;&lt;em&gt;Another composite face, where blur seemed to hinder, rather than help, perception.&lt;&#x2F;em&gt;&lt;&#x2F;td&gt;&lt;&#x2F;tr&gt;
+&lt;&#x2F;tbody&gt;&lt;&#x2F;table&gt;
+&lt;h3 id=&quot;conclusion-and-final-thoughts&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; Conclusion and Final Thoughts &lt;&#x2F;span&gt;&lt;&#x2F;h3&gt;
+&lt;p&gt;For anyone working with or building on top of these AI systems, I believe understanding these kinds of behaviors is important. An AI&#x27;s failure to see a pattern that is obvious to us—or its tendency to see one only under specific conditions like blurring—highlights the inherent differences in how they process visual information.&lt;&#x2F;p&gt;
+&lt;p&gt;This method of probing with spatial frequencies and illusions could serve as a simple, fun, intuitive benchmark for tracking the progress of future vision models. As new architectures are developed, seeing how they handle these edge cases can tell us a lot about whether they are developing more robust, human-like perception or simply becoming better at pattern-matching their training data.&lt;&#x2F;p&gt;
+&lt;p&gt;Of course, there are clear limitations here. I only used one model, Gemini 2.5 Pro, primarily because company I work provides free access to it. Other powerful models from OpenAI, Anthropic, or elsewhere might react to these images in completely different ways. The number of images was also small.&lt;&#x2F;p&gt;
+&lt;p&gt;Also you might be realized that model&#x27;s own distinction between a &quot;Face&quot; and a &quot;Pareidolia Face&quot;. What is the difference? When the model uses the simple &quot;Face&quot; label, does it believe it&#x27;s seeing a real person or animal? Is the &quot;Pareidolia&quot; tag an admission that it recognizes the illusion?&lt;&#x2F;p&gt;
+&lt;p&gt;Perhaps the most important takeaway is the value of using novel stimuli. The real test for these models isn&#x27;t showing them the famous &quot;Church Face&quot; again, but presenting them with the new, illusory faces we discover in our daily lives—a pattern in a coffee stain, the front of a new car, or a strangely-shaped vegetable. These &quot;wild&quot; pareidolia images, which the AI could not have been trained on, are the truest test of whether they are learning to &lt;em&gt;see&lt;&#x2F;em&gt; or just to &lt;em&gt;recognize&lt;&#x2F;em&gt;. And for me, that&#x27;s an experiment that never gets old.&lt;&#x2F;p&gt;
+</content>
+        
+    </entry>
+</feed>

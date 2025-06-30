@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+
+{% macro home_page(section) %}
+    <main>
+        <article>
+            <section class="body">
+                {{ post_macros::page_header(title=section.title) }}
+                {{ section.content | safe }}
+            </section>
+        </article>
+    </main>
+{% endmacro home_page %}
+
+{% block main_content %}
+    {{ self::home_page(section=section) }}
+{% endblock main_content %}

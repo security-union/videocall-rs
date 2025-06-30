@@ -1,0 +1,24 @@
+name: CI
+
+on: push
+
+jobs:
+  lighthouse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: zola@0.20.0
+
+      - name: Build the site
+        run: |
+          zola build --output-dir ./dist
+
+      - name: Run Lighthouse against a static dist dir
+        uses: treosh/lighthouse-ci-action@v12
+        with:
+          # no urls needed, since it uses local folder to scan .html files
+          configPath: "./lighthouserc.json"
+          uploadArtifacts: true

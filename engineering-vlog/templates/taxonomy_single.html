@@ -1,0 +1,7 @@
+{% extends "index.html" %}
+
+{% block main_content %}
+
+{{ post_macros::list_title(pages=term.pages, tag_name=term.name) }}
+
+{% endblock main_content %}

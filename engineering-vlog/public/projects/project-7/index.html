@@ -1,0 +1,42 @@
+<!doctype html><html lang=en><head><meta charset=UTF-8><meta content="IE=edge" http-equiv=X-UA-Compatible><meta content="width=device-width,initial-scale=1.0" name=viewport><title>
+         Calcarine
+        
+    </title><meta content=Calcarine property=og:title><meta content="A desktop app where live GPU shaders meet real-time local vision AI." property=og:description><meta content="A desktop app where live GPU shaders meet real-time local vision AI." name=description><link href=/icon/favicon.png rel=icon type=image/png><link href=https://engineering.videocall.rs/fonts.css rel=stylesheet><link title="Videocall Engineering" href=https://engineering.videocall.rs/atom.xml rel=alternate type=application/atom+xml><link href=https://engineering.videocall.rs/theme/light.css rel=stylesheet><link href=https://engineering.videocall.rs/theme/dark.css id=darkModeStyle rel=stylesheet><script src=https://engineering.videocall.rs/js/themetoggle.js></script><script>setTheme(getSavedTheme());</script><link href=https://engineering.videocall.rs/main.css media=screen rel=stylesheet><script data-cf-beacon='{"token": "37a0f981a37240aea00b781e300bc6c0"}' defer src=https://static.cloudflareinsights.com/beacon.min.js></script></head><script>// Function to set the theme
+        function setTheme(theme) {
+            document.documentElement.className = theme;
+            localStorage.setItem('theme', theme);
+        }
+
+        // Function to get the saved theme
+        function getSavedTheme() {
+            return localStorage.getItem('theme') || 'light';
+        }
+
+        // Set the theme on page load
+        document.addEventListener('DOMContentLoaded', (event) => {
+            setTheme(getSavedTheme());
+        });</script><body><div class=content><header><div class=main><a href=https://engineering.videocall.rs>Videocall Engineering</a><div class=socials><a class=social href=https://twitter.com/emportent rel=me> <img alt=x src=https://engineering.videocall.rs/social_icons/x.svg> </a><a class=social href=https://github.com/altunenes rel=me> <img alt=github src=https://engineering.videocall.rs/social_icons/github.svg> </a><a href="https://scholar.google.com/citations?user=_OtEw5oAAAAJ&hl" class=social rel=me> <img alt=scholar src=https://engineering.videocall.rs/social_icons/googlescholar.svg> </a><a class=social href=https://www.linkedin.com/in/enes-altun-0a3076167 rel=me> <img alt=linkedin src=https://engineering.videocall.rs/social_icons/linkedin.svg> </a><a class=social href=https://www.instagram.com/altunanes/ rel=me> <img alt=instagram src=https://engineering.videocall.rs/social_icons/instagram.svg> </a><a class=social href=https://orcid.org/0000-0002-6478-6909 rel=me> <img alt=orcid src=https://engineering.videocall.rs/social_icons/orcid.svg> </a><a class=social href=https://www.shadertoy.com/user/altunenes rel=me> <img alt=shadertoy src=https://engineering.videocall.rs/social_icons/shadertoy.svg> </a><a class=social href=https://bsky.app/profile/altunenes.bsky.social rel=me> <img alt=bluesky src=https://engineering.videocall.rs/social_icons/bluesky.svg> </a></div></div><nav><a href=https://engineering.videocall.rs/posts style=margin-left:.7em>/posts</a><a href=https://engineering.videocall.rs/projects style=margin-left:.7em>/projects</a><a href=https://engineering.videocall.rs/about style=margin-left:.7em>/about</a><a href=https://engineering.videocall.rs/tags style=margin-left:.7em>/tags</a><a href=https://engineering.videocall.rs/CV style=margin-left:.7em>/CV</a><button aria-label="Toggle dark mode" id=dark-mode-toggle onclick=toggleTheme();><img alt="Light mode" id=sun-icon src=https://engineering.videocall.rs/feather/sun.svg> <img alt="Dark mode" id=moon-icon src=https://engineering.videocall.rs/feather/moon.svg></button></nav></header><script>function toggleTheme() {
+    const html = document.documentElement;
+    const currentTheme = html.classList.contains('dark') ? 'dark' : 'light';
+    const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+    
+    html.classList.remove(currentTheme);
+    html.classList.add(newTheme);
+    
+    localStorage.setItem('theme', newTheme);
+    updateThemeToggleIcons();
+}
+
+function updateThemeToggleIcons() {
+    const sunIcon = document.getElementById('sun-icon');
+    const moonIcon = document.getElementById('moon-icon');
+    const isDarkMode = document.documentElement.classList.contains('dark');
+    
+    sunIcon.style.display = isDarkMode ? 'none' : 'inline';
+    moonIcon.style.display = isDarkMode ? 'inline' : 'none';
+}
+
+// Set initial theme
+const savedTheme = localStorage.getItem('theme') || 'light';
+document.documentElement.classList.add(savedTheme);
+updateThemeToggleIcons();</script><main><article><div class=title><div class=page-header>Calcarine<span class=primary-color style=font-size:1.6em>.</span></div><div class=meta></div></div><h1>Table of Contents</h1><ul><li><a href=https://engineering.videocall.rs/projects/project-7/#tech-highlights>Tech Highlights</a><li><a href=https://engineering.videocall.rs/projects/project-7/#about-the-ai-model>About the AI Model</a><li><a href=https://engineering.videocall.rs/projects/project-7/#quick-start>Quick Start</a></ul><section class=body><h2><span style=color:orange> Calcarine </span></h2><p>Calcarine is a desktop application that bridges the gap between GPU programming and modern AI. It allows you to process any visual stream—images, videos, or your live webcam feed—with custom compute shaders while simultaneously getting real-time scene analysis from a powerful Vision Language Model (VLM).<h3 id=tech-highlights>Tech Highlights</h3><ul><li>Real-time video and image processing with <strong>GPU compute shaders</strong> (via <code>wgpu</code>).<li>Live VLM analysis using <strong>Microsoft's PHI-3.5 Vision</strong> model.<li><strong>Shader hot-reloading</strong> for live-coding visual effects.<li>Built entirely in <strong>Rust</strong> on the <strong>Cuneus</strong> framework with an <strong>egui</strong> interface.</ul><h3 id=about-the-ai-model>About the AI Model</h3><p>The project uses a CPU-optimized, INT4-quantized version of <strong>Microsoft's PHI-3.5 Vision</strong>. While this runs on the CPU, it's highly efficient and performs smoothly for real-time analysis (tested on a MacBook Air M3, 16GB RAM).<p>The primary goal is to demonstrate the pipeline of easily combining your own compute shaders with VLM analysis. As the ONNX and WebGPU ecosystems mature, the model backend will definitely be updated to leverage full GPU acceleration.<h3 id=quick-start>Quick Start</h3><ol><li><strong>Install GStreamer:</strong> Required for video and webcam support. Download from the <a href=https://gstreamer.freedesktop.org/download/>official GStreamer website</a>.<li><strong>Download Calcarine:</strong> Grab the latest release for your operating system.<li><strong>Run:</strong> The first launch will automatically download the AI models (~3.2 GB). Press 'H' to toggle the UI.</ol><hr><p><a href=https://github.com/altunenes/calcarine/releases><strong>Download from GitHub Releases</strong></a> <br> <a href=https://github.com/altunenes/calcarine><strong>View Source on GitHub</strong></a></section></article></main></div>

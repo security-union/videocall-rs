@@ -1,0 +1,56 @@
+<!doctype html><html lang=en><head><meta charset=UTF-8><meta content="IE=edge" http-equiv=X-UA-Compatible><meta content="width=device-width,initial-scale=1.0" name=viewport><title>
+         How I Implemented Hot Reloading for WGSL Shaders in Rust
+        
+    </title><meta content="How I Implemented Hot Reloading for WGSL Shaders in Rust" property=og:title><meta content="Videocall Engineering" property=og:description><meta content="Videocall Engineering" name=description><link href=/icon/favicon.png rel=icon type=image/png><link href=https://engineering.videocall.rs/fonts.css rel=stylesheet><link title="Videocall Engineering" href=https://engineering.videocall.rs/atom.xml rel=alternate type=application/atom+xml><link href=https://engineering.videocall.rs/theme/light.css rel=stylesheet><link href=https://engineering.videocall.rs/theme/dark.css id=darkModeStyle rel=stylesheet><script src=https://engineering.videocall.rs/js/themetoggle.js></script><script>setTheme(getSavedTheme());</script><link href=https://engineering.videocall.rs/main.css media=screen rel=stylesheet><script data-cf-beacon='{"token": "37a0f981a37240aea00b781e300bc6c0"}' defer src=https://static.cloudflareinsights.com/beacon.min.js></script></head><script>// Function to set the theme
+        function setTheme(theme) {
+            document.documentElement.className = theme;
+            localStorage.setItem('theme', theme);
+        }
+
+        // Function to get the saved theme
+        function getSavedTheme() {
+            return localStorage.getItem('theme') || 'light';
+        }
+
+        // Set the theme on page load
+        document.addEventListener('DOMContentLoaded', (event) => {
+            setTheme(getSavedTheme());
+        });</script><body><div class=content><header><div class=main><a href=https://engineering.videocall.rs>Videocall Engineering</a><div class=socials><a class=social href=https://twitter.com/emportent rel=me> <img alt=x src=https://engineering.videocall.rs/social_icons/x.svg> </a><a class=social href=https://github.com/altunenes rel=me> <img alt=github src=https://engineering.videocall.rs/social_icons/github.svg> </a><a href="https://scholar.google.com/citations?user=_OtEw5oAAAAJ&hl" class=social rel=me> <img alt=scholar src=https://engineering.videocall.rs/social_icons/googlescholar.svg> </a><a class=social href=https://www.linkedin.com/in/enes-altun-0a3076167 rel=me> <img alt=linkedin src=https://engineering.videocall.rs/social_icons/linkedin.svg> </a><a class=social href=https://www.instagram.com/altunanes/ rel=me> <img alt=instagram src=https://engineering.videocall.rs/social_icons/instagram.svg> </a><a class=social href=https://orcid.org/0000-0002-6478-6909 rel=me> <img alt=orcid src=https://engineering.videocall.rs/social_icons/orcid.svg> </a><a class=social href=https://www.shadertoy.com/user/altunenes rel=me> <img alt=shadertoy src=https://engineering.videocall.rs/social_icons/shadertoy.svg> </a><a class=social href=https://bsky.app/profile/altunenes.bsky.social rel=me> <img alt=bluesky src=https://engineering.videocall.rs/social_icons/bluesky.svg> </a></div></div><nav><a href=https://engineering.videocall.rs/posts style=margin-left:.7em>/posts</a><a href=https://engineering.videocall.rs/projects style=margin-left:.7em>/projects</a><a href=https://engineering.videocall.rs/about style=margin-left:.7em>/about</a><a href=https://engineering.videocall.rs/tags style=margin-left:.7em>/tags</a><a href=https://engineering.videocall.rs/CV style=margin-left:.7em>/CV</a><button aria-label="Toggle dark mode" id=dark-mode-toggle onclick=toggleTheme();><img alt="Light mode" id=sun-icon src=https://engineering.videocall.rs/feather/sun.svg> <img alt="Dark mode" id=moon-icon src=https://engineering.videocall.rs/feather/moon.svg></button></nav></header><script>function toggleTheme() {
+    const html = document.documentElement;
+    const currentTheme = html.classList.contains('dark') ? 'dark' : 'light';
+    const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+    
+    html.classList.remove(currentTheme);
+    html.classList.add(newTheme);
+    
+    localStorage.setItem('theme', newTheme);
+    updateThemeToggleIcons();
+}
+
+function updateThemeToggleIcons() {
+    const sunIcon = document.getElementById('sun-icon');
+    const moonIcon = document.getElementById('moon-icon');
+    const isDarkMode = document.documentElement.classList.contains('dark');
+    
+    sunIcon.style.display = isDarkMode ? 'none' : 'inline';
+    moonIcon.style.display = isDarkMode ? 'inline' : 'none';
+}
+
+// Set initial theme
+const savedTheme = localStorage.getItem('theme') || 'light';
+document.documentElement.classList.add(savedTheme);
+updateThemeToggleIcons();</script><main><article><div class=title><div class=page-header>How I Implemented Hot Reloading for WGSL Shaders in Rust<span class=primary-color style=font-size:1.6em>.</span></div><div class=meta>Posted on <time>2025-03-15</time></div></div><section class=body><p><span style=color:orange>My solution</span><p>When developing WGSL shaders for my Rust-based graphics engine, I needed a solution to avoid constantly restarting the application to see changes. I built a hot reload system that watches shader files and automatically recompiles them when modifications are detected. The core of this approach uses Rust's notify crate to monitor file system events, combined with a debouncing mechanism to prevent multiple reloads during rapid file saves. When a change is detected, the engine creates new shader modules with <code>core.device.create_shader_module()</code> and carefully rebuilds the render pipeline while maintaining the original bind group layouts.<p>Important struct: <a href=https://github.com/altunenes/cuneus/blob/b068041c7902df29d33c3100ea4b74a1a38164ff/src/hot.rs#L9-L231>Source Code</a><pre class=language-rust data-lang=rust style=color:#bfbab0;background-color:#0f1419><code class=language-rust data-lang=rust><span style=color:#f73>pub struct </span><span style=color:#59c2ff>ShaderHotReload </span><span>{
+</span><span>    </span><span style=color:#f73>pub </span><span>vs_module</span><span style=color:#bfbab0cc>: </span><span>wgpu</span><span style=color:#f29668>::</span><span>ShaderModule,
+</span><span>    </span><span style=color:#f73>pub </span><span>fs_module</span><span style=color:#bfbab0cc>: </span><span>wgpu</span><span style=color:#f29668>::</span><span>ShaderModule,
+</span><span>    device</span><span style=color:#bfbab0cc>: </span><span>Arc&LTwgpu</span><span style=color:#f29668>::</span><span>Device>,
+</span><span>    shader_paths</span><span style=color:#bfbab0cc>: </span><span style=color:#39bae6;font-style:italic>Vec</span><span>&LTPathBuf>,
+</span><span>    last_vs_content</span><span style=color:#bfbab0cc>:</span><span> String,
+</span><span>    last_fs_content</span><span style=color:#bfbab0cc>:</span><span> String,
+</span><span>    </span><span style=color:#bfbab0cc>#</span><span>[</span><span style=color:#ffb454>allow</span><span>(dead_code)]
+</span><span>    watcher</span><span style=color:#bfbab0cc>: </span><span>notify</span><span style=color:#f29668>::</span><span>RecommendedWatcher,
+</span><span>    rx</span><span style=color:#bfbab0cc>: </span><span>Receiver&LTnotify</span><span style=color:#f29668>::</span><span>Event>,
+</span><span>    _watcher_tx</span><span style=color:#bfbab0cc>: </span><span>std</span><span style=color:#f29668>::</span><span>sync</span><span style=color:#f29668>::</span><span>mpsc</span><span style=color:#f29668>::</span><span>Sender&LTnotify</span><span style=color:#f29668>::</span><span>Event>,
+</span><span>    last_update_times</span><span style=color:#bfbab0cc>: </span><span>HashMap&LTPathBuf, Instant>, </span><span style=color:#5c6773;font-style:italic>//Keeps track of when each shader file was last updated.
+</span><span>    debounce_duration</span><span style=color:#bfbab0cc>:</span><span> Duration, </span><span style=color:#5c6773;font-style:italic>//Defines how long to wait before allowing another reload of the same file. The default is 100ms.
+</span><span>}
+</span></code></pre><p>My ShaderHotReload struct stores references to shader files, tracks the last update times for debouncing, and maintains the original shader content for comparison. When a file change is detected, it reads the new shader content, compares it to the previous version, and only triggers a reload if there's an actual change.</section><div class=post-tags><nav class="nav tags"><ul class=tags><li><a href=https://engineering.videocall.rs/tags/rust/>rust</a><li><a href=https://engineering.videocall.rs/tags/gpu/>gpu</a></ul></nav></div></article></main><div class=giscus></div><script async crossorigin data-category=General data-category-id=DIC_kwDOL5Nyoc4CfU7n data-emit-metadata=0 data-input-position=bottom data-lang=en data-mapping=pathname data-reactions-enabled=1 data-repo=altunenes/altunenes.github.io data-repo-id=R_kgDOL5NyoQ data-strict=0 data-theme=preferred_color_scheme src=https://giscus.app/client.js></script></div>

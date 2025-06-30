@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">
+    <title>Videocall Engineering - gabor</title>
+    <subtitle>Videocall Engineering</subtitle>
+    <link rel="self" type="application/atom+xml" href="https://engineering.videocall.rs/tags/gabor/atom.xml"/>
+    <link rel="alternate" type="text/html" href="https://engineering.videocall.rs"/>
+    <generator uri="https://www.getzola.org/">Zola</generator>
+    <updated>2024-12-05T00:00:00+00:00</updated>
+    <id>https://engineering.videocall.rs/tags/gabor/atom.xml</id>
+    <entry xml:lang="en">
+        <title>Illusory Movement of Dotted Lines but Gabor Version</title>
+        <published>2024-12-05T00:00:00+00:00</published>
+        <updated>2024-12-05T00:00:00+00:00</updated>
+        
+        <author>
+          <name>
+            
+              Unknown
+            
+          </name>
+        </author>
+        
+        <link rel="alternate" type="text/html" href="https://engineering.videocall.rs/posts/gabordots/"/>
+        <id>https://engineering.videocall.rs/posts/gabordots/</id>
+        
+        <content type="html" xml:base="https://engineering.videocall.rs/posts/gabordots/">&lt;h2 id=&quot;introduction&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt;Introduction&lt;&#x2F;span&gt;&lt;&#x2F;h2&gt;
+&lt;p&gt;Today, I was exploring &lt;a href=&quot;https:&#x2F;&#x2F;michaelbach.de&#x2F;ot&#x2F;mot-dottedLines&#x2F;index.html&quot;&gt;Michael Bach&#x27;s&lt;&#x2F;a&gt; comments about some illusions and I stumbled upon an illusion called &quot;Dotted Line Motion Illusion&quot; that I hadn&#x27;t known before. I wanted to read more about it because the effect didn&#x27;t seem to work well for me. Both Bach and the original article used a rectangular checkerboard design for the illusion. I tried to reproduce the code in ShaderToy and noticed that the scale of the rectangles and the background color significantly affect the strength of the illusion, at least from my perception.&lt;&#x2F;p&gt;
+&lt;h2 id=&quot;plain-version&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt;Plain Version&lt;&#x2F;span&gt;&lt;&#x2F;h2&gt;
+&lt;p&gt;First, investigate the illusion below. Click the play button, track the red disc as it moves, and notice how the checkered lines seem to shift. It works best on a big screen.&lt;&#x2F;p&gt;
+&lt;div align=&quot;center&quot;&gt;
+&lt;iframe width=&quot;640&quot; height=&quot;450&quot; frameborder=&quot;0&quot; src=&quot;https:&#x2F;&#x2F;www.shadertoy.com&#x2F;embed&#x2F;XcKXRV?gui=true&amp;t=10&amp;paused=true&amp;muted=false&quot; allowfullscreen&gt;&lt;&#x2F;iframe&gt;
+&lt;&#x2F;div&gt;
+&lt;p&gt;After finishing the coding, I pondered whether &quot;The reason is that the black&#x2F;white contrast signals between adjacent dots along the length of the line are stronger than black&#x2F;grey or white&#x2F;grey contrast signals across the line, and the motion is computed as a vector sum of local contrast-weighted motion signals.&quot; could be an explanation, and then, could Gabor patches be more effective here?&lt;&#x2F;p&gt;
+&lt;h2 id=&quot;gabor-version&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt;Gabor Version&lt;&#x2F;span&gt;&lt;&#x2F;h2&gt;
+&lt;p&gt;Here&#x27;s what I did. Now, try this and see which one appears stronger. Interestingly, even on a smaller screen, this version works much better for me and it&#x27;s really functioning very nicely.&lt;&#x2F;p&gt;
+&lt;div align=&quot;center&quot;&gt;
+&lt;iframe width=&quot;640&quot; height=&quot;450&quot; frameborder=&quot;0&quot; src=&quot;https:&#x2F;&#x2F;www.shadertoy.com&#x2F;embed&#x2F;McKSRK?gui=true&amp;t=10&amp;paused=true&amp;muted=false&quot; allowfullscreen&gt;&lt;&#x2F;iframe&gt;
+&lt;&#x2F;div&gt;
+&lt;h2 id=&quot;exploring-reverse-effects&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt;Exploring Reverse Effects&lt;&#x2F;span&gt;&lt;&#x2F;h2&gt;
+&lt;p&gt;Even more interestingly, I discovered a reverse effect when I animated the phase offset. Follow the red dot again, and you&#x27;ll notice that the phase movement stops at some point.&lt;&#x2F;p&gt;
+&lt;div align=&quot;center&quot;&gt;
+&lt;iframe width=&quot;640&quot; height=&quot;450&quot; frameborder=&quot;0&quot; src=&quot;https:&#x2F;&#x2F;www.shadertoy.com&#x2F;embed&#x2F;4fyXz3?gui=true&amp;t=10&amp;paused=true&amp;muted=false&quot; allowfullscreen&gt;&lt;&#x2F;iframe&gt;
+&lt;&#x2F;div&gt;
+&lt;h2 id=&quot;reference-paper&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt;Reference Paper&lt;&#x2F;span&gt;&lt;&#x2F;h2&gt;
+&lt;p&gt;For more detailed information on the scientific background of these visual phenomena, refer to the following paper:&lt;&#x2F;p&gt;
+&lt;p&gt;Ito, H., Anstis, S., &amp;amp; Cavanagh, P. (2009). Illusory Movement of Dotted Lines. Perception, 38(9), 1405-1409. &lt;a href=&quot;https:&#x2F;&#x2F;doi.org&#x2F;10.1068&#x2F;p6383&quot;&gt;https:&#x2F;&#x2F;doi.org&#x2F;10.1068&#x2F;p6383&lt;&#x2F;a&gt;&lt;&#x2F;p&gt;
+</content>
+        
+    </entry>
+    <entry xml:lang="en">
+        <title>Gabor Patches on the Texture!</title>
+        <published>2023-10-16T00:00:00+00:00</published>
+        <updated>2023-10-16T00:00:00+00:00</updated>
+        
+        <author>
+          <name>
+            
+              Unknown
+            
+          </name>
+        </author>
+        
+        <link rel="alternate" type="text/html" href="https://engineering.videocall.rs/posts/imgabor/"/>
+        <id>https://engineering.videocall.rs/posts/imgabor/</id>
+        
+        <content type="html" xml:base="https://engineering.videocall.rs/posts/imgabor/">&lt;p&gt;Below is a video featuring the outcome of my experiment. Take a close look and tell me, do you perceive the face in the image more in the horizontal or vertical orientation of the Gabor patches?&lt;&#x2F;p&gt;
+&lt;div align=&quot;center&quot;&gt;
+&lt;blockquote class=&quot;twitter-tweet&quot; data-media-max-width=&quot;560&quot;&gt;&lt;p lang=&quot;en&quot; dir=&quot;ltr&quot;&gt;with different orientations of Gabors... Actually interesting, because this reminds me of research underscoring the important role of horizontal info in face perception, revealing its crucial impact on facial encoding&#x2F;processing while vertical info often reduces these effects. 🙂 &lt;a href=&quot;https:&#x2F;&#x2F;t.co&#x2F;mUcCwJ4SBc&quot;&gt;https:&#x2F;&#x2F;t.co&#x2F;mUcCwJ4SBc&lt;&#x2F;a&gt; &lt;a href=&quot;https:&#x2F;&#x2F;t.co&#x2F;ghXyMWS7CO&quot;&gt;pic.twitter.com&#x2F;ghXyMWS7CO&lt;&#x2F;a&gt;&lt;&#x2F;p&gt;&amp;mdash; enes altun (@emportent) &lt;a href=&quot;https:&#x2F;&#x2F;twitter.com&#x2F;emportent&#x2F;status&#x2F;1713689728195690576?ref_src=twsrc%5Etfw&quot;&gt;October 15, 2023&lt;&#x2F;a&gt;&lt;&#x2F;blockquote&gt; &lt;script async src=&quot;https:&#x2F;&#x2F;platform.twitter.com&#x2F;widgets.js&quot; charset=&quot;utf-8&quot;&gt;&lt;&#x2F;script&gt;
+&lt;&#x2F;div&gt;
+&lt;p&gt;If you&#x27;ve been following my previous posts, you&#x27;re already familiar with the concept of Gabor patches and how they&#x27;re a fantastic tool for understanding various aspects of visual perception. What&#x27;s particularly intriguing is how these patches can alter our perception of orientation.&lt;&#x2F;p&gt;
+&lt;p&gt;findings of &lt;a href=&quot;https:&#x2F;&#x2F;pubmed.ncbi.nlm.nih.gov&#x2F;19757911&#x2F;&quot;&gt;Dakin and Watt (2009)&lt;&#x2F;a&gt; and others(there are a lot of papers about that issue), our perception of faces is significantly influenced by horizontal information compared to vertical. Some call this as &lt;a href=&quot;https:&#x2F;&#x2F;royalsocietypublishing.org&#x2F;doi&#x2F;10.1098&#x2F;rspb.2023.1118#:~:text=The%20radial%20bias%20may%20modulate,the%20individual%20differences%20we%20observe.&quot;&gt;radial bias&lt;&#x2F;a&gt;&lt;&#x2F;p&gt;
+&lt;p&gt;Building on this intriguing concept, Dakin and Watt&#x27;s study delves even deeper into our visual system&#x27;s preference for horizontal features in faces. They introduced the idea of facial &#x27;bar codes,&#x27; unique clusters of horizontal lines, akin to commercial bar codes, that our brains use for quick and efficient face recognition. This theory elegantly explains why we&#x27;re so adept at recognizing faces under various conditions and why certain transformations, like inverting a face, make recognition remarkably challenging. It&#x27;s a compelling reminder of how our visual system has fine-tuned itself over millennia, optimizing certain perceptual shortcuts for survival.&lt;&#x2F;p&gt;
+&lt;p&gt;In a nutshell, when the Gabor patches are aligned horizontally, we&#x27;re likely to perceive the face more clearly. This phenomenon ties back to how our brains process faces, giving preferential treatment to horizontal features. It&#x27;s all about how the human visual system has evolved to prioritize certain spatial frequencies and orientations, especially when it comes to recognizing faces - one of the most crucial visual tasks we perform.&lt;&#x2F;p&gt;
+&lt;p&gt;But hey, don&#x27;t just take my word for it! Dive into the research, play around with the code, and explore the captivating realm of Gabor patches and visual perception. Who knows what other secrets are waiting to be uncovered?&lt;&#x2F;p&gt;
+&lt;p&gt;Note: This code is computationally intensive, so only run it if you&#x27;re confident in your GPU&#x27;s capabilities. Also, please be cautious when adjusting the numbers—small changes can have big impacts!&quot;&lt;&#x2F;p&gt;
+&lt;div align=&quot;center&quot;&gt;
+&lt;iframe width=&quot;420&quot; height=&quot;360&quot; frameborder=&quot;0&quot; src=&quot;https:&#x2F;&#x2F;www.shadertoy.com&#x2F;embed&#x2F;Dd3fRB?gui=true&amp;t=10&amp;paused=true&amp;muted=false&quot; allowfullscreen&gt;&lt;&#x2F;iframe&gt;
+&lt;&#x2F;div&gt;
+</content>
+        
+    </entry>
+    <entry xml:lang="en">
+        <title>Reverse Phi Motion Using Gabors</title>
+        <published>2023-10-15T00:00:00+00:00</published>
+        <updated>2023-10-15T00:00:00+00:00</updated>
+        
+        <author>
+          <name>
+            
+              Unknown
+            
+          </name>
+        </author>
+        
+        <link rel="alternate" type="text/html" href="https://engineering.videocall.rs/posts/gaborillusion/"/>
+        <id>https://engineering.videocall.rs/posts/gaborillusion/</id>
+        
+        <content type="html" xml:base="https://engineering.videocall.rs/posts/gaborillusion/">&lt;h3 id=&quot;new-gabor-illusion&quot;&gt;&lt;span style=&quot;color:orange;&quot;&gt; New Gabor Illusion &lt;&#x2F;span&gt;&lt;&#x2F;h3&gt;
+&lt;p&gt;While diving into some hands-on coding with &lt;a href=&quot;https:&#x2F;&#x2F;altunenes.github.io&#x2F;posts&#x2F;2023&#x2F;10&#x2F;gabor&#x2F;&quot;&gt;Gabor patches&lt;&#x2F;a&gt;, a fascinating idea struck me: What if I sculpted shapes like triangles or ellipses, infused them with some sine phases, and voila—could I possibly evoke a simple reverse phi effect? 🤔🔄&lt;&#x2F;p&gt;
+&lt;p&gt;To my delight, I believe I succeeded! 🎉 Navigate your cursor and hit the space bar to unveil the effect. 🖱️⌨️ Your insights and thoughts are eagerly awaited! =)&lt;&#x2F;p&gt;
+&lt;div align=&quot;center&quot;&gt;
+&lt;iframe width=&quot;640&quot; height=&quot;360&quot; frameborder=&quot;0&quot; src=&quot;https:&#x2F;&#x2F;www.shadertoy.com&#x2F;embed&#x2F;dsdfzS?gui=true&amp;t=10&amp;paused=true&amp;muted=false&quot; allowfullscreen&gt;&lt;&#x2F;iframe&gt;
+&lt;&#x2F;div&gt;
+&lt;p&gt;or look at that =) not: unlike other &quot;reverse phi motion&quot; effects, this one doesn&#x27;t have &quot;thin edges&quot; with sine phases. Its just Gabors... 😁&lt;&#x2F;p&gt;
+&lt;div align=&quot;center&quot;&gt;
+&lt;iframe width=&quot;640&quot; height=&quot;360&quot; frameborder=&quot;0&quot; src=&quot;https:&#x2F;&#x2F;www.shadertoy.com&#x2F;embed&#x2F;dscfzs?gui=true&amp;t=10&amp;paused=true&amp;muted=false&quot; allowfullscreen&gt;&lt;&#x2F;iframe&gt;
+&lt;&#x2F;div&gt;
+</content>
+        
+    </entry>
+</feed>

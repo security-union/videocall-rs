@@ -18,6 +18,10 @@ authors = ["Dario Lencina Talarico"]
 
 *Extreme ownership transforms invisible risk into disciplined personal action—and it's the only guarantee that a real-time autonomous-vehicle backend survives the night.*
 
+<p style="text-align:center; margin-top:1em; margin-bottom:1em;">
+    <img src="/images/4-am-coding.png" alt="4 AM coding session" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />
+</p>
+
 ## 01:00 AM — Sensing Invisible Risk
 
 The cursor blinks in the darkness, matching the soft blue LED of the baby monitor two rooms away. My six-week-old daughter shuffles in her sleep, my wife breathes shallowly—still recovering from the nine-month marathon that preceded the birth—yet here I am, eyes fixed on a terminal that refuses to rest. May Mobility's backend, the one I own end-to-end, is nocturnal by nature. Every ninety seconds Lyft and Uber refresh dashboards that trace red, green, or amber back to something I designed, something I risked.

@@ -1,0 +1,49 @@
+{% macro list_post(page) %}
+<li class="list-item">
+    <section>
+        <div class="post-header">
+            <time>{{ page.date | date(format="%d-%m-%Y") }}</time>
+
+            <div>
+                <h1 class="title">
+                    <a href={{ page.permalink | safe }}>{{ page.title }}</a>
+
+                    {% if page.draft %}<span class="draft-label">DRAFT</span>{% endif %}
+                </h1>
+
+                <div class="meta">
+                    <div class="description">
+                        {% if page.description %}
+                            {{ page.description }}
+                        {% elif page.summary %}
+                            {{ page.summary | safe }}&hellip;
+                        {% else %}
+                            {% set hide_read_more = true %}
+                        {% endif %}
+                    </div>
+
+                    {% if not hide_read_more %}<a class="readmore" href={{ page.permalink | safe }}>Read more ⟶</a>{% endif %}
+                </div>
+            </div>
+        </div>
+    </section>
+</li>
+{% endmacro list_post %}
+
+{% macro list_posts(pages) %}
+    <ul>
+        {%- for page in pages %}
+            {{ post_macros::list_post(page=page) }}
+        {% endfor -%}
+    </ul>
+{% endmacro list_posts %}
+
+{% macro page_header(title) %}
+    {% if title %}
+    <div class="page-header">
+        {{ title }}
+    </div>
+    {% endif %}
+{% endmacro content %}
+
+{% macro site_title() %}{{ config.title | default(value="Home") }}{% endmacro %}

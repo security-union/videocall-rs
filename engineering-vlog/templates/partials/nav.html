@@ -1,0 +1,54 @@
+<header>
+    <div class="main">
+        <a href="{{ config.base_url }}">{{ config.title }}</a>
+
+        <div class="socials">
+            {% for social in config.extra.socials %}
+            <a rel="me" href="{{ social.url }}" class="social">
+                <img alt="{{ social.name }}" src="{{ get_url(path='social_icons/' ~ social.icon ~ '.svg') }}">
+            </a>
+            {% endfor %}
+        </div>
+    </div>
+
+    <nav>
+        {% for menu in config.extra.menu %}
+        <a href="{{ get_url(path=menu.url) }}" style="margin-left: 0.7em">{{ menu.name }}</a>
+        {% endfor %}
+
+        {% if config.extra.theme == "toggle" %}
+        <button id="dark-mode-toggle" onclick="toggleTheme();" aria-label="Toggle dark mode">
+            <img src="{{ get_url(path="feather/sun.svg") }}" id="sun-icon" alt="Light mode" />
+            <img src="{{ get_url(path="feather/moon.svg") }}" id="moon-icon" alt="Dark mode" />
+        </button>
+        {% endif %}
+    </nav>
+</header>
+
+<script>
+function toggleTheme() {
+    const html = document.documentElement;
+    const currentTheme = html.classList.contains('dark') ? 'dark' : 'light';
+    const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+    
+    html.classList.remove(currentTheme);
+    html.classList.add(newTheme);
+    
+    localStorage.setItem('theme', newTheme);
+    updateThemeToggleIcons();
+}
+
+function updateThemeToggleIcons() {
+    const sunIcon = document.getElementById('sun-icon');
+    const moonIcon = document.getElementById('moon-icon');
+    const isDarkMode = document.documentElement.classList.contains('dark');
+    
+    sunIcon.style.display = isDarkMode ? 'none' : 'inline';
+    moonIcon.style.display = isDarkMode ? 'inline' : 'none';
+}
+
+// Set initial theme
+const savedTheme = localStorage.getItem('theme') || 'light';
+document.documentElement.classList.add(savedTheme);
+updateThemeToggleIcons();
+</script>

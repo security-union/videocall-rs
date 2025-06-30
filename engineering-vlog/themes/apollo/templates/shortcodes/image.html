@@ -1,0 +1,21 @@
+{% set image_meta = get_image_metadata(path=path) %}
+
+{% set width = width | default(value=image_meta.width) %}
+{% set height = width | default(value=image_meta.height) %}
+{% set op = op | default(value='fit_width') %}
+{% set format = format | default(value='avif') %}
+{% set quality = quality | default(value=80) %}
+{% set img = resize_image(path=path, width=width, height=height, op=op, format=format, quality=quality) %}
+
+{% set loading = loading | default(value='lazy') %}
+{% set decoding = decoding | default(value='async') %}
+{% set style = style | default(value='') %}
+<img
+    aspect-ratio="{{ width }} / {{ height }}"
+    src="{{ img.url }}"
+    alt="{{ alt }}"
+    style="{{ style }}"
+    loading="{{ loading }}"
+    decoding="{{ decoding }}"
+    class="{{ class | default(value="") }}"
+/>

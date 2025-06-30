@@ -8,6 +8,7 @@ on:
       - "Publish Website to Docker image"
       - "Publish Base UI to Docker image"
       - "Publish Base API to Docker image"
+      - "Publish Engineering Vlog to Docker image"
     branches: [main]
     types:
       - completed
@@ -101,3 +102,15 @@ jobs:
             --atomic \
             --set "podAnnotations.rollme=\"$(date +%s)\"" \
             -f ./helm/videocall-website/values.yaml
+
+      - name: Deploy engineering-vlog
+        if: ${{ github.event.inputs.services == 'all' || contains(github.event.inputs.services, 'engineering-vlog') }}
+        run: |
+          # Update chart dependencies (none for now)
+          helm dependency update ./helm/engineering-vlog || true
+          # Upgrade or install if not exists
+          helm upgrade --install engineering-vlog ./helm/engineering-vlog \
+            --namespace default \
+            --atomic \
+            --set "podAnnotations.rollme=\"$(date +%s)\"" \
+            -f ./helm/engineering-vlog/values.yaml

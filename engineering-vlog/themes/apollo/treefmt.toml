@@ -1,0 +1,15 @@
+walk = "git"
+excludes = ["static/**", "content/*"]
+
+[formatter.nix]
+command = "alejandra"
+includes = ["*.nix"]
+
+[formatter.djlint]
+command = "djlint"
+options = ["--preserve-blank-lines", "--reformat"]
+includes = ["*.html"]
+
+[formatter.scss]
+command = "prettier"
+includes = ["*.scss", "*.sass"]

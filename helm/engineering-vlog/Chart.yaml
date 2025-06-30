@@ -1,0 +1,5 @@
+apiVersion: v2
+name: engineering-vlog
+description: A Helm chart for engineering-vlog static site
+version: 0.1.0
+type: application 

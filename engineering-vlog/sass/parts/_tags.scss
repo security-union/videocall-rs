@@ -1,0 +1,22 @@
+// No indentation inside post
+.tags ul {
+  margin-left: 0;
+  padding-left: 0;
+}
+
+.tags li::before {
+  content: "🏷 ";
+}
+
+.tags li {
+  list-style-type: none;
+}
+
+.tags a {
+  border-bottom: 3px solid var(--primary-color);
+}
+
+.tags a:hover {
+  color: var(--hover_color);
+  background-color: var(--primary-color);
+}

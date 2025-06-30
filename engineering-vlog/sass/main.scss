@@ -1,0 +1,56 @@
+// Import parts
+@import "parts/cards";
+@import "parts/code";
+@import "parts/header";
+@import "parts/image";
+@import "parts/toc";
+@import "parts/note";
+@import "parts/misc";
+@import "parts/table";
+@import "parts/tags";
+
+// Import fonts
+@import "fonts";
+
+:root {
+  /* Used for: block comment, hr, ... */
+  --border-color: var(--border-color);
+
+  /* Fonts */
+  --text-font: 'Jetbrains Mono', monospace;
+  --header-font: 'Space Grotesk', 'Helvetica', sans-serif;
+  --code-font: 'Jetbrains Mono', monospace;
+}
+
+html {
+  background-color: var(--bg-0);
+  color: var(--text-0);
+  font-family: var(--text-font);
+  line-height: 1.6em;
+  -webkit-font-smoothing: antialiased;
+}
+
+.content {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 0 24px;
+  word-wrap: break-word;
+}
+
+@media all and (min-width:640px) {
+  html {
+    font-size: 16.5px;
+  }
+}
+
+@media all and (min-width:720px) {
+  html {
+    font-size: 17px;
+  }
+}
+
+@media all and (min-width:960px) {
+  html {
+    font-size: 18px;
+  }
+}

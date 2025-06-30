@@ -1,0 +1,16 @@
+/* Taxonomies for a post */
+.tags {
+  a::before {
+    content: "#";
+    display: inline;
+    white-space: nowrap !important;
+  }
+}
+
+.authors {
+  a::before {
+    content: "@";
+    display: inline;
+    white-space: nowrap !important;
+  }
+}

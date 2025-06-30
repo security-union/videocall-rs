@@ -1,0 +1,32 @@
+<div class="toc">
+    <div class="heading">Table of Contents</div>
+    <ul class="toc-list">
+        {% for h1 in page.toc %}
+            <li class="parent">
+                {% set h1_index = loop.index %}
+                <a href="{{ h1.permalink | safe }}">{{ h1.title }}</a>
+
+                {% if h1.children %}
+                    <ul>
+                    {% for h2 in h1.children %}
+                        {% set h2_index = loop.index %}
+                        <li>
+                            <a href="{{ h2.permalink | safe }}">{{ h2.title }}</a>
+                        </li>
+
+                        {% if h2.children %}
+                            <ul>
+                                {% for h3 in h2.children %}
+                                    <li>
+                                        <a href="{{ h3.permalink | safe }}">{{ h3.title }}</a>
+                                    </li>
+                                {% endfor %}
+                            </ul>
+                        {% endif %}
+                    {% endfor %}
+                    </ul>
+                {% endif %}
+            </li>
+        {% endfor %}
+    </ul>
+</div>

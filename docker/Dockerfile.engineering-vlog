@@ -1,0 +1,12 @@
+FROM ghcr.io/getzola/zola:v0.19.1 AS build
+
+WORKDIR /site
+COPY engineering-vlog/ /site
+RUN ["zola", "build"]
+
+FROM nginx:1.27-alpine AS production
+
+COPY --from=build /site/public /usr/share/nginx/html
+
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"] 

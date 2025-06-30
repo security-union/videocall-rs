@@ -1,0 +1,88 @@
+:root {
+  --note-header-bg: var(--bg-2);
+  --note-header-color: var(--text-0);
+  --note-content-bg: var(--bg-1);
+}
+
+
+.note-container {
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 1em 0;
+  position: relative;
+  border-left: 3px solid var(--primary-color);
+  font-family: var(--paragraph-font);
+}
+
+.note-toggle,
+.note-header {
+  color: var(--note-header-color);
+  background-color: var(--note-header-bg);
+  padding: 10px 25px;
+  text-align: left;
+  border: none;
+  width: 100%;
+  position: relative;
+  outline: none;
+  font-size: 1.2em;
+  transition: background-color 0.3s ease;
+
+  p {
+    margin: 0;
+  }
+
+  .note-center {
+    text-align: center;
+    padding-right: 50px;
+  }
+
+  .note-icon,
+  .note-icon {
+    padding-left: 25px;
+  }
+}
+
+.note-toggle {
+  cursor: pointer;
+  position: relative;
+}
+
+.note-toggle::before {
+  content: '▼';
+  position: absolute;
+  right: 20px;
+  /* Position the arrow to the right */
+  top: 50%;
+  /* Center vertically */
+  transform: translateY(-50%);
+  /* Center vertically */
+}
+
+.note-toggle:hover,
+.note-toggle:focus {
+  color: var(--note-header-color);
+  background-color: var(--note-header-bg);
+  outline: none;
+}
+
+.note-content {
+  padding: 10px 20px;
+  background-color: var(--note-content-bg);
+}
+
+.note-icon::before {
+  content: '✎';
+  color: var(--primary-color);
+  position: absolute;
+  left: 20px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+summary:hover,
+summary:focus {
+  color: var(--primary-color);
+  background-color: var(--note-header-bg);
+  outline: none;
+  padding: 10px;
+}

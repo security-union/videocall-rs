@@ -1,0 +1,54 @@
+replicaCount: 1
+
+image:
+  repository: securityunion/videocall-engineering-vlog
+  pullPolicy: Always
+  tag: latest
+
+resources:
+  limits:
+    cpu: "50m"
+    memory: "32Mi"
+  requests:
+    cpu: "20m"
+    memory: "32Mi"
+
+service:
+  type: ClusterIP
+  port: 80
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 100
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
+
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: engineering.videocall.rs
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: engineering-vlog
+            port:
+              number: 80
+  tls:
+    - secretName: engineering-vlog-tls
+      hosts:
+        - engineering.videocall.rs
+
+nodeSelector: {}
+tolerations: []
+affinity: {} 

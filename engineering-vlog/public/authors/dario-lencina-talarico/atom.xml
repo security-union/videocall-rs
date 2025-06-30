@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xml:lang="en">
+    <title>Videocall Engineering - Dario Lencina Talarico</title>
+    <subtitle>Technical Vlog of the Videocall Engineering team</subtitle>
+    <link rel="self" type="application/atom+xml" href="https://engineering.videocall.rs/authors/dario-lencina-talarico/atom.xml"/>
+    <link rel="alternate" type="text/html" href="https://engineering.videocall.rs"/>
+    <generator uri="https://www.getzola.org/">Zola</generator>
+    <updated>2025-06-30T00:00:00+00:00</updated>
+    <id>https://engineering.videocall.rs/authors/dario-lencina-talarico/atom.xml</id>
+    <entry xml:lang="en">
+        <title>Extreme Ownership at 01:00 AM: Confessions of a Staff Engineer Building Autonomous Vehicle Backends</title>
+        <published>2025-06-30T00:00:00+00:00</published>
+        <updated>2025-06-30T00:00:00+00:00</updated>
+        
+        <author>
+          <name>
+            Dario Lencina Talarico
+          </name>
+        </author>
+        
+        <link rel="alternate" type="text/html" href="https://engineering.videocall.rs/posts/extreme-ownership-staff-engineer/"/>
+        <id>https://engineering.videocall.rs/posts/extreme-ownership-staff-engineer/</id>
+        
+        <content type="html" xml:base="https://engineering.videocall.rs/posts/extreme-ownership-staff-engineer/">&lt;p&gt;&lt;em&gt;Extreme ownership transforms invisible risk into disciplined personal action—and it&#x27;s the only guarantee that a real-time autonomous-vehicle backend survives the night.&lt;&#x2F;em&gt;&lt;&#x2F;p&gt;
+&lt;h2 id=&quot;01-00-am-sensing-invisible-risk&quot;&gt;01:00 AM — Sensing Invisible Risk&lt;&#x2F;h2&gt;
+&lt;p&gt;The cursor blinks in the darkness, matching the soft blue LED of the baby monitor two rooms away. My six-week-old daughter shuffles in her sleep, my wife breathes shallowly—still recovering from the nine-month marathon that preceded the birth—yet here I am, eyes fixed on a terminal that refuses to rest. May Mobility&#x27;s backend, the one I own end-to-end, is nocturnal by nature. Every ninety seconds Lyft and Uber refresh dashboards that trace red, green, or amber back to something I designed, something I risked.&lt;&#x2F;p&gt;
+&lt;p&gt;Tonight the risk is quiet, and the air already tastes of burnt coffee. That is rarely comforting. A Grafana latency panel flashes yellow, then green again before my screenshot shortcut lands. Quiet means an incident may already be unfolding unseen, a packet loss spike hiding between Prometheus scrapes. Extreme ownership—Jocko Willink&#x27;s stark mantra—turns that possibility into personal debt. If the SLA slips, if the tele-assist feed stutters while a shuttle navigates downtown chaos, the fault line runs through me, not the codebase. Ownership liberates: once everything is my fault, excuses evaporate and only action remains.&lt;&#x2F;p&gt;
+&lt;h2 id=&quot;engineering-predictability-designing-the-eta-service&quot;&gt;Engineering Predictability — Designing the ETA Service&lt;&#x2F;h2&gt;
+&lt;p&gt;The ETA service began exactly like this—under dimmed desk lamp, caffeine gone cold, baby kicking inside a still-pregnant wife trying to sleep through the clacking keys. Even tonight, a lonely Redis cache miss crackles in the logs like distant thunder—harmless, perhaps, or a match searching for tinder. The requirement sounded innocent: &quot;Give riders an accurate arrival time.&quot; Reality laughed. GPS drifts in urban canyons, passengers judge minutes like hours. I reached for Rust, for Kalman filters fusing LiDAR ground truth, for gRPC because protobuf feels like honesty at the wire. I wrapped the whole thing in a fortress of metrics: request latency histograms, Redis cache hit ratios, downstream timeout counts. Observability first or perish.&lt;&#x2F;p&gt;
+&lt;p&gt;Two hundred milliseconds—less time than it takes neon rain to kiss the pavement. In that breath, the Ego (autonomous vehicle) coughs up its prophecy, sensors contest, algorithms arbitrate. The verdict leaves my service as a single number, pulsing across the wire toward Lyft&#x27;s unforgiving gateway. Miss by a heartbeat and the ride evaporates. Passengers seethe, drivers snap, metrics bleed red. Anger spiders upward: C-suite jaws tighten, stock tickers sputter, investors flick to other channels. In the ashes of a bad ETA, a whole company can die without firing a shot.&lt;&#x2F;p&gt;
+&lt;p&gt;The first full test run finished at 03:00 AM on a Tuesday I now remember only by the smell of burnt coffee. Weeks stretched into months until I pushed &lt;code&gt;v1.0.0&lt;&#x2F;code&gt; behind a feature flag. The staged rollout produced zero regressions and exactly one silent thank-you—from the universe, perhaps. At my level, nobody applauds when systems work; working is the default, the bare minimum. I&#x27;m fine with that. My reward is the flatness of graphs, the compounding of stock options into potential generational wealth.&lt;&#x2F;p&gt;
+&lt;h2 id=&quot;04-12-am-incident-and-response&quot;&gt;04:12 AM — Incident and Response&lt;&#x2F;h2&gt;
+&lt;p&gt;04:12 AM. PagerDuty screams: &lt;em&gt;Framerate &amp;lt; 5 fps on Miranda. Verify cellular connection.&lt;&#x2F;em&gt; My heart delivers its own alert: if operators can&#x27;t see the road clearly, the shuttle will safe-stop in five seconds and dozens of commuters will mutter about unreliable tech. 99.999 percent reliability feels impressive until you are staring at the 0.001 percent in real time. The cause—undocumented ISP maintenance—was mundane; the consequence was not. By 04:30 AM I had forced a fallback to our secondary LTE path, throttled encoder bitrate, and filed a retro ticket before most of the company&#x27;s Slack status lights turned green.&lt;&#x2F;p&gt;
+&lt;pre data-lang=&quot;text&quot; style=&quot;background-color:#0f1419;color:#bfbab0;&quot; class=&quot;language-text &quot;&gt;&lt;code class=&quot;language-text&quot; data-lang=&quot;text&quot;&gt;&lt;span&gt;04:12 ▸ PagerDuty page — Miranda video &amp;lt;5 fps
+&lt;&#x2F;span&gt;&lt;span&gt;04:13 ▸ Executed failover script — switched to secondary carrier
+&lt;&#x2F;span&gt;&lt;span&gt;04:20 ▸ Throttled encoder bitrate to 1 Mbps
+&lt;&#x2F;span&gt;&lt;span&gt;04:30 ▸ Filed retro ticket and opened root-cause thread
+&lt;&#x2F;span&gt;&lt;&#x2F;code&gt;&lt;&#x2F;pre&gt;
+&lt;blockquote&gt;
+&lt;p&gt;&lt;code&gt;ops-miranda 04:12&lt;&#x2F;code&gt;  Mirada&#x27;s front cam is toast—seeing artifacts.&lt;&#x2F;p&gt;
+&lt;&#x2F;blockquote&gt;
+&lt;p&gt;Failure still stings, but it fuels the backlog. We now heartbeat each Peplink connection, visualize bit errors beside weather radar overlays, and test failovers twice per sprint. Ownership means turning shame into system tests.&lt;&#x2F;p&gt;
+&lt;h2 id=&quot;alliances-and-the-road-ahead&quot;&gt;Alliances and the Road Ahead&lt;&#x2F;h2&gt;
+&lt;p&gt;Partnerships aren&#x27;t API contracts; they&#x27;re trust ledgers. Every time Lyft suggests a feature and we answer &quot;already live,&quot; the ledger tilts in our favor. The north star is predictable: integrations → precedents → partnerships → platform dominance. The route is not. But I will navigate it, one pull request, one alert, one caffeine-stained sunrise at a time.&lt;&#x2F;p&gt;
+&lt;h2 id=&quot;06-00-am-dawn-and-call-to-action&quot;&gt;06:00 AM — Dawn and Call to Action&lt;&#x2F;h2&gt;
+&lt;p&gt;The alert dashboard is green again. Outside, morning bleeds through the blinds. My daughter stirs, my wife smiles in semi-sleep, and the system hums without complaint. I failed last night, learned by dawn, and shipped the fix before breakfast.&lt;&#x2F;p&gt;
+&lt;p&gt;Pressure vents better through prose than through bourbon. I write to remind May Mobility—and myself—that reliability is intentional, never accidental. I write so junior engineers can see that ownership scales with scope, but so does fulfillment. If you&#x27;ve read this far, pick one alert—any alert—and own it before midnight strikes. Will your system hum at dawn?&lt;&#x2F;p&gt;
+&lt;p&gt;That is enough—for now. Time to go to work.&lt;&#x2F;p&gt;
+&lt;h2 id=&quot;about-the-author&quot;&gt;About the Author&lt;&#x2F;h2&gt;
+&lt;p&gt;&lt;em&gt;Dario Lencina Talarico is a Staff Software Engineer at May Mobility, where he architects and operates the real-time backends that keep autonomous shuttles safe and on schedule. Side projects like Videocall.rs—and this engineering vlog—are his playground for exploring ultra-low-latency systems at the edge.&lt;&#x2F;em&gt;&lt;&#x2F;p&gt;
+</content>
+        
+    </entry>
+</feed>

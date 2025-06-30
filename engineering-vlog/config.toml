@@ -8,6 +8,7 @@ minify_html = true
 
 taxonomies = [
     {name = "tags", feed = true},
+    {name = "authors", feed = true},
 ]
 
 [markdown]
@@ -19,13 +20,15 @@ toc = true
 use_cdn = false
 favicon = "/icon/favicon.png"
 theme = "toggle"              # light, dark, auto, toggle
-comment = true
+comment = false
 # mathjax = true
 # mathjax_dollar_inline_enable = true
 
 menu = [
     { name = "/vlog", url = "/", weight = 1 },
-    { name = "/tags", url = "/tags", weight = 2 },
+    { name = "/posts", url = "/posts/", weight = 2 },
+    { name = "/tags", url = "/tags/", weight = 3 },
+    { name = "/authors", url = "/authors/", weight = 4 },
 ]
 
 socials = []

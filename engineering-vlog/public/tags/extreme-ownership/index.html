@@ -1,0 +1,42 @@
+<!doctype html><html lang=en><head><meta charset=UTF-8><meta content="IE=edge" http-equiv=X-UA-Compatible><meta content="width=device-width,initial-scale=1.0" name=viewport><title>
+         Videocall Engineering
+        
+    </title><meta content="Videocall Engineering" property=og:title><meta content="Technical Vlog of the Videocall Engineering team" property=og:description><meta content="Technical Vlog of the Videocall Engineering team" name=description><link href=/icon/favicon.png rel=icon type=image/png><link href=https://engineering.videocall.rs/fonts.css rel=stylesheet><link title="Videocall Engineering" href=https://engineering.videocall.rs/atom.xml rel=alternate type=application/atom+xml><link href=https://engineering.videocall.rs/theme/light.css rel=stylesheet><link href=https://engineering.videocall.rs/theme/dark.css id=darkModeStyle rel=stylesheet><script src=https://engineering.videocall.rs/js/themetoggle.js></script><script>setTheme(getSavedTheme());</script><link href=https://engineering.videocall.rs/main.css media=screen rel=stylesheet><script data-cf-beacon='{"token": "37a0f981a37240aea00b781e300bc6c0"}' defer src=https://static.cloudflareinsights.com/beacon.min.js></script></head><script>// Function to set the theme
+        function setTheme(theme) {
+            document.documentElement.className = theme;
+            localStorage.setItem('theme', theme);
+        }
+
+        // Function to get the saved theme
+        function getSavedTheme() {
+            return localStorage.getItem('theme') || 'light';
+        }
+
+        // Set the theme on page load
+        document.addEventListener('DOMContentLoaded', (event) => {
+            setTheme(getSavedTheme());
+        });</script><body><div class=content><header><div class=main><a href=https://engineering.videocall.rs>Videocall Engineering</a><div class=socials></div></div><nav><a href=https://engineering.videocall.rs style=margin-left:.7em>/vlog</a><a href=https://engineering.videocall.rs/posts style=margin-left:.7em>/posts</a><a href=https://engineering.videocall.rs/tags style=margin-left:.7em>/tags</a><a href=https://engineering.videocall.rs/authors style=margin-left:.7em>/authors</a><button aria-label="Toggle dark mode" id=dark-mode-toggle onclick=toggleTheme();><img alt="Light mode" id=sun-icon src=https://engineering.videocall.rs/feather/sun.svg> <img alt="Dark mode" id=moon-icon src=https://engineering.videocall.rs/feather/moon.svg></button></nav></header><script>function toggleTheme() {
+    const html = document.documentElement;
+    const currentTheme = html.classList.contains('dark') ? 'dark' : 'light';
+    const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+    
+    html.classList.remove(currentTheme);
+    html.classList.add(newTheme);
+    
+    localStorage.setItem('theme', newTheme);
+    updateThemeToggleIcons();
+}
+
+function updateThemeToggleIcons() {
+    const sunIcon = document.getElementById('sun-icon');
+    const moonIcon = document.getElementById('moon-icon');
+    const isDarkMode = document.documentElement.classList.contains('dark');
+    
+    sunIcon.style.display = isDarkMode ? 'none' : 'inline';
+    moonIcon.style.display = isDarkMode ? 'inline' : 'none';
+}
+
+// Set initial theme
+const savedTheme = localStorage.getItem('theme') || 'light';
+document.documentElement.classList.add(savedTheme);
+updateThemeToggleIcons();</script><h1>Entries tagged - "extreme ownership"</h1><ul class=posts><li class=post><a href=https://engineering.videocall.rs/posts/extreme-ownership-staff-engineer/>Extreme Ownership at 01:00 AM: Confessions of a Staff Engineer Building Autonomous Vehicle Backends</a> <span class=meta>2025-06-30</span></ul></div>

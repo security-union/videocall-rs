@@ -104,6 +104,13 @@
                         Posted on <time>{{ page.date | date(format="%Y-%m-%d") }}</time>
                     {% endif %}
 
+                    {% if page.taxonomies and page.taxonomies.authors %}
+                        &nbsp;by
+                        {% for author in page.taxonomies.authors %}
+                            <a href="{{ get_taxonomy_url(kind='authors', name=author) | safe }}">{{ author }}</a>{% if not loop.last %}, {% endif %}
+                        {% endfor %}
+                    {% endif %}
+
                     {% if page.draft %}
                         <span class="draft-label">DRAFT</span>
                     {% endif %}

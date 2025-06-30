@@ -4,11 +4,16 @@ date = 2025-06-30
 # Set to `true` while drafting; switch to `false` once published
 draft = false
 slug = "extreme-ownership-staff-engineer"
-description = "A raw, SEO-tuned look at backend reliability, observability, and leadership through the lens of extreme ownership from a staff software engineer at May Mobility who architects real-time ETA services for Lyft and Uber integrations."
+description = "A raw look at backend reliability, observability, and leadership through the lens of extreme ownership from a staff software engineer at May Mobility who architects real-time ETA services for Lyft and Uber integrations."
 tags = ["extreme ownership", "staff engineer", "software reliability", "backend architecture", "observability", "rust", "autonomous vehicles", "leadership", "devops"]
+authors = ["Dario Lencina Talarico"]
 
 [extra]
 seo_keywords = ["senior engineer", "software reliability", "backend architecture", "autonomous vehicles", "rust", "observability", "may mobility", "pagerduty"]
+
+[taxonomies]
+tags = ["extreme ownership", "staff engineer", "software reliability", "backend architecture", "observability", "rust", "autonomous vehicles", "leadership", "devops"]
+authors = ["Dario Lencina Talarico"]
 +++
 
 *Extreme ownership transforms invisible risk into disciplined personal action—and it's the only guarantee that a real-time autonomous-vehicle backend survives the night.*
@@ -26,10 +31,6 @@ The ETA service began exactly like this—under dimmed desk lamp, caffeine gone 
 Two hundred milliseconds—less time than it takes neon rain to kiss the pavement. In that breath, the Ego (autonomous vehicle) coughs up its prophecy, sensors contest, algorithms arbitrate. The verdict leaves my service as a single number, pulsing across the wire toward Lyft's unforgiving gateway. Miss by a heartbeat and the ride evaporates. Passengers seethe, drivers snap, metrics bleed red. Anger spiders upward: C-suite jaws tighten, stock tickers sputter, investors flick to other channels. In the ashes of a bad ETA, a whole company can die without firing a shot.
 
 The first full test run finished at 03:00 AM on a Tuesday I now remember only by the smell of burnt coffee. Weeks stretched into months until I pushed `v1.0.0` behind a feature flag. The staged rollout produced zero regressions and exactly one silent thank-you—from the universe, perhaps. At my level, nobody applauds when systems work; working is the default, the bare minimum. I'm fine with that. My reward is the flatness of graphs, the compounding of stock options into potential generational wealth.
-
-## Culture as Safety Net — Building Psychological Safety
-
-Fred Kofman taught me that every business is, at its core, a conversation among people chasing meaning. So I architect protocols **and** psychological safety. Post-mortems stay blameless, pull requests stay kind, because fear clogs the throughput of ideas faster than any network partition. The chain is shared: when Lyft latency drops, a rider smiles, an investor relaxes, my daughter's college fund inhales. Engineering is economics disguised as syntax.
 
 ## 04:12 AM — Incident and Response
 
@@ -57,3 +58,7 @@ The alert dashboard is green again. Outside, morning bleeds through the blinds. 
 Pressure vents better through prose than through bourbon. I write to remind May Mobility—and myself—that reliability is intentional, never accidental. I write so junior engineers can see that ownership scales with scope, but so does fulfillment. If you've read this far, pick one alert—any alert—and own it before midnight strikes. Will your system hum at dawn?
 
 That is enough—for now. Time to go to work.
+
+## About the Author
+
+*Dario Lencina Talarico is a Staff Software Engineer at May Mobility, where he architects and operates the real-time backends that keep autonomous shuttles safe and on schedule. Side projects like Videocall.rs—and this engineering vlog—are his playground for exploring ultra-low-latency systems at the edge.*

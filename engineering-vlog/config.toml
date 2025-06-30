@@ -1,6 +1,6 @@
 base_url = "https://engineering.videocall.rs"
 title = "Videocall Engineering"
-description = "Videocall Engineering"
+description = "Technical Vlog of the Videocall Engineering team"
 compile_sass = true
 build_search_index = false
 generate_feeds = true
@@ -24,25 +24,11 @@ comment = true
 # mathjax_dollar_inline_enable = true
 
 menu = [
-    { name = "/posts", url = "/posts", weight = 1 },
-    { name = "/projects", url = "/projects", weight = 2 },
-    { name = "/about", url = "/about", weight = 3 },
-    { name = "/tags", url = "/tags", weight = 4 },
-    { name = "/CV", url = "/CV", weight = 5 },
-
+    { name = "/vlog", url = "/", weight = 1 },
+    { name = "/tags", url = "/tags", weight = 2 },
 ]
 
-socials = [
-    { name = "x", url = "https://twitter.com/emportent", icon = "x" },
-    { name = "github", url = "https://github.com/altunenes", icon = "github" },
-    { name = "scholar", url = "https://scholar.google.com/citations?user=_OtEw5oAAAAJ&hl", icon = "googlescholar" },
-    { name = "linkedin", url = "https://www.linkedin.com/in/enes-altun-0a3076167", icon = "linkedin" },
-    { name = "instagram", url = "https://www.instagram.com/altunanes/", icon = "instagram" },
-    { name = "orcid", url = "https://orcid.org/0000-0002-6478-6909", icon = "orcid" },
-    { name = "shadertoy", url = "https://www.shadertoy.com/user/altunenes", icon = "shadertoy" },
-    { name = "bluesky", url = "https://bsky.app/profile/altunenes.bsky.social", icon = "bluesky" }
-    
-]
+socials = []
 
 custom_css = []
 
@@ -58,14 +44,4 @@ website_id = "43929cd1-1e83...."
 host_url = "https://stats.mywebsite.com" # default: https://analytics.eu.umami.is
 
 [extra.giscus]
-repo = "altunenes/altunenes.github.io"
-repo_id = "R_kgDOL5NyoQ"
-category = "General"
-category_id = "DIC_kwDOL5Nyoc4CfU7n"
-mapping = "pathname"
-strict = "0"
-reactions_enabled = "1"
-emit_metadata = "0"
-input_position = "bottom"
-theme = "preferred_color_scheme"
-lang = "en"
+enabled = false

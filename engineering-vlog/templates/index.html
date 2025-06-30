@@ -1,6 +1,5 @@
 {% extends "section.html" %}
 
 {% block main_content %}
-    {% set page = get_page(path="about.md") %}
-    {{ post_macros::content(page=page) }}
+    {{ section.content | safe }}
 {% endblock main_content %}

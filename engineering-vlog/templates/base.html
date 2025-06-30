@@ -1,0 +1,56 @@
+{% import "macros/macros.html" as post_macros %}
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    {% include "partials/header.html" %}
+    <script>
+        // Function to set the theme
+        function setTheme(theme) {
+            document.documentElement.className = theme;
+            localStorage.setItem('theme', theme);
+        }
+
+        // Function to get the saved theme
+        function getSavedTheme() {
+            return localStorage.getItem('theme') || 'light';
+        }
+
+        // Set the theme on page load
+        document.addEventListener('DOMContentLoaded', (event) => {
+            setTheme(getSavedTheme());
+        });
+    </script>
+</head>
+<body>
+    <div class="content">
+        {% include "partials/nav.html" %}
+
+        {% block main_content %}
+            Nothing here?!
+        {% endblock main_content %}
+        
+        {% if page and page.ancestors %}
+            {% set is_post = false %}
+            {% for ancestor in page.ancestors %}
+                {% if "posts" in ancestor %}
+                    {% set_global is_post = true %}
+                {% endif %}
+            {% endfor %}
+            
+            {% if is_post %}
+                {% if page.extra.comment is defined %}
+                    {% set show_comment = page.extra.comment %}
+                {% else %}
+                    {% set show_comment = config.extra.comment %}
+                {% endif %}
+                
+                {% if show_comment %}
+                <div class="giscus"></div>
+                {% include "_giscus_script.html" %}
+                {% endif %}
+            {% endif %}
+        {% endif %}
+    </div>
+</body>
+</html>

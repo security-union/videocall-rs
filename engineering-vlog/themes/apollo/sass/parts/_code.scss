@@ -1,0 +1,234 @@
+// Define base colors and fonts for light and dark themes
+:root {
+  --code-font: var(--code-font), monospace;
+  --bg-primary: var(--bg-1);
+  --text-color: var(--text-0); // Color of the code text
+  --label-color: #f0f0f0; // Text color of the label
+
+  --highlight-color: #f0f0f0;
+}
+
+:root.dark {
+  --highlight-color: #204e8a;
+}
+
+// Define language colors map
+$language-colors: (
+  "js": (
+    #f7df1e,
+    "JavaScript",
+  ),
+  "yaml": (
+    #f71e6a,
+    "YAML",
+  ),
+  "shell": (
+    #4eaa25,
+    "Shell",
+  ),
+  // Updated to a more specific green shade
+  "json": (
+      dodgerblue,
+      "JSON",
+    ),
+  "python": (
+    #3572a5,
+    "Python",
+  ),
+  // Using the specific Python blue
+  "css": (
+      #264de4,
+      "CSS",
+    ),
+  "go": (
+    #00add8,
+    "Go",
+  ),
+  // Official Go color
+  "markdown": (
+      #0000ff,
+      "Markdown",
+    ),
+  "rust": (
+    #ff4647,
+    "Rust",
+  ),
+  // Adjusted to match Rust's branding
+  "java": (
+      #f89820,
+      "Java",
+    ),
+  // Oracle Java color
+  "csharp": (
+      #178600,
+      "C#",
+    ),
+  "ruby": (
+    #701516,
+    "Ruby",
+  ),
+  "swift": (
+    #f05138,
+    "Swift",
+  ),
+  "php": (
+    #777bb4,
+    "PHP",
+  ),
+  "typescript": (
+    #3178c6,
+    "TypeScript",
+  ),
+  "scala": (
+    #c22d40,
+    "Scala",
+  ),
+  "kotlin": (
+    #f18e33,
+    "Kotlin",
+  ),
+  "lua": (
+    #000080,
+    "Lua",
+  ),
+  "perl": (
+    #0298c3,
+    "Perl",
+  ),
+  "haskell": (
+    #5e5086,
+    "Haskell",
+  ),
+  "r": (
+    #198ce7,
+    "R",
+  ),
+  "dart": (
+    #00d2b8,
+    "Dart",
+  ),
+  "elixir": (
+    #6e4a7e,
+    "Elixir",
+  ),
+  "clojure": (
+    #5881d8,
+    "Clojure",
+  ),
+  "bash": (
+    #4eaa25,
+    "Bash",
+  ),
+  "default": (
+    #333,
+    "Code",
+  ),
+);
+
+@mixin base-label-style($bg-color, $text-color: var(--label-color)) {
+  background: $bg-color;
+  color: $text-color;
+  border-radius: 0 0 0.25rem 0.25rem;
+  font-size: 12px;
+  letter-spacing: 0.025rem;
+  padding: 0.1rem 0.5rem;
+  text-align: right;
+  text-transform: uppercase;
+  position: absolute;
+  right: 0;
+  top: 0;
+  margin-top: 0.1rem;
+}
+
+// Example usage within a specific class for clarity
+.code-label {
+  @include base-label-style(#333); // Default background color
+}
+
+@each $lang, $color-info in $language-colors {
+  .label-#{$lang} {
+    @include base-label-style(nth($color-info, 1));
+  }
+}
+
+code {
+  background-color: var(--bg-primary);
+  padding: 0.1em 0.2em;
+  border-radius: 5px;
+  border: 1px solid var(--border-color);
+  font-family: var(--code-font);
+}
+
+pre {
+  background-color: var(--bg-primary) !important;
+  border-radius: 5px;
+  border: 1px solid var(--border-color);
+  line-height: 1.4;
+  overflow-x: auto;
+  padding: 1em;
+  position: relative;
+
+  mark {
+    background-color: var(
+      --highlight-color
+    ) !important; // Ensure mark uses the theme background
+    padding: 0;
+    border-radius: 0px;
+  }
+
+  code {
+    background-color: transparent !important;
+    color: var(--text-color);
+    font-size: 100%;
+    padding: 0;
+    border: none;
+    font-family: var(--code-font);
+
+    table {
+      margin: 0;
+      border-collapse: collapse;
+      font-family: var(--code-font);
+
+      mark {
+        display: block;
+        color: unset;
+        padding: 0;
+        background-color: var(--highlight-color) !important;
+        filter: brightness(1.2); // Example to slightly increase brightness
+      }
+    }
+
+    td,
+    th,
+    tr {
+      padding: 0;
+      border-bottom: none;
+      border: none; // Ensure no borders around rows
+    }
+
+    tbody td:first-child {
+      text-align: center;
+      user-select: none;
+      min-width: 60px;
+      border-right: none;
+    }
+
+    tbody tr:nth-child(even),
+    thead tr {
+      background-color: unset;
+    }
+  }
+}
+
+.clipboard-button,
+.clipboard-button svg {
+  all: unset;
+  cursor: pointer;
+  position: absolute;
+  bottom: 5px;
+  right: 5px;
+  z-index: 10;
+  background-color: transparent;
+  border: none;
+  fill: var(--text-color);
+}

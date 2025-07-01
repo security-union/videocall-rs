@@ -48,54 +48,8 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rust_neteq = "0.1.0"
+videocall_neteq = "0.1.0"
 log = "0.4"
-```
-
-### Basic Usage
-
-```rust
-use rust_neteq::{NetEq, NetEqConfig, AudioPacket, RtpHeader};
-
-// Create configuration
-let mut config = NetEqConfig::default();
-config.sample_rate = 16000;
-config.channels = 1;
-config.min_delay_ms = 20;
-config.max_delay_ms = 500;
-
-// Create NetEQ instance
-let mut neteq = NetEq::new(config)?;
-
-// Create and insert audio packet
-let header = RtpHeader::new(seq_num, timestamp, ssrc, payload_type, false);
-let packet = AudioPacket::new(header, audio_data, 16000, 1, 20);
-neteq.insert_packet(packet)?;
-
-// Retrieve audio frame (10ms)
-let frame = neteq.get_audio()?;
-println!("Retrieved {} samples", frame.samples.len());
-
-// Get statistics
-let stats = neteq.get_statistics();
-println!("Buffer size: {}ms", stats.current_buffer_size_ms);
-println!("Target delay: {}ms", stats.target_delay_ms);
-```
-
-### Configuration Options
-
-```rust
-let mut config = NetEqConfig {
-    sample_rate: 16000,              // Audio sample rate
-    channels: 1,                     // Number of channels
-    max_packets_in_buffer: 200,      // Maximum buffer capacity
-    min_delay_ms: 20,                // Minimum target delay
-    max_delay_ms: 500,               // Maximum allowed delay
-    enable_fast_accelerate: true,    // Enable aggressive acceleration
-    enable_muted_state: false,       // Muted state detection
-    for_test_no_time_stretching: false, // Disable time stretching
-    // ... additional configuration options
-};
 ```
 
 ## Core Components
@@ -205,7 +159,6 @@ Both accelerate and preemptive expand algorithms include:
 ## Performance Characteristics
 
 ### Memory Usage
-- **Packet Storage**: ~1-5MB typical usage (depends on buffer size)
 - **Processing Overhead**: Minimal per-frame allocation
 - **Statistics**: ~1KB for comprehensive metrics
 
@@ -244,7 +197,7 @@ cargo run --example basic_usage
 ### Basic Jitter Buffer
 
 ```rust
-use rust_neteq::{NetEq, NetEqConfig};
+use videocall_neteq::{NetEq, NetEqConfig};
 
 let config = NetEqConfig::default();
 let mut neteq = NetEq::new(config)?;

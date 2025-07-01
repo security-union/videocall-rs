@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use rust_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
+use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -103,8 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Count different frame types
         match frame.speech_type {
-            rust_neteq::neteq::SpeechType::Expand => expand_count += 1,
-            rust_neteq::neteq::SpeechType::Normal => {
+            videocall_neteq::neteq::SpeechType::Expand => expand_count += 1,
+            videocall_neteq::neteq::SpeechType::Normal => {
                 // Check if this was likely an accelerate operation
                 // (simplified detection based on frame energy changes)
                 accelerate_count += 1;

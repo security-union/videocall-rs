@@ -17,6 +17,7 @@
  */
 
 use std::time::{Duration, Instant};
+use std::thread::sleep;
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::delay_manager::{DelayConfig, DelayManager};
@@ -536,7 +537,7 @@ impl NetEq {
         Ok(())
     }
 
-    fn current_buffer_size_ms(&self) -> u32 {
+    pub fn current_buffer_size_ms(&self) -> u32 {
         self.packet_buffer.get_span_duration_ms()
     }
 }
@@ -559,6 +560,8 @@ fn simple_random() -> f32 {
 mod tests {
     use super::*;
     use crate::packet::RtpHeader;
+    use rand::seq::SliceRandom;
+    use rand::thread_rng;
 
     fn create_test_packet(seq: u16, ts: u32, duration_ms: u32) -> AudioPacket {
         let header = RtpHeader::new(seq, ts, 12345, 96, false);
@@ -618,5 +621,87 @@ mod tests {
         let frame = neteq.get_audio().unwrap();
         assert_eq!(frame.speech_type, SpeechType::Expand);
         assert!(!frame.vad_activity);
+    }
+
+    #[test]
+    fn test_packet_buffer_with_out_of_order_jitter() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Create five consecutive packets (seq 0-5, timestamps 0,160,320,480,640)
+        let packets: Vec<AudioPacket> = (0u16..=4)
+            .map(|i| create_test_packet(i, i as u32 * 160, 10))
+            .collect();
+
+        let mut counter = 0;
+        for p in packets {
+            neteq.insert_packet(p).unwrap();
+            assert_eq!(neteq.current_buffer_size_ms(), counter);
+            counter += 10;
+        }
+
+        assert_eq!(neteq.current_buffer_size_ms(), 40);
+
+        // NetEQ should still deliver a normal speech frame
+        let frame = neteq.get_audio().unwrap();
+        assert_eq!(frame.speech_type, SpeechType::Normal);
+        assert!(frame.vad_activity);
+
+        println!("before stats: {:?}\n", neteq.get_statistics());
+
+        // We want to produce "jitter" in the output, so we need to insert a packet with a different timestamp
+        let packet = create_test_packet(5, 1000, 10);
+        neteq.insert_packet(packet).unwrap();
+
+        // assert that the jitter is detected
+        println!("before jitter: {:?}\n", neteq.get_statistics());
+
+        // add more jitter by inserting a packet with a timestamp that is way ahead of the current timestamp
+        let packet = create_test_packet(6, 10000, 10);
+        neteq.insert_packet(packet).unwrap();
+
+        // assert that the jitter is detected
+        println!("after jitter: {:?}", neteq.get_statistics());
+
+        // get audio frame
+    }
+
+    #[test]
+    fn test_escalating_packet_delays() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Insert packets with progressively larger real-time delays between arrivals
+        let mut seq: u16 = 0;
+        let mut ts: u32 = 0;
+        // Delays in milliseconds – each entry is the sleep before inserting the next packet
+        let delays_ms = [0u64, 10, 30, 70, 120];
+
+        for delay in &delays_ms {
+            if *delay > 0 {
+                sleep(Duration::from_millis(*delay));
+            }
+            let packet = create_test_packet(seq, ts, 10);
+            neteq.insert_packet(packet).unwrap();
+            seq = seq.wrapping_add(1);
+            ts = ts.wrapping_add(160); // 10 ms at 16 kHz
+        }
+
+        // Pull a series of audio frames; some should be normal, some should be expands
+        let mut expand_frames = 0;
+        for _ in 0..(delays_ms.len() + 3) {
+            let frame = neteq.get_audio().unwrap();
+            if frame.speech_type == SpeechType::Expand {
+                expand_frames += 1;
+            }
+            // Simulate playout interval
+            sleep(Duration::from_millis(10));
+        }
+
+        let stats = neteq.get_statistics();
+        assert!(expand_frames > 0, "Expected at least one expand frame due to late packets");
+        assert!(stats.lifetime.concealment_events >= expand_frames as u64, "Concealment events should grow");
+        assert!(stats.lifetime.concealed_samples > 0, "Concealed samples should increase");
+        assert!(stats.network.max_waiting_time_ms > 0, "Waiting time stats should reflect packet delays");
     }
 }

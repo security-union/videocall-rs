@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::BufferSize;
@@ -89,6 +90,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _stream = start_audio_playback(sample_rate, channels, neteq.clone())?;
 
     log::info!("CPAL stream started; feeding packets to NetEq ...");
+
+    // ── Spawn stats logger thread (logs once per second) ────────────────────
+    let stats_neteq = neteq.clone();
+    thread::spawn(move || {
+        let mut prev_calls = 0u64;
+        let mut prev_frames = 0u64;
+        loop {
+            thread::sleep(Duration::from_secs(1));
+
+            let calls = CALLBACK_CALLS.load(Ordering::Relaxed);
+            let frames = CALLBACK_FRAMES.load(Ordering::Relaxed);
+            let delta_calls = calls - prev_calls;
+            let delta_frames = frames - prev_frames;
+            prev_calls = calls;
+            prev_frames = frames;
+
+            let fps = delta_frames as f32 / calls_per_sec_den(channels) as f32; // will compute later
+            if let Ok(eq) = stats_neteq.lock() {
+                let stats = eq.get_statistics();
+                log::info!(
+                    "Stats: buffer={}ms target={}ms packets={} expand_rate={}‰ accel_rate={}‰ calls/s={} avg_frames={}",
+                    stats.current_buffer_size_ms,
+                    stats.target_delay_ms,
+                    stats.packet_count,
+                    stats.network.expand_rate as f32 / 16.384,  // Q14 to per-myriad
+                    stats.network.accelerate_rate as f32 / 16.384,
+                    delta_calls,
+                    delta_frames / delta_calls.max(1)
+                );
+            }
+        }
+    });
 
     // ── Spawn producer thread to feed remaining packets ─────────────────────-
     let producer_neteq = neteq.clone();
@@ -179,6 +212,8 @@ fn build_stream_f32(
         move |output: &mut [f32], _| {
             fill_output_neteq(output, &neteq, &mut leftover);
             log::debug!("CPAL callback filled {} samples (f32)", output.len());
+            CALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+            CALLBACK_FRAMES.fetch_add(output.len() as u64, Ordering::Relaxed);
         },
         err_fn,
         None,
@@ -202,6 +237,8 @@ fn build_stream_i16(
                 *o = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
             }
             log::debug!("CPAL callback filled {} samples (i16)", output.len());
+            CALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+            CALLBACK_FRAMES.fetch_add(output.len() as u64, Ordering::Relaxed);
         },
         err_fn,
         None,
@@ -225,6 +262,8 @@ fn build_stream_u16(
                 *o = ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
             }
             log::debug!("CPAL callback filled {} samples (u16)", output.len());
+            CALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
+            CALLBACK_FRAMES.fetch_add(output.len() as u64, Ordering::Relaxed);
         },
         err_fn,
         None,
@@ -238,7 +277,7 @@ fn fill_output_neteq(buffer: &mut [f32], neteq: &Arc<Mutex<NetEq>>, leftover: &m
             match neteq.lock() {
                 Ok(mut n) => match n.get_audio() {
                     Ok(frame) => {
-                        log::warn!("NetEq get_audio: {:?}", frame.speech_type);
+                        log::debug!("NetEq get_audio: {:?}", frame.speech_type);
                         leftover.extend_from_slice(&frame.samples);
                     },
                     Err(e) => {
@@ -260,4 +299,13 @@ fn fill_output_neteq(buffer: &mut [f32], neteq: &Arc<Mutex<NetEq>>, leftover: &m
         leftover.drain(..n);
         idx += n;
     }
+}
+
+// global counters for callback diagnostics
+static CALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
+static CALLBACK_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+// helper removed channels variable; adjust after compile
+fn calls_per_sec_den(channels: u8) -> u64 {
+    channels as u64
 } 

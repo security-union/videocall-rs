@@ -3,6 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::BufferSize;
 use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 
 // This example does the following:
@@ -55,12 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("NetEq initialised (sample_rate {} Hz, channels {}).", sample_rate, channels);
 
-    // ── Start CPAL output; keep the stream alive for the duration of main ────
-    let _stream = start_audio_playback(sample_rate, channels, neteq.clone())?;
+    // ── Warm-start NetEq with a few packets before audio begins ─────────────
+    let warmup_packets = 10; // 10 × 20 ms = 200 ms
 
-    log::info!("CPAL stream started; feeding packets to NetEq ...");
-
-    // ── Packetise and insert into NetEq (20 ms cadence) ───────────────────────
+    // Packet parameters
     let samples_per_channel_20ms = (sample_rate as f32 * 0.02) as usize;
     let packet_samples = samples_per_channel_20ms * channels as usize;
 
@@ -68,37 +67,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut timestamp: u32 = 0;
     let ssrc = 0x1234_5678;
 
-    for (idx, chunk) in wav_samples.chunks(packet_samples).enumerate() {
-        let mut payload = Vec::with_capacity(chunk.len() * 4);
-        for &s in chunk {
-            payload.extend_from_slice(&s.to_le_bytes());
-        }
-        let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 96, false);
-        let packet = AudioPacket::new(hdr, payload, sample_rate, channels, 20);
-        if let Ok(mut n) = neteq.lock() {
-            if let Err(e) = n.insert_packet(packet) {
-                log::error!("NetEq insert_packet error: {:?}", e);
-            }
-        }
+    let mut chunk_index_iter = wav_samples.chunks(packet_samples).enumerate();
 
-        seq_no = seq_no.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(samples_per_channel_20ms as u32);
-        if idx % 50 == 0 {
-            log::debug!("fed {} packets ({} seconds)", idx, idx as f32 * 0.02);
+    for _ in 0..warmup_packets {
+        if let Some((idx, chunk)) = chunk_index_iter.next() {
+            let mut payload = Vec::with_capacity(chunk.len() * 4);
+            for &s in chunk {
+                payload.extend_from_slice(&s.to_le_bytes());
+            }
+            let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 96, false);
+            let packet = AudioPacket::new(hdr, payload, sample_rate, channels, 20);
+            if let Ok(mut n) = neteq.lock() {
+                let _ = n.insert_packet(packet);
+            }
+            seq_no = seq_no.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(samples_per_channel_20ms as u32);
         }
-        thread::sleep(Duration::from_millis(20));
     }
 
-    log::info!("Finished feeding packets; waiting for playback to drain ...");
+    // ── Start CPAL output; keep the stream alive for the duration of main ────
+    let _stream = start_audio_playback(sample_rate, channels, neteq.clone())?;
 
-    // Wait a little to let playback finish.
-    thread::sleep(Duration::from_secs(3));
+    log::info!("CPAL stream started; feeding packets to NetEq ...");
+
+    // ── Spawn producer thread to feed remaining packets ─────────────────────-
+    let producer_neteq = neteq.clone();
+    // Move remaining samples into the producer thread to satisfy 'static
+    let remaining_samples: Vec<f32> = wav_samples
+        .iter()
+        .skip(warmup_packets * packet_samples)
+        .cloned()
+        .collect();
+    let total_remaining_chunks = remaining_samples.len() / packet_samples;
+
+    thread::spawn(move || {
+        for idx in 0..total_remaining_chunks {
+            let start = idx * packet_samples;
+            let chunk = &remaining_samples[start..start + packet_samples];
+            let mut payload = Vec::with_capacity(chunk.len() * 4);
+            for &s in chunk {
+                payload.extend_from_slice(&s.to_le_bytes());
+            }
+            let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 96, false);
+            let packet = AudioPacket::new(hdr, payload, sample_rate, channels, 20);
+            if let Ok(mut n) = producer_neteq.lock() {
+                let _ = n.insert_packet(packet);
+            }
+
+            // Advance RTP timing
+            seq_no = seq_no.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(samples_per_channel_20ms as u32);
+
+            if idx % 50 == 0 {
+                log::debug!("fed {} packets ({} seconds)", idx + warmup_packets, (idx + warmup_packets) as f32 * 0.02);
+            }
+
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        log::info!("Producer finished feeding all packets");
+    });
+
+    let total_secs = wav_samples.len() as f32 / sample_rate as f32 / channels as f32;
+    thread::sleep(Duration::from_secs_f32(total_secs + 1.0));
+
     Ok(())
 }
 
 // ───────────────────────────── Helpers ───────────────────────────────────────
 fn start_audio_playback(
-    _sample_rate: u32,
+    sample_rate: u32,
     channels: u8,
     neteq: Arc<Mutex<NetEq>>, // shared NetEq
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
@@ -112,7 +150,11 @@ fn start_audio_playback(
     // Pick a supported config matching our WAV if possible.
     let supported = device.default_output_config()?;
     let sample_format = supported.sample_format();
-    let cfg: cpal::StreamConfig = supported.config();
+    let mut cfg: cpal::StreamConfig = supported.config();
+
+    // Request a fixed 10 ms buffer size per callback.
+    let frames_per_buffer = (sample_rate / 100) as u32; // 10 ms worth of frames
+    cfg.buffer_size = BufferSize::Fixed(frames_per_buffer);
 
     let stream = match sample_format {
         F32 => build_stream_f32(&device, &cfg, channels, neteq.clone())?,

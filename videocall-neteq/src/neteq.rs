@@ -331,7 +331,8 @@ impl NetEq {
     fn get_decision(&mut self) -> Result<Operation> {
         // Check if we have packets
         if self.packet_buffer.is_empty() {
-            self.consecutive_expands += 1;
+            // Safely increment without risking overflow in debug builds.
+            self.consecutive_expands = self.consecutive_expands.saturating_add(1);
             return Ok(Operation::Expand);
         }
 

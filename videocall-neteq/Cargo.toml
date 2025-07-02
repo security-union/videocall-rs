@@ -14,10 +14,12 @@ log = "0.4"
 ringbuf = "0.3"
 hound = { version = "3.5", optional = true }
 rand = "0.9.1"
+cpal = "0.15"
 
 [features]
 default = []
 audio_files = ["hound"]
 
 [dev-dependencies]
-env_logger = "0.10" 
+env_logger = "0.10"
+hound = "3.5" 

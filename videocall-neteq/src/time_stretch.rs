@@ -183,6 +183,9 @@ impl Accelerate {
     }
 }
 
+// Allow Accelerate to be moved across threads (contains only primitive data, no interior mutability).
+unsafe impl Send for Accelerate {}
+
 impl TimeStretcher for Accelerate {
     fn process(
         &mut self,
@@ -360,6 +363,9 @@ impl PreemptiveExpand {
     }
 }
 
+// Safe because PreemptiveExpand only contains owned numeric data.
+unsafe impl Send for PreemptiveExpand {}
+
 impl TimeStretcher for PreemptiveExpand {
     fn process(
         &mut self,
@@ -384,12 +390,12 @@ pub struct TimeStretchFactory;
 
 impl TimeStretchFactory {
     /// Create an accelerate processor
-    pub fn create_accelerate(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher> {
+    pub fn create_accelerate(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher + Send> {
         Box::new(Accelerate::new(sample_rate, channels))
     }
 
     /// Create a preemptive expand processor  
-    pub fn create_preemptive_expand(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher> {
+    pub fn create_preemptive_expand(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher + Send> {
         Box::new(PreemptiveExpand::new(sample_rate, channels))
     }
 }

@@ -155,8 +155,8 @@ pub struct NetEq {
     packet_buffer: PacketBuffer,
     delay_manager: DelayManager,
     statistics: StatisticsCalculator,
-    accelerate: Box<dyn TimeStretcher>,
-    preemptive_expand: Box<dyn TimeStretcher>,
+    accelerate: Box<dyn TimeStretcher + Send>,
+    preemptive_expand: Box<dyn TimeStretcher + Send>,
     last_decode_timestamp: Option<u32>,
     output_frame_size_samples: usize,
     muted: bool,
@@ -199,8 +199,9 @@ impl NetEq {
         let statistics = StatisticsCalculator::new();
 
         // Create time stretchers
-        let accelerate = TimeStretchFactory::create_accelerate(config.sample_rate, config.channels);
-        let preemptive_expand =
+        let accelerate: Box<dyn TimeStretcher + Send> =
+            TimeStretchFactory::create_accelerate(config.sample_rate, config.channels);
+        let preemptive_expand: Box<dyn TimeStretcher + Send> =
             TimeStretchFactory::create_preemptive_expand(config.sample_rate, config.channels);
 
         Ok(Self {

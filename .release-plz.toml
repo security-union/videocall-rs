@@ -46,7 +46,11 @@ publish = false
 changelog_update = true
 git_release_enable = false
 
-
+[[package]]
+name = "videocall-neteq"
+publish = false
+changelog_update = true
+git_release_enable = false
 
 
 [changelog]

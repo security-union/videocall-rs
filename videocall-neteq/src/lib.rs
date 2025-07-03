@@ -28,9 +28,9 @@ pub mod delay_manager;
 pub mod error;
 pub mod neteq;
 pub mod packet;
+pub mod signal;
 pub mod statistics;
 pub mod time_stretch;
-pub mod signal;
 
 pub use error::{NetEqError, Result};
 pub use neteq::{NetEq, NetEqConfig, NetEqStats, Operation};

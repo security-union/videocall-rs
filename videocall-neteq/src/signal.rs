@@ -50,4 +50,4 @@ pub fn crossfade(prev: &[f32], next: &[f32], fade_len: usize, out: &mut Vec<f32>
         let sample = prev[total_prev - fade_len + i] * fade_out + next[i] * fade_in;
         out.push(sample);
     }
-} 
+}

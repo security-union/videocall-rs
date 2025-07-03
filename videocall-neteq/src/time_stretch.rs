@@ -281,10 +281,12 @@ impl PreemptiveExpand {
 
         // Crossfade duplicate region
         let fade_out_start = best_pos - self.overlap_length;
-        crate::signal::crossfade(&input[fade_out_start..best_pos],
-                                 &input[best_pos..best_pos + self.overlap_length],
-                                 self.overlap_length,
-                                 output);
+        crate::signal::crossfade(
+            &input[fade_out_start..best_pos],
+            &input[best_pos..best_pos + self.overlap_length],
+            self.overlap_length,
+            output,
+        );
 
         // Append rest (including duplicate region)
         output.extend_from_slice(&input[best_pos..]);

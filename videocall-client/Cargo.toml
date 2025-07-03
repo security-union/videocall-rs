@@ -1,6 +1,6 @@
 [package]
 name = "videocall-client"
-version = "1.1.7"
+version = "1.1.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A client for the videocall project"
@@ -37,7 +37,7 @@ yew = { version = "0.21" }
 yew-websocket = "1.21.0"
 yew-webtransport = "0.21.1"
 prost = "0.11"
-videocall-codecs = { path = "../videocall-codecs", features = ["wasm"], version = "0.1.1" }
+videocall-codecs = { path = "../videocall-codecs", features = ["wasm"], version = "0.1.2" }
 
 [dependencies.web-sys]
 version = "0.3.72"

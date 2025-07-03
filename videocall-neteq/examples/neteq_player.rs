@@ -189,6 +189,13 @@ fn start_audio_playback(
     // Request a fixed 10 ms buffer size per callback.
     let frames_per_buffer = (sample_rate / 100) as u32; // 10 ms worth of frames
     cfg.buffer_size = BufferSize::Fixed(frames_per_buffer);
+    cfg.channels = 1;
+
+    log::info!(
+        "Final stream config - sample_rate={} buffer_size={:?}",
+        cfg.sample_rate.0,
+        cfg.buffer_size
+    );
 
     let stream = match sample_format {
         F32 => build_stream_f32(&device, &cfg, channels, neteq.clone())?,

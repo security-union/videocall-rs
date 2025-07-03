@@ -45,22 +45,22 @@ pub trait TimeStretcher {
 /// Accelerate algorithm - removes audio samples to speed up playback
 #[derive(Debug)]
 pub struct Accelerate {
-    sample_rate: u32,
-    channels: u8,
+    _sample_rate: u32,
+    _channels: u8,
     length_change_samples: usize,
     overlap_length: usize,
-    max_change_rate: f32,
+    _max_change_rate: f32,
 }
 
 impl Accelerate {
     /// Create a new accelerate processor
     pub fn new(sample_rate: u32, channels: u8) -> Self {
         Self {
-            sample_rate,
-            channels,
+            _sample_rate: sample_rate,
+            _channels: channels,
             length_change_samples: 0,
             overlap_length: Self::calculate_overlap_length(sample_rate),
-            max_change_rate: 0.25, // Maximum 25% reduction
+            _max_change_rate: 0.25, // Maximum 25% reduction
         }
     }
 
@@ -232,7 +232,7 @@ impl PreemptiveExpand {
         &mut self,
         input: &[f32],
         output: &mut Vec<f32>,
-        fast_mode: bool,
+        _fast_mode: bool,
     ) -> TimeStretchResult {
         if input.len() < self.overlap_length * 2 {
             // Not enough samples to expand
@@ -357,8 +357,8 @@ mod tests {
     #[test]
     fn test_accelerate_creation() {
         let accelerate = Accelerate::new(16000, 1);
-        assert_eq!(accelerate.sample_rate, 16000);
-        assert_eq!(accelerate.channels, 1);
+        assert_eq!(accelerate._sample_rate, 16000);
+        assert_eq!(accelerate._channels, 1);
         assert_eq!(accelerate.get_length_change_samples(), 0);
     }
 

@@ -76,7 +76,7 @@ pub struct RelativeArrivalDelayTracker {
 #[derive(Debug, Clone)]
 struct PacketDelay {
     iat_delay_ms: i32,
-    timestamp: u32,
+    _timestamp: u32,
     arrival_time: Instant,
 }
 
@@ -124,10 +124,10 @@ impl RelativeArrivalDelayTracker {
         self.last_packet_time = None;
     }
 
-    fn update_delay_history(&mut self, iat_delay_ms: i32, timestamp: u32, sample_rate: u32) {
+    fn update_delay_history(&mut self, iat_delay_ms: i32, timestamp: u32, _sample_rate: u32) {
         let packet_delay = PacketDelay {
             iat_delay_ms,
-            timestamp,
+            _timestamp: timestamp,
             arrival_time: Instant::now(),
         };
 
@@ -285,7 +285,7 @@ impl DelayManager {
             self.initialized = true;
         } else {
             // Apply exponential smoothing
-            let mut forget_factor = if let Some(start_weight) = self.config.start_forget_weight {
+            let forget_factor = if let Some(start_weight) = self.config.start_forget_weight {
                 // Use stronger initial adaptation
                 let adaptation_factor = (start_weight - 1.0)
                     * (-self.last_update_time.elapsed().as_secs_f64() / 10.0).exp()

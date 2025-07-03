@@ -17,7 +17,6 @@
  */
 
 /// Simple signal-processing helpers used by time-stretch routines.
-
 /// Compute normalized cross-correlation of two equal-length  slices.
 /// Returns value in [-1,1].
 pub fn normalized_correlation(a: &[f32], b: &[f32]) -> f32 {

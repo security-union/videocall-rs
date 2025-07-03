@@ -18,6 +18,7 @@
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::delay_manager::{DelayConfig, DelayManager};
@@ -165,6 +166,8 @@ pub struct NetEq {
     frame_timestamp: u32,
     /// Samples remaining from a previously decoded packet (to support 20 ms packets → 10 ms frames)
     leftover_samples: Vec<f32>,
+    /// Map RTP payload-type → audio decoder instance.
+    decoders: HashMap<u8, Box<dyn crate::codec::AudioDecoder + Send>>,
 }
 
 impl NetEq {
@@ -220,6 +223,7 @@ impl NetEq {
             consecutive_expands: 0,
             frame_timestamp: 0,
             leftover_samples: Vec::new(),
+            decoders: HashMap::new(),
         })
     }
 
@@ -429,13 +433,23 @@ impl NetEq {
         while filled < samples_needed {
             match self.packet_buffer.get_next_packet() {
                 Some(packet) => {
-                    let total_samples_in_packet = packet.payload.len() / 4; // bytes → samples
-                    let mut packet_samples: Vec<f32> = Vec::with_capacity(total_samples_in_packet);
-                    // Convert bytes → f32
-                    for chunk in packet.payload.chunks_exact(4) {
-                        packet_samples
-                            .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                    }
+                    // Decode based on payload type if we have a decoder; otherwise treat as raw f32 PCM.
+                    let mut packet_samples: Vec<f32> = if let Some(dec) = self.decoders.get_mut(&packet.header.payload_type) {
+                        match dec.decode(&packet.payload) {
+                            Ok(pcm) => pcm,
+                            Err(e) => {
+                                log::error!("decoder error for pt {}: {:?}", packet.header.payload_type, e);
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        // Fallback: raw f32 PCM
+                        let mut v = Vec::with_capacity(packet.payload.len() / 4);
+                        for chunk in packet.payload.chunks_exact(4) {
+                            v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                        }
+                        v
+                    };
 
                     let available = packet_samples.len();
                     let need_now = samples_needed - filled;
@@ -627,6 +641,11 @@ impl NetEq {
 
     pub fn current_buffer_size_ms(&self) -> u32 {
         self.packet_buffer.get_span_duration_ms()
+    }
+
+    /// Register a decoder for a given RTP payload type.
+    pub fn register_decoder(&mut self, payload_type: u8, decoder: Box<dyn crate::codec::AudioDecoder + Send>) {
+        self.decoders.insert(payload_type, decoder);
     }
 }
 

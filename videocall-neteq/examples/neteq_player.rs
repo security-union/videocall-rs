@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::BufferSize;
 use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
+use videocall_neteq::codec::OpusDecoder;
+use opus::{Encoder as OpusEncoder, Application as OpusApp, Channels as OpusChannels};
 
 // This example does the following:
 // 1. Loads a WAV file (passed on the command-line).
@@ -64,6 +66,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         channels
     );
 
+    // Register Opus decoder for payload type 111.
+    {
+        let mut n = neteq.lock().unwrap();
+        n.register_decoder(111, Box::new(OpusDecoder::new(sample_rate, channels)?));
+    }
+
     // ── Warm-start NetEq with a few packets before audio begins ─────────────
     let warmup_packets = 10; // 10 × 20 ms = 200 ms
 
@@ -75,15 +83,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut timestamp: u32 = 0;
     let ssrc = 0x1234_5678;
 
+    // Create Opus encoder (monophonic/stereo depending on WAV)
+    let ch_enum = if channels == 1 { OpusChannels::Mono } else { OpusChannels::Stereo };
+    let mut opus_encoder = OpusEncoder::new(sample_rate as u32, ch_enum, OpusApp::Audio)?;
+
     let mut chunk_index_iter = wav_samples.chunks(packet_samples).enumerate();
 
     for _ in 0..warmup_packets {
         if let Some((idx, chunk)) = chunk_index_iter.next() {
-            let mut payload = Vec::with_capacity(chunk.len() * 4);
-            for &s in chunk {
-                payload.extend_from_slice(&s.to_le_bytes());
-            }
-            let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 96, false);
+            // Encode 20 ms PCM chunk into Opus
+            let mut encoded = vec![0u8; 4000];
+            let bytes_written = opus_encoder.encode_float(chunk, &mut encoded)?;
+            encoded.truncate(bytes_written as usize);
+            let payload = encoded;
+            let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 111, false);
             let packet = AudioPacket::new(hdr, payload, sample_rate, channels, 20);
             if let Ok(mut n) = neteq.lock() {
                 let _ = n.insert_packet(packet);
@@ -146,11 +159,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for idx in 0..total_remaining_chunks {
             let start = idx * packet_samples;
             let chunk = &remaining_samples[start..start + packet_samples];
-            let mut payload = Vec::with_capacity(chunk.len() * 4);
-            for &s in chunk {
-                payload.extend_from_slice(&s.to_le_bytes());
-            }
-            let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 96, false);
+            // Encode PCM chunk to Opus
+            let mut encoded = vec![0u8; 4000];
+            let bytes_written = opus_encoder.encode_float(chunk, &mut encoded)?;
+            encoded.truncate(bytes_written as usize);
+            let payload = encoded;
+            let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 111, false);
             let packet = AudioPacket::new(hdr, payload, sample_rate, channels, 20);
             if let Ok(mut n) = producer_neteq.lock() {
                 log::debug!("inserting packet {}", seq_no);
@@ -195,16 +209,34 @@ fn start_audio_playback(
         .default_output_device()
         .expect("No default output device");
 
-    // Pick a supported config matching our WAV if possible.
-    let supported = device.default_output_config()?;
-    log::info!("Device sample-rate   : {} Hz", supported.sample_rate().0);
+    // We prefer 48 kHz output for compatibility with Opus and many devices.
+    let preferred_rate = 48_000u32;
+
+    // Try to find a supported config that includes 48 kHz.
+    let mut cfg: Option<cpal::SupportedStreamConfig> = None;
+    for sc in device.supported_output_configs()? {
+        let sr_range = sc.min_sample_rate().0..=sc.max_sample_rate().0;
+        if sr_range.contains(&preferred_rate) {
+            cfg = Some(sc.with_sample_rate(cpal::SampleRate(preferred_rate)));
+            break;
+        }
+    }
+
+    let supported = cfg.unwrap_or_else(|| device.default_output_config().unwrap());
+
+    log::info!(
+        "Output device will run at {} Hz (format {:?})",
+        supported.sample_rate().0,
+        supported.sample_format()
+    );
+
     let sample_format = supported.sample_format();
     let mut cfg: cpal::StreamConfig = supported.config();
 
-    // Request a fixed 10 ms buffer size per callback.
-    let frames_per_buffer = (sample_rate / 100) as u32; // 10 ms worth of frames
+    // Request a fixed 10 ms buffer size per callback, based on chosen rate.
+    let frames_per_buffer = (cfg.sample_rate.0 / 100) as u32; // 10 ms worth
     cfg.buffer_size = BufferSize::Fixed(frames_per_buffer);
-    cfg.channels = 1;
+    cfg.channels = 1; // mono output
 
     log::info!(
         "Final stream config - sample_rate={} buffer_size={:?}",

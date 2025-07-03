@@ -29,6 +29,7 @@ pub mod neteq;
 pub mod packet;
 pub mod statistics;
 pub mod time_stretch;
+pub mod codec;
 
 pub use error::{NetEqError, Result};
 pub use neteq::{NetEq, NetEqConfig, NetEqStats, Operation};

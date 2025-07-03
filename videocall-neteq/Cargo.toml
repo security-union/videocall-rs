@@ -15,6 +15,7 @@ ringbuf = "0.3"
 hound = { version = "3.5", optional = true }
 rand = "0.9.1"
 cpal = "0.15"
+opus = "0.3"
 
 [features]
 default = []

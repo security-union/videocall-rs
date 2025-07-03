@@ -1,6 +1,6 @@
 [package]
 name = "neteq"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "NetEQ-inspired adaptive jitter buffer for audio decoding"
 license = "MIT OR Apache-2.0"
@@ -9,7 +9,7 @@ readme = "README.md"
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"
 keywords = ["audio", "jitter", "webrtc", "neteq", "buffer"]
-categories = ["multimedia::audio", "multimedia::encoding-decoding", "algorithms", "data-structures"]
+categories = ["multimedia::audio", "multimedia::encoding", "algorithms", "data-structures"]
 include = ["src/**/*"]
 
 [dependencies]

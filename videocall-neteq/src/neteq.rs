@@ -16,9 +16,9 @@
  * conditions.
  */
 
+use std::collections::HashMap;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::delay_manager::{DelayConfig, DelayManager};
@@ -434,11 +434,17 @@ impl NetEq {
             match self.packet_buffer.get_next_packet() {
                 Some(packet) => {
                     // Decode based on payload type if we have a decoder; otherwise treat as raw f32 PCM.
-                    let mut packet_samples: Vec<f32> = if let Some(dec) = self.decoders.get_mut(&packet.header.payload_type) {
+                    let mut packet_samples: Vec<f32> = if let Some(dec) =
+                        self.decoders.get_mut(&packet.header.payload_type)
+                    {
                         match dec.decode(&packet.payload) {
                             Ok(pcm) => pcm,
                             Err(e) => {
-                                log::error!("decoder error for pt {}: {:?}", packet.header.payload_type, e);
+                                log::error!(
+                                    "decoder error for pt {}: {:?}",
+                                    packet.header.payload_type,
+                                    e
+                                );
                                 Vec::new()
                             }
                         }
@@ -644,7 +650,11 @@ impl NetEq {
     }
 
     /// Register a decoder for a given RTP payload type.
-    pub fn register_decoder(&mut self, payload_type: u8, decoder: Box<dyn crate::codec::AudioDecoder + Send>) {
+    pub fn register_decoder(
+        &mut self,
+        payload_type: u8,
+        decoder: Box<dyn crate::codec::AudioDecoder + Send>,
+    ) {
         self.decoders.insert(payload_type, decoder);
     }
 }

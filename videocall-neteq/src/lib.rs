@@ -23,13 +23,13 @@
 //! and adaptive buffering for real-time audio applications.
 
 pub mod buffer;
+pub mod codec;
 pub mod delay_manager;
 pub mod error;
 pub mod neteq;
 pub mod packet;
 pub mod statistics;
 pub mod time_stretch;
-pub mod codec;
 
 pub use error::{NetEqError, Result};
 pub use neteq::{NetEq, NetEqConfig, NetEqStats, Operation};

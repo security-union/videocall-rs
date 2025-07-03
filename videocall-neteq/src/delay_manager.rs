@@ -296,11 +296,7 @@ impl DelayManager {
             };
 
             // Clamp to [0.0, 1.0] to ensure filter stability
-            if forget_factor > 1.0 {
-                forget_factor = 1.0;
-            } else if forget_factor < 0.0 {
-                forget_factor = 0.0;
-            }
+            let forget_factor = forget_factor.clamp(0.0, 1.0);
 
             self.filtered_delay = self.filtered_delay * forget_factor
                 + (relative_delay as f64) * (1.0 - forget_factor);

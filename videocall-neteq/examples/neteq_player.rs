@@ -182,6 +182,7 @@ fn start_audio_playback(
 
     // Pick a supported config matching our WAV if possible.
     let supported = device.default_output_config()?;
+    log::info!("Device sample-rate   : {} Hz", supported.sample_rate().0);
     let sample_format = supported.sample_format();
     let mut cfg: cpal::StreamConfig = supported.config();
 

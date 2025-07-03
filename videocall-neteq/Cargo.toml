@@ -16,6 +16,7 @@ hound = { version = "3.5", optional = true }
 rand = "0.9.1"
 cpal = "0.15"
 opus = "0.3"
+clap = { version = "4.5", features = ["derive"] }
 
 [features]
 default = []

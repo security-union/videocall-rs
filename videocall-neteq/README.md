@@ -225,6 +225,27 @@ log::info!("Buffer utilization: {:.1}%",
     stats.current_buffer_size_ms as f32 / stats.target_delay_ms as f32 * 100.0);
 ```
 
+### NetEq Player with Jitter Simulation
+
+The `neteq_player` example can replay a WAV file through NetEq while simulating
+network impairments.  It accepts two **independent** knobs:
+
+| Flag | Range | Meaning |
+|------|-------|---------|
+| `--packets-out-of-order <0.0-1.0>` | 0 = strictly in-order, 1 = heavily shuffled | Controls how often packets are delivered out of sequence.  Internally a window up to 40 ms is shuffled in proportion to the value. |
+| `--inter-frame-delay <0.0-1.0>` | 0 = no extra delay, 1 ≈ +1 s max | Adds random extra one-way delay to each packet before it reaches NetEq.  The delay is drawn uniformly from 0 … `value × 1000 ms`. |
+
+Example: replay a 48 kHz WAV while introducing moderate jitter and re-ordering:
+
+```bash
+cargo run --release --example neteq_player --features audio_files -- \
+    my_audio_48k.wav \
+    --packets-out-of-order 0.4 \
+    --inter-frame-delay 0.25
+```
+
+Use `-h` / `--help` / `--h` for the full argument list.
+
 ## Integration Notes
 
 ### Audio Codecs

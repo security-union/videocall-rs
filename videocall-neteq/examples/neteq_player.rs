@@ -1,13 +1,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::BufferSize;
-use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
+use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
+use rand::Rng;
 use videocall_neteq::codec::OpusDecoder;
-use opus::{Encoder as OpusEncoder, Application as OpusApp, Channels as OpusChannels};
+use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 
 // This example does the following:
 // 1. Loads a WAV file (passed on the command-line).
@@ -17,13 +19,39 @@ use opus::{Encoder as OpusEncoder, Application as OpusApp, Channels as OpusChann
 //
 // The NetEq instance never crosses thread boundaries (it lives on the main
 // thread) which avoids the need for `Send`/`Sync` on its internal objects.
+
+#[derive(Parser, Debug)]
+#[clap(about = "NetEq player with jitter simulation", version)]
+struct Args {
+    #[clap(value_parser, help = "Path to WAV file to play")]
+    wav_path: String,
+
+    #[clap(
+        long,
+        default_value_t = 0.0,
+        help = "Packets out-of-order level 0.0-1.0"
+    )]
+    packets_out_of_order: f32,
+
+    #[clap(
+        long,
+        default_value_t = 0.0,
+        help = "Inter-frame extra delay level 0.0-1.0"
+    )]
+    inter_frame_delay: f32,
+
+    #[clap(long = "h", action = clap::ArgAction::Help, hide = true)]
+    _help_alias: Option<bool>,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     // ── Parse CLI ─────────────────────────────────────────────────────────────
-    let wav_path = std::env::args()
-        .nth(1)
-        .expect("Usage: cargo run --example neteq_player --features audio_files <wav_file>");
+    let args = Args::parse();
+    let wav_path = args.wav_path;
+    let disorder_level = args.packets_out_of_order.clamp(0.0, 1.0);
+    let delay_level = args.inter_frame_delay.clamp(0.0, 1.0);
 
     log::info!("Loading WAV file: {}", wav_path);
 
@@ -84,7 +112,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ssrc = 0x1234_5678;
 
     // Create Opus encoder (monophonic/stereo depending on WAV)
-    let ch_enum = if channels == 1 { OpusChannels::Mono } else { OpusChannels::Stereo };
+    let ch_enum = if channels == 1 {
+        OpusChannels::Mono
+    } else {
+        OpusChannels::Stereo
+    };
     let mut opus_encoder = OpusEncoder::new(sample_rate as u32, ch_enum, OpusApp::Audio)?;
 
     let mut chunk_index_iter = wav_samples.chunks(packet_samples).enumerate();
@@ -143,9 +175,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // ── Set up channel and network simulator ────────────────────────────────
+    let (tx, rx) = mpsc::channel::<AudioPacket>();
+
+    // Network simulator thread
+    let neteq_for_net = neteq.clone();
+    thread::spawn(move || {
+        let mut rng = rand::thread_rng();
+        for packet in rx {
+            // Extra delay in 0..1000 ms scaled
+            let extra_delay_ms = rng.gen::<f32>() * delay_level * 100.0;
+            // Additional small randomness to create reordering within 0..40 ms window
+            let reorder_delay_ms = rng.gen::<f32>() * disorder_level * 40.0;
+            let total_delay = Duration::from_millis((extra_delay_ms + reorder_delay_ms) as u64);
+            std::thread::sleep(total_delay);
+
+            if let Ok(mut n) = neteq_for_net.lock() {
+                let _ = n.insert_packet(packet);
+            }
+        }
+    });
+
     // ── Spawn producer thread to feed remaining packets ─────────────────────-
-    let producer_neteq = neteq.clone();
-    // Move remaining samples into the producer thread to satisfy 'static
     let remaining_samples: Vec<f32> = wav_samples
         .iter()
         .skip(warmup_packets * packet_samples)
@@ -153,47 +204,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let total_remaining_chunks = remaining_samples.len() / packet_samples;
 
-    let period = Duration::from_millis(20);
-    let mut next = Instant::now();
-    loop {
-        for idx in 0..total_remaining_chunks {
-            let start = idx * packet_samples;
-            let chunk = &remaining_samples[start..start + packet_samples];
-            // Encode PCM chunk to Opus
-            let mut encoded = vec![0u8; 4000];
-            let bytes_written = opus_encoder.encode_float(chunk, &mut encoded)?;
-            encoded.truncate(bytes_written as usize);
-            let payload = encoded;
-            let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 111, false);
-            let packet = AudioPacket::new(hdr, payload, sample_rate, channels, 20);
-            if let Ok(mut n) = producer_neteq.lock() {
-                log::debug!("inserting packet {}", seq_no);
-                let _ = n.insert_packet(packet);
+    thread::spawn(move || {
+        let period = Duration::from_millis(20);
+        let mut next = Instant::now();
+        let mut loc_seq_no = seq_no;
+        let mut loc_timestamp = timestamp;
+
+        loop {
+            for idx in 0..total_remaining_chunks {
+                let start = idx * packet_samples;
+                let chunk = &remaining_samples[start..start + packet_samples];
+                let mut encoded = vec![0u8; 4000];
+                let bytes_written = opus_encoder
+                    .encode_float(chunk, &mut encoded)
+                    .expect("Opus encode");
+                encoded.truncate(bytes_written as usize);
+                let hdr = RtpHeader::new(loc_seq_no, loc_timestamp, ssrc, 111, false);
+                let packet = AudioPacket::new(hdr, encoded, sample_rate, channels, 20);
+                tx.send(packet).expect("channel send");
+
+                loc_seq_no = loc_seq_no.wrapping_add(1);
+                loc_timestamp = loc_timestamp.wrapping_add(samples_per_channel_20ms as u32);
+
+                next += period;
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
             }
-
-            // Advance RTP timing
-            seq_no = seq_no.wrapping_add(1);
-            timestamp = timestamp.wrapping_add(samples_per_channel_20ms as u32);
-
-            if idx % 50 == 0 {
-                log::debug!(
-                    "fed {} packets ({} seconds)",
-                    idx + warmup_packets,
-                    (idx + warmup_packets) as f32 * 0.02
-                );
-            }
-
-            next += period;
-            std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            log::info!(
+                "Producer finished feeding all packets – restarting loop for continuous play"
+            );
         }
+    });
 
-        log::info!("Producer finished feeding all packets");
+    // keep main alive
+    loop {
+        thread::sleep(Duration::from_secs(3600));
     }
-
-    let total_secs = wav_samples.len() as f32 / sample_rate as f32 / channels as f32;
-    thread::sleep(Duration::from_secs_f32(total_secs + 1.0));
-
-    Ok(())
 }
 
 // ───────────────────────────── Helpers ───────────────────────────────────────

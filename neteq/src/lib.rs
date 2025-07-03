@@ -23,10 +23,12 @@
 //! and adaptive buffering for real-time audio applications.
 
 pub mod buffer;
+pub mod codec;
 pub mod delay_manager;
 pub mod error;
 pub mod neteq;
 pub mod packet;
+pub mod signal;
 pub mod statistics;
 pub mod time_stretch;
 
@@ -41,7 +43,7 @@ mod tests {
     #[test]
     fn basic_functionality() {
         let config = NetEqConfig::default();
-        let mut neteq = NetEq::new(config).unwrap();
+        let neteq = NetEq::new(config).unwrap();
 
         // Test basic operations
         assert_eq!(neteq.target_delay_ms(), 0);

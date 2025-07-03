@@ -103,7 +103,7 @@ pub struct StatisticsCalculator {
     operation_stats: OperationStatistics,
     start_time: Instant,
     waiting_times: Vec<i32>,
-    last_update: Instant,
+    _last_update: Instant,
 }
 
 impl Default for StatisticsCalculator {
@@ -122,7 +122,7 @@ impl StatisticsCalculator {
             operation_stats: OperationStatistics::default(),
             start_time: now,
             waiting_times: Vec::new(),
-            last_update: now,
+            _last_update: now,
         }
     }
 

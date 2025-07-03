@@ -9,6 +9,7 @@ members = [
     "yew-ui",
     "videocall-sdk",
     "videocall-codecs",
+    "neteq",
 ]
 exclude = [
     "src-tauri",

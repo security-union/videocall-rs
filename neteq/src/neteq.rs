@@ -16,15 +16,15 @@
  * conditions.
  */
 
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::delay_manager::{DelayConfig, DelayManager};
-use crate::packet::{AudioPacket, RtpHeader};
+use crate::packet::AudioPacket;
 use crate::statistics::{
     LifetimeStatistics, NetworkStatistics, StatisticsCalculator, TimeStretchOperation,
 };
-use crate::time_stretch::{TimeStretchFactory, TimeStretchResult, TimeStretcher};
+use crate::time_stretch::{TimeStretchFactory, TimeStretcher};
 use crate::{NetEqError, Result};
 
 /// NetEQ configuration
@@ -154,14 +154,18 @@ pub struct NetEq {
     packet_buffer: PacketBuffer,
     delay_manager: DelayManager,
     statistics: StatisticsCalculator,
-    accelerate: Box<dyn TimeStretcher>,
-    preemptive_expand: Box<dyn TimeStretcher>,
+    accelerate: Box<dyn TimeStretcher + Send>,
+    preemptive_expand: Box<dyn TimeStretcher + Send>,
     last_decode_timestamp: Option<u32>,
     output_frame_size_samples: usize,
-    muted: bool,
+    _muted: bool,
     last_operation: Operation,
     consecutive_expands: u32,
     frame_timestamp: u32,
+    /// Samples remaining from a previously decoded packet (to support 20 ms packets → 10 ms frames)
+    leftover_samples: Vec<f32>,
+    /// Map RTP payload-type → audio decoder instance.
+    decoders: HashMap<u8, Box<dyn crate::codec::AudioDecoder + Send>>,
 }
 
 impl NetEq {
@@ -198,8 +202,9 @@ impl NetEq {
         let statistics = StatisticsCalculator::new();
 
         // Create time stretchers
-        let accelerate = TimeStretchFactory::create_accelerate(config.sample_rate, config.channels);
-        let preemptive_expand =
+        let accelerate: Box<dyn TimeStretcher + Send> =
+            TimeStretchFactory::create_accelerate(config.sample_rate, config.channels);
+        let preemptive_expand: Box<dyn TimeStretcher + Send> =
             TimeStretchFactory::create_preemptive_expand(config.sample_rate, config.channels);
 
         Ok(Self {
@@ -211,10 +216,12 @@ impl NetEq {
             preemptive_expand,
             last_decode_timestamp: None,
             output_frame_size_samples,
-            muted: false,
+            _muted: false,
             last_operation: Operation::Normal,
             consecutive_expands: 0,
             frame_timestamp: 0,
+            leftover_samples: Vec::new(),
+            decoders: HashMap::new(),
         })
     }
 
@@ -256,9 +263,30 @@ impl NetEq {
             self.output_frame_size_samples / self.config.channels as usize,
         );
 
+        // === Added detailed logging for buffer diagnostics ===
+        let pre_buffer_ms = self.current_buffer_size_ms();
+        let pre_target_delay = self.delay_manager.target_delay_ms();
+        let pre_packet_count = self.packet_buffer.len();
+        log::trace!(
+            "get_audio pre-decision: buffer={}ms, target={}ms, packets={}",
+            pre_buffer_ms,
+            pre_target_delay,
+            pre_packet_count
+        );
+        // -----------------------------------------------------
+
         // Determine what operation to perform
         let operation = self.get_decision()?;
         self.last_operation = operation;
+
+        // Additional logging of chosen operation and current state
+        log::debug!(
+            "get_audio decision: {:?} (buffer={}ms, target={}ms, packets={})",
+            operation,
+            pre_buffer_ms,
+            pre_target_delay,
+            pre_packet_count
+        );
 
         match operation {
             Operation::Normal => self.decode_normal(&mut frame)?,
@@ -274,6 +302,17 @@ impl NetEq {
                 frame.speech_type = SpeechType::Expand;
             }
         }
+
+        // === Log buffer status after producing frame ===
+        let post_buffer_ms = self.current_buffer_size_ms();
+        let post_packet_count = self.packet_buffer.len();
+        log::trace!(
+            "get_audio post-decision: operation={:?}, buffer_after={}ms, packets_after={}",
+            operation,
+            post_buffer_ms,
+            post_packet_count
+        );
+        // ------------------------------------------------
 
         // Update frame timestamp
         self.frame_timestamp = self
@@ -324,12 +363,14 @@ impl NetEq {
         self.delay_manager.reset();
         self.last_decode_timestamp = None;
         self.consecutive_expands = 0;
+        self.leftover_samples.clear();
     }
 
     fn get_decision(&mut self) -> Result<Operation> {
         // Check if we have packets
         if self.packet_buffer.is_empty() {
-            self.consecutive_expands += 1;
+            // Safely increment without risking overflow in debug builds.
+            self.consecutive_expands = self.consecutive_expands.saturating_add(1);
             return Ok(Operation::Expand);
         }
 
@@ -366,38 +407,91 @@ impl NetEq {
     }
 
     fn decode_normal(&mut self, frame: &mut AudioFrame) -> Result<()> {
-        if let Some(packet) = self.packet_buffer.get_next_packet() {
-            // Simple PCM decode (assuming packet contains raw f32 samples)
-            let samples_per_channel = frame.samples_per_channel;
-            let channels = self.config.channels as usize;
+        // Log buffer status at entry
+        log::trace!(
+            "decode_normal: entering with buffer={}ms, packets={}",
+            self.current_buffer_size_ms(),
+            self.packet_buffer.len()
+        );
 
-            if packet.payload.len() >= samples_per_channel * channels * 4 {
-                // Convert bytes to f32 (assuming little-endian IEEE 754)
-                for i in 0..(samples_per_channel * channels) {
-                    let byte_offset = i * 4;
-                    if byte_offset + 3 < packet.payload.len() {
-                        let bytes = [
-                            packet.payload[byte_offset],
-                            packet.payload[byte_offset + 1],
-                            packet.payload[byte_offset + 2],
-                            packet.payload[byte_offset + 3],
-                        ];
-                        frame.samples[i] = f32::from_le_bytes(bytes);
-                    }
-                }
-            } else {
-                // Fill with silence if not enough data
-                frame.samples.fill(0.0);
-                frame.speech_type = SpeechType::Expand;
-            }
+        // --------- New adaptive copy logic that preserves unused samples ---------
+        let samples_needed = frame.samples.len();
+        let mut filled = 0;
 
-            self.last_decode_timestamp = Some(packet.header.timestamp);
-            frame.speech_type = SpeechType::Normal;
-            frame.vad_activity = true;
-        } else {
-            // No packet available, expand
-            self.decode_expand(frame)?;
+        // First use any leftover samples from previous packet
+        if !self.leftover_samples.is_empty() {
+            let to_copy = samples_needed.min(self.leftover_samples.len());
+            frame.samples[..to_copy].copy_from_slice(&self.leftover_samples[..to_copy]);
+            self.leftover_samples.drain(..to_copy);
+            filled += to_copy;
+            log::trace!("decode_normal: consumed {} leftover samples", to_copy);
         }
+
+        // Continue pulling packets until frame is filled or buffer is empty
+        while filled < samples_needed {
+            match self.packet_buffer.get_next_packet() {
+                Some(packet) => {
+                    // Decode based on payload type if we have a decoder; otherwise treat as raw f32 PCM.
+                    let packet_samples: Vec<f32> = if let Some(dec) =
+                        self.decoders.get_mut(&packet.header.payload_type)
+                    {
+                        match dec.decode(&packet.payload) {
+                            Ok(pcm) => pcm,
+                            Err(e) => {
+                                log::error!(
+                                    "decoder error for pt {}: {:?}",
+                                    packet.header.payload_type,
+                                    e
+                                );
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        // Fallback: raw f32 PCM
+                        let mut v = Vec::with_capacity(packet.payload.len() / 4);
+                        for chunk in packet.payload.chunks_exact(4) {
+                            v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                        }
+                        v
+                    };
+
+                    let available = packet_samples.len();
+                    let need_now = samples_needed - filled;
+                    let to_copy = need_now.min(available);
+                    frame.samples[filled..filled + to_copy]
+                        .copy_from_slice(&packet_samples[..to_copy]);
+                    filled += to_copy;
+
+                    // Save any extra samples for next frame
+                    if available > to_copy {
+                        self.leftover_samples
+                            .extend_from_slice(&packet_samples[to_copy..]);
+                        log::trace!(
+                            "decode_normal: stored {} leftover samples",
+                            available - to_copy
+                        );
+                    }
+
+                    self.last_decode_timestamp = Some(packet.header.timestamp);
+                    frame.speech_type = SpeechType::Normal;
+                    frame.vad_activity = true;
+                }
+                None => {
+                    // Buffer empty before we could fill frame
+                    frame.samples[filled..].fill(0.0);
+                    frame.speech_type = SpeechType::Expand;
+                    break;
+                }
+            }
+        }
+        // ------------------------------------------------------------------------
+
+        // Log buffer status after consuming packet / expansion decision
+        log::trace!(
+            "decode_normal: exiting with buffer={}ms, packets={}",
+            self.current_buffer_size_ms(),
+            self.packet_buffer.len()
+        );
 
         Ok(())
     }
@@ -500,6 +594,12 @@ impl NetEq {
     }
 
     fn decode_expand(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        log::trace!(
+            "decode_expand: buffer before expand={}ms, packets={} (consecutive_expands={})",
+            self.current_buffer_size_ms(),
+            self.packet_buffer.len(),
+            self.consecutive_expands
+        );
         // Generate concealment audio (simple noise for now)
         for sample in &mut frame.samples {
             *sample = (simple_random() - 0.5) * 0.01; // Very quiet noise
@@ -514,6 +614,13 @@ impl NetEq {
         self.statistics.time_stretch_operation(
             TimeStretchOperation::Expand,
             frame.samples_per_channel as u64,
+        );
+
+        log::trace!(
+            "decode_expand: buffer after expand={}ms, packets={} (consecutive_expands={})",
+            self.current_buffer_size_ms(),
+            self.packet_buffer.len(),
+            self.consecutive_expands
         );
 
         Ok(())
@@ -536,8 +643,17 @@ impl NetEq {
         Ok(())
     }
 
-    fn current_buffer_size_ms(&self) -> u32 {
+    pub fn current_buffer_size_ms(&self) -> u32 {
         self.packet_buffer.get_span_duration_ms()
+    }
+
+    /// Register a decoder for a given RTP payload type.
+    pub fn register_decoder(
+        &mut self,
+        payload_type: u8,
+        decoder: Box<dyn crate::codec::AudioDecoder + Send>,
+    ) {
+        self.decoders.insert(payload_type, decoder);
     }
 }
 
@@ -557,6 +673,8 @@ fn simple_random() -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::{thread::sleep, time::Duration};
+
     use super::*;
     use crate::packet::RtpHeader;
 
@@ -618,5 +736,99 @@ mod tests {
         let frame = neteq.get_audio().unwrap();
         assert_eq!(frame.speech_type, SpeechType::Expand);
         assert!(!frame.vad_activity);
+    }
+
+    #[test]
+    fn test_packet_buffer_with_out_of_order_jitter() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Create five consecutive packets (seq 0-5, timestamps 0,160,320,480,640)
+        let packets: Vec<AudioPacket> = (0u16..=4)
+            .map(|i| create_test_packet(i, i as u32 * 160, 10))
+            .collect();
+
+        let mut counter = 0;
+        for p in packets {
+            neteq.insert_packet(p).unwrap();
+            assert_eq!(neteq.current_buffer_size_ms(), counter);
+            counter += 10;
+        }
+
+        assert_eq!(neteq.current_buffer_size_ms(), 40);
+
+        // NetEQ should still deliver a normal speech frame
+        let frame = neteq.get_audio().unwrap();
+        assert_eq!(frame.speech_type, SpeechType::Normal);
+        assert!(frame.vad_activity);
+
+        println!("before stats: {:?}\n", neteq.get_statistics());
+
+        // We want to produce "jitter" in the output, so we need to insert a packet with a different timestamp
+        let packet = create_test_packet(5, 1000, 10);
+        neteq.insert_packet(packet).unwrap();
+
+        // assert that the jitter is detected
+        println!("before jitter: {:?}\n", neteq.get_statistics());
+
+        // add more jitter by inserting a packet with a timestamp that is way ahead of the current timestamp
+        let packet = create_test_packet(6, 10000, 10);
+        neteq.insert_packet(packet).unwrap();
+
+        // assert that the jitter is detected
+        println!("after jitter: {:?}", neteq.get_statistics());
+
+        // get audio frame
+    }
+
+    #[test]
+    fn test_escalating_packet_delays() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Insert packets with progressively larger real-time delays between arrivals
+        let mut seq: u16 = 0;
+        let mut ts: u32 = 0;
+        // Delays in milliseconds – each entry is the sleep before inserting the next packet
+        let delays_ms = [0u64, 10, 30, 70, 120];
+
+        for delay in &delays_ms {
+            if *delay > 0 {
+                sleep(Duration::from_millis(*delay));
+            }
+            let packet = create_test_packet(seq, ts, 10);
+            neteq.insert_packet(packet).unwrap();
+            seq = seq.wrapping_add(1);
+            ts = ts.wrapping_add(160); // 10 ms at 16 kHz
+        }
+
+        // Pull a series of audio frames; some should be normal, some should be expands
+        let mut expand_frames = 0;
+        for _ in 0..(delays_ms.len() + 3) {
+            let frame = neteq.get_audio().unwrap();
+            if frame.speech_type == SpeechType::Expand {
+                expand_frames += 1;
+            }
+            // Simulate playout interval
+            sleep(Duration::from_millis(10));
+        }
+
+        let stats = neteq.get_statistics();
+        assert!(
+            expand_frames > 0,
+            "Expected at least one expand frame due to late packets"
+        );
+        assert!(
+            stats.lifetime.concealment_events >= expand_frames as u64,
+            "Concealment events should grow"
+        );
+        assert!(
+            stats.lifetime.concealed_samples > 0,
+            "Concealed samples should increase"
+        );
+        assert!(
+            stats.network.max_waiting_time_ms > 0,
+            "Waiting time stats should reflect packet delays"
+        );
     }
 }

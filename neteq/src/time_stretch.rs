@@ -16,9 +16,6 @@
  * conditions.
  */
 
-use crate::statistics::TimeStretchOperation;
-use crate::{NetEqError, Result};
-
 /// Return codes for time-stretching operations
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TimeStretchResult {
@@ -48,22 +45,22 @@ pub trait TimeStretcher {
 /// Accelerate algorithm - removes audio samples to speed up playback
 #[derive(Debug)]
 pub struct Accelerate {
-    sample_rate: u32,
-    channels: u8,
+    _sample_rate: u32,
+    _channels: u8,
     length_change_samples: usize,
     overlap_length: usize,
-    max_change_rate: f32,
+    _max_change_rate: f32,
 }
 
 impl Accelerate {
     /// Create a new accelerate processor
     pub fn new(sample_rate: u32, channels: u8) -> Self {
         Self {
-            sample_rate,
-            channels,
+            _sample_rate: sample_rate,
+            _channels: channels,
             length_change_samples: 0,
             overlap_length: Self::calculate_overlap_length(sample_rate),
-            max_change_rate: 0.25, // Maximum 25% reduction
+            _max_change_rate: 0.25, // Maximum 25% reduction
         }
     }
 
@@ -96,12 +93,10 @@ impl Accelerate {
             } else {
                 0.25 // Standard fast mode acceleration
             }
+        } else if is_low_energy {
+            0.2 // Gentle acceleration for low energy
         } else {
-            if is_low_energy {
-                0.2 // Gentle acceleration for low energy
-            } else {
-                0.15 // Conservative acceleration for normal energy
-            }
+            0.15 // Conservative acceleration for normal energy
         };
 
         let samples_to_remove = (input.len() as f32 * acceleration_factor) as usize;
@@ -183,6 +178,9 @@ impl Accelerate {
     }
 }
 
+// Allow Accelerate to be moved across threads (contains only primitive data, no interior mutability).
+unsafe impl Send for Accelerate {}
+
 impl TimeStretcher for Accelerate {
     fn process(
         &mut self,
@@ -205,8 +203,8 @@ impl TimeStretcher for Accelerate {
 /// Preemptive Expand algorithm - adds audio samples to slow down playback
 #[derive(Debug)]
 pub struct PreemptiveExpand {
-    sample_rate: u32,
-    channels: u8,
+    _sample_rate: u32,
+    _channels: u8,
     length_change_samples: usize,
     overlap_length: usize,
     max_expansion_rate: f32,
@@ -216,8 +214,8 @@ impl PreemptiveExpand {
     /// Create a new preemptive expand processor
     pub fn new(sample_rate: u32, channels: u8) -> Self {
         Self {
-            sample_rate,
-            channels,
+            _sample_rate: sample_rate,
+            _channels: channels,
             length_change_samples: 0,
             overlap_length: Self::calculate_overlap_length(sample_rate),
             max_expansion_rate: 0.25, // Maximum 25% expansion
@@ -234,7 +232,7 @@ impl PreemptiveExpand {
         &mut self,
         input: &[f32],
         output: &mut Vec<f32>,
-        fast_mode: bool,
+        _fast_mode: bool,
     ) -> TimeStretchResult {
         if input.len() < self.overlap_length * 2 {
             // Not enough samples to expand
@@ -246,46 +244,49 @@ impl PreemptiveExpand {
         let energy = self.calculate_energy(input);
         let is_low_energy = energy < 0.01; // Threshold for low energy detection
 
-        // Determine how much to expand based on mode and energy
-        let expansion_factor = if fast_mode {
-            if is_low_energy {
-                0.3 // More expansion for low energy in fast mode
-            } else {
-                0.2 // Standard fast mode expansion
-            }
-        } else {
-            if is_low_energy {
-                0.15 // Gentle expansion for low energy
-            } else {
-                0.1 // Conservative expansion for normal energy
-            }
-        };
+        // Target to add 25% of frame length but cap by max_expansion_rate
+        let desired_add = (input.len() as f32 * self.max_expansion_rate) as usize;
+        let add_len = desired_add.max(self.overlap_length);
 
-        let samples_to_add = (input.len() as f32 * expansion_factor) as usize;
-
-        if samples_to_add < self.overlap_length {
-            // Not enough to add meaningfully
+        // old part (last 15 ms) length
+        let old_len = self.overlap_length * 3; // ~15 ms at 48 kHz (approx)
+        if input.len() <= old_len + add_len {
             output.extend_from_slice(input);
             return TimeStretchResult::NoStretch;
         }
 
-        // Find the best location to duplicate samples (repeatable patterns)
-        let duplicate_start = self.find_best_duplication_point(input, samples_to_add);
+        let search_start = old_len;
+        let search_end = input.len() - add_len - self.overlap_length;
 
-        // Copy the first part
-        output.extend_from_slice(&input[..duplicate_start]);
+        let mut best_corr = -1.0f32;
+        let mut best_pos = search_start;
 
-        // Duplicate the selected region with crossfading
-        let duplicate_end = (duplicate_start + samples_to_add).min(input.len());
-        let duplicate_region = &input[duplicate_start..duplicate_end];
+        for pos in (search_start..=search_end).step_by(self.overlap_length / 2) {
+            let a = &input[(pos - self.overlap_length)..pos];
+            let b = &input[pos..pos + self.overlap_length];
+            let corr = crate::signal::normalized_correlation(a, b);
+            if corr > best_corr {
+                best_corr = corr;
+                best_pos = pos;
+            }
+        }
 
-        // Apply the duplicated region with overlap-add
-        self.apply_overlap_add(duplicate_region, output);
+        // Copy first part up to best_pos
+        output.extend_from_slice(&input[..best_pos]);
 
-        // Copy the remaining part
-        output.extend_from_slice(&input[duplicate_start..]);
+        // Crossfade duplicate region
+        let fade_out_start = best_pos - self.overlap_length;
+        crate::signal::crossfade(
+            &input[fade_out_start..best_pos],
+            &input[best_pos..best_pos + self.overlap_length],
+            self.overlap_length,
+            output,
+        );
 
-        self.length_change_samples = samples_to_add;
+        // Append rest (including duplicate region)
+        output.extend_from_slice(&input[best_pos..]);
+
+        self.length_change_samples = self.overlap_length;
 
         if is_low_energy {
             TimeStretchResult::SuccessLowEnergy
@@ -298,67 +299,10 @@ impl PreemptiveExpand {
         let sum_squares: f32 = samples.iter().map(|x| x * x).sum();
         sum_squares / samples.len() as f32
     }
-
-    fn find_best_duplication_point(&self, input: &[f32], duplication_length: usize) -> usize {
-        // Look for periodic patterns that can be duplicated naturally
-        let mut best_position = input.len() / 2; // Default to middle
-        let mut best_correlation = -1.0;
-
-        let search_start = self.overlap_length;
-        let search_end = input
-            .len()
-            .saturating_sub(duplication_length + self.overlap_length);
-
-        for pos in (search_start..search_end).step_by(self.overlap_length / 2) {
-            let end_pos = (pos + duplication_length).min(input.len());
-
-            // Calculate autocorrelation to find periodic patterns
-            let correlation = self.calculate_autocorrelation(&input[pos..end_pos]);
-
-            if correlation > best_correlation {
-                best_correlation = correlation;
-                best_position = pos;
-            }
-        }
-
-        best_position
-    }
-
-    fn calculate_autocorrelation(&self, samples: &[f32]) -> f32 {
-        if samples.len() < 2 {
-            return 0.0;
-        }
-
-        let half_len = samples.len() / 2;
-        let first_half = &samples[..half_len];
-        let second_half = &samples[half_len..half_len * 2];
-
-        let mut correlation = 0.0;
-        for i in 0..half_len {
-            correlation += first_half[i] * second_half[i];
-        }
-
-        correlation / half_len as f32
-    }
-
-    fn apply_overlap_add(&self, duplicate_region: &[f32], output: &mut Vec<f32>) {
-        // Simple overlap-add with triangular window
-        let overlap_len = self.overlap_length.min(duplicate_region.len());
-
-        // Add the duplicated region with fade in/out
-        for (i, &sample) in duplicate_region.iter().enumerate() {
-            let fade_factor = if i < overlap_len {
-                i as f32 / overlap_len as f32 // Fade in
-            } else if i >= duplicate_region.len() - overlap_len {
-                (duplicate_region.len() - i) as f32 / overlap_len as f32 // Fade out
-            } else {
-                1.0 // Full volume
-            };
-
-            output.push(sample * fade_factor);
-        }
-    }
 }
+
+// Safe because PreemptiveExpand only contains owned numeric data.
+unsafe impl Send for PreemptiveExpand {}
 
 impl TimeStretcher for PreemptiveExpand {
     fn process(
@@ -384,12 +328,15 @@ pub struct TimeStretchFactory;
 
 impl TimeStretchFactory {
     /// Create an accelerate processor
-    pub fn create_accelerate(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher> {
+    pub fn create_accelerate(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher + Send> {
         Box::new(Accelerate::new(sample_rate, channels))
     }
 
     /// Create a preemptive expand processor  
-    pub fn create_preemptive_expand(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher> {
+    pub fn create_preemptive_expand(
+        sample_rate: u32,
+        channels: u8,
+    ) -> Box<dyn TimeStretcher + Send> {
         Box::new(PreemptiveExpand::new(sample_rate, channels))
     }
 }
@@ -410,8 +357,8 @@ mod tests {
     #[test]
     fn test_accelerate_creation() {
         let accelerate = Accelerate::new(16000, 1);
-        assert_eq!(accelerate.sample_rate, 16000);
-        assert_eq!(accelerate.channels, 1);
+        assert_eq!(accelerate._sample_rate, 16000);
+        assert_eq!(accelerate._channels, 1);
         assert_eq!(accelerate.get_length_change_samples(), 0);
     }
 
@@ -437,8 +384,8 @@ mod tests {
     #[test]
     fn test_preemptive_expand_creation() {
         let expand = PreemptiveExpand::new(16000, 1);
-        assert_eq!(expand.sample_rate, 16000);
-        assert_eq!(expand.channels, 1);
+        assert_eq!(expand._sample_rate, 16000);
+        assert_eq!(expand._channels, 1);
         assert_eq!(expand.get_length_change_samples(), 0);
     }
 

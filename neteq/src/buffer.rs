@@ -17,10 +17,10 @@
  */
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::statistics::StatisticsCalculator;
-use crate::{AudioPacket, NetEqError, Result};
+use crate::{AudioPacket, Result};
 
 /// Configuration for smart flushing behavior
 #[derive(Debug, Clone)]
@@ -120,7 +120,7 @@ impl PacketBuffer {
     pub fn partial_flush(
         &mut self,
         target_level_ms: u32,
-        sample_rate: u32,
+        _sample_rate: u32,
         stats: &mut StatisticsCalculator,
     ) -> Result<BufferReturnCode> {
         if self.buffer.is_empty() {

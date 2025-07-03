@@ -11,7 +11,7 @@ on:
     paths:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
-      - 'videocall-neteq/**'
+      - 'neteq/**'
       - 'types/**'
 
 jobs:

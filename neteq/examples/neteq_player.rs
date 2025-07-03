@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::BufferSize;
+use neteq::codec::OpusDecoder;
+use neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
 use rand::Rng;
-use videocall_neteq::codec::OpusDecoder;
-use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 
 // This example does the following:
 // 1. Loads a WAV file (passed on the command-line).

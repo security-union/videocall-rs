@@ -18,7 +18,7 @@ Rust NetEQ is a pure-Rust, libWebRTC-inspired jitter buffer designed for profess
 
 ```toml
 [dependencies]
-videocall_neteq = "0.1"
+neteq = "0.1"
 ```
 
 Insert RTP payloads as they arrive, call `get_audio()` every 10 ms, and let the buffer handle the rest.  Full runnable snippets live in the [examples](examples) directory — open `basic_usage.rs` first.

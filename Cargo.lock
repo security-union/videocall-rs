@@ -3461,6 +3461,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "neteq"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cpal",
+ "env_logger",
+ "hound",
+ "log",
+ "opus",
+ "rand 0.9.1",
+ "ringbuf",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6288,22 +6304,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
-]
-
-[[package]]
-name = "videocall-neteq"
-version = "0.1.0"
-dependencies = [
- "clap",
- "cpal",
- "env_logger",
- "hound",
- "log",
- "opus",
- "rand 0.9.1",
- "ringbuf",
- "serde",
- "thiserror 1.0.69",
 ]
 
 [[package]]

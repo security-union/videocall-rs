@@ -120,7 +120,7 @@ impl PacketBuffer {
     pub fn partial_flush(
         &mut self,
         target_level_ms: u32,
-        sample_rate: u32,
+        _sample_rate: u32,
         stats: &mut StatisticsCalculator,
     ) -> Result<BufferReturnCode> {
         if self.buffer.is_empty() {

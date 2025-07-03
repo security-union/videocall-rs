@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.1...videocall-codecs-v0.1.2) - 2025-07-03
+
+### Other
+
+- Reset decoder and jitter buffer when there's a decoder error ([#298](https://github.com/security-union/videocall-rs/pull/298))
+
 ## [0.1.1](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.0...videocall-codecs-v0.1.1) - 2025-06-25
 
 ### Other

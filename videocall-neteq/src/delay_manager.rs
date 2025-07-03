@@ -285,7 +285,7 @@ impl DelayManager {
             self.initialized = true;
         } else {
             // Apply exponential smoothing
-            let forget_factor = if let Some(start_weight) = self.config.start_forget_weight {
+            let mut forget_factor = if let Some(start_weight) = self.config.start_forget_weight {
                 // Use stronger initial adaptation
                 let adaptation_factor = (start_weight - 1.0)
                     * (-self.last_update_time.elapsed().as_secs_f64() / 10.0).exp()
@@ -294,6 +294,13 @@ impl DelayManager {
             } else {
                 self.config.forget_factor
             };
+
+            // Clamp to [0.0, 1.0] to ensure filter stability
+            if forget_factor > 1.0 {
+                forget_factor = 1.0;
+            } else if forget_factor < 0.0 {
+                forget_factor = 0.0;
+            }
 
             self.filtered_delay = self.filtered_delay * forget_factor
                 + (relative_delay as f64) * (1.0 - forget_factor);

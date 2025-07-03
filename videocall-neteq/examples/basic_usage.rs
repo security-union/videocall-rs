@@ -16,8 +16,8 @@
  * conditions.
  */
 
-use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 use std::time::{Duration, Instant};
+use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();

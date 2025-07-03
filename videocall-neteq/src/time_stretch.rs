@@ -395,7 +395,10 @@ impl TimeStretchFactory {
     }
 
     /// Create a preemptive expand processor  
-    pub fn create_preemptive_expand(sample_rate: u32, channels: u8) -> Box<dyn TimeStretcher + Send> {
+    pub fn create_preemptive_expand(
+        sample_rate: u32,
+        channels: u8,
+    ) -> Box<dyn TimeStretcher + Send> {
         Box::new(PreemptiveExpand::new(sample_rate, channels))
     }
 }

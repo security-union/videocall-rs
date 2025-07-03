@@ -1,7 +1,7 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::BufferSize;
@@ -19,9 +19,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     // ── Parse CLI ─────────────────────────────────────────────────────────────
-    let wav_path = std::env::args().nth(1).expect(
-        "Usage: cargo run --example neteq_player --features audio_files <wav_file>",
-    );
+    let wav_path = std::env::args()
+        .nth(1)
+        .expect("Usage: cargo run --example neteq_player --features audio_files <wav_file>");
 
     log::info!("Loading WAV file: {}", wav_path);
 
@@ -33,7 +33,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!(
         "WAV spec -> sample_rate: {} Hz, channels: {}, bits_per_sample: {}",
-        sample_rate, channels, spec.bits_per_sample
+        sample_rate,
+        channels,
+        spec.bits_per_sample
     );
 
     let wav_samples: Vec<f32> = match spec.sample_format {
@@ -41,13 +43,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .samples::<i16>()
             .map(|s| s.unwrap() as f32 / 32768.0)
             .collect(),
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .map(|s| s.unwrap())
-            .collect(),
+        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
     };
 
-    log::info!("Total samples loaded: {} ({} seconds)", wav_samples.len(), wav_samples.len() as f32 / sample_rate as f32 / channels as f32);
+    log::info!(
+        "Total samples loaded: {} ({} seconds)",
+        wav_samples.len(),
+        wav_samples.len() as f32 / sample_rate as f32 / channels as f32
+    );
 
     // ── Prepare NetEq ─────────────────────────────────────────────────────────
     let mut neteq_cfg: NetEqConfig = NetEqConfig::default();
@@ -55,7 +58,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     neteq_cfg.channels = channels;
     let neteq = Arc::new(Mutex::new(NetEq::new(neteq_cfg)?));
 
-    log::info!("NetEq initialised (sample_rate {} Hz, channels {}).", sample_rate, channels);
+    log::info!(
+        "NetEq initialised (sample_rate {} Hz, channels {}).",
+        sample_rate,
+        channels
+    );
 
     // ── Warm-start NetEq with a few packets before audio begins ─────────────
     let warmup_packets = 10; // 10 × 20 ms = 200 ms
@@ -133,7 +140,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let total_remaining_chunks = remaining_samples.len() / packet_samples;
 
-    thread::spawn(move || {
+    let period = Duration::from_millis(20);
+    let mut next = Instant::now();
+    loop {
         for idx in 0..total_remaining_chunks {
             let start = idx * packet_samples;
             let chunk = &remaining_samples[start..start + packet_samples];
@@ -144,6 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 96, false);
             let packet = AudioPacket::new(hdr, payload, sample_rate, channels, 20);
             if let Ok(mut n) = producer_neteq.lock() {
+                log::debug!("inserting packet {}", seq_no);
                 let _ = n.insert_packet(packet);
             }
 
@@ -152,14 +162,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp = timestamp.wrapping_add(samples_per_channel_20ms as u32);
 
             if idx % 50 == 0 {
-                log::debug!("fed {} packets ({} seconds)", idx + warmup_packets, (idx + warmup_packets) as f32 * 0.02);
+                log::debug!(
+                    "fed {} packets ({} seconds)",
+                    idx + warmup_packets,
+                    (idx + warmup_packets) as f32 * 0.02
+                );
             }
 
-            thread::sleep(Duration::from_millis(20));
+            next += period;
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
         }
 
         log::info!("Producer finished feeding all packets");
-    });
+    }
 
     let total_secs = wav_samples.len() as f32 / sample_rate as f32 / channels as f32;
     thread::sleep(Duration::from_secs_f32(total_secs + 1.0));
@@ -287,17 +302,21 @@ fn fill_output_neteq(buffer: &mut [f32], neteq: &Arc<Mutex<NetEq>>, leftover: &m
                     Ok(frame) => {
                         log::debug!("NetEq get_audio: {:?}", frame.speech_type);
                         leftover.extend_from_slice(&frame.samples);
-                    },
+                    }
                     Err(e) => {
                         log::error!("NetEq get_audio error: {:?}", e);
                         // fill silence and return
-                        for s in &mut buffer[idx..] { *s = 0.0; }
+                        for s in &mut buffer[idx..] {
+                            *s = 0.0;
+                        }
                         return;
                     }
                 },
                 Err(poison) => {
                     log::error!("NetEq mutex poisoned: {}", poison);
-                    for s in &mut buffer[idx..] { *s = 0.0; }
+                    for s in &mut buffer[idx..] {
+                        *s = 0.0;
+                    }
                     return;
                 }
             }
@@ -316,4 +335,4 @@ static CALLBACK_FRAMES: AtomicU64 = AtomicU64::new(0);
 // helper removed channels variable; adjust after compile
 fn calls_per_sec_den(channels: u8) -> u64 {
     channels as u64
-} 
+}

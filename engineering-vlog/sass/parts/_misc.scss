@@ -1,0 +1,115 @@
+.primary-color {
+  color: var(--primary-color);
+}
+
+.draft-label {
+  color: var(--hover-color);
+  text-decoration: none;
+  padding: 2px 4px;
+  border-radius: 4px;
+  margin-left: 6px;
+  background-color: var(--primary-color);
+}
+
+::-moz-selection {
+  background: var(--primary-color);
+  color: var(--hover-color);
+  text-shadow: none;
+}
+
+::selection {
+  background: var(--primary-color);
+  color: var(--hover-color);
+}
+
+p {
+  line-height: 1.5;
+}
+
+hr {
+  border: 0;
+  border-top: 3px solid var(--border-color);
+  margin: 1em 0;
+}
+
+blockquote {
+  border-left: 3px solid var(--border-color);
+  color: #737373;
+  margin: 0;
+  padding-left: 1em;
+}
+
+a {
+  border-bottom: 3px solid var(--primary-color);
+  color: inherit;
+  text-decoration: none;
+
+  // Make sure the underline is at the top
+  position: relative; // needed for z-index
+  z-index: 1;
+}
+
+a:hover {
+  background-color: var(--primary-color);
+  color: var(--hover-color);
+}
+
+time {
+  color: grey;
+}
+
+/* Remove post list padding */
+.list>ul {
+  margin: 0;
+  padding: 1rem 0 0 0;
+}
+
+/* Post list */
+.list-item {
+  margin-bottom: 30px;
+  list-style-type: none;
+}
+
+@media all and (max-width: 640px) {
+  .post-header {
+    display: grid;
+    grid-template-rows: auto 1fr;
+
+    h1 {
+      margin-top: 0;
+      // font-size: 130%;
+
+      a {
+        border-bottom: none;
+      }
+    }
+  }
+}
+
+/* Post list */
+@media all and (min-width: 640px) {
+  .post-header {
+    display: grid;
+    gap: 1rem;
+    grid-row-gap: 1.5rem;
+    grid-template-columns: auto 1fr;
+
+    h1 {
+      margin: 0;
+      font-size: 130%;
+
+      a {
+        border-bottom: none;
+      }
+    }
+  }
+}
+
+/* Remove styling from theme toggle button */
+#dark-mode-toggle {
+  border-bottom: none;
+
+  &:hover {
+    background-color: transparent;
+  }
+}

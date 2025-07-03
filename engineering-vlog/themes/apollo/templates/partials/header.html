@@ -1,0 +1,232 @@
+{% import "macros/macros.html" as post_macros %}
+
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="base" content="{{ config.base_url }}">
+
+    {% if page.extra.meta %}
+        <!-- the meta data config goes here  -->
+        {% for data in page.extra.meta %}
+            <meta {% for key, value in data %} {% if key == "property" and value == "og:title" %} {% set_global page_has_og_title = true -%} {% endif %}
+                  {% if key == "property" and value == "og:description" %} {% set_global page_has_og_description = true -%} {% endif %}
+                  {% if key == "name" and value == "description" %} {% set_global page_has_description = true -%} {% endif %}
+                  {{ key }}
+                  None="{{ value }}"
+                  {% endfor %} />
+        {% endfor %}
+    {% endif %}
+
+    {# Site title #}
+    {% set current_path = current_path | default(value="/") %}
+    {% if current_path == "/" %}
+        <title>{{ post_macros::site_title() }}</title>
+        {% if not page_has_og_title %}
+            <meta property="og:title"
+                  content="{{ post_macros::site_title() }}" />
+        {% endif %}
+
+    {% else %}
+        <title>
+            {% if page.title %}
+                {{ page.title }}
+            {% elif section.title %}
+                {{ section.title }}
+            {% elif config.title %}
+                {{ config.title }}
+            {% else %}
+                Post
+            {% endif %}
+        </title>
+
+        {% if not page_has_og_title %}
+            <meta property="og:title"
+                  content="{% if page.title -%}{{ page.title }}{% elif config.title -%}{{ config.title }}{% else -%}Post{% endif -%}" />
+        {% endif %}
+    {% endif %}
+
+    {% if not page_has_og_description %}
+        {% if page.description %}
+            <meta property="og:description" content="{{ page.description }}" />
+        {% elif config.description %}
+            <meta property="og:description" content="{{ config.description }}" />
+        {% endif %}
+    {% endif %}
+
+    {% if not page_has_description %}
+        {% if page.description %}
+            <meta name="description" content="{{ page.description }}" />
+        {% elif config.description %}
+            <meta name="description" content="{{ config.description }}" />
+        {% endif %}
+    {% endif %}
+
+    {# Favicon #}
+    {% if config.extra.favicon %}<link rel="icon" type="image/png" href={{ get_url(path=config.extra.favicon) }} />{% endif %}
+
+    {# Font from cdn or disk #}
+    {% if config.extra.use_cdn | default(value=false) %}
+        <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+        <link rel="stylesheet"
+              href="https://cdn.jsdelivr.net/npm/jetbrains-mono@1.0.6/css/jetbrains-mono.min.css">
+        <link rel="stylesheet"
+              href="https://cdn.jsdelivr.net/npm/@fontsource/space-grotesk@4.5.8/index.min.css">
+    {% else %}
+        <link href={{ get_url(path="fonts.css") }} rel="stylesheet" />
+    {% endif %}
+
+    {# Syntax theme #}
+    {% if config.markdown.highlight_code and config.markdown.highlight_theme == "css" %}
+        <link rel="stylesheet" type="text/css" href="/syntax-theme-dark.css" media="(prefers-color-scheme: dark)" />
+        <link rel="stylesheet" type="text/css" href="/syntax-theme-light.css" media="(prefers-color-scheme: light)" />
+    {% endif %}
+
+    {# Analytics #}
+    {% if config.extra.analytics.enabled %}
+        {% if config.extra.analytics.umami.website_id %}
+            {% set website_id = config.extra.analytics.umami.website_id %}
+            {% set host_url = config.extra.analytics.umami.host_url | default(value="https://api-gateway.umami.dev/") %}
+
+            <script defer
+                    src="/js/imamu.js"
+                    data-website-id="{{ website_id }}"
+                    data-host-url="{{ host_url }}"></script>
+        {% endif %}
+
+        {% if config.extra.analytics.goatcounter.user %}
+            {% set user = config.extra.analytics.goatcounter.user %}
+            {% set host = config.extra.analytics.goatcounter.host | default(value="goatcounter.com") %}
+
+            <script data-goatcounter="https://{{ user }}.{{ host }}/count"
+                    async
+                    src="{{ get_url(path="js/count.js") }}"></script>
+            <noscript>
+                {# EasyList blocks '.com/count?', so we have to use '.com//count' #}
+                <img src="https://{{ user }}.{{ host }}//count?p={{ current_path }}&t={{ page.title | default(value=config.title) }}">
+            </noscript>
+        {% endif %}
+    {% endif %}
+
+    {# Fancy Codeblock #}
+    {% if config.extra.fancy_code %}<script defer src={{ get_url(path="js/codeblock.js") }}></script>{% endif %}
+
+    {# Table of contents #}
+    {% if config.extra.toc | default(value=false) %}<script defer src={{ get_url(path="js/toc.js") }}></script>{% endif %}
+
+    {# Dynamic Note #}
+    {% if config.extra.dynamic_note | default(value=false) %}
+        <script src={{ get_url(path="js/note.js") }}></script>
+    {% endif %}
+
+    {% if config.extra.mathjax | default(value=false) %}
+        {% if config.extra.mathjax_dollar_inline_enable | default(value=false) %}
+            <script>
+            MathJax = {
+              tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']]
+              }
+            };
+            </script>
+        {% endif %}
+        <script type="text/javascript" id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
+        </script>
+    {% endif %}
+
+    {# RSS #}
+    {% if config.generate_feeds %}
+        {% for feed_filenames in config.feed_filenames %}
+            {% if feed_filenames == "atom.xml" %}
+            <link rel="alternate"
+                  type="application/atom+xml"
+                  title="{{ post_macros::site_title() }}"
+                  href="{{ get_url(path="atom.xml", trailing_slash=false) }}" />
+            {% elif feed_filenames == "rss.xml" %}
+            <link rel="alternate"
+                  type="application/rss+xml"
+                  title="{{ post_macros::site_title() }}"
+                  href="{{ get_url(path="rss.xml", trailing_slash=false) }}" />
+            {% endif %}
+        {% endfor %}
+    {% endif %}
+
+
+    {% set theme = config.extra.theme | default(value="toggle") %}
+    {% if theme == "dark" %}
+        <link rel="stylesheet"
+              type="text/css"
+              href="{{ get_url(path='theme/dark.css') }}" />
+    {% elif theme == "light" %}
+        <link rel="stylesheet"
+              type="text/css"
+              href="{{ get_url(path="theme/light.css") }}" />
+    {% elif theme == "auto" %}
+        <link rel="stylesheet"
+              type="text/css"
+              href="{{ get_url(path="theme/light.css") }}" />
+        <link rel="stylesheet"
+              type="text/css"
+              href="{{ get_url(path='theme/dark.css') }}"
+              media="(prefers-color-scheme: dark)" />
+    {% elif theme == "toggle" %}
+        <link rel="stylesheet"
+              type="text/css"
+              href="{{ get_url(path="theme/light.css") }}" />
+        <link id="darkModeStyle"
+              rel="stylesheet"
+              type="text/css"
+              href="{{ get_url(path='theme/dark.css') }}" />
+    {% endif %}
+
+    <!-- Set the correct theme in the script -->
+
+    {% if theme == "auto" or theme == "toggle" %}
+        <script src={{ get_url(path="js/themetoggle.js") }}></script>
+
+        {% if theme == "auto" %}
+            <script>
+                if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                    setTheme("dark");
+                } else {
+                    setTheme("light");
+                }
+            </script>
+        {% else %}
+            <script>setTheme(getSavedTheme());</script>
+        {% endif %}
+    {% endif %}
+
+
+    <link rel="stylesheet"
+          type="text/css"
+          media="screen"
+          href="{{ get_url(path="main.css") }}" />
+
+    {% if config.extra.stylesheets %}
+        {% for stylesheet in config.extra.stylesheets %}
+            <link rel="stylesheet" href="{{ get_url(path=stylesheet) }}">
+        {% endfor %}
+    {% endif %}
+
+    {# Search #}
+    {%- if config.build_search_index -%}
+        {%- if config.search.index_format -%}
+            {%- set search_index_format = config.search.index_format -%}
+        {%- elif config.extra.index_format -%}
+            {# Necessary to support Zola 0.17.X, as it doesn't have access to config.search.index_format #}
+            {# See: https://github.com/getzola/zola/issues/2165 #}
+            {%- set search_index_format = config.extra.index_format -%}
+        {%- else -%}
+            {%- set search_index_format = "elasticlunr_json" -%}
+        {%- endif -%}
+
+        {%- if search_index_format == "elasticlunr_javascript" -%}
+            <script defer
+                    src="{{ get_url(path='search_index.' ~ lang ~ '.js', cachebust=true) | safe }}"></script>
+        {%- endif -%}
+
+        {# Main search script #}
+        <script defer
+                src="{{ get_url(path='js/searchElasticlunr.min.js', cachebust=true) | safe }}"></script>
+    {%- endif -%}
+</head>

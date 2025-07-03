@@ -1,0 +1,151 @@
+.page-header {
+  font-size: 2.5em;
+  line-height: 100%;
+  font-family: var(--header-font);
+  margin: 4rem 0px 1rem 0px;
+}
+
+/* 404 header */
+.not-found-header {
+  font-family: var(--header-font);
+  position: absolute;
+  top: 40%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  font-size: 3em;
+}
+
+nav {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    padding: 0;
+
+    /* Mobile-specific adjustments */
+    @media (max-width: 600px) {
+        flex-direction: column;
+    }
+
+    /* title and socials */
+    .left-nav {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 12px;
+      font-size: 1.5rem;
+
+      .socials {
+        /* flex-container */
+        display: flex;
+        flex-direction: row;
+        flex-wrap: wrap;
+        justify-content: flex-start;
+        align-items: flex-end;
+        gap: 6px;
+
+        .social img {
+          width: 16px;
+          height: 16px;
+
+        }
+
+        /* Don't display background on hover */
+        a:hover {
+            background-color: transparent;
+        }
+      }
+    }
+
+    /* navigation + theme toggle */
+    .right-nav {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+
+        #dark-mode-toggle {
+            margin-left: 0.5rem;
+            padding: 0.1rem;
+
+            > img {
+                width: 16px;
+                height: 16px;
+            }
+
+            /* Don't display background on hover */
+            &:hover {
+                background-color: transparent;
+            }
+        }
+    }
+}
+
+/* TODO: Is this still used? */
+.logo {
+  border-bottom: unset;
+  background-image: unset;
+
+  > img {
+    border: unset;
+    width: auto;
+    height: 24px;
+    vertical-align: middle;
+  }
+
+  &:hover {
+    background-color: transparent;
+  }
+}
+
+/* TODO: Is this still used? */
+.meta {
+  color: #999;
+  display: flexbox;
+  /* This changes the meta class to use flexbox, which ensures inline display */
+  align-items: center;
+  /* Aligns items vertically in the middle */
+  flex-wrap: wrap;
+  /* Allows items to wrap as needed */
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-family: monospace var(--header-font);
+  font-size: 1.2rem;
+  margin-top: 2em;
+}
+
+h1::before {
+  color: var(--primary-color);
+  content: "# ";
+}
+
+h2::before {
+  color: var(--primary-color);
+  content: "## ";
+}
+
+h3::before {
+  color: var(--primary-color);
+  content: "### ";
+}
+
+h4::before {
+  color: var(--primary-color);
+  content: "#### ";
+}
+
+h5::before {
+  color: var(--primary-color);
+  content: "##### ";
+}
+
+h6::before {
+  color: var(--primary-color);
+  content: "###### ";
+}

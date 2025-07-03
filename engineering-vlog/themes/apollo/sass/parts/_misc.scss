@@ -1,0 +1,152 @@
+.primary-color {
+  color: var(--primary-color);
+}
+
+.draft-label {
+  color: var(--hover-color);
+  text-decoration: none;
+  padding: 2px 4px;
+  border-radius: 4px;
+  margin-left: 6px;
+  background-color: var(--primary-color);
+}
+
+::-moz-selection {
+  background: var(--primary-color);
+  color: var(--hover-color);
+  text-shadow: none;
+}
+
+::selection {
+  background: var(--primary-color);
+  color: var(--hover-color);
+}
+
+hr {
+  color: var(--border-color);
+  background: none;
+  margin: 1.2rem auto;
+}
+
+blockquote {
+  border-left: 3px solid var(--primary-color);
+  color: #737373;
+  margin: 0;
+  padding-left: 1em;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+
+  /* use colored hovering */
+  &:hover {
+      background-color: var(--primary-color);
+      color: var(--hover-color);
+  }
+
+  /* hover link with child elements (e.g. code)  */
+  &:hover > code {
+      background-color: var(--primary-color);
+      color: var(--hover-color);
+
+      /* disable the border + vertical padding  */
+      border: none;
+      padding: 0 .2em;
+  }
+
+    /* disable colored hovering for video in /talks */
+    &.talk-video:hover {
+        background-color: transparent;
+        color: inherit;
+    }
+}
+
+/* Only have colored links inside the text */
+main {
+  a {
+      border-bottom: 2px solid var(--primary-color);
+
+      // Make sure the underline is at the top
+      position: relative; // needed for z-index
+      z-index: 1;
+  }
+
+  // Disable colored links in:
+  // - .meta
+  // - header (socials, theme toggle)
+  // - /talks
+  // - /projects
+  .meta a, .talks-grid a, .cards a {
+    border-bottom: none;
+  }
+
+  // Don't display border on zola internal links on headers
+  .zola-anchor {
+    border-bottom: none;
+  }
+}
+
+time {
+  color: grey;
+}
+
+.post-list,.tag-list {
+    > ul {
+        margin: 0;
+        padding: 1rem 0 0 0;
+    }
+
+    .list-item {
+        margin-bottom: 0.5rem;
+        list-style-type: none;
+    }
+
+    .post-header {
+      display: grid;
+      align-items: center;
+
+      @media all and (max-width: 640px) {
+          grid-template-rows: auto 1fr;
+      }
+      @media all and (min-width: 640px) {
+          grid-template-columns: auto 1fr;
+          gap: 1rem;
+      }
+
+      @media only screen and (max-width: 640px) {
+        margin: 1.6rem 0px;
+      }
+
+      h1 {
+        margin: 0;
+        font-weight: normal;
+        font-family: var(--header-font);
+
+        a {
+          border-bottom: none;
+        }
+      }
+
+      time {
+          font-family: var(--mono-text-font);
+          text-align: left;
+
+          margin: 0;
+      }
+    }
+
+}
+
+// change the line-through color
+del {
+  text-decoration-color: var(--primary-color);
+  text-decoration-thickness: 3px;
+}
+
+.MathJax_Display,
+.MJXc-display,
+.MathJax_SVG_Display {
+  overflow-x: auto;
+  overflow-y: hidden;
+}

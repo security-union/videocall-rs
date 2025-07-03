@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% macro content(page) %}
+<div class="visible-element-observer-root" data-selector="main article p">
+    <main>
+        <article>
+            <div class="title">
+                {#<h1 class="title">{{ page.title }}</h1>#}
+                {{ post_macros::page_header(title=page.title) }}
+
+                <div class="meta">
+                    {% if page.date %}
+                        Posted on <time>{{ page.date | date(format="%Y-%m-%d") }}</time>
+                    {% endif %}
+
+
+                    {% if page.updated %}
+                        :: Updated on <time>{{ page.updated | date(format="%Y-%m-%d") }}</time>
+                    {% endif %}
+
+                    {% if page.extra.read_time %}:: <time>{{ page.reading_time }}</time> Min Read{% endif %}
+
+                    {% if config.extra.word_count and page.word_count %}:: {{ page.word_count }} Words{% endif %}
+
+                    {# View the page on GitHub #}
+                    {% if page.extra.repo_view | default(value=config.extra.repo_view) | default(value=false) %}
+                        {# Use the page's repo_url if defined, otherwise use the global edit_repo_url #}
+                        {% if page.extra.repo_url is defined %}
+                            {% set repo_url = page.extra.repo_url %}
+                        {% elif config.extra.repo_url is defined %}
+                            {% set repo_url = config.extra.repo_url %}
+                        {% else %}
+                            {% set repo_url = false %}
+                        {% endif %}
+
+                        {% if repo_url %}
+                            {% set final_url = repo_url ~ page.relative_path %}
+                            :: <a href="{{ final_url }}" target="_blank" rel="noopener noreferrer">Source Code</a>
+                        {% endif %}
+                    {% endif %}
+
+                    {# Inline display of authors directly after the date #}
+                    {% if page.taxonomies and page.taxonomies.authors %}
+                        <span class="authors-label"> :: </span>
+                        <span class="authors">
+                            {%- for author in page.taxonomies.authors %}
+                                <a href="{{ get_taxonomy_url(kind='authors', name=author, lang=page.lang) }}"
+                                   class="post-authors">{{ author }}</a>
+                            {% endfor %}
+                        </span>
+                    {% endif %}
+
+                    {# Inline display of tags directly after the authors #}
+                    {% if page.taxonomies and page.taxonomies.tags %}
+                        <span class="tags-label"> :: </span>
+                        <span class="tags">
+                            {%- for tag in page.taxonomies.tags %}
+                                <a href="{{ get_taxonomy_url(kind='tags', name=tag, lang=page.lang) }}"
+                                   class="post-tag">{{ tag }}</a>
+                            {% endfor %}
+                        </span>
+                    {% endif %}
+
+                    {% if page.draft %}<span class="draft-label">DRAFT</span>{% endif %}
+
+                </div>
+            </div>
+
+            {% if page.extra.tldr %}
+                <div class="tldr">
+                    <strong>tl;dr:</strong>
+                    {{ page.extra.tldr }}
+                </div>
+            {% endif %}
+
+            <section class="body">
+                {{ page.content | safe }}
+            </section>
+        </article>
+    </main>
+</div>
+{% endmacro content %}
+
+
+{% block main_content %}
+    {{ self::content(page=page) }}
+{% endblock main_content %}
+
+{% block right_content %}
+    {# Optional table of contents #}
+    {% if config.extra.toc | default(value=false) and page.toc %}
+        {% include "partials/toc.html" %}
+    {% endif %}
+{% endblock right_content %}

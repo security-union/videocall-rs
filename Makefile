@@ -19,3 +19,7 @@ fmt:
 
 check: 
 		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app && cargo clippy --all  -- --deny warnings && cargo fmt --check"
+
+clean:
+		docker compose -f docker/docker-compose.yaml down --remove-orphans \
+			--volumes --rmi all

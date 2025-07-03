@@ -17,16 +17,14 @@
  */
 
 use std::collections::HashMap;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::delay_manager::{DelayConfig, DelayManager};
-use crate::packet::{AudioPacket, RtpHeader};
+use crate::packet::AudioPacket;
 use crate::statistics::{
     LifetimeStatistics, NetworkStatistics, StatisticsCalculator, TimeStretchOperation,
 };
-use crate::time_stretch::{TimeStretchFactory, TimeStretchResult, TimeStretcher};
+use crate::time_stretch::{TimeStretchFactory, TimeStretcher};
 use crate::{NetEqError, Result};
 
 /// NetEQ configuration
@@ -434,7 +432,7 @@ impl NetEq {
             match self.packet_buffer.get_next_packet() {
                 Some(packet) => {
                     // Decode based on payload type if we have a decoder; otherwise treat as raw f32 PCM.
-                    let mut packet_samples: Vec<f32> = if let Some(dec) =
+                    let packet_samples: Vec<f32> = if let Some(dec) =
                         self.decoders.get_mut(&packet.header.payload_type)
                     {
                         match dec.decode(&packet.payload) {
@@ -675,10 +673,10 @@ fn simple_random() -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::{thread::sleep, time::Duration};
+
     use super::*;
     use crate::packet::RtpHeader;
-    use rand::seq::SliceRandom;
-    use rand::thread_rng;
 
     fn create_test_packet(seq: u16, ts: u32, duration_ms: u32) -> AudioPacket {
         let header = RtpHeader::new(seq, ts, 12345, 96, false);

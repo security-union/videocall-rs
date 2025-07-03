@@ -43,7 +43,7 @@ mod tests {
     #[test]
     fn basic_functionality() {
         let config = NetEqConfig::default();
-        let mut neteq = NetEq::new(config).unwrap();
+        let neteq = NetEq::new(config).unwrap();
 
         // Test basic operations
         assert_eq!(neteq.target_delay_ms(), 0);

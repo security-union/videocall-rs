@@ -16,9 +16,6 @@
  * conditions.
  */
 
-use crate::statistics::TimeStretchOperation;
-use crate::{NetEqError, Result};
-
 /// Return codes for time-stretching operations
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TimeStretchResult {
@@ -96,12 +93,10 @@ impl Accelerate {
             } else {
                 0.25 // Standard fast mode acceleration
             }
+        } else if is_low_energy {
+            0.2 // Gentle acceleration for low energy
         } else {
-            if is_low_energy {
-                0.2 // Gentle acceleration for low energy
-            } else {
-                0.15 // Conservative acceleration for normal energy
-            }
+            0.15 // Conservative acceleration for normal energy
         };
 
         let samples_to_remove = (input.len() as f32 * acceleration_factor) as usize;
@@ -208,8 +203,8 @@ impl TimeStretcher for Accelerate {
 /// Preemptive Expand algorithm - adds audio samples to slow down playback
 #[derive(Debug)]
 pub struct PreemptiveExpand {
-    sample_rate: u32,
-    channels: u8,
+    _sample_rate: u32,
+    _channels: u8,
     length_change_samples: usize,
     overlap_length: usize,
     max_expansion_rate: f32,
@@ -219,8 +214,8 @@ impl PreemptiveExpand {
     /// Create a new preemptive expand processor
     pub fn new(sample_rate: u32, channels: u8) -> Self {
         Self {
-            sample_rate,
-            channels,
+            _sample_rate: sample_rate,
+            _channels: channels,
             length_change_samples: 0,
             overlap_length: Self::calculate_overlap_length(sample_rate),
             max_expansion_rate: 0.25, // Maximum 25% expansion
@@ -389,8 +384,8 @@ mod tests {
     #[test]
     fn test_preemptive_expand_creation() {
         let expand = PreemptiveExpand::new(16000, 1);
-        assert_eq!(expand.sample_rate, 16000);
-        assert_eq!(expand.channels, 1);
+        assert_eq!(expand._sample_rate, 16000);
+        assert_eq!(expand._channels, 1);
         assert_eq!(expand.get_length_change_samples(), 0);
     }
 

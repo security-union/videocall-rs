@@ -83,9 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // ── Prepare NetEq ─────────────────────────────────────────────────────────
-    let mut neteq_cfg: NetEqConfig = NetEqConfig::default();
-    neteq_cfg.sample_rate = sample_rate;
-    neteq_cfg.channels = channels;
+    let neteq_cfg: NetEqConfig = NetEqConfig {
+        sample_rate,
+        channels,
+        ..Default::default()
+    };
     let neteq = Arc::new(Mutex::new(NetEq::new(neteq_cfg)?));
 
     log::info!(
@@ -117,12 +119,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         OpusChannels::Stereo
     };
-    let mut opus_encoder = OpusEncoder::new(sample_rate as u32, ch_enum, OpusApp::Audio)?;
+    let mut opus_encoder = OpusEncoder::new(sample_rate, ch_enum, OpusApp::Audio)?;
 
     let mut chunk_index_iter = wav_samples.chunks(packet_samples).enumerate();
 
     for _ in 0..warmup_packets {
-        if let Some((idx, chunk)) = chunk_index_iter.next() {
+        if let Some((_idx, chunk)) = chunk_index_iter.next() {
             // Encode 20 ms PCM chunk into Opus
             let mut encoded = vec![0u8; 4000];
             let bytes_written = opus_encoder.encode_float(chunk, &mut encoded)?;
@@ -158,7 +160,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prev_calls = calls;
             prev_frames = frames;
 
-            let fps = delta_frames as f32 / calls_per_sec_den(channels) as f32; // will compute later
             if let Ok(eq) = stats_neteq.lock() {
                 let stats = eq.get_statistics();
                 log::info!(
@@ -181,12 +182,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Network simulator thread
     let neteq_for_net = neteq.clone();
     thread::spawn(move || {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for packet in rx {
             // Extra delay in 0..1000 ms scaled
-            let extra_delay_ms = rng.gen::<f32>() * delay_level * 100.0;
+            let extra_delay_ms = rng.random::<f32>() * delay_level * 100.0;
             // Additional small randomness to create reordering within 0..40 ms window
-            let reorder_delay_ms = rng.gen::<f32>() * disorder_level * 40.0;
+            let reorder_delay_ms = rng.random::<f32>() * disorder_level * 40.0;
             let total_delay = Duration::from_millis((extra_delay_ms + reorder_delay_ms) as u64);
             std::thread::sleep(total_delay);
 
@@ -279,7 +280,7 @@ fn start_audio_playback(
     let mut cfg: cpal::StreamConfig = supported.config();
 
     // Request a fixed 10 ms buffer size per callback, based on chosen rate.
-    let frames_per_buffer = (cfg.sample_rate.0 / 100) as u32; // 10 ms worth
+    let frames_per_buffer = cfg.sample_rate.0 / 100; // 10 ms worth
     cfg.buffer_size = BufferSize::Fixed(frames_per_buffer);
     cfg.channels = 1; // mono output
 

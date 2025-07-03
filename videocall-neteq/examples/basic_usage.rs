@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use videocall_neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,13 +26,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================");
 
     // Create NetEQ configuration
-    let mut config = NetEqConfig::default();
-    config.sample_rate = 16000; // 16 kHz
-    config.channels = 1; // Mono
-    config.max_packets_in_buffer = 50;
-    config.enable_fast_accelerate = true;
-    config.min_delay_ms = 20; // Minimum 20ms delay
-    config.max_delay_ms = 500; // Maximum 500ms delay
+    let config = NetEqConfig {
+        sample_rate: 16000,
+        channels: 1,
+        max_packets_in_buffer: 50,
+        max_delay_ms: 500,
+        min_delay_ms: 20,
+        enable_fast_accelerate: true,
+        enable_muted_state: false,
+        enable_rtx_handling: false,
+        for_test_no_time_stretching: false,
+        ..Default::default()
+    };
 
     // Create NetEQ instance
     let mut neteq = NetEq::new(config)?;
@@ -95,7 +100,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Retrieve audio frames (10ms each)
     let mut total_samples = 0;
     let mut expand_count = 0;
-    let mut accelerate_count = 0;
 
     for frame_num in 0..50 {
         let frame = neteq.get_audio()?;
@@ -107,7 +111,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             videocall_neteq::neteq::SpeechType::Normal => {
                 // Check if this was likely an accelerate operation
                 // (simplified detection based on frame energy changes)
-                accelerate_count += 1;
             }
             _ => {}
         }
@@ -203,7 +206,7 @@ fn demonstrate_packet_loss() -> Result<(), Box<dyn std::error::Error>> {
     let mut timestamp = 0u32;
 
     // Send some normal packets
-    for i in 0..10 {
+    for _i in 0..10 {
         let packet = create_audio_packet(sequence_number, timestamp, 160, 16000, 10);
         neteq.insert_packet(packet)?;
 
@@ -217,7 +220,7 @@ fn demonstrate_packet_loss() -> Result<(), Box<dyn std::error::Error>> {
     timestamp = timestamp.wrapping_add(5 * 160);
 
     // Continue with normal packets
-    for i in 0..10 {
+    for _i in 0..10 {
         let packet = create_audio_packet(sequence_number, timestamp, 160, 16000, 10);
         neteq.insert_packet(packet)?;
 

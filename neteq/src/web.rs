@@ -66,7 +66,6 @@ impl WebNetEq {
         if self.leftovers.borrow().is_empty() {
             let frame = self.neteq.borrow_mut().get_audio().map_err(Self::map_err)?;
             let frame_type = frame.speech_type;
-            web_sys::console::log_1(&format!("[neteq-worker] get_audio: {:?}", frame_type).into());
             self.leftovers
                 .borrow_mut()
                 .extend_from_slice(&frame.samples);

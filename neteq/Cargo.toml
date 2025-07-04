@@ -50,7 +50,9 @@ web = [
     "web-sys/DedicatedWorkerGlobalScope",
     "web-sys/MessageEvent",
     "web-sys/console",
-    "console_error_panic_hook"
+    "web-sys/Window",
+    "console_error_panic_hook",
+    "web-sys/Navigator",
 ]
 audio_out = ["cpal", "clap", "opus"]
 

@@ -1,12 +1,13 @@
 use super::AudioDecoder;
 use crate::{NetEqError, Result};
-use js_sys::{Float32Array, Function, Uint8Array};
+use js_sys::{Float32Array, Function, Reflect, Uint8Array};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+use web_sys::window;
 use web_sys::{
     AudioData, AudioDecoder as WcAudioDecoder, AudioDecoderConfig, AudioDecoderInit,
     EncodedAudioChunk, EncodedAudioChunkInit, EncodedAudioChunkType as ChunkType,
@@ -179,3 +180,122 @@ unsafe impl Send for OpusDecoder {}
 
 #[cfg(target_arch = "wasm32")]
 unsafe impl Sync for OpusDecoder {}
+
+// --- Safari fallback ---------------------------------------------------------
+// On Safari (WebKit) the WebCodecs `AudioDecoder` API is not available.
+// Instead of failing outright, we provide a very small fallback that simply
+// returns silence. This keeps the `NetEq` state-machine alive and allows the
+// rest of the pipeline (jitter-buffer, playout logic, etc.) to work while we
+// develop a full worklet-based decoder.
+//
+// The fallback is only selected at runtime when the browser is detected to be
+// Safari. All other browsers will continue to use the WebCodecs implementation
+// above.
+
+// Cached result to avoid repeated checks
+use std::sync::OnceLock;
+static IS_IOS: OnceLock<bool> = OnceLock::new();
+
+/// Detects if the current environment is likely iOS Safari.
+/// Checks user agent and the absence of AudioEncoder API which causes crashes on iOS.
+pub fn is_ios() -> bool {
+    *IS_IOS.get_or_init(|| {
+        if let Some(window) = window() {
+            // Check if AudioEncoder exists in window
+            let audio_encoder_exists = is_audio_encoder_available();
+            if let Ok(ua) = window.navigator().user_agent() {
+                let ua_lower = ua.to_lowercase();
+                let likely_ios = ua_lower.contains("iphone") || ua_lower.contains("ipad") || ua_lower.contains("ipod");
+                // Consider it iOS if the user agent suggests iOS OR if AudioEncoder is missing
+                // Audio Encoder may be missing on older browsers too, so we check both conditions
+                let result = likely_ios || !audio_encoder_exists;
+                log::info!(
+                    "Platform detection: User Agent='{}', LikelyiOS={}, AudioEncoderAvailable={}, FinalResult={}",
+                    ua, likely_ios, audio_encoder_exists, result
+                );
+                return result;
+            }
+        }
+        log::warn!("Could not determine platform, assuming not iOS.");
+        false // Default to false if detection fails
+    })
+}
+
+/// Safely check if AudioEncoder is available without crashing
+fn is_audio_encoder_available() -> bool {
+    // Use reflection to safely check if AudioEncoder exists on the window object
+    if let Some(window) = window() {
+        let global = JsValue::from(window);
+
+        // First check if AudioEncoder exists on the window object
+        match Reflect::has(&global, &JsValue::from_str("AudioEncoder")) {
+            Ok(exists) => {
+                if !exists {
+                    return false;
+                }
+
+                // Try to access it to make sure it's properly supported
+                match Reflect::get(&global, &JsValue::from_str("AudioEncoder")) {
+                    Ok(constructor) => {
+                        // Check if it's a function/constructor by verifying it's not undefined/null
+                        !constructor.is_undefined() && !constructor.is_null()
+                    }
+                    Err(_) => false,
+                }
+            }
+            Err(_) => false,
+        }
+    } else {
+        false
+    }
+}
+
+/// Minimal placeholder decoder for Safari. At the moment it produces silence
+/// but satisfies the `AudioDecoder` trait so the rest of the code builds.
+///
+/// In the future this can be replaced by a worklet-powered implementation that
+/// mirrors the WebCodecs path.  For now, having a working stub is already a
+/// big step forward because it unblocks compilation/running on Safari.
+#[derive(Debug)]
+pub struct SafariOpusDecoder {
+    sample_rate: u32,
+    channels: u8,
+}
+
+impl SafariOpusDecoder {
+    pub fn new(sample_rate: u32, channels: u8) -> Result<Self> {
+        Ok(Self {
+            sample_rate,
+            channels,
+        })
+    }
+}
+
+impl AudioDecoder for SafariOpusDecoder {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    fn decode(&mut self, _encoded: &[u8]) -> Result<Vec<f32>> {
+        // Produce a frame of silence (20 ms) so timing matches the normal
+        // Opus decoder path.
+        let samples_per_channel = (self.sample_rate as f32 * 0.02) as usize;
+        let total = samples_per_channel * self.channels as usize;
+        Ok(vec![0.0; total])
+    }
+}
+
+// Helper that hides the runtime choice between WebCodecs and Safari fallback.
+// Callers should use this instead of invoking `OpusDecoder::new` directly.
+#[allow(dead_code)]
+pub fn create_opus_decoder(sample_rate: u32, channels: u8) -> Result<Box<dyn AudioDecoder>> {
+    if is_ios() {
+        Ok(Box::new(SafariOpusDecoder::new(sample_rate, channels)?))
+    } else {
+        Ok(Box::new(OpusDecoder::new(sample_rate, channels)?))
+    }
+}

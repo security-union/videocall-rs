@@ -93,7 +93,7 @@ impl OpusDecoder {
         let output_fn: &Function = output_cb.as_ref().unchecked_ref();
         let error_fn: &Function = error_cb.as_ref().unchecked_ref();
 
-        let init = AudioDecoderInit::new(output_fn, error_fn);
+        let init = AudioDecoderInit::new(error_fn, output_fn);
 
         let wc_decoder = WcAudioDecoder::new(&init)
             .map_err(|e| NetEqError::DecoderError(format!("AudioDecoder init: {:?}", e)))?;

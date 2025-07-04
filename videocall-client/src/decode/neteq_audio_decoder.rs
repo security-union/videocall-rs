@@ -1,10 +1,7 @@
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::decode::config::configure_audio_context;
-use crate::decode::AudioPeerDecoderTrait;
 use crate::decode::DecodeStatus;
-use crate::utils::is_ios; // maybe unused
 use js_sys::{Float32Array, Object};
-use log::error;
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen;
 use std::sync::Arc;
@@ -13,7 +10,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AudioBufferSourceNode, AudioContext, AudioData, AudioDataInit, MediaStreamTrackGenerator,
+    AudioContext, AudioData, AudioDataInit, MediaStreamTrackGenerator,
     MediaStreamTrackGeneratorInit, MessageEvent, Worker,
 };
 
@@ -179,19 +176,6 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                     timestamp: packet.timestamp as u32,
                     payload: packet.data.clone(),
                 };
-
-                // Debug: log what we are sending to the worker so we can confirm the
-                // metadata and payload length look correct and that the `Insert`
-                // messages are actually being generated from the decoder.
-                #[cfg(debug_assertions)]
-                {
-                    use wasm_bindgen::JsValue;
-                    // web_sys::console::log_3(
-                    //     &JsValue::from_str("[neteq-audio-decoder] Insert:"),
-                    //     &JsValue::from_f64(audio_meta.sequence as f64),
-                    //     &JsValue::from_f64(packet.data.len() as f64),
-                    // );
-                }
 
                 // Any serialisation or postMessage error will simply be logged. We don't want it
                 // to bubble up and force a complete decoder reset, which leads to the video

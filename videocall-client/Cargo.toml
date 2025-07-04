@@ -39,6 +39,9 @@ yew-webtransport = "0.21.1"
 prost = "0.11"
 videocall-codecs = { path = "../videocall-codecs", features = ["wasm"], version = "0.1.2" }
 neteq = { path = "../neteq", features = ["web"], version = "0.1.1" }
+serde-wasm-bindgen = "0.6.5"
+serde_bytes = "0.11"
+
 
 [dependencies.web-sys]
 version = "0.3.72"
@@ -53,6 +56,8 @@ features = [
     "AudioDecoderInit",
     "AudioDecoderConfig",
     "AudioContext",
+    "AudioBuffer",
+    "AudioBufferSourceNode",
     "AudioWorklet",
     "AudioWorkletNode",
     "AudioWorkletNodeOptions",

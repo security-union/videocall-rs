@@ -20,6 +20,7 @@ pub mod audio_decoder_wrapper;
 pub mod config;
 pub mod hash_map_with_ordered_keys;
 pub mod media_decoder_trait;
+pub mod neteq_audio_decoder;
 pub mod peer_decode_manager;
 pub mod peer_decoder;
 pub mod safari;
@@ -29,6 +30,7 @@ pub use peer_decode_manager::{PeerDecodeManager, PeerStatus};
 pub use peer_decoder::VideoPeerDecoder;
 
 use crate::utils::is_ios;
+use neteq_audio_decoder::NetEqAudioPeerDecoder;
 use peer_decoder::{
     DecodeStatus as StandardDecodeStatus, PeerDecode as StandardPeerDecodeTrait,
     StandardAudioPeerDecoder,
@@ -99,9 +101,9 @@ pub fn create_audio_peer_decoder(
             speaker_device_id,
         )))
     } else {
-        log::info!("Platform detection: Using standard (AudioDecoder API) audio peer decoder");
-        StandardAudioPeerDecoder::new(speaker_device_id)
-            .map(|decoder| Box::new(decoder) as Box<dyn AudioPeerDecoderTrait>)
+        log::info!("Platform detection: Using NetEq audio peer decoder");
+        NetEqAudioPeerDecoder::new(speaker_device_id)
+            .map(|d| Box::new(d) as Box<dyn AudioPeerDecoderTrait>)
     }
 }
 

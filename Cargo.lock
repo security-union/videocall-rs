@@ -6288,6 +6288,8 @@ dependencies = [
  "rand 0.8.5",
  "rsa",
  "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "serde_bytes",
  "videocall-codecs",
  "videocall-types",
  "wasm-bindgen",

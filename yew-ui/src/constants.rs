@@ -19,9 +19,18 @@
 use videocall_types::truthy;
 
 // This is read at compile time, please restart if you change this value.
-pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
-pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
-pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lobby");
+pub const LOGIN_URL: &str = match option_env!("LOGIN_URL") {
+    Some(url) => url,
+    None => "/login",
+};
+pub const ACTIX_WEBSOCKET: &str = match option_env!("ACTIX_UI_BACKEND_URL") {
+    Some(url) => url,
+    None => "ws://localhost:8081",
+};
+pub const WEBTRANSPORT_HOST: &str = match option_env!("WEBTRANSPORT_HOST") {
+    Some(url) => url,
+    None => "https://localhost:4443/lobby",
+};
 pub const CANVAS_LIMIT: usize = 20;
 
 pub const AUDIO_BITRATE_KBPS: u32 = 65u32;

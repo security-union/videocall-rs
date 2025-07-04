@@ -39,10 +39,10 @@ mod wasm_worker {
     pub fn start() {
         console_error_panic_hook::set_once();
         let self_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
-
+        let self_scope_clone = self_scope.clone();
         let on_message = Closure::wrap(Box::new(move |evt: MessageEvent| {
             match serde_wasm_bindgen::from_value::<WorkerMsg>(evt.data()) {
-                Ok(msg) => handle_message(&self_scope, msg),
+                Ok(msg) => handle_message(&self_scope_clone, msg),
                 Err(e) => console::error_1(&format!("[neteq-worker] bad msg: {:?}", e).into()),
             }
         }) as Box<dyn FnMut(_)>);

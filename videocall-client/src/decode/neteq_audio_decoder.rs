@@ -1,0 +1,148 @@
+use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
+use crate::decode::AudioPeerDecoderTrait;
+use crate::decode::DecodeStatus;
+use crate::utils::is_ios; // maybe unused
+use js_sys::Float32Array;
+use log::error;
+use serde::{Deserialize, Serialize};
+use serde_wasm_bindgen;
+use std::sync::Arc;
+use videocall_types::protos::media_packet::MediaPacket;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{AudioBufferSourceNode, AudioContext, MessageEvent, Worker};
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "camelCase")]
+enum WorkerMsg {
+    Init {
+        sample_rate: u32,
+        channels: u8,
+    },
+    Insert {
+        seq: u16,
+        timestamp: u32,
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+    },
+    Flush,
+    Clear,
+    Close,
+}
+
+/// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
+#[derive(Debug)]
+pub struct NetEqAudioPeerDecoder {
+    worker: Worker,
+    audio_context: AudioContext,
+    decoded: bool,
+    _on_message_closure: Closure<dyn FnMut(MessageEvent)>, // Keep closure alive
+}
+
+impl NetEqAudioPeerDecoder {
+    pub fn new(speaker_device_id: Option<String>) -> Result<Self, JsValue> {
+        // Locate worker URL from <link id="neteq-worker" ...>
+        let window = web_sys::window().expect("no window");
+        let document = window.document().expect("no document");
+        let worker_url = document
+            .get_element_by_id("neteq-worker")
+            .expect("neteq-worker link tag not found")
+            .get_attribute("href")
+            .expect("link tag has no href");
+
+        let worker = Worker::new(&worker_url)?;
+
+        // Create AudioContext (choose sample rate 48k)
+        let audio_context = AudioContext::new()?;
+        // Try setSinkId if provided
+        if let Some(device_id) = speaker_device_id {
+            if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
+                .unwrap_or(false)
+            {
+                // setSinkId returns a Promise.
+                let promise = audio_context.set_sink_id_with_str(&device_id);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = JsFuture::from(promise).await;
+                });
+            }
+        }
+
+        // Prepare Init message
+        let init_msg = WorkerMsg::Init {
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: AUDIO_CHANNELS as u8,
+        };
+        worker.post_message(&serde_wasm_bindgen::to_value(&init_msg)?)?;
+
+        // Set up message handler
+        let audio_ctx_clone = audio_context.clone();
+        let on_message_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
+            let data = event.data();
+            if data.is_instance_of::<Float32Array>() {
+                let pcm = Float32Array::from(data);
+                let length = pcm.length() as usize; // samples total (mono)
+                let frames = length; // since mono 1 ch
+                if let Ok(buffer) = audio_ctx_clone.create_buffer(
+                    AUDIO_CHANNELS,
+                    frames as u32,
+                    AUDIO_SAMPLE_RATE as f32,
+                ) {
+                    // Fill buffer
+                    if let Ok(mut channel_data) = buffer.get_channel_data(0) {
+                        // Convert the Float32Array coming from the worker to a Rust Vec<f32>
+                        let mut samples = vec![0f32; length];
+                        pcm.copy_to(&mut samples);
+                        // Copy the samples into the AudioBuffer's channel data buffer
+                        channel_data[..].copy_from_slice(&samples[..]);
+                    }
+                    // Play immediately
+                    if let Ok(source) = audio_ctx_clone.create_buffer_source() {
+                        source.set_buffer(Some(&buffer));
+                        let _ = source.connect_with_audio_node(&audio_ctx_clone.destination());
+                        let _ = source.start();
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(_)>);
+
+        worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
+
+        Ok(Self {
+            worker,
+            audio_context,
+            decoded: false,
+            _on_message_closure: on_message_closure,
+        })
+    }
+}
+
+impl Drop for NetEqAudioPeerDecoder {
+    fn drop(&mut self) {
+        let _ = self.audio_context.close();
+        self.worker.terminate();
+    }
+}
+
+impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
+        // Build Insert message
+        if let Some(audio_meta) = packet.audio_metadata.as_ref() {
+            let insert = WorkerMsg::Insert {
+                seq: audio_meta.sequence as u16,
+                timestamp: packet.timestamp as u32,
+                payload: packet.data.clone(),
+            };
+            let js_val = serde_wasm_bindgen::to_value(&insert).unwrap();
+            self.worker.post_message(&js_val).unwrap();
+            let first_frame = !self.decoded;
+            self.decoded = true;
+            Ok(DecodeStatus {
+                rendered: true,
+                first_frame,
+            })
+        } else {
+            Err(anyhow::anyhow!("No audio metadata"))
+        }
+    }
+}

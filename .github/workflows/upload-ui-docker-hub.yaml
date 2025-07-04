@@ -13,6 +13,7 @@ on:
       - 'types/**'
       - 'videocall-client/**'
       - 'videocall-codecs/**'
+      - 'neteq/**'
       - Dockerfile.yew
       - nginx.conf
   workflow_dispatch:

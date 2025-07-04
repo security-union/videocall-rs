@@ -81,4 +81,4 @@ Contributions are welcome — please skim the [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
 
-MIT
+MIT or Apache-2.0

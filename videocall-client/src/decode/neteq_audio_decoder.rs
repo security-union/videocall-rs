@@ -68,14 +68,8 @@ impl NetEqAudioPeerDecoder {
             }
         }
 
-        // Prepare Init message
-        let init_msg = WorkerMsg::Init {
-            sample_rate: AUDIO_SAMPLE_RATE,
-            channels: AUDIO_CHANNELS as u8,
-        };
-        worker.post_message(&serde_wasm_bindgen::to_value(&init_msg)?)?;
-
-        // Set up message handler
+        // Set up message handler BEFORE sending the Init command so the worker definitely
+        // has its listener ready when the first message arrives.
         let audio_ctx_clone = audio_context.clone();
         let on_message_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
@@ -107,6 +101,31 @@ impl NetEqAudioPeerDecoder {
         }) as Box<dyn FnMut(_)>);
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
+
+        // Now that the message listener is wired up, dispatch the Init message with a short
+        // `setTimeout` so we give the worker JS runtime a moment to finish evaluating its
+        // top-level code (and thus have its own onmessage installed).
+        let init_msg = WorkerMsg::Init {
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: AUDIO_CHANNELS as u8,
+        };
+
+        let init_js = serde_wasm_bindgen::to_value(&init_msg)?;
+        let worker_clone = worker.clone();
+        let send_cb = Closure::wrap(Box::new(move || {
+            if let Err(e) = worker_clone.post_message(&init_js) {
+                web_sys::console::error_2(&"[neteq-audio-decoder] failed to post Init:".into(), &e);
+            }
+        }) as Box<dyn FnMut()>);
+        // 10 ms is plenty; even 0 would usually work but this is extra safe.
+        web_sys::window()
+            .expect("no window")
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                send_cb.as_ref().unchecked_ref(),
+                10,
+            )?;
+        // Leak the closure (single-shot) so it lives until the timeout fires.
+        send_cb.forget();
 
         Ok(Self {
             worker,
@@ -168,7 +187,10 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
             None => {
                 // Malformed/old packet that lacks metadata – skip with a warning instead of
                 // propagating an error that would reset the entire peer.
-                log::warn!("Received audio packet without metadata – skipping");
+                log::warn!(
+                    "Received audio packet with length {} without metadata – skipping",
+                    packet.data.len()
+                );
                 Ok(DecodeStatus {
                     rendered: false,
                     first_frame: false,

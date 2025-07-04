@@ -65,6 +65,7 @@ pub fn transform_audio_chunk(
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_millis() as f64;
+    // chunk length in bytes
 
     let media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),

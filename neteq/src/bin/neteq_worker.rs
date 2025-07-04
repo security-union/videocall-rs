@@ -41,14 +41,64 @@ mod wasm_worker {
         console::log_1(&"[neteq-worker] starting".into());
         let self_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
         let self_scope_clone = self_scope.clone();
+        let self_scope_clone_2 = self_scope.clone();
         let on_message = Closure::wrap(Box::new(move |evt: MessageEvent| {
             match serde_wasm_bindgen::from_value::<WorkerMsg>(evt.data()) {
                 Ok(msg) => handle_message(&self_scope_clone, msg),
                 Err(e) => console::error_1(&format!("[neteq-worker] bad msg: {:?}", e).into()),
             }
         }) as Box<dyn FnMut(_)>);
+        console::log_1(&"[neteq-worker] onmessage".into());
 
         self_scope.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+        // Eagerly create a default NetEq (48 kHz / mono). If the main thread later sends an
+        // explicit Init message, that path will simply be ignored because `NETEQ` is already
+        // populated.
+        NETEQ.with(|cell| {
+            if cell.borrow().is_none() {
+                match WebNetEq::new(48_000, 1) {
+                    Ok(eq) => {
+                        *cell.borrow_mut() = Some(eq);
+                        console::log_1(
+                            &"[neteq-worker] NetEq auto-initialised (48 kHz/mono)".into(),
+                        );
+                    }
+                    Err(e) => {
+                        console::error_2(&"[neteq-worker] auto-init error:".into(), &e);
+                    }
+                }
+            }
+        });
+
+        // === Stats interval (1 Hz) ===
+        console::log_1(&"[neteq-worker] stats interval".into());
+        let stats_cb = Closure::wrap(Box::new(move || {
+            console::log_1(&"[neteq-worker] stats".into());
+            NETEQ.with(|cell| {
+                if let Some(eq) = cell.borrow().as_ref() {
+                    match eq.get_statistics() {
+                        Ok(js_val) => {
+                            let prefix = JsValue::from_str("[neteq-worker] stats: ");
+                            console::log_2(&prefix, &js_val);
+                        }
+                        Err(e) => {
+                            console::error_1(
+                                &format!("[neteq-worker] stats error: {:?}", e).into(),
+                            );
+                        }
+                    }
+                } else {
+                    console::log_1(&"[neteq-worker] no eq".into());
+                }
+            });
+        }) as Box<dyn FnMut()>);
+        let _ = self_scope_clone_2.set_interval_with_callback_and_timeout_and_arguments_0(
+            stats_cb.as_ref().unchecked_ref(),
+            1000,
+        );
+        stats_cb.forget();
+
         on_message.forget();
     }
 
@@ -59,6 +109,10 @@ mod wasm_worker {
                 sample_rate,
                 channels,
             } => {
+                console::log_2(
+                    &"[neteq-worker] Init received, sr=".into(),
+                    &JsValue::from_f64(sample_rate as f64),
+                );
                 NETEQ.with(|cell| {
                     if cell.borrow().is_none() {
                         match WebNetEq::new(sample_rate, channels) {
@@ -66,7 +120,9 @@ mod wasm_worker {
                                 *cell.borrow_mut() = Some(eq);
                                 console::log_1(&"[neteq-worker] NetEq initialised".into());
                             }
-                            Err(e) => console::error_1(&e),
+                            Err(e) => {
+                                console::error_2(&"[neteq-worker] NetEq init error:".into(), &e);
+                            }
                         }
                     }
                 });
@@ -74,6 +130,7 @@ mod wasm_worker {
                 let cb = Closure::wrap(Box::new(move || {
                     NETEQ.with(|cell| {
                         if let Some(eq) = cell.borrow().as_ref() {
+                            console::log_1(&"[neteq-worker] get_audio".into());
                             if let Ok(pcm) = eq.get_audio() {
                                 let sab = js_sys::Array::of1(&pcm.buffer());
                                 let _ = js_sys::global()
@@ -88,37 +145,13 @@ mod wasm_worker {
                     10,
                 );
                 cb.forget();
-
-                // === Stats interval (1 Hz) ===
-                let stats_cb = Closure::wrap(Box::new(move || {
-                    NETEQ.with(|cell| {
-                        if let Some(eq) = cell.borrow().as_ref() {
-                            match eq.get_statistics() {
-                                Ok(js_val) => {
-                                    let prefix = JsValue::from_str("[neteq-worker] stats: ");
-                                    console::log_2(&prefix, &js_val);
-                                }
-                                Err(e) => {
-                                    console::error_1(
-                                        &format!("[neteq-worker] stats error: {:?}", e).into(),
-                                    );
-                                }
-                            }
-                        }
-                    });
-                }) as Box<dyn FnMut()>);
-
-                let _ = scope.set_interval_with_callback_and_timeout_and_arguments_0(
-                    stats_cb.as_ref().unchecked_ref(),
-                    1000,
-                );
-                stats_cb.forget();
             }
             WorkerMsg::Insert {
                 seq,
                 timestamp,
                 payload,
             } => {
+                // console::log_1(&"[neteq-worker] insert_packet".into());
                 NETEQ.with(|cell| {
                     if let Some(eq) = cell.borrow().as_ref() {
                         if let Err(e) = eq.insert_packet(seq, timestamp, &payload) {

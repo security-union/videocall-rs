@@ -1,15 +1,28 @@
-#![cfg(all(feature = "web", target_arch = "wasm32"))]
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
 
 // WebAssembly (browser) wrapper around NetEq that exposes a small API for use inside
 // a Dedicated Web Worker or AudioWorklet.
 
 use crate::{codec::OpusDecoder, AudioPacket, NetEq, NetEqConfig, RtpHeader};
 use serde_wasm_bindgen;
-
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
 use wasm_bindgen::prelude::*;
 
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
 #[wasm_bindgen]
 pub struct WebNetEq {
     neteq: std::cell::RefCell<NetEq>,
@@ -18,7 +31,6 @@ pub struct WebNetEq {
     channels: u8,
 }
 
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
 #[wasm_bindgen]
 impl WebNetEq {
     #[wasm_bindgen(constructor)]

@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use crate::{NetEqError, Result};
+use crate::Result;
 
 // Trait common to all decoders -------------------------------------------------
 pub trait AudioDecoder {

@@ -15,17 +15,25 @@ include = ["src/**/*"]
 [dependencies]
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_bytes = { version = "0.11", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["DedicatedWorkerGlobalScope", "MessageEvent"] }
+console_error_panic_hook = { version = "0.1", optional = true }
 log = "0.4"
 ringbuf = "0.3"
 hound = { version = "3.5", optional = true }
 rand = "0.9.1"
-cpal = "0.15"
+cpal = { version = "0.15", optional = true }
 opus = "0.3"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"], optional = true }
 
 [features]
 default = []
 audio_files = ["hound"]
+web = ["wasm-bindgen", "serde-wasm-bindgen", "serde_bytes", "js-sys", "web-sys", "console_error_panic_hook"]
+audio_out = ["cpal", "clap"]
 
 [dev-dependencies]
 env_logger = "0.10"

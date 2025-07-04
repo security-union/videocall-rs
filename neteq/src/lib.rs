@@ -32,9 +32,15 @@ pub mod signal;
 pub mod statistics;
 pub mod time_stretch;
 
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub mod web;
+
 pub use error::{NetEqError, Result};
 pub use neteq::{NetEq, NetEqConfig, NetEqStats, Operation};
 pub use packet::{AudioPacket, RtpHeader};
+
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub use web::WebNetEq;
 
 #[cfg(test)]
 mod tests {

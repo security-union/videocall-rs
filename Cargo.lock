@@ -3465,15 +3465,21 @@ name = "neteq"
 version = "0.1.1"
 dependencies = [
  "clap",
+ "console_error_panic_hook",
  "cpal",
  "env_logger",
  "hound",
+ "js-sys",
  "log",
  "opus",
  "rand 0.9.1",
  "ringbuf",
  "serde",
+ "serde-wasm-bindgen 0.6.5",
+ "serde_bytes",
  "thiserror 1.0.69",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
@@ -5069,6 +5075,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_bytes"
+version = "0.11.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8437fd221bde2d4ca316d61b90e337e9e702b3820b87d63caa9ba6c02bd06d96"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde_derive"
 version = "1.0.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6266,6 +6281,7 @@ dependencies = [
  "gloo-utils 0.1.7",
  "js-sys",
  "log",
+ "neteq",
  "pidgeon",
  "prost",
  "protobuf",

@@ -34,7 +34,24 @@ web-time = "1.1.0"
 [features]
 default = []
 audio_files = ["hound"]
-web = ["wasm-bindgen", "serde-wasm-bindgen", "serde_bytes", "js-sys", "web-sys", "console_error_panic_hook"]
+web = [
+    "wasm-bindgen",
+    "serde-wasm-bindgen",
+    "serde_bytes",
+    "js-sys",
+    "web-sys/AudioDecoder",
+    "web-sys/AudioDecoderConfig",
+    "web-sys/AudioDecoderInit",
+    "web-sys/AudioData",
+    "web-sys/AudioDataCopyToOptions",
+    "web-sys/EncodedAudioChunk",
+    "web-sys/EncodedAudioChunkInit",
+    "web-sys/EncodedAudioChunkType",
+    "web-sys/DedicatedWorkerGlobalScope",
+    "web-sys/MessageEvent",
+    "web-sys/console",
+    "console_error_panic_hook"
+]
 audio_out = ["cpal", "clap", "opus"]
 
 [dev-dependencies]

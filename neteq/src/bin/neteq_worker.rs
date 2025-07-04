@@ -42,6 +42,7 @@ mod wasm_worker {
         let self_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
         let self_scope_clone = self_scope.clone();
         let self_scope_clone_2 = self_scope.clone();
+        let self_scope_clone_3 = self_scope.clone();
         let on_message = Closure::wrap(Box::new(move |evt: MessageEvent| {
             match serde_wasm_bindgen::from_value::<WorkerMsg>(evt.data()) {
                 Ok(msg) => handle_message(&self_scope_clone, msg),
@@ -98,6 +99,25 @@ mod wasm_worker {
             1000,
         );
         stats_cb.forget();
+
+        // Timer to pull audio every 10 ms.
+        let cb = Closure::wrap(Box::new(move || {
+            NETEQ.with(|cell| {
+                if let Some(eq) = cell.borrow().as_ref() {
+                    if let Ok(pcm) = eq.get_audio() {
+                        let sab = js_sys::Array::of1(&pcm.buffer());
+                        let _ = js_sys::global()
+                            .unchecked_into::<DedicatedWorkerGlobalScope>()
+                            .post_message_with_transfer(&pcm, &sab);
+                    }
+                }
+            });
+        }) as Box<dyn FnMut()>);
+        let _ = self_scope_clone_3.set_interval_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            10,
+        );
+        cb.forget();
 
         on_message.forget();
     }

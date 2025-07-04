@@ -380,7 +380,6 @@ fn fill_output_neteq(buffer: &mut [f32], neteq: &Arc<Mutex<NetEq>>, leftover: &m
             match neteq.lock() {
                 Ok(mut n) => match n.get_audio() {
                     Ok(frame) => {
-                        log::debug!("NetEq get_audio: {:?}", frame.speech_type);
                         leftover.extend_from_slice(&frame.samples);
                     }
                     Err(e) => {

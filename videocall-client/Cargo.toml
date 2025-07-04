@@ -44,7 +44,7 @@ serde_bytes = "0.11"
 
 
 [dependencies.web-sys]
-version = "0.3.72"
+version = "0.3"
 features = [
     "AudioTrack",
     "AudioData",
@@ -117,7 +117,14 @@ features = [
     "MediaDeviceKind",
     "MediaTrackConstraints",
     "CanvasRenderingContext2d",
-    "Performance"
+    "Performance",
+    "AnalyserNode",
+    "HtmlCanvasElement",
+    "CssStyleDeclaration",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+    "MediaSource",
+    "DomException",
 ]
 
 [dependencies.pidgeon]

@@ -1,8 +1,9 @@
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
+use crate::decode::config::configure_audio_context;
 use crate::decode::AudioPeerDecoderTrait;
 use crate::decode::DecodeStatus;
 use crate::utils::is_ios; // maybe unused
-use js_sys::Float32Array;
+use js_sys::{Float32Array, Object};
 use log::error;
 use serde::{Deserialize, Serialize};
 use serde_wasm_bindgen;
@@ -11,7 +12,11 @@ use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{AudioBufferSourceNode, AudioContext, AudioContextOptions, MessageEvent, Worker};
+use web_sys::{
+    AnalyserNode, AudioBufferSourceNode, AudioContext, AudioData, AudioDataInit,
+    CanvasRenderingContext2d, HtmlCanvasElement, MediaStreamTrackGenerator,
+    MediaStreamTrackGeneratorInit, MessageEvent, Worker,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
@@ -36,8 +41,11 @@ enum WorkerMsg {
 pub struct NetEqAudioPeerDecoder {
     worker: Worker,
     audio_context: AudioContext,
+    _generator: MediaStreamTrackGenerator,
+    analyser: AnalyserNode,
     decoded: bool,
     _on_message_closure: Closure<dyn FnMut(MessageEvent)>, // Keep closure alive
+    _draw_closure: Closure<dyn FnMut()>,                   // Keep rAF closure alive
 }
 
 impl NetEqAudioPeerDecoder {
@@ -53,10 +61,66 @@ impl NetEqAudioPeerDecoder {
 
         let worker = Worker::new(&worker_url)?;
 
-        // Create AudioContext (choose sample rate 48k)
-        let audio_context_options = AudioContextOptions::new();
-        audio_context_options.set_sample_rate(AUDIO_SAMPLE_RATE as f32);
-        let audio_context = AudioContext::new_with_context_options(&audio_context_options).unwrap();
+        // Use shared helper so routing/sink handling matches the standard decoder path
+        let generator =
+            MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio"))?;
+        let audio_context = configure_audio_context(&generator, speaker_device_id.clone())
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+        // Create an AnalyserNode for debug visualisation.
+        let analyser = audio_context.create_analyser()?;
+        analyser.set_fft_size(2048);
+
+        // Create (or reuse) a debug canvas on the page.
+        let canvas: HtmlCanvasElement =
+            if let Some(elem) = document.get_element_by_id("audio-debug") {
+                elem.dyn_into::<HtmlCanvasElement>()?
+            } else {
+                let canvas: HtmlCanvasElement = document
+                    .create_element("canvas")?
+                    .dyn_into::<HtmlCanvasElement>()?;
+                canvas.set_id("audio-debug");
+                canvas.set_width(512);
+                canvas.set_height(100);
+                canvas.style().set_property("position", "fixed")?;
+                canvas.style().set_property("bottom", "0")?;
+                canvas.style().set_property("left", "0")?;
+                canvas.style().set_property("z-index", "10000")?;
+                document.body().unwrap().append_child(&canvas)?;
+                canvas
+            };
+        let ctx: CanvasRenderingContext2d = canvas
+            .get_context("2d")?
+            .unwrap()
+            .dyn_into::<CanvasRenderingContext2d>()?;
+
+        // Animation frame loop to draw waveform.
+        let analyser_clone = analyser.clone();
+        let draw_closure = Closure::wrap(Box::new(move || {
+            let buffer_len = analyser_clone.frequency_bin_count();
+            let mut data = vec![0u8; buffer_len as usize];
+            analyser_clone.get_byte_time_domain_data(&mut data);
+            ctx.set_fill_style(&JsValue::from_str("black"));
+            ctx.fill_rect(0.0, 0.0, 512.0, 100.0);
+            ctx.set_stroke_style(&JsValue::from_str("lime"));
+            ctx.begin_path();
+            for (i, v) in data.iter().enumerate() {
+                let x = i as f64 / buffer_len as f64 * 512.0;
+                let y = (*v as f64 / 255.0) * 100.0;
+                if i == 0 {
+                    ctx.move_to(x, y);
+                } else {
+                    ctx.line_to(x, y);
+                }
+            }
+            ctx.stroke();
+        }) as Box<dyn FnMut()>);
+        // Draw at ~30 fps
+        window.set_interval_with_callback_and_timeout_and_arguments_0(
+            draw_closure.as_ref().unchecked_ref(),
+            33,
+        )?;
+
         // Try setSinkId if provided
         if let Some(device_id) = speaker_device_id {
             if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
@@ -73,6 +137,7 @@ impl NetEqAudioPeerDecoder {
         // Set up message handler BEFORE sending the Init command so the worker definitely
         // has its listener ready when the first message arrives.
         let audio_ctx_clone = audio_context.clone();
+        let generator_for_cb = generator.clone();
         let on_message_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
             if data.is_instance_of::<Float32Array>() {
@@ -84,44 +149,36 @@ impl NetEqAudioPeerDecoder {
                 }
 
                 let pcm = Float32Array::from(data);
-                let length = pcm.length() as usize; // samples total (mono)
-                let frames = length; // since mono 1 ch
-                if let Ok(buffer) = audio_ctx_clone.create_buffer(
-                    AUDIO_CHANNELS,
-                    frames as u32,
-                    AUDIO_SAMPLE_RATE as f32,
-                ) {
-                    // Fill buffer
-                    if let Ok(mut channel_data) = buffer.get_channel_data(0) {
-                        // Convert the Float32Array coming from the worker to a Rust Vec<f32>
-                        let mut samples = vec![0f32; length];
-                        pcm.copy_to(&mut samples);
-                        // Copy the samples into the AudioBuffer's channel data buffer
-                        channel_data[..].copy_from_slice(&samples[..]);
-                    }
-                    // Play immediately
-                    if let Ok(source) = audio_ctx_clone.create_buffer_source() {
-                        source.set_buffer(Some(&buffer));
-                        let _ = source.connect_with_audio_node(&audio_ctx_clone.destination());
-                        let _ = source.start();
-                    }
-                }
+                let length = pcm.length() as usize;
+                let frames = length as u32; // mono
 
-                // Debug: compute a simple RMS level to verify we have non-zero audio, and log context info.
-                // let mut samples = vec![0f32; length];
-                // pcm.copy_to(&mut samples);
-                // let rms: f64 = if length > 0 {
-                //     let sum: f64 = samples.iter().map(|v| (*v as f64).powi(2)).sum();
-                //     (sum / length as f64).sqrt()
-                // } else {
-                //     0.0
-                // };
-                // web_sys::console::log_4(
-                //     &"[neteq-audio-decoder] PCM chunk".into(),
-                //     &JsValue::from_f64(length as f64),
-                //     &JsValue::from_f64(rms),
-                //     &JsValue::from_f64(audio_ctx_clone.current_time()),
-                // );
+                let adi = AudioDataInit::new(
+                    &pcm.unchecked_into::<Object>(),
+                    web_sys::AudioSampleFormat::F32,
+                    AUDIO_CHANNELS,
+                    frames,
+                    AUDIO_SAMPLE_RATE as f32,
+                    audio_ctx_clone.current_time() * 1e6,
+                );
+
+                if let Ok(audio_data) = AudioData::new(&adi) {
+                    let writable = generator_for_cb.writable();
+                    if !writable.locked() {
+                        if let Ok(writer) = writable.get_writer() {
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if JsFuture::from(writer.ready()).await.is_ok() {
+                                    let _ =
+                                        JsFuture::from(writer.write_with_chunk(&audio_data)).await;
+                                }
+                                writer.release_lock();
+                            });
+                        }
+                    }
+                } else {
+                    web_sys::console::warn_1(
+                        &"[neteq-audio-decoder] failed to create AudioData".into(),
+                    );
+                }
             }
         }) as Box<dyn FnMut(_)>);
 
@@ -155,8 +212,11 @@ impl NetEqAudioPeerDecoder {
         Ok(Self {
             worker,
             audio_context,
+            _generator: generator,
+            analyser,
             decoded: false,
             _on_message_closure: on_message_closure,
+            _draw_closure: draw_closure,
         })
     }
 }

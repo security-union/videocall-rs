@@ -13,8 +13,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AnalyserNode, AudioBufferSourceNode, AudioContext, AudioData, AudioDataInit,
-    CanvasRenderingContext2d, HtmlCanvasElement, MediaStreamTrackGenerator,
+    AudioBufferSourceNode, AudioContext, AudioData, AudioDataInit, MediaStreamTrackGenerator,
     MediaStreamTrackGeneratorInit, MessageEvent, Worker,
 };
 
@@ -42,10 +41,8 @@ pub struct NetEqAudioPeerDecoder {
     worker: Worker,
     audio_context: AudioContext,
     _generator: MediaStreamTrackGenerator,
-    analyser: AnalyserNode,
     decoded: bool,
     _on_message_closure: Closure<dyn FnMut(MessageEvent)>, // Keep closure alive
-    _draw_closure: Closure<dyn FnMut()>,                   // Keep rAF closure alive
 }
 
 impl NetEqAudioPeerDecoder {
@@ -66,60 +63,6 @@ impl NetEqAudioPeerDecoder {
             MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio"))?;
         let audio_context = configure_audio_context(&generator, speaker_device_id.clone())
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        // Create an AnalyserNode for debug visualisation.
-        let analyser = audio_context.create_analyser()?;
-        analyser.set_fft_size(2048);
-
-        // Create (or reuse) a debug canvas on the page.
-        let canvas: HtmlCanvasElement =
-            if let Some(elem) = document.get_element_by_id("audio-debug") {
-                elem.dyn_into::<HtmlCanvasElement>()?
-            } else {
-                let canvas: HtmlCanvasElement = document
-                    .create_element("canvas")?
-                    .dyn_into::<HtmlCanvasElement>()?;
-                canvas.set_id("audio-debug");
-                canvas.set_width(512);
-                canvas.set_height(100);
-                canvas.style().set_property("position", "fixed")?;
-                canvas.style().set_property("bottom", "0")?;
-                canvas.style().set_property("left", "0")?;
-                canvas.style().set_property("z-index", "10000")?;
-                document.body().unwrap().append_child(&canvas)?;
-                canvas
-            };
-        let ctx: CanvasRenderingContext2d = canvas
-            .get_context("2d")?
-            .unwrap()
-            .dyn_into::<CanvasRenderingContext2d>()?;
-
-        // Animation frame loop to draw waveform.
-        let analyser_clone = analyser.clone();
-        let draw_closure = Closure::wrap(Box::new(move || {
-            let buffer_len = analyser_clone.frequency_bin_count();
-            let mut data = vec![0u8; buffer_len as usize];
-            analyser_clone.get_byte_time_domain_data(&mut data);
-            ctx.set_fill_style(&JsValue::from_str("black"));
-            ctx.fill_rect(0.0, 0.0, 512.0, 100.0);
-            ctx.set_stroke_style(&JsValue::from_str("lime"));
-            ctx.begin_path();
-            for (i, v) in data.iter().enumerate() {
-                let x = i as f64 / buffer_len as f64 * 512.0;
-                let y = (*v as f64 / 255.0) * 100.0;
-                if i == 0 {
-                    ctx.move_to(x, y);
-                } else {
-                    ctx.line_to(x, y);
-                }
-            }
-            ctx.stroke();
-        }) as Box<dyn FnMut()>);
-        // Draw at ~30 fps
-        window.set_interval_with_callback_and_timeout_and_arguments_0(
-            draw_closure.as_ref().unchecked_ref(),
-            33,
-        )?;
 
         // Try setSinkId if provided
         if let Some(device_id) = speaker_device_id {
@@ -213,10 +156,8 @@ impl NetEqAudioPeerDecoder {
             worker,
             audio_context,
             _generator: generator,
-            analyser,
             decoded: false,
             _on_message_closure: on_message_closure,
-            _draw_closure: draw_closure,
         })
     }
 }

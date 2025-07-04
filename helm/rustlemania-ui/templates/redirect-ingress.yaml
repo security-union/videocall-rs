@@ -1,4 +1,5 @@
 {{- if .Values.ingress.enabled }}
+{{- if and .Values.ingress.enabled .Values.ingress.redirect }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -43,4 +44,5 @@ spec:
                 name: {{ include "rustlemania.fullname" . }}
                 port:
                   number: 80
+{{- end }}
 {{- end }} 

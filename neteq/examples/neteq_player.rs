@@ -1,3 +1,5 @@
+#![cfg(feature = "audio_out")]
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;

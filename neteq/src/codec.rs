@@ -29,9 +29,9 @@ pub trait AudioDecoder {
 }
 
 // Select implementation depending on target -----------------------------------
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "audio_out"))]
 mod native_opus;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "audio_out"))]
 pub use native_opus::OpusDecoder;
 
 #[cfg(target_arch = "wasm32")]

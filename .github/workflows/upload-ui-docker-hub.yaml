@@ -7,7 +7,7 @@ on:
   push:
     branches:
       - main
-      - videocall-codecs-readme
+      - add-safari-to-neteq
     paths:
       - 'yew-ui/**'
       - 'types/**'

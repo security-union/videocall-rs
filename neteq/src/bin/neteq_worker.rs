@@ -75,22 +75,21 @@ mod wasm_worker {
         // === Stats interval (1 Hz) ===
         console::log_1(&"[neteq-worker] stats interval".into());
         let stats_cb = Closure::wrap(Box::new(move || {
-            console::log_1(&"[neteq-worker] stats".into());
             NETEQ.with(|cell| {
                 if let Some(eq) = cell.borrow().as_ref() {
-                    match eq.get_statistics() {
-                        Ok(js_val) => {
-                            let prefix = JsValue::from_str("[neteq-worker] stats: ");
-                            console::log_2(&prefix, &js_val);
-                        }
-                        Err(e) => {
-                            console::error_1(
-                                &format!("[neteq-worker] stats error: {:?}", e).into(),
-                            );
-                        }
+                    if let Ok(js_val) = eq.get_statistics() {
+                        // Build { cmd: "stats", stats: <object> }
+                        let obj = js_sys::Object::new();
+                        let _ = js_sys::Reflect::set(
+                            &obj,
+                            &JsValue::from_str("cmd"),
+                            &JsValue::from_str("stats"),
+                        );
+                        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("stats"), &js_val);
+                        let _ = js_sys::global()
+                            .unchecked_into::<DedicatedWorkerGlobalScope>()
+                            .post_message(&obj);
                     }
-                } else {
-                    console::log_1(&"[neteq-worker] no eq".into());
                 }
             });
         }) as Box<dyn FnMut()>);

@@ -17,6 +17,7 @@ yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = { workspace = true }
 videocall-types = { path= "../videocall-types", version = "1.0.3" }
 videocall-client = { path= "../videocall-client", version = "1.1.8" }
+videocall-diagnostics = { path = "../videocall-diagnostics" }
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
 lazy_static = "1.4.0"

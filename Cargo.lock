@@ -6291,7 +6291,9 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen 0.6.5",
  "serde_bytes",
+ "serde_json",
  "videocall-codecs",
+ "videocall-diagnostics",
  "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -6323,6 +6325,17 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+]
+
+[[package]]
+name = "videocall-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "flume",
+ "js-sys",
+ "once_cell",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -6447,6 +6460,7 @@ dependencies = [
  "log",
  "regex",
  "videocall-client",
+ "videocall-diagnostics",
  "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",

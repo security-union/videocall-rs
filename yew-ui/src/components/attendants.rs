@@ -25,6 +25,7 @@ use gloo_utils::window;
 use log::{debug, error, warn};
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_diagnostics::{subscribe, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -73,6 +74,9 @@ pub enum Msg {
     RemoveLastFakePeer,
     #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
+    NetEqStatsUpdated(String),
+    NetEqBufferUpdated(u64),
+    NetEqJitterUpdated(u64),
 }
 
 impl From<WsAction> for Msg {
@@ -119,6 +123,9 @@ pub struct AttendantsComponent {
     pub diagnostics_data: Option<String>,
     pub sender_stats: Option<String>,
     pub encoder_settings: Option<String>,
+    pub neteq_stats: Option<String>,
+    pub neteq_buffer_history: Vec<u64>,
+    pub neteq_jitter_history: Vec<u64>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -266,9 +273,11 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        Self {
-            client: Self::create_video_call_client(ctx),
-            media_device_access: Self::create_media_device_access(ctx),
+        let client = Self::create_video_call_client(ctx);
+        let media_device_access = Self::create_media_device_access(ctx);
+        let mut self_ = Self {
+            client,
+            media_device_access,
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
@@ -278,17 +287,46 @@ impl Component for AttendantsComponent {
             error: None,
             diagnostics_data: None,
             sender_stats: None,
+            encoder_settings: None,
+            neteq_stats: None,
+            neteq_buffer_history: Vec::new(),
+            neteq_jitter_history: Vec::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
-            encoder_settings: None,
             meeting_joined: false,
             fake_peer_ids: Vec::new(),
             #[cfg(feature = "fake-peers")]
             next_fake_peer_id_counter: 1,
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
+        };
+        {
+            let link = ctx.link().clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut rx = subscribe();
+                while let Ok(evt) = rx.recv_async().await {
+                    if evt.subsystem == "neteq" {
+                        for m in &evt.metrics {
+                            if m.name == "stats_json" {
+                                if let MetricValue::Text(json) = &m.value {
+                                    link.send_message(Msg::NetEqStatsUpdated(json.clone()));
+                                }
+                            } else if m.name == "current_buffer_size_ms" {
+                                if let MetricValue::U64(v) = &m.value {
+                                    link.send_message(Msg::NetEqBufferUpdated(*v as u64));
+                                }
+                            } else if m.name == "jitter_buffer_delay_ms" {
+                                if let MetricValue::U64(v) = &m.value {
+                                    link.send_message(Msg::NetEqJitterUpdated(*v as u64));
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         }
+        self_
     }
 
     fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
@@ -466,6 +504,24 @@ impl Component for AttendantsComponent {
                 self.force_desktop_grid_on_mobile = !self.force_desktop_grid_on_mobile;
                 self.simulation_info_message = None;
                 true
+            }
+            Msg::NetEqStatsUpdated(s) => {
+                self.neteq_stats = Some(s);
+                true
+            }
+            Msg::NetEqBufferUpdated(v) => {
+                self.neteq_buffer_history.push(v);
+                if self.neteq_buffer_history.len() > 50 {
+                    self.neteq_buffer_history.remove(0);
+                } // keep last 50
+                false
+            }
+            Msg::NetEqJitterUpdated(v) => {
+                self.neteq_jitter_history.push(v);
+                if self.neteq_jitter_history.len() > 50 {
+                    self.neteq_jitter_history.remove(0);
+                }
+                false
             }
         }
     }
@@ -775,7 +831,6 @@ impl Component for AttendantsComponent {
                                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                                                     <circle cx="12" cy="12" r="3"></circle>
                                                                     <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                                                                    <line x1="3" y1="3" x2="21" y2="21"></line>
                                                                 </svg>
                                                                 <span class="tooltip">{ "Close Settings" }</span>
                                                             </>
@@ -871,12 +926,77 @@ impl Component for AttendantsComponent {
                                 }
                             </div>
                             <div class="diagnostics-section">
+                                <h3>{"NetEQ Stats"}</h3>
+                                if let Some(data) = &self.neteq_stats {
+                                    <pre>{ data }</pre>
+                                } else {
+                                    <p>{"No NetEQ stats available."}</p>
+                                }
+                            </div>
+                            <div class="diagnostics-section">
                                 <h3>{"Media Status"}</h3>
                                 <pre>{format!("Video: {}\nAudio: {}\nScreen Share: {}",
                                     if self.video_enabled { "Enabled" } else { "Disabled" },
                                     if self.mic_enabled { "Enabled" } else { "Disabled" },
                                     if self.share_screen { "Enabled" } else { "Disabled" }
                                 )}</pre>
+                            </div>
+                            <div class="diagnostics-section">
+                                <h3>{"NetEQ Buffer"}</h3>
+                                if let Some(data) = &self.neteq_stats {
+                                    <pre>{ data }</pre>
+                                } else {
+                                    <p>{"No NetEQ stats available."}</p>
+                                }
+                            </div>
+                            <div class="diagnostics-section">
+                                <h3>{"NetEQ Buffer History"}</h3>
+                                <svg width="100" height="30" viewBox="0 0 100 30" preserveAspectRatio="none">
+                                    {{
+                                        let max = *self.neteq_buffer_history.iter().max().unwrap_or(&1) as f64;
+                                        let points: String = self.neteq_buffer_history.iter().enumerate().map(|(i,v)| {
+                                            let x = i as f64 / 49.0 * 100.0; // scale to 0-100
+                                            let y = 30.0 - (*v as f64 / if max==0.0 {1.0}else{max} * 30.0);
+                                            format!("{:.1},{:.1}", x, y)
+                                        }).collect::<Vec<_>>().join(" ");
+                                        html!{<polyline points={points} fill="none" stroke="#8ef" stroke-width="2"/>}
+                                    }}
+                                </svg>
+                            </div>
+                            <div class="diagnostics-section">
+                                <h3>{"Jitter Buffer Delay (ms)"}</h3>
+                                <svg width="150" height="60" viewBox="0 0 150 60" preserveAspectRatio="none">
+                                    <line x1="30" y1="5" x2="30" y2="55" stroke="#666" stroke-width="1" />
+                                    <line x1="30" y1="55" x2="145" y2="55" stroke="#666" stroke-width="1" />
+                                    {{
+                                        let max = *self
+                                            .neteq_jitter_history
+                                            .iter()
+                                            .max()
+                                            .unwrap_or(&1) as f64;
+                                        let points: String = self
+                                            .neteq_jitter_history
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(i, v)| {
+                                                let x = 30.0 + (i as f64 / 49.0 * 115.0);
+                                                let y = 55.0 - (*v as f64 / if max == 0.0 { 1.0 } else { max } * 50.0);
+                                                format!("{:.1},{:.1}", x, y)
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(" ");
+                                        html! { <polyline points={points} fill="none" stroke="#ff8" stroke-width="2" /> }
+                                    }}
+                                    {{
+                                        let max_val = *self.neteq_jitter_history.iter().max().unwrap_or(&0);
+                                        html!{
+                                            <>
+                                                <text x="0" y="10" fill="#888" font-size="8">{ max_val }</text>
+                                                <text x="0" y="55" fill="#888" font-size="8">{"0"}</text>
+                                            </>
+                                        }
+                                    }}
+                                </svg>
                             </div>
                         </div>
                     </div>

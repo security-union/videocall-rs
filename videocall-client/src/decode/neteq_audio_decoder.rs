@@ -3,8 +3,10 @@ use crate::decode::config::configure_audio_context;
 use crate::decode::DecodeStatus;
 use js_sys::{Float32Array, Object};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use serde_wasm_bindgen;
 use std::sync::Arc;
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -118,6 +120,76 @@ impl NetEqAudioPeerDecoder {
                     web_sys::console::warn_1(
                         &"[neteq-audio-decoder] failed to create AudioData".into(),
                     );
+                }
+            } else if data.is_object() {
+                let obj: js_sys::Object = data.clone().unchecked_into();
+                let cmd = js_sys::Reflect::get(&obj, &JsValue::from_str("cmd"))
+                    .unwrap_or(JsValue::UNDEFINED);
+                if cmd.as_string().as_deref() == Some("stats") {
+                    if let Ok(stats_js) = js_sys::Reflect::get(&obj, &JsValue::from_str("stats")) {
+                        // Convert to JSON string for quick display
+                        if let Ok(stats_json) = js_sys::JSON::stringify(&stats_js) {
+                            if let Some(json_str) = stats_json.as_string() {
+                                // Always emit the raw JSON block for debugging/UI display.
+                                let _ = global_sender().send(DiagEvent {
+                                    subsystem: "neteq",
+                                    stream_id: None,
+                                    ts_ms: now_ms(),
+                                    metrics: vec![metric!("stats_json", json_str.clone())],
+                                });
+
+                                if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
+                                    // Extract useful numbers
+                                    if let Some(lifetime) = parsed.get("lifetime") {
+                                        if let Some(jitter) = lifetime
+                                            .get("jitter_buffer_delay_ms")
+                                            .and_then(|v| v.as_u64())
+                                        {
+                                            let _ = global_sender().send(DiagEvent {
+                                                subsystem: "neteq",
+                                                stream_id: None,
+                                                ts_ms: now_ms(),
+                                                metrics: vec![metric!(
+                                                    "jitter_buffer_delay_ms",
+                                                    jitter
+                                                )],
+                                            });
+                                        }
+                                        if let Some(target) = parsed
+                                            .get("jitter_buffer_target_delay_ms")
+                                            .and_then(|v| v.as_u64())
+                                        {
+                                            let _ = global_sender().send(DiagEvent {
+                                                subsystem: "neteq",
+                                                stream_id: None,
+                                                ts_ms: now_ms(),
+                                                metrics: vec![metric!(
+                                                    "jitter_buffer_target_delay_ms",
+                                                    target
+                                                )],
+                                            });
+                                        }
+                                    }
+                                    if let Some(network) = parsed.get("network") {
+                                        if let Some(buf) = network
+                                            .get("current_buffer_size_ms")
+                                            .and_then(|v| v.as_u64())
+                                        {
+                                            let _ = global_sender().send(DiagEvent {
+                                                subsystem: "neteq",
+                                                stream_id: None,
+                                                ts_ms: now_ms(),
+                                                metrics: vec![metric!(
+                                                    "current_buffer_size_ms",
+                                                    buf
+                                                )],
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }) as Box<dyn FnMut(_)>);

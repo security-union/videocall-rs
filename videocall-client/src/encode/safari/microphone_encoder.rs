@@ -16,17 +16,29 @@
  * conditions.
  */
 
+use crate::audio_worklet_codec::EncoderInitOptions;
+use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
+use crate::constants::AUDIO_CHANNELS;
+use crate::constants::AUDIO_SAMPLE_RATE;
+use crate::crypto::aes::Aes128State;
 use crate::encode::encoder_state::EncoderState;
+use crate::wrappers::EncodedAudioChunkTypeWrapper;
+use crate::VideoCallClient;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
 use js_sys::Uint8Array;
+use protobuf::Message;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::{
+    media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
+    packet_wrapper::packet_wrapper::PacketType,
+};
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -38,21 +50,10 @@ use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
+use web_time::SystemTime;
 use yew::Callback;
 
 pub const AUDIO_BITRATE_KBPS: u32 = 65u32;
-use crate::audio_worklet_codec::EncoderInitOptions;
-use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
-use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::crypto::aes::Aes128State;
-use crate::wrappers::EncodedAudioChunkTypeWrapper;
-use crate::VideoCallClient;
-use protobuf::Message;
-use videocall_types::protos::{
-    media_packet::{media_packet::MediaType, MediaPacket, VideoMetadata},
-    packet_wrapper::packet_wrapper::PacketType,
-};
 
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
@@ -60,12 +61,18 @@ pub fn transform_audio_chunk(
     sequence: u64,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as f64;
+
     let media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),
         media_type: MediaType::AUDIO.into(),
         frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
         data: chunk.to_vec(),
-        video_metadata: Some(VideoMetadata {
+        timestamp: now_ms,
+        audio_metadata: Some(AudioMetadata {
             sequence,
             ..Default::default()
         })

@@ -28,6 +28,7 @@ rand = { version = "0.9.1", optional = true, default-features = false }
 cpal = { version = "0.15", optional = true }
 opus = { version = "0.3", default-features = false, optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
+web-time = "1.1.0"
 
 
 [features]

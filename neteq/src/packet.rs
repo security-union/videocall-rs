@@ -17,7 +17,7 @@
  */
 
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// RTP Header information
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -3480,6 +3480,7 @@ dependencies = [
  "thiserror 1.0.69",
  "wasm-bindgen",
  "web-sys",
+ "web-time",
 ]
 
 [[package]]

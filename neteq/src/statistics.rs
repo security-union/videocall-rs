@@ -17,7 +17,7 @@
  */
 
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Network statistics similar to libWebRTC's NetEqNetworkStatistics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

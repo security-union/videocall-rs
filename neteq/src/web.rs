@@ -4,6 +4,7 @@
 // a Dedicated Web Worker or AudioWorklet.
 
 use crate::{codec::OpusDecoder, AudioPacket, NetEq, NetEqConfig, RtpHeader};
+use serde_wasm_bindgen;
 
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 use wasm_bindgen::prelude::*;
@@ -73,6 +74,13 @@ impl WebNetEq {
         let out = js_sys::Float32Array::from(pcm.as_slice());
         pcm.clear();
         Ok(out)
+    }
+
+    /// Get current NetEq statistics as a JS object.
+    #[wasm_bindgen(js_name = getStatistics)]
+    pub fn get_statistics(&self) -> Result<JsValue, JsValue> {
+        let stats = self.neteq.borrow().get_statistics();
+        serde_wasm_bindgen::to_value(&stats).map_err(|e| JsValue::from_str(&format!("{:?}", e)))
     }
 
     fn map_err(e: crate::NetEqError) -> JsValue {

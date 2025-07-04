@@ -126,23 +126,54 @@ impl Drop for NetEqAudioPeerDecoder {
 
 impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
-        // Build Insert message
-        if let Some(audio_meta) = packet.audio_metadata.as_ref() {
-            let insert = WorkerMsg::Insert {
-                seq: audio_meta.sequence as u16,
-                timestamp: packet.timestamp as u32,
-                payload: packet.data.clone(),
-            };
-            let js_val = serde_wasm_bindgen::to_value(&insert).unwrap();
-            self.worker.post_message(&js_val).unwrap();
-            let first_frame = !self.decoded;
-            self.decoded = true;
-            Ok(DecodeStatus {
-                rendered: true,
-                first_frame,
-            })
-        } else {
-            Err(anyhow::anyhow!("No audio metadata"))
+        match packet.audio_metadata.as_ref() {
+            Some(audio_meta) => {
+                // Normal path – send the packet to the NetEq worker.
+                let insert = WorkerMsg::Insert {
+                    seq: audio_meta.sequence as u16,
+                    timestamp: packet.timestamp as u32,
+                    payload: packet.data.clone(),
+                };
+
+                // Debug: log what we are sending to the worker so we can confirm the
+                // metadata and payload length look correct and that the `Insert`
+                // messages are actually being generated from the decoder.
+                #[cfg(debug_assertions)]
+                {
+                    use wasm_bindgen::JsValue;
+                    // web_sys::console::log_3(
+                    //     &JsValue::from_str("[neteq-audio-decoder] Insert:"),
+                    //     &JsValue::from_f64(audio_meta.sequence as f64),
+                    //     &JsValue::from_f64(packet.data.len() as f64),
+                    // );
+                }
+
+                // Any serialisation or postMessage error will simply be logged. We don't want it
+                // to bubble up and force a complete decoder reset, which leads to the video
+                // worker being recreated ("Terminating worker" loops observed in the console).
+                if let Err(e) =
+                    serde_wasm_bindgen::to_value(&insert).map(|msg| self.worker.post_message(&msg))
+                {
+                    log::error!("Failed to dispatch NetEq insert message: {:?}", e);
+                    // Still report success so the caller doesn't reset the whole peer.
+                }
+
+                let first_frame = !self.decoded;
+                self.decoded = true;
+                Ok(DecodeStatus {
+                    rendered: true,
+                    first_frame,
+                })
+            }
+            None => {
+                // Malformed/old packet that lacks metadata – skip with a warning instead of
+                // propagating an error that would reset the entire peer.
+                log::warn!("Received audio packet without metadata – skipping");
+                Ok(DecodeStatus {
+                    rendered: false,
+                    first_frame: false,
+                })
+            }
         }
     }
 }

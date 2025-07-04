@@ -38,6 +38,7 @@ mod wasm_worker {
     #[wasm_bindgen(start)]
     pub fn start() {
         console_error_panic_hook::set_once();
+        console::log_1(&"[neteq-worker] starting".into());
         let self_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
         let self_scope_clone = self_scope.clone();
         let on_message = Closure::wrap(Box::new(move |evt: MessageEvent| {
@@ -52,6 +53,7 @@ mod wasm_worker {
     }
 
     fn handle_message(scope: &DedicatedWorkerGlobalScope, msg: WorkerMsg) {
+        // console::log_1(&format!("[neteq-worker] received message: {:?}", msg).into());
         match msg {
             WorkerMsg::Init {
                 sample_rate,
@@ -86,6 +88,31 @@ mod wasm_worker {
                     10,
                 );
                 cb.forget();
+
+                // === Stats interval (1 Hz) ===
+                let stats_cb = Closure::wrap(Box::new(move || {
+                    NETEQ.with(|cell| {
+                        if let Some(eq) = cell.borrow().as_ref() {
+                            match eq.get_statistics() {
+                                Ok(js_val) => {
+                                    let prefix = JsValue::from_str("[neteq-worker] stats: ");
+                                    console::log_2(&prefix, &js_val);
+                                }
+                                Err(e) => {
+                                    console::error_1(
+                                        &format!("[neteq-worker] stats error: {:?}", e).into(),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }) as Box<dyn FnMut()>);
+
+                let _ = scope.set_interval_with_callback_and_timeout_and_arguments_0(
+                    stats_cb.as_ref().unchecked_ref(),
+                    1000,
+                );
+                stats_cb.forget();
             }
             WorkerMsg::Insert {
                 seq,
@@ -95,7 +122,9 @@ mod wasm_worker {
                 NETEQ.with(|cell| {
                     if let Some(eq) = cell.borrow().as_ref() {
                         if let Err(e) = eq.insert_packet(seq, timestamp, &payload) {
-                            console::error_1(&e);
+                            console::error_1(
+                                &format!("[neteq-worker] insert_packet error: {:?}", e).into(),
+                            );
                         }
                     }
                 });

@@ -11,7 +11,7 @@ use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{AudioBufferSourceNode, AudioContext, MessageEvent, Worker};
+use web_sys::{AudioBufferSourceNode, AudioContext, AudioContextOptions, MessageEvent, Worker};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
@@ -54,7 +54,9 @@ impl NetEqAudioPeerDecoder {
         let worker = Worker::new(&worker_url)?;
 
         // Create AudioContext (choose sample rate 48k)
-        let audio_context = AudioContext::new()?;
+        let audio_context_options = AudioContextOptions::new();
+        audio_context_options.set_sample_rate(AUDIO_SAMPLE_RATE as f32);
+        let audio_context = AudioContext::new_with_context_options(&audio_context_options).unwrap();
         // Try setSinkId if provided
         if let Some(device_id) = speaker_device_id {
             if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
@@ -74,6 +76,13 @@ impl NetEqAudioPeerDecoder {
         let on_message_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
             if data.is_instance_of::<Float32Array>() {
+                // Ensure AudioContext is running (browser may start it suspended until user gesture).
+                if let Err(e) = audio_ctx_clone.resume() {
+                    web_sys::console::warn_1(
+                        &format!("[neteq-audio-decoder] AudioContext resume error: {:?}", e).into(),
+                    );
+                }
+
                 let pcm = Float32Array::from(data);
                 let length = pcm.length() as usize; // samples total (mono)
                 let frames = length; // since mono 1 ch
@@ -97,6 +106,22 @@ impl NetEqAudioPeerDecoder {
                         let _ = source.start();
                     }
                 }
+
+                // Debug: compute a simple RMS level to verify we have non-zero audio, and log context info.
+                // let mut samples = vec![0f32; length];
+                // pcm.copy_to(&mut samples);
+                // let rms: f64 = if length > 0 {
+                //     let sum: f64 = samples.iter().map(|v| (*v as f64).powi(2)).sum();
+                //     (sum / length as f64).sqrt()
+                // } else {
+                //     0.0
+                // };
+                // web_sys::console::log_4(
+                //     &"[neteq-audio-decoder] PCM chunk".into(),
+                //     &JsValue::from_f64(length as f64),
+                //     &JsValue::from_f64(rms),
+                //     &JsValue::from_f64(audio_ctx_clone.current_time()),
+                // );
             }
         }) as Box<dyn FnMut(_)>);
 

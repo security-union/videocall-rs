@@ -161,6 +161,9 @@ impl AudioDecoder for OpusDecoder {
         if let Some(frame) = self.pcm_queue.borrow_mut().pop_front() {
             Ok(frame)
         } else {
+            web_sys::console::warn_1(
+                &"[WebCodecs OpusDecoder] returning silence (queue empty)".into(),
+            );
             // No frame ready yet—return silence of 20 ms.
             let samples_per_channel = (self.sample_rate as f32 * 0.02) as usize;
             let total = samples_per_channel * self.channels as usize;

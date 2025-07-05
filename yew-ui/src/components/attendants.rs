@@ -317,11 +317,11 @@ impl Component for AttendantsComponent {
                                 }
                             } else if m.name == "current_buffer_size_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    link.send_message(Msg::NetEqBufferUpdated(*v as u64));
+                                    link.send_message(Msg::NetEqBufferUpdated(*v));
                                 }
                             } else if m.name == "jitter_buffer_delay_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    link.send_message(Msg::NetEqJitterUpdated(*v as u64));
+                                    link.send_message(Msg::NetEqJitterUpdated(*v));
                                 }
                             }
                         }

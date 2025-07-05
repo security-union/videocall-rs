@@ -99,9 +99,7 @@ You need to sleep.
 
 ## 7. Why am I planning on continue doing this?
 
-Throughout my careers, I had many of my major breakthroughs at 2 AM.
-
-I do not know tel
+Throughout my careers, I had many of my major breakthroughs at 2 AM, and I'm not alone.
 
 
 ## References

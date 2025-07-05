@@ -10,6 +10,7 @@ authors = ["Dario Lencina Talarico"]
 
 [extra]
 seo_keywords = ["2am coding", "late night programming", "developer productivity", "focus techniques", "debugging tips", "creative problem solving", "pomodoro technique", "coding concentration", "software engineer productivity", "night owl programming"]
+comment = true
 
 [taxonomies]
 tags = ["productivity", "focus", "debugging", "software engineering", "concentration", "creative problem solving", "developer tips", "late night coding"]
@@ -130,11 +131,6 @@ The combination of reduced inhibition, fewer distractions, and that quiet "flow 
 Late-night coding can be incredibly productive when done right, but it should be the exception, not the rule. When you do find yourself coding at 2 AM, make it count: define your goal, set a time limit, eliminate distractions, and work in focused chunks.
 
 Your future self will thank you for both the breakthrough solution and the commit message explaining what the hell you were thinking at 3:30 AM.
-
----
-
-*Have your own late-night coding breakthrough stories? Share them in the comments below.*
-
 
 ## References
 

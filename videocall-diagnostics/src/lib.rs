@@ -55,7 +55,7 @@ pub enum MetricValue {
 
 use flume::{Receiver, Sender};
 
-static BUS: Lazy<(Sender<DiagEvent>, Receiver<DiagEvent>)> = Lazy::new(|| flume::unbounded());
+static BUS: Lazy<(Sender<DiagEvent>, Receiver<DiagEvent>)> = Lazy::new(flume::unbounded);
 
 /// Obtain a sender that can publish diagnostics events.
 pub fn global_sender() -> &'static Sender<DiagEvent> {

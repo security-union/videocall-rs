@@ -17,7 +17,7 @@
  */
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use crate::{NetEqError, Result};
 

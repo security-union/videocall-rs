@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
@@ -96,7 +97,7 @@ pub enum Operation {
 }
 
 /// NetEQ statistics summary
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetEqStats {
     pub network: NetworkStatistics,
     pub lifetime: LifetimeStatistics,

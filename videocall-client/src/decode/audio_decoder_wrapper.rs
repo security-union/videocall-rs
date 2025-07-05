@@ -58,14 +58,6 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
         audio_chunk.set_duration(audio.duration);
         let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
 
-        log::debug!(
-            "Decoding audio chunk: type={:?}, size={}, timestamp={}, duration={}",
-            chunk_type,
-            audio.data.len(),
-            audio.timestamp,
-            audio.duration,
-        );
-
         match self.0.decode(&encoded_audio_chunk) {
             Ok(_) => {
                 log::debug!("Successfully decoded audio chunk");

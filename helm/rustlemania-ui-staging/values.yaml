@@ -9,7 +9,7 @@ rustlemania-ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: test-MediaTrackStreamProcessor-add-wasm-opus-encoder-86ac22d8 # Using latest since staging tag doesn't exist yet
+    tag: add-safari-to-neteq-4a839ace # Using latest since staging tag doesn't exist yet
   
   resources:
     limits:
@@ -25,6 +25,7 @@ rustlemania-ui:
   
   ingress:
     enabled: true
+    redirect: false
     className: nginx
     annotations:
       cert-manager.io/issuer: letsencrypt-prod

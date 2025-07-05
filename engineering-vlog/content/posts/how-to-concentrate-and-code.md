@@ -10,7 +10,6 @@ authors = ["Dario Lencina Talarico"]
 
 [extra]
 seo_keywords = ["2am coding", "late night programming", "developer productivity", "focus techniques", "debugging tips", "creative problem solving", "pomodoro technique", "coding concentration", "software engineer productivity", "night owl programming"]
-comment = true
 
 [taxonomies]
 tags = ["productivity", "focus", "debugging", "software engineering", "concentration", "creative problem solving", "developer tips", "late night coding"]

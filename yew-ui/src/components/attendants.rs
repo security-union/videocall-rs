@@ -138,6 +138,59 @@ pub struct AttendantsComponent {
 }
 
 impl AttendantsComponent {
+    fn render_buffer_chart(&self) -> Html {
+        let max = *self.neteq_buffer_history.iter().max().unwrap_or(&1) as f64;
+        let points: String = self
+            .neteq_buffer_history
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let x = 25.0 + (i as f64 / 49.0 * 110.0);
+                let y = 55.0 - (*v as f64 / if max == 0.0 { 1.0 } else { max } * 50.0);
+                format!("{:.1},{:.1}", x, y)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let max_val = *self.neteq_buffer_history.iter().max().unwrap_or(&0);
+        let span = self.neteq_buffer_history.len().saturating_sub(1);
+
+        html! {
+            <svg width="140" height="60" viewBox="0 0 140 60" preserveAspectRatio="none">
+                <line x1="25" y1="5" x2="25" y2="55" stroke="#666" stroke-width="1" />
+                <line x1="25" y1="55" x2="135" y2="55" stroke="#666" stroke-width="1" />
+                <polyline points={points} fill="none" stroke="#8ef" stroke-width="2" />
+                <text x="0" y="10" fill="#888" font-size="8">{ max_val }</text>
+                <text x="0" y="55" fill="#888" font-size="8">{"0"}</text>
+                <text x="25" y="59" fill="#888" font-size="8">{"0s"}</text>
+                <text x="115" y="59" fill="#888" font-size="8">{ format!("{}s", span) }</text>
+            </svg>
+        }
+    }
+
+    fn render_jitter_chart(&self) -> Html {
+        let max = *self.neteq_jitter_history.iter().max().unwrap_or(&1) as f64;
+        let points: String = self
+            .neteq_jitter_history
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let x = 25.0 + (i as f64 / 49.0 * 110.0);
+                let y = 55.0 - (*v as f64 / if max == 0.0 { 1.0 } else { max } * 50.0);
+                format!("{:.1},{:.1}", x, y)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        html! {
+            <svg width="140" height="60" viewBox="0 0 140 60" preserveAspectRatio="none">
+                <line x1="25" y1="5" x2="25" y2="55" stroke="#666" stroke-width="1" />
+                <line x1="25" y1="55" x2="135" y2="55" stroke="#666" stroke-width="1" />
+                <polyline points={points} fill="none" stroke="#ff8" stroke-width="2" />
+            </svg>
+        }
+    }
+
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
@@ -275,7 +328,7 @@ impl Component for AttendantsComponent {
     fn create(ctx: &Context<Self>) -> Self {
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
-        let mut self_ = Self {
+        let self_ = Self {
             client,
             media_device_access,
             share_screen: false,
@@ -304,7 +357,7 @@ impl Component for AttendantsComponent {
         {
             let link = ctx.link().clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let mut rx = subscribe();
+                let rx = subscribe();
                 while let Ok(evt) = rx.recv_async().await {
                     if evt.subsystem == "neteq" {
                         for m in &evt.metrics {
@@ -852,16 +905,15 @@ impl Component for AttendantsComponent {
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
 
                                         </nav>
-                                        // Display simulation info message if any
-                                        {
-                                            if let Some(message) = &self.simulation_info_message {
-                                                html!{
-                                                    <p class="simulation-info-message">{ message }</p>
-                                                }
-                                            } else {
-                                                html!{}
-                                            }
-                                        }
+                                                                {
+                            if let Some(message) = &self.simulation_info_message {
+                                html!{
+                                    <p class="simulation-info-message">{ message }</p>
+                                }
+                            } else {
+                                html!{}
+                            }
+                        }
                                     </div>
                                     {
                                         if media_access_granted {
@@ -903,34 +955,42 @@ impl Component for AttendantsComponent {
                         <div class="diagnostics-data">
                             <div class="diagnostics-section">
                                 <h3>{"Reception Stats"}</h3>
-                                if let Some(data) = &self.diagnostics_data {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No reception data available."}</p>
+                                {
+                                    if let Some(data) = &self.diagnostics_data {
+                                        html! { <pre>{ data }</pre> }
+                                    } else {
+                                        html! { <p>{"No reception data available."}</p> }
+                                    }
                                 }
                             </div>
                             <div class="diagnostics-section">
                                 <h3>{"Sending Stats"}</h3>
-                                if let Some(data) = &self.sender_stats {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No sending data available."}</p>
+                                {
+                                    if let Some(data) = &self.sender_stats {
+                                        html! { <pre>{ data }</pre> }
+                                    } else {
+                                        html! { <p>{"No sending data available."}</p> }
+                                    }
                                 }
                             </div>
                             <div class="diagnostics-section">
                                 <h3>{"Encoder Settings"}</h3>
-                                if let Some(data) = &self.encoder_settings {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No encoder settings available."}</p>
+                                {
+                                    if let Some(data) = &self.encoder_settings {
+                                        html! { <pre>{ data }</pre> }
+                                    } else {
+                                        html! { <p>{"No encoder settings available."}</p> }
+                                    }
                                 }
                             </div>
                             <div class="diagnostics-section">
                                 <h3>{"NetEQ Stats"}</h3>
-                                if let Some(data) = &self.neteq_stats {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No NetEQ stats available."}</p>
+                                {
+                                    if let Some(data) = &self.neteq_stats {
+                                        html! { <pre>{ data }</pre> }
+                                    } else {
+                                        html! { <p>{"No NetEQ stats available."}</p> }
+                                    }
                                 }
                             </div>
                             <div class="diagnostics-section">
@@ -942,61 +1002,11 @@ impl Component for AttendantsComponent {
                                 )}</pre>
                             </div>
                             <div class="diagnostics-section">
-                                <h3>{"NetEQ Buffer"}</h3>
-                                if let Some(data) = &self.neteq_stats {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No NetEQ stats available."}</p>
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"NetEQ Buffer History"}</h3>
-                                <svg width="100" height="30" viewBox="0 0 100 30" preserveAspectRatio="none">
-                                    {{
-                                        let max = *self.neteq_buffer_history.iter().max().unwrap_or(&1) as f64;
-                                        let points: String = self.neteq_buffer_history.iter().enumerate().map(|(i,v)| {
-                                            let x = i as f64 / 49.0 * 100.0; // scale to 0-100
-                                            let y = 30.0 - (*v as f64 / if max==0.0 {1.0}else{max} * 30.0);
-                                            format!("{:.1},{:.1}", x, y)
-                                        }).collect::<Vec<_>>().join(" ");
-                                        html!{<polyline points={points} fill="none" stroke="#8ef" stroke-width="2"/>}
-                                    }}
-                                </svg>
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Jitter Buffer Delay (ms)"}</h3>
-                                <svg width="150" height="60" viewBox="0 0 150 60" preserveAspectRatio="none">
-                                    <line x1="30" y1="5" x2="30" y2="55" stroke="#666" stroke-width="1" />
-                                    <line x1="30" y1="55" x2="145" y2="55" stroke="#666" stroke-width="1" />
-                                    {{
-                                        let max = *self
-                                            .neteq_jitter_history
-                                            .iter()
-                                            .max()
-                                            .unwrap_or(&1) as f64;
-                                        let points: String = self
-                                            .neteq_jitter_history
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(i, v)| {
-                                                let x = 30.0 + (i as f64 / 49.0 * 115.0);
-                                                let y = 55.0 - (*v as f64 / if max == 0.0 { 1.0 } else { max } * 50.0);
-                                                format!("{:.1},{:.1}", x, y)
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join(" ");
-                                        html! { <polyline points={points} fill="none" stroke="#ff8" stroke-width="2" /> }
-                                    }}
-                                    {{
-                                        let max_val = *self.neteq_jitter_history.iter().max().unwrap_or(&0);
-                                        html!{
-                                            <>
-                                                <text x="0" y="10" fill="#888" font-size="8">{ max_val }</text>
-                                                <text x="0" y="55" fill="#888" font-size="8">{"0"}</text>
-                                            </>
-                                        }
-                                    }}
-                                </svg>
+                                <h3>{"NetEQ Buffer / Jitter History"}</h3>
+                                <div style="display:flex; gap:12px; align-items:center;">
+                                    { self.render_buffer_chart() }
+                                    { self.render_jitter_chart() }
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1004,45 +1014,4 @@ impl Component for AttendantsComponent {
             </div>
         }
     }
-}
-
-#[function_component(DiagnosticsSidebar)]
-fn diagnostics_sidebar(props: &DiagnosticsSidebarProps) -> Html {
-    let diagnostics_data = props.diagnostics_data.clone();
-    let sender_stats = props.sender_stats.clone();
-    let on_close = props.on_close.clone();
-
-    html! {
-        <div class="diagnostics-sidebar">
-            <div class="diagnostics-header">
-                <h2>{"Diagnostics"}</h2>
-                <button class="close-button" onclick={on_close}>{"×"}</button>
-            </div>
-            <div class="diagnostics-data">
-                <div class="diagnostics-section">
-                    <h3>{"Reception Stats"}</h3>
-                    if let Some(data) = diagnostics_data {
-                        <pre class="diagnostics-text">{data}</pre>
-                    } else {
-                        <p>{"No reception data available."}</p>
-                    }
-                </div>
-                <div class="diagnostics-section">
-                    <h3>{"Sending Stats"}</h3>
-                    if let Some(data) = sender_stats {
-                        <pre class="diagnostics-text">{data}</pre>
-                    } else {
-                        <p>{"No sending data available."}</p>
-                    }
-                </div>
-            </div>
-        </div>
-    }
-}
-
-#[derive(Properties, PartialEq)]
-pub struct DiagnosticsSidebarProps {
-    pub diagnostics_data: Option<String>,
-    pub sender_stats: Option<String>,
-    pub on_close: Callback<MouseEvent>,
 }

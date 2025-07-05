@@ -21,42 +21,43 @@ authors = ["Dario Lencina Talarico"]
 </p>
 
 
-## Disclaimer
-
-I do not recommend doing this regularly. It's not sustainable and will burn you out.
-
 ## The Why Behind Late-Night Coding
 
-I'm a staff engineer at May Mobility. If your trip has any sort of latency—like delayed audio announcements telling you your autonomous ride has arrived—that's on me.
+Research shows that people actually perform better on creative problem-solving tasks during their non-optimal times of day - when they're slightly tired and less inhibited<sup>[2]</sup>. This reduced frontal lobe activity allows for more creative connections between ideas, making those 2 AM coding sessions surprisingly effective for breakthrough moments.
+
+I am the creator of the [videocall](https://videocall.rs) project by night, but I'm also a staff engineer at May Mobility. If your autonomous vehicle trip has any sort of latency—like or interruption during the ride—that's on me.
 
 I take this responsibility seriously, and sometimes my brain wakes me up in the middle of the night to get that one last thing done.
 
+This article will be a guide on how to get the most out of your 2 AM coding session.
+
 ## 1. Define your goal
+
 Realistically, you only have a few hours to work, so you need to define your goal. Be realistic, don't set yourself up for failure.
 
 You are already working late, so it better be worth it.
 
-## 2. Define when you you are going to bed
+## 2. Define when you are going to bed
 
 So if you start at 2 AM, you should plan to go to bed at 3:30 AM tops. You need to sleep.
 
 ## 3. Get your environment ready
 
-- Turn off notifications: both browser and phone: nothing destroys focus like a Discord notification.
+- Turn off notifications: both browser and phone: **nothing destroys focus like a Discord notification.**
 - Close all other tabs.
 - Turn on the lights, you'll be surprised how much better you can see.
 - Contrary to the popular belief, you don't need to be in a dark room to code. In fact, you'll be surprised how much better you can see with the lights on.
-- Set your perfect playlist. Use a dbmeter to get the perfect volume. I recommend 50dB - 60dB.
+- Set your perfect playlist. Use a dbmeter to get the perfect volume. I recommend 50dB - 60dB you'll probably find yourself adjusting the volume throughout the session.
 - Here's my playlist if you want to use it: [Deep Focus: 2 AM](https://music.youtube.com/browse/VLPLxM2CWwQlzBtfIgvgv2lwqhNlJBPD0eLI)
 
 
-## 4. Use a pomodoro timer
+## 4. Use a Pomodoro Timer
 
-Utilize a pomodoro timer, this will help you stay focused and avoid burnout.
+Utilize a pomodoro timer, this will help you stay focused and on track.
 
 Here's a pomodoro timer I use: [Pomodoro Timer](https://chromewebstore.google.com/detail/pomodoro-chrome-extension/iccjkhpkdhdhjiaocipcegfeoclioejn?hl=en&pli=1) also [Pomofocus](https://pomofocus.io/) is a great option.
 
-## Divide the session into smaller chunks
+## Divide the session into smaller chunks and get to work
 
 Between 2 AM and 3:30 AM, you have 90 minutes. Here's how I'd break down a real scenario:
 
@@ -96,4 +97,15 @@ You need to sleep.
 
 ## 6. Repeat
 
+## 7. Why am I planning on continue doing this?
 
+Throughout my careers, I had many of my major breakthroughs at 2 AM.
+
+I do not know tel
+
+
+## References
+
+1. [Why Productivity Peaks at 2 AM](https://corner.buka.sh/why-productivity-peaks-at-2am-the-myth-the-madness-and-the-method/)
+
+2. [Time of day effects on problem solving: When the non-optimal is optimal](https://www.researchgate.net/figure/correct-for-each-problem-solved-during-optimal-and-non-optimal-times-of-day_tbl1_254225496)

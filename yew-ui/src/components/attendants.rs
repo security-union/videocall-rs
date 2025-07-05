@@ -17,7 +17,10 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility,
+    canvas_generator,
+    neteq_chart::{ChartType, NetEqChart},
+    peer_list::PeerList,
 };
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
@@ -138,59 +141,6 @@ pub struct AttendantsComponent {
 }
 
 impl AttendantsComponent {
-    fn render_buffer_chart(&self) -> Html {
-        let max = *self.neteq_buffer_history.iter().max().unwrap_or(&1) as f64;
-        let points: String = self
-            .neteq_buffer_history
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let x = 25.0 + (i as f64 / 49.0 * 110.0);
-                let y = 55.0 - (*v as f64 / if max == 0.0 { 1.0 } else { max } * 50.0);
-                format!("{:.1},{:.1}", x, y)
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let max_val = *self.neteq_buffer_history.iter().max().unwrap_or(&0);
-        let span = self.neteq_buffer_history.len().saturating_sub(1);
-
-        html! {
-            <svg width="140" height="60" viewBox="0 0 140 60" preserveAspectRatio="none">
-                <line x1="25" y1="5" x2="25" y2="55" stroke="#666" stroke-width="1" />
-                <line x1="25" y1="55" x2="135" y2="55" stroke="#666" stroke-width="1" />
-                <polyline points={points} fill="none" stroke="#8ef" stroke-width="2" />
-                <text x="0" y="10" fill="#888" font-size="8">{ max_val }</text>
-                <text x="0" y="55" fill="#888" font-size="8">{"0"}</text>
-                <text x="25" y="59" fill="#888" font-size="8">{"0s"}</text>
-                <text x="115" y="59" fill="#888" font-size="8">{ format!("{}s", span) }</text>
-            </svg>
-        }
-    }
-
-    fn render_jitter_chart(&self) -> Html {
-        let max = *self.neteq_jitter_history.iter().max().unwrap_or(&1) as f64;
-        let points: String = self
-            .neteq_jitter_history
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let x = 25.0 + (i as f64 / 49.0 * 110.0);
-                let y = 55.0 - (*v as f64 / if max == 0.0 { 1.0 } else { max } * 50.0);
-                format!("{:.1},{:.1}", x, y)
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        html! {
-            <svg width="140" height="60" viewBox="0 0 140 60" preserveAspectRatio="none">
-                <line x1="25" y1="5" x2="25" y2="55" stroke="#666" stroke-width="1" />
-                <line x1="25" y1="55" x2="135" y2="55" stroke="#666" stroke-width="1" />
-                <polyline points={points} fill="none" stroke="#ff8" stroke-width="2" />
-            </svg>
-        }
-    }
-
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
@@ -1004,8 +954,18 @@ impl Component for AttendantsComponent {
                             <div class="diagnostics-section">
                                 <h3>{"NetEQ Buffer / Jitter History"}</h3>
                                 <div style="display:flex; gap:12px; align-items:center;">
-                                    { self.render_buffer_chart() }
-                                    { self.render_jitter_chart() }
+                                    <NetEqChart
+                                        data={self.neteq_buffer_history.clone()}
+                                        chart_type={ChartType::Buffer}
+                                        width={140}
+                                        height={80}
+                                    />
+                                    <NetEqChart
+                                        data={self.neteq_jitter_history.clone()}
+                                        chart_type={ChartType::Jitter}
+                                        width={140}
+                                        height={80}
+                                    />
                                 </div>
                             </div>
                         </div>

@@ -23,6 +23,7 @@ pub mod device_settings_modal;
 pub mod host;
 pub mod icons;
 pub mod matomo;
+pub mod neteq_chart;
 pub mod top_bar;
 
 mod canvas_generator;

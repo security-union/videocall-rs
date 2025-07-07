@@ -83,7 +83,7 @@ Key features:
 - Network adaptation rate visualization  
 - Audio quality metrics and underrun detection
 - Configurable volume control for silent testing
-- Native Rust axum web server (no Python dependency)
+- Native Rust axum web server
 
 ## Roadmap
 

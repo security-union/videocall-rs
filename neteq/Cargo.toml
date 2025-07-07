@@ -37,7 +37,7 @@ tower-http = { version = "0.5", features = ["cors", "fs", "set-header"], optiona
 
 
 [features]
-default = []
+default = ["native", "audio_files"]
 audio_files = ["hound"]
 web = [
     "wasm-bindgen",
@@ -59,10 +59,22 @@ web = [
     "console_error_panic_hook",
     "web-sys/Navigator",
 ]
-audio_out = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
+native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
 
 [dev-dependencies]
 env_logger = "0.10"
 hound = "3.5"
+
+[[example]]
+name = "basic_usage"
+required-features = ["native"]
+
+[[example]]
+name = "neteq_player"
+required-features = ["native", "audio_files"]
+
+[[bin]]
+name = "dashboard_server"
+required-features = ["native"]
 
 

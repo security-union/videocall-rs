@@ -10,10 +10,10 @@ Here's a complete workflow using the native Rust server:
 
 ```bash
 # Terminal 1: Start the dashboard server
-cargo run --bin dashboard_server --features=audio_out
+cargo run --bin dashboard_server
 
 # Terminal 2: Start NetEq player with stats
-RUST_LOG=info cargo run --example neteq_player --features=audio_out -- \
+RUST_LOG=info cargo run --example neteq_player --features=native -- \
   --json-stats \
   --reorder-window-ms 50 \
   --volume 0.5 \
@@ -26,7 +26,7 @@ RUST_LOG=info cargo run --example neteq_player --features=audio_out -- \
 
 ```bash
 # Start the NetEq player with JSON statistics output
-RUST_LOG=info cargo run --example neteq_player --features=audio_out -- \
+RUST_LOG=info cargo run --example neteq_player --features=native -- \
   --json-stats \
   --reorder-window-ms 200 \
   --volume 0.5 \
@@ -40,16 +40,10 @@ In a new terminal, choose one of these options:
 #### Option A: Rust Axum Server (Recommended)
 ```bash
 # Start the built-in Rust server
-cargo run --bin dashboard_server --features=audio_out
+cargo run --bin dashboard_server --features=native
 
 # Or with custom port
-cargo run --bin dashboard_server --features=audio_out -- --port 8080
-```
-
-#### Option B: Python Server (Alternative)
-```bash
-# Start the Python web server
-python3 serve_dashboard.py
+cargo run --bin dashboard_server --features=native -- --port 8080
 ```
 
 ### 3. Open the Dashboard
@@ -127,7 +121,7 @@ Based on the dashboard data:
 ## Command Line Options
 
 ```bash
-cargo run --example neteq_player --features=audio_out -- \
+cargo run --example neteq_player --features=native -- \
   --json-stats                    # Enable JSON output for dashboard
   --reorder-window-ms 50          # Packet reordering simulation (0-200ms)
   --max-jitter-ms 20              # Additional jitter simulation (0-500ms)

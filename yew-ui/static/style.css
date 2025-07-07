@@ -848,6 +848,28 @@ select {
     text-align: center;
 }
 
+/* NetEQ Chart Styles */
+.neteq-chart {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin: 5px;
+}
+
+.neteq-chart .chart-title {
+    font-size: 10px;
+    color: #ccc;
+    margin-bottom: 5px;
+    text-align: center;
+    font-weight: 500;
+}
+
+.neteq-chart svg {
+    border: 1px solid #444;
+    border-radius: 4px;
+    background-color: #1a1a1a;
+}
+
 .grid-item-pinned {
   position: fixed;
   top: 0;

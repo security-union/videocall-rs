@@ -17,7 +17,10 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility,
+    canvas_generator,
+    neteq_chart::{ChartType, NetEqChart},
+    peer_list::PeerList,
 };
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
@@ -25,6 +28,7 @@ use gloo_utils::window;
 use log::{debug, error, warn};
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_diagnostics::{subscribe, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -73,6 +77,9 @@ pub enum Msg {
     RemoveLastFakePeer,
     #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
+    NetEqStatsUpdated(String),
+    NetEqBufferUpdated(u64),
+    NetEqJitterUpdated(u64),
 }
 
 impl From<WsAction> for Msg {
@@ -119,6 +126,9 @@ pub struct AttendantsComponent {
     pub diagnostics_data: Option<String>,
     pub sender_stats: Option<String>,
     pub encoder_settings: Option<String>,
+    pub neteq_stats: Option<String>,
+    pub neteq_buffer_history: Vec<u64>,
+    pub neteq_jitter_history: Vec<u64>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -266,9 +276,11 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        Self {
-            client: Self::create_video_call_client(ctx),
-            media_device_access: Self::create_media_device_access(ctx),
+        let client = Self::create_video_call_client(ctx);
+        let media_device_access = Self::create_media_device_access(ctx);
+        let self_ = Self {
+            client,
+            media_device_access,
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
@@ -278,17 +290,46 @@ impl Component for AttendantsComponent {
             error: None,
             diagnostics_data: None,
             sender_stats: None,
+            encoder_settings: None,
+            neteq_stats: None,
+            neteq_buffer_history: Vec::new(),
+            neteq_jitter_history: Vec::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
-            encoder_settings: None,
             meeting_joined: false,
             fake_peer_ids: Vec::new(),
             #[cfg(feature = "fake-peers")]
             next_fake_peer_id_counter: 1,
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
+        };
+        {
+            let link = ctx.link().clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let rx = subscribe();
+                while let Ok(evt) = rx.recv_async().await {
+                    if evt.subsystem == "neteq" {
+                        for m in &evt.metrics {
+                            if m.name == "stats_json" {
+                                if let MetricValue::Text(json) = &m.value {
+                                    link.send_message(Msg::NetEqStatsUpdated(json.clone()));
+                                }
+                            } else if m.name == "current_buffer_size_ms" {
+                                if let MetricValue::U64(v) = &m.value {
+                                    link.send_message(Msg::NetEqBufferUpdated(*v));
+                                }
+                            } else if m.name == "jitter_buffer_delay_ms" {
+                                if let MetricValue::U64(v) = &m.value {
+                                    link.send_message(Msg::NetEqJitterUpdated(*v));
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         }
+        self_
     }
 
     fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
@@ -466,6 +507,24 @@ impl Component for AttendantsComponent {
                 self.force_desktop_grid_on_mobile = !self.force_desktop_grid_on_mobile;
                 self.simulation_info_message = None;
                 true
+            }
+            Msg::NetEqStatsUpdated(s) => {
+                self.neteq_stats = Some(s);
+                true
+            }
+            Msg::NetEqBufferUpdated(v) => {
+                self.neteq_buffer_history.push(v);
+                if self.neteq_buffer_history.len() > 50 {
+                    self.neteq_buffer_history.remove(0);
+                } // keep last 50
+                false
+            }
+            Msg::NetEqJitterUpdated(v) => {
+                self.neteq_jitter_history.push(v);
+                if self.neteq_jitter_history.len() > 50 {
+                    self.neteq_jitter_history.remove(0);
+                }
+                false
             }
         }
     }
@@ -775,7 +834,6 @@ impl Component for AttendantsComponent {
                                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                                                     <circle cx="12" cy="12" r="3"></circle>
                                                                     <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                                                                    <line x1="3" y1="3" x2="21" y2="21"></line>
                                                                 </svg>
                                                                 <span class="tooltip">{ "Close Settings" }</span>
                                                             </>
@@ -797,16 +855,15 @@ impl Component for AttendantsComponent {
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
 
                                         </nav>
-                                        // Display simulation info message if any
-                                        {
-                                            if let Some(message) = &self.simulation_info_message {
-                                                html!{
-                                                    <p class="simulation-info-message">{ message }</p>
-                                                }
-                                            } else {
-                                                html!{}
-                                            }
-                                        }
+                                                                {
+                            if let Some(message) = &self.simulation_info_message {
+                                html!{
+                                    <p class="simulation-info-message">{ message }</p>
+                                }
+                            } else {
+                                html!{}
+                            }
+                        }
                                     </div>
                                     {
                                         if media_access_granted {
@@ -848,26 +905,42 @@ impl Component for AttendantsComponent {
                         <div class="diagnostics-data">
                             <div class="diagnostics-section">
                                 <h3>{"Reception Stats"}</h3>
-                                if let Some(data) = &self.diagnostics_data {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No reception data available."}</p>
+                                {
+                                    if let Some(data) = &self.diagnostics_data {
+                                        html! { <pre>{ data }</pre> }
+                                    } else {
+                                        html! { <p>{"No reception data available."}</p> }
+                                    }
                                 }
                             </div>
                             <div class="diagnostics-section">
                                 <h3>{"Sending Stats"}</h3>
-                                if let Some(data) = &self.sender_stats {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No sending data available."}</p>
+                                {
+                                    if let Some(data) = &self.sender_stats {
+                                        html! { <pre>{ data }</pre> }
+                                    } else {
+                                        html! { <p>{"No sending data available."}</p> }
+                                    }
                                 }
                             </div>
                             <div class="diagnostics-section">
                                 <h3>{"Encoder Settings"}</h3>
-                                if let Some(data) = &self.encoder_settings {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No encoder settings available."}</p>
+                                {
+                                    if let Some(data) = &self.encoder_settings {
+                                        html! { <pre>{ data }</pre> }
+                                    } else {
+                                        html! { <p>{"No encoder settings available."}</p> }
+                                    }
+                                }
+                            </div>
+                            <div class="diagnostics-section">
+                                <h3>{"NetEQ Stats"}</h3>
+                                {
+                                    if let Some(data) = &self.neteq_stats {
+                                        html! { <pre>{ data }</pre> }
+                                    } else {
+                                        html! { <p>{"No NetEQ stats available."}</p> }
+                                    }
                                 }
                             </div>
                             <div class="diagnostics-section">
@@ -878,51 +951,27 @@ impl Component for AttendantsComponent {
                                     if self.share_screen { "Enabled" } else { "Disabled" }
                                 )}</pre>
                             </div>
+                            <div class="diagnostics-section">
+                                <h3>{"NetEQ Buffer / Jitter History"}</h3>
+                                <div style="display:flex; gap:12px; align-items:center;">
+                                    <NetEqChart
+                                        data={self.neteq_buffer_history.clone()}
+                                        chart_type={ChartType::Buffer}
+                                        width={140}
+                                        height={80}
+                                    />
+                                    <NetEqChart
+                                        data={self.neteq_jitter_history.clone()}
+                                        chart_type={ChartType::Jitter}
+                                        width={140}
+                                        height={80}
+                                    />
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
             </div>
         }
     }
-}
-
-#[function_component(DiagnosticsSidebar)]
-fn diagnostics_sidebar(props: &DiagnosticsSidebarProps) -> Html {
-    let diagnostics_data = props.diagnostics_data.clone();
-    let sender_stats = props.sender_stats.clone();
-    let on_close = props.on_close.clone();
-
-    html! {
-        <div class="diagnostics-sidebar">
-            <div class="diagnostics-header">
-                <h2>{"Diagnostics"}</h2>
-                <button class="close-button" onclick={on_close}>{"×"}</button>
-            </div>
-            <div class="diagnostics-data">
-                <div class="diagnostics-section">
-                    <h3>{"Reception Stats"}</h3>
-                    if let Some(data) = diagnostics_data {
-                        <pre class="diagnostics-text">{data}</pre>
-                    } else {
-                        <p>{"No reception data available."}</p>
-                    }
-                </div>
-                <div class="diagnostics-section">
-                    <h3>{"Sending Stats"}</h3>
-                    if let Some(data) = sender_stats {
-                        <pre class="diagnostics-text">{data}</pre>
-                    } else {
-                        <p>{"No sending data available."}</p>
-                    }
-                </div>
-            </div>
-        </div>
-    }
-}
-
-#[derive(Properties, PartialEq)]
-pub struct DiagnosticsSidebarProps {
-    pub diagnostics_data: Option<String>,
-    pub sender_stats: Option<String>,
-    pub on_close: Callback<MouseEvent>,
 }

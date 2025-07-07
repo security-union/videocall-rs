@@ -70,6 +70,21 @@ Run any example with
 cargo run --release --example basic_usage
 ```
 
+## Performance Dashboard
+
+Monitor NetEq performance in real-time with our interactive web dashboard. Track buffer health, network adaptation rates, and audio quality metrics.
+
+📊 **[Complete Dashboard Setup Guide →](DASHBOARD_README.md)**
+
+![NetEq Performance Dashboard](stats_dashboard_sample.png)
+
+Key features:
+- Real-time buffer size vs target monitoring
+- Network adaptation rate visualization  
+- Audio quality metrics and underrun detection
+- Configurable volume control for silent testing
+- Native Rust axum web server
+
 ## Roadmap
 
 1. Advanced concealment (pitch-based PLC)
@@ -81,4 +96,4 @@ Contributions are welcome — please skim the [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
 
-MIT
+MIT or Apache-2.0

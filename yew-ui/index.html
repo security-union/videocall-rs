@@ -27,6 +27,18 @@
         /> 
         <!-- Runtime link so the wasm decoder can find the built worker URL -->
         <link id="codecs-worker" href="/worker_decoder_loader.js" />
+        <!-- NetEq worker -->
+        <link
+        data-trunk
+        rel="rust"
+        href="../neteq/Cargo.toml"
+        data-bin="neteq_worker"
+        data-type="worker"
+        data-cargo-features="web"
+        data-cargo-no-default-features
+        data-loader-shim
+        />
+        <link id="neteq-worker" href="/neteq_worker_loader.js" />
         <!-- Load wasm worker scripts from the videocall-codecs crate -->
         <script>	
             if (!self.MediaStreamTrackProcessor) {	

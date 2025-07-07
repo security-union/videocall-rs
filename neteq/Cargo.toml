@@ -15,18 +15,66 @@ include = ["src/**/*"]
 [dependencies]
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_bytes = { version = "0.11", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["DedicatedWorkerGlobalScope", "MessageEvent", "console"] }
+console_error_panic_hook = { version = "0.1", optional = true }
 log = "0.4"
 ringbuf = "0.3"
 hound = { version = "3.5", optional = true }
-rand = "0.9.1"
-cpal = "0.15"
-opus = "0.3"
-clap = { version = "4.5", features = ["derive"] }
+rand = { version = "0.9.1", optional = true, default-features = false, features = ["thread_rng"] }
+cpal = { version = "0.15", optional = true }
+opus = { version = "0.3", default-features = false, optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+env_logger = { version = "0.10", optional = true }
+web-time = "1.1.0"
+axum = { version = "0.7", optional = true }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "fs"], optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "fs", "set-header"], optional = true }
+
 
 [features]
-default = []
+default = ["native", "audio_files"]
 audio_files = ["hound"]
+web = [
+    "wasm-bindgen",
+    "serde-wasm-bindgen",
+    "serde_bytes",
+    "js-sys",
+    "web-sys/AudioDecoder",
+    "web-sys/AudioDecoderConfig",
+    "web-sys/AudioDecoderInit",
+    "web-sys/AudioData",
+    "web-sys/AudioDataCopyToOptions",
+    "web-sys/EncodedAudioChunk",
+    "web-sys/EncodedAudioChunkInit",
+    "web-sys/EncodedAudioChunkType",
+    "web-sys/DedicatedWorkerGlobalScope",
+    "web-sys/MessageEvent",
+    "web-sys/console",
+    "web-sys/Window",
+    "console_error_panic_hook",
+    "web-sys/Navigator",
+]
+native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
 
 [dev-dependencies]
 env_logger = "0.10"
-hound = "3.5" 
+hound = "3.5"
+
+[[example]]
+name = "basic_usage"
+required-features = ["native"]
+
+[[example]]
+name = "neteq_player"
+required-features = ["native", "audio_files"]
+
+[[bin]]
+name = "dashboard_server"
+required-features = ["native"]
+
+

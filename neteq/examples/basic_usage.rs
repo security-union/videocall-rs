@@ -17,7 +17,7 @@
  */
 
 use neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
-use std::time::Duration;
+use web_time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();

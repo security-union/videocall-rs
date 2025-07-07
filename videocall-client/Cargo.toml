@@ -38,9 +38,18 @@ yew-websocket = "1.21.0"
 yew-webtransport = "0.21.1"
 prost = "0.11"
 videocall-codecs = { path = "../videocall-codecs", features = ["wasm"], version = "0.1.2" }
+neteq = { path = "../neteq", features = ["web"], version = "0.1.1", optional = true }
+serde-wasm-bindgen = "0.6.5"
+serde_bytes = "0.11"
+videocall-diagnostics = { path = "../videocall-diagnostics" }
+serde_json = { version = "1.0" }
+
+[features]
+neteq_ff = ["neteq"]
+default = []
 
 [dependencies.web-sys]
-version = "0.3.72"
+version = "0.3"
 features = [
     "AudioTrack",
     "AudioData",
@@ -52,6 +61,8 @@ features = [
     "AudioDecoderInit",
     "AudioDecoderConfig",
     "AudioContext",
+    "AudioBuffer",
+    "AudioBufferSourceNode",
     "AudioWorklet",
     "AudioWorkletNode",
     "AudioWorkletNodeOptions",
@@ -111,7 +122,14 @@ features = [
     "MediaDeviceKind",
     "MediaTrackConstraints",
     "CanvasRenderingContext2d",
-    "Performance"
+    "Performance",
+    "AnalyserNode",
+    "HtmlCanvasElement",
+    "CssStyleDeclaration",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+    "MediaSource",
+    "DomException",
 ]
 
 [dependencies.pidgeon]

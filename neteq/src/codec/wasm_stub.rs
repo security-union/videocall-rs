@@ -154,7 +154,6 @@ impl AudioDecoder for OpusDecoder {
 
         let init =
             EncodedAudioChunkInit::new(&data_js.into(), self.next_timestamp as f64, ChunkType::Key);
-        let mut init = init;
         init.set_duration(20_000f64.into()); // 20 ms assumption
 
         let chunk = EncodedAudioChunk::new(&init)

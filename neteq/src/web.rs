@@ -77,7 +77,6 @@ impl WebNetEq {
     pub fn get_audio(&self) -> Result<js_sys::Float32Array, JsValue> {
         if self.leftovers.borrow().is_empty() {
             let frame = self.neteq.borrow_mut().get_audio().map_err(Self::map_err)?;
-            let frame_type = frame.speech_type;
             self.leftovers
                 .borrow_mut()
                 .extend_from_slice(&frame.samples);

@@ -23,11 +23,18 @@ pub mod media_decoder_trait;
 pub mod neteq_audio_decoder;
 pub mod peer_decode_manager;
 pub mod peer_decoder;
+#[cfg(not(feature = "neteq_ff"))]
+pub mod safari;
 pub mod video_decoder_wrapper;
+#[cfg(not(feature = "neteq_ff"))]
+use safari::audio_decoder::{
+    AudioPeerDecoder as SafariAudioPeerDecoder, PeerDecode as SafariPeerDecodeTrait,
+};
 
 pub use peer_decode_manager::{PeerDecodeManager, PeerStatus};
 pub use peer_decoder::VideoPeerDecoder;
 
+#[cfg(feature = "neteq_ff")]
 use neteq_audio_decoder::NetEqAudioPeerDecoder;
 use peer_decoder::{
     DecodeStatus as StandardDecodeStatus, PeerDecode as StandardPeerDecodeTrait,
@@ -65,6 +72,17 @@ impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
     }
 }
 
+impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
+    fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
+        let decode_status = SafariPeerDecodeTrait::decode(self, packet)?;
+        Ok(DecodeStatus {
+            rendered: decode_status.rendered,
+            first_frame: decode_status.first_frame,
+        })
+    }
+}
+
+#[cfg(feature = "neteq_ff")]
 /// Factory function to create the appropriate audio peer decoder based on platform detection
 pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
@@ -72,6 +90,25 @@ pub fn create_audio_peer_decoder(
     log::info!("Platform detection: Using NetEq audio peer decoder");
     NetEqAudioPeerDecoder::new(speaker_device_id)
         .map(|d| Box::new(d) as Box<dyn AudioPeerDecoderTrait>)
+}
+
+#[cfg(not(feature = "neteq_ff"))]
+pub fn create_audio_peer_decoder(
+    speaker_device_id: Option<String>,
+) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
+    use crate::utils::is_ios;
+    if is_ios() {
+        log::info!(
+            "Platform detection: Using Safari (AudioWorklet) audio peer decoder for iOS device"
+        );
+        Ok(Box::new(SafariAudioPeerDecoder::new_with_speaker(
+            speaker_device_id,
+        )))
+    } else {
+        log::info!("Platform detection: Using standard (AudioDecoder API) audio peer decoder");
+        StandardAudioPeerDecoder::new(speaker_device_id)
+            .map(|decoder| Box::new(decoder) as Box<dyn AudioPeerDecoderTrait>)
+    }
 }
 
 // No need to re-export PeerDecode or VideoPeerDecodeTrait here as they are specific to their implementations.

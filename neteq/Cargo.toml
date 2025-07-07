@@ -28,7 +28,12 @@ rand = { version = "0.9.1", optional = true, default-features = false, features 
 cpal = { version = "0.15", optional = true }
 opus = { version = "0.3", default-features = false, optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
+env_logger = { version = "0.10", optional = true }
 web-time = "1.1.0"
+axum = { version = "0.7", optional = true }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "fs"], optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "fs", "set-header"], optional = true }
 
 
 [features]
@@ -54,7 +59,7 @@ web = [
     "console_error_panic_hook",
     "web-sys/Navigator",
 ]
-audio_out = ["cpal", "clap", "opus", "rand"]
+audio_out = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
 
 [dev-dependencies]
 env_logger = "0.10"

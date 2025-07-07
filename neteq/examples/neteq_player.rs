@@ -1,5 +1,7 @@
 #![cfg(feature = "audio_out")]
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -42,6 +44,16 @@ struct Args {
     )]
     max_jitter_ms: u32,
 
+    #[clap(long, help = "Output statistics to JSON file for web dashboard")]
+    json_stats: bool,
+
+    #[clap(
+        long,
+        default_value_t = 1.0,
+        help = "Audio output volume (0.0 = mute, 1.0 = full volume)"
+    )]
+    volume: f32,
+
     #[clap(long = "h", action = clap::ArgAction::Help, hide = true)]
     _help_alias: Option<bool>,
 }
@@ -54,8 +66,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wav_path = args.wav_path;
     let reorder_window_ms = args.reorder_window_ms.min(200); // Cap at 200ms for sanity
     let max_jitter_ms = args.max_jitter_ms.min(500); // Cap at 500ms for sanity
+    let json_stats = args.json_stats;
+    let volume = args.volume.clamp(0.0, 2.0); // Allow up to 200% volume, minimum 0% (mute)
 
     log::info!("Loading WAV file: {}", wav_path);
+    log::info!(
+        "Audio volume: {:.1}% ({})",
+        volume * 100.0,
+        if volume == 0.0 { "MUTED" } else { "enabled" }
+    );
 
     if reorder_window_ms > 0 || max_jitter_ms > 0 {
         log::info!(
@@ -186,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Start CPAL output; keep the stream alive for the duration of main ────
-    let _stream = start_audio_playback(sample_rate, channels, neteq.clone())?;
+    let _stream = start_audio_playback(sample_rate, channels, neteq.clone(), volume)?;
 
     log::info!("CPAL stream started; feeding packets to NetEq ...");
 
@@ -195,6 +214,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     thread::spawn(move || {
         let mut prev_calls = 0u64;
         let mut prev_frames = 0u64;
+        let mut json_file = if json_stats {
+            Some(
+                OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open("neteq_stats.jsonl")
+                    .expect("Failed to create stats file"),
+            )
+        } else {
+            None
+        };
+
         loop {
             thread::sleep(Duration::from_secs(1));
 
@@ -208,17 +240,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let underruns = BUFFER_UNDERRUNS.load(Ordering::Relaxed);
             if let Ok(eq) = stats_neteq.lock() {
                 let stats = eq.get_statistics();
+                let expand_rate = stats.network.expand_rate as f32 / 16.384; // Q14 to per-myriad
+                let accel_rate = stats.network.accelerate_rate as f32 / 16.384;
+                let avg_frames = delta_frames / delta_calls.max(1);
+
                 log::info!(
-                    "Stats: buffer={}ms target={}ms packets={} expand_rate={}‰ accel_rate={}‰ calls/s={} avg_frames={} UNDERRUNS={}",
+                    "Stats: buffer={}ms target={}ms packets={} expand_rate={:.1}‰ accel_rate={:.1}‰ calls/s={} avg_frames={} UNDERRUNS={}",
                     stats.current_buffer_size_ms,
                     stats.target_delay_ms,
                     stats.packet_count,
-                    stats.network.expand_rate as f32 / 16.384,  // Q14 to per-myriad
-                    stats.network.accelerate_rate as f32 / 16.384,
+                    expand_rate,
+                    accel_rate,
                     delta_calls,
-                    delta_frames / delta_calls.max(1),
+                    avg_frames,
                     underruns
                 );
+
+                // Write JSON stats if enabled
+                if let Some(ref mut file) = json_file {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis();
+
+                    let json_line = format!(
+                        "{{\"timestamp\":{},\"buffer_ms\":{},\"target_ms\":{},\"packets\":{},\"expand_rate\":{:.1},\"accel_rate\":{:.1},\"calls_per_sec\":{},\"avg_frames\":{},\"underruns\":{}}}\n",
+                        timestamp,
+                        stats.current_buffer_size_ms,
+                        stats.target_delay_ms,
+                        stats.packet_count,
+                        expand_rate,
+                        accel_rate,
+                        delta_calls,
+                        avg_frames,
+                        underruns
+                    );
+
+                    let _ = file.write_all(json_line.as_bytes());
+                    let _ = file.flush();
+                }
             }
         }
     });
@@ -328,6 +388,7 @@ fn start_audio_playback(
     _sample_rate: u32,
     channels: u8,
     neteq: Arc<Mutex<NetEq>>, // shared NetEq
+    volume: f32,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     use cpal::SampleFormat::*;
 
@@ -372,9 +433,9 @@ fn start_audio_playback(
     );
 
     let stream = match sample_format {
-        F32 => build_stream_f32(&device, &cfg, channels, neteq.clone())?,
-        I16 => build_stream_i16(&device, &cfg, channels, neteq.clone())?,
-        U16 => build_stream_u16(&device, &cfg, channels, neteq.clone())?,
+        F32 => build_stream_f32(&device, &cfg, channels, neteq.clone(), volume)?,
+        I16 => build_stream_i16(&device, &cfg, channels, neteq.clone(), volume)?,
+        U16 => build_stream_u16(&device, &cfg, channels, neteq.clone(), volume)?,
         _ => unreachable!(),
     };
     stream.play()?;
@@ -386,13 +447,14 @@ fn build_stream_f32(
     cfg: &cpal::StreamConfig,
     _channels: u8,
     neteq: Arc<Mutex<NetEq>>,
+    volume: f32,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let mut leftover: Vec<f32> = Vec::new();
     let err_fn = |e| eprintln!("Stream error: {}", e);
     device.build_output_stream(
         cfg,
         move |output: &mut [f32], _| {
-            fill_output_neteq(output, &neteq, &mut leftover);
+            fill_output_neteq(output, &neteq, &mut leftover, volume);
             log::debug!("CPAL callback filled {} samples (f32)", output.len());
             CALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
             CALLBACK_FRAMES.fetch_add(output.len() as u64, Ordering::Relaxed);
@@ -407,6 +469,7 @@ fn build_stream_i16(
     cfg: &cpal::StreamConfig,
     _channels: u8,
     neteq: Arc<Mutex<NetEq>>,
+    volume: f32,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let mut leftover: Vec<f32> = Vec::new();
     let err_fn = |e| eprintln!("Stream error: {}", e);
@@ -414,7 +477,7 @@ fn build_stream_i16(
         cfg,
         move |output: &mut [i16], _| {
             let mut tmp = vec![0.0f32; output.len()];
-            fill_output_neteq(&mut tmp, &neteq, &mut leftover);
+            fill_output_neteq(&mut tmp, &neteq, &mut leftover, volume);
             for (o, &v) in output.iter_mut().zip(tmp.iter()) {
                 *o = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
             }
@@ -432,6 +495,7 @@ fn build_stream_u16(
     cfg: &cpal::StreamConfig,
     _channels: u8,
     neteq: Arc<Mutex<NetEq>>,
+    volume: f32,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let mut leftover: Vec<f32> = Vec::new();
     let err_fn = |e| eprintln!("Stream error: {}", e);
@@ -439,7 +503,7 @@ fn build_stream_u16(
         cfg,
         move |output: &mut [u16], _| {
             let mut tmp = vec![0.0f32; output.len()];
-            fill_output_neteq(&mut tmp, &neteq, &mut leftover);
+            fill_output_neteq(&mut tmp, &neteq, &mut leftover, volume);
             for (o, &v) in output.iter_mut().zip(tmp.iter()) {
                 *o = ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * u16::MAX as f32) as u16;
             }
@@ -452,7 +516,12 @@ fn build_stream_u16(
     )
 }
 
-fn fill_output_neteq(buffer: &mut [f32], neteq: &Arc<Mutex<NetEq>>, leftover: &mut Vec<f32>) {
+fn fill_output_neteq(
+    buffer: &mut [f32],
+    neteq: &Arc<Mutex<NetEq>>,
+    leftover: &mut Vec<f32>,
+    volume: f32,
+) {
     let mut idx = 0;
     let mut underrun_occurred = false;
 
@@ -495,7 +564,10 @@ fn fill_output_neteq(buffer: &mut [f32], neteq: &Arc<Mutex<NetEq>>, leftover: &m
             break;
         }
 
-        buffer[idx..idx + n].copy_from_slice(&leftover[..n]);
+        // Copy samples and apply volume scaling
+        for i in 0..n {
+            buffer[idx + i] = leftover[i] * volume;
+        }
         leftover.drain(..n);
         idx += n;
     }

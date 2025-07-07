@@ -24,7 +24,7 @@ console_error_panic_hook = { version = "0.1", optional = true }
 log = "0.4"
 ringbuf = "0.3"
 hound = { version = "3.5", optional = true }
-rand = { version = "0.9.1", optional = true, default-features = false }
+rand = { version = "0.9.1", optional = true, default-features = false, features = ["thread_rng"] }
 cpal = { version = "0.15", optional = true }
 opus = { version = "0.3", default-features = false, optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
@@ -54,7 +54,7 @@ web = [
     "console_error_panic_hook",
     "web-sys/Navigator",
 ]
-audio_out = ["cpal", "clap", "opus"]
+audio_out = ["cpal", "clap", "opus", "rand"]
 
 [dev-dependencies]
 env_logger = "0.10"

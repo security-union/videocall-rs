@@ -30,17 +30,17 @@ struct Args {
 
     #[clap(
         long,
-        default_value_t = 0.0,
-        help = "Packets out-of-order level 0.0-1.0"
+        default_value_t = 0,
+        help = "Maximum packet reordering window in milliseconds (0-200ms recommended)"
     )]
-    packets_out_of_order: f32,
+    reorder_window_ms: u32,
 
     #[clap(
         long,
-        default_value_t = 0.0,
-        help = "Inter-frame extra delay level 0.0-1.0"
+        default_value_t = 0,
+        help = "Maximum additional jitter delay in milliseconds (0-500ms recommended)"
     )]
-    inter_frame_delay: f32,
+    max_jitter_ms: u32,
 
     #[clap(long = "h", action = clap::ArgAction::Help, hide = true)]
     _help_alias: Option<bool>,
@@ -52,23 +52,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Parse CLI ─────────────────────────────────────────────────────────────
     let args = Args::parse();
     let wav_path = args.wav_path;
-    let disorder_level = args.packets_out_of_order.clamp(0.0, 1.0);
-    let delay_level = args.inter_frame_delay.clamp(0.0, 1.0);
+    let reorder_window_ms = args.reorder_window_ms.min(200); // Cap at 200ms for sanity
+    let max_jitter_ms = args.max_jitter_ms.min(500); // Cap at 500ms for sanity
 
     log::info!("Loading WAV file: {}", wav_path);
+
+    if reorder_window_ms > 0 || max_jitter_ms > 0 {
+        log::info!(
+            "Network simulation enabled: max_jitter={}ms, reorder_window={}ms",
+            max_jitter_ms,
+            reorder_window_ms
+        );
+    } else {
+        log::info!("Network simulation disabled (no jitter or reordering)");
+    }
 
     // ── Read WAV file ─────────────────────────────────────────────────────────
     let mut reader = hound::WavReader::open(&wav_path)?;
     let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-    let channels = spec.channels as u8;
+    let original_sample_rate = spec.sample_rate;
+    let original_channels = spec.channels as u8;
 
     log::info!(
         "WAV spec -> sample_rate: {} Hz, channels: {}, bits_per_sample: {}",
-        sample_rate,
-        channels,
+        original_sample_rate,
+        original_channels,
         spec.bits_per_sample
     );
+
+    // Opus requirements: sample_rate must be 8k, 12k, 16k, 24k, or 48k Hz; channels must be 1 or 2
+    let opus_sample_rates = [8000, 12000, 16000, 24000, 48000];
+    let sample_rate = if opus_sample_rates.contains(&original_sample_rate) {
+        original_sample_rate
+    } else {
+        // Default to 48kHz if not supported
+        log::warn!(
+            "Sample rate {} Hz not supported by Opus, using 48000 Hz",
+            original_sample_rate
+        );
+        48000
+    };
+
+    let channels = if original_channels <= 2 {
+        original_channels
+    } else {
+        log::warn!(
+            "Opus only supports mono/stereo, downmixing {} channels to stereo",
+            original_channels
+        );
+        2
+    };
+
+    if sample_rate != original_sample_rate || channels != original_channels {
+        log::info!(
+            "Audio will be converted: {}Hz/{}ch -> {}Hz/{}ch",
+            original_sample_rate,
+            original_channels,
+            sample_rate,
+            channels
+        );
+    }
 
     let wav_samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => reader
@@ -105,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Warm-start NetEq with a few packets before audio begins ─────────────
-    let warmup_packets = 10; // 10 × 20 ms = 200 ms
+    let warmup_packets = 25; // 25 × 20 ms = 500 ms - increased for better stability
 
     // Packet parameters
     let samples_per_channel_20ms = (sample_rate as f32 * 0.02) as usize;
@@ -162,17 +205,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             prev_calls = calls;
             prev_frames = frames;
 
+            let underruns = BUFFER_UNDERRUNS.load(Ordering::Relaxed);
             if let Ok(eq) = stats_neteq.lock() {
                 let stats = eq.get_statistics();
                 log::info!(
-                    "Stats: buffer={}ms target={}ms packets={} expand_rate={}‰ accel_rate={}‰ calls/s={} avg_frames={}",
+                    "Stats: buffer={}ms target={}ms packets={} expand_rate={}‰ accel_rate={}‰ calls/s={} avg_frames={} UNDERRUNS={}",
                     stats.current_buffer_size_ms,
                     stats.target_delay_ms,
                     stats.packet_count,
                     stats.network.expand_rate as f32 / 16.384,  // Q14 to per-myriad
                     stats.network.accelerate_rate as f32 / 16.384,
                     delta_calls,
-                    delta_frames / delta_calls.max(1)
+                    delta_frames / delta_calls.max(1),
+                    underruns
                 );
             }
         }
@@ -181,21 +226,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Set up channel and network simulator ────────────────────────────────
     let (tx, rx) = mpsc::channel::<AudioPacket>();
 
-    // Network simulator thread
+    // Network simulator thread with improved timing
     let neteq_for_net = neteq.clone();
     thread::spawn(move || {
         let mut rng = rand::rng();
-        for packet in rx {
-            // Extra delay in 0..1000 ms scaled
-            let extra_delay_ms = rng.random::<f32>() * delay_level * 100.0;
-            // Additional small randomness to create reordering within 0..40 ms window
-            let reorder_delay_ms = rng.random::<f32>() * disorder_level * 40.0;
-            let total_delay = Duration::from_millis((extra_delay_ms + reorder_delay_ms) as u64);
-            std::thread::sleep(total_delay);
+        let mut reorder_buffer: Vec<(AudioPacket, Instant)> = Vec::new();
 
-            if let Ok(mut n) = neteq_for_net.lock() {
-                let _ = n.insert_packet(packet);
+        for packet in rx {
+            let now = Instant::now();
+
+            // Handle reordering by buffering some packets
+            if reorder_window_ms > 0 && rng.random::<f32>() < 0.1 {
+                // 10% chance to reorder
+                let reorder_delay_ms = rng.random::<f32>() * reorder_window_ms as f32 * 0.5; // Reduce reorder delay
+                let delivery_time = now + Duration::from_millis(reorder_delay_ms as u64);
+                reorder_buffer.push((packet, delivery_time));
+            } else {
+                // Regular packet with optional jitter
+                let jitter_delay_ms = if max_jitter_ms > 0 {
+                    rng.random::<f32>() * max_jitter_ms as f32 * 0.3 // Reduce jitter significantly
+                } else {
+                    0.0
+                };
+
+                if jitter_delay_ms > 0.0 {
+                    std::thread::sleep(Duration::from_millis(jitter_delay_ms as u64));
+                }
+
+                if let Ok(mut n) = neteq_for_net.lock() {
+                    let _ = n.insert_packet(packet);
+                }
             }
+
+            // Deliver any reordered packets that are ready
+            reorder_buffer.retain(|(packet, delivery_time)| {
+                if now >= *delivery_time {
+                    if let Ok(mut n) = neteq_for_net.lock() {
+                        let _ = n.insert_packet(packet.clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
         }
     });
 
@@ -208,13 +281,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_remaining_chunks = remaining_samples.len() / packet_samples;
 
     thread::spawn(move || {
-        let period = Duration::from_millis(20);
-        let mut next = Instant::now();
+        let _period = Duration::from_millis(20);
         let mut loc_seq_no = seq_no;
         let mut loc_timestamp = timestamp;
 
         loop {
+            let loop_start = Instant::now();
             for idx in 0..total_remaining_chunks {
+                let packet_start_time = loop_start + Duration::from_millis(idx as u64 * 20);
+
                 let start = idx * packet_samples;
                 let chunk = &remaining_samples[start..start + packet_samples];
                 let mut encoded = vec![0u8; 4000];
@@ -224,13 +299,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 encoded.truncate(bytes_written as usize);
                 let hdr = RtpHeader::new(loc_seq_no, loc_timestamp, ssrc, 111, false);
                 let packet = AudioPacket::new(hdr, encoded, sample_rate, channels, 20);
+
+                // More precise timing - sleep until the exact time this packet should be sent
+                let now = Instant::now();
+                if packet_start_time > now {
+                    std::thread::sleep(packet_start_time - now);
+                }
+
                 tx.send(packet).expect("channel send");
 
                 loc_seq_no = loc_seq_no.wrapping_add(1);
                 loc_timestamp = loc_timestamp.wrapping_add(samples_per_channel_20ms as u32);
-
-                next += period;
-                std::thread::sleep(next.saturating_duration_since(Instant::now()));
             }
             log::info!(
                 "Producer finished feeding all packets – restarting loop for continuous play"
@@ -246,7 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ───────────────────────────── Helpers ───────────────────────────────────────
 fn start_audio_playback(
-    sample_rate: u32,
+    _sample_rate: u32,
     channels: u8,
     neteq: Arc<Mutex<NetEq>>, // shared NetEq
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
@@ -375,6 +454,8 @@ fn build_stream_u16(
 
 fn fill_output_neteq(buffer: &mut [f32], neteq: &Arc<Mutex<NetEq>>, leftover: &mut Vec<f32>) {
     let mut idx = 0;
+    let mut underrun_occurred = false;
+
     while idx < buffer.len() {
         if leftover.is_empty() {
             match neteq.lock() {
@@ -383,35 +464,48 @@ fn fill_output_neteq(buffer: &mut [f32], neteq: &Arc<Mutex<NetEq>>, leftover: &m
                         leftover.extend_from_slice(&frame.samples);
                     }
                     Err(e) => {
-                        log::error!("NetEq get_audio error: {:?}", e);
+                        log::warn!("BUFFER UNDERRUN: NetEq get_audio error: {:?}", e);
+                        underrun_occurred = true;
                         // fill silence and return
                         for s in &mut buffer[idx..] {
                             *s = 0.0;
                         }
-                        return;
+                        break;
                     }
                 },
                 Err(poison) => {
                     log::error!("NetEq mutex poisoned: {}", poison);
+                    underrun_occurred = true;
                     for s in &mut buffer[idx..] {
                         *s = 0.0;
                     }
-                    return;
+                    break;
                 }
             }
         }
+
         let n = std::cmp::min(leftover.len(), buffer.len() - idx);
+        if n == 0 {
+            // Still no data available - this is an underrun
+            underrun_occurred = true;
+            log::warn!("BUFFER UNDERRUN: No audio data available, filling with silence");
+            for s in &mut buffer[idx..] {
+                *s = 0.0;
+            }
+            break;
+        }
+
         buffer[idx..idx + n].copy_from_slice(&leftover[..n]);
         leftover.drain(..n);
         idx += n;
+    }
+
+    if underrun_occurred {
+        BUFFER_UNDERRUNS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 // global counters for callback diagnostics
 static CALLBACK_CALLS: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_FRAMES: AtomicU64 = AtomicU64::new(0);
-
-// helper removed channels variable; adjust after compile
-fn calls_per_sec_den(channels: u8) -> u64 {
-    channels as u64
-}
+static BUFFER_UNDERRUNS: AtomicU64 = AtomicU64::new(0);

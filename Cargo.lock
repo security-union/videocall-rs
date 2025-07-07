@@ -6538,7 +6538,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-diagnostics"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flume",
  "js-sys",

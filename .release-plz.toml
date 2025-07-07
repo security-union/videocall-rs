@@ -48,9 +48,17 @@ git_release_enable = false
 
 [[package]]
 name = "neteq"
+publish = true
+changelog_update = true
+git_release_enable = true
+
+[[package]]
+name = "videocall-diagnostics"
 publish = false
 changelog_update = true
 git_release_enable = false
+
+
 
 
 [changelog]

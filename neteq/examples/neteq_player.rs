@@ -1,5 +1,3 @@
-#![cfg(feature = "native")]
-
 /*
  * Copyright 2025 Security Union LLC
  *

@@ -16,8 +16,6 @@
  * conditions.
  */
 
-#![cfg(feature = "native")]
-
 use axum::{
     extract::Path,
     http::{header, StatusCode},
@@ -169,7 +167,7 @@ async fn static_file_handler(
 
     match fs::read(&file_path).await {
         Ok(content) => {
-            let content_type = match file_path.split('.').last().unwrap_or("") {
+            let content_type = match file_path.split('.').next_back().unwrap_or("") {
                 "html" => "text/html",
                 "css" => "text/css",
                 "js" => "application/javascript",

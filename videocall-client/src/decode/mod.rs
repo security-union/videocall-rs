@@ -72,6 +72,7 @@ impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
     }
 }
 
+#[cfg(not(feature = "neteq_ff"))]
 impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let decode_status = SafariPeerDecodeTrait::decode(self, packet)?;

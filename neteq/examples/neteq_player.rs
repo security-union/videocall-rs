@@ -72,6 +72,16 @@ struct Args {
 
     #[clap(long = "h", action = clap::ArgAction::Help, hide = true)]
     _help_alias: Option<bool>,
+
+    #[clap(long, help = "Disable NetEq and decode audio directly (A/B testing)")]
+    no_neteq: bool,
+
+    #[clap(
+        long,
+        default_value_t = 0,
+        help = "Minimum delay in milliseconds for NetEQ buffer (0-500ms recommended)"
+    )]
+    min_delay_ms: u32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -166,6 +176,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let neteq_cfg: NetEqConfig = NetEqConfig {
         sample_rate,
         channels,
+        bypass_mode: args.no_neteq,
+        min_delay_ms: args.min_delay_ms,
         ..Default::default()
     };
     let neteq = Arc::new(Mutex::new(NetEq::new(neteq_cfg)?));
@@ -175,6 +187,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sample_rate,
         channels
     );
+
+    if args.no_neteq {
+        log::info!(
+            "NetEq BYPASS MODE enabled - packets will be decoded directly without jitter buffering"
+        );
+    } else {
+        log::info!("NetEq normal mode - using jitter buffer and adaptive algorithms");
+    }
 
     // Register Opus decoder for payload type 111.
     {
@@ -280,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .as_millis();
 
                     let json_line = format!(
-                        "{{\"timestamp\":{},\"buffer_ms\":{},\"target_ms\":{},\"packets\":{},\"expand_rate\":{:.1},\"accel_rate\":{:.1},\"calls_per_sec\":{},\"avg_frames\":{},\"underruns\":{}}}\n",
+                        "{{\"timestamp\":{},\"buffer_ms\":{},\"target_ms\":{},\"packets\":{},\"expand_rate\":{:.1},\"accel_rate\":{:.1},\"calls_per_sec\":{},\"avg_frames\":{},\"underruns\":{},\"reorder_rate\":{},\"reordered_packets\":{},\"max_reorder_distance\":{},\"sequence_number\":{},\"rtp_timestamp\":{}}}\n",
                         timestamp,
                         stats.current_buffer_size_ms,
                         stats.target_delay_ms,
@@ -289,7 +309,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         accel_rate,
                         delta_calls,
                         avg_frames,
-                        underruns
+                        underruns,
+                        stats.network.reorder_rate_permyriad,
+                        stats.network.reordered_packets,
+                        stats.network.max_reorder_distance,
+                        0, // We'll update this when we track actual sequence numbers
+                        0  // We'll update this when we track actual RTP timestamps
                     );
 
                     let _ = file.write_all(json_line.as_bytes());
@@ -312,7 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let now = Instant::now();
 
             // Handle reordering by buffering some packets
-            if reorder_window_ms > 0 && rng.random::<f32>() < 0.1 {
+            if reorder_window_ms > 0 && rng.random::<f32>() < 0.5 {
                 // 10% chance to reorder
                 let reorder_delay_ms = rng.random::<f32>() * reorder_window_ms as f32 * 0.5; // Reduce reorder delay
                 let delivery_time = now + Duration::from_millis(reorder_delay_ms as u64);

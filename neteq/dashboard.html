@@ -140,6 +140,18 @@
                     <div class="status-value" id="accelRate">--</div>
                     <div class="status-label">Accel Rate (‰)</div>
                 </div>
+                <div class="status-item">
+                    <div class="status-value" id="reorderRate">--</div>
+                    <div class="status-label">Reorder Rate (‰)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="reorderedPackets">--</div>
+                    <div class="status-label">Reordered Packets</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="maxReorderDistance">--</div>
+                    <div class="status-label">Max Reorder Distance</div>
+                </div>
             </div>
         </div>
 
@@ -160,8 +172,19 @@
                 <canvas id="qualityChart"></canvas>
             </div>
             <div class="chart-container">
+                <div class="chart-title">Packet Reordering Analysis</div>
+                <canvas id="reorderChart"></canvas>
+            </div>
+        </div>
+
+        <div class="charts-grid">
+            <div class="chart-container">
                 <div class="chart-title">System Performance</div>
                 <canvas id="performanceChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <div class="chart-title">Packet Sequence & Timestamps</div>
+                <canvas id="sequenceChart"></canvas>
             </div>
         </div>
     </div>
@@ -328,6 +351,81 @@
                     }
                 }
             });
+
+            // Reorder chart
+            charts.reorder = new Chart(document.getElementById('reorderChart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Reorder Rate (‰)',
+                            data: [],
+                            borderColor: '#ff6b6b',
+                            backgroundColor: 'rgba(255, 107, 107, 0.1)',
+                            tension: 0.1,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Max Reorder Distance',
+                            data: [],
+                            borderColor: '#4ecdc4',
+                            backgroundColor: 'rgba(78, 205, 196, 0.1)',
+                            tension: 0.1,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: { display: true, text: 'Rate (‰)' }
+                        },
+                        y1: {
+                            type: 'linear',
+                            display: true,
+                            position: 'right',
+                            title: { display: true, text: 'Distance' },
+                            grid: { drawOnChartArea: false }
+                        }
+                    }
+                }
+            });
+
+            // Sequence chart
+            charts.sequence = new Chart(document.getElementById('sequenceChart'), {
+                type: 'scatter',
+                data: {
+                    datasets: [
+                        {
+                            label: 'Sequence Numbers',
+                            data: [],
+                            borderColor: '#9c88ff',
+                            backgroundColor: 'rgba(156, 136, 255, 0.6)',
+                            pointRadius: 3
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            display: true,
+                            title: { display: true, text: 'RTP Timestamp' }
+                        },
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            title: { display: true, text: 'Sequence Number' }
+                        }
+                    }
+                }
+            });
         }
 
         function updateCharts(data) {
@@ -340,6 +438,9 @@
             document.getElementById('underruns').textContent = data.underruns;
             document.getElementById('expandRate').textContent = data.expand_rate.toFixed(1);
             document.getElementById('accelRate').textContent = data.accel_rate.toFixed(1);
+            document.getElementById('reorderRate').textContent = data.reorder_rate || 0;
+            document.getElementById('reorderedPackets').textContent = data.reordered_packets || 0;
+            document.getElementById('maxReorderDistance').textContent = data.max_reorder_distance || 0;
 
             // Color coding for status
             const bufferElement = document.getElementById('currentBuffer');
@@ -382,6 +483,24 @@
             // Performance chart
             charts.performance.data.datasets[0].data.push(data.calls_per_sec);
             charts.performance.data.datasets[1].data.push(data.avg_frames);
+
+            // Reorder chart
+            charts.reorder.data.datasets[0].data.push(data.reorder_rate || 0);
+            charts.reorder.data.datasets[1].data.push(data.max_reorder_distance || 0);
+
+            // Sequence chart (scatter plot)
+            if (data.sequence_number && data.rtp_timestamp) {
+                const sequenceData = charts.sequence.data.datasets[0].data;
+                sequenceData.push({
+                    x: data.rtp_timestamp,
+                    y: data.sequence_number
+                });
+                
+                // Keep only last 100 points for readability
+                if (sequenceData.length > 100) {
+                    sequenceData.shift();
+                }
+            }
 
             // Update all charts
             Object.values(charts).forEach(chart => chart.update('none'));

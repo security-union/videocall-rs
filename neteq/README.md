@@ -96,4 +96,18 @@ Contributions are welcome — please skim the [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## License
 
-MIT or Apache-2.0
+MIT OR Apache-2.0
+
+## License and Attribution
+
+This project is licensed under MIT OR Apache-2.0.
+
+### WebRTC Attribution
+
+This NetEQ implementation is algorithmically inspired by and compatible with the WebRTC NetEQ jitter buffer. The original WebRTC project is:
+- Copyright (c) 2011, The WebRTC project authors
+- Licensed under the 3-clause BSD license  
+- Available at: https://webrtc.googlesource.com/src/
+
+This Rust implementation is an independent rewrite and is not a derivative work of the WebRTC source code.
+

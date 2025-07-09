@@ -17,9 +17,7 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility,
-    canvas_generator,
-    neteq_chart::{ChartType, NetEqChart},
+    browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     peer_list::PeerList,
 };
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
@@ -535,6 +533,7 @@ impl Component for AttendantsComponent {
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
         let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
+        let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
         let mut display_peers_vec = real_peers_vec.clone();
@@ -896,81 +895,19 @@ impl Component for AttendantsComponent {
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
-                <div id="diagnostics-sidebar" class={if self.diagnostics_open {"visible"} else {""}}>
-                    <div class="sidebar-header">
-                        <h2>{"Diagnostics"}</h2>
-                        <button class="close-button" onclick={toggle_diagnostics}>{"×"}</button>
-                    </div>
-                    <div class="sidebar-content">
-                        <div class="diagnostics-data">
-                            <div class="diagnostics-section">
-                                <h3>{"Reception Stats"}</h3>
-                                {
-                                    if let Some(data) = &self.diagnostics_data {
-                                        html! { <pre>{ data }</pre> }
-                                    } else {
-                                        html! { <p>{"No reception data available."}</p> }
-                                    }
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Sending Stats"}</h3>
-                                {
-                                    if let Some(data) = &self.sender_stats {
-                                        html! { <pre>{ data }</pre> }
-                                    } else {
-                                        html! { <p>{"No sending data available."}</p> }
-                                    }
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Encoder Settings"}</h3>
-                                {
-                                    if let Some(data) = &self.encoder_settings {
-                                        html! { <pre>{ data }</pre> }
-                                    } else {
-                                        html! { <p>{"No encoder settings available."}</p> }
-                                    }
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"NetEQ Stats"}</h3>
-                                {
-                                    if let Some(data) = &self.neteq_stats {
-                                        html! { <pre>{ data }</pre> }
-                                    } else {
-                                        html! { <p>{"No NetEQ stats available."}</p> }
-                                    }
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Media Status"}</h3>
-                                <pre>{format!("Video: {}\nAudio: {}\nScreen Share: {}",
-                                    if self.video_enabled { "Enabled" } else { "Disabled" },
-                                    if self.mic_enabled { "Enabled" } else { "Disabled" },
-                                    if self.share_screen { "Enabled" } else { "Disabled" }
-                                )}</pre>
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"NetEQ Buffer / Jitter History"}</h3>
-                                <div style="display:flex; gap:12px; align-items:center;">
-                                    <NetEqChart
-                                        data={self.neteq_buffer_history.clone()}
-                                        chart_type={ChartType::Buffer}
-                                        width={140}
-                                        height={80}
-                                    />
-                                    <NetEqChart
-                                        data={self.neteq_jitter_history.clone()}
-                                        chart_type={ChartType::Jitter}
-                                        width={140}
-                                        height={80}
-                                    />
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+                <Diagnostics
+                    is_open={self.diagnostics_open}
+                    on_close={close_diagnostics}
+                    diagnostics_data={self.diagnostics_data.clone()}
+                    sender_stats={self.sender_stats.clone()}
+                    encoder_settings={self.encoder_settings.clone()}
+                    neteq_stats={self.neteq_stats.clone()}
+                    neteq_buffer_history={self.neteq_buffer_history.clone()}
+                    neteq_jitter_history={self.neteq_jitter_history.clone()}
+                    video_enabled={self.video_enabled}
+                    mic_enabled={self.mic_enabled}
+                    share_screen={self.share_screen}
+                />
             </div>
         }
     }

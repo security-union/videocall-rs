@@ -20,6 +20,7 @@ pub mod attendants;
 pub mod browser_compatibility;
 pub mod device_selector;
 pub mod device_settings_modal;
+pub mod diagnostics;
 pub mod host;
 pub mod icons;
 pub mod matomo;

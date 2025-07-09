@@ -26,7 +26,6 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub struct WebNetEq {
     neteq: std::cell::RefCell<NetEq>,
-    leftovers: std::cell::RefCell<Vec<f32>>, // cached PCM between quanta
     sample_rate: u32,
     channels: u8,
 }
@@ -38,7 +37,7 @@ impl WebNetEq {
         let cfg = NetEqConfig {
             sample_rate,
             channels,
-            min_delay_ms: 500,
+            min_delay_ms: 60, // Reduced from 500ms - more reasonable for web audio
             ..Default::default()
         };
         let mut neteq = NetEq::new(cfg).map_err(Self::map_err)?;
@@ -48,7 +47,6 @@ impl WebNetEq {
         );
         Ok(WebNetEq {
             neteq: std::cell::RefCell::new(neteq),
-            leftovers: std::cell::RefCell::new(Vec::new()),
             sample_rate,
             channels,
         })
@@ -73,19 +71,11 @@ impl WebNetEq {
             .map_err(Self::map_err)
     }
 
-    /// Get up to 10 ms of decoded PCM as a Float32Array.
+    /// Get 10ms of decoded PCM directly from NetEq as a Float32Array.
     #[wasm_bindgen]
     pub fn get_audio(&self) -> Result<js_sys::Float32Array, JsValue> {
-        if self.leftovers.borrow().is_empty() {
-            let frame = self.neteq.borrow_mut().get_audio().map_err(Self::map_err)?;
-            self.leftovers
-                .borrow_mut()
-                .extend_from_slice(&frame.samples);
-        }
-        // Consume everything we have (could be less/more than render quantum).
-        let mut pcm = self.leftovers.borrow_mut();
-        let out = js_sys::Float32Array::from(pcm.as_slice());
-        pcm.clear();
+        let frame = self.neteq.borrow_mut().get_audio().map_err(Self::map_err)?;
+        let out = js_sys::Float32Array::from(frame.samples.as_slice());
         Ok(out)
     }
 

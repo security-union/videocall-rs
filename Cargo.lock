@@ -6668,6 +6668,7 @@ dependencies = [
  "lazy_static",
  "log",
  "regex",
+ "serde",
  "serde_json",
  "videocall-client",
  "videocall-diagnostics",

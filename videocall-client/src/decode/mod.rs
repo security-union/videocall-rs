@@ -87,15 +87,17 @@ impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
 /// Factory function to create the appropriate audio peer decoder based on platform detection
 pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
+    peer_id: String,
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
     log::info!("Platform detection: Using NetEq audio peer decoder");
-    NetEqAudioPeerDecoder::new(speaker_device_id)
+    NetEqAudioPeerDecoder::new(speaker_device_id, peer_id)
         .map(|d| Box::new(d) as Box<dyn AudioPeerDecoderTrait>)
 }
 
 #[cfg(not(feature = "neteq_ff"))]
 pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
+    _peer_id: String, // peer_id not used by Safari/Standard decoders yet
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
     use crate::utils::is_ios;
     if is_ios() {

@@ -42,10 +42,11 @@ pub struct NetEqAudioPeerDecoder {
     _generator: MediaStreamTrackGenerator,
     decoded: bool,
     _on_message_closure: Closure<dyn FnMut(MessageEvent)>, // Keep closure alive
+    peer_id: String, // Track which peer this decoder belongs to
 }
 
 impl NetEqAudioPeerDecoder {
-    pub fn new(speaker_device_id: Option<String>) -> Result<Self, JsValue> {
+    pub fn new(speaker_device_id: Option<String>, peer_id: String) -> Result<Self, JsValue> {
         // Locate worker URL from <link id="neteq-worker" ...>
         let window = web_sys::window().expect("no window");
         let document = window.document().expect("no document");
@@ -80,6 +81,7 @@ impl NetEqAudioPeerDecoder {
         // has its listener ready when the first message arrives.
         let audio_ctx_clone = audio_context.clone();
         let generator_for_cb = generator.clone();
+        let peer_id_clone = peer_id.clone();
         let on_message_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
             if data.is_instance_of::<Float32Array>() {
@@ -131,9 +133,14 @@ impl NetEqAudioPeerDecoder {
                         if let Ok(stats_json) = js_sys::JSON::stringify(&stats_js) {
                             if let Some(json_str) = stats_json.as_string() {
                                 // Always emit the raw JSON block for debugging/UI display.
+                                log::info!(
+                                    "[NetEQ Decoder {}] Sending stats_json: {}",
+                                    peer_id_clone,
+                                    json_str
+                                );
                                 let _ = global_sender().send(DiagEvent {
                                     subsystem: "neteq",
-                                    stream_id: None,
+                                    stream_id: Some(peer_id_clone.clone()),
                                     ts_ms: now_ms(),
                                     metrics: vec![metric!("stats_json", json_str.clone())],
                                 });
@@ -147,7 +154,7 @@ impl NetEqAudioPeerDecoder {
                                         {
                                             let _ = global_sender().send(DiagEvent {
                                                 subsystem: "neteq",
-                                                stream_id: None,
+                                                stream_id: Some(peer_id_clone.clone()),
                                                 ts_ms: now_ms(),
                                                 metrics: vec![metric!(
                                                     "jitter_buffer_delay_ms",
@@ -161,7 +168,7 @@ impl NetEqAudioPeerDecoder {
                                         {
                                             let _ = global_sender().send(DiagEvent {
                                                 subsystem: "neteq",
-                                                stream_id: None,
+                                                stream_id: Some(peer_id_clone.clone()),
                                                 ts_ms: now_ms(),
                                                 metrics: vec![metric!(
                                                     "jitter_buffer_target_delay_ms",
@@ -177,7 +184,7 @@ impl NetEqAudioPeerDecoder {
                                         {
                                             let _ = global_sender().send(DiagEvent {
                                                 subsystem: "neteq",
-                                                stream_id: None,
+                                                stream_id: Some(peer_id_clone.clone()),
                                                 ts_ms: now_ms(),
                                                 metrics: vec![metric!(
                                                     "current_buffer_size_ms",
@@ -227,6 +234,7 @@ impl NetEqAudioPeerDecoder {
             _generator: generator,
             decoded: false,
             _on_message_closure: on_message_closure,
+            peer_id,
         })
     }
 }

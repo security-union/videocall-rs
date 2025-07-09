@@ -103,7 +103,8 @@ impl Peer {
         email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
-        let (audio, video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id)?;
+        let (audio, video, screen) =
+            Self::new_decoders(&video_canvas_id, &screen_canvas_id, &email)?;
         Ok(Self {
             audio,
             video,
@@ -122,6 +123,7 @@ impl Peer {
     fn new_decoders(
         video_canvas_id: &str,
         screen_canvas_id: &str,
+        peer_id: &str,
     ) -> Result<
         (
             Box<dyn AudioPeerDecoderTrait>,
@@ -131,7 +133,7 @@ impl Peer {
         JsValue,
     > {
         Ok((
-            create_audio_peer_decoder(None)?,
+            create_audio_peer_decoder(None, peer_id.to_string())?,
             VideoPeerDecoder::new(video_canvas_id)?,
             VideoPeerDecoder::new(screen_canvas_id)?,
         ))
@@ -139,7 +141,7 @@ impl Peer {
 
     fn reset(&mut self) -> Result<(), JsValue> {
         let (audio, video, screen) =
-            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id)?;
+            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &self.email)?;
         self.audio = audio;
         self.video = video;
         self.screen = screen;
@@ -398,7 +400,7 @@ impl PeerDecodeManager {
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {
                 // Create a new audio decoder with the new speaker device
-                match create_audio_peer_decoder(speaker_device_id.clone()) {
+                match create_audio_peer_decoder(speaker_device_id.clone(), key.clone()) {
                     Ok(new_audio_decoder) => {
                         // Replace the old decoder with the new one
                         peer.audio = new_audio_decoder;

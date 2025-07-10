@@ -16,21 +16,40 @@
  * conditions.
  */
 
+use super::AudioDecoder;
 use crate::{NetEqError, Result};
+
+// Native libopus decoder for native targets
+#[cfg(not(target_arch = "wasm32"))]
 use opus::{Channels, Decoder as OpusInner};
 
-use super::AudioDecoder;
+// WebCodecs decoder for web targets
+#[cfg(target_arch = "wasm32")]
+use {
+    js_sys::{Object, Uint8Array},
+    std::cell::RefCell,
+    std::rc::Rc,
+    wasm_bindgen::prelude::*,
+    wasm_bindgen::JsCast,
+    wasm_bindgen_futures::JsFuture,
+};
 
-/// Wrapper around libopus via the `opus` crate` (native targets).
+// -----------------------------------------------------------------------------
+// Native libopus decoder (non-web)
+// -----------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Wrapper around libopus via the `opus` crate (native targets).
 #[derive(Debug)]
-pub struct OpusDecoder {
+pub struct NativeOpusDecoder {
     inner: OpusInner,
     sample_rate: u32,
     channels: u8,
 }
 
-impl OpusDecoder {
-    pub fn new(sample_rate: u32, channels: u8) -> Result<Self> {
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeOpusDecoder {
+    pub async fn new(sample_rate: u32, channels: u8) -> Result<Self> {
         let ch_enum = match channels {
             1 => Channels::Mono,
             2 => Channels::Stereo,
@@ -46,7 +65,8 @@ impl OpusDecoder {
     }
 }
 
-impl AudioDecoder for OpusDecoder {
+#[cfg(not(target_arch = "wasm32"))]
+impl AudioDecoder for NativeOpusDecoder {
     fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -63,5 +83,49 @@ impl AudioDecoder for OpusDecoder {
             .map_err(|e| NetEqError::DecoderError(format!("Opus decode: {e}")))?;
         buf.truncate(decoded_samples * self.channels as usize);
         Ok(buf)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// WebCodecs AudioDecoder (web)
+// -----------------------------------------------------------------------------
+
+// WebCodecs decoder temporarily disabled - using Safari decoder for all web targets
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+/// WebCodecs AudioDecoder wrapper for browsers that support it (Chrome, Firefox)
+pub struct NativeOpusDecoder {
+    // decoder: web_sys::AudioDecoder,
+    sample_rate: u32,
+    channels: u8,
+    // decoded_frames: Rc<RefCell<Vec<Vec<f32>>>>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl NativeOpusDecoder {
+    #[allow(dead_code)]
+    pub async fn new(sample_rate: u32, channels: u8) -> Result<Self> {
+        // WebCodecs implementation disabled for now
+        Ok(Self {
+            sample_rate,
+            channels,
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl AudioDecoder for NativeOpusDecoder {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>> {
+        // WebCodecs implementation disabled - return silence
+        let samples = (self.sample_rate as f32 * 0.02) as usize * self.channels as usize;
+        Ok(vec![0.0; samples])
     }
 }

@@ -60,7 +60,7 @@ mod wasm_worker {
     thread_local! {
         static NETEQ: std::cell::RefCell<Option<WebNetEq>> = const { std::cell::RefCell::new(None) };
         static IS_MUTED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) }; // Start muted by default
-        static DIAGNOSTICS_ENABLED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) }; // Diagnostics enabled by default
+        static DIAGNOSTICS_ENABLED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) }; // Diagnostics enabled by default
     }
 
     #[wasm_bindgen(start)]
@@ -88,25 +88,38 @@ mod wasm_worker {
             if cell.borrow().is_none() {
                 match WebNetEq::new(48_000, 1) {
                     Ok(eq) => {
-                        *cell.borrow_mut() = Some(eq);
-                        console::log_1(
-                            &"[neteq-worker] NetEq auto-initialised (48 kHz/mono)".into(),
-                        );
+                        // Spawn async initialization
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match eq.init().await {
+                                Ok(()) => {
+                                    NETEQ.with(|cell| {
+                                        *cell.borrow_mut() = Some(eq);
+                                    });
+                                    console::log_1(
+                                        &"[neteq-worker] NetEq auto-initialised (48 kHz/mono)"
+                                            .into(),
+                                    );
 
-                        // Log initial mute state
-                        IS_MUTED.with(|muted_cell| {
-                            let is_muted = *muted_cell.borrow();
-                            console::log_1(
-                                &format!(
-                                    "🔇 NetEq worker auto-initialized with muted: {}",
-                                    is_muted
-                                )
-                                .into(),
-                            );
+                                    // Log initial mute state
+                                    IS_MUTED.with(|muted_cell| {
+                                        let is_muted = *muted_cell.borrow();
+                                        console::log_1(
+                                            &format!(
+                                                "🔇 NetEq worker auto-initialized with muted: {}",
+                                                is_muted
+                                            )
+                                            .into(),
+                                        );
+                                    });
+                                }
+                                Err(e) => {
+                                    console::error_2(&"[neteq-worker] auto-init error:".into(), &e);
+                                }
+                            }
                         });
                     }
                     Err(e) => {
-                        console::error_2(&"[neteq-worker] auto-init error:".into(), &e);
+                        console::error_2(&"[neteq-worker] WebNetEq::new error:".into(), &e);
                     }
                 }
             }

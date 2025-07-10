@@ -318,7 +318,7 @@ impl NetEqAudioPeerDecoder {
     }
 
     /// Create audio decoder that uses NetEq worker for buffering and timing
-    pub fn new(
+    pub fn new_with_muted_state(
         speaker_device_id: Option<String>,
         peer_id: String,
     ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {

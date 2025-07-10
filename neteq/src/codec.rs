@@ -130,4 +130,4 @@ impl AudioDecoder for UnifiedOpusDecoder {
 pub type OpusDecoder = UnifiedOpusDecoder;
 
 #[cfg(not(feature = "web"))]
-pub use wasm_stub::*;
+pub type OpusDecoder = wasm_stub::OpusDecoder;

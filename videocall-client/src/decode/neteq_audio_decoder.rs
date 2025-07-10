@@ -1,6 +1,6 @@
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::decode::config::configure_audio_context;
-use crate::decode::{DecodeStatus, AudioPeerDecoderTrait};
+use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
 use js_sys::{Float32Array, Object, Reflect};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -231,14 +231,19 @@ impl NetEqAudioPeerDecoder {
                 // DEBUG: Track PCM frame reception from NetEq worker
                 static mut PCM_FRAMES_RECEIVED: u32 = 0;
                 static mut LAST_PCM_LOG_TIME: f64 = 0.0;
-                
+
                 unsafe {
                     PCM_FRAMES_RECEIVED += 1;
                     let now = js_sys::Date::now();
-                    if now - LAST_PCM_LOG_TIME > 5000.0 { // Log every 5 seconds
+                    if now - LAST_PCM_LOG_TIME > 5000.0 {
+                        // Log every 5 seconds
                         let frames_per_sec = PCM_FRAMES_RECEIVED as f64 / 5.0;
                         web_sys::console::log_1(
-                            &format!("🎵 NetEq→Safari: Receiving {:.1} PCM frames/sec from NetEq worker", frames_per_sec).into()
+                            &format!(
+                                "🎵 NetEq→Safari: Receiving {:.1} PCM frames/sec from NetEq worker",
+                                frames_per_sec
+                            )
+                            .into(),
                         );
                         PCM_FRAMES_RECEIVED = 0;
                         LAST_PCM_LOG_TIME = now;
@@ -259,18 +264,22 @@ impl NetEqAudioPeerDecoder {
                     let pcm_player_clone = pcm_player_for_cb.clone();
 
                     let pcm_copy = pcm.clone();
-                    
+
                     // DEBUG: Track Safari PCM sending attempts
                     static mut SAFARI_PCM_SEND_ATTEMPTS: u32 = 0;
                     static mut LAST_SAFARI_SEND_LOG: f64 = 0.0;
-                    
+
                     unsafe {
                         SAFARI_PCM_SEND_ATTEMPTS += 1;
                         let now = js_sys::Date::now();
                         if now - LAST_SAFARI_SEND_LOG > 5000.0 {
                             let sends_per_sec = SAFARI_PCM_SEND_ATTEMPTS as f64 / 5.0;
                             web_sys::console::log_1(
-                                &format!("🦄 Safari PCM: Attempting to send {:.1} frames/sec to worklet", sends_per_sec).into()
+                                &format!(
+                                    "🦄 Safari PCM: Attempting to send {:.1} frames/sec to worklet",
+                                    sends_per_sec
+                                )
+                                .into(),
                             );
                             SAFARI_PCM_SEND_ATTEMPTS = 0;
                             LAST_SAFARI_SEND_LOG = now;
@@ -280,7 +289,7 @@ impl NetEqAudioPeerDecoder {
                     wasm_bindgen_futures::spawn_local(async move {
                         // Check if worklet is already initialized
                         let needs_init = pcm_player_clone.borrow().is_none();
-                        
+
                         if needs_init {
                             web_sys::console::log_1(
                                 &"Safari: Initializing AudioWorklet for first time".into(),
@@ -302,7 +311,7 @@ impl NetEqAudioPeerDecoder {
                                 }
                             }
                         }
-                        
+
                         // Send PCM to worklet
                         if let Some(ref worklet) = *pcm_player_clone.borrow() {
                             Self::send_pcm_to_safari_worklet(worklet, &pcm_copy);
@@ -463,11 +472,11 @@ impl NetEqAudioPeerDecoder {
             pcm_player: pcm_player_ref,
             is_safari,
         };
-        
+
         // Auto-unmute the NetEq worker to start audio production
         web_sys::console::log_1(&"🔓 Auto-unmuting NetEq worker to start audio production".into());
         decoder.set_muted(false); // This should unmute the worker
-        
+
         Ok(decoder)
     }
 }

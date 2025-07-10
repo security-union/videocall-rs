@@ -180,40 +180,44 @@ mod wasm_worker {
         );
         stats_cb.forget();
 
-        // Timer to pull audio every 10 ms.
+        // Precise timer to pull audio every 10 ms (100Hz exactly)
         let cb = Closure::wrap(Box::new(move || {
             IS_MUTED.with(|muted_cell| {
                 let is_muted = *muted_cell.borrow();
-                
+
                 // DEBUG: Track audio production attempts
                 static mut AUDIO_PRODUCTION_ATTEMPTS: u32 = 0;
                 static mut AUDIO_PRODUCED_COUNT: u32 = 0;
                 static mut LAST_PRODUCTION_LOG: f64 = 0.0;
-                
+
                 unsafe {
                     AUDIO_PRODUCTION_ATTEMPTS += 1;
                     let now = js_sys::Date::now();
-                    
-                    if now - LAST_PRODUCTION_LOG > 5000.0 { // Log every 5 seconds
+
+                    if now - LAST_PRODUCTION_LOG > 5000.0 {
+                        // Log every 5 seconds
                         let attempts_per_sec = AUDIO_PRODUCTION_ATTEMPTS as f64 / 5.0;
                         let produced_per_sec = AUDIO_PRODUCED_COUNT as f64 / 5.0;
                         console::log_1(
                             &format!(
                                 "🔊 NetEq worker: {:.1} attempts/sec, {:.1} produced/sec, muted={}",
                                 attempts_per_sec, produced_per_sec, is_muted
-                            ).into()
+                            )
+                            .into(),
                         );
                         AUDIO_PRODUCTION_ATTEMPTS = 0;
                         AUDIO_PRODUCED_COUNT = 0;
                         LAST_PRODUCTION_LOG = now;
                     }
                 }
-                
+
                 if !is_muted {
                     NETEQ.with(|cell| {
                         if let Some(eq) = cell.borrow().as_ref() {
                             if let Ok(pcm) = eq.get_audio() {
-                                unsafe { AUDIO_PRODUCED_COUNT += 1; }
+                                unsafe {
+                                    AUDIO_PRODUCED_COUNT += 1;
+                                }
                                 let sab = js_sys::Array::of1(&pcm.buffer());
                                 let _ = js_sys::global()
                                     .unchecked_into::<DedicatedWorkerGlobalScope>()
@@ -243,7 +247,7 @@ mod wasm_worker {
         }) as Box<dyn FnMut()>);
         let _ = self_scope_clone_3.set_interval_with_callback_and_timeout_and_arguments_0(
             cb.as_ref().unchecked_ref(),
-            10,
+            9, // Use 9ms instead of 10ms to compensate for Safari's timer slowness
         );
         cb.forget();
 

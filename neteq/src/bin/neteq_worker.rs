@@ -55,7 +55,7 @@ mod wasm_worker {
 
     thread_local! {
         static NETEQ: std::cell::RefCell<Option<WebNetEq>> = const { std::cell::RefCell::new(None) };
-        static IS_MUTED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
+        static IS_MUTED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) }; // Start muted by default
     }
 
     #[wasm_bindgen(start)]
@@ -87,6 +87,18 @@ mod wasm_worker {
                         console::log_1(
                             &"[neteq-worker] NetEq auto-initialised (48 kHz/mono)".into(),
                         );
+
+                        // Log initial mute state
+                        IS_MUTED.with(|muted_cell| {
+                            let is_muted = *muted_cell.borrow();
+                            console::log_1(
+                                &format!(
+                                    "🔇 NetEq worker auto-initialized with muted: {}",
+                                    is_muted
+                                )
+                                .into(),
+                            );
+                        });
                     }
                     Err(e) => {
                         console::error_2(&"[neteq-worker] auto-init error:".into(), &e);
@@ -177,38 +189,9 @@ mod wasm_worker {
                     &"[neteq-worker] Init received, sr=".into(),
                     &JsValue::from_f64(sample_rate as f64),
                 );
-                NETEQ.with(|cell| {
-                    if cell.borrow().is_none() {
-                        match WebNetEq::new(sample_rate, channels) {
-                            Ok(eq) => {
-                                *cell.borrow_mut() = Some(eq);
-                                console::log_1(&"[neteq-worker] NetEq initialised".into());
-                            }
-                            Err(e) => {
-                                console::error_2(&"[neteq-worker] NetEq init error:".into(), &e);
-                            }
-                        }
-                    }
-                });
-                // Timer to pull audio every 10 ms.
-                let cb = Closure::wrap(Box::new(move || {
-                    NETEQ.with(|cell| {
-                        if let Some(eq) = cell.borrow().as_ref() {
-                            console::log_1(&"[neteq-worker] get_audio".into());
-                            if let Ok(pcm) = eq.get_audio() {
-                                let sab = js_sys::Array::of1(&pcm.buffer());
-                                let _ = js_sys::global()
-                                    .unchecked_into::<DedicatedWorkerGlobalScope>()
-                                    .post_message_with_transfer(&pcm, &sab);
-                            }
-                        }
-                    });
-                }) as Box<dyn FnMut()>);
-                let _ = scope.set_interval_with_callback_and_timeout_and_arguments_0(
-                    cb.as_ref().unchecked_ref(),
-                    10,
-                );
-                cb.forget();
+
+                // NOTE: We don't set up a second timer here! The main timer in start() already handles audio production
+                // and respects the mute state. Setting up a second timer would bypass mute functionality.
             }
             WorkerMsg::Insert {
                 seq,

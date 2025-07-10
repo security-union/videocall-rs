@@ -245,11 +245,7 @@ impl Peer {
                     // Check if audio state changed at all
                     let audio_state_changed = self.audio_enabled != metadata.audio_enabled;
 
-                    self.video_enabled = metadata.video_enabled;
-                    self.audio_enabled = metadata.audio_enabled;
-                    self.screen_enabled = metadata.screen_enabled;
-
-                    // Set mute state on audio decoder when audio state changes
+                    // Set mute state on audio decoder when audio state changes (before updating state)
                     if audio_state_changed {
                         web_sys::console::log_1(&format!("[MUTE DEBUG] Audio state changed for peer {} - audio_enabled: {} -> {}", 
                                                          self.email, self.audio_enabled, metadata.audio_enabled).into());
@@ -266,6 +262,10 @@ impl Peer {
                             .into(),
                         );
                     }
+
+                    self.video_enabled = metadata.video_enabled;
+                    self.audio_enabled = metadata.audio_enabled;
+                    self.screen_enabled = metadata.screen_enabled;
 
                     // Flush video decoder when video is turned off
                     if video_turned_off {

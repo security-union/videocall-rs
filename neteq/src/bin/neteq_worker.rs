@@ -68,15 +68,16 @@ mod wasm_worker {
         console_error_panic_hook::set_once();
         console::log_1(&"[neteq-worker] starting".into());
 
-        // Load opus-decoder library in worker context
+        // Load opus-decoder library in worker context by evaluating the script directly
         let global_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
-        if let Ok(import_scripts_fn) =
-            js_sys::Reflect::get(&global_scope, &JsValue::from_str("importScripts"))
-        {
-            if import_scripts_fn.is_function() {
-                let import_scripts = import_scripts_fn.unchecked_into::<js_sys::Function>();
+
+        // Instead of importing external file, evaluate the opus-decoder script directly
+        let opus_decoder_script = include_str!("../scripts/opus-decoder.min.js");
+        if let Ok(eval_fn) = js_sys::Reflect::get(&global_scope, &JsValue::from_str("eval")) {
+            if eval_fn.is_function() {
+                let eval_function = eval_fn.unchecked_into::<js_sys::Function>();
                 if let Err(e) =
-                    import_scripts.call1(&global_scope, &JsValue::from_str("./opus-decoder.min.js"))
+                    eval_function.call1(&global_scope, &JsValue::from_str(opus_decoder_script))
                 {
                     console::warn_2(&"[neteq-worker] Failed to load opus-decoder:".into(), &e);
                 } else {

@@ -48,8 +48,8 @@ pub struct NetEqAudioPeerDecoder {
     decoded: bool,
     _on_message_closure: Closure<dyn FnMut(MessageEvent)>, // Keep closure alive
     peer_id: String, // Track which peer this decoder belongs to
-    pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // Safari PCM player worklet (shared with closure)
-    is_safari: bool,                                   // Whether we're running on Safari
+    _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // Safari PCM player worklet (shared with closure)
+    _is_safari: bool,                                   // Whether we're running on Safari
 }
 
 impl NetEqAudioPeerDecoder {
@@ -469,8 +469,8 @@ impl NetEqAudioPeerDecoder {
             decoded: false,
             _on_message_closure: on_message_closure,
             peer_id,
-            pcm_player: pcm_player_ref,
-            is_safari,
+            _pcm_player: pcm_player_ref,
+            _is_safari: is_safari,
         };
 
         // Auto-unmute the NetEq worker to start audio production

@@ -51,11 +51,16 @@ mod wasm_worker {
         Mute {
             muted: bool,
         },
+        /// Enable/disable diagnostics reporting
+        SetDiagnostics {
+            enabled: bool,
+        },
     }
 
     thread_local! {
         static NETEQ: std::cell::RefCell<Option<WebNetEq>> = const { std::cell::RefCell::new(None) };
         static IS_MUTED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) }; // Start muted by default
+        static DIAGNOSTICS_ENABLED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) }; // Diagnostics enabled by default
     }
 
     #[wasm_bindgen(start)]
@@ -110,22 +115,30 @@ mod wasm_worker {
         // === Stats interval (1 Hz) ===
         console::log_1(&"[neteq-worker] stats interval".into());
         let stats_cb = Closure::wrap(Box::new(move || {
-            NETEQ.with(|cell| {
-                if let Some(eq) = cell.borrow().as_ref() {
-                    if let Ok(js_val) = eq.get_statistics() {
-                        // Build { cmd: "stats", stats: <object> }
-                        let obj = js_sys::Object::new();
-                        let _ = js_sys::Reflect::set(
-                            &obj,
-                            &JsValue::from_str("cmd"),
-                            &JsValue::from_str("stats"),
-                        );
-                        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("stats"), &js_val);
-                        let _ = js_sys::global()
-                            .unchecked_into::<DedicatedWorkerGlobalScope>()
-                            .post_message(&obj);
-                    }
+            DIAGNOSTICS_ENABLED.with(|enabled_cell| {
+                let is_enabled = *enabled_cell.borrow();
+                if !is_enabled {
+                    return; // Skip stats reporting if diagnostics are disabled
                 }
+
+                NETEQ.with(|cell| {
+                    if let Some(eq) = cell.borrow().as_ref() {
+                        if let Ok(js_val) = eq.get_statistics() {
+                            // Build { cmd: "stats", stats: <object> }
+                            let obj = js_sys::Object::new();
+                            let _ = js_sys::Reflect::set(
+                                &obj,
+                                &JsValue::from_str("cmd"),
+                                &JsValue::from_str("stats"),
+                            );
+                            let _ =
+                                js_sys::Reflect::set(&obj, &JsValue::from_str("stats"), &js_val);
+                            let _ = js_sys::global()
+                                .unchecked_into::<DedicatedWorkerGlobalScope>()
+                                .post_message(&obj);
+                        }
+                    }
+                });
             });
         }) as Box<dyn FnMut()>);
         let _ = self_scope_clone_2.set_interval_with_callback_and_timeout_and_arguments_0(
@@ -232,6 +245,15 @@ mod wasm_worker {
                     );
                     console::log_1(
                         &format!("🔇 NetEq worker received mute message: {}", muted).into(),
+                    );
+                });
+            }
+            WorkerMsg::SetDiagnostics { enabled } => {
+                DIAGNOSTICS_ENABLED.with(|enabled_cell| {
+                    *enabled_cell.borrow_mut() = enabled;
+                    console::log_2(
+                        &"[neteq-worker] diagnostics enabled:".into(),
+                        &JsValue::from_bool(enabled),
                     );
                 });
             }

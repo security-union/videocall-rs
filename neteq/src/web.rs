@@ -37,7 +37,7 @@ impl WebNetEq {
         let cfg = NetEqConfig {
             sample_rate,
             channels,
-            min_delay_ms: 60, // Reduced from 500ms - more reasonable for web audio
+            min_delay_ms: 200,
             ..Default::default()
         };
         let mut neteq = NetEq::new(cfg).map_err(Self::map_err)?;

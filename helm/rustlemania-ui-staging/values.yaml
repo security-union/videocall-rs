@@ -9,7 +9,7 @@ rustlemania-ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: add-safari-to-neteq-4a839ace # Using latest since staging tag doesn't exist yet
+    tag: add-safari-to-neteq-638ec04b # Using latest since staging tag doesn't exist yet
   
   resources:
     limits:

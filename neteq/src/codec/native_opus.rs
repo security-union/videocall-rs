@@ -34,6 +34,7 @@ pub struct NativeOpusDecoder {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl NativeOpusDecoder {
+    #[allow(dead_code)]
     pub async fn new(sample_rate: u32, channels: u8) -> Result<Self> {
         let ch_enum = match channels {
             1 => Channels::Mono,

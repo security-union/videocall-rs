@@ -18,8 +18,9 @@
 
 //! Safari-compatible Opus decoder implementation
 //!
-//! This decoder extracts the WebAssembly Opus decoder from decoderWorker.min.js
-//! and provides real Opus decoding functionality without WebCodecs dependencies.
+//! This decoder uses the opus-decoder npm library via cached reflection.
+//! We use reflection once during init to cache methods, then call them directly
+//! to avoid reflection overhead in the hot path.
 
 use crate::codec::AudioDecoder;
 use js_sys::{Function, Promise, Reflect, Uint8Array};
@@ -27,9 +28,11 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::console;
 
-// We'll access the opus-decoder library directly through js_sys instead of extern bindings
 pub struct SafariOpusDecoder {
-    decoder: Option<JsValue>, // Store as JsValue instead of specific type
+    decoder: Option<JsValue>,
+    // Cached methods to avoid reflection overhead
+    decode_frame_fn: Option<Function>,
+    free_fn: Option<Function>,
     initialized: bool,
     sample_rate: u32,
     channels: u8,
@@ -45,6 +48,8 @@ impl SafariOpusDecoder {
         console::log_1(&"Safari decoder: Creating SafariOpusDecoder instance".into());
         Self {
             decoder: None,
+            decode_frame_fn: None,
+            free_fn: None,
             initialized: false,
             sample_rate,
             channels,
@@ -58,13 +63,13 @@ impl SafariOpusDecoder {
 
         console::log_1(&"Safari decoder: Creating OpusDecoder instance".into());
 
-        // Access opus-decoder from global scope more directly
+        // Access opus-decoder from globalThis['opus-decoder'] using reflection
         let global = js_sys::global();
 
-        // Try to get the opus-decoder namespace
+        // Get globalThis['opus-decoder'] namespace using bracket notation
         let opus_decoder_ns = Reflect::get(&global, &"opus-decoder".into()).map_err(|_| {
             crate::NetEqError::DecoderError(
-                "opus-decoder library not found in global scope".to_string(),
+                "opus-decoder library not found at globalThis['opus-decoder']".to_string(),
             )
         })?;
 
@@ -110,8 +115,40 @@ impl SafariOpusDecoder {
             crate::NetEqError::DecoderError("OpusDecoder initialization failed".to_string())
         })?;
 
-        console::log_1(&"Safari decoder: OpusDecoder ready".into());
+        // Cache methods using reflection (done once during init)
+        console::log_1(&"Safari decoder: Caching decoder methods".into());
+
+        // Cache decodeFrame method
+        let decode_frame_method = Reflect::get(&decoder, &"decodeFrame".into()).map_err(|_| {
+            crate::NetEqError::DecoderError("decodeFrame method not found".to_string())
+        })?;
+
+        if !decode_frame_method.is_function() {
+            return Err(crate::NetEqError::DecoderError(
+                "decodeFrame is not a function".to_string(),
+            ));
+        }
+
+        let decode_frame_fn = decode_frame_method.unchecked_into::<Function>();
+
+        // Cache free method
+        let free_method = Reflect::get(&decoder, &"free".into())
+            .map_err(|_| crate::NetEqError::DecoderError("free method not found".to_string()))?;
+
+        if !free_method.is_function() {
+            return Err(crate::NetEqError::DecoderError(
+                "free is not a function".to_string(),
+            ));
+        }
+
+        let free_fn = free_method.unchecked_into::<Function>();
+
+        console::log_1(&"Safari decoder: OpusDecoder ready with cached methods".into());
+
+        // Store cached decoder and methods
         self.decoder = Some(decoder);
+        self.decode_frame_fn = Some(decode_frame_fn);
+        self.free_fn = Some(free_fn);
         self.initialized = true;
 
         Ok(())
@@ -123,16 +160,18 @@ impl SafariOpusDecoder {
             return self.generate_test_tone();
         }
 
-        let decoder = match &self.decoder {
-            Some(d) => d,
-            None => {
-                console::log_1(&"Safari decoder: No decoder instance, using test tone".into());
+        let (decoder, decode_frame_fn) = match (&self.decoder, &self.decode_frame_fn) {
+            (Some(d), Some(f)) => (d, f),
+            _ => {
+                console::log_1(
+                    &"Safari decoder: Missing decoder or cached method, using test tone".into(),
+                );
                 return self.generate_test_tone();
             }
         };
 
-        // Try to decode using the opus-decoder library
-        match self.decode_with_opus_decoder(decoder, encoded) {
+        // Try to decode using the cached methods (no reflection needed!)
+        match self.decode_with_cached_method(decoder, decode_frame_fn, encoded) {
             Ok(samples) => samples,
             Err(e) => {
                 console::warn_2(
@@ -144,39 +183,28 @@ impl SafariOpusDecoder {
         }
     }
 
-    fn decode_with_opus_decoder(
+    fn decode_with_cached_method(
         &self,
         decoder: &JsValue,
+        decode_frame_fn: &Function,
         encoded: &[u8],
     ) -> crate::Result<Vec<f32>> {
         // Create Uint8Array from encoded data
         let encoded_array = Uint8Array::new_with_length(encoded.len() as u32);
         encoded_array.copy_from(encoded);
 
-        // Call decodeFrame method
-        let decode_frame_method = Reflect::get(decoder, &"decodeFrame".into()).map_err(|_| {
-            crate::NetEqError::DecoderError("decodeFrame method not found".to_string())
-        })?;
-
-        if !decode_frame_method.is_function() {
-            return Err(crate::NetEqError::DecoderError(
-                "decodeFrame is not a function".to_string(),
-            ));
-        }
-
-        let decode_frame_fn = decode_frame_method.unchecked_into::<Function>();
+        // Call cached decodeFrame method directly (no reflection!)
         let result = decode_frame_fn
             .call1(decoder, &encoded_array)
             .map_err(|_| crate::NetEqError::DecoderError("decodeFrame call failed".to_string()))?;
 
         // Extract PCM data from result
-        // The opus-decoder library returns an object with PCM data
         self.extract_pcm_from_result(&result)
     }
 
     fn extract_pcm_from_result(&self, result: &JsValue) -> crate::Result<Vec<f32>> {
         // Extract channelData from the result
-        let channel_data = Reflect::get(result, &"channelData".into()).map_err(|_| {
+        let channel_data = js_sys::Reflect::get(result, &"channelData".into()).map_err(|_| {
             crate::NetEqError::DecoderError(
                 "channelData property not found in decode result".to_string(),
             )
@@ -227,7 +255,7 @@ impl SafariOpusDecoder {
 
     pub fn get_decoder_type(&self) -> &'static str {
         if self.initialized {
-            "WebAssembly Opus (opus-decoder library)"
+            "WebAssembly Opus (opus-decoder library with cached methods)"
         } else {
             "Test tone generator (opus-decoder not ready)"
         }
@@ -237,25 +265,14 @@ impl SafariOpusDecoder {
 impl Drop for SafariOpusDecoder {
     fn drop(&mut self) {
         if self.initialized {
-            if let Some(decoder) = &self.decoder {
+            if let (Some(decoder), Some(free_fn)) = (&self.decoder, &self.free_fn) {
                 console::log_1(&"Safari decoder: Cleaning up OpusDecoder instance".into());
 
-                // Call the free() method to de-allocate WASM memory
-                if let Ok(free_method) = Reflect::get(decoder, &"free".into()) {
-                    if free_method.is_function() {
-                        let free_fn = free_method.unchecked_into::<Function>();
-                        if let Err(_) = free_fn.call0(decoder) {
-                            console::warn_1(&"Safari decoder: Failed to call free() method".into());
-                        } else {
-                            console::log_1(
-                                &"Safari decoder: Successfully freed OpusDecoder memory".into(),
-                            );
-                        }
-                    } else {
-                        console::warn_1(&"Safari decoder: free is not a function".into());
-                    }
+                // Call the cached free() method directly (no reflection!)
+                if let Err(_) = free_fn.call0(decoder) {
+                    console::warn_1(&"Safari decoder: Failed to call free() method".into());
                 } else {
-                    console::warn_1(&"Safari decoder: free method not found".into());
+                    console::log_1(&"Safari decoder: Successfully freed OpusDecoder memory".into());
                 }
             }
         }

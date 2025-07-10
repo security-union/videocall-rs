@@ -114,8 +114,8 @@ pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
     peer_id: String,
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
-    NetEqAudioPeerDecoder::new(speaker_device_id, peer_id)
-        .map(|d| Box::new(d) as Box<dyn AudioPeerDecoderTrait>)
+    // NetEq decoders should start muted by default (peers start with audio_enabled=false)
+    NetEqAudioPeerDecoder::new_with_mute_state(speaker_device_id, peer_id, true)
 }
 
 #[cfg(not(feature = "neteq_ff"))]

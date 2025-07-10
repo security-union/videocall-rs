@@ -1,5 +1,4 @@
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
-use crate::decode::config::configure_audio_context;
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
 use js_sys::{Float32Array, Object, Reflect};
 use serde::{Deserialize, Serialize};
@@ -13,10 +12,7 @@ use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    AudioContext, AudioContextOptions, AudioData, AudioDataInit, AudioWorkletNode,
-    MediaStreamTrackGenerator, MediaStreamTrackGeneratorInit, MessageEvent, Worker,
-};
+use web_sys::{AudioContext, AudioContextOptions, AudioWorkletNode, MessageEvent, Worker};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
@@ -44,15 +40,25 @@ enum WorkerMsg {
 pub struct NetEqAudioPeerDecoder {
     worker: Worker,
     audio_context: AudioContext,
-    _generator: Option<MediaStreamTrackGenerator>, // None for Safari
     decoded: bool,
     _on_message_closure: Closure<dyn FnMut(MessageEvent)>, // Keep closure alive
     peer_id: String, // Track which peer this decoder belongs to
-    _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // Safari PCM player worklet (shared with closure)
-    _is_safari: bool,                                   // Whether we're running on Safari
+    _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
 }
 
 impl NetEqAudioPeerDecoder {
+    /// Create a NetEq worker.
+    fn create_neteq_worker() -> Result<Worker, JsValue> {
+        let window = web_sys::window().expect("no window");
+        let document = window.document().expect("no document");
+        let worker_url = document
+            .get_element_by_id("neteq-worker")
+            .expect("neteq-worker link tag not found")
+            .get_attribute("href")
+            .expect("link tag has no href");
+        Worker::new(&worker_url)
+    }
+
     /// Send PCM data to Safari AudioWorklet (simple and efficient)
     fn send_pcm_to_safari_worklet(pcm_player: &AudioWorkletNode, pcm: &Float32Array) {
         // Create message object for the worklet
@@ -145,111 +151,49 @@ impl NetEqAudioPeerDecoder {
         Ok((audio_context, pcm_player))
     }
 
-    pub fn new(speaker_device_id: Option<String>, peer_id: String) -> Result<Self, JsValue> {
-        // Locate worker URL from <link id="neteq-worker" ...>
-        let window = web_sys::window().expect("no window");
-        let document = window.document().expect("no document");
-        let worker_url = document
-            .get_element_by_id("neteq-worker")
-            .expect("neteq-worker link tag not found")
-            .get_attribute("href")
-            .expect("link tag has no href");
+    /// Create audio decoder that uses NetEq worker for buffering and timing
+    pub fn new(
+        speaker_device_id: Option<String>,
+        peer_id: String,
+    ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
+        Self::new_with_mute_state(speaker_device_id, peer_id, true) // Default to muted
+    }
 
-        let worker = Worker::new(&worker_url)?;
+    /// Create audio decoder with explicit initial mute state
+    pub fn new_with_mute_state(
+        speaker_device_id: Option<String>,
+        peer_id: String,
+        initial_muted: bool,
+    ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
+        // Create worker
+        let worker = Self::create_neteq_worker()?;
 
-        // Detect Safari early to choose the right audio path
-        let is_safari = {
-            let global = js_sys::global();
-            !Reflect::has(&global, &JsValue::from_str("AudioData")).unwrap_or(false)
-        };
+        // Create AudioContext with enforced 48kHz for all browsers
+        let options = AudioContextOptions::new();
+        options.set_sample_rate(48000.0);
+        let audio_context = AudioContext::new_with_context_options(&options)?;
 
-        // Create audio context and generator based on browser
-        let (audio_context, generator, pcm_player_ref) = if is_safari {
-            web_sys::console::log_1(&"Safari detected: Using AudioWorklet PCM player".into());
-            // Safari: Create basic AudioContext with ENFORCED 48kHz
-            let options = AudioContextOptions::new();
-            options.set_sample_rate(48000.0); // Explicitly force 48kHz
-            let audio_context = AudioContext::new_with_context_options(&options)?;
-
-            // Verify Safari actually respects our sample rate setting
-            let actual_sample_rate = audio_context.sample_rate();
-            web_sys::console::log_2(
-                &"Safari initial AudioContext sample rate:".into(),
-                &JsValue::from_f64(actual_sample_rate as f64),
-            );
-
-            if (actual_sample_rate - 48000.0).abs() > 1.0 {
-                web_sys::console::warn_2(
-                    &"⚠️ Safari initial AudioContext sample rate mismatch! Expected 48000, got:"
-                        .into(),
-                    &JsValue::from_f64(actual_sample_rate as f64),
-                );
+        // Set sink device if specified
+        if let Some(device_id) = speaker_device_id {
+            if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
+                .unwrap_or(false)
+            {
+                let promise = audio_context.set_sink_id_with_str(&device_id);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = JsFuture::from(promise).await;
+                });
             }
+        }
 
-            // Set sink device if specified
-            if let Some(device_id) = speaker_device_id {
-                if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
-                    .unwrap_or(false)
-                {
-                    let promise = audio_context.set_sink_id_with_str(&device_id);
-                    wasm_bindgen_futures::spawn_local(async move {
-                        let _ = JsFuture::from(promise).await;
-                    });
-                }
-            }
+        let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
 
-            (
-                audio_context,
-                None,
-                Rc::new(RefCell::new(None::<AudioWorkletNode>)),
-            )
-        } else {
-            web_sys::console::log_1(
-                &"Chrome/Firefox detected: Using MediaStreamTrackGenerator path".into(),
-            );
-            // Chrome/Firefox: Standard MediaStreamTrackGenerator path
-            let generator =
-                MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio"))?;
-            let audio_context = configure_audio_context(&generator, speaker_device_id)
-                .map_err(|e| JsValue::from_str(&e.to_string()))?;
-            (
-                audio_context,
-                Some(generator),
-                Rc::new(RefCell::new(None::<AudioWorkletNode>)),
-            )
-        };
-
-        // Set up message handler
+        // Set up worker message handling
+        let pcm_player_clone = pcm_player_ref.clone();
         let audio_ctx_clone = audio_context.clone();
-        let generator_for_cb = generator.clone();
-        let peer_id_clone = peer_id.clone();
-        let pcm_player_for_cb = pcm_player_ref.clone();
 
         let on_message_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
             if data.is_instance_of::<Float32Array>() {
-                // DEBUG: Track PCM frame reception from NetEq worker
-                static mut PCM_FRAMES_RECEIVED: u32 = 0;
-                static mut LAST_PCM_LOG_TIME: f64 = 0.0;
-
-                unsafe {
-                    PCM_FRAMES_RECEIVED += 1;
-                    let now = js_sys::Date::now();
-                    if now - LAST_PCM_LOG_TIME > 5000.0 {
-                        // Log every 5 seconds
-                        let frames_per_sec = PCM_FRAMES_RECEIVED as f64 / 5.0;
-                        web_sys::console::log_1(
-                            &format!(
-                                "🎵 NetEq→Safari: Receiving {:.1} PCM frames/sec from NetEq worker",
-                                frames_per_sec
-                            )
-                            .into(),
-                        );
-                        PCM_FRAMES_RECEIVED = 0;
-                        LAST_PCM_LOG_TIME = now;
-                    }
-                }
-
                 // Ensure AudioContext is running
                 if let Err(e) = audio_ctx_clone.resume() {
                     web_sys::console::warn_1(
@@ -258,173 +202,40 @@ impl NetEqAudioPeerDecoder {
                 }
 
                 let pcm = Float32Array::from(data);
+                let pcm_copy = pcm.clone();
+                let pcm_player_clone = pcm_player_clone.clone();
 
-                if is_safari {
-                    // Safari: Send PCM to AudioWorklet (initialize lazily if needed)
-                    let pcm_player_clone = pcm_player_for_cb.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    // Check if worklet is already initialized
+                    let needs_init = pcm_player_clone.borrow().is_none();
 
-                    let pcm_copy = pcm.clone();
-
-                    // DEBUG: Track Safari PCM sending attempts
-                    static mut SAFARI_PCM_SEND_ATTEMPTS: u32 = 0;
-                    static mut LAST_SAFARI_SEND_LOG: f64 = 0.0;
-
-                    unsafe {
-                        SAFARI_PCM_SEND_ATTEMPTS += 1;
-                        let now = js_sys::Date::now();
-                        if now - LAST_SAFARI_SEND_LOG > 5000.0 {
-                            let sends_per_sec = SAFARI_PCM_SEND_ATTEMPTS as f64 / 5.0;
-                            web_sys::console::log_1(
-                                &format!(
-                                    "🦄 Safari PCM: Attempting to send {:.1} frames/sec to worklet",
-                                    sends_per_sec
-                                )
-                                .into(),
-                            );
-                            SAFARI_PCM_SEND_ATTEMPTS = 0;
-                            LAST_SAFARI_SEND_LOG = now;
-                        }
-                    }
-
-                    wasm_bindgen_futures::spawn_local(async move {
-                        // Check if worklet is already initialized
-                        let needs_init = pcm_player_clone.borrow().is_none();
-
-                        if needs_init {
-                            web_sys::console::log_1(
-                                &"Safari: Initializing AudioWorklet for first time".into(),
-                            );
-                            // Initialize the worklet
-                            match Self::create_safari_audio_context(None).await {
-                                Ok((_, worklet)) => {
-                                    *pcm_player_clone.borrow_mut() = Some(worklet);
-                                    web_sys::console::log_1(
-                                        &"Safari: AudioWorklet initialized successfully".into(),
-                                    );
-                                }
-                                Err(e) => {
-                                    web_sys::console::error_2(
-                                        &"Safari: Failed to initialize worklet:".into(),
-                                        &e,
-                                    );
-                                    return;
-                                }
-                            }
-                        }
-
-                        // Send PCM to worklet
-                        if let Some(ref worklet) = *pcm_player_clone.borrow() {
-                            Self::send_pcm_to_safari_worklet(worklet, &pcm_copy);
-                        }
-                    });
-                } else {
-                    // Chrome/Firefox: MediaStreamTrackGenerator path
-                    if let Some(ref generator) = generator_for_cb {
-                        let length = pcm.length() as usize;
-                        let frames = length as u32; // mono
-
-                        let adi = AudioDataInit::new(
-                            &pcm.unchecked_into::<Object>(),
-                            web_sys::AudioSampleFormat::F32,
-                            AUDIO_CHANNELS,
-                            frames,
-                            AUDIO_SAMPLE_RATE as f32,
-                            audio_ctx_clone.current_time() * 1e6,
+                    if needs_init {
+                        web_sys::console::log_1(
+                            &"Initializing AudioWorklet for PCM playback".into(),
                         );
-
-                        if let Ok(audio_data) = AudioData::new(&adi) {
-                            let writable = generator.writable();
-                            if !writable.locked() {
-                                if let Ok(writer) = writable.get_writer() {
-                                    wasm_bindgen_futures::spawn_local(async move {
-                                        if JsFuture::from(writer.ready()).await.is_ok() {
-                                            let _ = JsFuture::from(
-                                                writer.write_with_chunk(&audio_data),
-                                            )
-                                            .await;
-                                        }
-                                        writer.release_lock();
-                                    });
-                                }
+                        // Initialize the worklet
+                        match Self::create_safari_audio_context(None).await {
+                            Ok((_, worklet)) => {
+                                *pcm_player_clone.borrow_mut() = Some(worklet);
+                                web_sys::console::log_1(
+                                    &"AudioWorklet initialized successfully".into(),
+                                );
                             }
-                        } else {
-                            web_sys::console::warn_1(
-                                &"[neteq-audio-decoder] failed to create AudioData".into(),
-                            );
-                        }
-                    }
-                }
-            } else if data.is_object() {
-                let obj: js_sys::Object = data.clone().unchecked_into();
-                let cmd = js_sys::Reflect::get(&obj, &JsValue::from_str("cmd"))
-                    .unwrap_or(JsValue::UNDEFINED);
-                if cmd.as_string().as_deref() == Some("stats") {
-                    if let Ok(stats_js) = js_sys::Reflect::get(&obj, &JsValue::from_str("stats")) {
-                        // Convert to JSON string for quick display
-                        if let Ok(stats_json) = js_sys::JSON::stringify(&stats_js) {
-                            if let Some(json_str) = stats_json.as_string() {
-                                // Always emit the raw JSON block for debugging/UI display.
-
-                                let _ = global_sender().send(DiagEvent {
-                                    subsystem: "neteq",
-                                    stream_id: Some(peer_id_clone.clone()),
-                                    ts_ms: now_ms(),
-                                    metrics: vec![metric!("stats_json", json_str.clone())],
-                                });
-
-                                if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
-                                    // Extract useful numbers
-                                    if let Some(lifetime) = parsed.get("lifetime") {
-                                        if let Some(jitter) = lifetime
-                                            .get("jitter_buffer_delay_ms")
-                                            .and_then(|v| v.as_u64())
-                                        {
-                                            let _ = global_sender().send(DiagEvent {
-                                                subsystem: "neteq",
-                                                stream_id: Some(peer_id_clone.clone()),
-                                                ts_ms: now_ms(),
-                                                metrics: vec![metric!(
-                                                    "jitter_buffer_delay_ms",
-                                                    jitter
-                                                )],
-                                            });
-                                        }
-                                        if let Some(target) = parsed
-                                            .get("jitter_buffer_target_delay_ms")
-                                            .and_then(|v| v.as_u64())
-                                        {
-                                            let _ = global_sender().send(DiagEvent {
-                                                subsystem: "neteq",
-                                                stream_id: Some(peer_id_clone.clone()),
-                                                ts_ms: now_ms(),
-                                                metrics: vec![metric!(
-                                                    "jitter_buffer_target_delay_ms",
-                                                    target
-                                                )],
-                                            });
-                                        }
-                                    }
-                                    if let Some(network) = parsed.get("network") {
-                                        if let Some(buf) = network
-                                            .get("current_buffer_size_ms")
-                                            .and_then(|v| v.as_u64())
-                                        {
-                                            let _ = global_sender().send(DiagEvent {
-                                                subsystem: "neteq",
-                                                stream_id: Some(peer_id_clone.clone()),
-                                                ts_ms: now_ms(),
-                                                metrics: vec![metric!(
-                                                    "current_buffer_size_ms",
-                                                    buf
-                                                )],
-                                            });
-                                        }
-                                    }
-                                }
+                            Err(e) => {
+                                web_sys::console::error_2(
+                                    &"Failed to initialize worklet:".into(),
+                                    &e,
+                                );
+                                return;
                             }
                         }
                     }
-                }
+
+                    // Send PCM to worklet
+                    if let Some(ref worklet) = *pcm_player_clone.borrow() {
+                        Self::send_pcm_to_safari_worklet(worklet, &pcm_copy);
+                    }
+                });
             }
         }) as Box<dyn FnMut(_)>);
 
@@ -454,30 +265,33 @@ impl NetEqAudioPeerDecoder {
 
         web_sys::console::log_1(
             &format!(
-                "NetEq audio decoder initialized for Safari: {} (MediaStreamTrackGenerator: {})",
-                is_safari,
-                generator.is_some()
+                "NetEq audio decoder initialized for peer {} (muted: {})",
+                peer_id, initial_muted
             )
             .into(),
         );
 
-        // CRITICAL: NetEq worker starts muted by default - unmute it immediately
+        // Create decoder with explicit mute state
         let mut decoder = Self {
             worker,
             audio_context,
-            _generator: generator,
             decoded: false,
             _on_message_closure: on_message_closure,
             peer_id,
             _pcm_player: pcm_player_ref,
-            _is_safari: is_safari,
         };
 
-        // Auto-unmute the NetEq worker to start audio production
-        web_sys::console::log_1(&"🔓 Auto-unmuting NetEq worker to start audio production".into());
-        decoder.set_muted(false); // This should unmute the worker
+        // Set the initial mute state explicitly
+        decoder.set_muted(initial_muted);
+        web_sys::console::log_1(
+            &format!(
+                "✅ NetEq decoder initialized for peer {} with muted: {}",
+                decoder.peer_id, initial_muted
+            )
+            .into(),
+        );
 
-        Ok(decoder)
+        Ok(Box::new(decoder))
     }
 }
 

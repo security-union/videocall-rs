@@ -106,7 +106,7 @@ impl Peer {
         let (mut audio, video, screen) =
             Self::new_decoders(&video_canvas_id, &screen_canvas_id, &email)?;
 
-        // Initialize audio decoder as muted since audio_enabled starts as false
+        // Initialize with explicit mute state (audio_enabled starts as false, so muted=true)
         audio.set_muted(true);
         debug!("Initialized peer {} with audio muted", email);
 
@@ -458,12 +458,18 @@ impl PeerDecodeManager {
 
         for key in keys {
             if let Some(peer) = self.connected_peers.get_mut(&key) {
+                // Preserve current mute state
+                let current_muted = !peer.audio_enabled;
+
                 // Create a new audio decoder with the new speaker device
                 match create_audio_peer_decoder(speaker_device_id.clone(), key.clone()) {
-                    Ok(new_audio_decoder) => {
+                    Ok(mut new_audio_decoder) => {
+                        // Restore the mute state to the new decoder
+                        new_audio_decoder.set_muted(current_muted);
+
                         // Replace the old decoder with the new one
                         peer.audio = new_audio_decoder;
-                        log::info!("Successfully rebuilt audio decoder for peer: {} with new speaker device", key);
+                        log::info!("Successfully rebuilt audio decoder for peer: {} with speaker device (muted: {})", key, current_muted);
                     }
                     Err(e) => {
                         log::error!(

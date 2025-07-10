@@ -18,7 +18,7 @@
 
 //! Audio codec support for NetEq.
 
-use crate::{NetEqError, Result};
+use crate::Result;
 
 /// Trait for audio decoders.
 pub trait AudioDecoder {
@@ -51,71 +51,77 @@ pub use wasm_stub::*;
 // -----------------------------------------------------------------------------
 
 #[cfg(feature = "web")]
-/// Unified Opus decoder - currently only uses Safari implementation
+/// Unified Opus decoder using opus-decoder library for Safari compatibility
 pub struct UnifiedOpusDecoder {
-    /// SafariOpusDecoder for all web targets
+    /// SafariOpusDecoder using opus-decoder library
     decoder: safari_decoder::SafariOpusDecoder,
+    /// Cached sample rate (48kHz for Opus)
+    sample_rate: u32,
+    /// Cached channel count (mono for now)
+    channels: u8,
 }
 
 #[cfg(feature = "web")]
 impl UnifiedOpusDecoder {
-    /// Creates a new unified decoder (currently always uses Safari implementation)
+    /// Creates a new unified decoder using opus-decoder library
     pub async fn new(sample_rate: u32, channels: u8) -> Result<Self> {
-        let decoder = safari_decoder::SafariOpusDecoder::new(sample_rate, channels).await?;
-        Ok(Self { decoder })
+        let mut decoder = safari_decoder::SafariOpusDecoder::new(sample_rate, channels);
+        // Initialize the decoder during construction
+        decoder.init_decoder().await?;
+        Ok(Self {
+            decoder,
+            sample_rate,
+            channels,
+        })
     }
 
-    /// Creates a new unified decoder with optional audio playback for Safari
+    /// Creates a new unified decoder (audio context parameter kept for compatibility)
     pub async fn new_with_playback(
         sample_rate: u32,
         channels: u8,
-        audio_context: Option<&web_sys::AudioContext>,
+        _audio_context: Option<&web_sys::AudioContext>,
     ) -> Result<Self> {
-        let decoder = safari_decoder::SafariOpusDecoder::new(sample_rate, channels).await?;
-
-        // Initialize audio playback if context provided
-        if let Some(ctx) = audio_context {
-            decoder.init_audio_playback(ctx).await?;
-        }
-
-        Ok(Self { decoder })
-    }
-
-    /// Check if the browser supports WebCodecs AudioDecoder
-    fn has_webcodecs_support() -> bool {
-        // For now, always return false to use Safari decoder
-        // This avoids thread safety issues with WebCodecs implementation
-        false
+        Self::new(sample_rate, channels).await
     }
 
     /// Get the decoder type for debugging
     pub fn decoder_type(&self) -> &'static str {
-        self.decoder.decoder_type()
+        self.decoder.get_decoder_type()
     }
 
-    /// Enable audio playback for Safari decoder
-    pub async fn enable_audio_playback(&self, audio_context: &web_sys::AudioContext) -> Result<()> {
-        self.decoder.init_audio_playback(audio_context).await
+    /// Enable audio playback (kept for compatibility, now a no-op)
+    pub async fn enable_audio_playback(
+        &self,
+        _audio_context: &web_sys::AudioContext,
+    ) -> Result<()> {
+        Ok(())
     }
 
-    /// Flush audio buffers
+    /// Flush audio buffers (kept for compatibility, now a no-op)
     pub fn flush_audio(&self) -> Result<()> {
-        self.decoder.flush_audio()
+        Ok(())
+    }
+
+    /// Async decode method for internal use
+    pub async fn decode_async(&mut self, encoded: &[u8]) -> Vec<f32> {
+        self.decoder.decode_sync(encoded)
     }
 }
 
 #[cfg(feature = "web")]
 impl AudioDecoder for UnifiedOpusDecoder {
     fn sample_rate(&self) -> u32 {
-        self.decoder.sample_rate()
+        self.sample_rate
     }
 
     fn channels(&self) -> u8 {
-        self.decoder.channels()
+        self.channels
     }
 
     fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>> {
-        self.decoder.decode(encoded)
+        // Use the synchronous decode method (decoder is already initialized)
+        let samples = self.decoder.decode_sync(encoded);
+        Ok(samples)
     }
 }
 

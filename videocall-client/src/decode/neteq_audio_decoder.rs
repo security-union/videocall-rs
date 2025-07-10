@@ -55,9 +55,6 @@ impl NetEqAudioPeerDecoder {
     fn send_pcm_to_safari_player(audio_context: &AudioContext, pcm: &Float32Array) {
         // For now, just log that we received PCM data for Safari
         // TODO: Initialize and send to pcmPlayerWorker
-        web_sys::console::log_1(
-            &format!("Safari: Received {} PCM samples for playback", pcm.length()).into(),
-        );
 
         // Simple test: connect PCM directly to AudioContext destination
         // This is a temporary solution to verify audio routing works

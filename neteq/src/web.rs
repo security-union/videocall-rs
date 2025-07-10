@@ -21,7 +21,6 @@
 
 use crate::{codec::UnifiedOpusDecoder, AudioPacket, NetEq, NetEqConfig, RtpHeader};
 use serde_wasm_bindgen;
-use std::borrow::{Borrow, BorrowMut};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]

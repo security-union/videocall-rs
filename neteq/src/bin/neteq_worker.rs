@@ -67,6 +67,26 @@ mod wasm_worker {
     pub fn start() {
         console_error_panic_hook::set_once();
         console::log_1(&"[neteq-worker] starting".into());
+
+        // Load opus-decoder library in worker context
+        let global_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+        if let Ok(import_scripts_fn) =
+            js_sys::Reflect::get(&global_scope, &JsValue::from_str("importScripts"))
+        {
+            if import_scripts_fn.is_function() {
+                let import_scripts = import_scripts_fn.unchecked_into::<js_sys::Function>();
+                if let Err(e) =
+                    import_scripts.call1(&global_scope, &JsValue::from_str("./opus-decoder.min.js"))
+                {
+                    console::warn_2(&"[neteq-worker] Failed to load opus-decoder:".into(), &e);
+                } else {
+                    console::log_1(
+                        &"[neteq-worker] Successfully loaded opus-decoder library".into(),
+                    );
+                }
+            }
+        }
+
         let self_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
         let self_scope_clone = self_scope.clone();
         let self_scope_clone_2 = self_scope.clone();

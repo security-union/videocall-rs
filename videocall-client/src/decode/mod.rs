@@ -114,7 +114,6 @@ pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
     peer_id: String,
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
-    log::info!("Platform detection: Using NetEq audio peer decoder");
     NetEqAudioPeerDecoder::new(speaker_device_id, peer_id)
         .map(|d| Box::new(d) as Box<dyn AudioPeerDecoderTrait>)
 }

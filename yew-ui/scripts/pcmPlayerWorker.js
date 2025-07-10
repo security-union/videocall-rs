@@ -13,7 +13,7 @@
  */
 
 class SimpleAudioBuffer {
-    constructor(maxSamples = 8192, channels = 1) {
+    constructor(maxSamples = 2048, channels = 1) { // Reduce from 8192 to 2048 (~43ms at 48kHz)
         this.maxSamples = maxSamples;
         this.channels = channels;
         this.buffers = [];
@@ -25,6 +25,8 @@ class SimpleAudioBuffer {
         for (let ch = 0; ch < channels; ch++) {
             this.buffers[ch] = new Float32Array(maxSamples);
         }
+        
+        console.log(`Safari PCM buffer initialized: ${maxSamples} samples (~${(maxSamples/48000*1000).toFixed(1)}ms at 48kHz)`);
     }
     
     /**
@@ -32,6 +34,7 @@ class SimpleAudioBuffer {
      */
     push(channelData, frameLength) {
         if (this.availableSamples + frameLength > this.maxSamples) {
+            console.warn(`Safari PCM buffer full! Available: ${this.availableSamples}, trying to add: ${frameLength}, max: ${this.maxSamples}`);
             return false; // Buffer full
         }
         
@@ -85,6 +88,13 @@ class SimpleAudioBuffer {
     }
     
     /**
+     * Get buffer utilization percentage
+     */
+    getUtilization() {
+        return (this.availableSamples / this.maxSamples) * 100;
+    }
+    
+    /**
      * Clear the buffer
      */
     reset() {
@@ -102,10 +112,16 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
         
-        // Audio buffer for incoming PCM data
-        this.audioBuffer = new SimpleAudioBuffer(8192, 2); // 8192 samples, 2 channels max
+        // Audio buffer for incoming PCM data (smaller buffer for faster consumption)
+        this.audioBuffer = new SimpleAudioBuffer(2048, 2); // Reduced from 8192 to 2048
         this.sampleRate = 48000; // Default, will be updated
         this.channels = 2; // Default, will be updated
+        
+        // Debug counters
+        this.processCallCount = 0;
+        this.lastLogTime = Date.now();
+        this.samplesConsumed = 0;
+        this.silenceFrames = 0;
         
         // Listen for PCM data from main thread
         this.port.onmessage = (event) => {
@@ -115,20 +131,27 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
                 case 'configure':
                     this.sampleRate = sampleRate || 48000;
                     this.channels = channels || 1;
-                    this.audioBuffer = new SimpleAudioBuffer(8192, this.channels);
+                    this.audioBuffer = new SimpleAudioBuffer(2048, this.channels); // Keep small buffer
+                    console.log(`Safari PCM worklet configured: ${this.sampleRate}Hz, ${this.channels} channels`);
                     break;
                     
                 case 'play':
                     if (pcm && pcm instanceof Float32Array) {
-                        this.enqueuePCM(pcm);
+                        const success = this.enqueuePCM(pcm);
+                        if (!success) {
+                            console.warn(`Safari PCM: Failed to enqueue ${pcm.length} samples - buffer full`);
+                        }
                     }
                     break;
                     
                 case 'flush':
                     this.audioBuffer.reset();
+                    console.log('Safari PCM buffer flushed');
                     break;
             }
         };
+        
+        console.log('Safari PCMPlayerProcessor initialized');
     }
     
     /**
@@ -147,7 +170,7 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         }
         
         // Push to buffer
-        this.audioBuffer.push(channelData, samplesPerChannel);
+        return this.audioBuffer.push(channelData, samplesPerChannel);
     }
     
     /**
@@ -156,6 +179,8 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     process(inputs, outputs, parameters) {
         const output = outputs[0];
         const frameLength = output[0].length;
+        
+        this.processCallCount++;
         
         // Prepare output channel arrays
         const outputChannels = [];
@@ -167,11 +192,29 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         if (this.audioBuffer.isFrameAvailable(frameLength)) {
             // Pull audio data from buffer
             this.audioBuffer.pull(outputChannels, frameLength);
+            this.samplesConsumed += frameLength;
         } else {
             // No audio available, output silence
             for (let ch = 0; ch < output.length; ch++) {
                 output[ch].fill(0);
             }
+            this.silenceFrames++;
+        }
+        
+        // Log statistics every 5 seconds
+        const now = Date.now();
+        if (now - this.lastLogTime > 5000) {
+            const utilization = this.audioBuffer.getUtilization();
+            const processRate = this.processCallCount / 5; // calls per second
+            const consumptionRate = (this.samplesConsumed / this.sampleRate) / 5; // seconds of audio per second
+            
+            console.log(`Safari PCM stats: process=${processRate.toFixed(1)}/s, consumption=${consumptionRate.toFixed(2)}x realtime, buffer=${utilization.toFixed(1)}%, silence=${this.silenceFrames} frames`);
+            
+            // Reset counters
+            this.processCallCount = 0;
+            this.samplesConsumed = 0;
+            this.silenceFrames = 0;
+            this.lastLogTime = now;
         }
         
         // Keep processor alive

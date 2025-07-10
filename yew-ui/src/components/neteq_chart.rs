@@ -69,9 +69,6 @@ pub struct NetEqStats {
 // Convert from the raw NetEQ structure to the UI structure
 impl From<RawNetEqStats> for NetEqStats {
     fn from(raw: RawNetEqStats) -> Self {
-        log::info!("[NetEqStats::from] Converting raw stats: buffer_ms={}, target_ms={}, packet_count={}, expand_rate={}, accel_rate={}", 
-            raw.current_buffer_size_ms, raw.target_delay_ms, raw.packet_count, raw.network.expand_rate, raw.network.accelerate_rate);
-
         Self {
             timestamp: 0, // We don't have a timestamp in the raw data, use 0 or current time
             buffer_ms: raw.current_buffer_size_ms,

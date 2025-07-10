@@ -63,12 +63,26 @@ impl From<StandardDecodeStatus> for DecodeStatus {
 /// Trait to abstract over different audio peer decoder implementations
 pub trait AudioPeerDecoderTrait {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
+    fn flush(&mut self);
+    fn set_muted(&mut self, muted: bool);
 }
 
 // Implement trait for standard audio peer decoder
 impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         StandardPeerDecodeTrait::decode(self, packet).map(|status| status.into())
+    }
+
+    fn flush(&mut self) {
+        // For standard decoder, we can flush the decoder state
+        if let Err(e) = self.decoder.flush() {
+            log::error!("Failed to flush standard audio decoder: {:?}", e);
+        }
+    }
+
+    fn set_muted(&mut self, _muted: bool) {
+        // Standard decoder doesn't support muting at the decoder level
+        log::debug!("set_muted called on standard audio decoder (no-op)");
     }
 }
 
@@ -80,6 +94,17 @@ impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
             rendered: decode_status.rendered,
             first_frame: decode_status.first_frame,
         })
+    }
+
+    fn flush(&mut self) {
+        // For Safari decoder, we can flush the worklet - but we don't have direct access
+        // to the decoder field, so we'll just log for now
+        log::debug!("Flush called on Safari audio decoder");
+    }
+
+    fn set_muted(&mut self, _muted: bool) {
+        // Safari decoder doesn't support muting at the decoder level
+        log::debug!("set_muted called on Safari audio decoder (no-op)");
     }
 }
 

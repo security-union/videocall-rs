@@ -47,10 +47,15 @@ mod wasm_worker {
         Flush,
         Clear,
         Close,
+        /// Mute/unmute audio output
+        Mute {
+            muted: bool,
+        },
     }
 
     thread_local! {
         static NETEQ: std::cell::RefCell<Option<WebNetEq>> = const { std::cell::RefCell::new(None) };
+        static IS_MUTED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
     }
 
     #[wasm_bindgen(start)]
@@ -119,15 +124,37 @@ mod wasm_worker {
 
         // Timer to pull audio every 10 ms.
         let cb = Closure::wrap(Box::new(move || {
-            NETEQ.with(|cell| {
-                if let Some(eq) = cell.borrow().as_ref() {
-                    if let Ok(pcm) = eq.get_audio() {
-                        let sab = js_sys::Array::of1(&pcm.buffer());
-                        let _ = js_sys::global()
-                            .unchecked_into::<DedicatedWorkerGlobalScope>()
-                            .post_message_with_transfer(&pcm, &sab);
+            IS_MUTED.with(|muted_cell| {
+                let is_muted = *muted_cell.borrow();
+                if !is_muted {
+                    NETEQ.with(|cell| {
+                        if let Some(eq) = cell.borrow().as_ref() {
+                            if let Ok(pcm) = eq.get_audio() {
+                                let sab = js_sys::Array::of1(&pcm.buffer());
+                                let _ = js_sys::global()
+                                    .unchecked_into::<DedicatedWorkerGlobalScope>()
+                                    .post_message_with_transfer(&pcm, &sab);
+                            }
+                        }
+                    });
+                } else {
+                    // Debug: Log when audio is skipped due to muting (but only occasionally to avoid spam)
+                    static mut SKIP_COUNTER: u32 = 0;
+                    unsafe {
+                        SKIP_COUNTER += 1;
+                        if SKIP_COUNTER % 100 == 0 {
+                            // Log every 100 skips (every 1 second)
+                            console::log_1(
+                                &format!(
+                                    "🔇 Skipped audio production {} times (muted)",
+                                    SKIP_COUNTER
+                                )
+                                .into(),
+                            );
+                        }
                     }
                 }
+                // If muted, we don't call get_audio() so NetEq doesn't produce expand packets
             });
         }) as Box<dyn FnMut()>);
         let _ = self_scope_clone_3.set_interval_with_callback_and_timeout_and_arguments_0(
@@ -199,12 +226,31 @@ mod wasm_worker {
                     }
                 });
             }
-            WorkerMsg::Flush => {}
+            WorkerMsg::Flush => {
+                NETEQ.with(|cell| {
+                    if let Some(eq) = cell.borrow().as_ref() {
+                        // Flush is handled by the NetEq instance
+                        console::log_1(&"[neteq-worker] flush".into());
+                    }
+                });
+            }
             WorkerMsg::Clear => {
                 NETEQ.with(|cell| cell.borrow_mut().take());
             }
             WorkerMsg::Close => {
                 scope.close();
+            }
+            WorkerMsg::Mute { muted } => {
+                IS_MUTED.with(|muted_cell| {
+                    *muted_cell.borrow_mut() = muted;
+                    console::log_2(
+                        &"[neteq-worker] audio muted:".into(),
+                        &JsValue::from_bool(muted),
+                    );
+                    console::log_1(
+                        &format!("🔇 NetEq worker received mute message: {}", muted).into(),
+                    );
+                });
             }
         }
     }

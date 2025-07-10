@@ -311,28 +311,13 @@ impl Component for AttendantsComponent {
                 let rx = subscribe();
                 while let Ok(evt) = rx.recv_async().await {
                     if evt.subsystem == "neteq" {
-                        log::info!(
-                            "[DiagEvent] Received neteq event with {} metrics, stream_id: {:?}",
-                            evt.metrics.len(),
-                            evt.stream_id
-                        );
                         for m in &evt.metrics {
-                            log::debug!(
-                                "[DiagEvent] Processing metric: {} = {:?}",
-                                m.name,
-                                m.value
-                            );
                             if m.name == "stats_json" {
                                 if let MetricValue::Text(json) = &m.value {
                                     let peer_id = evt
                                         .stream_id
                                         .clone()
                                         .unwrap_or_else(|| "unknown".to_string());
-                                    log::info!(
-                                        "[DiagEvent] Sending NetEqStatsUpdated for peer {}: {}",
-                                        peer_id,
-                                        json
-                                    );
                                     link.send_message(Msg::NetEqStatsUpdated(
                                         peer_id,
                                         json.clone(),
@@ -344,11 +329,6 @@ impl Component for AttendantsComponent {
                                         .stream_id
                                         .clone()
                                         .unwrap_or_else(|| "unknown".to_string());
-                                    log::info!(
-                                        "[DiagEvent] Sending NetEqBufferUpdated for peer {}: {}",
-                                        peer_id,
-                                        v
-                                    );
                                     link.send_message(Msg::NetEqBufferUpdated(peer_id, *v));
                                 }
                             } else if m.name == "jitter_buffer_delay_ms" {
@@ -357,11 +337,6 @@ impl Component for AttendantsComponent {
                                         .stream_id
                                         .clone()
                                         .unwrap_or_else(|| "unknown".to_string());
-                                    log::info!(
-                                        "[DiagEvent] Sending NetEqJitterUpdated for peer {}: {}",
-                                        peer_id,
-                                        v
-                                    );
                                     link.send_message(Msg::NetEqJitterUpdated(peer_id, *v));
                                 }
                             }
@@ -550,11 +525,6 @@ impl Component for AttendantsComponent {
                 true
             }
             Msg::NetEqStatsUpdated(peer_id, stats_json) => {
-                log::info!(
-                    "[UI] Received NetEqStatsUpdated for peer {}: {}",
-                    peer_id,
-                    stats_json
-                );
                 self.neteq_stats = Some(stats_json.clone());
 
                 // Accumulate stats history per peer for dashboard charts
@@ -566,12 +536,6 @@ impl Component for AttendantsComponent {
                 if peer_stats.len() > 60 {
                     peer_stats.remove(0);
                 } // keep last 60 entries (60 seconds of data)
-
-                log::info!(
-                    "[UI] NetEQ stats for peer {} now has {} entries",
-                    peer_id,
-                    peer_stats.len()
-                );
                 true
             }
             Msg::NetEqBufferUpdated(peer_id, buffer_value) => {

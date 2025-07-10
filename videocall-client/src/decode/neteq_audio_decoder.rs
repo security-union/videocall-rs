@@ -32,6 +32,9 @@ enum WorkerMsg {
     Flush,
     Clear,
     Close,
+    Mute {
+        muted: bool,
+    },
 }
 
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
@@ -133,11 +136,7 @@ impl NetEqAudioPeerDecoder {
                         if let Ok(stats_json) = js_sys::JSON::stringify(&stats_js) {
                             if let Some(json_str) = stats_json.as_string() {
                                 // Always emit the raw JSON block for debugging/UI display.
-                                log::info!(
-                                    "[NetEQ Decoder {}] Sending stats_json: {}",
-                                    peer_id_clone,
-                                    json_str
-                                );
+
                                 let _ = global_sender().send(DiagEvent {
                                     subsystem: "neteq",
                                     stream_id: Some(peer_id_clone.clone()),
@@ -286,6 +285,56 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                     first_frame: false,
                 })
             }
+        }
+    }
+
+    fn flush(&mut self) {
+        // Send flush message to NetEq worker to clear the buffer
+        let flush_msg = WorkerMsg::Flush;
+        if let Err(e) =
+            serde_wasm_bindgen::to_value(&flush_msg).map(|msg| self.worker.post_message(&msg))
+        {
+            log::error!("Failed to dispatch NetEq flush message: {:?}", e);
+        } else {
+            log::debug!(
+                "Sent flush message to NetEq worker for peer {}",
+                self.peer_id
+            );
+        }
+    }
+
+    fn set_muted(&mut self, muted: bool) {
+        // Send mute message to NetEq worker to stop/start audio production
+        let mute_msg = WorkerMsg::Mute { muted };
+
+        // Use console.log for immediate visibility in browser console
+        web_sys::console::log_2(
+            &format!(
+                "[MUTE DEBUG] Sending mute message for peer {}",
+                self.peer_id
+            )
+            .into(),
+            &JsValue::from_bool(muted),
+        );
+
+        if let Err(e) =
+            serde_wasm_bindgen::to_value(&mute_msg).map(|msg| self.worker.post_message(&msg))
+        {
+            log::error!("Failed to dispatch NetEq mute message: {:?}", e);
+            web_sys::console::error_1(&format!("Failed to send mute message: {:?}", e).into());
+        } else {
+            log::debug!(
+                "Sent mute message to NetEq worker for peer {} (muted: {})",
+                self.peer_id,
+                muted
+            );
+            web_sys::console::log_1(
+                &format!(
+                    "✅ Mute message sent successfully for peer {} (muted: {})",
+                    self.peer_id, muted
+                )
+                .into(),
+            );
         }
     }
 }

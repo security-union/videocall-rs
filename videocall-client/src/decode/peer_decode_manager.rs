@@ -103,8 +103,13 @@ impl Peer {
         email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
-        let (audio, video, screen) =
+        let (mut audio, video, screen) =
             Self::new_decoders(&video_canvas_id, &screen_canvas_id, &email)?;
+
+        // Initialize audio decoder as muted since audio_enabled starts as false
+        audio.set_muted(true);
+        debug!("Initialized peer {} with audio muted", email);
+
         Ok(Self {
             audio,
             video,
@@ -140,8 +145,16 @@ impl Peer {
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {
-        let (audio, video, screen) =
+        let (mut audio, video, screen) =
             Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &self.email)?;
+
+        // Preserve the current mute state after reset
+        audio.set_muted(!self.audio_enabled);
+        debug!(
+            "Reset peer {} with audio muted: {}",
+            self.email, !self.audio_enabled
+        );
+
         self.audio = audio;
         self.video = video;
         self.screen = screen;
@@ -189,12 +202,26 @@ impl Peer {
                     },
                 ))
             }
-            MediaType::AUDIO => Ok((
-                media_type,
-                self.audio
-                    .decode(&packet)
-                    .map_err(|_| PeerDecodeError::AudioDecodeError)?,
-            )),
+            MediaType::AUDIO => {
+                if !self.audio_enabled {
+                    // Peer is muted, don't send packet to NetEq to avoid expand packets (hissing sound)
+                    debug!("Peer {} is muted, skipping audio packet", self.email);
+                    Ok((
+                        media_type,
+                        DecodeStatus {
+                            rendered: false,
+                            first_frame: false,
+                        },
+                    ))
+                } else {
+                    Ok((
+                        media_type,
+                        self.audio
+                            .decode(&packet)
+                            .map_err(|_| PeerDecodeError::AudioDecodeError)?,
+                    ))
+                }
+            }
             MediaType::SCREEN => {
                 let screen_status = self
                     .screen
@@ -213,16 +240,48 @@ impl Peer {
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
                     // Check if video is being turned off (on -> off transition)
                     let video_turned_off = self.video_enabled && !metadata.video_enabled;
+                    // Check if audio is being turned off (on -> off transition)
+                    let audio_turned_off = self.audio_enabled && !metadata.audio_enabled;
+                    // Check if audio state changed at all
+                    let audio_state_changed = self.audio_enabled != metadata.audio_enabled;
 
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
+
+                    // Set mute state on audio decoder when audio state changes
+                    if audio_state_changed {
+                        web_sys::console::log_1(&format!("[MUTE DEBUG] Audio state changed for peer {} - audio_enabled: {} -> {}", 
+                                                         self.email, self.audio_enabled, metadata.audio_enabled).into());
+                        self.audio.set_muted(!metadata.audio_enabled);
+                        debug!(
+                            "Set audio decoder muted state for peer {} to {}",
+                            self.email, !metadata.audio_enabled
+                        );
+                        web_sys::console::log_1(
+                            &format!(
+                                "🔇 Setting peer {} muted to {}",
+                                self.email, !metadata.audio_enabled
+                            )
+                            .into(),
+                        );
+                    }
 
                     // Flush video decoder when video is turned off
                     if video_turned_off {
                         self.video.flush();
                         debug!(
                             "Flushed video decoder for peer {} (video turned off)",
+                            self.email
+                        );
+                    }
+
+                    // Flush audio decoder when audio is turned off to prevent expand packets
+                    if audio_turned_off {
+                        // For NetEq audio decoders, we need to flush the buffer to prevent hissing
+                        self.audio.flush();
+                        debug!(
+                            "Flushed audio decoder for peer {} (audio turned off)",
                             self.email
                         );
                     }

@@ -55,20 +55,10 @@ pub struct DiagnosticsProps {
 }
 
 fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
-    log::info!(
-        "[parse_neteq_stats_history] Parsing {} characters of stats data",
-        neteq_stats_str.len()
-    );
-    log::debug!("[parse_neteq_stats_history] Raw data: {}", neteq_stats_str);
-
     let mut stats = Vec::new();
 
     // Try to parse as newline-delimited JSON (JSONL format)
     let lines: Vec<&str> = neteq_stats_str.lines().collect();
-    log::info!(
-        "[parse_neteq_stats_history] Found {} lines to parse",
-        lines.len()
-    );
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -76,16 +66,10 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
             log::debug!("[parse_neteq_stats_history] Skipping empty line {}", i);
             continue;
         }
-        log::debug!(
-            "[parse_neteq_stats_history] Parsing line {}: {}",
-            i,
-            trimmed
-        );
 
         match serde_json::from_str::<crate::components::neteq_chart::RawNetEqStats>(trimmed) {
             Ok(raw_stat) => {
                 let stat: NetEqStats = raw_stat.into();
-                log::info!("[parse_neteq_stats_history] Successfully parsed line {}: buffer_ms={}, target_ms={}", i, stat.buffer_ms, stat.target_ms);
                 stats.push(stat);
             }
             Err(e) => {
@@ -109,7 +93,6 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
         {
             Ok(raw_stat) => {
                 let stat: NetEqStats = raw_stat.into();
-                log::info!("[parse_neteq_stats_history] Successfully parsed as single JSON: buffer_ms={}, target_ms={}", stat.buffer_ms, stat.target_ms);
                 stats.push(stat);
             }
             Err(e) => {
@@ -125,30 +108,12 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
     if stats.len() > 60 {
         stats.drain(0..stats.len() - 60);
     }
-
-    log::info!(
-        "[parse_neteq_stats_history] Successfully parsed {} stats entries",
-        stats.len()
-    );
     stats
 }
 
 #[function_component(Diagnostics)]
 pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     let selected_peer = use_state(|| "All Peers".to_string());
-
-    // Log data received for debugging
-    log::info!(
-        "[Diagnostics] Rendering with {} per-peer stats entries",
-        props.neteq_stats_per_peer.len()
-    );
-    for (peer_id, stats) in &props.neteq_stats_per_peer {
-        log::info!(
-            "[Diagnostics] Peer {}: {} stats entries",
-            peer_id,
-            stats.len()
-        );
-    }
 
     let close_handler = {
         let on_close = props.on_close.clone();
@@ -168,43 +133,25 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
 
     // Parse NetEQ stats based on selected peer
     let neteq_stats_history = if *selected_peer == "All Peers" {
-        log::info!("[Diagnostics] Parsing stats for 'All Peers'");
         let result = props
             .neteq_stats
             .as_ref()
             .map(|stats_str| parse_neteq_stats_history(stats_str))
             .unwrap_or_default();
-        log::info!(
-            "[Diagnostics] All Peers parsing result: {} stats entries",
-            result.len()
-        );
         result
     } else {
-        log::info!("[Diagnostics] Parsing stats for peer '{}'", *selected_peer);
         let result = props
             .neteq_stats_per_peer
             .get(&*selected_peer)
             .map(|peer_stats| {
-                log::info!(
-                    "[Diagnostics] Found {} raw stats entries for peer '{}'",
-                    peer_stats.len(),
-                    *selected_peer
-                );
                 let joined = peer_stats.join("\n");
-                log::info!("[Diagnostics] Joined stats: {} characters", joined.len());
                 parse_neteq_stats_history(&joined)
             })
             .unwrap_or_default();
-        log::info!(
-            "[Diagnostics] Peer '{}' parsing result: {} stats entries",
-            *selected_peer,
-            result.len()
-        );
         result
     };
 
     let latest_neteq_stats = neteq_stats_history.last().cloned();
-    log::info!("[Diagnostics] Latest stats: {:?}", latest_neteq_stats);
 
     // Get buffer and jitter history for selected peer
     let (buffer_history, jitter_history) = if *selected_peer == "All Peers" {

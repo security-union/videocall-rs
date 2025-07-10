@@ -531,7 +531,7 @@ impl Component for AttendantsComponent {
                 let peer_stats = self
                     .neteq_stats_per_peer
                     .entry(peer_id.clone())
-                    .or_insert_with(Vec::new);
+                    .or_default();
                 peer_stats.push(stats_json);
                 if peer_stats.len() > 60 {
                     peer_stats.remove(0);
@@ -539,10 +539,7 @@ impl Component for AttendantsComponent {
                 true
             }
             Msg::NetEqBufferUpdated(peer_id, buffer_value) => {
-                let peer_buffer = self
-                    .neteq_buffer_per_peer
-                    .entry(peer_id)
-                    .or_insert_with(Vec::new);
+                let peer_buffer = self.neteq_buffer_per_peer.entry(peer_id).or_default();
                 peer_buffer.push(buffer_value);
                 if peer_buffer.len() > 50 {
                     peer_buffer.remove(0);
@@ -550,10 +547,7 @@ impl Component for AttendantsComponent {
                 false
             }
             Msg::NetEqJitterUpdated(peer_id, jitter_value) => {
-                let peer_jitter = self
-                    .neteq_jitter_per_peer
-                    .entry(peer_id)
-                    .or_insert_with(Vec::new);
+                let peer_jitter = self.neteq_jitter_per_peer.entry(peer_id).or_default();
                 peer_jitter.push(jitter_value);
                 if peer_jitter.len() > 50 {
                     peer_jitter.remove(0);

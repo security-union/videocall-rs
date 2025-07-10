@@ -16,172 +16,266 @@
  * conditions.
  */
 
+//! Safari-compatible Opus decoder implementation
+//!
+//! This decoder uses the opus-decoder npm library via cached reflection.
+//! We use reflection once during init to cache methods, then call them directly
+//! to avoid reflection overhead in the hot path.
 
-//! Safari-specific Opus decoder implemented via an `AudioWorklet`.
-//!
-//! Safari (WebKit) does not yet expose the WebCodecs `AudioDecoder` API that
-//! we use on Chromium / Firefox.  Instead we spin up a custom worklet
-//! (`decoder-worklet`) – the exact same script that is already used by the
-//! Yew front-end – and communicate with it over `postMessage`.
-//!
-//! The worklet sends back raw PCM frames (`Float32Array`) which we collect in
-//! a ring-buffer on the Rust side and expose synchronously via `AudioDecoder`.
-//!
-//! Rough data-flow:
-//!   NetEq -> SafariOpusDecoder::decode()  ——postMessage—>  decoder-worklet
-//!                                            |                  |
-//!                                            |  (PCM plane[0])  |
-//!                                            |  (Float32Array)  |
-//!                                            v                  |
-//!                             (MessagePort.onmessage)   <——postMessage——
-//!                                            |                  |
-//!                              push samples into queue           |
-//!                                            |                  |
-//!   NetEq <- SafariOpusDecoder::decode() pops frame <────────────┘
-//!
-//! NOTE: This file purposefully re-implements a *tiny* subset of the helper
-//! utilities that live in `videocall-client/src/decode/safari/…` so the `neteq`
-//! crate can stay self-contained.
-#![cfg(feature = "web")]
-
-use super::AudioDecoder;
-use crate::{NetEqError, Result};
-use gloo_utils::format::JsValueSerdeExt;
-use js_sys::{Float32Array, Function, Uint8Array};
-use serde::Serialize;
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use crate::codec::AudioDecoder;
+use js_sys::{Function, Promise, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{
-    AudioContext, AudioContextOptions, AudioWorkletNode, AudioWorkletNodeOptions, MessagePort,
-};
-
-// -----------------------------------------------------------------------------
-// Worklet message definitions – MUST match decoderWorker.min.js
-// -----------------------------------------------------------------------------
-#[derive(Serialize, Debug)]
-#[serde(tag = "command", rename_all = "camelCase")]
-enum DecoderMessages {
-    Init { decoder_sample_rate: u32, number_of_channels: u32 },
-    Decode { pages: Vec<u8> },
-    Flush,
-    Close,
-}
-
-// -----------------------------------------------------------------------------
-// Tiny helper wrapper around AudioWorkletNode
-// -----------------------------------------------------------------------------
-#[derive(Clone, Default)]
-struct WorkletHandle {
-    inner: Rc<RefCell<Option<AudioWorkletNode>>>,
-}
-
-impl WorkletHandle {
-    async fn instantiate(
-        &self,
-        ctx: &AudioContext,
-        script_path: &str,
-        name: &str,
-        channels: u32,
-    ) -> Result<()> {
-        // Load module (one-time; OK to call repeatedly – WebKit dedups).
-        JsFuture::from(ctx.audio_worklet()?.add_module(script_path)?).await.map_err(|e| {
-            NetEqError::DecoderError(format!("addModule: {:?}", e))
-        })?;
-
-        let opts = AudioWorkletNodeOptions::new();
-        opts.set_number_of_inputs(0); // decoder has no audio inputs
-        opts.set_number_of_outputs(0); // we get raw pcm via postMessage instead
-        opts.set_channel_count(channels);
-
-        let node = AudioWorkletNode::new_with_options(ctx, name, &opts)?;
-        self.inner.borrow_mut().replace(node);
-        Ok(())
-    }
-
-    fn port(&self) -> Option<MessagePort> {
-        self.inner
-            .borrow()
-            .as_ref()
-            .and_then(|n| n.port().ok())
-    }
-
-    fn send<T: Serialize>(&self, msg: &T) -> Result<()> {
-        let port = self.port().ok_or_else(|| {
-            NetEqError::DecoderError("AudioWorklet not instantiated".into())
-        })?;
-        let js_val = JsValue::from_serde(msg)
-            .map_err(|e| NetEqError::DecoderError(format!("serde to JsValue: {e}")))?;
-        port.post_message(&js_val)
-            .map_err(|e| NetEqError::DecoderError(format!("postMessage: {e:?}")))
-    }
-}
-
-// -----------------------------------------------------------------------------
-// SafariOpusDecoder
-// -----------------------------------------------------------------------------
+use web_sys::console;
 
 pub struct SafariOpusDecoder {
-    worklet: WorkletHandle,
-    ctx: AudioContext,
-    pcm_queue: Rc<RefCell<VecDeque<Vec<f32>>>>,
+    decoder: Option<JsValue>,
+    // Cached methods to avoid reflection overhead
+    decode_frame_fn: Option<Function>,
+    free_fn: Option<Function>,
+    initialized: bool,
     sample_rate: u32,
     channels: u8,
 }
 
+// IMPORTANT: The OpusDecoder type from wasm-bindgen is not Send/Sync by default.
+// Since we're running in a single-threaded WASM environment, this is safe.
+unsafe impl Send for SafariOpusDecoder {}
+unsafe impl Sync for SafariOpusDecoder {}
+
 impl SafariOpusDecoder {
-    pub async fn new(sample_rate: u32, channels: u8) -> Result<Self> {
-        // Shared queue between JS → Rust.
-        let queue: Rc<RefCell<VecDeque<Vec<f32>>>> = Rc::new(RefCell::new(VecDeque::new()));
-
-        // Create AudioContext with desired sample-rate.
-        let opts = AudioContextOptions::new();
-        opts.sample_rate(sample_rate as f32);
-        let ctx = AudioContext::new_with_context_options(&opts)
-            .map_err(|e| NetEqError::DecoderError(format!("AudioContext: {e:?}")))?;
-
-        // Instantiate worklet.
-        let worklet = WorkletHandle::default();
-        worklet
-            .instantiate(&ctx, "/decoderWorker.min.js", "decoder-worklet", channels as u32)
-            .await?;
-
-        // Hook up onmessage to capture PCM.
-        {
-            let queue_clone = queue.clone();
-            let on_msg = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |evt: JsValue| {
-                if let Some(obj) = js_sys::Object::try_from(&evt).ok() {
-                    // Expect { pcm: Float32Array, frames: u32 }
-                    if let Ok(pcm_val) = js_sys::Reflect::get(&obj, &JsValue::from_str("pcm")) {
-                        if pcm_val.is_instance_of::<Float32Array>() {
-                            let pcm_js: Float32Array = pcm_val.unchecked_into();
-                            let mut buf = vec![0.0f32; pcm_js.length() as usize];
-                            pcm_js.copy_to(&mut buf[..]);
-                            queue_clone.borrow_mut().push_back(buf);
-                        }
-                    }
-                }
-            }));
-            if let Some(port) = worklet.port() {
-                port.set_onmessage(Some(on_msg.as_ref().unchecked_ref()));
-            }
-            on_msg.forget(); // keep closure alive
-        }
-
-        // Send init message.
-        worklet.send(&DecoderMessages::Init {
-            decoder_sample_rate: sample_rate,
-            number_of_channels: channels as u32,
-        })?;
-
-        Ok(Self {
-            worklet,
-            ctx,
-            pcm_queue: queue,
+    pub fn new(sample_rate: u32, channels: u8) -> Self {
+        console::log_1(&"Safari decoder: Creating SafariOpusDecoder instance".into());
+        Self {
+            decoder: None,
+            decode_frame_fn: None,
+            free_fn: None,
+            initialized: false,
             sample_rate,
             channels,
-        })
+        }
+    }
+
+    pub async fn init_decoder(&mut self) -> crate::Result<()> {
+        if self.initialized {
+            return Ok(());
+        }
+
+        console::log_1(&"Safari decoder: Creating OpusDecoder instance".into());
+
+        // Access opus-decoder from globalThis['opus-decoder'] using reflection
+        let global = js_sys::global();
+
+        // Get globalThis['opus-decoder'] namespace using bracket notation
+        let opus_decoder_ns = Reflect::get(&global, &"opus-decoder".into()).map_err(|_| {
+            crate::NetEqError::DecoderError(
+                "opus-decoder library not found at globalThis['opus-decoder']".to_string(),
+            )
+        })?;
+
+        if opus_decoder_ns.is_undefined() {
+            return Err(crate::NetEqError::DecoderError(
+                "opus-decoder library not loaded".to_string(),
+            ));
+        }
+
+        // Get the OpusDecoder constructor
+        let opus_decoder_constructor = Reflect::get(&opus_decoder_ns, &"OpusDecoder".into())
+            .map_err(|_| {
+                crate::NetEqError::DecoderError("OpusDecoder constructor not found".to_string())
+            })?;
+
+        if !opus_decoder_constructor.is_function() {
+            return Err(crate::NetEqError::DecoderError(
+                "OpusDecoder is not a constructor function".to_string(),
+            ));
+        }
+
+        // Create new instance using js_sys::Reflect::construct
+        let constructor_fn = opus_decoder_constructor.unchecked_into::<Function>();
+        let decoder = Reflect::construct(&constructor_fn, &js_sys::Array::new()).map_err(|_| {
+            crate::NetEqError::DecoderError("Failed to create OpusDecoder instance".to_string())
+        })?;
+
+        // Get the ready promise
+        let ready_promise = Reflect::get(&decoder, &"ready".into()).map_err(|_| {
+            crate::NetEqError::DecoderError("OpusDecoder.ready property not found".to_string())
+        })?;
+
+        if !ready_promise.is_object() {
+            return Err(crate::NetEqError::DecoderError(
+                "OpusDecoder.ready is not a Promise".to_string(),
+            ));
+        }
+
+        let ready_promise = ready_promise.unchecked_into::<Promise>();
+
+        console::log_1(&"Safari decoder: Waiting for decoder to be ready".into());
+        JsFuture::from(ready_promise).await.map_err(|_| {
+            crate::NetEqError::DecoderError("OpusDecoder initialization failed".to_string())
+        })?;
+
+        // Cache methods using reflection (done once during init)
+        console::log_1(&"Safari decoder: Caching decoder methods".into());
+
+        // Cache decodeFrame method
+        let decode_frame_method = Reflect::get(&decoder, &"decodeFrame".into()).map_err(|_| {
+            crate::NetEqError::DecoderError("decodeFrame method not found".to_string())
+        })?;
+
+        if !decode_frame_method.is_function() {
+            return Err(crate::NetEqError::DecoderError(
+                "decodeFrame is not a function".to_string(),
+            ));
+        }
+
+        let decode_frame_fn = decode_frame_method.unchecked_into::<Function>();
+
+        // Cache free method
+        let free_method = Reflect::get(&decoder, &"free".into())
+            .map_err(|_| crate::NetEqError::DecoderError("free method not found".to_string()))?;
+
+        if !free_method.is_function() {
+            return Err(crate::NetEqError::DecoderError(
+                "free is not a function".to_string(),
+            ));
+        }
+
+        let free_fn = free_method.unchecked_into::<Function>();
+
+        console::log_1(&"Safari decoder: OpusDecoder ready with cached methods".into());
+
+        // Store cached decoder and methods
+        self.decoder = Some(decoder);
+        self.decode_frame_fn = Some(decode_frame_fn);
+        self.free_fn = Some(free_fn);
+        self.initialized = true;
+
+        Ok(())
+    }
+
+    pub fn decode_sync(&mut self, encoded: &[u8]) -> Vec<f32> {
+        if !self.initialized {
+            console::log_1(&"Safari decoder: Not initialized, using test tone".into());
+            return self.generate_test_tone();
+        }
+
+        let (decoder, decode_frame_fn) = match (&self.decoder, &self.decode_frame_fn) {
+            (Some(d), Some(f)) => (d, f),
+            _ => {
+                console::log_1(
+                    &"Safari decoder: Missing decoder or cached method, using test tone".into(),
+                );
+                return self.generate_test_tone();
+            }
+        };
+
+        // Try to decode using the cached methods (no reflection needed!)
+        match self.decode_with_cached_method(decoder, decode_frame_fn, encoded) {
+            Ok(samples) => samples,
+            Err(e) => {
+                console::warn_2(
+                    &"Safari decoder: Decode failed, using test tone:".into(),
+                    &e.to_string().into(),
+                );
+                self.generate_test_tone()
+            }
+        }
+    }
+
+    fn decode_with_cached_method(
+        &self,
+        decoder: &JsValue,
+        decode_frame_fn: &Function,
+        encoded: &[u8],
+    ) -> crate::Result<Vec<f32>> {
+        // Create Uint8Array from encoded data
+        let encoded_array = Uint8Array::new_with_length(encoded.len() as u32);
+        encoded_array.copy_from(encoded);
+
+        // Call cached decodeFrame method directly (no reflection!)
+        let result = decode_frame_fn
+            .call1(decoder, &encoded_array)
+            .map_err(|_| crate::NetEqError::DecoderError("decodeFrame call failed".to_string()))?;
+
+        // Extract PCM data from result
+        self.extract_pcm_from_result(&result)
+    }
+
+    fn extract_pcm_from_result(&self, result: &JsValue) -> crate::Result<Vec<f32>> {
+        // Extract channelData from the result
+        let channel_data = js_sys::Reflect::get(result, &"channelData".into()).map_err(|_| {
+            crate::NetEqError::DecoderError(
+                "channelData property not found in decode result".to_string(),
+            )
+        })?;
+
+        // channelData should be an array of Float32Arrays (one per channel)
+        let channel_array = channel_data.dyn_into::<js_sys::Array>().map_err(|_| {
+            crate::NetEqError::DecoderError("channelData is not an array".to_string())
+        })?;
+
+        if channel_array.length() == 0 {
+            return Err(crate::NetEqError::DecoderError(
+                "channelData array is empty".to_string(),
+            ));
+        }
+
+        // Get the first channel (mono or left channel for stereo)
+        let first_channel = channel_array.get(0);
+        let float32_array = first_channel
+            .dyn_into::<js_sys::Float32Array>()
+            .map_err(|_| {
+                crate::NetEqError::DecoderError("First channel is not a Float32Array".to_string())
+            })?;
+
+        // Copy the PCM data to a Vec<f32>
+        let mut samples = vec![0.0f32; float32_array.length() as usize];
+        float32_array.copy_to(&mut samples);
+
+        Ok(samples)
+    }
+
+    fn generate_test_tone(&self) -> Vec<f32> {
+        // Generate A4 note (440 Hz) test tone
+        const FRAME_SIZE_MS: u32 = 20;
+        let frame_samples = (self.sample_rate * FRAME_SIZE_MS / 1000) as usize;
+        let mut samples = Vec::with_capacity(frame_samples);
+
+        const FREQUENCY: f32 = 440.0; // A4 note
+        let angular_freq = 2.0 * std::f32::consts::PI * FREQUENCY / self.sample_rate as f32;
+
+        for i in 0..frame_samples {
+            let sample = 0.1 * (angular_freq * i as f32).sin(); // Low amplitude
+            samples.push(sample);
+        }
+
+        samples
+    }
+
+    pub fn get_decoder_type(&self) -> &'static str {
+        if self.initialized {
+            "WebAssembly Opus (opus-decoder library with cached methods)"
+        } else {
+            "Test tone generator (opus-decoder not ready)"
+        }
+    }
+}
+
+impl Drop for SafariOpusDecoder {
+    fn drop(&mut self) {
+        if self.initialized {
+            if let (Some(decoder), Some(free_fn)) = (&self.decoder, &self.free_fn) {
+                console::log_1(&"Safari decoder: Cleaning up OpusDecoder instance".into());
+
+                // Call the cached free() method directly (no reflection!)
+                if free_fn.call0(decoder).is_err() {
+                    console::warn_1(&"Safari decoder: Failed to call free() method".into());
+                } else {
+                    console::log_1(&"Safari decoder: Successfully freed OpusDecoder memory".into());
+                }
+            }
+        }
     }
 }
 
@@ -194,27 +288,8 @@ impl AudioDecoder for SafariOpusDecoder {
         self.channels
     }
 
-    fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>> {
-        // Forward packet to worklet.
-        let data_js = Uint8Array::new_with_length(encoded.len() as u32);
-        data_js.copy_from(encoded);
-        self.worklet.send(&DecoderMessages::Decode {
-            pages: encoded.to_vec(),
-        })?;
-
-        // Pop oldest decoded frame (20 ms) if available.
-        if let Some(frame) = self.pcm_queue.borrow_mut().pop_front() {
-            Ok(frame)
-        } else {
-            // Return silence if nothing decoded yet (startup / loss).
-            let samples = (self.sample_rate as f32 * 0.02) as usize * self.channels as usize;
-            Ok(vec![0.0; samples])
-        }
+    fn decode(&mut self, encoded: &[u8]) -> crate::Result<Vec<f32>> {
+        let samples = self.decode_sync(encoded);
+        Ok(samples)
     }
 }
-
-// SAFETY: wasm32 is single-threaded in browsers.
-#[cfg(target_arch = "wasm32")]
-unsafe impl Send for SafariOpusDecoder {}
-#[cfg(target_arch = "wasm32")]
-unsafe impl Sync for SafariOpusDecoder {} 

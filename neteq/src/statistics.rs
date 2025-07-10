@@ -41,6 +41,11 @@ pub struct NetworkStatistics {
     pub median_waiting_time_ms: i32,
     pub min_waiting_time_ms: i32,
     pub max_waiting_time_ms: i32,
+    /// Packet reordering statistics
+    pub reordered_packets: u32,
+    pub total_packets_received: u32,
+    pub reorder_rate_permyriad: u16, // Reordering rate in per-myriad (‰)
+    pub max_reorder_distance: u16,   // Maximum sequence number distance for reordered packets
 }
 
 /// Lifetime statistics that persist over the NetEQ lifetime
@@ -199,6 +204,34 @@ impl StatisticsCalculator {
             self.lifetime_stats.late_packets_discarded += 1;
         }
         self.operation_stats.discarded_primary_packets += 1;
+    }
+
+    /// Record packet reordering event
+    pub fn packet_reordered(&mut self, sequence_distance: u16) {
+        self.network_stats.reordered_packets += 1;
+        self.network_stats.total_packets_received += 1;
+
+        // Update maximum reorder distance
+        if sequence_distance > self.network_stats.max_reorder_distance {
+            self.network_stats.max_reorder_distance = sequence_distance;
+        }
+
+        // Calculate reorder rate in per-myriad
+        let rate = (self.network_stats.reordered_packets as f64
+            / self.network_stats.total_packets_received as f64)
+            * 10000.0;
+        self.network_stats.reorder_rate_permyriad = rate as u16;
+    }
+
+    /// Record normal packet arrival (in order)
+    pub fn packet_in_order(&mut self) {
+        self.network_stats.total_packets_received += 1;
+
+        // Recalculate reorder rate
+        let rate = (self.network_stats.reordered_packets as f64
+            / self.network_stats.total_packets_received as f64)
+            * 10000.0;
+        self.network_stats.reorder_rate_permyriad = rate as u16;
     }
 
     /// Get current network statistics

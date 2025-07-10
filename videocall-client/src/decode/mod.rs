@@ -63,6 +63,8 @@ impl From<StandardDecodeStatus> for DecodeStatus {
 /// Trait to abstract over different audio peer decoder implementations
 pub trait AudioPeerDecoderTrait {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
+    fn flush(&mut self);
+    fn set_muted(&mut self, muted: bool);
 }
 
 // Implement trait for standard audio peer decoder
@@ -70,8 +72,21 @@ impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         StandardPeerDecodeTrait::decode(self, packet).map(|status| status.into())
     }
+
+    fn flush(&mut self) {
+        // For standard decoder, we can flush the decoder state
+        if let Err(e) = self.decoder.flush() {
+            log::error!("Failed to flush standard audio decoder: {:?}", e);
+        }
+    }
+
+    fn set_muted(&mut self, _muted: bool) {
+        // Standard decoder doesn't support muting at the decoder level
+        log::debug!("set_muted called on standard audio decoder (no-op)");
+    }
 }
 
+#[cfg(not(feature = "neteq_ff"))]
 impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let decode_status = SafariPeerDecodeTrait::decode(self, packet)?;
@@ -80,21 +95,33 @@ impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
             first_frame: decode_status.first_frame,
         })
     }
+
+    fn flush(&mut self) {
+        // For Safari decoder, we can flush the worklet - but we don't have direct access
+        // to the decoder field, so we'll just log for now
+        log::debug!("Flush called on Safari audio decoder");
+    }
+
+    fn set_muted(&mut self, _muted: bool) {
+        // Safari decoder doesn't support muting at the decoder level
+        log::debug!("set_muted called on Safari audio decoder (no-op)");
+    }
 }
 
 #[cfg(feature = "neteq_ff")]
 /// Factory function to create the appropriate audio peer decoder based on platform detection
 pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
+    peer_id: String,
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
-    log::info!("Platform detection: Using NetEq audio peer decoder");
-    NetEqAudioPeerDecoder::new(speaker_device_id)
-        .map(|d| Box::new(d) as Box<dyn AudioPeerDecoderTrait>)
+    // NetEq decoders should start muted by default (peers start with audio_enabled=false)
+    NetEqAudioPeerDecoder::new_with_mute_state(speaker_device_id, peer_id, true)
 }
 
 #[cfg(not(feature = "neteq_ff"))]
 pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
+    _peer_id: String, // peer_id not used by Safari/Standard decoders yet
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
     use crate::utils::is_ios;
     if is_ios() {

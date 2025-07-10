@@ -16,8 +16,17 @@ cargo run --bin dashboard_server
 RUST_LOG=info cargo run --example neteq_player --features=native -- \
   --json-stats \
   --reorder-window-ms 50 \
+  --min-delay-ms 100 \
   --volume 0.5 \
   ~/path/to/your/audio.wav
+
+# Or test with NetEQ bypass mode for A/B comparison:
+RUST_LOG=info cargo run --release --example neteq_player --features=native -- \
+  --json-stats \
+  --no-neteq \
+  --reorder-window-ms 50 \
+  --volume 0.5 \
+  ~/Downloads/BundyBests2.wav
 
 # Open browser to: http://localhost:8000/dashboard.html
 ```
@@ -29,6 +38,7 @@ RUST_LOG=info cargo run --example neteq_player --features=native -- \
 RUST_LOG=info cargo run --example neteq_player --features=native -- \
   --json-stats \
   --reorder-window-ms 200 \
+  --min-delay-ms 100 \
   --volume 0.5 \
   ~/path/to/your/audio.wav
 ```
@@ -64,13 +74,18 @@ Click "Start Monitoring" to begin real-time visualization.
 - **Accelerate Rate**: How often NetEq speeds up audio to catch up (lower is better) 
 - **Packet Count**: Number of packets in NetEq's buffer
 - **Underruns**: Buffer underrun events (should be 0)
+- **Reorder Rate**: Percentage of packets arriving out of order (‰)
+- **Reordered Packets**: Total count of packets that arrived out of sequence
+- **Max Reorder Distance**: Maximum sequence number gap for reordered packets
 
 ### Charts
 
 1. **Buffer Size vs Target**: Shows how well NetEq maintains its target buffer size
 2. **Network Adaptation Rates**: Shows expand/accelerate rates indicating network issues
 3. **Packet Count & Audio Quality**: Shows packet availability and underrun events
-4. **System Performance**: Shows callback frequency and frame processing
+4. **Packet Reordering Analysis**: Shows reordering rate and maximum reorder distance
+5. **System Performance**: Shows callback frequency and frame processing
+6. **Packet Sequence & Timestamps**: Scatter plot showing RTP sequence vs timestamp order
 
 ### Health Indicators
 
@@ -126,8 +141,43 @@ cargo run --example neteq_player --features=native -- \
   --reorder-window-ms 50          # Packet reordering simulation (0-200ms)
   --max-jitter-ms 20              # Additional jitter simulation (0-500ms)
   --volume 0.0                    # Audio volume (0.0=mute, 1.0=full, 2.0=200%)
+  --min-delay-ms 100              # Minimum delay for NetEQ buffer (0-500ms)
+  --no-neteq                      # Bypass NetEQ and decode directly (A/B testing)
   path/to/audio.wav
 ```
+
+### NetEQ Bypass Mode
+
+Use `--no-neteq` to disable NetEQ processing and decode Opus packets directly:
+
+- **Purpose**: A/B testing to measure NetEQ's impact on audio quality
+- **Behavior**: Packets are decoded immediately upon arrival without jitter buffering
+- **Use Case**: Compare audio quality with/without NetEQ under identical network conditions
+- **Limitations**: No reordering correction, no adaptive algorithms, no concealment
+
+### Minimum Delay Configuration
+
+Use `--min-delay-ms` to set the minimum jitter buffer delay:
+
+- **Default**: 0ms (adaptive based on network conditions)
+- **Low values (0-50ms)**: More responsive but less resilient to jitter
+- **Medium values (50-150ms)**: Balanced performance for most networks
+- **High values (150-500ms)**: More robust against severe jitter but higher latency
+- **Effect**: Higher minimum delay provides more time to reorder packets and handle network variations
+- **Trade-off**: Latency vs. audio quality under poor network conditions
+
+## Interpreting Reordering Data
+
+### Reorder Rate
+- **Good**: < 10‰ (less than 1% of packets reordered)
+- **Concerning**: 10-50‰
+- **Problem**: > 50‰ indicates significant network issues
+
+### Packet Sequence Chart
+- **Ideal**: Points form a smooth ascending line
+- **Reordering**: Points appear below the expected sequence line
+- **Gaps**: Missing points indicate packet loss
+- **Clusters**: Grouped points suggest bursty reordering
 
 ## Files Generated
 
@@ -142,4 +192,7 @@ cargo run --example neteq_player --features=native -- \
 - Monitor expand rate as primary health indicator
 - Keep buffer size stable and near target
 - Use `--volume 0.0` to mute audio for silent performance testing
-- Use `--volume 0.1` for quiet monitoring while analyzing data 
+- Use `--volume 0.1` for quiet monitoring while analyzing data
+- **For reordering tests**: Use `--min-delay-ms 100` to give NetEQ time to reorder packets
+- **Higher min-delay-ms** reduces reorder rate but increases latency
+- **Compare bypass mode** with different min-delay-ms values to measure NetEQ benefits 

@@ -18,8 +18,29 @@ serde = { version = "1.0", features = ["derive"] }
 serde_bytes = { version = "0.11", optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
-web-sys = { version = "0.3", optional = true, features = ["DedicatedWorkerGlobalScope", "MessageEvent", "console"] }
+web-sys = { version = "0.3", optional = true, features = [
+    "DedicatedWorkerGlobalScope", 
+    "MessageEvent", 
+    "console",
+    "AudioDecoder",
+    "AudioDecoderConfig",
+    "AudioDecoderInit",
+    "AudioData",
+    "AudioDataCopyToOptions",
+    "EncodedAudioChunk",
+    "EncodedAudioChunkInit",
+    "EncodedAudioChunkType",
+    "Window",
+    "Navigator",
+    "AudioContext",
+    "AudioWorkletNode",
+    "AudioWorklet",
+    "BaseAudioContext",
+    "AudioNode",
+] }
+gloo-utils = { version = "0.2", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 log = "0.4"
 ringbuf = "0.3"
@@ -34,30 +55,21 @@ axum = { version = "0.7", optional = true }
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "fs"], optional = true }
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["cors", "fs", "set-header"], optional = true }
-
+once_cell = { version = "1.19", optional = true }
 
 [features]
 default = ["native", "audio_files"]
 audio_files = ["hound"]
 web = [
     "wasm-bindgen",
+    "wasm-bindgen-futures",
     "serde-wasm-bindgen",
     "serde_bytes",
     "js-sys",
-    "web-sys/AudioDecoder",
-    "web-sys/AudioDecoderConfig",
-    "web-sys/AudioDecoderInit",
-    "web-sys/AudioData",
-    "web-sys/AudioDataCopyToOptions",
-    "web-sys/EncodedAudioChunk",
-    "web-sys/EncodedAudioChunkInit",
-    "web-sys/EncodedAudioChunkType",
-    "web-sys/DedicatedWorkerGlobalScope",
-    "web-sys/MessageEvent",
-    "web-sys/console",
-    "web-sys/Window",
+    "web-sys",
+    "gloo-utils", 
     "console_error_panic_hook",
-    "web-sys/Navigator",
+    "once_cell",
 ]
 native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
 

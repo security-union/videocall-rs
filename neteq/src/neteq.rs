@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::delay_manager::{DelayConfig, DelayManager};
@@ -49,6 +50,8 @@ pub struct NetEqConfig {
     pub enable_rtx_handling: bool,
     /// Disable time stretching (for testing)
     pub for_test_no_time_stretching: bool,
+    /// Bypass NetEQ processing and decode packets directly (for A/B testing)
+    pub bypass_mode: bool,
     /// Delay manager configuration
     pub delay_config: DelayConfig,
     /// Smart flushing configuration
@@ -67,6 +70,7 @@ impl Default for NetEqConfig {
             enable_muted_state: false,
             enable_rtx_handling: false,
             for_test_no_time_stretching: false,
+            bypass_mode: false,
             delay_config: DelayConfig::default(),
             smart_flush_config: SmartFlushConfig::default(),
         }
@@ -167,6 +171,8 @@ pub struct NetEq {
     leftover_samples: Vec<f32>,
     /// Map RTP payload-type → audio decoder instance.
     decoders: HashMap<u8, Box<dyn crate::codec::AudioDecoder + Send>>,
+    /// Audio queue for bypass mode (direct decoding without jitter buffer)
+    bypass_audio_queue: VecDeque<f32>,
 }
 
 impl NetEq {
@@ -223,11 +229,35 @@ impl NetEq {
             frame_timestamp: 0,
             leftover_samples: Vec::new(),
             decoders: HashMap::new(),
+            bypass_audio_queue: VecDeque::new(),
         })
     }
 
     /// Insert a packet into the jitter buffer
     pub fn insert_packet(&mut self, packet: AudioPacket) -> Result<()> {
+        if self.config.bypass_mode {
+            // Bypass mode: decode packet immediately and queue audio
+            if let Some(decoder) = self.decoders.get_mut(&packet.header.payload_type) {
+                match decoder.decode(&packet.payload) {
+                    Ok(pcm_samples) => {
+                        let sample_count = pcm_samples.len();
+                        self.bypass_audio_queue.extend(pcm_samples);
+                        log::trace!("Bypass mode: decoded {} samples", sample_count);
+                    }
+                    Err(e) => {
+                        log::warn!("Bypass mode decode error: {:?}", e);
+                    }
+                }
+            } else {
+                log::warn!(
+                    "No decoder registered for payload type {} in bypass mode",
+                    packet.header.payload_type
+                );
+            }
+            return Ok(());
+        }
+
+        // Normal NetEQ processing
         // Update delay manager
         let _relative_delay =
             self.delay_manager
@@ -258,6 +288,41 @@ impl NetEq {
 
     /// Get 10ms of audio data
     pub fn get_audio(&mut self) -> Result<AudioFrame> {
+        if self.config.bypass_mode {
+            // Bypass mode: return samples directly from queue
+            let mut frame = AudioFrame::new(
+                self.config.sample_rate,
+                self.config.channels,
+                self.output_frame_size_samples / self.config.channels as usize,
+            );
+
+            let samples_needed = self.output_frame_size_samples;
+            let mut filled = 0;
+
+            // Fill from bypass queue
+            while filled < samples_needed && !self.bypass_audio_queue.is_empty() {
+                frame.samples[filled] = self.bypass_audio_queue.pop_front().unwrap();
+                filled += 1;
+            }
+
+            // Fill remaining with silence if needed
+            while filled < samples_needed {
+                frame.samples[filled] = 0.0;
+                filled += 1;
+            }
+
+            frame.speech_type = if filled == samples_needed {
+                SpeechType::Normal
+            } else {
+                SpeechType::Expand
+            };
+            frame.vad_activity = filled > 0;
+
+            return Ok(frame);
+        }
+
+        // Normal NetEQ processing continues below...
+
         let mut frame = AudioFrame::new(
             self.config.sample_rate,
             self.config.channels,

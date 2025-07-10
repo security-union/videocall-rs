@@ -85,6 +85,14 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
     }
 }
 
+impl AudioDecoderWrapper {
+    pub fn flush(&self) -> Result<(), JsValue> {
+        // AudioDecoder.flush() returns a Promise, we'll call it and return immediately
+        let _ = self.0.flush();
+        Ok(())
+    }
+}
+
 // Implement the general media decoder trait
 impl MediaDecoderTrait for AudioDecoderWrapper {
     type InitType = AudioDecoderInit;

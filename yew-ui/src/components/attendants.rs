@@ -17,15 +17,14 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility,
-    canvas_generator,
-    neteq_chart::{ChartType, NetEqChart},
+    browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     peer_list::PeerList,
 };
 use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_utils::window;
 use log::{debug, error, warn};
+use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_diagnostics::{subscribe, MetricValue};
@@ -77,9 +76,9 @@ pub enum Msg {
     RemoveLastFakePeer,
     #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
-    NetEqStatsUpdated(String),
-    NetEqBufferUpdated(u64),
-    NetEqJitterUpdated(u64),
+    NetEqStatsUpdated(String, String), // (peer_id, stats_json)
+    NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
+    NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
 }
 
 impl From<WsAction> for Msg {
@@ -127,8 +126,9 @@ pub struct AttendantsComponent {
     pub sender_stats: Option<String>,
     pub encoder_settings: Option<String>,
     pub neteq_stats: Option<String>,
-    pub neteq_buffer_history: Vec<u64>,
-    pub neteq_jitter_history: Vec<u64>,
+    pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
+    pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
+    pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -292,8 +292,9 @@ impl Component for AttendantsComponent {
             sender_stats: None,
             encoder_settings: None,
             neteq_stats: None,
-            neteq_buffer_history: Vec::new(),
-            neteq_jitter_history: Vec::new(),
+            neteq_stats_per_peer: HashMap::new(),
+            neteq_buffer_per_peer: HashMap::new(),
+            neteq_jitter_per_peer: HashMap::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -313,15 +314,30 @@ impl Component for AttendantsComponent {
                         for m in &evt.metrics {
                             if m.name == "stats_json" {
                                 if let MetricValue::Text(json) = &m.value {
-                                    link.send_message(Msg::NetEqStatsUpdated(json.clone()));
+                                    let peer_id = evt
+                                        .stream_id
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    link.send_message(Msg::NetEqStatsUpdated(
+                                        peer_id,
+                                        json.clone(),
+                                    ));
                                 }
                             } else if m.name == "current_buffer_size_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    link.send_message(Msg::NetEqBufferUpdated(*v));
+                                    let peer_id = evt
+                                        .stream_id
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    link.send_message(Msg::NetEqBufferUpdated(peer_id, *v));
                                 }
                             } else if m.name == "jitter_buffer_delay_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    link.send_message(Msg::NetEqJitterUpdated(*v));
+                                    let peer_id = evt
+                                        .stream_id
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    link.send_message(Msg::NetEqJitterUpdated(peer_id, *v));
                                 }
                             }
                         }
@@ -508,21 +524,33 @@ impl Component for AttendantsComponent {
                 self.simulation_info_message = None;
                 true
             }
-            Msg::NetEqStatsUpdated(s) => {
-                self.neteq_stats = Some(s);
+            Msg::NetEqStatsUpdated(peer_id, stats_json) => {
+                self.neteq_stats = Some(stats_json.clone());
+
+                // Accumulate stats history per peer for dashboard charts
+                let peer_stats = self
+                    .neteq_stats_per_peer
+                    .entry(peer_id.clone())
+                    .or_default();
+                peer_stats.push(stats_json);
+                if peer_stats.len() > 60 {
+                    peer_stats.remove(0);
+                } // keep last 60 entries (60 seconds of data)
                 true
             }
-            Msg::NetEqBufferUpdated(v) => {
-                self.neteq_buffer_history.push(v);
-                if self.neteq_buffer_history.len() > 50 {
-                    self.neteq_buffer_history.remove(0);
+            Msg::NetEqBufferUpdated(peer_id, buffer_value) => {
+                let peer_buffer = self.neteq_buffer_per_peer.entry(peer_id).or_default();
+                peer_buffer.push(buffer_value);
+                if peer_buffer.len() > 50 {
+                    peer_buffer.remove(0);
                 } // keep last 50
                 false
             }
-            Msg::NetEqJitterUpdated(v) => {
-                self.neteq_jitter_history.push(v);
-                if self.neteq_jitter_history.len() > 50 {
-                    self.neteq_jitter_history.remove(0);
+            Msg::NetEqJitterUpdated(peer_id, jitter_value) => {
+                let peer_jitter = self.neteq_jitter_per_peer.entry(peer_id).or_default();
+                peer_jitter.push(jitter_value);
+                if peer_jitter.len() > 50 {
+                    peer_jitter.remove(0);
                 }
                 false
             }
@@ -535,6 +563,7 @@ impl Component for AttendantsComponent {
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
         let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
+        let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
         let mut display_peers_vec = real_peers_vec.clone();
@@ -896,81 +925,39 @@ impl Component for AttendantsComponent {
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
-                <div id="diagnostics-sidebar" class={if self.diagnostics_open {"visible"} else {""}}>
-                    <div class="sidebar-header">
-                        <h2>{"Diagnostics"}</h2>
-                        <button class="close-button" onclick={toggle_diagnostics}>{"×"}</button>
-                    </div>
-                    <div class="sidebar-content">
-                        <div class="diagnostics-data">
-                            <div class="diagnostics-section">
-                                <h3>{"Reception Stats"}</h3>
-                                {
-                                    if let Some(data) = &self.diagnostics_data {
-                                        html! { <pre>{ data }</pre> }
-                                    } else {
-                                        html! { <p>{"No reception data available."}</p> }
-                                    }
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Sending Stats"}</h3>
-                                {
-                                    if let Some(data) = &self.sender_stats {
-                                        html! { <pre>{ data }</pre> }
-                                    } else {
-                                        html! { <p>{"No sending data available."}</p> }
-                                    }
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Encoder Settings"}</h3>
-                                {
-                                    if let Some(data) = &self.encoder_settings {
-                                        html! { <pre>{ data }</pre> }
-                                    } else {
-                                        html! { <p>{"No encoder settings available."}</p> }
-                                    }
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"NetEQ Stats"}</h3>
-                                {
-                                    if let Some(data) = &self.neteq_stats {
-                                        html! { <pre>{ data }</pre> }
-                                    } else {
-                                        html! { <p>{"No NetEQ stats available."}</p> }
-                                    }
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Media Status"}</h3>
-                                <pre>{format!("Video: {}\nAudio: {}\nScreen Share: {}",
-                                    if self.video_enabled { "Enabled" } else { "Disabled" },
-                                    if self.mic_enabled { "Enabled" } else { "Disabled" },
-                                    if self.share_screen { "Enabled" } else { "Disabled" }
-                                )}</pre>
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"NetEQ Buffer / Jitter History"}</h3>
-                                <div style="display:flex; gap:12px; align-items:center;">
-                                    <NetEqChart
-                                        data={self.neteq_buffer_history.clone()}
-                                        chart_type={ChartType::Buffer}
-                                        width={140}
-                                        height={80}
-                                    />
-                                    <NetEqChart
-                                        data={self.neteq_jitter_history.clone()}
-                                        chart_type={ChartType::Jitter}
-                                        width={140}
-                                        height={80}
-                                    />
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+                <Diagnostics
+                    is_open={self.diagnostics_open}
+                    on_close={close_diagnostics}
+                    diagnostics_data={self.diagnostics_data.clone()}
+                    sender_stats={self.sender_stats.clone()}
+                    encoder_settings={self.encoder_settings.clone()}
+                    neteq_stats={
+                        let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
+                        if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
+                    }
+                    neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
+                    neteq_buffer_history={
+                        // Aggregate all peers' buffer history, taking the most recent from each
+                        let mut aggregated_buffer = Vec::new();
+                        for peer_buffer in self.neteq_buffer_per_peer.values() {
+                            aggregated_buffer.extend(peer_buffer.iter().cloned());
+                        }
+                        aggregated_buffer
+                    }
+                    neteq_jitter_history={
+                        // Aggregate all peers' jitter history, taking the most recent from each
+                        let mut aggregated_jitter = Vec::new();
+                        for peer_jitter in self.neteq_jitter_per_peer.values() {
+                            aggregated_jitter.extend(peer_jitter.iter().cloned());
+                        }
+                        aggregated_jitter
+                    }
+                    neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
+                    neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
+                    video_enabled={self.video_enabled}
+                    mic_enabled={self.mic_enabled}
+                    share_screen={self.share_screen}
+                />
             </div>
         }
     }

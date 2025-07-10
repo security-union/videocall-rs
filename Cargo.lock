@@ -3604,9 +3604,11 @@ dependencies = [
  "console_error_panic_hook",
  "cpal",
  "env_logger",
+ "gloo-utils 0.2.0",
  "hound",
  "js-sys",
  "log",
+ "once_cell",
  "opus",
  "rand 0.9.1",
  "ringbuf",
@@ -3618,6 +3620,7 @@ dependencies = [
  "tower 0.4.13",
  "tower-http",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
  "web-time",
 ]
@@ -6538,7 +6541,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-diagnostics"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "flume",
  "js-sys",
@@ -6668,6 +6671,7 @@ dependencies = [
  "lazy_static",
  "log",
  "regex",
+ "serde",
  "serde_json",
  "videocall-client",
  "videocall-diagnostics",

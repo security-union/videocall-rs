@@ -16,8 +16,8 @@ readme = "../README.md"
 yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = { workspace = true }
 videocall-types = { path= "../videocall-types", version = "1.0.3" }
-videocall-client = { path= "../videocall-client", version = "1.1.9" }
-videocall-diagnostics = { path = "../videocall-diagnostics" }
+videocall-client = { path= "../videocall-client", version = "1.1.9", features = ["neteq_ff"] }
+videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.0" }
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"
 lazy_static = "1.4.0"
@@ -31,6 +31,7 @@ futures = "0.3.31"
 web-time = "1.1.0"
 regex = "1.10"
 js-sys = "0.3.72"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dependencies.web-sys]

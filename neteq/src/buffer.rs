@@ -204,6 +204,27 @@ impl PacketBuffer {
             return Ok(BufferReturnCode::Ok);
         }
 
+        // Detect reordering: if packet is not inserted at the end, it's reordered
+        let is_reordered = insert_pos < self.buffer.len();
+
+        if is_reordered {
+            // Calculate reorder distance (how far out of order)
+            let expected_pos = self.buffer.len();
+            let distance = (expected_pos - insert_pos) as u16;
+            stats.packet_reordered(distance);
+
+            log::debug!(
+                "Reordered packet detected: seq={}, ts={}, insert_pos={}, expected_pos={}, distance={}",
+                packet.header.sequence_number,
+                packet.header.timestamp,
+                insert_pos,
+                expected_pos,
+                distance
+            );
+        } else {
+            stats.packet_in_order();
+        }
+
         // Insert the packet
         self.buffer.insert(insert_pos, packet);
 

@@ -151,6 +151,172 @@ impl NetEqAudioPeerDecoder {
         Ok((audio_context, pcm_player))
     }
 
+    /// Handle PCM audio data from NetEq worker
+    fn handle_pcm_data(
+        pcm: Float32Array,
+        pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
+        audio_context: &AudioContext,
+    ) {
+        // Ensure AudioContext is running
+        if let Err(e) = audio_context.resume() {
+            web_sys::console::warn_1(
+                &format!("[neteq-audio-decoder] AudioContext resume error: {:?}", e).into(),
+            );
+        }
+
+        let pcm_player_clone = pcm_player.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            Self::ensure_worklet_initialized(&pcm_player_clone).await;
+
+            if let Some(ref worklet) = *pcm_player_clone.borrow() {
+                Self::send_pcm_to_safari_worklet(worklet, &pcm);
+            }
+        });
+    }
+
+    /// Ensure AudioWorklet is initialized (lazy initialization)
+    async fn ensure_worklet_initialized(pcm_player: &Rc<RefCell<Option<AudioWorkletNode>>>) {
+        if pcm_player.borrow().is_some() {
+            return;
+        }
+
+        web_sys::console::log_1(&"Initializing AudioWorklet for PCM playback".into());
+
+        match Self::create_safari_audio_context(None).await {
+            Ok((_, worklet)) => {
+                *pcm_player.borrow_mut() = Some(worklet);
+                web_sys::console::log_1(&"AudioWorklet initialized successfully".into());
+            }
+            Err(e) => {
+                web_sys::console::error_2(&"Failed to initialize worklet:".into(), &e);
+            }
+        }
+    }
+
+    /// Handle statistics messages from NetEq worker
+    fn handle_stats_message(data: &JsValue, peer_id: &str) {
+        let obj = match data.dyn_ref::<js_sys::Object>() {
+            Some(obj) => obj,
+            None => return,
+        };
+
+        let cmd =
+            js_sys::Reflect::get(obj, &JsValue::from_str("cmd")).unwrap_or(JsValue::UNDEFINED);
+
+        if cmd.as_string().as_deref() != Some("stats") {
+            return;
+        }
+
+        let stats_js = match js_sys::Reflect::get(obj, &JsValue::from_str("stats")) {
+            Ok(stats) => stats,
+            Err(_) => return,
+        };
+
+        let stats_json = match js_sys::JSON::stringify(&stats_js) {
+            Ok(json) => json,
+            Err(_) => return,
+        };
+
+        let json_str = match stats_json.as_string() {
+            Some(s) => s,
+            None => return,
+        };
+
+        Self::emit_stats_diagnostics(&json_str, peer_id);
+        Self::emit_parsed_metrics(&json_str, peer_id);
+    }
+
+    /// Emit raw stats JSON for debugging
+    fn emit_stats_diagnostics(json_str: &str, peer_id: &str) {
+        let _ = global_sender().send(DiagEvent {
+            subsystem: "neteq",
+            stream_id: Some(peer_id.to_string()),
+            ts_ms: now_ms(),
+            metrics: vec![metric!("stats_json", json_str.to_string())],
+        });
+    }
+
+    /// Parse and emit specific metrics
+    fn emit_parsed_metrics(json_str: &str, peer_id: &str) {
+        let parsed: Value = match serde_json::from_str(json_str) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        Self::emit_jitter_metrics(&parsed, peer_id);
+        Self::emit_buffer_metrics(&parsed, peer_id);
+    }
+
+    /// Emit jitter buffer metrics
+    fn emit_jitter_metrics(parsed: &Value, peer_id: &str) {
+        let lifetime = match parsed.get("lifetime") {
+            Some(l) => l,
+            None => return,
+        };
+
+        if let Some(jitter) = lifetime
+            .get("jitter_buffer_delay_ms")
+            .and_then(|v| v.as_u64())
+        {
+            let _ = global_sender().send(DiagEvent {
+                subsystem: "neteq",
+                stream_id: Some(peer_id.to_string()),
+                ts_ms: now_ms(),
+                metrics: vec![metric!("jitter_buffer_delay_ms", jitter)],
+            });
+        }
+
+        if let Some(target) = lifetime
+            .get("jitter_buffer_target_delay_ms")
+            .and_then(|v| v.as_u64())
+        {
+            let _ = global_sender().send(DiagEvent {
+                subsystem: "neteq",
+                stream_id: Some(peer_id.to_string()),
+                ts_ms: now_ms(),
+                metrics: vec![metric!("jitter_buffer_target_delay_ms", target)],
+            });
+        }
+    }
+
+    /// Emit buffer size metrics
+    fn emit_buffer_metrics(parsed: &Value, peer_id: &str) {
+        let network = match parsed.get("network") {
+            Some(n) => n,
+            None => return,
+        };
+
+        if let Some(buf) = network
+            .get("current_buffer_size_ms")
+            .and_then(|v| v.as_u64())
+        {
+            let _ = global_sender().send(DiagEvent {
+                subsystem: "neteq",
+                stream_id: Some(peer_id.to_string()),
+                ts_ms: now_ms(),
+                metrics: vec![metric!("current_buffer_size_ms", buf)],
+            });
+        }
+    }
+
+    /// Create message handler for NetEq worker
+    fn create_message_handler(
+        pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
+        audio_context: AudioContext,
+        peer_id: String,
+    ) -> Closure<dyn FnMut(MessageEvent)> {
+        Closure::wrap(Box::new(move |event: MessageEvent| {
+            let data = event.data();
+
+            if data.is_instance_of::<Float32Array>() {
+                let pcm = Float32Array::from(data);
+                Self::handle_pcm_data(pcm, pcm_player.clone(), &audio_context);
+            } else if data.is_object() {
+                Self::handle_stats_message(&data, &peer_id);
+            }
+        }) as Box<dyn FnMut(_)>)
+    }
+
     /// Create audio decoder that uses NetEq worker for buffering and timing
     pub fn new(
         speaker_device_id: Option<String>,
@@ -188,56 +354,11 @@ impl NetEqAudioPeerDecoder {
         let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
 
         // Set up worker message handling
-        let pcm_player_clone = pcm_player_ref.clone();
-        let audio_ctx_clone = audio_context.clone();
-
-        let on_message_closure = Closure::wrap(Box::new(move |event: MessageEvent| {
-            let data = event.data();
-            if data.is_instance_of::<Float32Array>() {
-                // Ensure AudioContext is running
-                if let Err(e) = audio_ctx_clone.resume() {
-                    web_sys::console::warn_1(
-                        &format!("[neteq-audio-decoder] AudioContext resume error: {:?}", e).into(),
-                    );
-                }
-
-                let pcm = Float32Array::from(data);
-                let pcm_copy = pcm.clone();
-                let pcm_player_clone = pcm_player_clone.clone();
-
-                wasm_bindgen_futures::spawn_local(async move {
-                    // Check if worklet is already initialized
-                    let needs_init = pcm_player_clone.borrow().is_none();
-
-                    if needs_init {
-                        web_sys::console::log_1(
-                            &"Initializing AudioWorklet for PCM playback".into(),
-                        );
-                        // Initialize the worklet
-                        match Self::create_safari_audio_context(None).await {
-                            Ok((_, worklet)) => {
-                                *pcm_player_clone.borrow_mut() = Some(worklet);
-                                web_sys::console::log_1(
-                                    &"AudioWorklet initialized successfully".into(),
-                                );
-                            }
-                            Err(e) => {
-                                web_sys::console::error_2(
-                                    &"Failed to initialize worklet:".into(),
-                                    &e,
-                                );
-                                return;
-                            }
-                        }
-                    }
-
-                    // Send PCM to worklet
-                    if let Some(ref worklet) = *pcm_player_clone.borrow() {
-                        Self::send_pcm_to_safari_worklet(worklet, &pcm_copy);
-                    }
-                });
-            }
-        }) as Box<dyn FnMut(_)>);
+        let on_message_closure = Self::create_message_handler(
+            pcm_player_ref.clone(),
+            audio_context.clone(),
+            peer_id.clone(),
+        );
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
 

@@ -269,7 +269,7 @@ impl Drop for SafariOpusDecoder {
                 console::log_1(&"Safari decoder: Cleaning up OpusDecoder instance".into());
 
                 // Call the cached free() method directly (no reflection!)
-                if let Err(_) = free_fn.call0(decoder) {
+                if free_fn.call0(decoder).is_err() {
                     console::warn_1(&"Safari decoder: Failed to call free() method".into());
                 } else {
                     console::log_1(&"Safari decoder: Successfully freed OpusDecoder memory".into());

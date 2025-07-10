@@ -1,6 +1,6 @@
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
-use js_sys::{Float32Array, Object, Reflect};
+use js_sys::Float32Array;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_wasm_bindgen;

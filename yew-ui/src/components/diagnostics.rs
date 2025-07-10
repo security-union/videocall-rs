@@ -270,23 +270,6 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                     height={200}
                                 />
                             </div>
-                            <div class="chart-container">
-                                // Legacy buffer/jitter charts
-                                <div style="display:flex; gap:12px; align-items:center;">
-                                    <NetEqChart
-                                        data={buffer_history.clone()}
-                                        chart_type={ChartType::Buffer}
-                                        width={140}
-                                        height={80}
-                                    />
-                                    <NetEqChart
-                                        data={jitter_history.clone()}
-                                        chart_type={ChartType::Jitter}
-                                        width={140}
-                                        height={80}
-                                    />
-                                </div>
-                            </div>
                         </div>
                     </div>
                 } else {
@@ -361,16 +344,6 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                 html! { <pre>{ data }</pre> }
                             } else {
                                 html! { <p>{"No encoder settings available."}</p> }
-                            }
-                        }
-                    </div>
-                    <div class="diagnostics-section">
-                        <h3>{"NetEQ Raw Stats"}</h3>
-                        {
-                            if let Some(data) = &props.neteq_stats {
-                                html! { <pre>{ data }</pre> }
-                            } else {
-                                html! { <p>{"No NetEQ stats available."}</p> }
                             }
                         }
                     </div>

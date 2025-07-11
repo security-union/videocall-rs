@@ -270,6 +270,19 @@ impl AttendantsComponent {
     fn view_grid_toggle(&self, _ctx: &Context<Self>) -> Html {
         html! {} // Empty html when feature is not enabled
     }
+
+    fn play_user_joined() {
+        if let Some(_window) = web_sys::window() {
+            if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
+                audio.set_volume(0.4); // Set moderate volume
+                if let Err(e) = audio.play() {
+                    log::warn!("Failed to play notification sound: {:?}", e);
+                }
+            } else {
+                log::warn!("Failed to create audio element for notification sound");
+            }
+        }
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -426,7 +439,12 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(_email) => true,
+            Msg::OnPeerAdded(email) => {
+                log::info!("New user joined: {}", email);
+                // Play notification sound when a new user joins the call
+                Self::play_user_joined();
+                true
+            }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::MeetingAction(action) => {
                 match action {

@@ -43,6 +43,7 @@ features = [
     "Storage",
     "Document",
     "Clipboard",
+    "HtmlAudioElement",
 ]
 
 [dev-dependencies]

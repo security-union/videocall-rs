@@ -1,10 +1,20 @@
+use lazy_static::lazy_static;
 use videocall_types::truthy;
 
-// This is read at compile time, please restart if you change this value.
-pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
-pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
-pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lobby");
 pub const CANVAS_LIMIT: usize = 20;
+
+lazy_static! {
+    pub static ref LOGIN_URL: String = 
+        std::env::var("LOGIN_URL").unwrap_or_else(|_| "http://localhost:8081/login".to_string());
+    pub static ref ACTIX_WEBSOCKET: String = format!(
+        "{}/lobby",
+        std::env::var("ACTIX_UI_BACKEND_URL").unwrap_or_else(|_| "ws://localhost:8081".to_string())
+    );
+    pub static ref WEBTRANSPORT_HOST: String = format!(
+        "{}/lobby",
+        std::env::var("WEBTRANSPORT_HOST").unwrap_or_else(|_| "https://127.0.0.1:4433".to_string())
+    );
+}
 
 pub const AUDIO_BITRATE_KBPS: u32 = 65u32;
 pub const VIDEO_BITRATE_KBPS: u32 = 1_000u32;

@@ -1,8 +1,8 @@
 use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, peer_list::PeerList,
 };
-use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
-use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
+use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM};
+use crate::components::host::Host;
 use log::{debug, error, warn};
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -102,8 +102,8 @@ impl AttendantsComponent {
         let id = ctx.props().id.clone();
         let opts = VideoCallClientOptions {
             userid: email.clone(),
-            websocket_url: format!("{ACTIX_WEBSOCKET}/{email}/{id}"),
-            webtransport_url: format!("{WEBTRANSPORT_HOST}/{email}/{id}"),
+            websocket_url: format!("{}/{}/{}", *crate::constants::ACTIX_WEBSOCKET, email, id),
+            webtransport_url: format!("{}/{}/{}", *crate::constants::WEBTRANSPORT_HOST, email, id),
             enable_e2ee: ctx.props().e2ee_enabled,
             enable_webtransport: ctx.props().webtransport_enabled,
             on_connected: {

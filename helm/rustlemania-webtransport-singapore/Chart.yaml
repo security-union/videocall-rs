@@ -1,0 +1,5 @@
+apiVersion: v2
+name: rustlemania-webtransport-singapore
+version: 0.1.0
+description: WebTransport server for Singapore region
+appVersion: "1.0.0" 

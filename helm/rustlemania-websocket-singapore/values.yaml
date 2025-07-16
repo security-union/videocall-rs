@@ -1,0 +1,91 @@
+# Singapore WebSocket server configuration
+nameOverride: "rustlemania-websocket-singapore"
+fullnameOverride: "rustlemania-websocket-singapore"
+
+replicaCount: 2  # Start with 2 replicas for HA
+
+image:
+  repository: securityunion/rustlemania-api
+  pullPolicy: Always
+  tag: latest
+
+env:
+  - name: RUST_LOG
+    value: info
+  - name: ACTIX_PORT
+    value: "8080"
+  - name: UI_ENDPOINT
+    value: https://singapore.videocall.rs
+  - name: NATS_URL
+    value: nats-singapore:4222  # Connect to Singapore NATS cluster
+  - name: DATABASE_ENABLED
+    value: "false"
+  - name: DATABASE_URL
+    value: abc
+  - name: REGION
+    value: "singapore"
+
+resources:
+  limits:
+    cpu: "200m"  # Higher resources for international traffic
+    memory: "256Mi"
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+service:
+  type: ClusterIP
+  port: 8080
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Node selector for Singapore region
+nodeSelector:
+  kubernetes.io/region: "sgp1"
+
+tolerations: []
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        labelSelector:
+          matchExpressions:
+          - key: app
+            operator: In
+            values:
+            - rustlemania-websocket-singapore
+        topologyKey: kubernetes.io/hostname
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    kubernetes.io/tls-acme: "true"
+    # Cloudflare-specific annotations for geo-routing
+    external-dns.alpha.kubernetes.io/cloudflare-proxied: "true"
+    external-dns.alpha.kubernetes.io/hostname: "api.singapore.videocall.rs"
+  hosts:
+    - host: api.singapore.videocall.rs
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: rustlemania-websocket-singapore
+            port:
+              number: 8080
+  tls:
+    - secretName: rustlemania-websocket-singapore-tls
+      hosts:
+        - api.singapore.videocall.rs 

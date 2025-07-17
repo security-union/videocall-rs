@@ -16,27 +16,35 @@
  * conditions.
  */
 
-use super::super::connection::{ConnectOptions, Connection};
+use super::super::connection::{ConnectionManager, ConnectionManagerOptions, ConnectionState};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
+
 use log::{debug, error, info};
 use protobuf::Message;
 use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
 use rsa::RsaPublicKey;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
+
+/// RTT testing period in milliseconds
+const RTT_TESTING_PERIOD_MS: u64 = 3000;
+
+/// Interval between RTT probes in milliseconds  
 
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]
@@ -65,11 +73,11 @@ pub struct VideoCallClientOptions {
     /// remote peers' clients.
     pub userid: String,
 
-    /// The url to which WebSocket connections should be made
-    pub websocket_url: String,
+    /// The urls to which WebSocket connections should be made (comma-separated)
+    pub websocket_urls: Vec<String>,
 
-    /// The url to which WebTransport connections should be made
-    pub webtransport_url: String,
+    /// The urls to which WebTransport connections should be made (comma-separated)
+    pub webtransport_urls: Vec<String>,
 
     /// Callback will be called as `callback(())` after a new connection is made
     pub on_connected: Callback<()>,
@@ -91,6 +99,12 @@ pub struct VideoCallClientOptions {
 
     /// Callback for encoder settings
     pub on_encoder_settings_update: Option<Callback<String>>,
+
+    /// RTT testing period in milliseconds (default: 3000ms)
+    pub rtt_testing_period_ms: Option<u64>,
+
+    /// Interval between RTT probes in milliseconds (default: 200ms)
+    pub rtt_probe_interval_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -103,7 +117,8 @@ struct InnerOptions {
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
-    connection: Option<Connection>,
+    connection_manager: Option<ConnectionManager>,
+    connection_state: ConnectionState,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
@@ -194,7 +209,11 @@ impl VideoCallClient {
                     userid: options.userid.clone(),
                     on_peer_added: options.on_peer_added.clone(),
                 },
-                connection: None,
+                connection_manager: None,
+                connection_state: ConnectionState::Failed {
+                    error: "Not connected".to_string(),
+                    last_known_server: None,
+                },
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -219,12 +238,11 @@ impl VideoCallClient {
         client
     }
 
-    /// Initiates a connection to a videocall server.
+    /// Initiates a connection to a videocall server with RTT testing.
     ///
-    /// Initiates a connection using WebTransport (to
-    /// [`options.webtransport_url`](VideoCallClientOptions::webtransport_url)) or WebSocket (to
-    /// [`options.websocket_url`](VideoCallClientOptions::websocket_url)), based on the value of
-    /// [`options.enable_webtransport`](VideoCallClientOptions::enable_webtransport).
+    /// Tests all provided servers by measuring round-trip time (RTT) and connects to the server
+    /// with the lowest average RTT. The testing period and probe interval can be configured
+    /// via the options.
     ///
     /// Note that this method's success means only that it succesfully *attempted* initiation of the
     /// connection.  The connection cannot actually be considered to have been succesful until the
@@ -234,11 +252,34 @@ impl VideoCallClient {
     /// [`options.on_connection_lost`](VideoCallClientOptions::on_connection_lost) callback will be
     /// invoked.
     ///
-    pub fn connect(&mut self) -> anyhow::Result<()> {
-        let options = ConnectOptions {
+    pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
+        let total_servers =
+            self.options.websocket_urls.len() + self.options.webtransport_urls.len();
+        info!("Starting RTT testing for {} servers", total_servers);
+
+        if total_servers == 0 {
+            return Err(anyhow!("No servers provided for RTT testing"));
+        }
+
+        if total_servers == 1 {
+            // Only one server available, skip RTT testing
+            info!("Only one server available, skipping RTT testing");
+            return self.connect();
+        }
+
+        let testing_period = self
+            .options
+            .rtt_testing_period_ms
+            .unwrap_or(RTT_TESTING_PERIOD_MS);
+
+        info!("RTT testing period: {}ms", testing_period);
+
+        // Create ConnectionManager which will handle all the RTT testing
+        let manager_options = ConnectionManagerOptions {
+            websocket_urls: self.options.websocket_urls.clone(),
+            webtransport_urls: self.options.webtransport_urls.clone(),
             userid: self.options.userid.clone(),
-            websocket_url: self.options.websocket_url.clone(),
-            webtransport_url: self.options.webtransport_url.clone(),
+            enable_webtransport: self.options.enable_webtransport,
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
@@ -255,22 +296,22 @@ impl VideoCallClient {
                     }
                 })
             },
-            on_connected: {
+            on_state_changed: {
                 let inner = Rc::downgrade(&self.inner);
-                let callback = self.options.on_connected.clone();
-                Callback::from(move |_| {
+                Callback::from(move |state| {
                     if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow() {
-                            Ok(inner) => inner.send_public_key(),
+                        match inner.try_borrow_mut() {
+                            Ok(mut inner) => {
+                                inner.connection_state = state;
+                                // TODO: Handle connection state changes
+                            }
                             Err(_) => {
-                                error!("Unable to borrow inner -- not sending public key");
+                                error!("Unable to borrow inner for state change");
                             }
                         }
                     }
-                    callback.emit(());
                 })
             },
-            on_connection_lost: self.options.on_connection_lost.clone(),
             peer_monitor: {
                 let inner = Rc::downgrade(&self.inner);
                 let on_connection_lost = self.options.on_connection_lost.clone();
@@ -289,24 +330,50 @@ impl VideoCallClient {
                     }
                 })
             },
+            election_period_ms: Some(testing_period),
         };
-        info!(
-            "webtransport connect = {}",
-            self.options.enable_webtransport
-        );
-        info!(
-            "end to end encryption enabled = {}",
-            self.options.enable_e2ee
-        );
+
+        let connection_manager = ConnectionManager::new(manager_options, self.aes.clone())?;
 
         let mut borrowed = self.inner.try_borrow_mut()?;
-        borrowed.connection.replace(Connection::connect(
-            self.options.enable_webtransport,
-            options,
-            self.aes.clone(),
-        )?);
-        info!("Connected to server");
+        borrowed.connection_manager = Some(connection_manager);
+
+        // Set up 1Hz diagnostics reporting timer
+        let inner_ref = Rc::downgrade(&self.inner);
+        let _diagnostics_timer = gloo::timers::callback::Interval::new(1000, move || {
+            if let Some(inner) = inner_ref.upgrade() {
+                if let Ok(inner) = inner.try_borrow() {
+                    if let Some(connection_manager) = &inner.connection_manager {
+                        connection_manager.trigger_diagnostics_report();
+                    }
+                }
+            }
+        });
+
+        // Keep the timer alive (stored in Inner but we'll ignore the warning for now)
+        // TODO: Properly store timer to prevent it from being dropped
+        std::mem::forget(_diagnostics_timer);
+
+        info!("ConnectionManager created with 1Hz diagnostics reporting");
         Ok(())
+    }
+
+    /// Initiates a connection to a videocall server with automatic RTT-based server selection.
+    ///
+    /// This method automatically tests all provided servers and connects to the one with the lowest RTT.
+    /// For single server deployments, it connects immediately without testing.
+    ///
+    /// Note that this method's success means only that it succesfully *attempted* initiation of the
+    /// connection.  The connection cannot actually be considered to have been succesful until the
+    /// [`options.on_connected`](VideoCallClientOptions::on_connected) callback has been invoked.
+    ///
+    /// If the connection does not succeed, the
+    /// [`options.on_connection_lost`](VideoCallClientOptions::on_connection_lost) callback will be
+    /// invoked.
+    ///
+    pub fn connect(&mut self) -> anyhow::Result<()> {
+        // Always use RTT testing - it handles single server case efficiently
+        self.connect_with_rtt_testing()
     }
 
     fn create_peer_decoder_manager(
@@ -333,7 +400,15 @@ impl VideoCallClient {
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
         match self.inner.try_borrow() {
-            Ok(inner) => inner.send_packet(media),
+            Ok(inner) => {
+                if let Some(connection_manager) = &inner.connection_manager {
+                    if let Err(e) = connection_manager.send_packet(media) {
+                        error!("Failed to send packet: {}", e);
+                    }
+                } else {
+                    error!("No connection manager available");
+                }
+            }
             Err(_) => {
                 error!("Unable to borrow inner -- dropping send packet {:?}", media)
             }
@@ -343,8 +418,8 @@ impl VideoCallClient {
     /// Returns `true` if the client is currently connected to a server.
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection) = &inner.connection {
-                return connection.is_connected();
+            if let Some(connection_manager) = &inner.connection_manager {
+                return connection_manager.is_connected();
             }
         };
         false
@@ -410,6 +485,52 @@ impl VideoCallClient {
         &self.options.userid
     }
 
+    /// Get current connection state from ConnectionManager
+    pub fn get_connection_state(&self) -> Option<ConnectionState> {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(connection_manager) = &inner.connection_manager {
+                return Some(connection_manager.get_connection_state());
+            }
+        }
+        None
+    }
+
+    /// Get RTT measurements from ConnectionManager (for debugging)
+    pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(connection_manager) = &inner.connection_manager {
+                let measurements = connection_manager.get_rtt_measurements();
+                let mut result = HashMap::new();
+                for (connection_id, measurement) in measurements {
+                    if let Some(avg_rtt) = measurement.average_rtt {
+                        result.insert(connection_id.clone(), avg_rtt);
+                    }
+                }
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// Send RTT probes manually (for testing)
+    pub fn send_rtt_probes(&self) -> anyhow::Result<()> {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            if let Some(connection_manager) = &mut inner.connection_manager {
+                return connection_manager.send_rtt_probes();
+            }
+        }
+        Err(anyhow!("No connection manager available"))
+    }
+
+    /// Check and complete election if testing period is over
+    pub fn check_election_completion(&self) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            if let Some(connection_manager) = &mut inner.connection_manager {
+                connection_manager.check_and_complete_election();
+            }
+        }
+    }
+
     /// Get diagnostics information for all peers
     ///
     /// Returns a formatted string with FPS stats for all peers if diagnostics are enabled,
@@ -431,16 +552,13 @@ impl VideoCallClient {
 
     /// Send a diagnostic packet to the server
     pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
-        if let Ok(inner) = self.inner.try_borrow() {
-            inner.send_packet(PacketWrapper {
-                packet_type: PacketType::DIAGNOSTICS.into(),
-                email: self.options.userid.clone(),
-                data: packet.write_to_bytes().unwrap(),
-                ..Default::default()
-            });
-        } else {
-            error!("Failed to borrow inner for sending diagnostic packet");
-        }
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::DIAGNOSTICS.into(),
+            email: self.options.userid.clone(),
+            data: packet.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        self.send_packet(wrapper);
     }
 
     pub fn subscribe_diagnostics(
@@ -457,25 +575,58 @@ impl VideoCallClient {
 
     pub fn set_video_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection) = &inner.connection {
-                connection.set_video_enabled(enabled);
+            if let Some(connection_manager) = &inner.connection_manager {
+                if let Err(e) = connection_manager.set_video_enabled(enabled) {
+                    error!("Failed to set video enabled {}: {}", enabled, e);
+                } else {
+                    debug!("Successfully set video enabled: {}", enabled);
+                }
+            } else {
+                debug!(
+                    "No connection manager available for set_video_enabled({})",
+                    enabled
+                );
             }
+        } else {
+            error!("Unable to borrow inner for set_video_enabled({})", enabled);
         }
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection) = &inner.connection {
-                connection.set_audio_enabled(enabled);
+            if let Some(connection_manager) = &inner.connection_manager {
+                if let Err(e) = connection_manager.set_audio_enabled(enabled) {
+                    error!("Failed to set audio enabled {}: {}", enabled, e);
+                } else {
+                    debug!("Successfully set audio enabled: {}", enabled);
+                }
+            } else {
+                debug!(
+                    "No connection manager available for set_audio_enabled({})",
+                    enabled
+                );
             }
+        } else {
+            error!("Unable to borrow inner for set_audio_enabled({})", enabled);
         }
     }
 
     pub fn set_screen_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection) = &inner.connection {
-                connection.set_screen_enabled(enabled);
+            if let Some(connection_manager) = &inner.connection_manager {
+                if let Err(e) = connection_manager.set_screen_enabled(enabled) {
+                    error!("Failed to set screen enabled {}: {}", enabled, e);
+                } else {
+                    debug!("Successfully set screen enabled: {}", enabled);
+                }
+            } else {
+                debug!(
+                    "No connection manager available for set_screen_enabled({})",
+                    enabled
+                );
             }
+        } else {
+            error!("Unable to borrow inner for set_screen_enabled({})", enabled);
         }
     }
 
@@ -499,12 +650,6 @@ impl VideoCallClient {
 }
 
 impl Inner {
-    fn send_packet(&self, media: PacketWrapper) {
-        if let Some(connection) = &self.connection {
-            connection.send_packet(media);
-        }
-    }
-
     fn on_inbound_media(&mut self, response: PacketWrapper) {
         debug!(
             "<< Received {:?} from {}",
@@ -555,12 +700,22 @@ impl Inner {
                 match encrypted_aes_packet {
                     Ok(data) => {
                         debug!(">> {} sending AES key", self.options.userid);
-                        self.send_packet(PacketWrapper {
-                            packet_type: PacketType::AES_KEY.into(),
-                            email: self.options.userid.clone(),
-                            data,
-                            ..Default::default()
-                        });
+
+                        // Send AES key packet via ConnectionManager
+                        if let Some(connection_manager) = &self.connection_manager {
+                            let packet = PacketWrapper {
+                                packet_type: PacketType::AES_KEY.into(),
+                                email: self.options.userid.clone(),
+                                data,
+                                ..Default::default()
+                            };
+
+                            if let Err(e) = connection_manager.send_packet(packet) {
+                                error!("Failed to send AES key packet: {}", e);
+                            }
+                        } else {
+                            error!("No connection manager available for AES key");
+                        }
                     }
                     Err(e) => {
                         error!("Failed to send AES_KEY to peer: {}", e);
@@ -569,6 +724,8 @@ impl Inner {
             }
             Ok(PacketType::MEDIA) => {
                 let email = response.email.clone();
+
+                // RTT handling is now done in ConnectionManager
                 if let Err(e) = self.peer_decode_manager.decode(response) {
                     error!("error decoding packet: {}", e);
                     self.peer_decode_manager.delete_peer(&email);
@@ -616,12 +773,22 @@ impl Inner {
                 match packet.write_to_bytes() {
                     Ok(data) => {
                         debug!(">> {} sending public key", userid);
-                        self.send_packet(PacketWrapper {
-                            packet_type: PacketType::RSA_PUB_KEY.into(),
-                            email: userid,
-                            data,
-                            ..Default::default()
-                        });
+
+                        // Send RSA public key packet via ConnectionManager
+                        if let Some(connection_manager) = &self.connection_manager {
+                            let packet = PacketWrapper {
+                                packet_type: PacketType::RSA_PUB_KEY.into(),
+                                email: userid,
+                                data,
+                                ..Default::default()
+                            };
+
+                            if let Err(e) = connection_manager.send_packet(packet) {
+                                error!("Failed to send RSA public key packet: {}", e);
+                            }
+                        } else {
+                            error!("No connection manager available for RSA public key");
+                        }
                     }
                     Err(e) => {
                         error!("Failed to serialize rsa packet: {}", e);

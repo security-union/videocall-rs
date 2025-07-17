@@ -1,0 +1,66 @@
+# Singapore WebSocket server configuration
+rustlemania-websocket:
+  nameOverride: "websocket-singapore"
+  fullnameOverride: "websocket-singapore"
+
+  replicaCount: 1
+
+  env:
+    - name: RUST_LOG
+      value: info
+    - name: ACTIX_PORT
+      value: "8080"
+    - name: UI_ENDPOINT
+      value: https://singapore.webtransport.video
+    - name: NATS_URL
+      value: nats-singapore:4222  # Connect to Singapore NATS cluster
+    - name: DATABASE_ENABLED
+      value: "false"
+    - name: DATABASE_URL
+      value: abc
+    - name: REGION
+      value: "singapore"
+
+  resources:
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+
+  service:
+    type: LoadBalancer  # LoadBalancer to get external IP
+    port: 8080
+    annotations:
+      service.beta.kubernetes.io/do-loadbalancer-name: "websocket-singapore"
+      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
+      external-dns.alpha.kubernetes.io/hostname: "websocket-singapore.webtransport.video"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+  # Node selector for Singapore region
+  nodeSelector:
+    topology.kubernetes.io/region: "sgp1"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - websocket-singapore
+          topologyKey: kubernetes.io/hostname 

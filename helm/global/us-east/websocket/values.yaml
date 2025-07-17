@@ -1,0 +1,66 @@
+# US East WebSocket server configuration
+rustlemania-websocket:
+  nameOverride: "websocket-us-east"
+  fullnameOverride: "websocket-us-east"
+
+  replicaCount: 1  # Higher replicas for primary region
+
+  env:
+    - name: RUST_LOG
+      value: info
+    - name: ACTIX_PORT
+      value: "8080"
+    - name: UI_ENDPOINT
+      value: https://websocket-us-east.webtransport.video
+    - name: NATS_URL
+      value: nats-us-east:4222  # Connect to US East NATS cluster
+    - name: DATABASE_ENABLED
+      value: "false"
+    - name: DATABASE_URL
+      value: abc
+    - name: REGION
+      value: "us-east"
+
+  resources:
+    limits:
+      cpu: "300m"
+      memory: "384Mi"
+    requests:
+      cpu: "150m"
+      memory: "192Mi"
+
+  service:
+    type: LoadBalancer  # LoadBalancer to get external IP
+    port: 8080
+    annotations:
+      service.beta.kubernetes.io/do-loadbalancer-name: "websocket-us-east"
+      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
+      external-dns.alpha.kubernetes.io/hostname: "us-east.webtransport.video"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 70
+
+  # Node selector for US East region
+  nodeSelector:
+    topology.kubernetes.io/region: "nyc1"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - websocket-us-east
+          topologyKey: kubernetes.io/hostname 

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: websocket-singapore
+version: 0.1.0
+description: WebSocket server for Singapore region with LoadBalancer
+
+dependencies:
+  - name: rustlemania-websocket
+    version: 0.1.0
+    repository: file://../../../rustlemania-websocket 

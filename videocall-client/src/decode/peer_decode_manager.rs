@@ -294,6 +294,20 @@ impl Peer {
                     },
                 ))
             }
+            MediaType::RTT => {
+                // RTT packets are handled by ConnectionManager, not by peer decoders
+                debug!(
+                    "Received RTT packet for peer {} - ignoring in peer decoder",
+                    self.email
+                );
+                Ok((
+                    media_type,
+                    DecodeStatus {
+                        rendered: false,
+                        first_frame: false,
+                    },
+                ))
+            }
         }
     }
 

@@ -29,8 +29,10 @@ use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
-use tracing::{error, info, trace_span};
+use tracing::{debug, error, info, trace_span};
 use videocall_types::protos::connection_packet::ConnectionPacket;
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use web_transport_quinn::Session;
@@ -47,6 +49,18 @@ pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 
 const MAX_UNIDIRECTIONAL_STREAM_SIZE: usize = 500_000;
+
+/// Check if the binary data is an RTT packet that should be echoed back
+fn is_rtt_packet(data: &[u8]) -> bool {
+    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+        if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+            if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                return media_packet.media_type == MediaType::RTT.into();
+            }
+        }
+    }
+    false
+}
 
 #[derive(Debug)]
 pub struct WebTransportOpt {
@@ -286,20 +300,37 @@ async fn handle_session(
             while let Ok(mut uni_stream) = session.accept_uni().await {
                 let nc = nc.clone();
                 let specific_subject = specific_subject.clone();
+                let session_clone = session.clone();
                 tokio::spawn(async move {
                     let result = uni_stream.read_to_end(1_000_000).await;
                     match result {
                         Ok(buf) => {
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    nc.publish(specific_subject.clone(), buf.into()).await
-                                {
-                                    error!(
-                                        "Error publishing to subject {}: {}",
-                                        &specific_subject, e
-                                    );
+                            // Check if this is an RTT packet that should be echoed back
+                            if is_rtt_packet(&buf) {
+                                debug!("Echoing RTT packet back via WebTransport");
+                                match session_clone.open_uni().await {
+                                    Ok(mut echo_stream) => {
+                                        if let Err(e) = echo_stream.write_all(&buf).await {
+                                            error!("Error echoing RTT packet: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Error opening echo stream: {}", e);
+                                    }
                                 }
-                            });
+                            } else {
+                                // Normal packet processing - publish to NATS
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        nc.publish(specific_subject.clone(), buf.into()).await
+                                    {
+                                        error!(
+                                            "Error publishing to subject {}: {}",
+                                            &specific_subject, e
+                                        );
+                                    }
+                                });
+                            }
                         }
                         Err(e) => {
                             error!("Error reading from unidirectional stream: {}", e);
@@ -311,12 +342,22 @@ async fn handle_session(
     };
 
     let _datagrams_task = {
+        let session_clone = session.clone();
         tokio::spawn(async move {
-            let session = session.read().await;
+            let session = session_clone.read().await;
             while let Ok(buf) = session.read_datagram().await {
-                let nc = nc.clone();
-                if let Err(e) = nc.publish(specific_subject.clone(), buf).await {
-                    error!("Error publishing to subject {}: {}", specific_subject, e);
+                // Check if this is an RTT packet that should be echoed back
+                if is_rtt_packet(&buf) {
+                    debug!("Echoing RTT datagram back via WebTransport");
+                    if let Err(e) = session.send_datagram(buf.into()) {
+                        error!("Error echoing RTT datagram: {}", e);
+                    }
+                } else {
+                    // Normal datagram processing - publish to NATS
+                    let nc = nc.clone();
+                    if let Err(e) = nc.publish(specific_subject.clone(), buf).await {
+                        error!("Error publishing to subject {}: {}", specific_subject, e);
+                    }
                 }
             }
         })
@@ -399,6 +440,7 @@ async fn handle_quic_connection(
                 let nc = nc.clone();
                 let specific_subject_tx_clone = specific_subject_tx.clone();
                 let specific_subject_rx = specific_subject_rx_clone.clone();
+                let session_for_echo = session.clone();
                 tokio::spawn(async move {
                     if let Ok(d) = uni_stream.read_to_end(MAX_UNIDIRECTIONAL_STREAM_SIZE).await {
                         if specific_subject_rx.borrow().is_none() {
@@ -420,9 +462,31 @@ async fn handle_quic_connection(
                                 }
                             }
                         } else {
-                            let specific_subject = specific_subject_rx.borrow().clone().unwrap();
-                            if let Err(e) = nc.publish(specific_subject.clone(), d.into()).await {
-                                error!("Error publishing to subject {}: {}", &specific_subject, e);
+                            // Check if this is an RTT packet that should be echoed back
+                            if is_rtt_packet(&d) {
+                                debug!("Echoing RTT packet back via QUIC");
+                                let session_read = session_for_echo.clone();
+                                match session_read.open_uni().await {
+                                    Ok(mut echo_stream) => {
+                                        if let Err(e) = echo_stream.write_all(&d).await {
+                                            error!("Error echoing RTT packet via QUIC: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Error opening QUIC echo stream: {}", e);
+                                    }
+                                }
+                            } else {
+                                // Normal packet processing - publish to NATS
+                                let specific_subject =
+                                    specific_subject_rx.borrow().clone().unwrap();
+                                if let Err(e) = nc.publish(specific_subject.clone(), d.into()).await
+                                {
+                                    error!(
+                                        "Error publishing to subject {}: {}",
+                                        &specific_subject, e
+                                    );
+                                }
                             }
                         }
                     } else {
@@ -434,16 +498,26 @@ async fn handle_quic_connection(
     };
 
     let _datagrams_task = {
+        let session_clone = session.clone();
         tokio::spawn(async move {
-            let session = session.read().await;
+            let session = session_clone.read().await;
             if specific_subject_rx.borrow().is_none() {
                 specific_subject_rx.changed().await.unwrap();
             }
             let specific_subject = specific_subject_rx.borrow().clone().unwrap();
             while let Ok(datagram) = session.read_datagram().await {
-                let nc = nc.clone();
-                if let Err(e) = nc.publish(specific_subject.clone(), datagram).await {
-                    error!("Error publishing to subject {}: {}", specific_subject, e);
+                // Check if this is an RTT packet that should be echoed back
+                if is_rtt_packet(&datagram) {
+                    debug!("Echoing RTT datagram back via QUIC");
+                    if let Err(e) = session.send_datagram(datagram.into()) {
+                        error!("Error echoing RTT datagram via QUIC: {}", e);
+                    }
+                } else {
+                    // Normal datagram processing - publish to NATS
+                    let nc = nc.clone();
+                    if let Err(e) = nc.publish(specific_subject.clone(), datagram).await {
+                        error!("Error publishing to subject {}: {}", specific_subject, e);
+                    }
                 }
             }
         })

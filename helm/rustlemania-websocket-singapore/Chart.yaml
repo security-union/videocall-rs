@@ -1,5 +1,0 @@
-apiVersion: v2
-name: rustlemania-websocket-singapore
-version: 0.1.0
-description: WebSocket server for Singapore region
-appVersion: "1.0.0" 

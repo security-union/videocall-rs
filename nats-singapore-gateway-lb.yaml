@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-singapore-gateway-lb
+  annotations:
+    service.beta.kubernetes.io/do-loadbalancer-name: "nats-gateway-singapore"
+spec:
+  selector:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/instance: nats-singapore
+  ports:
+    - name: gateway
+      protocol: TCP
+      port: 7222
+      targetPort: 7222
+    - name: client
+      protocol: TCP
+      port: 4222
+      targetPort: 4222
+  type: LoadBalancer 

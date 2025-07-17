@@ -52,6 +52,8 @@ pub struct DiagnosticsProps {
     pub mic_enabled: bool,
     /// Current screen share state
     pub share_screen: bool,
+    /// Connection manager diagnostics state
+    pub connection_manager_state: Option<String>,
 }
 
 fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
@@ -355,6 +357,18 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                             if props.share_screen { "Enabled" } else { "Disabled" }
                         )}</pre>
                     </div>
+                    {
+                        if let Some(connection_state) = &props.connection_manager_state {
+                            html! {
+                                <div class="diagnostics-section">
+                                    <h3>{"Connection Manager"}</h3>
+                                    <pre>{connection_state}</pre>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }
+                    }
                 </div>
             </div>
         </div>

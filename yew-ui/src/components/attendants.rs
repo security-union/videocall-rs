@@ -24,6 +24,7 @@ use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST}
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_utils::window;
 use log::{debug, error, warn};
+use serde_json;
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
@@ -79,6 +80,7 @@ pub enum Msg {
     NetEqStatsUpdated(String, String), // (peer_id, stats_json)
     NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
     NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
+    ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
     HangUp,
 }
 
@@ -130,6 +132,7 @@ pub struct AttendantsComponent {
     pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
     pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
     pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
+    pub connection_manager_state: Option<String>,           // connection manager diagnostics
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -147,8 +150,8 @@ impl AttendantsComponent {
         let id = ctx.props().id.clone();
         let opts = VideoCallClientOptions {
             userid: email.clone(),
-            websocket_url: format!("{ACTIX_WEBSOCKET}/{email}/{id}"),
-            webtransport_url: format!("{WEBTRANSPORT_HOST}/{email}/{id}"),
+            websocket_urls: vec![format!("{ACTIX_WEBSOCKET}/{email}/{id}")],
+            webtransport_urls: vec![format!("{WEBTRANSPORT_HOST}/{email}/{id}")],
             enable_e2ee: ctx.props().e2ee_enabled,
             enable_webtransport: ctx.props().webtransport_enabled,
             on_connected: {
@@ -191,6 +194,8 @@ impl AttendantsComponent {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
+            rtt_testing_period_ms: Some(3000),
+            rtt_probe_interval_ms: Some(200),
         };
         VideoCallClient::new(opts)
     }
@@ -310,6 +315,7 @@ impl Component for AttendantsComponent {
             neteq_stats_per_peer: HashMap::new(),
             neteq_buffer_per_peer: HashMap::new(),
             neteq_jitter_per_peer: HashMap::new(),
+            connection_manager_state: None,
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -355,6 +361,11 @@ impl Component for AttendantsComponent {
                                     link.send_message(Msg::NetEqJitterUpdated(peer_id, *v));
                                 }
                             }
+                        }
+                    } else if evt.subsystem == "connection_manager" {
+                        // Convert connection manager diagnostics to JSON for display
+                        if let Ok(json) = serde_json::to_string_pretty(&evt) {
+                            link.send_message(Msg::ConnectionManagerUpdate(json));
                         }
                     }
                 }
@@ -573,6 +584,10 @@ impl Component for AttendantsComponent {
                     peer_jitter.remove(0);
                 }
                 false
+            }
+            Msg::ConnectionManagerUpdate(diagnostics_json) => {
+                self.connection_manager_state = Some(diagnostics_json);
+                true
             }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
@@ -990,6 +1005,7 @@ impl Component for AttendantsComponent {
                     video_enabled={self.video_enabled}
                     mic_enabled={self.mic_enabled}
                     share_screen={self.share_screen}
+                    connection_manager_state={self.connection_manager_state.clone()}
                 />
             </div>
         }

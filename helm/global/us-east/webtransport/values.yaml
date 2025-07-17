@@ -1,0 +1,72 @@
+# US East WebTransport server configuration
+rustlemania-webtransport:
+  nameOverride: "webtransport-us-east"
+  fullnameOverride: "webtransport-us-east"
+
+  replicaCount: 1  # Higher replicas for primary region
+
+  command: ['webtransport_server']
+  tlsSecret: webtransport-us-east-tls
+
+  env:
+    - name: RUST_LOG
+      value: debug,quinn=warn
+    - name: NATS_URL
+      value: nats-us-east:4222  # Connect to US East NATS cluster
+    - name: LISTEN_URL
+      value: 0.0.0.0:443
+    - name: HEALTH_LISTEN_URL
+      value: 0.0.0.0:444
+    - name: CERT_PATH
+      value: /certs/tls.crt
+    - name: KEY_PATH
+      value: /certs/tls.key
+    - name: REGION
+      value: "us-east"
+
+  resources:
+    limits:
+      cpu: "500m"
+      memory: "768Mi"
+    requests:
+      cpu: "250m"
+      memory: "384Mi"
+
+  service:
+    type: LoadBalancer  # LoadBalancer for UDP traffic
+    port: 443
+    healthPort: 444
+    annotations:
+      service.beta.kubernetes.io/do-loadbalancer-name: "webtransport-us-east"
+      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
+      external-dns.alpha.kubernetes.io/hostname: "webtransport-us-east.webtransport.video"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  # Node selector for US East region
+  nodeSelector:
+    topology.kubernetes.io/region: "nyc1"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - webtransport-us-east
+          topologyKey: kubernetes.io/hostname 

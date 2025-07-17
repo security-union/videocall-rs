@@ -25,6 +25,7 @@ use log::{debug, error, info, warn};
 use protobuf::Message;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::cell::RefCell;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -38,9 +39,6 @@ const DEFAULT_ELECTION_PERIOD_MS: u64 = 3000;
 
 /// Interval between RTT probes in milliseconds  
 const RTT_PROBE_INTERVAL_MS: u64 = 200;
-
-/// RTT reporting interval for diagnostics (1Hz)
-const RTT_REPORTING_INTERVAL_MS: u64 = 1000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
@@ -73,10 +71,11 @@ pub struct ServerRttMeasurement {
     pub average_rtt: Option<f64>,
     pub connection_id: String,
     pub active: bool,
+    pub connected: bool,
 }
 
 #[derive(Debug)]
-enum ElectionState {
+pub enum ElectionState {
     Testing {
         start_time: f64,
         duration_ms: u64,
@@ -120,6 +119,7 @@ pub struct ConnectionManager {
     rtt_probe_timer: Option<Interval>,
     election_timer: Option<Interval>,
     rtt_start_times: HashMap<String, f64>, // track when RTT probes were sent
+    rtt_responses: Rc<RefCell<Vec<(String, f64)>>>, // Shared queue for RTT responses: (connection_id, timestamp)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
 }
@@ -135,6 +135,8 @@ impl ConnectionManager {
 
         info!("ConnectionManager starting with {} servers", total_servers);
 
+        let rtt_responses = Rc::new(RefCell::new(Vec::new()));
+
         let mut manager = Self {
             connections: HashMap::new(),
             active_connection_id: None,
@@ -147,6 +149,7 @@ impl ConnectionManager {
             rtt_probe_timer: None,
             election_timer: None,
             rtt_start_times: HashMap::new(),
+            rtt_responses,
             options,
             aes,
         };
@@ -170,14 +173,11 @@ impl ConnectionManager {
         // Create all connections upfront
         self.create_all_connections()?;
 
-        // Start RTT probing
-        let probe_timer = self.start_rtt_probing()?;
-
         // Set election state
         self.election_state = ElectionState::Testing {
             start_time,
             duration_ms: election_duration,
-            probe_timer: Some(probe_timer),
+            probe_timer: None, // Will be set externally
         };
 
         // Start RTT reporting to diagnostics
@@ -186,16 +186,11 @@ impl ConnectionManager {
         // Report initial state
         self.report_state();
 
-        // Schedule election completion
-        self.schedule_election_completion(election_duration);
-
         Ok(())
     }
 
     /// Create connections to all configured servers
     fn create_all_connections(&mut self) -> Result<()> {
-        let mut connection_id = 0;
-
         // Create WebSocket connections
         for (i, url) in self.options.websocket_urls.iter().enumerate() {
             let conn_id = format!("ws_{}", i);
@@ -221,6 +216,7 @@ impl ConnectionManager {
                             average_rtt: None,
                             connection_id: conn_id.clone(),
                             active: false,
+                            connected: false,
                         },
                     );
                     debug!("Created WebSocket connection {}: {}", conn_id, url);
@@ -229,7 +225,6 @@ impl ConnectionManager {
                     error!("Failed to create WebSocket connection to {}: {}", url, e);
                 }
             }
-            connection_id += 1;
         }
 
         // Create WebTransport connections
@@ -257,6 +252,7 @@ impl ConnectionManager {
                             average_rtt: None,
                             connection_id: conn_id.clone(),
                             active: false,
+                            connected: false,
                         },
                     );
                     debug!("Created WebTransport connection {}: {}", conn_id, url);
@@ -265,10 +261,24 @@ impl ConnectionManager {
                     error!("Failed to create WebTransport connection to {}: {}", url, e);
                 }
             }
-            connection_id += 1;
         }
 
         info!("Created {} connections for testing", self.connections.len());
+        
+        // If only one connection was created, elect it immediately
+        if self.connections.len() == 1 {
+            info!("Only one connection created, electing immediately");
+            
+            // Set a very short election period for immediate election
+            if let ElectionState::Testing { start_time, .. } = &mut self.election_state {
+                self.election_state = ElectionState::Testing {
+                    start_time: *start_time,
+                    duration_ms: 100, // Very short - will be elected almost immediately
+                    probe_timer: None,
+                };
+            }
+        }
+        
         Ok(())
     }
 
@@ -277,29 +287,34 @@ impl ConnectionManager {
         let userid = self.options.userid.clone();
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
-
+        let rtt_responses = self.rtt_responses.clone();
+        
         Callback::from(move |packet: PacketWrapper| {
             // Handle RTT responses internally
             if packet.email == userid {
                 if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
                         if media_packet.media_type == MediaType::RTT.into() {
-                            // Extract timestamp from RTT packet and log for now
+                            // Extract timestamp from RTT packet
                             let timestamp = media_packet.timestamp;
                             debug!(
                                 "RTT response received on connection {} with timestamp {}",
                                 connection_id, timestamp
                             );
 
-                            // RTT processing will need to be triggered externally due to borrow checker constraints
-                            // The timestamp and connection_id information is logged for external processing
-                            return;
+                            // Add RTT response to shared queue for processing
+                            if let Ok(mut responses) = rtt_responses.try_borrow_mut() {
+                                responses.push((connection_id.clone(), timestamp));
+                            } else {
+                                warn!("Unable to add RTT response to queue - queue is borrowed");
+                            }
+                            return; // Don't forward RTT packets
                         }
                     }
                 }
             }
 
-            // Forward all packets for now - active connection filtering will be added later
+            // Forward all non-RTT packets to the main handler
             on_inbound_media.emit(packet);
         })
     }
@@ -308,6 +323,7 @@ impl ConnectionManager {
     fn create_connected_callback(&self, connection_id: String) -> Callback<()> {
         Callback::from(move |_| {
             debug!("Connection {} established", connection_id);
+            // Mark connection as connected - this will be handled externally
         })
     }
 
@@ -317,17 +333,6 @@ impl ConnectionManager {
             warn!("Connection {} lost: {:?}", connection_id, error);
             // Reconnection logic will be handled separately
         })
-    }
-
-    /// Start RTT probing to all connections
-    fn start_rtt_probing(&self) -> Result<Interval> {
-        // For now, create a placeholder timer
-        // RTT probing will be implemented with a different approach
-        let probe_timer = Interval::new(RTT_PROBE_INTERVAL_MS as u32, || {
-            debug!("RTT probe timer tick");
-        });
-
-        Ok(probe_timer)
     }
 
     /// Send RTT probe to a specific connection
@@ -341,6 +346,11 @@ impl ConnectionManager {
             return Ok(()); // Skip non-connected connections
         }
 
+        // Update connection status
+        if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
+            measurement.connected = true;
+        }
+
         let timestamp = js_sys::Date::now();
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
@@ -349,6 +359,7 @@ impl ConnectionManager {
             .insert(connection_id.to_string(), timestamp);
 
         connection.send_packet(rtt_packet);
+        debug!("Sent RTT probe to {} at timestamp {}", connection_id, timestamp);
         Ok(())
     }
 
@@ -390,18 +401,6 @@ impl ConnectionManager {
                 / measurement.measurements.len() as f64;
             measurement.average_rtt = Some(avg_rtt);
         }
-    }
-
-    /// Schedule election completion after the testing period
-    fn schedule_election_completion(&self, duration_ms: u64) {
-        // For now, create a placeholder timer
-        // Election completion will be handled differently
-        let completion_timer = Interval::new(duration_ms as u32, || {
-            debug!("Election completion timer fired");
-        });
-
-        // Timer will fire once and then we'll clean it up
-        std::mem::forget(completion_timer);
     }
 
     /// Complete the election and select the best connection
@@ -526,21 +525,54 @@ impl ConnectionManager {
         debug!("Diagnostics reporting initialized - will be triggered externally");
     }
 
+    /// Process any queued RTT responses
+    fn process_queued_rtt_responses(&mut self) {
+        // First collect all responses to avoid borrow conflicts
+        let responses_to_process: Vec<(String, f64)> = if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
+            responses.drain(..).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Now process each response
+        for (connection_id, _response_timestamp) in responses_to_process {
+            if let Some(sent_timestamp) = self.rtt_start_times.get(&connection_id) {
+                self.handle_rtt_response(&connection_id, *sent_timestamp);
+                // Remove the timestamp since we've processed this response
+                self.rtt_start_times.remove(&connection_id);
+            } else {
+                debug!("Received RTT response for {} but no sent timestamp found", connection_id);
+            }
+        }
+    }
+
     /// Trigger diagnostics reporting (to be called externally at 1Hz)
-    pub fn trigger_diagnostics_report(&self) {
+    pub fn trigger_diagnostics_report(&mut self) {
+        debug!("ConnectionManager::trigger_diagnostics_report called - state: {:?}", self.election_state);
+        
+        // First process any queued RTT responses
+        self.process_queued_rtt_responses();
+        
+        // Then report diagnostics
         self.report_diagnostics();
     }
 
-    /// Process RTT response packet
-    pub fn process_rtt_response(&mut self, connection_id: &str, timestamp: f64) {
-        self.handle_rtt_response(connection_id, timestamp);
+    /// Process RTT response packet (called externally when RTT responses are received)
+    pub fn process_rtt_response(&mut self, connection_id: &str, _timestamp: f64) {
+        if let Some(sent_timestamp) = self.rtt_start_times.get(connection_id) {
+            self.handle_rtt_response(connection_id, *sent_timestamp);
+            // Remove the timestamp since we've processed this response
+            self.rtt_start_times.remove(connection_id);
+        } else {
+            debug!("Received RTT response for {} but no sent timestamp found", connection_id);
+        }
     }
 
     /// Report RTT metrics to diagnostics system
     fn report_diagnostics(&self) {
         debug!(
-            "Reporting diagnostics - Active: {:?}",
-            self.active_connection_id
+            "ConnectionManager::report_diagnostics - Active: {:?}, Election State: {:?}",
+            self.active_connection_id, self.election_state
         );
 
         let mut metrics = Vec::new();
@@ -557,6 +589,9 @@ impl ConnectionManager {
                 metrics.push(metric!("election_state", "testing"));
                 metrics.push(metric!("election_progress", progress as f64));
                 metrics.push(metric!("servers_total", self.connections.len() as u64));
+
+                // Send individual server events separately during testing
+                // (Individual server metrics are sent as separate events below)
             }
             ElectionState::Elected {
                 connection_id,
@@ -582,6 +617,7 @@ impl ConnectionManager {
                     }
                 }
             }
+
             ElectionState::Reconnecting {
                 connection_id,
                 attempt,
@@ -600,44 +636,8 @@ impl ConnectionManager {
             }
         }
 
-        // Report RTT measurements for all servers
-        for (connection_id, measurement) in &self.rtt_measurements {
-            if let Some(avg_rtt) = measurement.average_rtt {
-                debug!(
-                    "RTT {}: {}ms (active: {})",
-                    connection_id, avg_rtt, measurement.active
-                );
-
-                // Create per-server metrics
-                let server_metrics = vec![
-                    metric!("server_rtt", avg_rtt),
-                    metric!("server_url", measurement.url.as_str()),
-                    metric!(
-                        "server_type",
-                        if measurement.is_webtransport {
-                            "webtransport"
-                        } else {
-                            "websocket"
-                        }
-                    ),
-                    metric!("server_active", measurement.active as u64),
-                    metric!("measurement_count", measurement.measurements.len() as u64),
-                ];
-
-                let event = DiagEvent {
-                    subsystem: "connection_manager",
-                    stream_id: Some(connection_id.clone()),
-                    ts_ms: now_ms(),
-                    metrics: server_metrics,
-                };
-
-                if let Err(e) = global_sender().send(event) {
-                    debug!("Failed to send server diagnostics: {}", e);
-                }
-            }
-        }
-
         // Send overall connection manager state
+        debug!("ConnectionManager: Prepared {} metrics for main event: {:?}", metrics.len(), metrics);
         if !metrics.is_empty() {
             let event = DiagEvent {
                 subsystem: "connection_manager",
@@ -646,8 +646,72 @@ impl ConnectionManager {
                 metrics,
             };
 
-            if let Err(e) = global_sender().send(event) {
-                debug!("Failed to send connection manager diagnostics: {}", e);
+            debug!("ConnectionManager: Sending main connection manager diagnostics event: {:?}", event);
+            match global_sender().send(event) {
+                Ok(_) => {
+                    debug!("ConnectionManager: Successfully sent main connection manager diagnostics event");
+                }
+                Err(e) => {
+                    error!("ConnectionManager: Failed to send main connection manager diagnostics: {}", e);
+                }
+            }
+        } else {
+            warn!("ConnectionManager: No metrics to send for main connection manager event - this might be why UI shows 'unknown'");
+        }
+
+        // Send individual server metrics as separate events
+        for (connection_id, measurement) in &self.rtt_measurements {
+            let connected = self.connections.get(connection_id)
+                .map(|c| c.is_connected())
+                .unwrap_or(false);
+
+            let status = if measurement.active {
+                "active"
+            } else if connected {
+                if measurement.average_rtt.is_some() {
+                    "testing"
+                } else {
+                    "connected"
+                }
+            } else {
+                "connecting"
+            };
+
+            let server_metrics = vec![
+                metric!("server_url", measurement.url.as_str()),
+                metric!(
+                    "server_type",
+                    if measurement.is_webtransport {
+                        "webtransport"
+                    } else {
+                        "websocket"
+                    }
+                ),
+                metric!("server_status", status),
+                metric!("server_active", measurement.active as u64),
+                metric!("server_connected", connected as u64),
+                metric!("measurement_count", measurement.measurements.len() as u64),
+            ];
+
+            let mut final_metrics = server_metrics;
+            if let Some(avg_rtt) = measurement.average_rtt {
+                final_metrics.push(metric!("server_rtt", avg_rtt));
+            }
+
+            let event = DiagEvent {
+                subsystem: "connection_manager",
+                stream_id: Some(measurement.connection_id.clone()),
+                ts_ms: now_ms(),
+                metrics: final_metrics,
+            };
+
+            match global_sender().send(event) {
+                Ok(_) => {
+                    debug!("ConnectionManager: Successfully sent server diagnostics for {}", measurement.connection_id);
+                }
+                Err(e) => {
+                    error!("ConnectionManager: Failed to send server diagnostics for {}: {}", measurement.connection_id, e);
+                }
             }
         }
     }

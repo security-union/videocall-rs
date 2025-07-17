@@ -30,17 +30,29 @@ rustlemania-websocket:
       memory: "192Mi"
 
   service:
-    type: LoadBalancer  # LoadBalancer to get external IP
+    type: ClusterIP  # Changed to ClusterIP for ingress
     port: 8080
+
+  ingress:
+    enabled: true
+    className: nginx
     annotations:
-      service.beta.kubernetes.io/do-loadbalancer-name: "websocket-us-east"
-      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
-      external-dns.alpha.kubernetes.io/hostname: "us-east.webtransport.video"
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    hosts:
+      - host: us-east.webtransport.video
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: websocket-us-east
+              port:
+                number: 8080
+    tls:
+      - secretName: websocket-us-east-tls
+        hosts:
+          - us-east.webtransport.video
 
   autoscaling:
     enabled: true

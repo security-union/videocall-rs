@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_diagnostics::{subscribe, MetricValue};
+use crate::components::diagnostics::SerializableDiagEvent;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -132,7 +133,8 @@ pub struct AttendantsComponent {
     pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
     pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
     pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
-    pub connection_manager_state: Option<String>,           // connection manager diagnostics
+    pub connection_manager_state: Option<String>,           // connection manager diagnostics (serialized)
+    pub connection_manager_events: Vec<SerializableDiagEvent>, // accumulate individual events
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -316,6 +318,7 @@ impl Component for AttendantsComponent {
             neteq_buffer_per_peer: HashMap::new(),
             neteq_jitter_per_peer: HashMap::new(),
             connection_manager_state: None,
+            connection_manager_events: Vec::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -329,8 +332,11 @@ impl Component for AttendantsComponent {
         {
             let link = ctx.link().clone();
             wasm_bindgen_futures::spawn_local(async move {
+                log::info!("AttendantsComponent: Starting diagnostics subscription");
                 let rx = subscribe();
+                log::info!("AttendantsComponent: Diagnostics subscription established");
                 while let Ok(evt) = rx.recv_async().await {
+                    log::debug!("AttendantsComponent: Received diagnostics event - subsystem: {}, stream_id: {:?}", evt.subsystem, evt.stream_id);
                     if evt.subsystem == "neteq" {
                         for m in &evt.metrics {
                             if m.name == "stats_json" {
@@ -363,12 +369,15 @@ impl Component for AttendantsComponent {
                             }
                         }
                     } else if evt.subsystem == "connection_manager" {
-                        // Convert connection manager diagnostics to JSON for display
-                        if let Ok(json) = serde_json::to_string_pretty(&evt) {
-                            link.send_message(Msg::ConnectionManagerUpdate(json));
-                        }
+                        log::info!("AttendantsComponent: Received connection manager diagnostics event: {:?}", evt);
+                        // Convert DiagEvent to SerializableDiagEvent and send as JSON
+                        let serializable_evt = SerializableDiagEvent::from(evt);
+                        link.send_message(Msg::ConnectionManagerUpdate(serde_json::to_string(&serializable_evt).unwrap_or_default()));
+                    } else {
+                        log::debug!("AttendantsComponent: Received event for unknown subsystem: {}", evt.subsystem);
                     }
                 }
+                log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
             });
         }
         self_
@@ -585,8 +594,28 @@ impl Component for AttendantsComponent {
                 }
                 false
             }
-            Msg::ConnectionManagerUpdate(diagnostics_json) => {
-                self.connection_manager_state = Some(diagnostics_json);
+            Msg::ConnectionManagerUpdate(event_json) => {
+                log::info!("AttendantsComponent: Processing ConnectionManagerUpdate: {}", event_json);
+                
+                // Parse the SerializableDiagEvent from JSON
+                if let Ok(event) = serde_json::from_str::<SerializableDiagEvent>(&event_json) {
+                    // Accumulate connection manager events
+                    self.connection_manager_events.push(event);
+                    
+                    // Keep only the last 20 events to avoid memory bloat
+                    if self.connection_manager_events.len() > 20 {
+                        self.connection_manager_events.remove(0);
+                    }
+                    
+                    // Serialize the accumulated events for the diagnostics component
+                    if let Ok(serialized) = serde_json::to_string(&self.connection_manager_events) {
+                        self.connection_manager_state = Some(serialized);
+                    }
+                    
+                    log::info!("AttendantsComponent: Updated connection_manager_state with {} accumulated events, triggering re-render", self.connection_manager_events.len());
+                } else {
+                    log::error!("AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {}", event_json);
+                }
                 true
             }
             Msg::HangUp => {
@@ -709,7 +738,7 @@ impl Component for AttendantsComponent {
                     { // Invitation overlay when there are no connected peers
                         if num_display_peers == 0 {
                             html! {
-                                <div id="invite-overlay" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.9); padding: 1.5rem 2rem; border-radius: 8px; width: 90%; max-width: 420px; z-index: 3000; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3); text-align: center;">
+                                <div id="invite-overlay" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.9); padding: 1.5rem 2rem; border-radius: 8px; width: 90%; max-width: 420px; z-index: 0; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3); text-align: center;">
                                     <h3 style="margin-top:0;">{"Your meeting's ready"}</h3>
                                     <p style="font-size: 0.9rem; opacity: 0.8;">{"Share this meeting link with others you want in the meeting"}</p>
                                     <div style="display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;">

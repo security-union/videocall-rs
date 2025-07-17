@@ -32,6 +32,23 @@ declare -a CHARTS=(
     "global/singapore/webtransport"
 )
 
+# Infrastructure components that need to be deployed first
+declare -a CERT_MANAGER_COMPONENTS=(
+    "cert-manager"
+    "cert-manager-issuer"
+)
+
+# Certificate resources (deployed after cert-manager)
+declare -a CERTIFICATE_FILES=(
+    "global/singapore/websocket/certificate.yaml"
+    "global/singapore/webtransport/certificate.yaml" 
+    "global/us-east/websocket/certificate.yaml"
+    "global/us-east/webtransport/certificate.yaml"
+)
+
+# DigitalOcean DNS secret file
+declare -r DIGITALOCEAN_SECRET_FILE="${HELM_DIR}/digital-ocean-secret/digitalocean-dns.yaml"
+
 # Helper functions for chart configurations
 get_context_for_chart() {
     case "$1" in
@@ -151,10 +168,12 @@ Options:
     -h, --help           Show this help message
 
 This script will:
-1. Update helm dependencies for all charts
-2. Switch to appropriate Kubernetes contexts
-3. Deploy WebSocket and WebTransport services to both regions
-4. Verify deployments and collect load balancer IPs
+1. Deploy DigitalOcean DNS secret to both clusters (for Let's Encrypt DNS validation)
+2. Deploy cert-manager and certificate issuer (Let's Encrypt)
+3. Update helm dependencies for all charts
+4. Deploy SSL certificates for all endpoints
+5. Deploy WebSocket and WebTransport services to both regions
+6. Verify deployments and check certificate status
 
 Contexts used:
 - US East: ${US_EAST_CONTEXT}
@@ -195,6 +214,47 @@ validate_prerequisites() {
         fi
         log_info "✓ Chart '${chart}' exists"
     done
+    
+    # Check cert-manager components exist
+    for component in "${CERT_MANAGER_COMPONENTS[@]}"; do
+        local component_path="${HELM_DIR}/${component}"
+        if [[ "$component" == "cert-manager-issuer" ]]; then
+            if [[ ! -f "${component_path}/cert-manager-issuer.yaml" ]]; then
+                error_exit "Cert-manager issuer not found: ${component_path}/cert-manager-issuer.yaml"
+            fi
+            log_info "✓ Cert-manager issuer exists"
+        fi
+    done
+    
+    # Check certificate files exist
+    for cert_file in "${CERTIFICATE_FILES[@]}"; do
+        local cert_path="${HELM_DIR}/${cert_file}"
+        if [[ ! -f "${cert_path}" ]]; then
+            error_exit "Certificate file not found: ${cert_path}"
+        fi
+        log_info "✓ Certificate file '$(basename ${cert_file})' exists"
+    done
+    
+    # Check DigitalOcean DNS secret file exists
+    if [[ ! -f "${DIGITALOCEAN_SECRET_FILE}" ]]; then
+        error_exit "DigitalOcean DNS secret file not found: ${DIGITALOCEAN_SECRET_FILE}
+
+To create this secret file:
+1. Get your DigitalOcean API token from https://cloud.digitalocean.com/account/api/tokens
+2. Base64 encode the token: echo -n 'dop_v1_YOUR_TOKEN_HERE' | base64
+3. Create the file at ${DIGITALOCEAN_SECRET_FILE} with this content:
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: digitalocean-dns
+type: Opaque
+data:
+  access-token: YOUR_BASE64_ENCODED_TOKEN_HERE
+
+Replace YOUR_BASE64_ENCODED_TOKEN_HERE with the base64 encoded token from step 2."
+    fi
+    log_info "✓ DigitalOcean DNS secret file exists"
     
     log_success "All prerequisites validated"
 }
@@ -253,6 +313,161 @@ deploy_chart() {
     log_success "Successfully deployed ${chart}"
 }
 
+# Deploy DigitalOcean DNS secret to both clusters
+deploy_digitalocean_secret() {
+    log_section "Deploying DigitalOcean DNS Secret"
+    
+    local contexts=("${US_EAST_CONTEXT}" "${SINGAPORE_CONTEXT}")
+    
+    for context in "${contexts[@]}"; do
+        log_info "Deploying DigitalOcean DNS secret to ${context}"
+        
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log_info "[DRY RUN] Would deploy DigitalOcean DNS secret to ${context}"
+            continue
+        fi
+        
+        # Switch context
+        if ! kubectl config use-context "${context}" >/dev/null 2>&1; then
+            error_exit "Failed to switch to context ${context}"
+        fi
+        
+        # Check if secret already exists
+        if kubectl get secret digitalocean-dns >/dev/null 2>&1; then
+            log_info "DigitalOcean DNS secret already exists in ${context}, skipping"
+            continue
+        fi
+        
+        # Deploy the secret
+        if ! kubectl apply -f "${DIGITALOCEAN_SECRET_FILE}"; then
+            error_exit "Failed to deploy DigitalOcean DNS secret to ${context}"
+        fi
+        
+        log_success "Successfully deployed DigitalOcean DNS secret to ${context}"
+    done
+}
+
+# Deploy cert-manager infrastructure
+deploy_cert_manager() {
+    log_section "Deploying Certificate Manager Infrastructure"
+    
+    # Switch to US East context for cert-manager (primary cluster)
+    if [[ "${DRY_RUN}" == "false" ]]; then
+        if ! kubectl config use-context "${US_EAST_CONTEXT}" >/dev/null 2>&1; then
+            error_exit "Failed to switch to context ${US_EAST_CONTEXT}"
+        fi
+        log_info "Switched to context: ${US_EAST_CONTEXT}"
+    fi
+    
+    for component in "${CERT_MANAGER_COMPONENTS[@]}"; do
+        local component_path="${HELM_DIR}/${component}"
+        log_info "Deploying ${component}"
+        
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log_info "[DRY RUN] Would deploy cert-manager component: ${component}"
+            continue
+        fi
+        
+        if [[ "$component" == "cert-manager" ]]; then
+            # Install cert-manager using helm chart
+            if ! helm repo list | grep -q jetstack; then
+                log_info "Adding jetstack helm repository"
+                helm repo add jetstack https://charts.jetstack.io
+                helm repo update
+            fi
+            
+            # Deploy to US East first
+            log_info "Deploying cert-manager to US East"
+            if ! helm upgrade --install cert-manager jetstack/cert-manager \
+                --namespace cert-manager \
+                --create-namespace \
+                --version v1.13.0 \
+                --set installCRDs=true \
+                --timeout 300s; then
+                error_exit "Failed to deploy cert-manager to US East"
+            fi
+            
+            # Deploy to Singapore
+            log_info "Deploying cert-manager to Singapore"
+            kubectl config use-context "${SINGAPORE_CONTEXT}" >/dev/null 2>&1
+            if ! helm upgrade --install cert-manager jetstack/cert-manager \
+                --namespace cert-manager \
+                --create-namespace \
+                --version v1.13.0 \
+                --set installCRDs=true \
+                --timeout 300s; then
+                error_exit "Failed to deploy cert-manager to Singapore"
+            fi
+        elif [[ "$component" == "cert-manager-issuer" ]]; then
+            # Wait for cert-manager to be ready in US East
+            log_info "Waiting for cert-manager to be ready in US East..."
+            kubectl config use-context "${US_EAST_CONTEXT}" >/dev/null 2>&1
+            kubectl wait --for=condition=ready pod -l app=cert-manager -n cert-manager --timeout=300s
+            kubectl wait --for=condition=ready pod -l app=cainjector -n cert-manager --timeout=300s
+            kubectl wait --for=condition=ready pod -l app=webhook -n cert-manager --timeout=300s
+            
+            # Wait for cert-manager to be ready in Singapore
+            log_info "Waiting for cert-manager to be ready in Singapore..."
+            kubectl config use-context "${SINGAPORE_CONTEXT}" >/dev/null 2>&1
+            kubectl wait --for=condition=ready pod -l app=cert-manager -n cert-manager --timeout=300s
+            kubectl wait --for=condition=ready pod -l app=cainjector -n cert-manager --timeout=300s
+            kubectl wait --for=condition=ready pod -l app=webhook -n cert-manager --timeout=300s
+            
+            # Deploy the issuer to US East first
+            log_info "Deploying cert-manager issuer to US East"
+            kubectl config use-context "${US_EAST_CONTEXT}" >/dev/null 2>&1
+            if ! kubectl apply -f "${component_path}/cert-manager-issuer.yaml"; then
+                error_exit "Failed to deploy cert-manager issuer to US East"
+            fi
+            
+            # Also deploy to Singapore
+            log_info "Deploying cert-manager issuer to Singapore"
+            kubectl config use-context "${SINGAPORE_CONTEXT}" >/dev/null 2>&1
+            if ! kubectl apply -f "${component_path}/cert-manager-issuer.yaml"; then
+                error_exit "Failed to deploy cert-manager issuer to Singapore"
+            fi
+        fi
+        
+        log_success "Successfully deployed ${component}"
+    done
+}
+
+# Deploy Certificate resources
+deploy_certificates() {
+    log_section "Deploying SSL Certificates"
+    
+    for cert_file in "${CERTIFICATE_FILES[@]}"; do
+        local cert_path="${HELM_DIR}/${cert_file}"
+        local region=""
+        
+        # Determine which context to use based on the file path
+        if [[ "$cert_file" == *"singapore"* ]]; then
+            region="Singapore"
+            if [[ "${DRY_RUN}" == "false" ]]; then
+                kubectl config use-context "${SINGAPORE_CONTEXT}" >/dev/null 2>&1
+            fi
+        else
+            region="US East"
+            if [[ "${DRY_RUN}" == "false" ]]; then
+                kubectl config use-context "${US_EAST_CONTEXT}" >/dev/null 2>&1
+            fi
+        fi
+        
+        log_info "Deploying certificate for ${region}: $(basename ${cert_file})"
+        
+        if [[ "${DRY_RUN}" == "true" ]]; then
+            log_info "[DRY RUN] Would deploy certificate: ${cert_path}"
+            continue
+        fi
+        
+        if ! kubectl apply -f "${cert_path}"; then
+            error_exit "Failed to deploy certificate: ${cert_path}"
+        fi
+        
+        log_success "Successfully deployed certificate: $(basename ${cert_file})"
+    done
+}
+
 # Deploy all charts
 deploy_all_charts() {
     log_section "Deploying All Charts"
@@ -277,26 +492,42 @@ verify_deployments() {
     kubectl config use-context "${US_EAST_CONTEXT}" >/dev/null 2>&1
     
     echo ""
-    log_info "US EAST REGION LOAD BALANCER IPs:"
+    log_info "US EAST REGION STATUS:"
     
-    local ws_ip=$(kubectl get service websocket-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+    # Check WebSocket ingress (now uses Ingress instead of LoadBalancer)
+    local ws_ingress=$(kubectl get ingress -o name 2>/dev/null | grep websocket || echo "not-found")
     local wt_ip=$(kubectl get service webtransport-us-east-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
     
-    log_info "  WebSocket: ${ws_ip}"
-    log_info "  WebTransport (QUIC): ${wt_ip}"
+    log_info "  WebSocket Ingress: ${ws_ingress}"
+    log_info "  WebTransport LoadBalancer IP: ${wt_ip}"
+    
+    # Check certificate status
+    local ws_cert=$(kubectl get certificate websocket-us-east-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "not-found")
+    local wt_cert=$(kubectl get certificate webtransport-us-east-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "not-found")
+    
+    log_info "  WebSocket Certificate: ${ws_cert}"
+    log_info "  WebTransport Certificate: ${wt_cert}"
     
     # Singapore
     log_info "Switching to Singapore context"
     kubectl config use-context "${SINGAPORE_CONTEXT}" >/dev/null 2>&1
     
     echo ""
-    log_info "SINGAPORE REGION LOAD BALANCER IPs:"
+    log_info "SINGAPORE REGION STATUS:"
     
-    local sg_ws_ip=$(kubectl get service websocket-singapore -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+    # Check WebSocket ingress (now uses Ingress instead of LoadBalancer)
+    local sg_ws_ingress=$(kubectl get ingress -o name 2>/dev/null | grep websocket || echo "not-found")
     local sg_wt_ip=$(kubectl get service webtransport-singapore-lb -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
     
-    log_info "  WebSocket: ${sg_ws_ip}"
-    log_info "  WebTransport (QUIC): ${sg_wt_ip}"
+    log_info "  WebSocket Ingress: ${sg_ws_ingress}"
+    log_info "  WebTransport LoadBalancer IP: ${sg_wt_ip}"
+    
+    # Check certificate status
+    local sg_ws_cert=$(kubectl get certificate websocket-singapore-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "not-found")
+    local sg_wt_cert=$(kubectl get certificate webtransport-singapore-tls -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "not-found")
+    
+    log_info "  WebSocket Certificate: ${sg_ws_cert}"
+    log_info "  WebTransport Certificate: ${sg_wt_cert}"
     
     echo ""
     log_success "Deployment verification complete"
@@ -324,7 +555,10 @@ main() {
     log_info "Skip dependencies: ${SKIP_DEPENDENCIES}"
     
     validate_prerequisites
+    deploy_digitalocean_secret
+    deploy_cert_manager
     update_dependencies
+    deploy_certificates
     deploy_all_charts
     verify_deployments
     

@@ -35,6 +35,7 @@ use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
+
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
@@ -253,18 +254,25 @@ impl VideoCallClient {
     /// invoked.
     ///
     pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
-        let total_servers =
-            self.options.websocket_urls.len() + self.options.webtransport_urls.len();
-        info!("Starting RTT testing for {} servers", total_servers);
+        let websocket_count = self.options.websocket_urls.len();
+        let webtransport_count = if self.options.enable_webtransport {
+            self.options.webtransport_urls.len()
+        } else {
+            0 // Don't count WebTransport URLs if WebTransport is disabled
+        };
+        let total_servers = websocket_count + webtransport_count;
+        
+        info!("Starting RTT testing for {} servers (WebSocket: {}, WebTransport: {})", 
+             total_servers, websocket_count, webtransport_count);
 
         if total_servers == 0 {
             return Err(anyhow!("No servers provided for RTT testing"));
         }
 
         if total_servers == 1 {
-            // Only one server available, skip RTT testing
-            info!("Only one server available, skipping RTT testing");
-            return self.connect();
+            // Only one server available, connect directly without RTT testing
+            info!("Only one server available, skipping RTT testing and connecting directly");
+            return self.connect_direct();
         }
 
         let testing_period = self
@@ -277,37 +285,44 @@ impl VideoCallClient {
         // Create ConnectionManager which will handle all the RTT testing
         let manager_options = ConnectionManagerOptions {
             websocket_urls: self.options.websocket_urls.clone(),
-            webtransport_urls: self.options.webtransport_urls.clone(),
+            webtransport_urls: if self.options.enable_webtransport {
+                self.options.webtransport_urls.clone()
+            } else {
+                Vec::new() // Empty if WebTransport is disabled
+            },
             userid: self.options.userid.clone(),
             enable_webtransport: self.options.enable_webtransport,
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow_mut() {
-                            Ok(mut inner) => inner.on_inbound_media(packet),
-                            Err(_) => {
-                                error!(
-                                    "Unable to borrow inner -- dropping receive packet {:?}",
-                                    packet
-                                );
-                            }
-                        }
-                    }
+                                          if let Some(inner) = Weak::upgrade(&inner) {
+                          if let Ok(mut inner) = inner.try_borrow_mut() {
+                              // Process the packet
+                              inner.on_inbound_media(packet);
+                          }
+                      }
                 })
             },
             on_state_changed: {
+                let on_connected = self.options.on_connected.clone();
+                let on_connection_lost = self.options.on_connection_lost.clone();
                 let inner = Rc::downgrade(&self.inner);
-                Callback::from(move |state| {
+                Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow_mut() {
-                            Ok(mut inner) => {
-                                inner.connection_state = state;
-                                // TODO: Handle connection state changes
-                            }
-                            Err(_) => {
-                                error!("Unable to borrow inner for state change");
-                            }
+                        if let Ok(mut inner) = inner.try_borrow_mut() {
+                            inner.connection_state = state.clone();
+                        }
+                    }
+
+                    match state {
+                        ConnectionState::Connected { .. } => {
+                            on_connected.emit(());
+                        }
+                        ConnectionState::Failed { error, .. } => {
+                            on_connection_lost.emit(JsValue::from_str(&error));
+                        }
+                        _ => {
+                            // Other states don't trigger callbacks
                         }
                     }
                 })
@@ -342,19 +357,143 @@ impl VideoCallClient {
         let inner_ref = Rc::downgrade(&self.inner);
         let _diagnostics_timer = gloo::timers::callback::Interval::new(1000, move || {
             if let Some(inner) = inner_ref.upgrade() {
-                if let Ok(inner) = inner.try_borrow() {
-                    if let Some(connection_manager) = &inner.connection_manager {
+                if let Ok(mut inner) = inner.try_borrow_mut() {
+                    if let Some(connection_manager) = &mut inner.connection_manager {
                         connection_manager.trigger_diagnostics_report();
                     }
                 }
             }
         });
 
-        // Keep the timer alive (stored in Inner but we'll ignore the warning for now)
-        // TODO: Properly store timer to prevent it from being dropped
+        // Set up RTT probing timer (200ms intervals)
+        let rtt_probe_interval = self.options.rtt_probe_interval_ms.unwrap_or(200);
+        let inner_ref_rtt = Rc::downgrade(&self.inner);
+        let _rtt_timer = gloo::timers::callback::Interval::new(rtt_probe_interval as u32, move || {
+            if let Some(inner) = inner_ref_rtt.upgrade() {
+                if let Ok(mut inner) = inner.try_borrow_mut() {
+                    if let Some(connection_manager) = &mut inner.connection_manager {
+                        if let Err(e) = connection_manager.send_rtt_probes() {
+                            debug!("Failed to send RTT probes: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Set up election completion checking timer (100ms intervals)
+        let inner_ref_election = Rc::downgrade(&self.inner);
+        let _election_timer = gloo::timers::callback::Interval::new(100, move || {
+            if let Some(inner) = inner_ref_election.upgrade() {
+                if let Ok(mut inner) = inner.try_borrow_mut() {
+                    if let Some(connection_manager) = &mut inner.connection_manager {
+                        connection_manager.check_and_complete_election();
+                    }
+                }
+            }
+        });
+
+        // Keep the timers alive (stored in Inner but we'll ignore the warning for now)
+        // TODO: Properly store timers to prevent them from being dropped
+        std::mem::forget(_diagnostics_timer);
+        std::mem::forget(_rtt_timer);
+        std::mem::forget(_election_timer);
+
+        info!("ConnectionManager created with RTT testing and 1Hz diagnostics reporting");
+        Ok(())
+    }
+
+    /// Connect directly to a single server without RTT testing (legacy fallback)
+    fn connect_direct(&mut self) -> anyhow::Result<()> {
+        info!("Connecting directly to single server without RTT testing");
+        
+        // For now, just use the ConnectionManager even for single server
+        // This ensures consistent diagnostics reporting
+        let websocket_urls = self.options.websocket_urls.clone();
+        let webtransport_urls = if self.options.enable_webtransport {
+            self.options.webtransport_urls.clone()
+        } else {
+            Vec::new()
+        };
+
+        let manager_options = ConnectionManagerOptions {
+            websocket_urls,
+            webtransport_urls,
+            userid: self.options.userid.clone(),
+            enable_webtransport: self.options.enable_webtransport,
+            on_inbound_media: {
+                let inner = Rc::downgrade(&self.inner);
+                Callback::from(move |packet| {
+                    if let Some(inner) = Weak::upgrade(&inner) {
+                        if let Ok(mut inner) = inner.try_borrow_mut() {
+                            inner.on_inbound_media(packet);
+                        }
+                    }
+                })
+            },
+            on_state_changed: {
+                let on_connected = self.options.on_connected.clone();
+                let on_connection_lost = self.options.on_connection_lost.clone();
+                let inner = Rc::downgrade(&self.inner);
+                Callback::from(move |state: ConnectionState| {
+                    if let Some(inner) = Weak::upgrade(&inner) {
+                        if let Ok(mut inner) = inner.try_borrow_mut() {
+                            inner.connection_state = state.clone();
+                        }
+                    }
+
+                    match state {
+                        ConnectionState::Connected { .. } => {
+                            on_connected.emit(());
+                        }
+                        ConnectionState::Failed { error, .. } => {
+                            on_connection_lost.emit(JsValue::from_str(&error));
+                        }
+                        _ => {}
+                    }
+                })
+            },
+            peer_monitor: {
+                let inner = Rc::downgrade(&self.inner);
+                let on_connection_lost = self.options.on_connection_lost.clone();
+                Callback::from(move |_| {
+                    if let Some(inner) = Weak::upgrade(&inner) {
+                        match inner.try_borrow_mut() {
+                            Ok(mut inner) => {
+                                inner.peer_decode_manager.run_peer_monitor();
+                            }
+                            Err(_) => {
+                                on_connection_lost.emit(JsValue::from_str(
+                                    "Unable to borrow inner -- not starting peer monitor",
+                                ));
+                            }
+                        }
+                    }
+                })
+            },
+            election_period_ms: Some(100), // Very short election period for direct connection
+        };
+
+        let connection_manager = ConnectionManager::new(manager_options, self.aes.clone())?;
+
+        let mut borrowed = self.inner.try_borrow_mut()?;
+        borrowed.connection_manager = Some(connection_manager);
+
+        // Set up 1Hz diagnostics reporting timer even for direct connections
+        let inner_ref = Rc::downgrade(&self.inner);
+        let _diagnostics_timer = gloo::timers::callback::Interval::new(1000, move || {
+            if let Some(inner) = inner_ref.upgrade() {
+                if let Ok(mut inner) = inner.try_borrow_mut() {
+                    if let Some(connection_manager) = &mut inner.connection_manager {
+                        connection_manager.trigger_diagnostics_report();
+                    }
+                }
+            }
+        });
+
+        // Keep the timer alive
         std::mem::forget(_diagnostics_timer);
 
-        info!("ConnectionManager created with 1Hz diagnostics reporting");
+        info!("Direct connection established with diagnostics reporting");
         Ok(())
     }
 
@@ -725,7 +864,9 @@ impl Inner {
             Ok(PacketType::MEDIA) => {
                 let email = response.email.clone();
 
-                // RTT handling is now done in ConnectionManager
+                // RTT responses are now handled directly by the ConnectionManager via individual connection callbacks
+                // No need to process them here anymore
+
                 if let Err(e) = self.peer_decode_manager.decode(response) {
                     error!("error decoding packet: {}", e);
                     self.peer_decode_manager.delete_peer(&email);

@@ -10,8 +10,6 @@ rustlemania-websocket:
       value: info
     - name: ACTIX_PORT
       value: "8080"
-    - name: UI_ENDPOINT
-      value: https://websocket-us-east.webtransport.video
     - name: NATS_URL
       value: nats-us-east:4222  # Connect to US East NATS cluster
     - name: DATABASE_ENABLED
@@ -41,7 +39,7 @@ rustlemania-websocket:
       nginx.ingress.kubernetes.io/ssl-redirect: "true"
       kubernetes.io/tls-acme: "true"
     hosts:
-      - host: us-east.webtransport.video
+      - host: websocket-us-east.webtransport.video
         paths:
           - path: /
             pathType: Prefix
@@ -52,7 +50,7 @@ rustlemania-websocket:
     tls:
       - secretName: websocket-us-east-tls
         hosts:
-          - us-east.webtransport.video
+          - websocket-us-east.webtransport.video
 
   autoscaling:
     enabled: true

@@ -9,4 +9,4 @@ spec:
     name: letsencrypt-prod
     kind: Issuer
   dnsNames:
-    - us-east.webtransport.video 
+`     - websocket-us-east.webtransport.video 

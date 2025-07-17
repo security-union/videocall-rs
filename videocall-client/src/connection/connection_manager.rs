@@ -23,9 +23,9 @@ use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
 use log::{debug, error, info, warn};
 use protobuf::Message;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::RefCell;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -264,11 +264,11 @@ impl ConnectionManager {
         }
 
         info!("Created {} connections for testing", self.connections.len());
-        
+
         // If only one connection was created, elect it immediately
         if self.connections.len() == 1 {
             info!("Only one connection created, electing immediately");
-            
+
             // Set a very short election period for immediate election
             if let ElectionState::Testing { start_time, .. } = &mut self.election_state {
                 self.election_state = ElectionState::Testing {
@@ -278,7 +278,7 @@ impl ConnectionManager {
                 };
             }
         }
-        
+
         Ok(())
     }
 
@@ -288,7 +288,7 @@ impl ConnectionManager {
         let aes = self.aes.clone();
         let on_inbound_media = self.options.on_inbound_media.clone();
         let rtt_responses = self.rtt_responses.clone();
-        
+
         Callback::from(move |packet: PacketWrapper| {
             // Handle RTT responses internally
             if packet.email == userid {
@@ -359,7 +359,10 @@ impl ConnectionManager {
             .insert(connection_id.to_string(), timestamp);
 
         connection.send_packet(rtt_packet);
-        debug!("Sent RTT probe to {} at timestamp {}", connection_id, timestamp);
+        debug!(
+            "Sent RTT probe to {} at timestamp {}",
+            connection_id, timestamp
+        );
         Ok(())
     }
 
@@ -528,11 +531,12 @@ impl ConnectionManager {
     /// Process any queued RTT responses
     fn process_queued_rtt_responses(&mut self) {
         // First collect all responses to avoid borrow conflicts
-        let responses_to_process: Vec<(String, f64)> = if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
-            responses.drain(..).collect()
-        } else {
-            Vec::new()
-        };
+        let responses_to_process: Vec<(String, f64)> =
+            if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
+                responses.drain(..).collect()
+            } else {
+                Vec::new()
+            };
 
         // Now process each response
         for (connection_id, _response_timestamp) in responses_to_process {
@@ -541,18 +545,24 @@ impl ConnectionManager {
                 // Remove the timestamp since we've processed this response
                 self.rtt_start_times.remove(&connection_id);
             } else {
-                debug!("Received RTT response for {} but no sent timestamp found", connection_id);
+                debug!(
+                    "Received RTT response for {} but no sent timestamp found",
+                    connection_id
+                );
             }
         }
     }
 
     /// Trigger diagnostics reporting (to be called externally at 1Hz)
     pub fn trigger_diagnostics_report(&mut self) {
-        debug!("ConnectionManager::trigger_diagnostics_report called - state: {:?}", self.election_state);
-        
+        debug!(
+            "ConnectionManager::trigger_diagnostics_report called - state: {:?}",
+            self.election_state
+        );
+
         // First process any queued RTT responses
         self.process_queued_rtt_responses();
-        
+
         // Then report diagnostics
         self.report_diagnostics();
     }
@@ -564,7 +574,10 @@ impl ConnectionManager {
             // Remove the timestamp since we've processed this response
             self.rtt_start_times.remove(connection_id);
         } else {
-            debug!("Received RTT response for {} but no sent timestamp found", connection_id);
+            debug!(
+                "Received RTT response for {} but no sent timestamp found",
+                connection_id
+            );
         }
     }
 
@@ -637,7 +650,11 @@ impl ConnectionManager {
         }
 
         // Send overall connection manager state
-        debug!("ConnectionManager: Prepared {} metrics for main event: {:?}", metrics.len(), metrics);
+        debug!(
+            "ConnectionManager: Prepared {} metrics for main event: {:?}",
+            metrics.len(),
+            metrics
+        );
         if !metrics.is_empty() {
             let event = DiagEvent {
                 subsystem: "connection_manager",
@@ -646,13 +663,19 @@ impl ConnectionManager {
                 metrics,
             };
 
-            debug!("ConnectionManager: Sending main connection manager diagnostics event: {:?}", event);
+            debug!(
+                "ConnectionManager: Sending main connection manager diagnostics event: {:?}",
+                event
+            );
             match global_sender().send(event) {
                 Ok(_) => {
                     debug!("ConnectionManager: Successfully sent main connection manager diagnostics event");
                 }
                 Err(e) => {
-                    error!("ConnectionManager: Failed to send main connection manager diagnostics: {}", e);
+                    error!(
+                        "ConnectionManager: Failed to send main connection manager diagnostics: {}",
+                        e
+                    );
                 }
             }
         } else {
@@ -661,7 +684,9 @@ impl ConnectionManager {
 
         // Send individual server metrics as separate events
         for (connection_id, measurement) in &self.rtt_measurements {
-            let connected = self.connections.get(connection_id)
+            let connected = self
+                .connections
+                .get(connection_id)
                 .map(|c| c.is_connected())
                 .unwrap_or(false);
 
@@ -707,10 +732,16 @@ impl ConnectionManager {
 
             match global_sender().send(event) {
                 Ok(_) => {
-                    debug!("ConnectionManager: Successfully sent server diagnostics for {}", measurement.connection_id);
+                    debug!(
+                        "ConnectionManager: Successfully sent server diagnostics for {}",
+                        measurement.connection_id
+                    );
                 }
                 Err(e) => {
-                    error!("ConnectionManager: Failed to send server diagnostics for {}: {}", measurement.connection_id, e);
+                    error!(
+                        "ConnectionManager: Failed to send server diagnostics for {}: {}",
+                        measurement.connection_id, e
+                    );
                 }
             }
         }

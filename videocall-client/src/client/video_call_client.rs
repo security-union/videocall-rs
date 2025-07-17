@@ -35,7 +35,6 @@ use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
-
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
@@ -261,9 +260,11 @@ impl VideoCallClient {
             0 // Don't count WebTransport URLs if WebTransport is disabled
         };
         let total_servers = websocket_count + webtransport_count;
-        
-        info!("Starting RTT testing for {} servers (WebSocket: {}, WebTransport: {})", 
-             total_servers, websocket_count, webtransport_count);
+
+        info!(
+            "Starting RTT testing for {} servers (WebSocket: {}, WebTransport: {})",
+            total_servers, websocket_count, webtransport_count
+        );
 
         if total_servers == 0 {
             return Err(anyhow!("No servers provided for RTT testing"));
@@ -295,12 +296,12 @@ impl VideoCallClient {
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
-                                          if let Some(inner) = Weak::upgrade(&inner) {
-                          if let Ok(mut inner) = inner.try_borrow_mut() {
-                              // Process the packet
-                              inner.on_inbound_media(packet);
-                          }
-                      }
+                    if let Some(inner) = Weak::upgrade(&inner) {
+                        if let Ok(mut inner) = inner.try_borrow_mut() {
+                            // Process the packet
+                            inner.on_inbound_media(packet);
+                        }
+                    }
                 })
             },
             on_state_changed: {
@@ -368,17 +369,18 @@ impl VideoCallClient {
         // Set up RTT probing timer (200ms intervals)
         let rtt_probe_interval = self.options.rtt_probe_interval_ms.unwrap_or(200);
         let inner_ref_rtt = Rc::downgrade(&self.inner);
-        let _rtt_timer = gloo::timers::callback::Interval::new(rtt_probe_interval as u32, move || {
-            if let Some(inner) = inner_ref_rtt.upgrade() {
-                if let Ok(mut inner) = inner.try_borrow_mut() {
-                    if let Some(connection_manager) = &mut inner.connection_manager {
-                        if let Err(e) = connection_manager.send_rtt_probes() {
-                            debug!("Failed to send RTT probes: {}", e);
+        let _rtt_timer =
+            gloo::timers::callback::Interval::new(rtt_probe_interval as u32, move || {
+                if let Some(inner) = inner_ref_rtt.upgrade() {
+                    if let Ok(mut inner) = inner.try_borrow_mut() {
+                        if let Some(connection_manager) = &mut inner.connection_manager {
+                            if let Err(e) = connection_manager.send_rtt_probes() {
+                                debug!("Failed to send RTT probes: {}", e);
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
 
         // Set up election completion checking timer (100ms intervals)
         let inner_ref_election = Rc::downgrade(&self.inner);
@@ -405,7 +407,7 @@ impl VideoCallClient {
     /// Connect directly to a single server without RTT testing (legacy fallback)
     fn connect_direct(&mut self) -> anyhow::Result<()> {
         info!("Connecting directly to single server without RTT testing");
-        
+
         // For now, just use the ConnectionManager even for single server
         // This ensures consistent diagnostics reporting
         let websocket_urls = self.options.websocket_urls.clone();

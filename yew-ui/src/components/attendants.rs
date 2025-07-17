@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     peer_list::PeerList,
@@ -29,7 +30,6 @@ use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_diagnostics::{subscribe, MetricValue};
-use crate::components::diagnostics::SerializableDiagEvent;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -133,7 +133,7 @@ pub struct AttendantsComponent {
     pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
     pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
     pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
-    pub connection_manager_state: Option<String>,           // connection manager diagnostics (serialized)
+    pub connection_manager_state: Option<String>, // connection manager diagnostics (serialized)
     pub connection_manager_events: Vec<SerializableDiagEvent>, // accumulate individual events
     pending_mic_enable: bool,
     pending_video_enable: bool,
@@ -372,9 +372,14 @@ impl Component for AttendantsComponent {
                         log::info!("AttendantsComponent: Received connection manager diagnostics event: {:?}", evt);
                         // Convert DiagEvent to SerializableDiagEvent and send as JSON
                         let serializable_evt = SerializableDiagEvent::from(evt);
-                        link.send_message(Msg::ConnectionManagerUpdate(serde_json::to_string(&serializable_evt).unwrap_or_default()));
+                        link.send_message(Msg::ConnectionManagerUpdate(
+                            serde_json::to_string(&serializable_evt).unwrap_or_default(),
+                        ));
                     } else {
-                        log::debug!("AttendantsComponent: Received event for unknown subsystem: {}", evt.subsystem);
+                        log::debug!(
+                            "AttendantsComponent: Received event for unknown subsystem: {}",
+                            evt.subsystem
+                        );
                     }
                 }
                 log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
@@ -595,26 +600,32 @@ impl Component for AttendantsComponent {
                 false
             }
             Msg::ConnectionManagerUpdate(event_json) => {
-                log::info!("AttendantsComponent: Processing ConnectionManagerUpdate: {}", event_json);
-                
+                log::info!(
+                    "AttendantsComponent: Processing ConnectionManagerUpdate: {}",
+                    event_json
+                );
+
                 // Parse the SerializableDiagEvent from JSON
                 if let Ok(event) = serde_json::from_str::<SerializableDiagEvent>(&event_json) {
                     // Accumulate connection manager events
                     self.connection_manager_events.push(event);
-                    
+
                     // Keep only the last 20 events to avoid memory bloat
                     if self.connection_manager_events.len() > 20 {
                         self.connection_manager_events.remove(0);
                     }
-                    
+
                     // Serialize the accumulated events for the diagnostics component
                     if let Ok(serialized) = serde_json::to_string(&self.connection_manager_events) {
                         self.connection_manager_state = Some(serialized);
                     }
-                    
+
                     log::info!("AttendantsComponent: Updated connection_manager_state with {} accumulated events, triggering re-render", self.connection_manager_events.len());
                 } else {
-                    log::error!("AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {}", event_json);
+                    log::error!(
+                        "AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {}",
+                        event_json
+                    );
                 }
                 true
             }

@@ -45,10 +45,14 @@ impl From<DiagEvent> for SerializableDiagEvent {
             subsystem: event.subsystem.to_string(),
             stream_id: event.stream_id,
             ts_ms: event.ts_ms,
-            metrics: event.metrics.into_iter().map(|m| SerializableMetric {
-                name: m.name.to_string(),
-                value: m.value,
-            }).collect(),
+            metrics: event
+                .metrics
+                .into_iter()
+                .map(|m| SerializableMetric {
+                    name: m.name.to_string(),
+                    value: m.value,
+                })
+                .collect(),
         }
     }
 }
@@ -97,16 +101,23 @@ impl Default for ConnectionManagerState {
 impl ConnectionManagerState {
     pub fn from_serializable_events(events: &[SerializableDiagEvent]) -> Self {
         let mut state = Self::default();
-        
-        log::info!("ConnectionManagerState::from_serializable_events: Processing {} events", events.len());
-        
+
+        log::info!(
+            "ConnectionManagerState::from_serializable_events: Processing {} events",
+            events.len()
+        );
+
         for event in events {
-            log::debug!("Processing event: subsystem={}, stream_id={:?}", event.subsystem, event.stream_id);
-            
+            log::debug!(
+                "Processing event: subsystem={}, stream_id={:?}",
+                event.subsystem,
+                event.stream_id
+            );
+
             if event.subsystem != "connection_manager" {
                 continue;
             }
-            
+
             if event.stream_id.is_none() {
                 // Main connection manager event
                 Self::process_main_event(event, &mut state);
@@ -114,7 +125,11 @@ impl ConnectionManagerState {
                 // Individual server event
                 if let Some(server) = Self::process_server_event(event, connection_id) {
                     // Update existing server or add new one
-                    if let Some(existing) = state.servers.iter_mut().find(|s| s.connection_id == server.connection_id) {
+                    if let Some(existing) = state
+                        .servers
+                        .iter_mut()
+                        .find(|s| s.connection_id == server.connection_id)
+                    {
                         *existing = server;
                     } else {
                         state.servers.push(server);
@@ -122,17 +137,22 @@ impl ConnectionManagerState {
                 }
             }
         }
-        
+
         // Sort servers for consistent display
-        state.servers.sort_by(|a, b| a.connection_id.cmp(&b.connection_id));
-        
-        log::info!("ConnectionManagerState::from_serializable_events: Final state: {:?}", state);
+        state
+            .servers
+            .sort_by(|a, b| a.connection_id.cmp(&b.connection_id));
+
+        log::info!(
+            "ConnectionManagerState::from_serializable_events: Final state: {:?}",
+            state
+        );
         state
     }
-    
+
     fn process_main_event(event: &SerializableDiagEvent, state: &mut ConnectionManagerState) {
         log::debug!("Processing main event with {} metrics", event.metrics.len());
-        
+
         for metric in &event.metrics {
             match metric.name.as_str() {
                 "election_state" => {
@@ -179,8 +199,11 @@ impl ConnectionManagerState {
             }
         }
     }
-    
-    fn process_server_event(event: &SerializableDiagEvent, connection_id: &str) -> Option<ServerInfo> {
+
+    fn process_server_event(
+        event: &SerializableDiagEvent,
+        connection_id: &str,
+    ) -> Option<ServerInfo> {
         let mut server = ServerInfo {
             connection_id: connection_id.to_string(),
             url: "unknown".to_string(),
@@ -191,7 +214,7 @@ impl ConnectionManagerState {
             connected: false,
             measurement_count: None,
         };
-        
+
         for metric in &event.metrics {
             match metric.name.as_str() {
                 "server_url" => {
@@ -232,7 +255,7 @@ impl ConnectionManagerState {
                 _ => {}
             }
         }
-        
+
         Some(server)
     }
 }
@@ -244,12 +267,10 @@ pub struct ConnectionManagerDisplayProps {
 
 #[function_component(ConnectionManagerDisplay)]
 pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html {
-    let parsed_state = props.connection_manager_state
-        .as_ref()
-        .map(|json| {
-            let events: Vec<SerializableDiagEvent> = serde_json::from_str(json).unwrap_or_default();
-            ConnectionManagerState::from_serializable_events(&events)
-        });
+    let parsed_state = props.connection_manager_state.as_ref().map(|json| {
+        let events: Vec<SerializableDiagEvent> = serde_json::from_str(json).unwrap_or_default();
+        ConnectionManagerState::from_serializable_events(&events)
+    });
 
     log::info!("ConnectionManagerDisplay: parsed_state: {:?}", parsed_state);
 
@@ -666,9 +687,9 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
                                                 html! {
                                                     <div class="detail-item">
                                                         <span class="detail-label">{"RTT:"}</span>
-                                                        <span class={classes!("detail-value", "rtt-value", 
-                                                            if rtt < 50.0 { "rtt-good" } 
-                                                            else if rtt < 150.0 { "rtt-ok" } 
+                                                        <span class={classes!("detail-value", "rtt-value",
+                                                            if rtt < 50.0 { "rtt-good" }
+                                                            else if rtt < 150.0 { "rtt-ok" }
                                                             else { "rtt-poor" }
                                                         )}>
                                                             {format!("{:.1}ms", rtt)}
@@ -707,7 +728,7 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
                                                                     html! {}
                                                                 }
                                                             }
-                                                            <span class={classes!("indicator", "status-indicator", format!("status-{}", server.status))} 
+                                                            <span class={classes!("indicator", "status-indicator", format!("status-{}", server.status))}
                                                                   title={server.status.clone()}>
                                                                 {
                                                                     match server.status.as_str() {
@@ -731,8 +752,8 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
                                                                 if let Some(rtt) = server.rtt {
                                                                     html! {
                                                                         <span class={classes!("server-rtt",
-                                                                            if rtt < 50.0 { "rtt-good" } 
-                                                                            else if rtt < 150.0 { "rtt-ok" } 
+                                                                            if rtt < 50.0 { "rtt-good" }
+                                                                            else if rtt < 150.0 { "rtt-ok" }
                                                                             else { "rtt-poor" }
                                                                         )}>
                                                                             {format!("{:.1}ms", rtt)}
@@ -791,7 +812,7 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
     } else {
         html! {
             <>
-                // Scoped CSS for diagnostics only  
+                // Scoped CSS for diagnostics only
                 <style>
                     {r#"
                     .connection-manager-display {

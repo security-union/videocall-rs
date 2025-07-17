@@ -349,7 +349,7 @@ async fn handle_session(
                 // Check if this is an RTT packet that should be echoed back
                 if is_rtt_packet(&buf) {
                     debug!("Echoing RTT datagram back via WebTransport");
-                    if let Err(e) = session.send_datagram(buf.into()) {
+                    if let Err(e) = session.send_datagram(buf) {
                         error!("Error echoing RTT datagram: {}", e);
                     }
                 } else {
@@ -509,7 +509,7 @@ async fn handle_quic_connection(
                 // Check if this is an RTT packet that should be echoed back
                 if is_rtt_packet(&datagram) {
                     debug!("Echoing RTT datagram back via QUIC");
-                    if let Err(e) = session.send_datagram(datagram.into()) {
+                    if let Err(e) = session.send_datagram(datagram) {
                         error!("Error echoing RTT datagram via QUIC: {}", e);
                     }
                 } else {

@@ -485,7 +485,7 @@ impl ConnectionManager {
         let active_id = self.active_connection_id.as_ref();
         let mut to_remove = Vec::new();
 
-        for (connection_id, _) in &self.connections {
+        for connection_id in self.connections.keys() {
             if Some(connection_id) != active_id {
                 to_remove.push(connection_id.clone());
             }

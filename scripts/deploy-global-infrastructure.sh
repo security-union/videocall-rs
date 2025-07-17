@@ -30,6 +30,9 @@ declare -a CHARTS=(
     "global/us-east/webtransport"
     "global/singapore/websocket"
     "global/singapore/webtransport"
+    # Ingress controller wrapper charts (must be deployed before WebSocket/UI ingresses can work)
+    "global/us-east/ingress-nginx"
+    "global/singapore/ingress-nginx"
 )
 
 # Infrastructure components that need to be deployed first
@@ -113,6 +116,12 @@ get_context_for_chart() {
         "global/singapore/websocket"|"global/singapore/webtransport")
             echo "${SINGAPORE_CONTEXT}"
             ;;
+        "global/us-east/ingress-nginx")
+            echo "${US_EAST_CONTEXT}"
+            ;;
+        "global/singapore/ingress-nginx")
+            echo "${SINGAPORE_CONTEXT}"
+            ;;
         *)
             echo "unknown"
             ;;
@@ -132,6 +141,12 @@ get_release_name_for_chart() {
             ;;
         "global/singapore/webtransport")
             echo "webtransport-singapore"
+            ;;
+        "global/us-east/ingress-nginx")
+            echo "ingress-nginx-us-east"
+            ;;
+        "global/singapore/ingress-nginx")
+            echo "ingress-nginx-singapore"
             ;;
         *)
             echo "unknown"
@@ -508,13 +523,14 @@ deploy_cert_manager() {
 # Deploy Certificate resources
 deploy_certificates() {
     log_section "Deploying SSL Certificates"
-    
+
     local cert_files=($(get_certificate_files_for_region "${DEPLOY_REGION}"))
-    
+
     for cert_file in "${cert_files[@]}"; do
         local cert_path="${HELM_DIR}/${cert_file}"
+        local namespace="default"
         local region=""
-        
+
         # Determine which context to use based on the file path
         if [[ "$cert_file" == *"singapore"* ]]; then
             region="Singapore"
@@ -527,19 +543,37 @@ deploy_certificates() {
                 kubectl config use-context "${US_EAST_CONTEXT}" >/dev/null 2>&1
             fi
         fi
-        
-        log_info "Deploying certificate for ${region}: $(basename ${cert_file})"
-        
+
+        # Extract certificate name from YAML (first occurrence under metadata)
+        local cert_name="$(grep -m1 '^  name:' "${cert_path}" | awk '{print $2}')"
+        if [[ -z "${cert_name}" ]]; then
+            log_warning "Could not determine certificate name from ${cert_path}. Skipping."
+            continue
+        fi
+
+        # Skip deployment if certificate already exists and is Ready
+        if kubectl get certificate "${cert_name}" -n "${namespace}" >/dev/null 2>&1; then
+            local readiness="$(kubectl get certificate "${cert_name}" -n "${namespace}" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")"
+            if [[ "${readiness}" == "True" ]]; then
+                log_info "Certificate ${cert_name} already exists and is Ready in ${region}, skipping"
+                continue
+            else
+                log_info "Certificate ${cert_name} exists but not Ready in ${region}, re-applying"
+            fi
+        else
+            log_info "Deploying certificate for ${region}: $(basename ${cert_file})"
+        fi
+
         if [[ "${DRY_RUN}" == "true" ]]; then
             log_info "[DRY RUN] Would deploy certificate: ${cert_path}"
             continue
         fi
-        
+
         if ! kubectl apply -f "${cert_path}"; then
             error_exit "Failed to deploy certificate: ${cert_path}"
         fi
-        
-        log_success "Successfully deployed certificate: $(basename ${cert_file})"
+
+        log_success "Successfully applied certificate: $(basename ${cert_file})"
     done
 }
 

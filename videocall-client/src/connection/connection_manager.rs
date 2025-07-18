@@ -620,9 +620,6 @@ impl ConnectionManager {
 
         // Then report diagnostics
         self.report_diagnostics();
-
-        // Finally handle any lost connections
-        self.process_lost_connections();
     }
 
     /// Report RTT metrics to diagnostics system
@@ -1001,31 +998,6 @@ impl ConnectionManager {
                     .and_then(|id| self.rtt_measurements.get(id))
                     .map(|m| m.url.clone()),
             },
-        }
-    }
-
-    /// Process any lost connections and trigger state updates
-    fn process_lost_connections(&mut self) {
-        let lost: Vec<String> = if let Ok(mut lost) = self.lost_connections.try_borrow() {
-            lost.drain(..).collect()
-        } else {
-            Vec::new()
-        };
-
-        for connection_id in lost {
-            if let Some(measurement) = self.rtt_measurements.get(&connection_id) {
-                warn!(
-                    "Connection {} lost - reporting failure to UI",
-                    connection_id
-                );
-
-                self.election_state = ElectionState::Failed {
-                    reason: "Connection lost".to_string(),
-                    failed_at: js_sys::Date::now(),
-                };
-                self.active_connection_id = None;
-                self.report_state();
-            }
         }
     }
 }

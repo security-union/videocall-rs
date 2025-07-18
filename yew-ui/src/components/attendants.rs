@@ -205,7 +205,7 @@ impl AttendantsComponent {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
-            rtt_testing_period_ms: Some(3000),
+            rtt_testing_period_ms: 60_000,
             rtt_probe_interval_ms: Some(200),
         };
         VideoCallClient::new(opts)

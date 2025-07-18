@@ -8,6 +8,11 @@ rustlemania-webtransport:
   command: ['webtransport_server']
   tlsSecret: webtransport-us-east-tls
 
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: high-availability-cf63fcce
+
   env:
     - name: RUST_LOG
       value: debug,quinn=warn
@@ -49,8 +54,8 @@ rustlemania-webtransport:
       external-dns.alpha.kubernetes.io/hostname: "webtransport-us-east.webtransport.video"
 
   autoscaling:
-    enabled: true
-    minReplicas: 3
+    enabled: false
+    minReplicas: 1
     maxReplicas: 10
     targetCPUUtilizationPercentage: 70
 

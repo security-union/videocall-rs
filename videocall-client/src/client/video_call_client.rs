@@ -41,11 +41,6 @@ use videocall_types::protos::rsa_packet::RsaPacket;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
-/// RTT testing period in milliseconds
-const RTT_TESTING_PERIOD_MS: u64 = 3000;
-
-/// Interval between RTT probes in milliseconds  
-
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoCallClientOptions {
@@ -101,7 +96,7 @@ pub struct VideoCallClientOptions {
     pub on_encoder_settings_update: Option<Callback<String>>,
 
     /// RTT testing period in milliseconds (default: 3000ms)
-    pub rtt_testing_period_ms: Option<u64>,
+    pub rtt_testing_period_ms: u64,
 
     /// Interval between RTT probes in milliseconds (default: 200ms)
     pub rtt_probe_interval_ms: Option<u64>,
@@ -276,12 +271,9 @@ impl VideoCallClient {
             return self.connect_direct();
         }
 
-        let testing_period = self
-            .options
-            .rtt_testing_period_ms
-            .unwrap_or(RTT_TESTING_PERIOD_MS);
+        let election_period_ms = self.options.rtt_testing_period_ms;
 
-        info!("RTT testing period: {}ms", testing_period);
+        info!("RTT testing period: {}ms", election_period_ms);
 
         // Create ConnectionManager which will handle all the RTT testing
         let manager_options = ConnectionManagerOptions {
@@ -346,7 +338,7 @@ impl VideoCallClient {
                     }
                 })
             },
-            election_period_ms: Some(testing_period),
+            election_period_ms,
         };
 
         let connection_manager = ConnectionManager::new(manager_options, self.aes.clone())?;
@@ -472,7 +464,7 @@ impl VideoCallClient {
                     }
                 })
             },
-            election_period_ms: Some(100), // Very short election period for direct connection
+            election_period_ms: 100, // Very short election period for direct connection
         };
 
         let connection_manager = ConnectionManager::new(manager_options, self.aes.clone())?;

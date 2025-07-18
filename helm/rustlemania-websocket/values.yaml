@@ -9,7 +9,7 @@ replicaCount: 1
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always
-  tag: latest
+  tag: high-availability-cf63fcce
 env:
   - name: RUST_LOG
     value: info

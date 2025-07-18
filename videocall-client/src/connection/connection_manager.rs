@@ -34,12 +34,6 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
-/// RTT testing period in milliseconds
-const DEFAULT_ELECTION_PERIOD_MS: u64 = 3000;
-
-/// Interval between RTT probes in milliseconds  
-const RTT_PROBE_INTERVAL_MS: u64 = 200;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {
     Testing {
@@ -106,7 +100,7 @@ pub struct ConnectionManagerOptions {
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
-    pub election_period_ms: Option<u64>,
+    pub election_period_ms: u64,
 }
 
 #[derive(Debug)]
@@ -162,10 +156,7 @@ impl ConnectionManager {
 
     /// Start the election process by creating all connections upfront
     fn start_election(&mut self) -> Result<()> {
-        let election_duration = self
-            .options
-            .election_period_ms
-            .unwrap_or(DEFAULT_ELECTION_PERIOD_MS);
+        let election_duration = self.options.election_period_ms;
         let start_time = js_sys::Date::now();
 
         info!("Starting connection election for {}ms", election_duration);

@@ -5,6 +5,11 @@ rustlemania-websocket:
 
   replicaCount: 1  # Higher replicas for primary region
 
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: high-availability-cf63fcce
+
   env:
     - name: RUST_LOG
       value: info
@@ -53,8 +58,8 @@ rustlemania-websocket:
           - websocket-us-east.webtransport.video
 
   autoscaling:
-    enabled: true
-    minReplicas: 3
+    enabled: false
+    minReplicas: 1
     maxReplicas: 12
     targetCPUUtilizationPercentage: 70
 

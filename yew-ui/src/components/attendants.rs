@@ -21,7 +21,9 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     peer_list::PeerList,
 };
-use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
+use crate::constants::{
+    CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
+};
 use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_utils::window;
 use log::{debug, error, warn};
@@ -205,7 +207,7 @@ impl AttendantsComponent {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
-            rtt_testing_period_ms: 60_000,
+            rtt_testing_period_ms: *SERVER_ELECTION_PERIOD_MS,
             rtt_probe_interval_ms: Some(200),
         };
         VideoCallClient::new(opts)

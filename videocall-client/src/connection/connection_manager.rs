@@ -448,26 +448,47 @@ impl ConnectionManager {
 
     /// Find the connection with the best (lowest) average RTT
     fn find_best_connection(&self) -> Result<(String, ServerRttMeasurement)> {
-        let mut best_connection: Option<(String, ServerRttMeasurement)> = None;
-        let mut best_rtt = f64::INFINITY;
+        // We run two passes: first look exclusively at WebTransport connections.
+        // Only if none of them are usable do we fall back to WebSocket.
+
+        let mut best_wt: Option<(String, ServerRttMeasurement)> = None;
+        let mut best_wt_rtt = f64::INFINITY;
+
+        let mut best_ws: Option<(String, ServerRttMeasurement)> = None;
+        let mut best_ws_rtt = f64::INFINITY;
 
         for (connection_id, measurement) in &self.rtt_measurements {
-            // Only consider connections that are actually connected
-            if let Some(connection) = self.connections.get(connection_id) {
-                if !connection.is_connected() {
+            // Skip connections that are not yet fully established
+            if let Some(conn) = self.connections.get(connection_id) {
+                if !conn.is_connected() {
                     continue;
                 }
             }
 
             if let Some(avg_rtt) = measurement.average_rtt {
-                if !measurement.measurements.is_empty() && avg_rtt < best_rtt {
-                    best_rtt = avg_rtt;
-                    best_connection = Some((connection_id.clone(), measurement.clone()));
+                if measurement.measurements.is_empty() {
+                    continue;
+                }
+
+                if measurement.is_webtransport {
+                    if avg_rtt < best_wt_rtt {
+                        best_wt_rtt = avg_rtt;
+                        best_wt = Some((connection_id.clone(), measurement.clone()));
+                    }
+                } else {
+                    if avg_rtt < best_ws_rtt {
+                        best_ws_rtt = avg_rtt;
+                        best_ws = Some((connection_id.clone(), measurement.clone()));
+                    }
                 }
             }
         }
 
-        best_connection.ok_or_else(|| anyhow!("No valid connections with RTT measurements found"))
+        if let Some(best) = best_wt {
+            return Ok(best);
+        }
+
+        best_ws.ok_or_else(|| anyhow!("No valid connections with RTT measurements found"))
     }
 
     /// Close all unused connections after election

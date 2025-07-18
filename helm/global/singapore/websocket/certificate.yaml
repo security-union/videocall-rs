@@ -9,4 +9,5 @@ spec:
     name: letsencrypt-prod
     kind: Issuer
   dnsNames:
-    - websocket-singapore.webtransport.video 
+    - websocket-singapore.webtransport.video
+    - webwebtransport-singapore.webtransport.video

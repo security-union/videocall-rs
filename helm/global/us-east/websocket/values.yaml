@@ -56,6 +56,7 @@ rustlemania-websocket:
       - secretName: websocket-us-east-tls
         hosts:
           - websocket-us-east.webtransport.video
+          - webtransport-us-east.webtransport.video
 
   autoscaling:
     enabled: false

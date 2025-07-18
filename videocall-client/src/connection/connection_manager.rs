@@ -113,6 +113,7 @@ pub struct ConnectionManager {
     rtt_probe_timer: Option<Interval>,
     election_timer: Option<Interval>,
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
+    lost_connections: Rc<RefCell<Vec<String>>>, // connection_ids that were lost and need handling
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
 }
@@ -129,6 +130,7 @@ impl ConnectionManager {
         info!("ConnectionManager starting with {} servers", total_servers);
 
         let rtt_responses = Rc::new(RefCell::new(Vec::new()));
+        let lost_connections = Rc::new(RefCell::new(Vec::new()));
 
         let mut manager = Self {
             connections: HashMap::new(),
@@ -142,6 +144,7 @@ impl ConnectionManager {
             rtt_probe_timer: None,
             election_timer: None,
             rtt_responses,
+            lost_connections,
             options,
             aes,
         };
@@ -320,9 +323,13 @@ impl ConnectionManager {
 
     /// Create callback for connection lost
     fn create_connection_lost_callback(&self, connection_id: String) -> Callback<JsValue> {
+        let lost_queue = self.lost_connections.clone();
         Callback::from(move |error| {
             warn!("Connection {} lost: {:?}", connection_id, error);
-            // Reconnection logic will be handled separately
+            // push to lost queue for handling in main loop
+            if let Ok(mut q) = lost_queue.try_borrow_mut() {
+                q.push(connection_id.clone());
+            }
         })
     }
 
@@ -510,14 +517,12 @@ impl ConnectionManager {
 
     /// Start reconnection process for failed active connection
     fn start_reconnection(&mut self, connection_id: String) {
-        const MAX_RECONNECT_ATTEMPTS: u32 = 3;
-
         warn!("Starting reconnection for {}", connection_id);
 
         self.election_state = ElectionState::Reconnecting {
             connection_id: connection_id.clone(),
             attempt: 1,
-            max_attempts: MAX_RECONNECT_ATTEMPTS,
+            max_attempts: 3, // Keep original MAX_RECONNECT_ATTEMPTS
             started_at: js_sys::Date::now(),
         };
 
@@ -530,6 +535,54 @@ impl ConnectionManager {
             failed_at: js_sys::Date::now(),
         };
         self.report_state();
+    }
+
+    /// (Re)create a single connection given its id and url/type
+    fn recreate_connection(
+        &mut self,
+        conn_id: &str,
+        url: &str,
+        is_webtransport: bool,
+    ) -> Result<()> {
+        let connect_options = if is_webtransport {
+            ConnectOptions {
+                userid: self.options.userid.clone(),
+                websocket_url: String::new(),
+                webtransport_url: url.to_string(),
+                on_inbound_media: self.create_inbound_media_callback(conn_id.to_string()),
+                on_connected: self.create_connected_callback(conn_id.to_string()),
+                on_connection_lost: self.create_connection_lost_callback(conn_id.to_string()),
+                peer_monitor: self.options.peer_monitor.clone(),
+            }
+        } else {
+            ConnectOptions {
+                userid: self.options.userid.clone(),
+                websocket_url: url.to_string(),
+                webtransport_url: String::new(),
+                on_inbound_media: self.create_inbound_media_callback(conn_id.to_string()),
+                on_connected: self.create_connected_callback(conn_id.to_string()),
+                on_connection_lost: self.create_connection_lost_callback(conn_id.to_string()),
+                peer_monitor: self.options.peer_monitor.clone(),
+            }
+        };
+
+        let new_conn = Connection::connect(is_webtransport, connect_options, self.aes.clone())?;
+        self.connections.insert(conn_id.to_string(), new_conn);
+
+        // reset measurement entry
+        self.rtt_measurements.insert(
+            conn_id.to_string(),
+            ServerRttMeasurement {
+                url: url.to_string(),
+                is_webtransport,
+                measurements: Vec::new(),
+                average_rtt: None,
+                connection_id: conn_id.to_string(),
+                active: false,
+                connected: false,
+            },
+        );
+        Ok(())
     }
 
     /// Start 1Hz diagnostics reporting  
@@ -567,6 +620,9 @@ impl ConnectionManager {
 
         // Then report diagnostics
         self.report_diagnostics();
+
+        // Finally handle any lost connections
+        self.process_lost_connections();
     }
 
     /// Report RTT metrics to diagnostics system
@@ -945,6 +1001,31 @@ impl ConnectionManager {
                     .and_then(|id| self.rtt_measurements.get(id))
                     .map(|m| m.url.clone()),
             },
+        }
+    }
+
+    /// Process any lost connections and trigger state updates
+    fn process_lost_connections(&mut self) {
+        let lost: Vec<String> = if let Ok(mut lost) = self.lost_connections.try_borrow() {
+            lost.drain(..).collect()
+        } else {
+            Vec::new()
+        };
+
+        for connection_id in lost {
+            if let Some(measurement) = self.rtt_measurements.get(&connection_id) {
+                warn!(
+                    "Connection {} lost - reporting failure to UI",
+                    connection_id
+                );
+
+                self.election_state = ElectionState::Failed {
+                    reason: "Connection lost".to_string(),
+                    failed_at: js_sys::Date::now(),
+                };
+                self.active_connection_id = None;
+                self.report_state();
+            }
         }
     }
 }

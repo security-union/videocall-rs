@@ -257,8 +257,7 @@ impl VideoCallClient {
         let total_servers = websocket_count + webtransport_count;
 
         info!(
-            "Starting RTT testing for {} servers (WebSocket: {}, WebTransport: {})",
-            total_servers, websocket_count, webtransport_count
+            "Starting RTT testing for {total_servers} servers (WebSocket: {websocket_count}, WebTransport: {webtransport_count})"
         );
 
         if total_servers == 0 {
@@ -273,7 +272,7 @@ impl VideoCallClient {
 
         let election_period_ms = self.options.rtt_testing_period_ms;
 
-        info!("RTT testing period: {}ms", election_period_ms);
+        info!("RTT testing period: {election_period_ms}ms");
 
         // Create ConnectionManager which will handle all the RTT testing
         let manager_options = ConnectionManagerOptions {
@@ -367,7 +366,7 @@ impl VideoCallClient {
                     if let Ok(mut inner) = inner.try_borrow_mut() {
                         if let Some(connection_manager) = &mut inner.connection_manager {
                             if let Err(e) = connection_manager.send_rtt_probes() {
-                                debug!("Failed to send RTT probes: {}", e);
+                                debug!("Failed to send RTT probes: {e}");
                             }
                         }
                     }
@@ -536,14 +535,14 @@ impl VideoCallClient {
             Ok(inner) => {
                 if let Some(connection_manager) = &inner.connection_manager {
                     if let Err(e) = connection_manager.send_packet(media) {
-                        error!("Failed to send packet: {}", e);
+                        error!("Failed to send packet: {e}");
                     }
                 } else {
                     error!("No connection manager available");
                 }
             }
             Err(_) => {
-                error!("Unable to borrow inner -- dropping send packet {:?}", media)
+                error!("Unable to borrow inner -- dropping send packet {media:?}")
             }
         }
     }
@@ -710,18 +709,15 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_manager) = &inner.connection_manager {
                 if let Err(e) = connection_manager.set_video_enabled(enabled) {
-                    error!("Failed to set video enabled {}: {}", enabled, e);
+                    error!("Failed to set video enabled {enabled}: {e}");
                 } else {
-                    debug!("Successfully set video enabled: {}", enabled);
+                    debug!("Successfully set video enabled: {enabled}");
                 }
             } else {
-                debug!(
-                    "No connection manager available for set_video_enabled({})",
-                    enabled
-                );
+                debug!("No connection manager available for set_video_enabled({enabled})");
             }
         } else {
-            error!("Unable to borrow inner for set_video_enabled({})", enabled);
+            error!("Unable to borrow inner for set_video_enabled({enabled})");
         }
     }
 
@@ -729,18 +725,15 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_manager) = &inner.connection_manager {
                 if let Err(e) = connection_manager.set_audio_enabled(enabled) {
-                    error!("Failed to set audio enabled {}: {}", enabled, e);
+                    error!("Failed to set audio enabled {enabled}: {e}");
                 } else {
-                    debug!("Successfully set audio enabled: {}", enabled);
+                    debug!("Successfully set audio enabled: {enabled}");
                 }
             } else {
-                debug!(
-                    "No connection manager available for set_audio_enabled({})",
-                    enabled
-                );
+                debug!("No connection manager available for set_audio_enabled({enabled})");
             }
         } else {
-            error!("Unable to borrow inner for set_audio_enabled({})", enabled);
+            error!("Unable to borrow inner for set_audio_enabled({enabled})");
         }
     }
 
@@ -748,18 +741,15 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_manager) = &inner.connection_manager {
                 if let Err(e) = connection_manager.set_screen_enabled(enabled) {
-                    error!("Failed to set screen enabled {}: {}", enabled, e);
+                    error!("Failed to set screen enabled {enabled}: {e}");
                 } else {
-                    debug!("Successfully set screen enabled: {}", enabled);
+                    debug!("Successfully set screen enabled: {enabled}");
                 }
             } else {
-                debug!(
-                    "No connection manager available for set_screen_enabled({})",
-                    enabled
-                );
+                debug!("No connection manager available for set_screen_enabled({enabled})");
             }
         } else {
-            error!("Unable to borrow inner for set_screen_enabled({})", enabled);
+            error!("Unable to borrow inner for set_screen_enabled({enabled})");
         }
     }
 
@@ -807,11 +797,11 @@ impl Inner {
                                     self.options.enable_e2ee,
                                 ),
                             ) {
-                                error!("Failed to set peer aes: {}", e);
+                                error!("Failed to set peer aes: {e}");
                             }
                         }
                         Err(e) => {
-                            error!("Failed to parse aes packet: {}", e);
+                            error!("Failed to parse aes packet: {e}");
                         }
                     }
                 }
@@ -844,14 +834,14 @@ impl Inner {
                             };
 
                             if let Err(e) = connection_manager.send_packet(packet) {
-                                error!("Failed to send AES key packet: {}", e);
+                                error!("Failed to send AES key packet: {e}");
                             }
                         } else {
                             error!("No connection manager available for AES key");
                         }
                     }
                     Err(e) => {
-                        error!("Failed to send AES_KEY to peer: {}", e);
+                        error!("Failed to send AES_KEY to peer: {e}");
                     }
                 }
             }
@@ -862,7 +852,7 @@ impl Inner {
                 // No need to process them here anymore
 
                 if let Err(e) = self.peer_decode_manager.decode(response) {
-                    error!("error decoding packet: {}", e);
+                    error!("error decoding packet: {e}");
                     self.peer_decode_manager.delete_peer(&email);
                 }
             }
@@ -873,7 +863,7 @@ impl Inner {
                 // Parse and handle the diagnostics packet
                 if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
                 {
-                    debug!("Received diagnostics packet: {:?}", diagnostics_packet);
+                    debug!("Received diagnostics packet: {diagnostics_packet:?}");
                     if let Some(sender_diagnostics) = &self.sender_diagnostics {
                         sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);
                     }
@@ -882,11 +872,11 @@ impl Inner {
                 }
             }
             Err(e) => {
-                error!("Failed to parse diagnostics packet: {}", e);
+                error!("Failed to parse diagnostics packet: {e}");
             }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {
-            debug!("added peer {}", peer_userid);
+            debug!("added peer {peer_userid}");
             self.send_public_key();
             self.options.on_peer_added.emit(peer_userid);
         }
@@ -907,7 +897,7 @@ impl Inner {
                 };
                 match packet.write_to_bytes() {
                     Ok(data) => {
-                        debug!(">> {} sending public key", userid);
+                        debug!(">> {userid} sending public key");
 
                         // Send RSA public key packet via ConnectionManager
                         if let Some(connection_manager) = &self.connection_manager {
@@ -919,19 +909,19 @@ impl Inner {
                             };
 
                             if let Err(e) = connection_manager.send_packet(packet) {
-                                error!("Failed to send RSA public key packet: {}", e);
+                                error!("Failed to send RSA public key packet: {e}");
                             }
                         } else {
                             error!("No connection manager available for RSA public key");
                         }
                     }
                     Err(e) => {
-                        error!("Failed to serialize rsa packet: {}", e);
+                        error!("Failed to serialize rsa packet: {e}");
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to export rsa public key to der: {}", e);
+                error!("Failed to export rsa public key to der: {e}");
             }
         }
     }

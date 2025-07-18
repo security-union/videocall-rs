@@ -127,7 +127,7 @@ impl ConnectionManager {
             return Err(anyhow!("No servers provided for connection testing"));
         }
 
-        info!("ConnectionManager starting with {} servers", total_servers);
+        info!("ConnectionManager starting with {total_servers} servers");
 
         let rtt_responses = Rc::new(RefCell::new(Vec::new()));
         let lost_connections = Rc::new(RefCell::new(Vec::new()));
@@ -160,7 +160,7 @@ impl ConnectionManager {
         let election_duration = self.options.election_period_ms;
         let start_time = js_sys::Date::now();
 
-        info!("Starting connection election for {}ms", election_duration);
+        info!("Starting connection election for {election_duration}ms");
 
         // Create all connections upfront
         self.create_all_connections()?;
@@ -185,7 +185,7 @@ impl ConnectionManager {
     fn create_all_connections(&mut self) -> Result<()> {
         // Create WebSocket connections
         for (i, url) in self.options.websocket_urls.iter().enumerate() {
-            let conn_id = format!("ws_{}", i);
+            let conn_id = format!("ws_{i}");
             let connect_options = ConnectOptions {
                 userid: self.options.userid.clone(),
                 websocket_url: url.clone(),
@@ -211,17 +211,17 @@ impl ConnectionManager {
                             connected: false,
                         },
                     );
-                    debug!("Created WebSocket connection {}: {}", conn_id, url);
+                    debug!("Created WebSocket connection {conn_id}: {url}");
                 }
                 Err(e) => {
-                    error!("Failed to create WebSocket connection to {}: {}", url, e);
+                    error!("Failed to create WebSocket connection to {url}: {e}");
                 }
             }
         }
 
         // Create WebTransport connections
         for (i, url) in self.options.webtransport_urls.iter().enumerate() {
-            let conn_id = format!("wt_{}", i);
+            let conn_id = format!("wt_{i}");
             let connect_options = ConnectOptions {
                 userid: self.options.userid.clone(),
                 websocket_url: String::new(), // Not used for WebTransport
@@ -247,10 +247,10 @@ impl ConnectionManager {
                             connected: false,
                         },
                     );
-                    debug!("Created WebTransport connection {}: {}", conn_id, url);
+                    debug!("Created WebTransport connection {conn_id}: {url}");
                 }
                 Err(e) => {
-                    error!("Failed to create WebTransport connection to {}: {}", url, e);
+                    error!("Failed to create WebTransport connection to {url}: {e}");
                 }
             }
         }
@@ -316,7 +316,7 @@ impl ConnectionManager {
     /// Create callback for connection established
     fn create_connected_callback(&self, connection_id: String) -> Callback<()> {
         Callback::from(move |_| {
-            debug!("Connection {} established", connection_id);
+            debug!("Connection {connection_id} established");
             // Mark connection as connected - this will be handled externally
         })
     }
@@ -325,7 +325,7 @@ impl ConnectionManager {
     fn create_connection_lost_callback(&self, connection_id: String) -> Callback<JsValue> {
         let lost_queue = self.lost_connections.clone();
         Callback::from(move |error| {
-            warn!("Connection {} lost: {:?}", connection_id, error);
+            warn!("Connection {connection_id} lost: {error:?}");
             // push to lost queue for handling in main loop
             if let Ok(mut q) = lost_queue.try_borrow_mut() {
                 q.push(connection_id.clone());
@@ -353,10 +353,7 @@ impl ConnectionManager {
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
         connection.send_packet(rtt_packet);
-        debug!(
-            "Sent RTT probe to {} at timestamp {}",
-            connection_id, timestamp
-        );
+        debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
 
@@ -443,7 +440,7 @@ impl ConnectionManager {
                 self.report_state();
             }
             Err(e) => {
-                error!("Election failed: {}", e);
+                error!("Election failed: {e}");
                 self.election_state = ElectionState::Failed {
                     reason: e.to_string(),
                     failed_at: js_sys::Date::now(),
@@ -482,11 +479,9 @@ impl ConnectionManager {
                         best_wt_rtt = avg_rtt;
                         best_wt = Some((connection_id.clone(), measurement.clone()));
                     }
-                } else {
-                    if avg_rtt < best_ws_rtt {
-                        best_ws_rtt = avg_rtt;
-                        best_ws = Some((connection_id.clone(), measurement.clone()));
-                    }
+                } else if avg_rtt < best_ws_rtt {
+                    best_ws_rtt = avg_rtt;
+                    best_ws = Some((connection_id.clone(), measurement.clone()));
                 }
             }
         }
@@ -511,78 +506,8 @@ impl ConnectionManager {
 
         for connection_id in to_remove {
             self.connections.remove(&connection_id);
-            info!("Closed unused connection: {}", connection_id);
+            info!("Closed unused connection: {connection_id}");
         }
-    }
-
-    /// Start reconnection process for failed active connection
-    fn start_reconnection(&mut self, connection_id: String) {
-        warn!("Starting reconnection for {}", connection_id);
-
-        self.election_state = ElectionState::Reconnecting {
-            connection_id: connection_id.clone(),
-            attempt: 1,
-            max_attempts: 3, // Keep original MAX_RECONNECT_ATTEMPTS
-            started_at: js_sys::Date::now(),
-        };
-
-        self.report_state();
-
-        // TODO: Implement actual reconnection logic
-        // For now, just fail after reporting state
-        self.election_state = ElectionState::Failed {
-            reason: "Reconnection not implemented yet".to_string(),
-            failed_at: js_sys::Date::now(),
-        };
-        self.report_state();
-    }
-
-    /// (Re)create a single connection given its id and url/type
-    fn recreate_connection(
-        &mut self,
-        conn_id: &str,
-        url: &str,
-        is_webtransport: bool,
-    ) -> Result<()> {
-        let connect_options = if is_webtransport {
-            ConnectOptions {
-                userid: self.options.userid.clone(),
-                websocket_url: String::new(),
-                webtransport_url: url.to_string(),
-                on_inbound_media: self.create_inbound_media_callback(conn_id.to_string()),
-                on_connected: self.create_connected_callback(conn_id.to_string()),
-                on_connection_lost: self.create_connection_lost_callback(conn_id.to_string()),
-                peer_monitor: self.options.peer_monitor.clone(),
-            }
-        } else {
-            ConnectOptions {
-                userid: self.options.userid.clone(),
-                websocket_url: url.to_string(),
-                webtransport_url: String::new(),
-                on_inbound_media: self.create_inbound_media_callback(conn_id.to_string()),
-                on_connected: self.create_connected_callback(conn_id.to_string()),
-                on_connection_lost: self.create_connection_lost_callback(conn_id.to_string()),
-                peer_monitor: self.options.peer_monitor.clone(),
-            }
-        };
-
-        let new_conn = Connection::connect(is_webtransport, connect_options, self.aes.clone())?;
-        self.connections.insert(conn_id.to_string(), new_conn);
-
-        // reset measurement entry
-        self.rtt_measurements.insert(
-            conn_id.to_string(),
-            ServerRttMeasurement {
-                url: url.to_string(),
-                is_webtransport,
-                measurements: Vec::new(),
-                average_rtt: None,
-                connection_id: conn_id.to_string(),
-                active: false,
-                connected: false,
-            },
-        );
-        Ok(())
     }
 
     /// Start 1Hz diagnostics reporting  
@@ -705,8 +630,7 @@ impl ConnectionManager {
             };
 
             debug!(
-                "ConnectionManager: Sending main connection manager diagnostics event: {:?}",
-                event
+                "ConnectionManager: Sending main connection manager diagnostics event: {event:?}"
             );
             match global_sender().send(event) {
                 Ok(_) => {
@@ -714,8 +638,7 @@ impl ConnectionManager {
                 }
                 Err(e) => {
                     error!(
-                        "ConnectionManager: Failed to send main connection manager diagnostics: {}",
-                        e
+                        "ConnectionManager: Failed to send main connection manager diagnostics: {e}"
                     );
                 }
             }
@@ -910,16 +833,11 @@ impl ConnectionManager {
         &self.rtt_measurements
     }
 
-    /// Get current election state (for debugging)
-    pub fn get_election_state(&self) -> &ElectionState {
-        &self.election_state
-    }
-
     /// Send RTT probes to all connected servers (can be called externally)
     pub fn send_rtt_probes(&mut self) -> Result<()> {
         for connection_id in self.connections.keys().cloned().collect::<Vec<_>>() {
             if let Err(e) = self.send_rtt_probe(&connection_id) {
-                debug!("Failed to send RTT probe to {}: {}", connection_id, e);
+                debug!("Failed to send RTT probe to {connection_id}: {e}");
             }
         }
         Ok(())

@@ -76,7 +76,7 @@ impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
     fn flush(&mut self) {
         // For standard decoder, we can flush the decoder state
         if let Err(e) = self.decoder.flush() {
-            log::error!("Failed to flush standard audio decoder: {:?}", e);
+            log::error!("Failed to flush standard audio decoder: {e:?}");
         }
     }
 

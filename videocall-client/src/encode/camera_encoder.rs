@@ -126,8 +126,7 @@ impl CameraEncoder {
                         let percent_change = (new - current).abs() / current;
 
                         if percent_change > BITRATE_CHANGE_THRESHOLD {
-                            on_encoder_settings_update
-                                .emit(format!("Bitrate: {:.2} kbps", bitrate));
+                            on_encoder_settings_update.emit(format!("Bitrate: {bitrate:.2} kbps"));
                             current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                         }
                     } else {
@@ -206,7 +205,7 @@ impl CameraEncoder {
                 if now - last_chunk_time >= 1000.0 {
                     let fps = chunks_in_last_second;
                     current_fps.store(fps, Ordering::Relaxed);
-                    log::debug!("Encoder output FPS: {}", fps);
+                    log::debug!("Encoder output FPS: {fps}");
                     chunks_in_last_second = 0;
                     last_chunk_time = now;
                 }
@@ -270,7 +269,7 @@ impl CameraEncoder {
 
             // Setup video encoder
             let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                error!("error_handler error {:?}", e);
+                error!("error_handler error {e:?}");
             }) as Box<dyn FnMut(JsValue)>);
 
             let video_output_handler =
@@ -300,7 +299,7 @@ impl CameraEncoder {
             video_encoder_config.set_latency_mode(LatencyMode::Realtime);
 
             if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                error!("Error configuring video encoder: {:?}", e);
+                error!("Error configuring video encoder: {e:?}");
             }
 
             let video_processor =
@@ -332,7 +331,7 @@ impl CameraEncoder {
                     let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                     video_track.stop();
                     if let Err(e) = video_encoder.close() {
-                        error!("Error closing video encoder: {:?}", e);
+                        error!("Error closing video encoder: {e:?}");
                     }
                     return;
                 }
@@ -340,11 +339,11 @@ impl CameraEncoder {
                 // Update the bitrate if it has changed more than the threshold percentage
                 let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
                 if new_current_bitrate != local_bitrate {
-                    log::info!("Updating video bitrate to {}", new_current_bitrate);
+                    log::info!("Updating video bitrate to {new_current_bitrate}");
                     local_bitrate = new_current_bitrate;
                     video_encoder_config.set_bitrate(local_bitrate as f64);
                     if let Err(e) = video_encoder.configure(&video_encoder_config) {
-                        error!("Error configuring video encoder: {:?}", e);
+                        error!("Error configuring video encoder: {e:?}");
                     }
                 }
 
@@ -363,8 +362,7 @@ impl CameraEncoder {
                             && (frame_width != current_encoder_width
                                 || frame_height != current_encoder_height)
                         {
-                            log::info!("Camera dimensions changed from {}x{} to {}x{}, reconfiguring encoder", 
-                                current_encoder_width, current_encoder_height, frame_width, frame_height);
+                            log::info!("Camera dimensions changed from {current_encoder_width}x{current_encoder_height} to {frame_width}x{frame_height}, reconfiguring encoder");
 
                             current_encoder_width = frame_width;
                             current_encoder_height = frame_height;
@@ -378,8 +376,7 @@ impl CameraEncoder {
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             if let Err(e) = video_encoder.configure(&new_config) {
                                 error!(
-                                    "Error reconfiguring camera encoder with new dimensions: {:?}",
-                                    e
+                                    "Error reconfiguring camera encoder with new dimensions: {e:?}"
                                 );
                             }
                         }
@@ -389,13 +386,13 @@ impl CameraEncoder {
                         if let Err(e) = video_encoder
                             .encode_with_options(&video_frame, &video_encoder_encode_options)
                         {
-                            error!("Error encoding video frame: {:?}", e);
+                            error!("Error encoding video frame: {e:?}");
                         }
                         video_frame.close();
                         video_frame_counter += 1;
                     }
                     Err(e) => {
-                        error!("error {:?}", e);
+                        error!("error {e:?}");
                     }
                 }
             }

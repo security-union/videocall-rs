@@ -79,12 +79,6 @@ pub enum ElectionState {
         connection_id: String,
         elected_at: f64,
     },
-    Reconnecting {
-        connection_id: String,
-        attempt: u32,
-        max_attempts: u32,
-        started_at: f64,
-    },
     Failed {
         reason: String,
         failed_at: f64,
@@ -96,7 +90,6 @@ pub struct ConnectionManagerOptions {
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
     pub userid: String,
-    pub enable_webtransport: bool,
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
@@ -596,18 +589,6 @@ impl ConnectionManager {
                     }
                 }
             }
-
-            ElectionState::Reconnecting {
-                connection_id,
-                attempt,
-                max_attempts,
-                ..
-            } => {
-                metrics.push(metric!("election_state", "reconnecting"));
-                metrics.push(metric!("reconnect_connection_id", connection_id.as_str()));
-                metrics.push(metric!("reconnect_attempt", *attempt as u64));
-                metrics.push(metric!("reconnect_max_attempts", *max_attempts as u64));
-            }
             ElectionState::Failed { reason, failed_at } => {
                 metrics.push(metric!("election_state", "failed"));
                 metrics.push(metric!("failure_reason", reason.as_str()));
@@ -743,24 +724,6 @@ impl ConnectionManager {
                     }
                 }
             }
-            ElectionState::Reconnecting {
-                connection_id,
-                attempt,
-                max_attempts,
-                ..
-            } => {
-                let server_url = self
-                    .rtt_measurements
-                    .get(connection_id)
-                    .map(|m| m.url.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                ConnectionState::Reconnecting {
-                    server_url,
-                    attempt: *attempt,
-                    max_attempts: *max_attempts,
-                }
-            }
             ElectionState::Failed { reason, .. } => ConnectionState::Failed {
                 error: reason.clone(),
                 last_known_server: self
@@ -888,24 +851,6 @@ impl ConnectionManager {
                         error: "Elected connection not found in measurements".to_string(),
                         last_known_server: None,
                     }
-                }
-            }
-            ElectionState::Reconnecting {
-                connection_id,
-                attempt,
-                max_attempts,
-                ..
-            } => {
-                let server_url = self
-                    .rtt_measurements
-                    .get(connection_id)
-                    .map(|m| m.url.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                ConnectionState::Reconnecting {
-                    server_url,
-                    attempt: *attempt,
-                    max_attempts: *max_attempts,
                 }
             }
             ElectionState::Failed { reason, .. } => ConnectionState::Failed {

@@ -283,7 +283,6 @@ impl VideoCallClient {
                 Vec::new() // Empty if WebTransport is disabled
             },
             userid: self.options.userid.clone(),
-            enable_webtransport: self.options.enable_webtransport,
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
@@ -412,7 +411,6 @@ impl VideoCallClient {
             websocket_urls,
             webtransport_urls,
             userid: self.options.userid.clone(),
-            enable_webtransport: self.options.enable_webtransport,
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {

@@ -150,10 +150,19 @@ impl AttendantsComponent {
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
+        let websocket_urls = ACTIX_WEBSOCKET
+            .split(',')
+            .map(|s| format!("{s}/{email}/{id}"))
+            .collect::<Vec<String>>();
+        let webtransport_urls = WEBTRANSPORT_HOST
+            .split(',')
+            .map(|s| format!("{s}/{email}/{id}"))
+            .collect::<Vec<String>>();
+
         let opts = VideoCallClientOptions {
             userid: email.clone(),
-            websocket_urls: vec![format!("{ACTIX_WEBSOCKET}/{email}/{id}")],
-            webtransport_urls: vec![format!("{WEBTRANSPORT_HOST}/{email}/{id}")],
+            websocket_urls,
+            webtransport_urls,
             enable_e2ee: ctx.props().e2ee_enabled,
             enable_webtransport: ctx.props().webtransport_enabled,
             on_connected: {
@@ -297,7 +306,6 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        log::info!("AttendantsComponent::create called");
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
         let self_ = Self {
@@ -332,11 +340,8 @@ impl Component for AttendantsComponent {
         {
             let link = ctx.link().clone();
             wasm_bindgen_futures::spawn_local(async move {
-                log::info!("AttendantsComponent: Starting diagnostics subscription");
                 let rx = subscribe();
-                log::info!("AttendantsComponent: Diagnostics subscription established");
                 while let Ok(evt) = rx.recv_async().await {
-                    log::debug!("AttendantsComponent: Received diagnostics event - subsystem: {}, stream_id: {:?}", evt.subsystem, evt.stream_id);
                     if evt.subsystem == "neteq" {
                         for m in &evt.metrics {
                             if m.name == "stats_json" {
@@ -369,8 +374,6 @@ impl Component for AttendantsComponent {
                             }
                         }
                     } else if evt.subsystem == "connection_manager" {
-                        log::info!("AttendantsComponent: Received connection manager diagnostics event: {:?}", evt);
-                        // Convert DiagEvent to SerializableDiagEvent and send as JSON
                         let serializable_evt = SerializableDiagEvent::from(evt);
                         link.send_message(Msg::ConnectionManagerUpdate(
                             serde_json::to_string(&serializable_evt).unwrap_or_default(),
@@ -600,11 +603,6 @@ impl Component for AttendantsComponent {
                 false
             }
             Msg::ConnectionManagerUpdate(event_json) => {
-                log::info!(
-                    "AttendantsComponent: Processing ConnectionManagerUpdate: {}",
-                    event_json
-                );
-
                 // Parse the SerializableDiagEvent from JSON
                 if let Ok(event) = serde_json::from_str::<SerializableDiagEvent>(&event_json) {
                     // Accumulate connection manager events
@@ -619,8 +617,6 @@ impl Component for AttendantsComponent {
                     if let Ok(serialized) = serde_json::to_string(&self.connection_manager_events) {
                         self.connection_manager_state = Some(serialized);
                     }
-
-                    log::info!("AttendantsComponent: Updated connection_manager_state with {} accumulated events, triggering re-render", self.connection_manager_events.len());
                 } else {
                     log::error!(
                         "AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {}",

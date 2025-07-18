@@ -101,19 +101,7 @@ impl Default for ConnectionManagerState {
 impl ConnectionManagerState {
     pub fn from_serializable_events(events: &[SerializableDiagEvent]) -> Self {
         let mut state = Self::default();
-
-        log::info!(
-            "ConnectionManagerState::from_serializable_events: Processing {} events",
-            events.len()
-        );
-
         for event in events {
-            log::debug!(
-                "Processing event: subsystem={}, stream_id={:?}",
-                event.subsystem,
-                event.stream_id
-            );
-
             if event.subsystem != "connection_manager" {
                 continue;
             }
@@ -142,17 +130,10 @@ impl ConnectionManagerState {
         state
             .servers
             .sort_by(|a, b| a.connection_id.cmp(&b.connection_id));
-
-        log::info!(
-            "ConnectionManagerState::from_serializable_events: Final state: {:?}",
-            state
-        );
         state
     }
 
     fn process_main_event(event: &SerializableDiagEvent, state: &mut ConnectionManagerState) {
-        log::debug!("Processing main event with {} metrics", event.metrics.len());
-
         for metric in &event.metrics {
             match metric.name.as_str() {
                 "election_state" => {
@@ -271,8 +252,6 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
         let events: Vec<SerializableDiagEvent> = serde_json::from_str(json).unwrap_or_default();
         ConnectionManagerState::from_serializable_events(&events)
     });
-
-    log::info!("ConnectionManagerDisplay: parsed_state: {:?}", parsed_state);
 
     if let Some(state) = parsed_state {
         html! {

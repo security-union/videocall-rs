@@ -7,7 +7,7 @@ on:
   push:
     branches:
       - main
-      - add-safari-to-neteq
+      - high-availability
     paths:
       - 'yew-ui/**'
       - 'types/**'

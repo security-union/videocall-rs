@@ -152,11 +152,11 @@ impl AttendantsComponent {
         let id = ctx.props().id.clone();
         let websocket_urls = ACTIX_WEBSOCKET
             .split(',')
-            .map(|s| format!("{s}/{email}/{id}"))
+            .map(|s| format!("{s}/lobby/{email}/{id}"))
             .collect::<Vec<String>>();
         let webtransport_urls = WEBTRANSPORT_HOST
             .split(',')
-            .map(|s| format!("{s}/{email}/{id}"))
+            .map(|s| format!("{s}/lobby/{email}/{id}"))
             .collect::<Vec<String>>();
 
         let opts = VideoCallClientOptions {

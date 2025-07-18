@@ -112,8 +112,7 @@ pub struct ConnectionManager {
     rtt_reporter: Option<Interval>,
     rtt_probe_timer: Option<Interval>,
     election_timer: Option<Interval>,
-    rtt_start_times: HashMap<String, f64>, // track when RTT probes were sent
-    rtt_responses: Rc<RefCell<Vec<(String, f64)>>>, // Shared queue for RTT responses: (connection_id, timestamp)
+    rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
 }
@@ -142,7 +141,6 @@ impl ConnectionManager {
             rtt_reporter: None,
             rtt_probe_timer: None,
             election_timer: None,
-            rtt_start_times: HashMap::new(),
             rtt_responses,
             options,
             aes,
@@ -283,19 +281,21 @@ impl ConnectionManager {
         Callback::from(move |packet: PacketWrapper| {
             // Handle RTT responses internally
             if packet.email == userid {
+                let reception_time = js_sys::Date::now();
                 if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
                     if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
                         if media_packet.media_type == MediaType::RTT.into() {
-                            // Extract timestamp from RTT packet
-                            let timestamp = media_packet.timestamp;
                             debug!(
-                                "RTT response received on connection {} with timestamp {}",
-                                connection_id, timestamp
+                                "RTT response received on connection {} at {}, sent at {}",
+                                connection_id, reception_time, media_packet.timestamp
                             );
-
                             // Add RTT response to shared queue for processing
                             if let Ok(mut responses) = rtt_responses.try_borrow_mut() {
-                                responses.push((connection_id.clone(), timestamp));
+                                responses.push((
+                                    connection_id.clone(),
+                                    media_packet,
+                                    reception_time,
+                                ));
                             } else {
                                 warn!("Unable to add RTT response to queue - queue is borrowed");
                             }
@@ -345,10 +345,6 @@ impl ConnectionManager {
         let timestamp = js_sys::Date::now();
         let rtt_packet = self.create_rtt_packet(timestamp)?;
 
-        // Track when we sent this probe
-        self.rtt_start_times
-            .insert(connection_id.to_string(), timestamp);
-
         connection.send_packet(rtt_packet);
         debug!(
             "Sent RTT probe to {} at timestamp {}",
@@ -376,11 +372,14 @@ impl ConnectionManager {
     }
 
     /// Handle RTT response and calculate round-trip time
-    fn handle_rtt_response(&mut self, connection_id: &str, sent_timestamp: f64) {
-        let current_time = js_sys::Date::now();
-        let rtt = current_time - sent_timestamp;
-
-        debug!("RTT for {}: {}ms", connection_id, rtt);
+    fn handle_rtt_response(
+        &mut self,
+        connection_id: &str,
+        media_packet: &MediaPacket,
+        reception_time: f64,
+    ) {
+        let sent_timestamp = media_packet.timestamp;
+        let rtt = reception_time - sent_timestamp;
 
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
             measurement.measurements.push(rtt);
@@ -522,7 +521,7 @@ impl ConnectionManager {
     /// Process any queued RTT responses
     fn process_queued_rtt_responses(&mut self) {
         // First collect all responses to avoid borrow conflicts
-        let responses_to_process: Vec<(String, f64)> =
+        let responses_to_process: Vec<(String, MediaPacket, f64)> =
             if let Ok(mut responses) = self.rtt_responses.try_borrow_mut() {
                 responses.drain(..).collect()
             } else {
@@ -530,17 +529,8 @@ impl ConnectionManager {
             };
 
         // Now process each response
-        for (connection_id, _response_timestamp) in responses_to_process {
-            if let Some(sent_timestamp) = self.rtt_start_times.get(&connection_id) {
-                self.handle_rtt_response(&connection_id, *sent_timestamp);
-                // Remove the timestamp since we've processed this response
-                self.rtt_start_times.remove(&connection_id);
-            } else {
-                debug!(
-                    "Received RTT response for {} but no sent timestamp found",
-                    connection_id
-                );
-            }
+        for (connection_id, media_packet, reception_time) in responses_to_process {
+            self.handle_rtt_response(&connection_id, &media_packet, reception_time);
         }
     }
 
@@ -556,20 +546,6 @@ impl ConnectionManager {
 
         // Then report diagnostics
         self.report_diagnostics();
-    }
-
-    /// Process RTT response packet (called externally when RTT responses are received)
-    pub fn process_rtt_response(&mut self, connection_id: &str, _timestamp: f64) {
-        if let Some(sent_timestamp) = self.rtt_start_times.get(connection_id) {
-            self.handle_rtt_response(connection_id, *sent_timestamp);
-            // Remove the timestamp since we've processed this response
-            self.rtt_start_times.remove(connection_id);
-        } else {
-            debug!(
-                "Received RTT response for {} but no sent timestamp found",
-                connection_id
-            );
-        }
     }
 
     /// Report RTT metrics to diagnostics system

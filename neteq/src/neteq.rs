@@ -242,10 +242,10 @@ impl NetEq {
                     Ok(pcm_samples) => {
                         let sample_count = pcm_samples.len();
                         self.bypass_audio_queue.extend(pcm_samples);
-                        log::trace!("Bypass mode: decoded {} samples", sample_count);
+                        log::trace!("Bypass mode: decoded {sample_count} samples");
                     }
                     Err(e) => {
-                        log::warn!("Bypass mode decode error: {:?}", e);
+                        log::warn!("Bypass mode decode error: {e:?}");
                     }
                 }
             } else {
@@ -334,10 +334,7 @@ impl NetEq {
         let pre_target_delay = self.delay_manager.target_delay_ms();
         let pre_packet_count = self.packet_buffer.len();
         log::trace!(
-            "get_audio pre-decision: buffer={}ms, target={}ms, packets={}",
-            pre_buffer_ms,
-            pre_target_delay,
-            pre_packet_count
+            "get_audio pre-decision: buffer={pre_buffer_ms}ms, target={pre_target_delay}ms, packets={pre_packet_count}"
         );
         // -----------------------------------------------------
 
@@ -347,11 +344,7 @@ impl NetEq {
 
         // Additional logging of chosen operation and current state
         log::debug!(
-            "get_audio decision: {:?} (buffer={}ms, target={}ms, packets={})",
-            operation,
-            pre_buffer_ms,
-            pre_target_delay,
-            pre_packet_count
+            "get_audio decision: {operation:?} (buffer={pre_buffer_ms}ms, target={pre_target_delay}ms, packets={pre_packet_count})"
         );
 
         match operation {
@@ -373,10 +366,7 @@ impl NetEq {
         let post_buffer_ms = self.current_buffer_size_ms();
         let post_packet_count = self.packet_buffer.len();
         log::trace!(
-            "get_audio post-decision: operation={:?}, buffer_after={}ms, packets_after={}",
-            operation,
-            post_buffer_ms,
-            post_packet_count
+            "get_audio post-decision: operation={operation:?}, buffer_after={post_buffer_ms}ms, packets_after={post_packet_count}"
         );
         // ------------------------------------------------
 
@@ -490,7 +480,7 @@ impl NetEq {
             frame.samples[..to_copy].copy_from_slice(&self.leftover_samples[..to_copy]);
             self.leftover_samples.drain(..to_copy);
             filled += to_copy;
-            log::trace!("decode_normal: consumed {} leftover samples", to_copy);
+            log::trace!("decode_normal: consumed {to_copy} leftover samples");
         }
 
         // Continue pulling packets until frame is filled or buffer is empty

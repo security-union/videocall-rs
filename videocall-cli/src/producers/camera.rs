@@ -178,12 +178,12 @@ impl CameraDaemon {
             ) {
                 Ok(camera) => camera,
                 Err(e) => {
-                    panic!("{}\n please run 'info --list-formats' to see the available resolutions, frame formats and fps", e)
+                    panic!("{e}\n please run 'info --list-formats' to see the available resolutions, frame formats and fps")
                 }
             };
             let actual_resolution = camera.resolution();
             camera.open_stream().unwrap();
-            println!("Requested format: {:?}", frame_format);
+            println!("Requested format: {frame_format:?}");
             println!("Actual stream format: {:?}", camera.frame_format());
 
             // Allocate buffer for raw data based on actual format

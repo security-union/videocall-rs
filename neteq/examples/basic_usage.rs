@@ -133,7 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_stats = neteq.get_statistics();
     println!("\nFinal Statistics:");
     println!("================");
-    println!("Total samples processed: {}", total_samples);
+    println!("Total samples processed: {total_samples}");
     println!(
         "Packets received: {}",
         final_stats.lifetime.jitter_buffer_packets_received
@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         final_stats.lifetime.concealment_events
     );
     println!("Buffer flushes: {}", final_stats.lifetime.buffer_flushes);
-    println!("Expand frames: {}", expand_count);
+    println!("Expand frames: {expand_count}");
     println!(
         "Current buffer size: {}ms",
         final_stats.current_buffer_size_ms

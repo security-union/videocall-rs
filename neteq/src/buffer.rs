@@ -112,7 +112,7 @@ impl PacketBuffer {
 
         if flushed_count > 0 {
             stats.buffer_flush();
-            log::debug!("Flushed {} packets from buffer", flushed_count);
+            log::debug!("Flushed {flushed_count} packets from buffer");
         }
     }
 
@@ -151,11 +151,7 @@ impl PacketBuffer {
                 }
             }
 
-            log::debug!(
-                "Partial flush: removed {} packets, kept {}",
-                remove_count,
-                keep_count
-            );
+            log::debug!("Partial flush: removed {remove_count} packets, kept {keep_count}");
             return Ok(BufferReturnCode::PartialFlush);
         }
 
@@ -283,7 +279,7 @@ impl PacketBuffer {
 
         let discarded = initial_len - self.buffer.len();
         if discarded > 0 {
-            log::debug!("Discarded {} old packets by timestamp", discarded);
+            log::debug!("Discarded {discarded} old packets by timestamp");
         }
     }
 
@@ -396,7 +392,7 @@ impl PacketBuffer {
 
         let discarded = initial_len - self.buffer.len();
         if discarded > 0 {
-            log::debug!("Discarded {} stale packets", discarded);
+            log::debug!("Discarded {discarded} stale packets");
         }
     }
 }

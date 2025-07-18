@@ -1,0 +1,58 @@
+nats:
+  nats:
+    natsbox:
+      enabled: true
+    cluster:
+      enabled: true
+      replicas: 3  # Smaller cluster for Singapore region
+      noAdvertise: true
+    # Gateway configuration for cross-region connectivity
+    gateway:
+      enabled: true
+      name: "singapore"  # Singapore region identifier
+      gateways:
+        - name: "us-east-1"
+          url: "nats://nats-gateway.us-east-1.videocall.rs:7222"
+        # Add more regions as needed
+        - name: "eu-west-1"
+          url: "nats://nats-gateway.eu-west-1.videocall.rs:7222"
+    # JetStream for message persistence and delivery guarantees
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          size: 5Gi  # Smaller storage for Singapore
+          storageClassName: do-block-storage-sgp1
+      memStore:
+        enabled: true
+        maxSize: 512Mi
+    # Monitoring and observability
+    exporter:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+    # Security configuration matching primary region
+    auth:
+      enabled: true
+      resolver:
+        type: "memory"
+        configMap:
+          name: "nats-accounts"
+    # Resource limits optimized for Singapore region
+    resources:
+      limits:
+        cpu: 300m
+        memory: 384Mi
+      requests:
+        cpu: 150m
+        memory: 192Mi
+    # Node selector for Singapore region
+    nodeSelector:
+      kubernetes.io/region: "sgp1"
+    # Service configuration for external access
+    service:
+      type: LoadBalancer
+      annotations:
+        service.beta.kubernetes.io/do-loadbalancer-name: "nats-singapore"
+        service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+        external-dns.alpha.kubernetes.io/hostname: "nats-gateway.singapore.videocall.rs" 

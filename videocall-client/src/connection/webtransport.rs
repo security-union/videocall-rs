@@ -198,7 +198,7 @@ fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<Pac
         Ok(media_packet) => callback.emit(media_packet),
         Err(_) => {
             let message_type = format!("{message_type:?}");
-            error!("failed to parse media packet {}", message_type);
+            error!("failed to parse media packet {message_type}");
         }
     }
 }

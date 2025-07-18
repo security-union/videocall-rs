@@ -6,3 +6,48 @@ nats:
       enabled: true
       replicas: 5
       noAdvertise: true
+    # Gateway configuration for cross-region connectivity
+    gateway:
+      enabled: true
+      name: "us-east-1"  # Current region identifier
+      gateways:
+        - name: "singapore"
+          url: "nats://nats-gateway.singapore.videocall.rs:7222"
+    # JetStream for message persistence and delivery guarantees
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          size: 10Gi
+          storageClassName: do-block-storage
+      memStore:
+        enabled: true
+        maxSize: 1Gi
+    # Monitoring and observability
+    exporter:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+    # Security configuration
+    auth:
+      enabled: true
+      # Configure access controls for cross-region access
+      resolver:
+        type: "memory"
+        configMap:
+          name: "nats-accounts"
+    # Resource limits for production
+    resources:
+      limits:
+        cpu: 500m
+        memory: 512Mi
+      requests:
+        cpu: 200m
+        memory: 256Mi
+    # Service configuration for external gateway access
+    service:
+      type: LoadBalancer
+      annotations:
+        service.beta.kubernetes.io/do-loadbalancer-name: "nats-us-east-1"
+        service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+        external-dns.alpha.kubernetes.io/hostname: "nats-gateway.us-east-1.videocall.rs"

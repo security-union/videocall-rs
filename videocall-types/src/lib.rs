@@ -28,6 +28,7 @@ impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
             protos::media_packet::media_packet::MediaType::VIDEO => write!(f, "video"),
             protos::media_packet::media_packet::MediaType::SCREEN => write!(f, "screen"),
             protos::media_packet::media_packet::MediaType::HEARTBEAT => write!(f, "heartbeat"),
+            protos::media_packet::media_packet::MediaType::RTT => write!(f, "rtt"),
         }
     }
 }

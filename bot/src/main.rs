@@ -56,10 +56,10 @@ async fn create_client(
     email_prefix: &str,
 ) -> JoinHandle<()> {
     let email = generate_email(email_prefix);
-    let url = format!("{}/lobby/{}/{}", endpoint, email, room);
+    let url = format!("{endpoint}/lobby/{email}/{room}");
     let parsed_url = Url::parse(&url).unwrap();
     let (mut ws_stream, _) = connect_async(parsed_url).await.unwrap();
-    println!("Connected to {}", url);
+    println!("Connected to {url}");
     let echo_user = echo_user.to_string();
     // Send a single heartbeat just so that we show up on the ui
     let media_packet = MediaPacket {
@@ -116,5 +116,5 @@ fn generate_email(email_prefix: &str) -> String {
         })
         .collect();
 
-    format!("{}{}@example.com", email_prefix, email)
+    format!("{email_prefix}{email}@example.com")
 }

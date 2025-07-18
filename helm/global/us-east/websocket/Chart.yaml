@@ -1,0 +1,9 @@
+apiVersion: v2
+name: websocket-us-east
+version: 0.1.0
+description: WebSocket server for US East region with LoadBalancer
+
+dependencies:
+  - name: rustlemania-websocket
+    version: 0.1.0
+    repository: file://../../../rustlemania-websocket 

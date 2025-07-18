@@ -20,8 +20,8 @@ use videocall_types::truthy;
 
 // This is read at compile time, please restart if you change this value.
 pub const LOGIN_URL: &str = std::env!("LOGIN_URL");
-pub const ACTIX_WEBSOCKET: &str = concat!(std::env!("ACTIX_UI_BACKEND_URL"), "/lobby");
-pub const WEBTRANSPORT_HOST: &str = concat!(std::env!("WEBTRANSPORT_HOST"), "/lobby");
+pub const ACTIX_WEBSOCKET: &str = std::env!("ACTIX_UI_BACKEND_URL");
+pub const WEBTRANSPORT_HOST: &str = std::env!("WEBTRANSPORT_HOST");
 pub const CANVAS_LIMIT: usize = 20;
 
 pub const AUDIO_BITRATE_KBPS: u32 = 65u32;
@@ -52,4 +52,8 @@ lazy_static! {
     pub static ref E2EE_ENABLED: bool = truthy(std::option_env!("E2EE_ENABLED"));
     pub static ref USERS_ALLOWED_TO_STREAM: Vec<String> =
         split_users(std::option_env!("USERS_ALLOWED_TO_STREAM"));
+    pub static ref SERVER_ELECTION_PERIOD_MS: u64 = std::option_env!("SERVER_ELECTION_PERIOD_MS")
+        .unwrap_or("2000")
+        .parse()
+        .expect("Failed to parse SERVER_ELECTION_PERIOD_MS");
 }

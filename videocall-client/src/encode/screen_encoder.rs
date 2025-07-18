@@ -114,7 +114,7 @@ impl ScreenEncoder {
 
                         if percent_change > BITRATE_CHANGE_THRESHOLD {
                             if let Some(callback) = &on_encoder_settings_update {
-                                callback.emit(format!("Bitrate: {:.2} kbps", bitrate));
+                                callback.emit(format!("Bitrate: {bitrate:.2} kbps"));
                             }
                             current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                         }
@@ -186,20 +186,17 @@ impl ScreenEncoder {
                 Ok(promise) => match JsFuture::from(promise).await {
                     Ok(stream) => stream.unchecked_into::<MediaStream>(),
                     Err(e) => {
-                        error!(
-                            "User denied screen sharing permission or error occurred: {:?}",
-                            e
-                        );
+                        error!("User denied screen sharing permission or error occurred: {e:?}");
                         return;
                     }
                 },
                 Err(e) => {
-                    error!("Failed to get display media: {:?}", e);
+                    error!("Failed to get display media: {e:?}");
                     return;
                 }
             };
 
-            log::info!("Screen to share: {:?}", screen_to_share);
+            log::info!("Screen to share: {screen_to_share:?}");
 
             let screen_track = Box::new(
                 screen_to_share
@@ -253,7 +250,7 @@ impl ScreenEncoder {
             };
 
             let screen_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                error!("Screen encoder error: {:?}", e);
+                error!("Screen encoder error: {e:?}");
             }) as Box<dyn FnMut(JsValue)>);
 
             let screen_output_handler =
@@ -267,7 +264,7 @@ impl ScreenEncoder {
             let screen_encoder = match VideoEncoder::new(&screen_encoder_init) {
                 Ok(encoder) => Box::new(encoder),
                 Err(e) => {
-                    error!("Failed to create video encoder: {:?}", e);
+                    error!("Failed to create video encoder: {e:?}");
                     return;
                 }
             };
@@ -287,7 +284,7 @@ impl ScreenEncoder {
             screen_encoder_config.set_bitrate(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
-                error!("Error configuring screen encoder: {:?}", e);
+                error!("Error configuring screen encoder: {e:?}");
                 return;
             }
 
@@ -296,7 +293,7 @@ impl ScreenEncoder {
             ) {
                 Ok(processor) => processor,
                 Err(e) => {
-                    error!("Failed to create media stream track processor: {:?}", e);
+                    error!("Failed to create media stream track processor: {e:?}");
                     return;
                 }
             };
@@ -319,7 +316,7 @@ impl ScreenEncoder {
                     switching.store(false, Ordering::Release);
                     media_track.stop();
                     if let Err(e) = screen_encoder.close() {
-                        error!("Error closing screen encoder: {:?}", e);
+                        error!("Error closing screen encoder: {e:?}");
                     }
                     break;
                 }
@@ -327,7 +324,7 @@ impl ScreenEncoder {
                 // Update the bitrate if it has changed from diagnostics system
                 let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
                 if new_bitrate != local_bitrate {
-                    info!("📊 Updating screen bitrate to {}", new_bitrate);
+                    info!("📊 Updating screen bitrate to {new_bitrate}");
                     local_bitrate = new_bitrate;
                     let new_config = VideoEncoderConfig::new(
                         VIDEO_CODEC,
@@ -337,7 +334,7 @@ impl ScreenEncoder {
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     if let Err(e) = screen_encoder.configure(&new_config) {
-                        error!("Error configuring screen encoder: {:?}", e);
+                        error!("Error configuring screen encoder: {e:?}");
                     }
                 }
 
@@ -346,7 +343,7 @@ impl ScreenEncoder {
                         let value = match Reflect::get(&js_frame, &JsString::from("value")) {
                             Ok(v) => v,
                             Err(e) => {
-                                error!("Failed to get frame value: {:?}", e);
+                                error!("Failed to get frame value: {e:?}");
                                 continue;
                             }
                         };
@@ -375,8 +372,7 @@ impl ScreenEncoder {
                             && (frame_width != current_encoder_width
                                 || frame_height != current_encoder_height)
                         {
-                            info!("Frame dimensions changed from {}x{} to {}x{}, reconfiguring encoder", 
-                                current_encoder_width, current_encoder_height, frame_width, frame_height);
+                            info!("Frame dimensions changed from {current_encoder_width}x{current_encoder_height} to {frame_width}x{frame_height}, reconfiguring encoder");
 
                             current_encoder_width = frame_width;
                             current_encoder_height = frame_height;
@@ -390,8 +386,7 @@ impl ScreenEncoder {
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             if let Err(e) = screen_encoder.configure(&new_config) {
                                 error!(
-                                    "Error reconfiguring screen encoder with new dimensions: {:?}",
-                                    e
+                                    "Error reconfiguring screen encoder with new dimensions: {e:?}"
                                 );
                             }
                         }
@@ -401,12 +396,12 @@ impl ScreenEncoder {
                         opts.set_key_frame(screen_frame_counter == 0);
 
                         if let Err(e) = screen_encoder.encode_with_options(&video_frame, &opts) {
-                            error!("Error encoding screen frame: {:?}", e);
+                            error!("Error encoding screen frame: {e:?}");
                         }
                         video_frame.close();
                     }
                     Err(e) => {
-                        error!("Error reading screen frame: {:?}", e);
+                        error!("Error reading screen frame: {e:?}");
                         break;
                     }
                 }

@@ -123,7 +123,7 @@ impl AudioPeerDecoder {
 
                         // Create the audio worklet node and connect it
                         if let Err(e) = Self::setup_audio_worklet(&codec, &context).await {
-                            error!("Failed to setup audio worklet: {:?}", e);
+                            error!("Failed to setup audio worklet: {e:?}");
                         } else {
                             info!(
                                 "Safari audio decoder initialized successfully with speaker device"
@@ -131,14 +131,14 @@ impl AudioPeerDecoder {
                         }
                     }
                     Err(e) => {
-                        error!("Failed to create audio context: {:?}", e);
+                        error!("Failed to create audio context: {e:?}");
                     }
                 }
             });
         }
 
         let error = Closure::wrap(Box::new(move |e: JsValue| {
-            error!("{:?}", e);
+            error!("{e:?}");
         }) as Box<dyn FnMut(JsValue)>);
 
         let output = Closure::wrap(Box::new(move |_audio_data: AudioData| {
@@ -166,7 +166,7 @@ impl AudioPeerDecoder {
         // Set the speaker device if specified
         if let Some(device_id) = speaker_device_id.clone() {
             if !device_id.is_empty() {
-                info!("Creating AudioContext with speaker device: {}", device_id);
+                info!("Creating AudioContext with speaker device: {device_id}");
                 options.set_sink_id(&JsValue::from_str(&device_id));
             }
         }
@@ -177,7 +177,7 @@ impl AudioPeerDecoder {
         if let Ok(promise) = context.resume() {
             match JsFuture::from(promise).await {
                 Ok(_) => info!("AudioContext resumed successfully"),
-                Err(e) => warn!("Failed to resume AudioContext: {:?}", e),
+                Err(e) => warn!("Failed to resume AudioContext: {e:?}"),
             }
         }
 
@@ -229,10 +229,7 @@ impl AudioPeerDecoder {
             return;
         }
 
-        info!(
-            "Updating Safari audio decoder speaker device to: {:?}",
-            speaker_device_id
-        );
+        info!("Updating Safari audio decoder speaker device to: {speaker_device_id:?}");
 
         let audio_context_ref = self.audio_context.clone();
         let current_speaker_id = self.current_speaker_id.clone();
@@ -263,7 +260,7 @@ impl AudioPeerDecoder {
                             info!("Old AudioContext closed successfully");
                         }
                         Err(e) => {
-                            error!("Failed to close old AudioContext: {:?}", e);
+                            error!("Failed to close old AudioContext: {e:?}");
                         }
                     }
                 } else {
@@ -307,7 +304,7 @@ impl AudioPeerDecoder {
                                 info!("New AudioContext resumed successfully");
                             }
                             Err(e) => {
-                                warn!("Failed to resume new AudioContext: {:?}", e);
+                                warn!("Failed to resume new AudioContext: {e:?}");
                             }
                         }
                     }
@@ -321,18 +318,12 @@ impl AudioPeerDecoder {
                             info!("Successfully updated Safari audio decoder speaker device");
                         }
                         Err(e) => {
-                            error!(
-                                "Failed to setup audio worklet with new AudioContext: {:?}",
-                                e
-                            );
+                            error!("Failed to setup audio worklet with new AudioContext: {e:?}");
                         }
                     }
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to create new AudioContext for speaker update: {:?}",
-                        e
-                    );
+                    error!("Failed to create new AudioContext for speaker update: {e:?}");
                 }
             }
         });

@@ -1,0 +1,6 @@
+dependencies:
+- name: rustlemania-websocket
+  repository: file://../../../rustlemania-websocket
+  version: 0.1.0
+digest: sha256:adb84ab8da50172d7f194e3e3184edfb56fbd0046240e4ad17eecde6d0f68407
+generated: "2025-07-16T07:40:11.187136-04:00"

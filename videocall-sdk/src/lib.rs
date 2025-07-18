@@ -84,7 +84,7 @@ impl DatagramQueue {
         let mut queue = self
             .queue
             .lock()
-            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {}", e)))?;
+            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {e}")))?;
 
         queue.push_back(data);
         info!("Added datagram to queue, queue size: {}", queue.len());
@@ -95,7 +95,7 @@ impl DatagramQueue {
         let mut queue = self
             .queue
             .lock()
-            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {}", e)))?;
+            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {e}")))?;
 
         match queue.pop_front() {
             Some(data) => {
@@ -112,7 +112,7 @@ impl DatagramQueue {
         let queue = self
             .queue
             .lock()
-            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {}", e)))?;
+            .map_err(|e| WebTransportError::QueueError(format!("Failed to acquire lock: {e}")))?;
 
         Ok(!queue.is_empty())
     }
@@ -138,7 +138,7 @@ impl WebTransportClient {
             .try_init();
 
         if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-            error!("Failed to install default provider: {:?}", e);
+            error!("Failed to install default provider: {e:?}");
         }
         // Create a multi-threaded Tokio runtime with all features enabled
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -154,11 +154,11 @@ impl WebTransportClient {
     }
 
     pub fn connect(&self, url: String) -> Result<(), WebTransportError> {
-        info!("Connecting to WebTransport server at {}", url);
+        info!("Connecting to WebTransport server at {url}");
 
         // Parse the URL
         let url = Url::parse(&url)
-            .map_err(|e| WebTransportError::InvalidUrl(format!("Invalid URL: {}", e)))?;
+            .map_err(|e| WebTransportError::InvalidUrl(format!("Invalid URL: {e}")))?;
 
         // Clone Arc for move into async block
         let session_mutex = Arc::clone(&self.session);
@@ -173,22 +173,20 @@ impl WebTransportClient {
                     for cert in certs {
                         root_store.add(cert).map_err(|e| {
                             WebTransportError::CertificateError(format!(
-                                "Failed to add certificate: {}",
-                                e
+                                "Failed to add certificate: {e}"
                             ))
                         })?;
                     }
                     count
                 }
                 Err(e) => {
-                    error!("Failed to load native certificates: {}", e);
+                    error!("Failed to load native certificates: {e}");
                     return Err(WebTransportError::CertificateError(format!(
-                        "Failed to load native certificates: {}",
-                        e
+                        "Failed to load native certificates: {e}"
                     )));
                 }
             };
-            info!("Loaded {} native certificates", cert_count);
+            info!("Loaded {cert_count} native certificates");
 
             // Create a rustls ClientConfig with the root store
             let _client_config = ClientConfig::builder()
@@ -200,18 +198,18 @@ impl WebTransportClient {
                 ClientBuilder::new()
                     .with_no_certificate_verification()
                     .map_err(|e| {
-                        WebTransportError::TlsError(format!("Failed to create client: {}", e))
+                        WebTransportError::TlsError(format!("Failed to create client: {e}"))
                     })?
             };
 
             // Connect to the server
             let session = client.connect(&url).await.map_err(|e| {
-                WebTransportError::ConnectionError(format!("Failed to connect: {}", e))
+                WebTransportError::ConnectionError(format!("Failed to connect: {e}"))
             })?;
 
             // Store the session
             let mut session_guard = session_mutex.lock().map_err(|e| {
-                WebTransportError::RuntimeError(format!("Failed to acquire lock: {}", e))
+                WebTransportError::RuntimeError(format!("Failed to acquire lock: {e}"))
             })?;
             *session_guard = Some(session);
 
@@ -228,7 +226,7 @@ impl WebTransportClient {
 
         self.runtime.block_on(async move {
             let session_guard = session_mutex.lock().map_err(|e| {
-                WebTransportError::RuntimeError(format!("Failed to acquire lock: {}", e))
+                WebTransportError::RuntimeError(format!("Failed to acquire lock: {e}"))
             })?;
 
             let session = session_guard
@@ -265,7 +263,7 @@ impl WebTransportClient {
                 let session_guard = match session_mutex.lock() {
                     Ok(guard) => guard,
                     Err(e) => {
-                        error!("Failed to acquire lock: {}", e);
+                        error!("Failed to acquire lock: {e}");
                         return;
                     }
                 };
@@ -286,15 +284,15 @@ impl WebTransportClient {
                     Ok(datagram) => {
                         let data = datagram.to_vec();
                         info!("Received datagram of size {} bytes", data.len());
-                        debug!("Datagram content: {:?}", data);
+                        debug!("Datagram content: {data:?}");
 
                         // Add the datagram to the queue
                         if let Err(e) = queue.add_datagram(data) {
-                            error!("Failed to add datagram to queue: {}", e);
+                            error!("Failed to add datagram to queue: {e}");
                         }
                     }
                     Err(e) => {
-                        error!("Error receiving datagram: {}", e);
+                        error!("Error receiving datagram: {e}");
                         break;
                     }
                 }
@@ -302,9 +300,9 @@ impl WebTransportClient {
         });
 
         // Store the listener handle
-        let mut listener_guard = datagram_listener_mutex.lock().map_err(|e| {
-            WebTransportError::RuntimeError(format!("Failed to acquire lock: {}", e))
-        })?;
+        let mut listener_guard = datagram_listener_mutex
+            .lock()
+            .map_err(|e| WebTransportError::RuntimeError(format!("Failed to acquire lock: {e}")))?;
         *listener_guard = Some(handle);
 
         info!("Successfully subscribed to inbound datagrams");
@@ -312,9 +310,10 @@ impl WebTransportClient {
     }
 
     pub fn stop_datagram_listener(&self) -> Result<(), WebTransportError> {
-        let mut listener_guard = self.datagram_listener.lock().map_err(|e| {
-            WebTransportError::RuntimeError(format!("Failed to acquire lock: {}", e))
-        })?;
+        let mut listener_guard = self
+            .datagram_listener
+            .lock()
+            .map_err(|e| WebTransportError::RuntimeError(format!("Failed to acquire lock: {e}")))?;
 
         if let Some(handle) = listener_guard.take() {
             handle.abort();
@@ -330,7 +329,7 @@ impl Drop for WebTransportClient {
         info!("Shutting down WebTransportClient");
         // Stop the datagram listener if it's running
         if let Err(e) = self.stop_datagram_listener() {
-            error!("Failed to stop datagram listener: {}", e);
+            error!("Failed to stop datagram listener: {e}");
         }
         // The runtime will be dropped automatically when the Arc's reference count reaches zero
     }

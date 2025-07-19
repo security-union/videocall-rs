@@ -7,11 +7,16 @@ on:
   push:
     branches:
       - main
+      - add-safari-to-neteq
     paths:
       - 'yew-ui/**'
       - 'types/**'
+      - 'videocall-client/**'
+      - 'videocall-codecs/**'
+      - 'neteq/**'
       - Dockerfile.yew
       - nginx.conf
+  workflow_dispatch:
 
 jobs:
   push_to_registry:

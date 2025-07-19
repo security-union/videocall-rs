@@ -1,3 +1,21 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use super::super::connection::{ConnectOptions, Connection};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
@@ -457,6 +475,24 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection) = &inner.connection {
                 connection.set_screen_enabled(enabled);
+            }
+        }
+    }
+
+    /// Updates the speaker device for all connected peers
+    ///
+    /// This will recreate all audio decoders to use the specified speaker device.
+    /// Pass None to use the default system speaker.
+    pub fn update_speaker_device(&self, speaker_device_id: Option<String>) -> Result<(), JsValue> {
+        match self.inner.try_borrow_mut() {
+            Ok(mut inner) => inner
+                .peer_decode_manager
+                .update_speaker_device(speaker_device_id),
+            Err(_) => {
+                error!("Failed to borrow inner for updating speaker device");
+                Err(JsValue::from_str(
+                    "Failed to borrow inner for updating speaker device",
+                ))
             }
         }
     }

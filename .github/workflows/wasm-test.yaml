@@ -5,10 +5,13 @@ on:
     branches: [ main ]
     paths:
       - 'videocall-client/**'
+      - 'videocall-codecs/**'
       - 'types/**'
   pull_request:
     paths:
       - 'videocall-client/**'
+      - 'videocall-codecs/**'
+      - 'neteq/**'
       - 'types/**'
 
 jobs:
@@ -37,8 +40,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-wasm-
 
+      - name: Install libvpx
+        run: sudo apt-get update && sudo apt-get install -y libvpx-dev
+
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Run wasm-pack tests
-        run: cd videocall-client && wasm-pack test --node 
+      - name: Run wasm-pack tests for videocall-client
+        run: cd videocall-client && wasm-pack test --node
+
+      - name: Run wasm-pack tests for videocall-codecs
+        run: cd videocall-codecs && cargo test

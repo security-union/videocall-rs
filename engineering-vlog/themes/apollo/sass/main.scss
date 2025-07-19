@@ -1,0 +1,96 @@
+@import "parts/_cards.scss";
+@import "parts/_code.scss";
+@import "parts/_header.scss";
+@import "parts/_image.scss";
+@import "parts/_toc.scss";
+@import "parts/_note.scss";
+@import "parts/_misc.scss";
+@import "parts/_table.scss";
+@import "parts/_tags.scss";
+@import "parts/_mermaid.scss";
+@import "parts/_search.scss";
+@import "parts/_talks.scss";
+
+:root {
+  /* Used for: block comment, hr, ... */
+  --border-color: var(--border-color);
+
+  /* Fonts */
+  --font-size-base: 13.5px;
+  --mono-text-font: "Jetbrains Mono";
+  --text-font: "ZedTextFtl";
+  --header-font: "ZedDisplayFtl" "Space Grotesk", "Helvetica", sans-serif;
+  --code-font: "Jetbrains Mono";
+
+  --line-height: 1.5;
+  --page-width: 920px;
+}
+
+html {
+  background-color: var(--bg-0);
+  color: var(--text-0);
+  font-family: var(--text-font);
+  line-height: var(--line-height);
+
+  @media (max-width: 992px) {
+    font-size: calc(var(--font-size-base) * 0.97);
+  }
+  @media (max-width: 768px) {
+      font-size: calc(var(--font-size-base) * 0.95);
+  }
+  @media (max-width: 576px) {
+      font-size: calc(var(--font-size-base) * 0.92);
+  }
+}
+
+body {
+  display: flex;
+  flex-grow: 1;
+  padding: 0.9rem;
+  padding-bottom: 1.5rem;
+  margin-bottom: 1.5rem;
+  min-height: calc(100vh - 150px);
+
+  @media (min-width: 992px) {
+    flex-direction: row;
+    justify-content: center;
+    align-items: flex-start;
+  }
+
+  .content {
+    width: 100%;
+    max-width: var(--page-width);
+    padding-bottom: 1.5rem;
+    margin-bottom: 1.5rem;
+    word-wrap: break-word;
+  }
+
+  .left-content {
+    width: 100%;
+
+    @media (min-width: 992px) {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+  }
+
+  .right-content {
+    width: 100%;
+
+    @media (min-width: 992px) {
+      flex: 1 1 0;
+      min-width: 0;
+
+    // Don't move this to the TOC, it won't work
+    // FIXME: Find a workaround
+    position: sticky;
+    top: 60px;
+    padding: 1em;
+    overflow-y: auto;
+    max-height: calc(100vh - 100px);
+
+    }
+
+
+  }
+}

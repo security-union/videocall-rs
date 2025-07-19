@@ -1,0 +1,94 @@
+[package]
+name = "neteq"
+version = "0.2.0"
+edition = "2021"
+description = "NetEQ-inspired adaptive jitter buffer for audio decoding"
+license = "MIT OR Apache-2.0"
+authors = ["Dario Lencina <dario@securityunion.dev>"]
+readme = "README.md"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+keywords = ["audio", "jitter", "webrtc", "neteq", "buffer"]
+categories = ["multimedia::audio", "multimedia::encoding", "algorithms", "data-structures"]
+include = ["src/**/*"]
+
+[dependencies]
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+# WASM/Web dependencies - only enabled with "web" feature
+serde_bytes = { version = "0.11", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "DedicatedWorkerGlobalScope", 
+    "MessageEvent", 
+    "console",
+    "AudioDecoder",
+    "AudioDecoderConfig",
+    "AudioDecoderInit",
+    "AudioData",
+    "AudioDataCopyToOptions",
+    "EncodedAudioChunk",
+    "EncodedAudioChunkInit",
+    "EncodedAudioChunkType",
+    "Window",
+    "Navigator",
+    "AudioContext",
+    "AudioWorkletNode",
+    "AudioWorklet",
+    "BaseAudioContext",
+    "AudioNode",
+] }
+gloo-utils = { version = "0.2", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+log = "0.4"
+ringbuf = "0.3"
+hound = { version = "3.5", optional = true }
+rand = { version = "0.9.1", optional = true, default-features = false, features = ["thread_rng"] }
+cpal = { version = "0.15", optional = true }
+opus = { version = "0.3", default-features = false, optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+env_logger = { version = "0.10", optional = true }
+web-time = "1.1.0"
+axum = { version = "0.7", optional = true }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "fs"], optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors", "fs", "set-header"], optional = true }
+once_cell = { version = "1.19", optional = true }
+
+[features]
+default = ["native", "audio_files"]
+audio_files = ["hound"]
+web = [
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "serde-wasm-bindgen",
+    "serde_bytes",
+    "js-sys",
+    "web-sys",
+    "gloo-utils", 
+    "console_error_panic_hook",
+    "once_cell",
+]
+native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
+
+[dev-dependencies]
+env_logger = "0.10"
+hound = "3.5"
+
+[[example]]
+name = "basic_usage"
+required-features = ["native"]
+
+[[example]]
+name = "neteq_player"
+required-features = ["native", "audio_files"]
+
+[[bin]]
+name = "dashboard_server"
+required-features = ["native"]
+
+

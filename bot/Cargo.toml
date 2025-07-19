@@ -1,6 +1,6 @@
 [package]
 name = "bot"
-version = "1.0.2"
+version = "1.0.4"
 edition = "2018"
 license = "MIT OR Apache-2.0"
 description = "A bot for the videocall project"
@@ -17,7 +17,7 @@ tokio = { version = "1.28.1", features = ["full"] }
 tokio-tungstenite = { version = "0.19.0", features = ["native-tls"] }
 rand = "0.8.5"
 futures = "0.3.16"
-videocall-types = { path= "../videocall-types", version = "1.0.1" }
+videocall-types = { path= "../videocall-types", version = "1.0.3" }
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"

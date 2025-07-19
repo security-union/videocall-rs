@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-bindings-linux-v0.1.2...videocall-nokhwa-bindings-linux-v0.1.3) - 2025-06-23
+
+### Other
+
+- Add new decoder and Add MIT - Apache 2 license to all files ([#285](https://github.com/security-union/videocall-rs/pull/285))
+
 ## [0.1.2](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-bindings-linux-v0.1.1...videocall-nokhwa-bindings-linux-v0.1.2) - 2025-03-26
 
 ### Other

@@ -1,6 +1,6 @@
 [package]
 name = "videocall-sdk"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform FFI bindings for videocall"
@@ -24,7 +24,7 @@ rustls-native-certs = "0.7"
 thiserror = "1.0.50"
 url = "2.4.1"
 tokio = { version = "1.32.0", features = ["full"] }
-anyhow = "1.0.75"
+anyhow = { workspace = true }
 bytes = "1.4.0"
 rustls = { version = "0.23.10", default-features = false, features = ["ring", "std"] }
 quinn = { version = "0.11", features = ["ring"] }
@@ -35,7 +35,7 @@ ring = { version = "0.17", default-features = false }
 futures = "0.3.31"
 
 # Types
-videocall-types = { path = "../videocall-types", version = "1.0.1" }
+videocall-types = { path = "../videocall-types", version = "1.0.3" }
 
 [build-dependencies]
 uniffi_build = { version = "0.29", features = ["builtin-bindgen"] }

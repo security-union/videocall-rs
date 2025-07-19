@@ -1,0 +1,21 @@
+{% extends "index.html" %}
+
+{% macro list_tag_posts(pages, tag_name=false) %}
+    {% if tag_name %}
+        <div class="page-header">
+            Entries tagged :: {{ tag_name }}
+        </div>
+    {% else %}
+        <div class="page-header">
+            All articles
+        </div>
+    {% endif %}
+
+    <main class="post-list">
+        {{ post_macros::list_posts(pages=pages) }}
+    </main>
+{% endmacro %}
+
+{% block main_content %}
+    {{ self::list_tag_posts(pages=term.pages, tag_name=term.name) }}
+{% endblock main_content %}

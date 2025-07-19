@@ -1,10 +1,32 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
+    host::Host, peer_list::PeerList,
 };
-use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM};
-use crate::components::host::Host;
+use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST, ACTIX_WEBSOCKET};
+use gloo_utils::window;
 use log::{debug, error, warn};
+use std::collections::HashMap;
+use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_diagnostics::{subscribe, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -34,9 +56,10 @@ pub enum MeetingAction {
 }
 
 #[derive(Debug)]
-pub enum UserScreenAction {
-    TogglePeerList,
-    ToggleDiagnostics,
+pub enum UserScreenToggleAction {
+    PeerList,
+    Diagnostics,
+    DeviceSettings,
 }
 
 #[derive(Debug)]
@@ -45,7 +68,17 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
-    UserScreenAction(UserScreenAction),
+    UserScreenAction(UserScreenToggleAction),
+    #[cfg(feature = "fake-peers")]
+    AddFakePeer,
+    #[cfg(feature = "fake-peers")]
+    RemoveLastFakePeer,
+    #[cfg(feature = "fake-peers")]
+    ToggleForceDesktopGrid,
+    NetEqStatsUpdated(String, String), // (peer_id, stats_json)
+    NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
+    NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
+    HangUp,
 }
 
 impl From<WsAction> for Msg {
@@ -54,8 +87,8 @@ impl From<WsAction> for Msg {
     }
 }
 
-impl From<UserScreenAction> for Msg {
-    fn from(action: UserScreenAction) -> Self {
+impl From<UserScreenToggleAction> for Msg {
+    fn from(action: UserScreenToggleAction) -> Self {
         Msg::UserScreenAction(action)
     }
 }
@@ -87,13 +120,24 @@ pub struct AttendantsComponent {
     pub video_enabled: bool,
     pub peer_list_open: bool,
     pub diagnostics_open: bool,
+    pub device_settings_open: bool,
     pub error: Option<String>,
     pub diagnostics_data: Option<String>,
     pub sender_stats: Option<String>,
     pub encoder_settings: Option<String>,
+    pub neteq_stats: Option<String>,
+    pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
+    pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
+    pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
+    pub meeting_joined: bool,
+    fake_peer_ids: Vec<String>,
+    #[cfg(feature = "fake-peers")]
+    next_fake_peer_id_counter: usize,
+    force_desktop_grid_on_mobile: bool,
+    simulation_info_message: Option<String>,
 }
 
 impl AttendantsComponent {
@@ -166,6 +210,78 @@ impl AttendantsComponent {
         };
         media_device_access
     }
+
+    #[cfg(feature = "fake-peers")]
+    fn view_fake_peer_buttons(&self, ctx: &Context<Self>, add_fake_peer_disabled: bool) -> Html {
+        html! {
+            <>
+                <button
+                    class="video-control-button test-button"
+                    title="Add Fake Peer"
+                    onclick={ctx.link().callback(|_| Msg::AddFakePeer)}
+                    disabled={add_fake_peer_disabled}
+                    >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-plus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="20" y1="8" x2="20" y2="14"></line><line x1="17" y1="11" x2="23" y2="11"></line></svg>
+                    <span class="tooltip">{ "Add Fake Peer" }</span>
+                </button>
+                <button
+                    class="video-control-button test-button"
+                    title="Remove Fake Peer"
+                    onclick={ctx.link().callback(|_| Msg::RemoveLastFakePeer)}>
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feather feather-user-minus"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="23" y1="11" x2="17" y2="11"></line></svg>
+                    <span class="tooltip">{ "Remove Fake Peer" }</span>
+                </button>
+            </>
+        }
+    }
+
+    #[cfg(not(feature = "fake-peers"))]
+    fn view_fake_peer_buttons(&self, _ctx: &Context<Self>, _add_fake_peer_disabled: bool) -> Html {
+        html! {} // Empty html when feature is not enabled
+    }
+
+    #[cfg(feature = "fake-peers")]
+    fn view_grid_toggle(&self, ctx: &Context<Self>) -> Html {
+        html! {
+            <>
+                <button
+                class={classes!("video-control-button", "test-button", "mobile-only-grid-toggle", self.force_desktop_grid_on_mobile.then_some("active"))}
+                title={if self.force_desktop_grid_on_mobile { "Use Mobile Grid (Stack)" } else { "Force Desktop Grid (Multi-column)" }}
+                onclick={ctx.link().callback(|_| Msg::ToggleForceDesktopGrid)}>
+                {
+                    if self.force_desktop_grid_on_mobile {
+                        html!{
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                        }
+                    } else {
+                        html!{
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+                        }
+                    }
+                }
+                <span class="tooltip">{if self.force_desktop_grid_on_mobile { "Use Mobile Grid" } else { "Force Desktop Grid" }}</span>
+            </button>
+            </>
+        }
+    }
+
+    #[cfg(not(feature = "fake-peers"))]
+    fn view_grid_toggle(&self, _ctx: &Context<Self>) -> Html {
+        html! {} // Empty html when feature is not enabled
+    }
+
+    fn play_user_joined() {
+        if let Some(_window) = web_sys::window() {
+            if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
+                audio.set_volume(0.4); // Set moderate volume
+                if let Err(e) = audio.play() {
+                    log::warn!("Failed to play notification sound: {:?}", e);
+                }
+            } else {
+                log::warn!("Failed to create audio element for notification sound");
+            }
+        }
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -173,27 +289,82 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        Self {
-            client: Self::create_video_call_client(ctx),
-            media_device_access: Self::create_media_device_access(ctx),
+        log::info!("AttendantsComponent::create called");
+        let client = Self::create_video_call_client(ctx);
+        let media_device_access = Self::create_media_device_access(ctx);
+        let self_ = Self {
+            client,
+            media_device_access,
             share_screen: false,
             mic_enabled: false,
             video_enabled: false,
             peer_list_open: false,
             diagnostics_open: false,
+            device_settings_open: false,
             error: None,
             diagnostics_data: None,
             sender_stats: None,
+            encoder_settings: None,
+            neteq_stats: None,
+            neteq_stats_per_peer: HashMap::new(),
+            neteq_buffer_per_peer: HashMap::new(),
+            neteq_jitter_per_peer: HashMap::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
-            encoder_settings: None,
+            meeting_joined: false,
+            fake_peer_ids: Vec::new(),
+            #[cfg(feature = "fake-peers")]
+            next_fake_peer_id_counter: 1,
+            force_desktop_grid_on_mobile: true,
+            simulation_info_message: None,
+        };
+        {
+            let link = ctx.link().clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let rx = subscribe();
+                while let Ok(evt) = rx.recv_async().await {
+                    if evt.subsystem == "neteq" {
+                        for m in &evt.metrics {
+                            if m.name == "stats_json" {
+                                if let MetricValue::Text(json) = &m.value {
+                                    let peer_id = evt
+                                        .stream_id
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    link.send_message(Msg::NetEqStatsUpdated(
+                                        peer_id,
+                                        json.clone(),
+                                    ));
+                                }
+                            } else if m.name == "current_buffer_size_ms" {
+                                if let MetricValue::U64(v) = &m.value {
+                                    let peer_id = evt
+                                        .stream_id
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    link.send_message(Msg::NetEqBufferUpdated(peer_id, *v));
+                                }
+                            } else if m.name == "jitter_buffer_delay_ms" {
+                                if let MetricValue::U64(v) = &m.value {
+                                    let peer_id = evt
+                                        .stream_id
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                    link.send_message(Msg::NetEqJitterUpdated(peer_id, *v));
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         }
+        self_
     }
 
-    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+    fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
         if first_render {
-            ctx.link().send_message(WsAction::Connect);
+            // Don't auto-connect anymore
         }
     }
 
@@ -211,6 +382,7 @@ impl Component for AttendantsComponent {
                             .send_message(WsAction::Log(format!("Connection failed: {e}")));
                     }
                     log::info!("Connected in attendants");
+                    self.meeting_joined = true;
                     true
                 }
                 WsAction::Connected => true,
@@ -225,7 +397,6 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::RequestMediaPermissions => {
                     self.media_device_access.request();
-                    ctx.link().send_message(WsAction::Connect);
                     false
                 }
                 WsAction::MediaPermissionsGranted => {
@@ -251,6 +422,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsError(error) => {
                     self.error = Some(error);
+                    self.meeting_joined = false; // Stay on join screen if permissions denied
                     true
                 }
                 WsAction::DiagnosticsUpdated(stats) => {
@@ -266,7 +438,12 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(_email) => true,
+            Msg::OnPeerAdded(email) => {
+                log::info!("New user joined: {}", email);
+                // Play notification sound when a new user joins the call
+                Self::play_user_joined();
+                true
+            }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::MeetingAction(action) => {
                 match action {
@@ -311,19 +488,94 @@ impl Component for AttendantsComponent {
             }
             Msg::UserScreenAction(action) => {
                 match action {
-                    UserScreenAction::TogglePeerList => {
+                    UserScreenToggleAction::PeerList => {
                         self.peer_list_open = !self.peer_list_open;
                         if self.peer_list_open {
                             self.diagnostics_open = false;
                         }
                     }
-                    UserScreenAction::ToggleDiagnostics => {
+                    UserScreenToggleAction::Diagnostics => {
                         self.diagnostics_open = !self.diagnostics_open;
                         if self.diagnostics_open {
                             self.peer_list_open = false;
                         }
                     }
+                    UserScreenToggleAction::DeviceSettings => {
+                        self.device_settings_open = !self.device_settings_open;
+                        if self.device_settings_open {
+                            self.peer_list_open = false;
+                            self.diagnostics_open = false;
+                        }
+                    }
                 }
+                true
+            }
+            #[cfg(feature = "fake-peers")]
+            Msg::RemoveLastFakePeer => {
+                if !self.fake_peer_ids.is_empty() {
+                    self.fake_peer_ids.pop();
+                }
+                self.simulation_info_message = None;
+                true
+            }
+            #[cfg(feature = "fake-peers")]
+            Msg::AddFakePeer => {
+                let current_total_peers =
+                    self.client.sorted_peer_keys().len() + self.fake_peer_ids.len();
+                if current_total_peers < CANVAS_LIMIT {
+                    let fake_peer_id = format!("fake-peer-{}", self.next_fake_peer_id_counter);
+                    self.fake_peer_ids.push(fake_peer_id);
+                    self.next_fake_peer_id_counter += 1;
+                    self.simulation_info_message = None;
+                } else {
+                    log::warn!(
+                        "Maximum participants ({}) reached. Cannot add more.",
+                        CANVAS_LIMIT
+                    );
+                    self.simulation_info_message =
+                        Some(format!("Maximum participants ({}) reached.", CANVAS_LIMIT));
+                }
+                true // Re-render to update button state or display message
+            }
+            #[cfg(feature = "fake-peers")]
+            Msg::ToggleForceDesktopGrid => {
+                self.force_desktop_grid_on_mobile = !self.force_desktop_grid_on_mobile;
+                self.simulation_info_message = None;
+                true
+            }
+            Msg::NetEqStatsUpdated(peer_id, stats_json) => {
+                self.neteq_stats = Some(stats_json.clone());
+
+                // Accumulate stats history per peer for dashboard charts
+                let peer_stats = self
+                    .neteq_stats_per_peer
+                    .entry(peer_id.clone())
+                    .or_default();
+                peer_stats.push(stats_json);
+                if peer_stats.len() > 60 {
+                    peer_stats.remove(0);
+                } // keep last 60 entries (60 seconds of data)
+                true
+            }
+            Msg::NetEqBufferUpdated(peer_id, buffer_value) => {
+                let peer_buffer = self.neteq_buffer_per_peer.entry(peer_id).or_default();
+                peer_buffer.push(buffer_value);
+                if peer_buffer.len() > 50 {
+                    peer_buffer.remove(0);
+                } // keep last 50
+                false
+            }
+            Msg::NetEqJitterUpdated(peer_id, jitter_value) => {
+                let peer_jitter = self.neteq_jitter_per_peer.entry(peer_id).or_default();
+                peer_jitter.push(jitter_value);
+                if peer_jitter.len() > 50 {
+                    peer_jitter.remove(0);
+                }
+                false
+            }
+            Msg::HangUp => {
+                log::info!("Hanging up - resetting to initial state");
+                let _ = window().location().reload(); // Refresh page for clean state
                 true
             }
         }
@@ -333,22 +585,137 @@ impl Component for AttendantsComponent {
         let email = ctx.props().email.clone();
         let media_access_granted = self.media_device_access.is_granted();
 
-        let toggle_peer_list = ctx.link().callback(|_| UserScreenAction::TogglePeerList);
-        let toggle_diagnostics = ctx.link().callback(|_| UserScreenAction::ToggleDiagnostics);
+        let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
+        let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
+        let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
-        let peers = self.client.sorted_peer_keys();
+        let real_peers_vec = self.client.sorted_peer_keys();
+        let mut display_peers_vec = real_peers_vec.clone();
+        display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
+
+        let num_display_peers = display_peers_vec.len();
+        // Cap the number of peers used for styling at CANVAS_LIMIT
+        let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
+
+        // Determine if the "Add Fake Peer" button should be disabled
+        let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
+
         let rows = canvas_generator::generate(
-            &self.client,
-            peers.iter().take(CANVAS_LIMIT).cloned().collect(),
+            &self.client, // canvas_generator is client-aware for real peers' media status
+            display_peers_vec
+                .iter()
+                .take(CANVAS_LIMIT)
+                .cloned()
+                .collect(),
         );
 
+        let container_style = if self.peer_list_open || self.diagnostics_open {
+            // Use num_peers_for_styling (capped at CANVAS_LIMIT) for the CSS variable
+            format!("width: 80%; --num-peers: {};", num_peers_for_styling.max(1))
+        } else {
+            format!(
+                "width: 100%; --num-peers: {};",
+                num_peers_for_styling.max(1)
+            )
+        };
+
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
+
+        // Compute meeting link for invitation overlay
+        let meeting_link = {
+            let origin_result = window().location().origin();
+            // If obtaining origin fails, fallback to empty string
+            let origin = origin_result.unwrap_or_else(|_| "".to_string());
+            format!("{}/meeting/{}", origin, ctx.props().id)
+        };
+
+        // Callback to copy the meeting link to clipboard
+        let copy_meeting_link = {
+            let meeting_link = meeting_link.clone();
+            Callback::from(move |_| {
+                if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) {
+                    // Try to write text; ignore potential JS promise errors for now
+                    let _ = clipboard.write_text(&meeting_link);
+                }
+            })
+        };
+
+        let mut grid_container_classes = classes!();
+        if self.force_desktop_grid_on_mobile {
+            grid_container_classes.push("force-desktop-grid");
+        }
+
+        // Show Join Meeting button if user hasn't joined yet
+        if !self.meeting_joined {
+            return html! {
+                <div id="main-container" class="meeting-page">
+                    <BrowserCompatibility/>
+                    <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #1a1a1a; z-index: 1000;">
+                        <div style="text-align: center; color: white; margin-bottom: 2rem;">
+                            <h1>{"Ready to join the meeting?"}</h1>
+                            <p>{"Click the button below to join and start listening to others."}</p>
+                            {if let Some(error) = &self.error {
+                                html! { <p style="color: #ff6b6b; margin-top: 1rem;">{error}</p> }
+                            } else {
+                                html! {}
+                            }}
+                        </div>
+                        <button
+                            class="join-meeting-button"
+                            style="
+                                background: #4CAF50; 
+                                color: white; 
+                                border: none; 
+                                padding: 1rem 2rem; 
+                                font-size: 1.2rem; 
+                                border-radius: 8px; 
+                                cursor: pointer;
+                                transition: background 0.3s ease;
+                            "
+                            onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}
+                        >
+                            {"Join Meeting"}
+                        </button>
+                    </div>
+                </div>
+            };
+        }
 
         html! {
             <div id="main-container" class="meeting-page">
                 <BrowserCompatibility/>
-                <div id="grid-container" style={if self.peer_list_open || self.diagnostics_open {"width: 80%;"} else {"width: 100%;"}}>
+                <div id="grid-container"
+                    class={grid_container_classes}
+                    data-peers={num_peers_for_styling.to_string()}
+                    style={container_style}>
                     { rows }
+
+                    { // Invitation overlay when there are no connected peers
+                        if num_display_peers == 0 {
+                            html! {
+                                <div id="invite-overlay" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.9); padding: 1.5rem 2rem; border-radius: 8px; width: 90%; max-width: 420px; z-index: 3000; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3); text-align: center;">
+                                    <h3 style="margin-top:0;">{"Your meeting's ready"}</h3>
+                                    <p style="font-size: 0.9rem; opacity: 0.8;">{"Share this meeting link with others you want in the meeting"}</p>
+                                    <div style="display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;">
+                                        <input
+                                            id="meeting-link-input"
+                                            value={meeting_link.clone()}
+                                            readonly=true
+                                            style="flex:1; padding: 0.5rem; border: none; border-radius: 4px; background: #333; color: white; font-size: 0.9rem; overflow:hidden; text-overflow: ellipsis;"/>
+                                        <button
+                                            class="copy-link-button"
+                                            style="margin-left: 0.5rem; background: #4CAF50; color: white; border: none; padding: 0.5rem 0.75rem; border-radius: 4px; cursor: pointer;"
+                                            onclick={copy_meeting_link}
+                                        >
+                                            {"Copy"}
+                                        </button>
+                                    </div>
+                                    <p style="font-size: 0.8rem; opacity: 0.7;">{"People who use this meeting link must get your permission before they can join."}</p>
+                                </div>
+                            }
+                        } else { html!{} }
+                    }
+
                     {
                         if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
                             html! {
@@ -412,36 +779,46 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
-                                            <button
-                                                class={classes!("video-control-button", self.share_screen.then_some("active"))}
-                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
-                                                {
-                                                    if self.share_screen {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-                                                                    <line x1="8" y1="21" x2="16" y2="21"></line>
-                                                                    <line x1="12" y1="17" x2="12" y2="21"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Stop Screen Share" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M13 3H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-3"></path>
-                                                                    <polyline points="8 21 12 17 16 21"></polyline>
-                                                                    <polyline points="16 7 20 7 20 3"></polyline>
-                                                                    <line x1="10" y1="14" x2="21" y2="3"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Share Screen" }</span>
-                                                            </>
-                                                        }
+
+                                            // Hide screen share button on Safari/iOS devices
+                                            {
+                                                if !is_ios() {
+                                                    html! {
+                                                        <button
+                                                            class={classes!("video-control-button", self.share_screen.then_some("active"))}
+                                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
+                                                            {
+                                                                if self.share_screen {
+                                                                    html! {
+                                                                        <>
+                                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                                <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+                                                                                <line x1="8" y1="21" x2="16" y2="21"></line>
+                                                                                <line x1="12" y1="17" x2="12" y2="21"></line>
+                                                                            </svg>
+                                                                            <span class="tooltip">{ "Stop Screen Share" }</span>
+                                                                        </>
+                                                                    }
+                                                                } else {
+                                                                    html! {
+                                                                        <>
+                                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                                <path d="M13 3H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-3"></path>
+                                                                                <polyline points="8 21 12 17 16 21"></polyline>
+                                                                                <polyline points="16 7 20 7 20 3"></polyline>
+                                                                                <line x1="10" y1="14" x2="21" y2="3"></line>
+                                                                            </svg>
+                                                                            <span class="tooltip">{ "Share Screen" }</span>
+                                                                        </>
+                                                                    }
+                                                                }
+                                                            }
+                                                        </button>
                                                     }
+                                                } else {
+                                                    html! {}
                                                 }
-                                            </button>
+                                            }
                                             <button
                                                 class={classes!("video-control-button", self.peer_list_open.then_some("active"))}
                                                 onclick={toggle_peer_list.clone()}>
@@ -500,28 +877,74 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            <button
+                                                class={classes!("video-control-button", "mobile-only-device-settings", self.device_settings_open.then_some("active"))}
+                                                onclick={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}>
+                                                {
+                                                    if self.device_settings_open {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <circle cx="12" cy="12" r="3"></circle>
+                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Close Settings" }</span>
+                                                            </>
+                                                        }
+                                                    } else {
+                                                        html! {
+                                                            <>
+                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                    <circle cx="12" cy="12" r="3"></circle>
+                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                                                                </svg>
+                                                                <span class="tooltip">{ "Device Settings" }</span>
+                                                            </>
+                                                        }
+                                                    }
+                                                }
+                                            </button>
+                                            <button
+                                                class="video-control-button danger"
+                                                onclick={ctx.link().callback(|_| Msg::HangUp)}>
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
+                                                    <path d="M12.017 6.995c-2.306 0-4.534.408-6.215 1.507-1.737 1.135-2.788 2.944-2.797 5.451a4.8 4.8 0 0 0 .01.62c.015.193.047.512.138.763a2.557 2.557 0 0 0 2.579 1.677H7.31a2.685 2.685 0 0 0 2.685-2.684v-.645a.684.684 0 0 1 .684-.684h2.647a.686.686 0 0 1 .686.687v.645c0 .712.284 1.395.787 1.898.478.478 1.101.787 1.847.787h1.647a2.555 2.555 0 0 0 2.575-1.674c.09-.25.123-.57.137-.763.015-.2.022-.433.01-.617-.002-2.508-1.049-4.32-2.785-5.458-1.68-1.1-3.907-1.51-6.213-1.51Z"/>
+                                                </svg>
+                                                <span class="tooltip">{ "Hang Up" }</span>
+                                            </button>
+                                            { self.view_grid_toggle(ctx) }
+                                            { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
+
                                         </nav>
+                                                                {
+                            if let Some(message) = &self.simulation_info_message {
+                                html!{
+                                    <p class="simulation-info-message">{ message }</p>
+                                }
+                            } else {
+                                html!{}
+                            }
+                        }
                                     </div>
                                     {
                                         if media_access_granted {
-                                            html! {<Host client={self.client.clone()} share_screen={self.share_screen} mic_enabled={self.mic_enabled} video_enabled={self.video_enabled} on_encoder_settings_update={on_encoder_settings_update} />}
+                                            html! {<Host
+                                                client={self.client.clone()}
+                                                share_screen={self.share_screen}
+                                                mic_enabled={self.mic_enabled}
+                                                video_enabled={self.video_enabled}
+                                                on_encoder_settings_update={on_encoder_settings_update}
+                                                device_settings_open={self.device_settings_open}
+                                                on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                            />}
                                         } else {
                                             html! {<></>}
                                         }
                                     }
                                     <h4 class="floating-name">{email}</h4>
 
-                                    {if !self.client.is_connected() {
-                                        html! {<h4>{"Connecting"}</h4>}
-                                    } else {
-                                        html! {<h4>{"Connected"}</h4>}
-                                    }}
+                                    <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
 
-                                    {if ctx.props().e2ee_enabled {
-                                        html! {<h4>{"End to End Encryption Enabled"}</h4>}
-                                    } else {
-                                        html! {<h4>{"End to End Encryption Disabled"}</h4>}
-                                    }}
                                 </nav>
                             }
                         } else {
@@ -532,92 +955,42 @@ impl Component for AttendantsComponent {
                     }
                 </div>
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
-                    <PeerList peers={peers} onclose={toggle_peer_list} />
+                    <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
-                <div id="diagnostics-sidebar" class={if self.diagnostics_open {"visible"} else {""}}>
-                    <div class="sidebar-header">
-                        <h2>{"Diagnostics"}</h2>
-                        <button class="close-button" onclick={toggle_diagnostics}>{"×"}</button>
-                    </div>
-                    <div class="sidebar-content">
-                        <div class="diagnostics-data">
-                            <div class="diagnostics-section">
-                                <h3>{"Reception Stats"}</h3>
-                                if let Some(data) = &self.diagnostics_data {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No reception data available."}</p>
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Sending Stats"}</h3>
-                                if let Some(data) = &self.sender_stats {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No sending data available."}</p>
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Encoder Settings"}</h3>
-                                if let Some(data) = &self.encoder_settings {
-                                    <pre>{ data }</pre>
-                                } else {
-                                    <p>{"No encoder settings available."}</p>
-                                }
-                            </div>
-                            <div class="diagnostics-section">
-                                <h3>{"Media Status"}</h3>
-                                <pre>{format!("Video: {}\nAudio: {}\nScreen Share: {}",
-                                    if self.video_enabled { "Enabled" } else { "Disabled" },
-                                    if self.mic_enabled { "Enabled" } else { "Disabled" },
-                                    if self.share_screen { "Enabled" } else { "Disabled" }
-                                )}</pre>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+                <Diagnostics
+                    is_open={self.diagnostics_open}
+                    on_close={close_diagnostics}
+                    diagnostics_data={self.diagnostics_data.clone()}
+                    sender_stats={self.sender_stats.clone()}
+                    encoder_settings={self.encoder_settings.clone()}
+                    neteq_stats={
+                        let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
+                        if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
+                    }
+                    neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
+                    neteq_buffer_history={
+                        // Aggregate all peers' buffer history, taking the most recent from each
+                        let mut aggregated_buffer = Vec::new();
+                        for peer_buffer in self.neteq_buffer_per_peer.values() {
+                            aggregated_buffer.extend(peer_buffer.iter().cloned());
+                        }
+                        aggregated_buffer
+                    }
+                    neteq_jitter_history={
+                        // Aggregate all peers' jitter history, taking the most recent from each
+                        let mut aggregated_jitter = Vec::new();
+                        for peer_jitter in self.neteq_jitter_per_peer.values() {
+                            aggregated_jitter.extend(peer_jitter.iter().cloned());
+                        }
+                        aggregated_jitter
+                    }
+                    neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
+                    neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
+                    video_enabled={self.video_enabled}
+                    mic_enabled={self.mic_enabled}
+                    share_screen={self.share_screen}
+                />
             </div>
         }
     }
-}
-
-#[function_component(DiagnosticsSidebar)]
-fn diagnostics_sidebar(props: &DiagnosticsSidebarProps) -> Html {
-    let diagnostics_data = props.diagnostics_data.clone();
-    let sender_stats = props.sender_stats.clone();
-    let on_close = props.on_close.clone();
-
-    html! {
-        <div class="diagnostics-sidebar">
-            <div class="diagnostics-header">
-                <h2>{"Diagnostics"}</h2>
-                <button class="close-button" onclick={on_close}>{"×"}</button>
-            </div>
-            <div class="diagnostics-data">
-                <div class="diagnostics-section">
-                    <h3>{"Reception Stats"}</h3>
-                    if let Some(data) = diagnostics_data {
-                        <pre class="diagnostics-text">{data}</pre>
-                    } else {
-                        <p>{"No reception data available."}</p>
-                    }
-                </div>
-                <div class="diagnostics-section">
-                    <h3>{"Sending Stats"}</h3>
-                    if let Some(data) = sender_stats {
-                        <pre class="diagnostics-text">{data}</pre>
-                    } else {
-                        <p>{"No sending data available."}</p>
-                    }
-                </div>
-            </div>
-        </div>
-    }
-}
-
-#[derive(Properties, PartialEq)]
-pub struct DiagnosticsSidebarProps {
-    pub diagnostics_data: Option<String>,
-    pub sender_stats: Option<String>,
-    pub on_close: Callback<MouseEvent>,
 }

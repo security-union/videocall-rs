@@ -1,3 +1,21 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
@@ -174,7 +192,7 @@ impl CameraEncoder {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let video_output_handler = {
-            let mut buffer: [u8; 100000] = [0; 100000];
+            let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
             let mut sequence_number = 0;
             let mut last_chunk_time = window().performance().unwrap().now();
             let mut chunks_in_last_second = 0;
@@ -193,10 +211,16 @@ impl CameraEncoder {
                     last_chunk_time = now;
                 }
 
+                // Ensure the backing buffer is large enough for this chunk
+                let byte_length = chunk.byte_length() as usize;
+                if buffer.len() < byte_length {
+                    buffer.resize(byte_length, 0);
+                }
+
                 let packet: PacketWrapper = transform_video_chunk(
                     chunk,
                     sequence_number,
-                    &mut buffer,
+                    buffer.as_mut_slice(),
                     &userid,
                     aes.clone(),
                 );
@@ -295,6 +319,10 @@ impl CameraEncoder {
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
 
+            // Track current encoder dimensions for dynamic reconfiguration
+            let mut current_encoder_width = width as u32;
+            let mut current_encoder_height = height as u32;
+
             loop {
                 if !enabled.load(Ordering::Acquire)
                     || destroy.load(Ordering::Acquire)
@@ -325,6 +353,37 @@ impl CameraEncoder {
                         let video_frame = Reflect::get(&js_frame, &JsString::from("value"))
                             .unwrap()
                             .unchecked_into::<VideoFrame>();
+
+                        // Check for dimension changes (rotation, camera switch)
+                        let frame_width = video_frame.display_width();
+                        let frame_height = video_frame.display_height();
+
+                        if frame_width > 0
+                            && frame_height > 0
+                            && (frame_width != current_encoder_width
+                                || frame_height != current_encoder_height)
+                        {
+                            log::info!("Camera dimensions changed from {}x{} to {}x{}, reconfiguring encoder", 
+                                current_encoder_width, current_encoder_height, frame_width, frame_height);
+
+                            current_encoder_width = frame_width;
+                            current_encoder_height = frame_height;
+
+                            let new_config = VideoEncoderConfig::new(
+                                VIDEO_CODEC,
+                                current_encoder_height,
+                                current_encoder_width,
+                            );
+                            new_config.set_bitrate(local_bitrate as f64);
+                            new_config.set_latency_mode(LatencyMode::Realtime);
+                            if let Err(e) = video_encoder.configure(&new_config) {
+                                error!(
+                                    "Error reconfiguring camera encoder with new dimensions: {:?}",
+                                    e
+                                );
+                            }
+                        }
+
                         let video_encoder_encode_options = VideoEncoderEncodeOptions::new();
                         video_encoder_encode_options.set_key_frame(video_frame_counter % 150 == 0);
                         if let Err(e) = video_encoder

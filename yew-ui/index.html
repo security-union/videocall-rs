@@ -3,13 +3,270 @@
     <head>
         <meta charset="utf-8" />
         <title>videocall.rs</title>
-        <meta name="viewport" content="width=device-width, user-scalable=no">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
         <link data-trunk rel="copy-dir" href="./assets" />
+        <!-- TODO: Uncomment this when we have a way to pass features to the build -->
+        <!-- <link data-trunk rel="rust" href="Cargo.toml" data-cargo-features="fake-peers" data-cargo-no-default-features /> -->
+        <link data-trunk rel="rust" href="Cargo.toml"/> 
         <link data-trunk rel="css" href="./static/leptos-style.css" />
         <link data-trunk rel="css" href="./static/tailwind.css" />
         <link data-trunk rel="css" href="./static/style.css" />
         <link data-trunk rel="css" href="./static/global.css" />
         <link data-trunk rel="css" href="./static/pin-fix.css" />
+        <link data-trunk rel="copy-file" href="./scripts/encoderWorker.min.js" />
+        <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
+        <link data-trunk rel="copy-file" href="./scripts/pcmPlayerWorker.js" />
+
+        <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
+        <link
+            data-trunk
+            rel="rust"
+            href="../videocall-codecs/Cargo.toml"
+            data-bin="worker_decoder"
+            data-type="worker"
+            data-cargo-features="wasm"
+            data-cargo-no-default-features
+            data-loader-shim
+        /> 
+        <!-- Runtime link so the wasm decoder can find the built worker URL -->
+        <link id="codecs-worker" href="/worker_decoder_loader.js" />
+        <!-- NetEq worker -->
+        <link
+        data-trunk
+        rel="rust"
+        href="../neteq/Cargo.toml"
+        data-bin="neteq_worker"
+        data-type="worker"
+        data-cargo-features="web"
+        data-cargo-no-default-features
+        data-loader-shim
+        />
+        <link id="neteq-worker" href="/neteq_worker_loader.js" />
+        <!-- Load wasm worker scripts from the videocall-codecs crate -->
+        <script>	
+            if (!self.MediaStreamTrackProcessor) {	
+            self.MediaStreamTrackProcessor = class MediaStreamTrackProcessor {
+                constructor({track}) {	
+                if (track.kind == "video") {	
+                    this.readable = new ReadableStream({	
+                    async start(controller) {	
+                        this.video = document.createElement("video");
+                        this.video.muted = true; // Prevent potential audio feedback	
+                        this.video.srcObject = new MediaStream([track]);	
+                        await Promise.all([
+                            this.video.play(),
+                            new Promise(r => this.video.onloadedmetadata = r) // Wait for metadata
+                        ]);
+                        this.track = track;	
+
+                        // Ensure initial dimensions are set before creating canvas
+                        if (!this.video.videoWidth || !this.video.videoHeight) {
+                            console.warn("Video dimensions not available immediately after metadata load.");
+                            // Potential fallback or wait mechanism might be needed if this happens often
+                        }
+
+                        this.canvas = new OffscreenCanvas(this.video.videoWidth || 640, this.video.videoHeight || 480); // Use default dimensions as fallback
+                        this.ctx = this.canvas.getContext('2d', {desynchronized: true});	
+
+                        // --- Performance Improvement: Use requestVideoFrameCallback if available ---
+                        if (this.video.requestVideoFrameCallback) {
+                            console.log("Using requestVideoFrameCallback for MediaStreamTrackProcessor polyfill");
+                            const processFrame = (now, metadata) => {
+                                // Check if stream is closed before processing
+                                if (!controller.desiredSize) return;
+
+                                try {
+                                    if (this.video.videoWidth && this.video.videoHeight) {
+                                         // Resize canvas if video dimensions changed
+                                         if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
+                                            this.canvas.width = this.video.videoWidth;
+                                            this.canvas.height = this.video.videoHeight;
+                                            // Re-get context if needed, although usually not necessary for 2d
+                                            // this.ctx = this.canvas.getContext('2d', {desynchronized: true});
+                                         }
+                                        this.ctx.drawImage(this.video, 0, 0);
+                                        // Use mediaTime for more accurate timestamp
+                                        controller.enqueue(new VideoFrame(this.canvas, {timestamp: metadata.mediaTime * 1e6 }));
+                                    }
+                                } catch (e) {
+                                    console.error("Error processing video frame (rVFC):", e);
+                                     try { controller.error(e); } catch {} // Close stream on error
+                                } finally {
+                                     // Schedule the next frame processing only if stream is still active
+                                     if (controller.desiredSize > 0) {
+                                         try {
+                                            this.video.requestVideoFrameCallback(processFrame);
+                                         } catch (e) {
+                                             console.error("Error requesting next video frame callback:", e);
+                                             try { controller.error(e); } catch {}
+                                         }
+                                     } else {
+                                         console.log("Stopping rVFC loop as stream is closed or backed up.");
+                                         this.video?.pause(); // Pause video when stopping
+                                     }
+                                }
+                            };
+                            // Start the loop
+                            this.video.requestVideoFrameCallback(processFrame);
+                        } else {
+                            // --- Fallback to simplified requestAnimationFrame ---
+                            console.warn("requestVideoFrameCallback not supported, falling back to requestAnimationFrame for MediaStreamTrackProcessor polyfill");
+                            let lastTimestamp = -1;
+                            const processFrameRAF = (timestamp) => {
+                                 // Check if stream is closed
+                                 if (!controller.desiredSize) {
+                                     console.log("Stopping rAF loop as stream is closed or backed up.");
+                                     this.video?.pause(); // Pause video when stopping
+                                     return;
+                                 }
+
+                                 // Avoid processing the same frame multiple times if RAF fires rapidly
+                                 if (timestamp === lastTimestamp) {
+                                     requestAnimationFrame(processFrameRAF);
+                                     return;
+                                 }
+                                 lastTimestamp = timestamp;
+
+                                 try {
+                                     if (this.video.videoWidth && this.video.videoHeight) {
+                                        // Resize canvas if video dimensions changed
+                                         if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
+                                            this.canvas.width = this.video.videoWidth;
+                                            this.canvas.height = this.video.videoHeight;
+                                         }
+                                        this.ctx.drawImage(this.video, 0, 0);
+                                        // Use performance.now() for timestamp as RAF timestamp isn't media time
+                                        controller.enqueue(new VideoFrame(this.canvas, { timestamp: performance.now() * 1000 }));
+                                    }
+                                 } catch (e) {
+                                     console.error("Error processing video frame (RAF):", e);
+                                     try { controller.error(e); } catch {} // Close stream on error
+                                 } finally {
+                                     // Schedule the next frame
+                                     if (controller.desiredSize > 0) {
+                                         requestAnimationFrame(processFrameRAF);
+                                     } else {
+                                          console.log("Stopping rAF loop as stream is closed or backed up.");
+                                          this.video?.pause(); // Pause video when stopping
+                                     }
+                                 }
+                            };
+                             // Start the loop
+                            requestAnimationFrame(processFrameRAF);
+                        }
+                    },	
+                    // Pull is no longer needed as the stream is now push-based
+                    // pull(controller) { ... },
+                    cancel(reason) {
+                        console.log("Video track processor cancelled:", reason);
+                        if (this.video) {
+                            this.video.pause();
+                            this.video.srcObject = null; // Release stream resources
+                        }
+                        // The rVFC/rAF loops will stop automatically due to the desiredSize check
+                    }	
+                    });	
+                } else if (track.kind == "audio") {	
+                    this.readable = new ReadableStream({	
+                    async start(controller) {	
+                        this.ac = new AudioContext;	
+                        this.arrays = [];	
+                        function worklet() {	
+                        registerProcessor("mstp-shim", class Processor extends AudioWorkletProcessor {	
+                            process(input) { this.port.postMessage(input); return true; }	
+                        });	
+                        }	
+                        await this.ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);	
+                        this.node = new AudioWorkletNode(this.ac, "mstp-shim");	
+                        this.ac.createMediaStreamSource(new MediaStream([track])).connect(this.node);	
+                        this.node.port.addEventListener("message", ({data}) => data[0][0] && this.arrays.push(data));	
+                    },	
+                    async pull(controller) {	
+                        while (!this.arrays.length) await new Promise(r => this.node.port.onmessage = r);	
+                        const [channels] = this.arrays.shift();	
+                        const joined = new Float32Array(channels.reduce((a, b) => a + b.length, 0));	
+                        channels.reduce((offset, a) => (joined.set(a, offset), offset + a.length), 0);	
+                        controller.enqueue(new AudioData({	
+                        format: "f32-planar",	
+                        sampleRate: this.ac.sampleRate,	
+                        numberOfFrames: channels[0].length,	
+                        numberOfChannels: channels.length,	
+                        timestamp: this.ac.currentTime * 1e6 | 0,	
+                        data: joined,	
+                        transfer: [joined.buffer]	
+                        }));	
+                    }	
+                    });	
+                }	
+                }	
+            };	
+            }	
+        </script>	
+        <!-- MediaStreamTrackGenerator polyfill -->	
+        <script>	
+            if (!window.MediaStreamTrackGenerator) {	
+            window.MediaStreamTrackGenerator = class MediaStreamTrackGenerator {	
+                constructor({kind}) {	
+                if (kind == "video") {	
+                    const canvas = document.createElement("canvas");	
+                    const ctx = canvas.getContext('2d', {desynchronized: true});	
+                    const track = canvas.captureStream().getVideoTracks()[0];	
+                    track.writable = new WritableStream({	
+                    write(frame) {	
+                        canvas.width = frame.displayWidth;	
+                        canvas.height = frame.displayHeight;	
+                        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);	
+                        frame.close();	
+                    }	
+                    });	
+                    return track;	
+                } else if (kind == "audio") {	
+                    const ac = new AudioContext;	
+                    const dest = ac.createMediaStreamDestination();	
+                    const [track] = dest.stream.getAudioTracks();	
+                    track.writable = new WritableStream({	
+                    async start(controller) {	
+                        this.arrays = [];	
+                        function worklet() {	
+                        registerProcessor("mstg-shim", class Processor extends AudioWorkletProcessor {	
+                            constructor() {	
+                            super();	
+                            this.arrays = [];	
+                            this.arrayOffset = 0;	
+                            this.port.onmessage = ({data}) => this.arrays.push(data);	
+                            this.emptyArray = new Float32Array(0);	
+                            }	
+                            process(inputs, [[output]]) {	
+                            for (let i = 0; i < output.length; i++) {	
+                                if (!this.array || this.arrayOffset >= this.array.length) {	
+                                this.array = this.arrays.shift() || this.emptyArray;	
+                                this.arrayOffset = 0;	
+                                }	
+                                output[i] = this.array[this.arrayOffset++] || 0;	
+                            }	
+                            return true;	
+                            }	
+                        });	
+                        }	
+                        await ac.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`);	
+                        this.node = new AudioWorkletNode(ac, "mstg-shim");	
+                        this.node.connect(dest);	
+                        return track;	
+                    },	
+                    write(audioData) {	
+                        const array = new Float32Array(audioData.numberOfFrames * audioData.numberOfChannels);	
+                        audioData.copyTo(array, {planeIndex: 0});	
+                        this.node.port.postMessage(array, [array.buffer]);	
+                        audioData.close();	
+                    }	
+                    });	
+                    return track;	
+                }	
+                }	
+            };	
+            }	
+        </script>
+>>>>>>> main
         <!-- Matomo -->
         <script>
             var _paq = window._paq = window._paq || [];

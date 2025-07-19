@@ -1,12 +1,33 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use js_sys::Array;
-use log::info;
+use log::{info, warn};
+use wasm_bindgen::JsValue;
+use wasm_bindgen_futures::JsFuture;
 use web_sys::{AudioContext, AudioContextOptions};
 use web_sys::{MediaStream, MediaStreamTrackGenerator};
 
 pub fn configure_audio_context(
     audio_stream_generator: &MediaStreamTrackGenerator,
+    sink_id: Option<String>,
 ) -> anyhow::Result<AudioContext> {
     info!(
         "Configuring audio context with sample rate: {}",
@@ -23,6 +44,26 @@ pub fn configure_audio_context(
     audio_context_options.set_sample_rate(AUDIO_SAMPLE_RATE as f32);
     let audio_context = AudioContext::new_with_context_options(&audio_context_options).unwrap();
     info!("Created audio context");
+
+    // Set the audio output device if specified and supported
+    if let Some(device_id) = sink_id {
+        // Check if setSinkId is supported
+        if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId")).unwrap_or(false) {
+            let audio_context_clone = audio_context.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match JsFuture::from(audio_context_clone.set_sink_id_with_str(&device_id)).await {
+                    Ok(_) => {
+                        info!("Successfully set audio output device to: {}", device_id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to set audio output device: {:?}", e);
+                    }
+                }
+            });
+        } else {
+            warn!("AudioContext.setSinkId() is not supported in this browser");
+        }
+    }
 
     // Create gain node for volume control
     let gain_node = audio_context

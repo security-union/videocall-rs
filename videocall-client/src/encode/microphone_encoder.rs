@@ -1,3 +1,21 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gloo_utils::window;
@@ -157,13 +175,19 @@ impl MicrophoneEncoder {
             ..
         } = self.state.clone();
         let audio_output_handler = {
-            let mut buffer: [u8; 100000] = [0; 100000];
+            let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
             let mut sequence_number = 0;
             Box::new(move |chunk: JsValue| {
                 let chunk = web_sys::EncodedAudioChunk::from(chunk);
+                // Ensure buffer can hold the encoded audio data
+                let byte_length = chunk.byte_length() as usize;
+                if buffer.len() < byte_length {
+                    buffer.resize(byte_length, 0);
+                }
+
                 let packet: PacketWrapper = transform_audio_chunk(
                     &chunk,
-                    &mut buffer,
+                    buffer.as_mut_slice(),
                     &userid,
                     sequence_number,
                     aes.clone(),

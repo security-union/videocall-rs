@@ -1,0 +1,49 @@
+base_url = "https://engineering.videocall.rs"
+title = "Videocall Engineering"
+description = "Technical Vlog of the Videocall Engineering team"
+compile_sass = true
+build_search_index = false
+generate_feeds = true
+minify_html = true
+
+taxonomies = [
+    {name = "tags", feed = true},
+    {name = "authors", feed = true},
+]
+
+[markdown]
+highlight_code = true
+highlight_theme = "ayu-dark"
+
+[extra]
+toc = true
+use_cdn = false
+favicon = "/icon/favicon.png"
+theme = "toggle"              # light, dark, auto, toggle
+comment = false
+# mathjax = true
+# mathjax_dollar_inline_enable = true
+
+menu = [
+    { name = "/posts", url = "/posts/", weight = 1 },
+    { name = "/tags", url = "/tags/", weight = 2 },
+    { name = "/authors", url = "/authors/", weight = 3 },
+]
+
+socials = []
+
+custom_css = []
+
+[extra.analytics]
+enabled = false
+
+[extra.analytics.goatcounter]
+user = "your_user"
+host = "example.com" # default= goatcounter.com
+
+[extra.analytics.umami]
+website_id = "43929cd1-1e83...."
+host_url = "https://stats.mywebsite.com" # default: https://analytics.eu.umami.is
+
+[extra.giscus]
+enabled = false

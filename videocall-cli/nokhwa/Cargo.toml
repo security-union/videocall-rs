@@ -1,12 +1,12 @@
 [package]
 name = "videocall-nokhwa"
-version = "0.10.8"
+version = "0.10.9"
 authors = ["l1npengtul <l1npengtul@protonmail.com>", "Dario Lencina <dario@securityunion.dev>"]
 edition = "2021"
 description = "A Simple-to-use, cross-platform Rust Webcam Capture Library"
 keywords = ["camera", "webcam", "capture", "cross-platform"]
 categories = ["api-bindings", "multimedia", "os", "web-programming"]
-license = "Apache-2.0"
+license = "MIT"
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"
 

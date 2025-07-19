@@ -1,5 +1,24 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
-use super::peer_decoder::{AudioPeerDecoder, DecodeStatus, PeerDecode, VideoPeerDecoder};
+use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
+use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
@@ -52,7 +71,7 @@ impl Display for PeerDecodeError {
 }
 
 pub struct Peer {
-    pub audio: AudioPeerDecoder,
+    pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
     pub screen: VideoPeerDecoder,
     pub email: String,
@@ -84,7 +103,13 @@ impl Peer {
         email: String,
         aes: Option<Aes128State>,
     ) -> Result<Self, JsValue> {
-        let (audio, video, screen) = Self::new_decoders(&video_canvas_id, &screen_canvas_id)?;
+        let (mut audio, video, screen) =
+            Self::new_decoders(&video_canvas_id, &screen_canvas_id, &email)?;
+
+        // Initialize with explicit mute state (audio_enabled starts as false, so muted=true)
+        audio.set_muted(true);
+        debug!("Initialized peer {} with audio muted", email);
+
         Ok(Self {
             audio,
             video,
@@ -103,17 +128,33 @@ impl Peer {
     fn new_decoders(
         video_canvas_id: &str,
         screen_canvas_id: &str,
-    ) -> Result<(AudioPeerDecoder, VideoPeerDecoder, VideoPeerDecoder), JsValue> {
+        peer_id: &str,
+    ) -> Result<
+        (
+            Box<dyn AudioPeerDecoderTrait>,
+            VideoPeerDecoder,
+            VideoPeerDecoder,
+        ),
+        JsValue,
+    > {
         Ok((
-            AudioPeerDecoder::new()?,
+            create_audio_peer_decoder(None, peer_id.to_string())?,
             VideoPeerDecoder::new(video_canvas_id)?,
             VideoPeerDecoder::new(screen_canvas_id)?,
         ))
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {
-        let (audio, video, screen) =
-            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id)?;
+        let (mut audio, video, screen) =
+            Self::new_decoders(&self.video_canvas_id, &self.screen_canvas_id, &self.email)?;
+
+        // Preserve the current mute state after reset
+        audio.set_muted(!self.audio_enabled);
+        debug!(
+            "Reset peer {} with audio muted: {}",
+            self.email, !self.audio_enabled
+        );
+
         self.audio = audio;
         self.video = video;
         self.screen = screen;
@@ -148,35 +189,107 @@ impl Peer {
             .enum_value()
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
-            MediaType::VIDEO => Ok((
-                media_type,
-                self.video
+            MediaType::VIDEO => {
+                let video_status = self
+                    .video
                     .decode(&packet)
-                    .map_err(|_| PeerDecodeError::VideoDecodeError)?,
-            )),
-            MediaType::AUDIO => Ok((
-                media_type,
-                self.audio
+                    .map_err(|_| PeerDecodeError::VideoDecodeError)?;
+                Ok((
+                    media_type,
+                    DecodeStatus {
+                        rendered: video_status._rendered,
+                        first_frame: video_status.first_frame,
+                    },
+                ))
+            }
+            MediaType::AUDIO => {
+                if !self.audio_enabled {
+                    // Peer is muted, don't send packet to NetEq to avoid expand packets (hissing sound)
+                    debug!("Peer {} is muted, skipping audio packet", self.email);
+                    Ok((
+                        media_type,
+                        DecodeStatus {
+                            rendered: false,
+                            first_frame: false,
+                        },
+                    ))
+                } else {
+                    Ok((
+                        media_type,
+                        self.audio
+                            .decode(&packet)
+                            .map_err(|_| PeerDecodeError::AudioDecodeError)?,
+                    ))
+                }
+            }
+            MediaType::SCREEN => {
+                let screen_status = self
+                    .screen
                     .decode(&packet)
-                    .map_err(|_| PeerDecodeError::AudioDecodeError)?,
-            )),
-            MediaType::SCREEN => Ok((
-                media_type,
-                self.screen
-                    .decode(&packet)
-                    .map_err(|_| PeerDecodeError::ScreenDecodeError)?,
-            )),
+                    .map_err(|_| PeerDecodeError::ScreenDecodeError)?;
+                Ok((
+                    media_type,
+                    DecodeStatus {
+                        rendered: screen_status._rendered,
+                        first_frame: screen_status.first_frame,
+                    },
+                ))
+            }
             MediaType::HEARTBEAT => {
                 // update state using heartbeat metadata
                 if let Some(metadata) = packet.heartbeat_metadata.as_ref() {
+                    // Check if video is being turned off (on -> off transition)
+                    let video_turned_off = self.video_enabled && !metadata.video_enabled;
+                    // Check if audio is being turned off (on -> off transition)
+                    let audio_turned_off = self.audio_enabled && !metadata.audio_enabled;
+                    // Check if audio state changed at all
+                    let audio_state_changed = self.audio_enabled != metadata.audio_enabled;
+
+                    // Set mute state on audio decoder when audio state changes (before updating state)
+                    if audio_state_changed {
+                        web_sys::console::log_1(&format!("[MUTE DEBUG] Audio state changed for peer {} - audio_enabled: {} -> {}", 
+                                                         self.email, self.audio_enabled, metadata.audio_enabled).into());
+                        self.audio.set_muted(!metadata.audio_enabled);
+                        debug!(
+                            "Set audio decoder muted state for peer {} to {}",
+                            self.email, !metadata.audio_enabled
+                        );
+                        web_sys::console::log_1(
+                            &format!(
+                                "🔇 Setting peer {} muted to {}",
+                                self.email, !metadata.audio_enabled
+                            )
+                            .into(),
+                        );
+                    }
+
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
+
+                    // Flush video decoder when video is turned off
+                    if video_turned_off {
+                        self.video.flush();
+                        debug!(
+                            "Flushed video decoder for peer {} (video turned off)",
+                            self.email
+                        );
+                    }
+
+                    // Flush audio decoder when audio is turned off to prevent expand packets
+                    if audio_turned_off {
+                        // For NetEq audio decoders, we need to flush the buffer to prevent hissing
+                        self.audio.flush();
+                        debug!(
+                            "Flushed audio decoder for peer {} (audio turned off)",
+                            self.email
+                        );
+                    }
                 }
                 Ok((
                     media_type,
                     DecodeStatus {
-                        _rendered: false,
+                        rendered: false,
                         first_frame: false,
                     },
                 ))
@@ -334,5 +447,41 @@ impl PeerDecodeManager {
 
     pub fn get_all_fps_stats(&self) -> Option<String> {
         None
+    }
+
+    /// Updates the speaker device for all connected peers by rebuilding their audio decoders
+    pub fn update_speaker_device(
+        &mut self,
+        speaker_device_id: Option<String>,
+    ) -> Result<(), JsValue> {
+        let keys: Vec<String> = self.connected_peers.ordered_keys().clone();
+
+        for key in keys {
+            if let Some(peer) = self.connected_peers.get_mut(&key) {
+                // Preserve current mute state
+                let current_muted = !peer.audio_enabled;
+
+                // Create a new audio decoder with the new speaker device
+                match create_audio_peer_decoder(speaker_device_id.clone(), key.clone()) {
+                    Ok(mut new_audio_decoder) => {
+                        // Restore the mute state to the new decoder
+                        new_audio_decoder.set_muted(current_muted);
+
+                        // Replace the old decoder with the new one
+                        peer.audio = new_audio_decoder;
+                        log::info!("Successfully rebuilt audio decoder for peer: {} with speaker device (muted: {})", key, current_muted);
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to rebuild audio decoder for peer: {}, error: {:?}",
+                            key,
+                            e
+                        );
+                        // Keep the old decoder rather than breaking audio completely
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }

@@ -1,0 +1,53 @@
+# Staging values for rustlemania-ui
+# This overrides the base rustlemania-ui chart values
+
+rustlemania-ui:
+  nameOverride: "rustlemania-ui-staging"
+  fullnameOverride: "rustlemania-ui-staging"
+  
+  replicaCount: 1
+  image:
+    repository: securityunion/rustlemania-ui
+    pullPolicy: Always
+    tag: add-safari-to-neteq-638ec04b # Using latest since staging tag doesn't exist yet
+  
+  resources:
+    limits:
+      cpu: "50m" # 50% of a single CPU
+      memory: "10Mi" # 512 MiB of memory
+    requests:
+      cpu: "20m" # 25% of a single CPU
+      memory: "10Mi" # 256 MiB of memory
+  
+  service:
+    type: ClusterIP
+    port: 80
+  
+  ingress:
+    enabled: true
+    redirect: false
+    className: nginx
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    hosts:
+      - host: staging-app.videocall.rs
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: rustlemania-ui-staging
+              port:
+                number: 80
+    tls:
+      - secretName: rustlemania-ui-staging-tls
+        hosts:
+          - staging-app.videocall.rs
+  
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 100
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80 

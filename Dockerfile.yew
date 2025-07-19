@@ -8,6 +8,7 @@ ENV WEBTRANSPORT_HOST="https://transport.rustlemania.com"
 ENV WEBTRANSPORT_ENABLED="true"
 ENV E2EE_ENABLED="false"
 ENV USERS_ALLOWED_TO_STREAM=""
+ENV UI_URL="https://app.videocall.rs"
 WORKDIR /app
 COPY . .
 WORKDIR /app/yew-ui

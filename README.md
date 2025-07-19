@@ -40,7 +40,7 @@ videocall.rs is a modern, open-source video conferencing system written entirely
 - **Multiple Transport Protocols:** Support for WebSockets and WebTransport 
 - **End-to-End Encryption (E2EE):** Optional secure communications between peers
 - **Scalable Architecture:** Designed with a pub/sub model using NATS for horizontal scaling
-- **Cross-Platform Support:** Works on major browsers (Chrome/Chromium, with Safari support in development)
+- **Cross-Platform Support:** Works on Chromium-based browsers (Chrome, Edge, Brave) with Safari support in development. Firefox is not supported due to incomplete MediaStreamTrackProcessor implementation.
 - **Native Client Support:** CLI tool for headless video streaming from devices like Raspberry Pi
 - **Open Source:** MIT licensed for maximum flexibility
 
@@ -106,7 +106,7 @@ We strongly recommend using the Docker-based setup for development, as it's well
 - Modern Linux distribution, macOS, or Windows 10/11
 - [Docker](https://docs.docker.com/engine/install/) and Docker Compose (for containerized setup)
 - [Rust toolchain](https://rustup.rs/) 1.85+ (for manual setup)
-- Chrome/Chromium browser for frontend access
+- Chromium-based browser (Chrome, Edge, Brave) for frontend access - Firefox is not supported
 
 ### Docker Setup
 
@@ -352,6 +352,7 @@ These hooks help maintain code quality by ensuring proper formatting and checkin
 <table>
 <tr>
 <td align="center"><a href="https://github.com/darioalessandro"><img src="https://avatars0.githubusercontent.com/u/1176339?s=400&v=4" width="100" alt=""/><br /><sub><b>Dario Lencina</b></sub></a></td>
+<td align="center"><a href="https://github.com/majorrawdawg"><img src="https://avatars.githubusercontent.com/u/106711326?v=4" width="100" alt=""/><br /><sub><b>Seth Reid</b></sub></a></td>
 <td align="center"><a href="https://github.com/griffobeid"><img src="https://avatars1.githubusercontent.com/u/12220672?s=400&u=639c5cafe1c504ee9c68ad3a5e09d1b2c186462c&v=4" width="100" alt=""/><br /><sub><b>Griffin Obeid</b></sub></a></td>    
 <td align="center"><a href="https://github.com/ronen"><img src="https://avatars.githubusercontent.com/u/125620?v=4" width="100" alt=""/><br /><sub><b>Ronen Barzel</b></sub></a></td>
 <td align="center"><a href="https://github.com/leon3s"><img src="https://avatars.githubusercontent.com/u/7750950?v=4" width="100" alt=""/><br /><sub><b>Leone</b></sub></a></td>
@@ -359,8 +360,6 @@ These hooks help maintain code quality by ensuring proper formatting and checkin
 </tr>
 </table>
 
-Special thanks to [JasterV](https://github.com/JasterV) for the Actix websocket implementation which contains fragments from the [chat-rooms-actix](https://github.com/JasterV/chat-rooms-actix) project.
-
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
+This project is dual licensed under the MIT License and the Apache License 2.0. See the [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) files for details.

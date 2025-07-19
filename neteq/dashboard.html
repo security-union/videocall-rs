@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetEq Performance Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .chart-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .chart-title {
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #333;
+        }
+        .status {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+        .status-item {
+            text-align: center;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .status-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: #007bff;
+        }
+        .status-label {
+            font-size: 12px;
+            color: #666;
+        }
+        .controls {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 0 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        .warning {
+            color: #dc3545;
+        }
+        .good {
+            color: #28a745;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>NetEq Performance Dashboard</h1>
+            <p>Real-time monitoring of NetEq audio buffer and network statistics</p>
+        </div>
+        
+        <div class="controls">
+            <button id="startBtn" onclick="startMonitoring()">Start Monitoring</button>
+            <button id="stopBtn" onclick="stopMonitoring()" disabled>Stop Monitoring</button>
+            <button onclick="clearCharts()">Clear Charts</button>
+            <span id="status">Ready to start monitoring...</span>
+        </div>
+
+        <div class="status">
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-value" id="currentBuffer">--</div>
+                    <div class="status-label">Buffer (ms)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="targetBuffer">--</div>
+                    <div class="status-label">Target (ms)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="packetCount">--</div>
+                    <div class="status-label">Packets</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="underruns">--</div>
+                    <div class="status-label">Underruns</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="expandRate">--</div>
+                    <div class="status-label">Expand Rate (‰)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="accelRate">--</div>
+                    <div class="status-label">Accel Rate (‰)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="reorderRate">--</div>
+                    <div class="status-label">Reorder Rate (‰)</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="reorderedPackets">--</div>
+                    <div class="status-label">Reordered Packets</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-value" id="maxReorderDistance">--</div>
+                    <div class="status-label">Max Reorder Distance</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="charts-grid">
+            <div class="chart-container">
+                <div class="chart-title">Buffer Size vs Target</div>
+                <canvas id="bufferChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <div class="chart-title">Network Adaptation Rates</div>
+                <canvas id="adaptationChart"></canvas>
+            </div>
+        </div>
+
+        <div class="charts-grid">
+            <div class="chart-container">
+                <div class="chart-title">Packet Count & Audio Quality</div>
+                <canvas id="qualityChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <div class="chart-title">Packet Reordering Analysis</div>
+                <canvas id="reorderChart"></canvas>
+            </div>
+        </div>
+
+        <div class="charts-grid">
+            <div class="chart-container">
+                <div class="chart-title">System Performance</div>
+                <canvas id="performanceChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <div class="chart-title">Packet Sequence & Timestamps</div>
+                <canvas id="sequenceChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let monitoring = false;
+        let charts = {};
+        let monitoringInterval;
+        let dataHistory = [];
+        const MAX_DATA_POINTS = 60; // Keep last 60 seconds
+
+        // Initialize charts
+        function initCharts() {
+            // Buffer chart
+            charts.buffer = new Chart(document.getElementById('bufferChart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Current Buffer (ms)',
+                            data: [],
+                            borderColor: '#007bff',
+                            backgroundColor: 'rgba(0, 123, 255, 0.1)',
+                            tension: 0.1
+                        },
+                        {
+                            label: 'Target Buffer (ms)',
+                            data: [],
+                            borderColor: '#28a745',
+                            backgroundColor: 'rgba(40, 167, 69, 0.1)',
+                            tension: 0.1
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Time (ms)' }
+                        }
+                    }
+                }
+            });
+
+            // Network adaptation chart
+            charts.adaptation = new Chart(document.getElementById('adaptationChart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Expand Rate (‰)',
+                            data: [],
+                            borderColor: '#dc3545',
+                            backgroundColor: 'rgba(220, 53, 69, 0.1)',
+                            tension: 0.1
+                        },
+                        {
+                            label: 'Accelerate Rate (‰)',
+                            data: [],
+                            borderColor: '#fd7e14',
+                            backgroundColor: 'rgba(253, 126, 20, 0.1)',
+                            tension: 0.1
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Rate (‰)' }
+                        }
+                    }
+                }
+            });
+
+            // Quality chart
+            charts.quality = new Chart(document.getElementById('qualityChart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Packet Count',
+                            data: [],
+                            borderColor: '#6f42c1',
+                            backgroundColor: 'rgba(111, 66, 193, 0.1)',
+                            tension: 0.1,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Buffer Underruns',
+                            data: [],
+                            borderColor: '#e83e8c',
+                            backgroundColor: 'rgba(232, 62, 140, 0.1)',
+                            tension: 0.1,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: { display: true, text: 'Packets' }
+                        },
+                        y1: {
+                            type: 'linear',
+                            display: true,
+                            position: 'right',
+                            title: { display: true, text: 'Underruns' },
+                            grid: { drawOnChartArea: false }
+                        }
+                    }
+                }
+            });
+
+            // Performance chart
+            charts.performance = new Chart(document.getElementById('performanceChart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Calls/sec',
+                            data: [],
+                            borderColor: '#20c997',
+                            backgroundColor: 'rgba(32, 201, 151, 0.1)',
+                            tension: 0.1,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Avg Frames',
+                            data: [],
+                            borderColor: '#ffc107',
+                            backgroundColor: 'rgba(255, 193, 7, 0.1)',
+                            tension: 0.1,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: { display: true, text: 'Calls/sec' }
+                        },
+                        y1: {
+                            type: 'linear',
+                            display: true,
+                            position: 'right',
+                            title: { display: true, text: 'Frames' },
+                            grid: { drawOnChartArea: false }
+                        }
+                    }
+                }
+            });
+
+            // Reorder chart
+            charts.reorder = new Chart(document.getElementById('reorderChart'), {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Reorder Rate (‰)',
+                            data: [],
+                            borderColor: '#ff6b6b',
+                            backgroundColor: 'rgba(255, 107, 107, 0.1)',
+                            tension: 0.1,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Max Reorder Distance',
+                            data: [],
+                            borderColor: '#4ecdc4',
+                            backgroundColor: 'rgba(78, 205, 196, 0.1)',
+                            tension: 0.1,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: { display: true, text: 'Rate (‰)' }
+                        },
+                        y1: {
+                            type: 'linear',
+                            display: true,
+                            position: 'right',
+                            title: { display: true, text: 'Distance' },
+                            grid: { drawOnChartArea: false }
+                        }
+                    }
+                }
+            });
+
+            // Sequence chart
+            charts.sequence = new Chart(document.getElementById('sequenceChart'), {
+                type: 'scatter',
+                data: {
+                    datasets: [
+                        {
+                            label: 'Sequence Numbers',
+                            data: [],
+                            borderColor: '#9c88ff',
+                            backgroundColor: 'rgba(156, 136, 255, 0.6)',
+                            pointRadius: 3
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            display: true,
+                            title: { display: true, text: 'RTP Timestamp' }
+                        },
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            title: { display: true, text: 'Sequence Number' }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateCharts(data) {
+            const time = new Date(data.timestamp).toLocaleTimeString();
+            
+            // Update status display
+            document.getElementById('currentBuffer').textContent = data.buffer_ms;
+            document.getElementById('targetBuffer').textContent = data.target_ms;
+            document.getElementById('packetCount').textContent = data.packets;
+            document.getElementById('underruns').textContent = data.underruns;
+            document.getElementById('expandRate').textContent = data.expand_rate.toFixed(1);
+            document.getElementById('accelRate').textContent = data.accel_rate.toFixed(1);
+            document.getElementById('reorderRate').textContent = data.reorder_rate || 0;
+            document.getElementById('reorderedPackets').textContent = data.reordered_packets || 0;
+            document.getElementById('maxReorderDistance').textContent = data.max_reorder_distance || 0;
+
+            // Color coding for status
+            const bufferElement = document.getElementById('currentBuffer');
+            if (data.buffer_ms === 0) {
+                bufferElement.className = 'status-value warning';
+            } else if (data.buffer_ms >= data.target_ms * 0.8 && data.buffer_ms <= data.target_ms * 1.2) {
+                bufferElement.className = 'status-value good';
+            } else {
+                bufferElement.className = 'status-value';
+            }
+
+            const underrunElement = document.getElementById('underruns');
+            if (data.underruns > 0) {
+                underrunElement.className = 'status-value warning';
+            } else {
+                underrunElement.className = 'status-value good';
+            }
+
+            // Add data to all charts
+            Object.values(charts).forEach(chart => {
+                if (chart.data.labels.length >= MAX_DATA_POINTS) {
+                    chart.data.labels.shift();
+                    chart.data.datasets.forEach(dataset => dataset.data.shift());
+                }
+                chart.data.labels.push(time);
+            });
+
+            // Buffer chart
+            charts.buffer.data.datasets[0].data.push(data.buffer_ms);
+            charts.buffer.data.datasets[1].data.push(data.target_ms);
+
+            // Adaptation chart
+            charts.adaptation.data.datasets[0].data.push(data.expand_rate);
+            charts.adaptation.data.datasets[1].data.push(data.accel_rate);
+
+            // Quality chart
+            charts.quality.data.datasets[0].data.push(data.packets);
+            charts.quality.data.datasets[1].data.push(data.underruns);
+
+            // Performance chart
+            charts.performance.data.datasets[0].data.push(data.calls_per_sec);
+            charts.performance.data.datasets[1].data.push(data.avg_frames);
+
+            // Reorder chart
+            charts.reorder.data.datasets[0].data.push(data.reorder_rate || 0);
+            charts.reorder.data.datasets[1].data.push(data.max_reorder_distance || 0);
+
+            // Sequence chart (scatter plot)
+            if (data.sequence_number && data.rtp_timestamp) {
+                const sequenceData = charts.sequence.data.datasets[0].data;
+                sequenceData.push({
+                    x: data.rtp_timestamp,
+                    y: data.sequence_number
+                });
+                
+                // Keep only last 100 points for readability
+                if (sequenceData.length > 100) {
+                    sequenceData.shift();
+                }
+            }
+
+            // Update all charts
+            Object.values(charts).forEach(chart => chart.update('none'));
+        }
+
+        async function loadLatestData() {
+            try {
+                // Read the JSON file (in a real deployment, you'd use a proper endpoint)
+                const response = await fetch('neteq_stats.jsonl?' + Date.now());
+                const text = await response.text();
+                
+                if (!text.trim()) return;
+                
+                const lines = text.trim().split('\n');
+                const latestLine = lines[lines.length - 1];
+                
+                if (latestLine) {
+                    const data = JSON.parse(latestLine);
+                    updateCharts(data);
+                    document.getElementById('status').textContent = `Last update: ${new Date().toLocaleTimeString()}`;
+                }
+            } catch (error) {
+                console.error('Error loading data:', error);
+                document.getElementById('status').textContent = `Error: ${error.message}`;
+            }
+        }
+
+        function startMonitoring() {
+            monitoring = true;
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = false;
+            document.getElementById('status').textContent = 'Monitoring started...';
+            
+            monitoringInterval = setInterval(loadLatestData, 1000);
+        }
+
+        function stopMonitoring() {
+            monitoring = false;
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('status').textContent = 'Monitoring stopped.';
+            
+            if (monitoringInterval) {
+                clearInterval(monitoringInterval);
+            }
+        }
+
+        function clearCharts() {
+            Object.values(charts).forEach(chart => {
+                chart.data.labels = [];
+                chart.data.datasets.forEach(dataset => dataset.data = []);
+                chart.update();
+            });
+            dataHistory = [];
+        }
+
+        // Initialize when page loads
+        window.addEventListener('load', initCharts);
+    </script>
+</body>
+</html> 

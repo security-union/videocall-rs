@@ -1,0 +1,41 @@
+.toc {
+    @media only screen and (max-width: 1365px) {
+        display: none;
+    }
+
+    li,
+    a {
+        font-family: sans-serif;
+        color: var(--text-2);
+        transition: none;
+        border-bottom: none;
+    }
+
+    a:hover {
+        color: var(--hover-color) !important;
+        transition: none;
+    }
+
+    .heading {
+        font-weight: 700;
+    }
+
+    ul {
+        list-style-type: none;
+        padding-left: 1em;
+        margin-top: 0;
+        margin-bottom: 0;
+    }
+    & > ul {
+        padding-left: 0;
+    }
+
+    li.selected,
+    li.selected > a {
+        color: var(--text-0);
+    }
+
+    .parent > a {
+        color: var(--text-0);
+    }
+}

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.18](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.17...videocall-cli-v1.0.18) - 2025-07-11
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.17](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.16...videocall-cli-v1.0.17) - 2025-07-10
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.16](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.15...videocall-cli-v1.0.16) - 2025-07-07
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.15](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.14...videocall-cli-v1.0.15) - 2025-07-05
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.14](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.13...videocall-cli-v1.0.14) - 2025-07-03
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.13](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.12...videocall-cli-v1.0.13) - 2025-06-23
+
+### Other
+
+- Add new decoder and Add MIT - Apache 2 license to all files ([#285](https://github.com/security-union/videocall-rs/pull/285))
+- Test media track stream processor add wasm opus encoder to support Safari for realz ([#266](https://github.com/security-union/videocall-rs/pull/266))
+
 ## [1.0.12](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.11...videocall-cli-v1.0.12) - 2025-04-20
 
 ### Other

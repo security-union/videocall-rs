@@ -1,0 +1,90 @@
+[package]
+name = "videocall-codecs"
+version = "0.1.2"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>",
+]
+keywords = ["video", "codec", "webrtc", "vpx", "wasm"]
+categories = ["multimedia::video", "wasm", "web-programming"]
+description = "Cross-platform video codec library with VP8/VP9 support for native and WebAssembly environments"
+include = ["src/**/*", "assets/**/*"]
+
+[lib]
+name = "videocall_codecs"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "worker_decoder"
+path = "src/bin/worker_decoder.rs"
+required-features = ["wasm"]
+
+[[bin]]
+name = "poc_decoder"
+path = "src/bin/poc_decoder.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "main"
+path = "src/bin/main.rs"
+required-features = ["native"]
+
+[features]
+default = []
+native = []
+wasm = [
+    "wasm-bindgen",
+    "web-sys",
+    "console_error_panic_hook",
+    "serde-wasm-bindgen",
+    "js-sys",
+    "wasm-bindgen-futures"
+]
+
+[dependencies]
+rand = "0.8.5"
+serde = { version = "1.0", features = ["derive"] }
+wasm-bindgen = { workspace = true, optional = true }
+console_error_panic_hook = { version = "0.1.7", optional = true }
+serde-wasm-bindgen = { version = "0.6.5", optional = true }
+env-libvpx-sys = { workspace = true, optional = true }
+anyhow = { workspace = true }
+image = { version = "0.24", features = ["png", "jpeg"] }
+js-sys = { version = "0.3.69", optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+log = "0.4.27"
+serde_json = "1.0"
+web-sys = { version = "0.3", optional = true, features = [
+    "console",
+    "VideoFrame",
+    "VideoDecoder",
+    "VideoDecoderConfig", 
+    "VideoDecoderInit",
+    "EncodedVideoChunk",
+    "EncodedVideoChunkInit",
+    "EncodedVideoChunkType",
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+    "Worker",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlLinkElement",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env-libvpx-sys = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+approx = "0.5.1"
+wasm-bindgen-test = "0.3.42"
+

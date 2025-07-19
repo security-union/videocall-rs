@@ -1,0 +1,130 @@
+.page-header {
+  font-size: 2.5em;
+  line-height: 100%;
+  font-family: var(--header-font);
+  margin: 4rem 0px 1rem 0px;
+}
+
+.centered-header {
+  font-family: var(--header-font);
+
+  position: absolute;
+  top: 40%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  font-size: 4em;
+}
+
+header {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  padding: 1em 0;
+}
+
+header .main {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  font-size: 1.5rem;
+
+  /* Otherwise header and menu is too close on small screens*/
+  margin-bottom: 10px;
+}
+
+.socials {
+  /* flex-child */
+  flex-grow: 0;
+  /* flex-container */
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.social {
+  border-bottom: unset;
+  background-image: unset;
+  padding: 2px;
+}
+
+.social>img {
+  border: unset;
+  width: 20px;
+  height: 20px;
+
+}
+
+.meta {
+  color: #999;
+  letter-spacing: -0.5px;
+}
+
+#dark-mode-toggle {
+  position: relative;
+}
+
+#dark-mode-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  margin-left: 0.7em;
+}
+
+#dark-mode-toggle img {
+  width: 24px;
+  height: 24px;
+  transition: transform 0.3s ease;
+}
+
+#dark-mode-toggle:hover img {
+  transform: scale(1.1);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-size: 1.2rem;
+  margin-top: 2em;
+}
+
+h1::before {
+  color: var(--primary-color);
+  content: "# ";
+}
+
+h2::before {
+  color: var(--primary-color);
+  content: "## ";
+}
+
+h3::before {
+  color: var(--primary-color);
+  content: "### ";
+}
+
+h4::before {
+  color: var(--primary-color);
+  content: "#### ";
+}
+
+h5::before {
+  color: var(--primary-color);
+  content: "##### ";
+}
+
+h6::before {
+  color: var(--primary-color);
+  content: "###### ";
+}

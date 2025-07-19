@@ -1,3 +1,21 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use super::media_decoder_trait::MediaDecoderTrait;
 use js_sys::Uint8Array;
 use log::{error, info};
@@ -40,14 +58,6 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
         audio_chunk.set_duration(audio.duration);
         let encoded_audio_chunk = EncodedAudioChunk::new(&audio_chunk).unwrap();
 
-        log::debug!(
-            "Decoding audio chunk: type={:?}, size={}, timestamp={}, duration={}",
-            chunk_type,
-            audio.data.len(),
-            audio.timestamp,
-            audio.duration,
-        );
-
         match self.0.decode(&encoded_audio_chunk) {
             Ok(_) => {
                 log::debug!("Successfully decoded audio chunk");
@@ -72,6 +82,14 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
     {
         info!("Creating new audio decoder");
         AudioDecoder::new(init).map(AudioDecoderWrapper)
+    }
+}
+
+impl AudioDecoderWrapper {
+    pub fn flush(&self) -> Result<(), JsValue> {
+        // AudioDecoder.flush() returns a Promise, we'll call it and return immediately
+        let _ = self.0.flush();
+        Ok(())
     }
 }
 

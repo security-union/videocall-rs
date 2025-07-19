@@ -8,6 +8,9 @@ members = [
     "videocall-cli",
     "yew-ui",
     "videocall-sdk",
+    "videocall-codecs",
+    "neteq",
+    "videocall-diagnostics",
 ]
 exclude = [
     "src-tauri",
@@ -19,3 +22,8 @@ exclude = [
     "videocall-cli/nokhwa/nokhwa-core"
 ]
 
+[workspace.dependencies]
+env-libvpx-sys = { version = "5.1.3", features = ["generate"] }
+anyhow = "1.0.75"
+wasm-bindgen-futures = { version = "0.4.30" }
+wasm-bindgen = "0.2.95"

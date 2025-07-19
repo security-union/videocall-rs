@@ -1,3 +1,21 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gloo_utils::window;
@@ -192,7 +210,7 @@ impl ScreenEncoder {
 
             // Setup FPS tracking and screen output handler
             let screen_output_handler = {
-                let mut buffer: [u8; 150000] = [0; 150000];
+                let mut buffer: Vec<u8> = Vec::with_capacity(150_000);
                 let mut sequence_number = 0;
                 let performance = window()
                     .performance()
@@ -216,10 +234,16 @@ impl ScreenEncoder {
                         last_chunk_time = now;
                     }
 
+                    // Ensure buffer is large enough for this chunk
+                    let byte_length = chunk.byte_length() as usize;
+                    if buffer.len() < byte_length {
+                        buffer.resize(byte_length, 0);
+                    }
+
                     let packet: PacketWrapper = transform_screen_chunk(
                         chunk,
                         sequence_number,
-                        &mut buffer,
+                        buffer.as_mut_slice(),
                         &userid,
                         aes.clone(),
                     );

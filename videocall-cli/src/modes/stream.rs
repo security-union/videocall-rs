@@ -1,3 +1,21 @@
+/*
+ * Copyright 2025 Security Union LLC
+ *
+ * Licensed under either of
+ *
+ * * Apache License, Version 2.0
+ *   (http://www.apache.org/licenses/LICENSE-2.0)
+ * * MIT license
+ *   (http://opensource.org/licenses/MIT)
+ *
+ * at your option.
+ *
+ * Unless you explicitly state otherwise, any contribution intentionally
+ * submitted for inclusion in the work by you, as defined in the Apache-2.0
+ * license, shall be dual licensed as above, without any additional terms or
+ * conditions.
+ */
+
 use tokio::sync::mpsc::channel;
 use videocall_cli::cli_args::Stream;
 use videocall_cli::consumers::camera_synk::CameraSynk;
@@ -45,7 +63,7 @@ pub async fn stream(opt: Stream) {
     let mut client: CameraSynks = if local_streaming {
         CameraSynks::DeadSynk(DeadSynk::new(opt))
     } else {
-        CameraSynks::CameraSynk(QUICClient::new(opt))
+        CameraSynks::CameraSynk(Box::new(QUICClient::new(opt)))
     };
     client.connect().await.expect("failed to connect");
     let camera_config = CameraConfig {

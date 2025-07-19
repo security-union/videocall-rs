@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.10](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.9...videocall-client-v1.1.10) - 2025-07-10
+
+### Other
+
+- release ([#316](https://github.com/security-union/videocall-rs/pull/316))
+
+## [1.1.9](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.8...videocall-client-v1.1.9) - 2025-07-07
+
+### Other
+
+- add neteq behind a feature flag ([#310](https://github.com/security-union/videocall-rs/pull/310))
+
+## [1.1.8](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.7...videocall-client-v1.1.8) - 2025-07-03
+
+### Other
+
+- Reset decoder and jitter buffer when there's a decoder error ([#298](https://github.com/security-union/videocall-rs/pull/298))
+
+## [1.1.7](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.6...videocall-client-v1.1.7) - 2025-06-23
+
+### Other
+
+- Add new decoder and Add MIT - Apache 2 license to all files ([#285](https://github.com/security-union/videocall-rs/pull/285))
+- Fix rotation ios image aspect ratio ([#282](https://github.com/security-union/videocall-rs/pull/282))
+- Hide screen share safari and fix selector ([#281](https://github.com/security-union/videocall-rs/pull/281))
+- Test media track stream processor add wasm opus encoder to support Safari for realz ([#266](https://github.com/security-union/videocall-rs/pull/266))
+
 ## [1.1.6](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.5...videocall-client-v1.1.6) - 2025-03-31
 
 ### Added

@@ -1,10 +1,10 @@
 name: Publish Website to Docker image
 
 on:
-  pull_request:
-    paths:
-      - 'leptos-website/**'
-      - 'docker/Dockerfile.website'
+  # pull_request:
+  #   paths:
+  #     - 'leptos-website/**'
+  #     - 'docker/Dockerfile.website'
   push:
     branches:
       - main

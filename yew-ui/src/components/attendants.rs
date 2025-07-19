@@ -18,10 +18,9 @@
 
 use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
-    peer_list::PeerList,
+    host::Host, peer_list::PeerList,
 };
-use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST};
-use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
+use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST, ACTIX_WEBSOCKET};
 use gloo_utils::window;
 use log::{debug, error, warn};
 use std::collections::HashMap;
@@ -147,8 +146,8 @@ impl AttendantsComponent {
         let id = ctx.props().id.clone();
         let opts = VideoCallClientOptions {
             userid: email.clone(),
-            websocket_url: format!("{ACTIX_WEBSOCKET}/{email}/{id}"),
-            webtransport_url: format!("{WEBTRANSPORT_HOST}/{email}/{id}"),
+            websocket_url: format!("{}/{}/{}", *crate::constants::ACTIX_WEBSOCKET, email, id),
+            webtransport_url: format!("{}/{}/{}", *crate::constants::WEBTRANSPORT_HOST, email, id),
             enable_e2ee: ctx.props().e2ee_enabled,
             enable_webtransport: ctx.props().webtransport_enabled,
             on_connected: {

@@ -9,15 +9,15 @@ rustlemania-ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: high-availability-6744e3ac # Using latest since staging tag doesn't exist yet
+    tag: main-e04fd6c2 # Using latest since staging tag doesn't exist yet
   
   resources:
     limits:
-      cpu: "400m" # 50% of a single CPU
-      memory: "400Mi" # 512 MiB of memory
+      cpu: "50m" # 50% of a single CPU
+      memory: "10Mi" # 512 MiB of memory
     requests:
-      cpu: "200m" # 25% of a single CPU
-      memory: "200Mi" # 256 MiB of memory
+      cpu: "20m" # 25% of a single CPU
+      memory: "10Mi" # 256 MiB of memory
   env:
     - name: RUST_LOG
       value: info

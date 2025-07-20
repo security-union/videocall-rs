@@ -798,7 +798,7 @@ impl Inner {
                     error!("error decoding packet: {e}");
                     match e {
                         PeerDecodeError::SameUserPacket(email) => {
-                            debug!("Rejecting packet from same user: {}", email);
+                            debug!("Rejecting packet from same user: {email}");
                         }
                         _ => {
                             self.peer_decode_manager.delete_peer(&email);
@@ -830,7 +830,7 @@ impl Inner {
                 self.options.on_peer_added.emit(peer_userid);
                 self.send_public_key();
             } else {
-                log::warn!("Rejecting packet from same user: {}", peer_userid);
+                log::warn!("Rejecting packet from same user: {peer_userid}");
             }
         }
     }

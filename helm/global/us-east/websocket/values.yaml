@@ -1,0 +1,82 @@
+# US East WebSocket server configuration
+rustlemania-websocket:
+  nameOverride: "websocket-us-east"
+  fullnameOverride: "websocket-us-east"
+
+  replicaCount: 1  # Higher replicas for primary region
+
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: high-availability-cf63fcce
+
+  env:
+    - name: RUST_LOG
+      value: info
+    - name: ACTIX_PORT
+      value: "8080"
+    - name: NATS_URL
+      value: nats-us-east:4222  # Connect to US East NATS cluster
+    - name: DATABASE_ENABLED
+      value: "false"
+    - name: DATABASE_URL
+      value: abc
+    - name: REGION
+      value: "us-east"
+
+  resources:
+    limits:
+      cpu: "300m"
+      memory: "384Mi"
+    requests:
+      cpu: "150m"
+      memory: "192Mi"
+
+  service:
+    type: ClusterIP  # Changed to ClusterIP for ingress
+    port: 8080
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    hosts:
+      - host: websocket-us-east.webtransport.video
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: websocket-us-east
+              port:
+                number: 8080
+    tls:
+      - secretName: websocket-us-east-tls
+        hosts:
+          - websocket-us-east.webtransport.video
+          - webtransport-us-east.webtransport.video
+
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 70
+
+  # Node selector for US East region
+  nodeSelector:
+    topology.kubernetes.io/region: "nyc1"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - websocket-us-east
+          topologyKey: kubernetes.io/hostname 

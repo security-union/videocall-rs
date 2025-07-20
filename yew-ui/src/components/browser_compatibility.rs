@@ -35,7 +35,7 @@ impl Component for BrowserCompatibility {
         log::info!("Checking browser compatibility");
         let error = Self::check_browser_compatibility();
         if let Some(error) = &error {
-            log::error!("Browser compatibility check failed: {}", error);
+            log::error!("Browser compatibility check failed: {error}");
         } else {
             log::info!("Browser compatibility check passed");
         }
@@ -112,8 +112,7 @@ impl BrowserCompatibility {
                 let is_firefox =
                     has_firefox || (has_gecko && !has_chrome && !has_safari && !has_like_gecko);
 
-                log::info!("Firefox detection: UA='{}', HasFirefox={}, HasGecko={}, HasChrome={}, HasSafari={}, HasLikeGecko={}, IsFirefox={}", 
-                    user_agent, has_firefox, has_gecko, has_chrome, has_safari, has_like_gecko, is_firefox);
+                log::info!("Firefox detection: UA='{user_agent}', HasFirefox={has_firefox}, HasGecko={has_gecko}, HasChrome={has_chrome}, HasSafari={has_safari}, HasLikeGecko={has_like_gecko}, IsFirefox={is_firefox}");
 
                 return is_firefox;
             }

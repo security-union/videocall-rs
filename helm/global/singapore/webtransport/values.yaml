@@ -1,0 +1,72 @@
+# Singapore WebTransport server configuration
+rustlemania-webtransport:
+  nameOverride: "webtransport-singapore"
+  fullnameOverride: "webtransport-singapore"
+
+  replicaCount: 1
+
+  command: ['webtransport_server']
+  tlsSecret: webtransport-singapore-tls
+
+  env:
+    - name: RUST_LOG
+      value: debug,quinn=warn
+    - name: NATS_URL
+      value: nats-singapore:4222  # Connect to Singapore NATS cluster
+    - name: LISTEN_URL
+      value: 0.0.0.0:443
+    - name: HEALTH_LISTEN_URL
+      value: 0.0.0.0:444
+    - name: CERT_PATH
+      value: /certs/tls.crt
+    - name: KEY_PATH
+      value: /certs/tls.key
+    - name: REGION
+      value: "singapore"
+
+  resources:
+    limits:
+      cpu: "400m"
+      memory: "512Mi"
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+
+  service:
+    type: LoadBalancer  # LoadBalancer for UDP traffic
+    port: 443
+    healthPort: 444
+    annotations:
+      service.beta.kubernetes.io/do-loadbalancer-name: "webtransport-singapore"
+      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
+      external-dns.alpha.kubernetes.io/hostname: "webtransport-singapore.webtransport.video"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+  # Node selector for Singapore region
+  nodeSelector:
+    topology.kubernetes.io/region: "sgp1"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - webtransport-singapore
+          topologyKey: kubernetes.io/hostname 

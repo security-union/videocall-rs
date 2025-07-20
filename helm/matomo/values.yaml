@@ -8,37 +8,37 @@ mariadb:
   primary:
     resources:
       limits:
-        cpu: 200m
-        memory: 256Mi
+        cpu: 100m        # Reduced from 200m (using 8m actual)
+        memory: 256Mi    # Keep same (using 316Mi actual) 
       requests:
-        cpu: 100m
-        memory: 128Mi
+        cpu: 50m         # Reduced from 100m
+        memory: 256Mi    # Increased from 128Mi to match actual usage
 
 # Set number of replicas to 1 to avoid multi-attach volume errors
 replicaCount: 1
 
-# Configure CronJobs
+# Configure CronJobs - Fixed resource configuration
 cronJobs:
   archive:
     enabled: true
     schedule: "*/15 * * * *"  # Run every 15 minutes instead of every 5
     resources:
       limits:
-        cpu: 100m
-        memory: 128Mi
+        cpu: 50m         # Reduced from 100m
+        memory: 128Mi    # Keep same
       requests:
-        cpu: 50m
-        memory: 64Mi
+        cpu: 25m         # Reduced from 50m
+        memory: 64Mi     # Keep same
   scheduled_tasks:
     enabled: true
     schedule: "*/15 * * * *"  # Run every 15 minutes instead of every 5
     resources:
       limits:
-        cpu: 100m
-        memory: 128Mi
+        cpu: 50m         # Reduced from 100m
+        memory: 128Mi    # Keep same
       requests:
-        cpu: 50m
-        memory: 64Mi
+        cpu: 25m         # Reduced from 50m
+        memory: 64Mi     # Keep same
 
 service:
   type: NodePort
@@ -73,15 +73,15 @@ persistence:
 matomoUsername: admin
 matomoPassword: YOUR_ADMIN_PASSWORD
 
-# Resource settings for Matomo
+# OPTIMIZED Resource settings for Matomo main container
 resources:
   limits:
-    cpu: 500m
-    memory: 768Mi
+    cpu: 200m        # Reduced from 500m (using 3m actual)
+    memory: 400Mi    # Reduced from 768Mi (using 296Mi actual)
   requests:
-    cpu: 200m
-    memory: 384Mi
+    cpu: 50m         # Reduced from 200m
+    memory: 320Mi    # Reduced from 384Mi but allows for growth
 
 # Disable any automatic updates to ensure stability
 updateStrategy:
-  type: Recreate
+  type: Recreate 

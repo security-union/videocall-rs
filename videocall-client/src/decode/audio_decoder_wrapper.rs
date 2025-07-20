@@ -44,7 +44,7 @@ pub struct AudioDecoderWrapper(web_sys::AudioDecoder);
 // Implement the trait for the wrapper struct
 impl AudioDecoderTrait for AudioDecoderWrapper {
     fn configure(&self, config: &AudioDecoderConfig) -> Result<(), JsValue> {
-        info!("Configuring audio decoder with config: {:?}", config);
+        info!("Configuring audio decoder with config: {config:?}");
         self.0.configure(config)
     }
 
@@ -64,7 +64,7 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
                 Ok(())
             }
             Err(e) => {
-                error!("Error decoding audio chunk: {:?}", e);
+                error!("Error decoding audio chunk: {e:?}");
                 Err(e)
             }
         }
@@ -72,7 +72,7 @@ impl AudioDecoderTrait for AudioDecoderWrapper {
 
     fn state(&self) -> CodecState {
         let state = self.0.state();
-        log::debug!("Audio decoder state: {:?}", state);
+        log::debug!("Audio decoder state: {state:?}");
         state
     }
 
@@ -107,10 +107,7 @@ impl MediaDecoderTrait for AudioDecoderWrapper {
     }
 
     fn configure(&self, config: &Self::ConfigType) -> Result<(), JsValue> {
-        info!(
-            "Configuring audio decoder (MediaDecoderTrait) with config: {:?}",
-            config
-        );
+        info!("Configuring audio decoder (MediaDecoderTrait) with config: {config:?}");
         self.0.configure(config)
     }
 
@@ -125,7 +122,7 @@ impl MediaDecoderTrait for AudioDecoderWrapper {
 
     fn state(&self) -> CodecState {
         let state = self.0.state();
-        info!("Audio decoder state (MediaDecoderTrait): {:?}", state);
+        info!("Audio decoder state (MediaDecoderTrait): {state:?}");
         state
     }
 
@@ -146,7 +143,7 @@ impl Drop for AudioDecoderWrapper {
     fn drop(&mut self) {
         log::info!("Dropping AudioDecoderWrapper");
         if let Err(e) = self.0.close() {
-            log::error!("Error closing AudioDecoderWrapper: {:?}", e);
+            log::error!("Error closing AudioDecoderWrapper: {e:?}");
         }
     }
 }

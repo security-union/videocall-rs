@@ -1,0 +1,8 @@
+apiVersion: v2
+name: ingress-nginx-singapore
+version: 0.1.0
+description: NGINX ingress controller for Singapore region with DigitalOcean LoadBalancer
+dependencies:
+  - name: ingress-nginx
+    version: 4.7.0
+    repository: https://kubernetes.github.io/ingress-nginx

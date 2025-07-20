@@ -140,8 +140,7 @@ impl FpsTracker {
             // Set FPS and bitrate to zero immediately when inactive
             if self.fps > 0.0 || self.current_bitrate > 0.0 {
                 log::info!(
-                    "Detected inactive stream, setting metrics to 0 (inactive for {:.0}ms)",
-                    inactive_ms
+                    "Detected inactive stream, setting metrics to 0 (inactive for {inactive_ms:.0}ms)"
                 );
                 self.fps = 0.0;
                 self.current_bitrate = 0.0;
@@ -265,7 +264,7 @@ impl DiagnosticManager {
                 .clone()
                 .try_send(DiagnosticEvent::HeartbeatTick)
             {
-                log::info!("Failed to send heartbeat: {:?}", e);
+                log::info!("Failed to send heartbeat: {e:?}");
             }
         }) as Box<dyn FnMut()>);
 
@@ -505,10 +504,10 @@ impl DiagnosticWorker {
 
         // Add timestamp
         let now = Date::now();
-        result.push_str(&format!("Time: {:.0}ms\n", now));
+        result.push_str(&format!("Time: {now:.0}ms\n"));
 
         for (peer_id, media_stats) in stats.iter() {
-            result.push_str(&format!("Peer {}: ", peer_id));
+            result.push_str(&format!("Peer {peer_id}: "));
 
             // First show Video if it exists
             if let Some((fps, bitrate)) = media_stats.get(&MediaType::VIDEO) {
@@ -537,12 +536,9 @@ impl DiagnosticWorker {
 
     fn append_media_stats(&self, result: &mut String, media_str: &str, fps: f64, bitrate: f64) {
         if fps <= 0.01 || bitrate <= 0.01 {
-            result.push_str(&format!("{}=INACTIVE ", media_str));
+            result.push_str(&format!("{media_str}=INACTIVE "));
         } else {
-            result.push_str(&format!(
-                "{}={:.2} FPS {:.1} kbit/s ",
-                media_str, fps, bitrate
-            ));
+            result.push_str(&format!("{media_str}={fps:.2} FPS {bitrate:.1} kbit/s "));
         }
     }
 }
@@ -654,7 +650,7 @@ impl SenderDiagnosticManager {
                 .clone()
                 .try_send(SenderDiagnosticEvent::HeartbeatTick)
             {
-                log::info!("Failed to send sender heartbeat: {:?}", e);
+                log::info!("Failed to send sender heartbeat: {e:?}");
             }
         }) as Box<dyn FnMut()>);
 
@@ -807,7 +803,7 @@ impl SenderDiagnosticWorker {
 
         // Only show stats for the current peer (where peer_id matches our userid)
         for (peer_id, media_stats) in &self.stream_stats {
-            result.push_str(&format!("Peer {}\n", peer_id));
+            result.push_str(&format!("Peer {peer_id}\n"));
 
             // First show Video if it exists
             if let Some(stats) = media_stats.get(&MediaType::VIDEO) {

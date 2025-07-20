@@ -44,6 +44,7 @@ pub enum PeerDecodeError {
     NoMediaType,
     NoPacketType,
     PacketParseError,
+    SameUserPacket(String),
 }
 
 #[derive(Debug)]
@@ -66,6 +67,7 @@ impl Display for PeerDecodeError {
             PeerDecodeError::PacketParseError => {
                 write!(f, "Failed to parse to protobuf MediaPacket")
             }
+            PeerDecodeError::SameUserPacket(s) => write!(f, "SameUserPacket: {s}"),
         }
     }
 }
@@ -108,7 +110,7 @@ impl Peer {
 
         // Initialize with explicit mute state (audio_enabled starts as false, so muted=true)
         audio.set_muted(true);
-        debug!("Initialized peer {} with audio muted", email);
+        debug!("Initialized peer {email} with audio muted");
 
         Ok(Self {
             audio,
@@ -294,6 +296,20 @@ impl Peer {
                     },
                 ))
             }
+            MediaType::RTT => {
+                // RTT packets are handled by ConnectionManager, not by peer decoders
+                debug!(
+                    "Received RTT packet for peer {} - ignoring in peer decoder",
+                    self.email
+                );
+                Ok((
+                    media_type,
+                    DecodeStatus {
+                        rendered: false,
+                        first_frame: false,
+                    },
+                ))
+            }
         }
     }
 
@@ -369,7 +385,7 @@ impl PeerDecodeManager {
         self.connected_peers.remove_if(pred);
     }
 
-    pub fn decode(&mut self, response: PacketWrapper) -> Result<(), PeerDecodeError> {
+    pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if let Some(peer) = self.connected_peers.get_mut(&email) {
@@ -379,6 +395,9 @@ impl PeerDecodeManager {
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
+                    if media_type != MediaType::RTT && packet.email == userid {
+                        return Err(PeerDecodeError::SameUserPacket(email.clone()));
+                    }
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_frame(&email, media_type, packet.data.len() as u64);
                     }
@@ -397,7 +416,7 @@ impl PeerDecodeManager {
     }
 
     fn add_peer(&mut self, email: &str, aes: Option<Aes128State>) -> Result<(), JsValue> {
-        debug!("Adding peer {}", email);
+        debug!("Adding peer {email}");
         self.connected_peers.insert(
             email.to_owned(),
             Peer::new(
@@ -418,7 +437,7 @@ impl PeerDecodeManager {
         if self.connected_peers.contains_key(email) {
             PeerStatus::NoChange
         } else if let Err(e) = self.add_peer(email, None) {
-            log::error!("Error adding peer: {:?}", e);
+            log::error!("Error adding peer: {e:?}");
             PeerStatus::NoChange
         } else {
             PeerStatus::Added(email.clone())
@@ -469,13 +488,11 @@ impl PeerDecodeManager {
 
                         // Replace the old decoder with the new one
                         peer.audio = new_audio_decoder;
-                        log::info!("Successfully rebuilt audio decoder for peer: {} with speaker device (muted: {})", key, current_muted);
+                        log::info!("Successfully rebuilt audio decoder for peer: {key} with speaker device (muted: {current_muted})");
                     }
                     Err(e) => {
                         log::error!(
-                            "Failed to rebuild audio decoder for peer: {}, error: {:?}",
-                            key,
-                            e
+                            "Failed to rebuild audio decoder for peer: {key}, error: {e:?}"
                         );
                         // Keep the old decoder rather than breaking audio completely
                     }

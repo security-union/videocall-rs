@@ -1,0 +1,8 @@
+controller:
+  service:
+    type: LoadBalancer
+    annotations:
+      service.beta.kubernetes.io/do-loadbalancer-name: "ingress-nginx-us-east"
+      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "10254" 

@@ -50,7 +50,7 @@ pub(super) trait WebMedia<TASK> {
             Ok(bytes) => self.send_bytes(bytes),
             Err(e) => {
                 let packet_type = packet.packet_type.enum_value_or_default();
-                error!("error sending {} packet: {:?}", packet_type, e);
+                error!("error sending {packet_type} packet: {e:?}");
             }
         }
     }

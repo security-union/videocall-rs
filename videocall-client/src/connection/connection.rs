@@ -51,6 +51,7 @@ pub struct Connection {
     video_enabled: Rc<AtomicBool>,
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
+    url: String,
 }
 
 impl Connection {
@@ -59,26 +60,33 @@ impl Connection {
         options: ConnectOptions,
         aes: Rc<Aes128State>,
     ) -> anyhow::Result<Self> {
-        let mut options = options;
-        let userid = options.userid.clone();
+        let mut new_options = options.clone();
+        let userid = new_options.userid.clone();
         let status = Rc::new(Cell::new(Status::Connecting));
-        {
+
+        let url = if webtransport {
+            new_options.webtransport_url.clone()
+        } else {
+            new_options.websocket_url.clone()
+        };
+
+        let on_connected_tap = {
             let status = Rc::clone(&status);
-            options.on_connected = tap_callback(
-                options.on_connected,
-                Callback::from(move |_| status.set(Status::Connected)),
-            );
-        }
-        {
+            Callback::from(move |_| status.set(Status::Connected))
+        };
+        new_options.on_connected = tap_callback(new_options.on_connected, on_connected_tap);
+
+        let on_lost_tap = {
             let status = Rc::clone(&status);
-            options.on_connection_lost = tap_callback(
-                options.on_connection_lost,
-                Callback::from(move |_| status.set(Status::Closed)),
-            );
-        }
-        let monitor = options.peer_monitor.clone();
+            Callback::from(move |_| status.set(Status::Closed))
+        };
+        new_options.on_connection_lost = tap_callback(new_options.on_connection_lost, on_lost_tap);
+
+        let monitor = new_options.peer_monitor.clone();
+        let task = Task::connect(webtransport, new_options)?;
+
         let mut connection = Self {
-            task: Rc::new(Task::connect(webtransport, options)?),
+            task: Rc::new(task),
             heartbeat: None,
             heartbeat_monitor: Some(Interval::new(5000, move || {
                 monitor.emit(());
@@ -88,6 +96,7 @@ impl Connection {
             audio_enabled: Rc::new(AtomicBool::new(false)),
             video_enabled: Rc::new(AtomicBool::new(false)),
             screen_enabled: Rc::new(AtomicBool::new(false)),
+            url,
         };
         connection.start_heartbeat(userid);
 
@@ -149,19 +158,19 @@ impl Connection {
     }
 
     pub fn set_video_enabled(&self, enabled: bool) {
-        log::debug!("Setting video enabled to {}", enabled);
+        log::debug!("Setting video enabled to {enabled}");
         self.video_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_audio_enabled(&self, enabled: bool) {
-        log::debug!("Setting audio enabled to {}", enabled);
+        log::debug!("Setting audio enabled to {enabled}");
         self.audio_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_screen_enabled(&self, enabled: bool) {
-        log::debug!("Setting screen enabled to {}", enabled);
+        log::debug!("Setting screen enabled to {enabled}");
         self.screen_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
@@ -169,6 +178,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        log::warn!("Dropping Connection to {}", self.url);
         self.stop_heartbeat();
     }
 }

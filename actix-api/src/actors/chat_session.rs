@@ -32,8 +32,13 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use tracing::{error, info, trace};
+use protobuf::Message as ProtobufMessage;
+use tracing::{debug, error, info, trace};
 use uuid::Uuid;
+use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub type RoomId = String;
 pub type Email = String;
@@ -58,6 +63,18 @@ impl WsChatSession {
             email,
             addr,
         }
+    }
+
+    /// Check if the binary data is an RTT packet that should be echoed back
+    fn is_rtt_packet(&self, data: &[u8]) -> bool {
+        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+            if packet_wrapper.packet_type == PacketType::MEDIA.into() {
+                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
+                    return media_packet.media_type == MediaType::RTT.into();
+                }
+            }
+        }
+        false
     }
 
     fn heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
@@ -154,9 +171,18 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 
         match msg {
             ws::Message::Binary(msg) => {
-                ctx.notify(Packet {
-                    data: Arc::new(msg.to_vec()),
-                });
+                let msg_bytes = msg.to_vec();
+
+                // Check if this is an RTT packet that should be echoed back
+                if self.is_rtt_packet(&msg_bytes) {
+                    debug!("Echoing RTT packet back to sender: {}", self.email);
+                    ctx.binary(msg_bytes);
+                } else {
+                    // Normal packet processing - forward to chat server
+                    ctx.notify(Packet {
+                        data: Arc::new(msg_bytes),
+                    });
+                }
             }
             ws::Message::Ping(msg) => {
                 self.heartbeat = Instant::now();

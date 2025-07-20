@@ -38,8 +38,7 @@ pub fn is_ios() -> bool {
                 // Audio Encoder may be missing on older browsers too, so we check both conditions
                 let result = likely_ios || !audio_encoder_exists;
                 log::info!(
-                    "Platform detection: User Agent='{}', LikelyiOS={}, AudioEncoderAvailable={}, FinalResult={}",
-                    ua, likely_ios, audio_encoder_exists, result
+                    "Platform detection: User Agent='{ua}', LikelyiOS={likely_ios}, AudioEncoderAvailable={audio_encoder_exists}, FinalResult={result}"
                 );
                 return result;
             }

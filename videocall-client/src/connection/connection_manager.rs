@@ -301,7 +301,11 @@ impl ConnectionManager {
             }
 
             // Forward all non-RTT packets to the main handler
-            on_inbound_media.emit(packet);
+            if packet.email != userid {
+                on_inbound_media.emit(packet);
+            } else {
+                warn!("Rejecting packet from same user: {}", packet.email);
+            }
         })
     }
 

@@ -20,6 +20,7 @@ use super::super::connection::{ConnectionController, ConnectionManagerOptions, C
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
+use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
@@ -790,10 +791,19 @@ impl Inner {
 
                 // RTT responses are now handled directly by the ConnectionManager via individual connection callbacks
                 // No need to process them here anymore
-
-                if let Err(e) = self.peer_decode_manager.decode(response) {
+                if let Err(e) = self
+                    .peer_decode_manager
+                    .decode(response, &self.options.userid)
+                {
                     error!("error decoding packet: {e}");
-                    self.peer_decode_manager.delete_peer(&email);
+                    match e {
+                        PeerDecodeError::SameUserPacket(email) => {
+                            debug!("Rejecting packet from same user: {}", email);
+                        }
+                        _ => {
+                            self.peer_decode_manager.delete_peer(&email);
+                        }
+                    }
                 }
             }
             Ok(PacketType::CONNECTION) => {
@@ -816,9 +826,12 @@ impl Inner {
             }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {
-            debug!("added peer {peer_userid}");
-            self.send_public_key();
-            self.options.on_peer_added.emit(peer_userid);
+            if peer_userid != self.options.userid {
+                self.options.on_peer_added.emit(peer_userid);
+                self.send_public_key();
+            } else {
+                log::warn!("Rejecting packet from same user: {}", peer_userid);
+            }
         }
     }
 

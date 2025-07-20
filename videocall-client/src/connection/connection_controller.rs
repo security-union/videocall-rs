@@ -34,8 +34,6 @@ pub struct ConnectionController {
 #[derive(Debug)]
 struct ConnectionControllerInner {
     connection_manager: ConnectionManager,
-    options: ConnectionManagerOptions,
-    aes: Rc<Aes128State>,
 }
 
 impl ConnectionController {
@@ -47,8 +45,6 @@ impl ConnectionController {
 
         let inner = Rc::new(RefCell::new(ConnectionControllerInner {
             connection_manager,
-            options,
-            aes,
         }));
 
         let timers = Self::start_timers(Rc::downgrade(&inner));

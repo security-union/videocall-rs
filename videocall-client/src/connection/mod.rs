@@ -26,5 +26,5 @@ mod websocket;
 mod webtransport;
 
 pub use connection_controller::ConnectionController;
-pub use connection_manager::{ConnectionManager, ConnectionManagerOptions, ConnectionState};
+pub use connection_manager::{ConnectionManagerOptions, ConnectionState};
 pub use webmedia::ConnectOptions;

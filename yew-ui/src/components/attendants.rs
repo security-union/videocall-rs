@@ -468,7 +468,7 @@ impl Component for AttendantsComponent {
                 }
             },
             Msg::OnPeerAdded(email) => {
-                log::info!("New user joined: {}", email);
+                log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
                 true
@@ -618,10 +618,7 @@ impl Component for AttendantsComponent {
                         self.connection_manager_state = Some(serialized);
                     }
                 } else {
-                    log::error!(
-                        "AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {}",
-                        event_json
-                    );
+                    log::error!("AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {event_json}");
                 }
                 true
             }

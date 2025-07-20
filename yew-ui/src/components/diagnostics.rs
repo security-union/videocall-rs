@@ -652,7 +652,7 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
                                                 html! {
                                                     <div class="detail-item">
                                                         <span class="detail-label">{"Type:"}</span>
-                                                        <span class={classes!("detail-value", "connection-type", format!("type-{}", server_type))}>
+                                                        <span class={classes!("detail-value", "connection-type", format!("type-{server_type}"))}>
                                                             {server_type.to_uppercase()}
                                                         </span>
                                                     </div>
@@ -869,7 +869,7 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            log::debug!("[parse_neteq_stats_history] Skipping empty line {}", i);
+            log::debug!("[parse_neteq_stats_history] Skipping empty line {i}");
             continue;
         }
 
@@ -895,10 +895,7 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
                 stats.push(stat);
             }
             Err(e) => {
-                log::warn!(
-                    "[parse_neteq_stats_history] Failed to parse as single JSON: {}",
-                    e
-                );
+                log::warn!("[parse_neteq_stats_history] Failed to parse as single JSON: {e}");
             }
         }
     }

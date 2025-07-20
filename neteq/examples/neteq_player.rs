@@ -199,7 +199,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register Opus decoder for payload type 111.
     {
         let mut n = neteq.lock().unwrap();
-        n.register_decoder(111, Box::new(OpusDecoder::new(sample_rate, channels)?));
+        n.register_decoder(
+            111,
+            Box::new(OpusDecoder::new(sample_rate, channels).unwrap()),
+        );
     }
 
     // ── Warm-start NetEq with a few packets before audio begins ─────────────

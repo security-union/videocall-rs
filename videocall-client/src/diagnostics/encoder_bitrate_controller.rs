@@ -389,10 +389,7 @@ impl EncoderBitrateController {
             || corrected_bitrate.is_nan()
         {
             log::warn!(
-                "Bitrate out of bounds or NaN: {:.0} kbps (min: {:.0} kbps, max: {:.0} kbps)",
-                corrected_bitrate,
-                min_bitrate,
-                max_bitrate
+                "Bitrate out of bounds or NaN: {corrected_bitrate:.0} kbps (min: {min_bitrate:.0} kbps, max: {max_bitrate:.0} kbps)"
             );
             // Use a safe default value instead
             f64::max(min_bitrate, f64::min(base_bitrate, max_bitrate))
@@ -502,9 +499,7 @@ mod tests {
                 // Should be close to base bitrate (in kbps)
                 assert!(
                     (bitrate - (ideal_bitrate_kbps) as f64).abs() < 10.0,
-                    "Expected bitrate close to base ({} kbps), got {} kbps",
-                    ideal_bitrate_kbps,
-                    bitrate
+                    "Expected bitrate close to base ({ideal_bitrate_kbps} kbps), got {bitrate} kbps"
                 );
             }
         }
@@ -514,8 +509,7 @@ mod tests {
         let jitter = controller.calculate_jitter();
         assert!(
             jitter < 0.1,
-            "Expected near-zero jitter in happy path, got {}",
-            jitter
+            "Expected near-zero jitter in happy path, got {jitter}"
         );
 
         // Verify we have exactly one peer
@@ -572,9 +566,7 @@ mod tests {
             // Should be much lower than ideal due to the poor peer
             assert!(
                 bitrate < ideal_bitrate_kbps as f64 * 0.7, // 70% of ideal or less
-                "Expected reduced bitrate due to poor peer, got {} bps (ideal: {} bps)",
-                bitrate,
-                ideal_bitrate_kbps
+                "Expected reduced bitrate due to poor peer, got {bitrate} bps (ideal: {ideal_bitrate_kbps} bps)"
             );
         }
     }
@@ -766,9 +758,7 @@ mod tests {
         // Verify that bitrate decreased when FPS decreased
         assert!(
             poor_bitrate < good_bitrate,
-            "Expected bitrate to decrease when FPS drops. Good: {}, Poor: {}",
-            good_bitrate,
-            poor_bitrate
+            "Expected bitrate to decrease when FPS drops. Good: {good_bitrate}, Poor: {poor_bitrate}"
         );
 
         // Verify that the bitrate is within the expected bounds (min and max)
@@ -776,15 +766,11 @@ mod tests {
         let max_bitrate = (ideal_bitrate_kbps) as f64 * 1.5; // 150% of ideal
         assert!(
             poor_bitrate >= min_bitrate,
-            "Poor bitrate {} bps should be greater than or equal to minimum bitrate {} bps",
-            poor_bitrate,
-            min_bitrate
+            "Poor bitrate {poor_bitrate} bps should be greater than or equal to minimum bitrate {min_bitrate} bps"
         );
         assert!(
             poor_bitrate <= max_bitrate,
-            "Poor bitrate {} bps should be less than or equal to maximum bitrate {} bps",
-            poor_bitrate,
-            max_bitrate
+            "Poor bitrate {poor_bitrate} bps should be less than or equal to maximum bitrate {max_bitrate} bps"
         );
     }
 
@@ -831,9 +817,7 @@ mod tests {
         let actual_jitter = controller.calculate_jitter();
         assert!(
             (actual_jitter - expected_jitter).abs() < 0.001,
-            "Expected jitter {}, got {}",
-            expected_jitter,
-            actual_jitter
+            "Expected jitter {expected_jitter}, got {actual_jitter}"
         );
 
         // Test gradual change
@@ -850,9 +834,7 @@ mod tests {
         let actual_jitter = controller.calculate_jitter();
         assert!(
             (actual_jitter - expected_jitter).abs() < 0.001,
-            "Expected jitter {}, got {}",
-            expected_jitter,
-            actual_jitter
+            "Expected jitter {expected_jitter}, got {actual_jitter}"
         );
     }
 

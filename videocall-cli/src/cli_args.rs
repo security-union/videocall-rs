@@ -27,7 +27,7 @@ use videocall_nokhwa::utils::FrameFormat;
 ///
 /// This cli connects to the videocall.rs and streams audio and video to the specified meeting.
 ///
-/// You can watch the video at https://videocall.rs/meeting/{user_id}/{meeting_id}
+/// You can watch the video at https://videocall.rs/meeting/{meeting_id}
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
 pub struct Opt {

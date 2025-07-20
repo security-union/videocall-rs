@@ -115,7 +115,7 @@ impl MicrophoneEncoder {
 
                         if percent_change > BITRATE_CHANGE_THRESHOLD {
                             if let Some(callback) = &on_encoder_settings_update {
-                                callback.emit(format!("Bitrate: {:.2} kbps", bitrate));
+                                callback.emit(format!("Bitrate: {bitrate:.2} kbps"));
                             }
                             current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                         }
@@ -231,7 +231,7 @@ impl MicrophoneEncoder {
 
             // Setup audio encoder
             let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                error!("error_handler error {:?}", e);
+                error!("error_handler error {e:?}");
             }) as Box<dyn FnMut(JsValue)>);
 
             let audio_output_handler =
@@ -251,7 +251,7 @@ impl MicrophoneEncoder {
             audio_encoder_config.set_sample_rate(AUDIO_SAMPLE_RATE);
             audio_encoder_config.set_number_of_channels(AUDIO_CHANNELS);
             if let Err(e) = audio_encoder.configure(&audio_encoder_config) {
-                error!("Error configuring microphone encoder: {:?}", e);
+                error!("Error configuring microphone encoder: {e:?}");
             }
 
             let audio_processor =
@@ -272,7 +272,7 @@ impl MicrophoneEncoder {
                     switching.store(false, Ordering::Release);
                     media_track.stop();
                     if let Err(e) = audio_encoder.close() {
-                        error!("Error closing microphone encoder: {:?}", e);
+                        error!("Error closing microphone encoder: {e:?}");
                     }
                     break;
                 }
@@ -280,14 +280,14 @@ impl MicrophoneEncoder {
                 // Update the bitrate if it has changed from diagnostics system
                 let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
                 if new_bitrate != local_bitrate {
-                    info!("📊 Updating microphone bitrate to {}", new_bitrate);
+                    info!("📊 Updating microphone bitrate to {new_bitrate}");
                     local_bitrate = new_bitrate;
                     let new_config = AudioEncoderConfig::new(AUDIO_CODEC);
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_sample_rate(AUDIO_SAMPLE_RATE);
                     new_config.set_number_of_channels(AUDIO_CHANNELS);
                     if let Err(e) = audio_encoder.configure(&new_config) {
-                        error!("Error configuring microphone encoder: {:?}", e);
+                        error!("Error configuring microphone encoder: {e:?}");
                     }
                 }
 
@@ -296,16 +296,16 @@ impl MicrophoneEncoder {
                         Ok(value) => {
                             let audio_frame = value.unchecked_into::<web_sys::AudioData>();
                             if let Err(e) = audio_encoder.encode(&audio_frame) {
-                                error!("Error encoding microphone frame: {:?}", e);
+                                error!("Error encoding microphone frame: {e:?}");
                             }
                             audio_frame.close();
                         }
                         Err(e) => {
-                            error!("Error getting frame value: {:?}", e);
+                            error!("Error getting frame value: {e:?}");
                         }
                     },
                     Err(e) => {
-                        error!("Error reading frame: {:?}", e);
+                        error!("Error reading frame: {e:?}");
                     }
                 }
             }

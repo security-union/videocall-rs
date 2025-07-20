@@ -1,0 +1,83 @@
+# Singapore WebSocket server configuration
+rustlemania-websocket:
+  nameOverride: "websocket-singapore"
+  fullnameOverride: "websocket-singapore"
+
+  replicaCount: 1
+
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: high-availability-cf63fcce
+
+  env:
+    - name: RUST_LOG
+      value: info
+    - name: ACTIX_PORT
+      value: "8080"
+    - name: UI_ENDPOINT
+      value: https://singapore.webtransport.video
+    - name: NATS_URL
+      value: nats-singapore:4222  # Connect to Singapore NATS cluster
+    - name: DATABASE_ENABLED
+      value: "false"
+    - name: DATABASE_URL
+      value: abc
+    - name: REGION
+      value: "singapore"
+
+  resources:
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+
+  service:
+    type: ClusterIP  # Changed to ClusterIP for ingress
+    port: 8080
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    hosts:
+      - host: websocket-singapore.webtransport.video
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: websocket-singapore
+              port:
+                number: 8080
+    tls:
+      - secretName: websocket-singapore-tls
+        hosts:
+          - websocket-singapore.webtransport.video
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+
+  # Node selector for Singapore region
+  nodeSelector:
+    topology.kubernetes.io/region: "sgp1"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - websocket-singapore
+          topologyKey: kubernetes.io/hostname 

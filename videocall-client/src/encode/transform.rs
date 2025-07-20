@@ -41,7 +41,7 @@ pub fn transform_video_chunk(
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
-        log::error!("Error copying video chunk: {:?}", e);
+        log::error!("Error copying video chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
@@ -78,7 +78,7 @@ pub fn transform_screen_chunk(
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
-        log::error!("Error copying video chunk: {:?}", e);
+        log::error!("Error copying video chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),
@@ -114,7 +114,7 @@ pub fn transform_audio_chunk(
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
     if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
-        log::error!("Error copying audio chunk: {:?}", e);
+        log::error!("Error copying audio chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),

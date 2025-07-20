@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-accounts
+  namespace: {{ .Release.Namespace }}
+data:
+  resolver.conf: |
+    {
+      "operator": "videocall-operator",
+      "system_account": "SYS",
+      "accounts": {
+        "SYS": {
+          "users": [
+            {"user": "sys", "password": "{{ .Values.nats.auth.systemPassword | default "videocall-sys-pass" }}"}
+          ]
+        },
+        "VIDEOCALL": {
+          "users": [
+            {"user": "videocall", "password": "{{ .Values.nats.auth.videocallPassword | default "videocall-pass" }}"}
+          ],
+          "exports": [
+            {"service": "room.>", "response": "many"}
+          ],
+          "imports": [
+            {"service": {"account": "VIDEOCALL", "subject": "room.>"}, "to": "remote.room.>"}
+          ]
+        }
+      }
+    } 

@@ -73,13 +73,13 @@ impl std::fmt::Display for EncoderSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut settings = Vec::new();
         if let Some(camera) = &self.camera {
-            settings.push(format!("Camera: {}", camera));
+            settings.push(format!("Camera: {camera}"));
         }
         if let Some(microphone) = &self.microphone {
-            settings.push(format!("Microphone: {}", microphone));
+            settings.push(format!("Microphone: {microphone}"));
         }
         if let Some(screen) = &self.screen {
-            settings.push(format!("Screen: {}", screen));
+            settings.push(format!("Screen: {screen}"));
         }
         write!(f, "{}", settings.join(", "))
     }
@@ -218,7 +218,7 @@ impl Component for Host {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        log::debug!("Host update: {:?}", msg);
+        log::debug!("Host update: {msg:?}");
         let should_update = match msg {
             Msg::EnableScreenShare => {
                 self.screen.start();
@@ -264,7 +264,7 @@ impl Component for Host {
                 true
             }
             Msg::AudioDeviceChanged(audio) => {
-                log::info!("Audio device changed: {}", audio);
+                log::info!("Audio device changed: {audio}");
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_inputs.select(&audio);
                 if self.microphone.select(audio) {
@@ -277,7 +277,7 @@ impl Component for Host {
                 true // Need to re-render to update device selector displays
             }
             Msg::VideoDeviceChanged(video) => {
-                log::info!("Video device changed: {}", video);
+                log::info!("Video device changed: {video}");
                 // Update the MediaDeviceList selection
                 self.media_devices.video_inputs.select(&video);
                 if self.camera.select(video) {
@@ -294,7 +294,7 @@ impl Component for Host {
                 self.media_devices.audio_outputs.select(&speaker);
                 // Update the speaker device for all connected peers
                 if let Err(e) = ctx.props().client.update_speaker_device(Some(speaker)) {
-                    log::error!("Failed to update speaker device: {:?}", e);
+                    log::error!("Failed to update speaker device: {e:?}");
                 }
                 true
             }
@@ -359,7 +359,7 @@ impl Component for Host {
                 true
             }
         };
-        log::debug!("Host update: {:?}", should_update);
+        log::debug!("Host update: {should_update:?}");
         should_update
     }
 

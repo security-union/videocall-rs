@@ -204,7 +204,7 @@ impl MicrophoneEncoder {
                     if let Some(msg_str) = message_type.as_string() {
                         if msg_str != "page" {
                             // This is a control message (ready, done, flushed), not an audio frame
-                            log::debug!("Received control message: {}", msg_str);
+                            log::debug!("Received control message: {msg_str}");
                             return;
                         }
                     }
@@ -218,7 +218,7 @@ impl MicrophoneEncoder {
                     sequence_number += 1;
                     log::debug!("Sent audio frame with sequence: {}", sequence_number - 1);
                 } else {
-                    log::error!("Received non-MessageEvent: {:?}", chunk);
+                    log::error!("Received non-MessageEvent: {chunk:?}");
                 }
             })
         };
@@ -257,14 +257,14 @@ impl MicrophoneEncoder {
                     .as_f64()
                     .unwrap() as u32;
 
-            log::info!("Microphone input sample rate: {} Hz", input_rate);
+            log::info!("Microphone input sample rate: {input_rate} Hz");
 
             // Use the microphone's sample rate for the AudioContext to avoid Firefox sample rate mismatch
             let options = AudioContextOptions::new();
             options.set_sample_rate(input_rate as f32);
 
             let context = AudioContext::new_with_context_options(&options).unwrap();
-            log::info!("Created AudioContext with sample rate: {} Hz", input_rate);
+            log::info!("Created AudioContext with sample rate: {input_rate} Hz");
 
             let worklet = codec
                 .create_node(
@@ -329,7 +329,7 @@ impl MicrophoneEncoder {
 
                     // Close the AudioContext
                     if let Err(e) = context.close() {
-                        log::error!("Error closing AudioContext: {:?}", e);
+                        log::error!("Error closing AudioContext: {e:?}");
                     }
 
                     // Destroy the codec

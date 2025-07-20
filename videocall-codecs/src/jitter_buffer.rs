@@ -84,7 +84,7 @@ impl<T> JitterBuffer<T> {
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
-        println!("[JITTER_BUFFER] Inserting frame: {}", seq);
+        println!("[JITTER_BUFFER] Inserting frame: {seq}");
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
@@ -97,12 +97,11 @@ impl<T> JitterBuffer<T> {
                     && last_decoded.saturating_sub(seq) > STREAM_RESTART_BACKTRACK_THRESHOLD
                 {
                     println!(
-                        "[JITTER_BUFFER] Detected keyframe with older sequence ({} <= {}). Assuming stream restart – flushing buffer.",
-                        seq, last_decoded
+                        "[JITTER_BUFFER] Detected keyframe with older sequence ({seq} <= {last_decoded}). Assuming stream restart – flushing buffer."
                     );
                     self.flush();
                 } else {
-                    println!("[JITTER_BUFFER] Ignoring old frame: {}", seq);
+                    println!("[JITTER_BUFFER] Ignoring old frame: {seq}");
                     self.num_consecutive_old_frames += 1;
                     if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
                         println!(
@@ -126,12 +125,12 @@ impl<T> JitterBuffer<T> {
                 println!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
                 self.drop_all_frames();
             } else {
-                println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {}", seq);
+                println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
                 return; // Reject the frame.
             }
         }
 
-        println!("[JITTER_BUFFER] Received frame: {}", seq);
+        println!("[JITTER_BUFFER] Received frame: {seq}");
 
         self.jitter_estimator.update_estimate(seq, arrival_time_ms);
         self.update_target_playout_delay();
@@ -171,50 +170,44 @@ impl<T> JitterBuffer<T> {
         loop {
             let mut found_frame_to_move = false;
 
-            let next_decodable_key: Option<u64> =
-                if let Some(last_seq) = self.last_decoded_sequence_number {
-                    // CASE 1: We are in a continuous stream. Look for the next frame.
-                    let next_continuous_seq = last_seq + 1;
-                    if self.buffered_frames.contains_key(&next_continuous_seq) {
-                        println!(
-                            "[JB_POLL] Seeking next continuous frame: {}",
-                            next_continuous_seq
-                        );
-                        Some(next_continuous_seq)
-                    } else {
-                        // CASE 2: Gap detected. Look for the next keyframe after the gap.
-                        let keyframe = self
-                            .buffered_frames
-                            .iter()
-                            .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
-                            .map(|(&s, _)| s);
-                        if let Some(k) = keyframe {
-                            println!(
-                                "[JB_POLL] Gap after {}. Seeking next keyframe. Found: {}",
-                                last_seq, k
-                            );
-                        } else {
-                            println!(
-                                "[JB_POLL] Gap after {}. No subsequent keyframe found.",
-                                last_seq
-                            );
-                        }
-                        keyframe
-                    }
+            let next_decodable_key: Option<u64> = if let Some(last_seq) =
+                self.last_decoded_sequence_number
+            {
+                // CASE 1: We are in a continuous stream. Look for the next frame.
+                let next_continuous_seq = last_seq + 1;
+                if self.buffered_frames.contains_key(&next_continuous_seq) {
+                    println!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
+                    Some(next_continuous_seq)
                 } else {
-                    // CASE 3: We have never decoded. We MUST start with a keyframe.
+                    // CASE 2: Gap detected. Look for the next keyframe after the gap.
                     let keyframe = self
                         .buffered_frames
                         .iter()
-                        .find(|(_, f)| f.is_keyframe())
+                        .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
                         .map(|(&s, _)| s);
                     if let Some(k) = keyframe {
-                        println!("[JB_POLL] Seeking first keyframe. Found: {}", k);
+                        println!(
+                            "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
+                        );
                     } else {
-                        println!("[JB_POLL] Seeking first keyframe. None found in buffer.");
+                        println!("[JB_POLL] Gap after {last_seq}. No subsequent keyframe found.");
                     }
                     keyframe
-                };
+                }
+            } else {
+                // CASE 3: We have never decoded. We MUST start with a keyframe.
+                let keyframe = self
+                    .buffered_frames
+                    .iter()
+                    .find(|(_, f)| f.is_keyframe())
+                    .map(|(&s, _)| s);
+                if let Some(k) = keyframe {
+                    println!("[JB_POLL] Seeking first keyframe. Found: {k}");
+                } else {
+                    println!("[JB_POLL] Seeking first keyframe. None found in buffer.");
+                }
+                keyframe
+            };
 
             if let Some(key) = next_decodable_key {
                 if let Some(frame) = self.buffered_frames.get(&key) {
@@ -238,8 +231,7 @@ impl<T> JitterBuffer<T> {
 
                             if is_first_frame || is_gap_recovery {
                                 println!(
-                                    "[JITTER_BUFFER] Keyframe {} recovery. Dropping frames before it.",
-                                    key
+                                    "[JITTER_BUFFER] Keyframe {key} recovery. Dropping frames before it."
                                 );
                                 self.drop_frames_before(key);
                             }
@@ -290,7 +282,7 @@ impl<T> JitterBuffer<T> {
 
         self.dropped_frames_count += keys_to_drop.len() as u64;
         for key in keys_to_drop {
-            println!("[JITTER_BUFFER] Dropping stale frame: {}", key);
+            println!("[JITTER_BUFFER] Dropping stale frame: {key}");
             self.buffered_frames.remove(&key);
         }
     }
@@ -300,7 +292,7 @@ impl<T> JitterBuffer<T> {
         let num_dropped = self.buffered_frames.len() as u64;
         self.buffered_frames.clear();
         self.dropped_frames_count += num_dropped;
-        println!("[JITTER_BUFFER] Dropped all {} frames.", num_dropped);
+        println!("[JITTER_BUFFER] Dropped all {num_dropped} frames.");
     }
 
     /// Flushes the jitter buffer, resetting its state completely.

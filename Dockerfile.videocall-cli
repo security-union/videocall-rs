@@ -19,7 +19,7 @@ FROM debian:bookworm-slim
 
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=0
-ENV QUIC_HOST=https://transport.rustlemania.com
+ENV QUIC_HOST=https://webtransport-us-east.webtransport.video
 ENV MEETING_ID=1234
 ENV USER_ID=1234
 

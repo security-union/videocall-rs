@@ -76,7 +76,7 @@ impl Drop for VideoDecoderWrapper {
         let encoder: &web_sys::VideoDecoder = &self.0;
         if encoder.state() != CodecState::Closed {
             if let Err(e) = encoder.close() {
-                log::error!("Error closing VideoDecoderWrapper: {:?}", e);
+                log::error!("Error closing VideoDecoderWrapper: {e:?}");
             }
         }
     }

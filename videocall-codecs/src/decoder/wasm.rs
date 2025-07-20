@@ -102,7 +102,7 @@ impl Decodable for WasmDecoder {
                         video_frame.close();
                     }
                     Err(_) => {
-                        log::warn!("Received unexpected message from worker: {:?}", js_val);
+                        log::warn!("Received unexpected message from worker: {js_val:?}");
                     }
                 }
             }) as Box<dyn FnMut(_)>)
@@ -159,7 +159,7 @@ impl WasmDecoder {
                         callback(video_frame);
                     }
                     Err(_) => {
-                        log::warn!("Received unexpected message from worker: {:?}", js_val);
+                        log::warn!("Received unexpected message from worker: {js_val:?}");
                     }
                 }
             }) as Box<dyn FnMut(_)>)
@@ -185,11 +185,11 @@ impl WasmDecoder {
         match serde_wasm_bindgen::to_value(&message) {
             Ok(js_message) => {
                 if let Err(e) = self.worker.post_message(&js_message) {
-                    log::error!("Error posting message to worker: {:?}", e);
+                    log::error!("Error posting message to worker: {e:?}");
                 }
             }
             Err(e) => {
-                log::error!("Error serializing message: {:?}", e);
+                log::error!("Error serializing message: {e:?}");
             }
         }
     }
@@ -208,13 +208,13 @@ impl WasmDecoder {
         match serde_wasm_bindgen::to_value(&message) {
             Ok(js_message) => {
                 if let Err(e) = self.worker.post_message(&js_message) {
-                    log::error!("Error posting flush message to worker: {:?}", e);
+                    log::error!("Error posting flush message to worker: {e:?}");
                 } else {
                     log::debug!("Sent flush message to worker");
                 }
             }
             Err(e) => {
-                log::error!("Error serializing flush message: {:?}", e);
+                log::error!("Error serializing flush message: {e:?}");
             }
         }
     }
@@ -225,13 +225,13 @@ impl WasmDecoder {
         match serde_wasm_bindgen::to_value(&message) {
             Ok(js_message) => {
                 if let Err(e) = self.worker.post_message(&js_message) {
-                    log::error!("Error posting reset message to worker: {:?}", e);
+                    log::error!("Error posting reset message to worker: {e:?}");
                 } else {
                     log::debug!("Sent reset message to worker");
                 }
             }
             Err(e) => {
-                log::error!("Error serializing reset message: {:?}", e);
+                log::error!("Error serializing reset message: {e:?}");
             }
         }
     }

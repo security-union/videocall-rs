@@ -103,7 +103,7 @@ impl Handler<ClientMessage> for ChatServer {
         } = msg;
         trace!("got message in server room {} session {}", room, session);
         let nc = self.nats_connection.clone();
-        let subject = format!("room.{}.{}", room, session);
+        let subject = format!("room.{room}.{session}");
         let subject = subject.replace(' ', "_");
         let b = bytes::Bytes::from(msg.data.to_vec());
         let fut = async move {
@@ -130,7 +130,7 @@ impl Handler<JoinRoom> for ChatServer {
         let session_recipient = match self.sessions.get(&session) {
             Some(recipient) => recipient.clone(),
             None => {
-                let err = format!("session {} is not connected", session);
+                let err = format!("session {session} is not connected");
                 error!("{}", err);
                 return MessageResult(Err(err));
             }
@@ -175,13 +175,13 @@ impl Handler<JoinRoom> for ChatServer {
 
 fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {
     (
-        format!("room.{}.*", room).replace(' ', "_"),
-        format!("{}-{}", session, room).replace(' ', "_"),
+        format!("room.{room}.*").replace(' ', "_"),
+        format!("{session}-{room}").replace(' ', "_"),
     )
 }
 
 fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {
-    let err = format!("error subscribing to subject {}: {}", subject, e);
+    let err = format!("error subscribing to subject {subject}: {e}");
     error!("{}", err);
     err
 }
@@ -192,11 +192,7 @@ fn handle_msg(
     session: SessionId,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
-        if msg.subject
-            == format!("room.{}.{}", room, session)
-                .replace(' ', "_")
-                .into()
-        {
+        if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
             return Ok(());
         }
 

@@ -85,7 +85,7 @@ pub fn home() -> Html {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        format!("{:x}", millis)
+        format!("{millis:x}")
     }
 
     let create_meeting = {

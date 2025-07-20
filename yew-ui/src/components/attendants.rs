@@ -222,8 +222,8 @@ impl AttendantsComponent {
         media_device_access.on_denied = {
             let link = ctx.link().clone();
             Callback::from(move |e| {
-                let complete_error = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({:?})", e);
-                error!("{}", complete_error);
+                let complete_error = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({e:?})");
+                error!("{complete_error}");
                 link.send_message(WsAction::MediaPermissionsError(complete_error.to_string()))
             })
         };
@@ -294,7 +294,7 @@ impl AttendantsComponent {
             if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
                 audio.set_volume(0.4); // Set moderate volume
                 if let Err(e) = audio.play() {
-                    log::warn!("Failed to play notification sound: {:?}", e);
+                    log::warn!("Failed to play notification sound: {e:?}");
                 }
             } else {
                 log::warn!("Failed to create audio element for notification sound");
@@ -381,10 +381,8 @@ impl Component for AttendantsComponent {
                             serde_json::to_string(&serializable_evt).unwrap_or_default(),
                         ));
                     } else {
-                        log::debug!(
-                            "AttendantsComponent: Received event for unknown subsystem: {}",
-                            evt.subsystem
-                        );
+                        let subsystem = evt.subsystem;
+                        log::debug!("AttendantsComponent: Received event for unknown subsystem: {subsystem}");
                     }
                 }
                 log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
@@ -400,7 +398,7 @@ impl Component for AttendantsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        debug!("AttendantsComponent update: {:?}", msg);
+        debug!("AttendantsComponent update: {msg:?}");
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
@@ -418,11 +416,11 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => true,
                 WsAction::Log(msg) => {
-                    warn!("{}", msg);
+                    warn!("{msg}");
                     false
                 }
                 WsAction::Lost(reason) => {
-                    warn!("Lost with reason {:?}", reason);
+                    warn!("Lost with reason {reason:?}");
                     ctx.link().send_message(WsAction::Connect);
                     true
                 }

@@ -879,15 +879,8 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
                 stats.push(stat);
             }
             Err(e) => {
-                log::warn!(
-                    "[parse_neteq_stats_history] Failed to parse line {}: {}",
-                    i,
-                    e
-                );
-                log::debug!(
-                    "[parse_neteq_stats_history] Failed line content: '{}'",
-                    trimmed
-                );
+                log::warn!("[parse_neteq_stats_history] Failed to parse line {i}: {e}");
+                log::debug!("[parse_neteq_stats_history] Failed line content: '{trimmed}'");
             }
         }
     }

@@ -1,7 +1,7 @@
 +++
-title = "Error Handling is Critical: How Delta's Lying Machines Taught Me Everything Wrong About UX"
+title = "I Lost $665 at the Airport in 20 Minutes: The Reason Is Embarrassingly Stupid"
 date = 2025-07-20
-description = "A Delta airport payment disaster reveals why honest error messages and proper UX design aren't just nice-to-have features—they're the difference between functional software and digital chaos. Learn from Three Mile Island's design failures."
+description = "A staff engineer's airport nightmare that cost $665 in 20 minutes. The reason will make you question everything you thought you knew about software reliability—and why the same mistake nearly caused a nuclear disaster."
 authors = ["Dario Lencina Talarico"]
 slug = "error-handling-critical-delta-ux-disaster"
 tags = ["error-handling", "ux-design", "software-engineering", "user-experience", "payment-systems", "three-mile-island", "system-design", "frontend-development"]
@@ -10,13 +10,13 @@ keywords = ["error handling", "error messages", "UX design", "user experience", 
 
 # Social media meta tags
 [extra]
-og_title = "Error Handling is Critical: How Delta's Lying Machines Taught Me Everything Wrong About UX"
-og_description = "A hilarious yet instructive tale of how Delta's payment system charged me 19 times while lying about it—and what software engineers can learn from Three Mile Island about honest error messages."
+og_title = "I Lost $665 at the Airport in 20 Minutes: The Reason Is Embarrassingly Stupid"
+og_description = "A staff engineer's airport nightmare that cost $665 in 20 minutes. The reason will make you question everything you thought you knew about software reliability."
 og_image = "/images/deltafail.jpg"
 og_type = "article"
 twitter_card = "summary_large_image"
-twitter_title = "Error Handling is Critical: Delta's UX Disaster Story"
-twitter_description = "How I accidentally paid $200 for one checked bag because Delta's machines lie about their status—and what Three Mile Island teaches us about honest error messages."
+twitter_title = "I Lost $665 at the Airport in 20 Minutes: The Reason Is Embarrassingly Stupid"
+twitter_description = "Staff engineer's airport disaster cost $665 in 20 minutes. The reason will shock you—and it's the same mistake that nearly caused a nuclear meltdown."
 twitter_image = "/images/deltafail.jpg"
 reading_time = "8"
 
@@ -25,7 +25,7 @@ tags = ["error-handling", "ux-design", "software-engineering", "user-experience"
 authors = ["Dario Lencina Talarico"]
 +++
 
-# Error Handling is Critical: How Delta's Lying Machines Taught Me Everything Wrong About UX
+# I Lost $665 at the Airport in 20 Minutes: The Reason Is Embarrassingly Stupid
 
 *Or: How I Accidentally Funded Delta's Quarterly Earnings While My Mother-in-Law Almost Missed Her Flight*
 
@@ -87,7 +87,7 @@ Someone, somewhere, made the decision that when a payment processes successfully
 
 So I find a Delta attendant to help sort this out. Big mistake. She immediately gets defensive, like I'm personally attacking her for the machine's inability to tell the truth. 
 
-But then I show her my Delta Reserve card (mistake #2), and suddenly she's not focused on my $200 problem anymore. Instead, she's explaining to me—while my mother-in-law is standing there with a ticking clock to her gate—that Delta employees don't get SkyClub access with Reserve cards.
+But then I show her my Delta Reserve card (mistake #2), and suddenly she's not focused on my $665 problem anymore. Instead, she's explaining to me—while my mother-in-law is standing there with a ticking clock to her gate—that Delta employees don't get SkyClub access with Reserve cards.
 
 Lady, I don't care about your employee benefits right now. I care about the fact that your machine just committed credit card fraud 19 times while lying about it.
 
@@ -164,7 +164,7 @@ But the lesson here isn't about airline incompetence (though there's plenty of t
 
 Your error messages matter. Your system state matters. The truth matters.
 
-And if you ever find yourself writing code that lies to users about what's happening, just remember: somewhere out there, there's a guy who paid $200 for a checked bag because your error message told him to keep trying.
+And if you ever find yourself writing code that lies to users about what's happening, just remember: somewhere out there, there's a guy who paid $665 for a checked bag because your error message told him to keep trying.
 
 Don't be that engineer. Be better than Delta.
 

@@ -512,11 +512,7 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     let x = margin_left + (i as f64 / (data_len - 1).max(1) as f64 * plot_width);
                     let y = margin_top + plot_height
                         - ((stats.calls_per_sec as f64).max(0.0) / max_calls * plot_height);
-                    if y.is_finite() {
-                        format!("{x:.1},{y:.1}")
-                    } else {
-                        format!("{x:.1},{y:.1}")
-                    }
+                    format!("{x:.1},{y:.1}")
                 })
                 .collect::<Vec<_>>()
                 .join(" ");

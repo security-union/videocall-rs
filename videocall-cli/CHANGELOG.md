@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.19](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.18...videocall-cli-v1.0.19) - 2025-07-20
+
+### Other
+
+- Add High availability ([#325](https://github.com/security-union/videocall-rs/pull/325))
+
 ## [1.0.18](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.17...videocall-cli-v1.0.18) - 2025-07-11
 
 ### Other

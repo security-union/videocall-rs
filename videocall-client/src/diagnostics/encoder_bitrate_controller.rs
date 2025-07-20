@@ -388,12 +388,7 @@ impl EncoderBitrateController {
         let final_bitrate = if !(min_bitrate..=max_bitrate).contains(&corrected_bitrate)
             || corrected_bitrate.is_nan()
         {
-            log::warn!(
-                "Bitrate out of bounds or NaN: {:.0} kbps (min: {:.0} kbps, max: {:.0} kbps)",
-                corrected_bitrate,
-                min_bitrate,
-                max_bitrate
-            );
+            log::warn!("Bitrate out of bounds or NaN: {corrected_bitrate:.0} kbps (min: {min_bitrate:.0} kbps, max: {max_bitrate:.0} kbps)");
             // Use a safe default value instead
             f64::max(min_bitrate, f64::min(base_bitrate, max_bitrate))
         } else {

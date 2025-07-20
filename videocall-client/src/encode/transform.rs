@@ -50,7 +50,7 @@ pub fn transform_video_chunk(
     // Only copy if there's actual data
     if byte_length > 0 {
         if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(&mut buffer[..byte_length])) {
-            log::error!("Error copying video chunk: {:?}", e);
+            log::error!("Error copying video chunk: {e:?}");
             return PacketWrapper::default();
         }
     }
@@ -98,7 +98,7 @@ pub fn transform_screen_chunk(
     // Only copy if there's actual data
     if byte_length > 0 {
         if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(&mut buffer[..byte_length])) {
-            log::error!("Error copying screen chunk: {:?}", e);
+            log::error!("Error copying screen chunk: {e:?}");
             return PacketWrapper::default();
         }
     }
@@ -146,7 +146,7 @@ pub fn transform_audio_chunk(
     // Only copy if there's actual data
     if byte_length > 0 {
         if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(&mut buffer[..byte_length])) {
-            log::error!("Error copying audio chunk: {:?}", e);
+            log::error!("Error copying audio chunk: {e:?}");
             return PacketWrapper::default();
         }
     }

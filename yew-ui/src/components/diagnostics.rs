@@ -16,8 +16,10 @@
  * conditions.
  */
 
-use crate::components::neteq_chart::{
-    AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
+use crate::components::{
+    neteq_chart::{
+        AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
+    },
 };
 use std::collections::HashMap;
 use yew::prelude::*;
@@ -63,7 +65,7 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            log::debug!("[parse_neteq_stats_history] Skipping empty line {}", i);
+            log::debug!("[parse_neteq_stats_history] Skipping empty line {i}");
             continue;
         }
 
@@ -73,15 +75,8 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
                 stats.push(stat);
             }
             Err(e) => {
-                log::warn!(
-                    "[parse_neteq_stats_history] Failed to parse line {}: {}",
-                    i,
-                    e
-                );
-                log::debug!(
-                    "[parse_neteq_stats_history] Failed line content: '{}'",
-                    trimmed
-                );
+                log::warn!("[parse_neteq_stats_history] Failed to parse line {i}: {e}");
+                log::debug!("[parse_neteq_stats_history] Failed line content: '{trimmed}'");
             }
         }
     }
@@ -96,10 +91,7 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
                 stats.push(stat);
             }
             Err(e) => {
-                log::warn!(
-                    "[parse_neteq_stats_history] Failed to parse as single JSON: {}",
-                    e
-                );
+                log::warn!("[parse_neteq_stats_history] Failed to parse as single JSON: {e}");
             }
         }
     }
@@ -186,7 +178,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     html! {
         <div id="diagnostics-sidebar" class={if props.is_open {"visible"} else {""}}>
             <div class="sidebar-header">
-                <h2>{"NetEq Performance Dashboard"}</h2>
+                <h2>{"Call Diagnostics"}</h2>
                 <button class="close-button" onclick={close_handler}>{"×"}</button>
             </div>
             <div class="sidebar-content">

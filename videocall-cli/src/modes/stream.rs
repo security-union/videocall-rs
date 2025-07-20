@@ -48,8 +48,7 @@ pub async fn stream(opt: Stream) {
     let valid_framerates = [10u32, 15u32, 30u32, 60u32];
     if !valid_framerates.contains(&framerate) {
         panic!(
-            "invalid framerate: {}, we currently support only {:?}",
-            framerate, valid_framerates
+            "invalid framerate: {framerate}, we currently support only {valid_framerates:?}",
         );
     }
     let user_id = opt.user_id.clone();

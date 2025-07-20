@@ -246,10 +246,7 @@ impl VideoCallClient {
                         match inner.try_borrow_mut() {
                             Ok(mut inner) => inner.on_inbound_media(packet),
                             Err(_) => {
-                                error!(
-                                    "Unable to borrow inner -- dropping receive packet {:?}",
-                                    packet
-                                );
+                                error!("Unable to borrow inner -- dropping send packet {packet:?}");
                             }
                         }
                     }
@@ -335,7 +332,7 @@ impl VideoCallClient {
         match self.inner.try_borrow() {
             Ok(inner) => inner.send_packet(media),
             Err(_) => {
-                error!("Unable to borrow inner -- dropping send packet {:?}", media)
+                error!("Unable to borrow inner -- dropping send packet {media:?}")
             }
         }
     }
@@ -529,11 +526,11 @@ impl Inner {
                                     self.options.enable_e2ee,
                                 ),
                             ) {
-                                error!("Failed to set peer aes: {}", e);
+                                error!("Failed to set peer aes: {e}");
                             }
                         }
                         Err(e) => {
-                            error!("Failed to parse aes packet: {}", e);
+                            error!("Failed to parse aes packet: {e}");
                         }
                     }
                 }
@@ -563,14 +560,14 @@ impl Inner {
                         });
                     }
                     Err(e) => {
-                        error!("Failed to send AES_KEY to peer: {}", e);
+                        error!("Failed to send AES_KEY to peer: {e}");
                     }
                 }
             }
             Ok(PacketType::MEDIA) => {
                 let email = response.email.clone();
                 if let Err(e) = self.peer_decode_manager.decode(response) {
-                    error!("error decoding packet: {}", e);
+                    error!("error decoding packet: {e}");
                     self.peer_decode_manager.delete_peer(&email);
                 }
             }
@@ -581,7 +578,7 @@ impl Inner {
                 // Parse and handle the diagnostics packet
                 if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
                 {
-                    debug!("Received diagnostics packet: {:?}", diagnostics_packet);
+                    debug!("Received diagnostics packet: {diagnostics_packet:?}");
                     if let Some(sender_diagnostics) = &self.sender_diagnostics {
                         sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);
                     }
@@ -590,11 +587,11 @@ impl Inner {
                 }
             }
             Err(e) => {
-                error!("Failed to parse diagnostics packet: {}", e);
+                error!("Failed to parse diagnostics packet: {e}");
             }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {
-            debug!("added peer {}", peer_userid);
+            debug!("added peer {peer_userid}");
             self.send_public_key();
             self.options.on_peer_added.emit(peer_userid);
         }
@@ -615,7 +612,7 @@ impl Inner {
                 };
                 match packet.write_to_bytes() {
                     Ok(data) => {
-                        debug!(">> {} sending public key", userid);
+                        debug!(">> {userid} sending public key");
                         self.send_packet(PacketWrapper {
                             packet_type: PacketType::RSA_PUB_KEY.into(),
                             email: userid,
@@ -624,12 +621,12 @@ impl Inner {
                         });
                     }
                     Err(e) => {
-                        error!("Failed to serialize rsa packet: {}", e);
+                        error!("Failed to serialize rsa packet: {e}");
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to export rsa public key to der: {}", e);
+                error!("Failed to export rsa public key to der: {e}");
             }
         }
     }

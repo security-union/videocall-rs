@@ -101,15 +101,15 @@ impl Handler<ClientMessage> for ChatServer {
             msg,
             user: _,
         } = msg;
-        trace!("got message in server room {} session {}", room, session);
+        trace!("got message in server room {room} session {session}");
         let nc = self.nats_connection.clone();
-        let subject = format!("room.{}.{}", room, session);
+        let subject = format!("room.{room}.{session}");
         let subject = subject.replace(' ', "_");
         let b = bytes::Bytes::from(msg.data.to_vec());
         let fut = async move {
             match nc.publish(subject.clone(), b).await {
-                Ok(_) => trace!("published message to {}", subject),
-                Err(e) => error!("error publishing message to {}: {}", subject, e),
+                Ok(_) => trace!("published message to {subject}"),
+                Err(e) => error!("error publishing message to {subject}: {e}"),
             }
         };
         let fut = actix::fut::wrap_future::<_, Self>(fut);
@@ -130,8 +130,8 @@ impl Handler<JoinRoom> for ChatServer {
         let session_recipient = match self.sessions.get(&session) {
             Some(recipient) => recipient.clone(),
             None => {
-                let err = format!("session {} is not connected", session);
-                error!("{}", err);
+                let err = format!("session {session} is not connected");
+                error!("{err}");
                 return MessageResult(Err(err));
             }
         };
@@ -145,10 +145,9 @@ impl Handler<JoinRoom> for ChatServer {
                 .map_err(|e| handle_subscription_error(e, &subject))
             {
                 Ok(mut sub) => {
-                    debug!("Subscribed to subject {} with queue {}", subject, queue);
+                    debug!("Subscribed to subject {subject} with queue {queue}");
                     info!(
-                        "someone connected to room {} with session {}",
-                        room,
+                        "someone connected to room {room} with session {}",
                         session_2.trim(),
                     );
                     while let Some(msg) = sub.next().await {
@@ -175,14 +174,14 @@ impl Handler<JoinRoom> for ChatServer {
 
 fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {
     (
-        format!("room.{}.*", room).replace(' ', "_"),
-        format!("{}-{}", session, room).replace(' ', "_"),
+        format!("room.{room}.*").replace(' ', "_"),
+        format!("{session}-{room}").replace(' ', "_"),
     )
 }
 
 fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {
-    let err = format!("error subscribing to subject {}: {}", subject, e);
-    error!("{}", err);
+    let err = format!("error subscribing to subject {subject}: {e}");
+    error!("{err}");
     err
 }
 
@@ -193,7 +192,7 @@ fn handle_msg(
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
         if msg.subject
-            == format!("room.{}.{}", room, session)
+            == format!("room.{room}.{session}")
                 .replace(' ', "_")
                 .into()
         {

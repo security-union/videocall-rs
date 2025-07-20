@@ -29,10 +29,7 @@ pub fn configure_audio_context(
     audio_stream_generator: &MediaStreamTrackGenerator,
     sink_id: Option<String>,
 ) -> anyhow::Result<AudioContext> {
-    info!(
-        "Configuring audio context with sample rate: {}",
-        AUDIO_SAMPLE_RATE
-    );
+    info!("Configuring audio context with sample rate: {AUDIO_SAMPLE_RATE} Hz");
 
     let js_tracks = Array::new();
     js_tracks.push(audio_stream_generator);
@@ -53,10 +50,10 @@ pub fn configure_audio_context(
             wasm_bindgen_futures::spawn_local(async move {
                 match JsFuture::from(audio_context_clone.set_sink_id_with_str(&device_id)).await {
                     Ok(_) => {
-                        info!("Successfully set audio output device to: {}", device_id);
+                        info!("Successfully set audio output device to: {device_id}");
                     }
                     Err(e) => {
-                        warn!("Failed to set audio output device: {:?}", e);
+                        warn!("Failed to set audio output device: {e:?}");
                     }
                 }
             });
@@ -71,7 +68,7 @@ pub fn configure_audio_context(
         .map_err(|e| anyhow::anyhow!("Failed to create gain node: {:?}", e))?;
     gain_node.gain().set_value(1.0);
     gain_node.set_channel_count(AUDIO_CHANNELS);
-    info!("Created gain node with {} channels", AUDIO_CHANNELS);
+    info!("Created gain node with {AUDIO_CHANNELS} channels");
 
     // Create media stream source
     let source = audio_context

@@ -91,7 +91,7 @@ impl WebDecoder {
                 // Post the VideoFrame back to the main thread
                 if let Err(e) = global_scope.post_message(&video_frame) {
                     console::error_1(
-                        &format!("[WORKER] Error posting decoded frame: {:?}", e).into(),
+                        &format!("[WORKER] Error posting decoded frame: {e:?}").into(),
                     );
                 }
                 video_frame.close();
@@ -109,11 +109,11 @@ impl WebDecoder {
         );
 
         let decoder =
-            VideoDecoder::new(&init).map_err(|e| format!("Failed to create decoder: {:?}", e))?;
+            VideoDecoder::new(&init).map_err(|e| format!("Failed to create decoder: {e:?}"))?;
         let config = VideoDecoderConfig::new("vp09.00.10.08");
         decoder
             .configure(&config)
-            .map_err(|e| format!("Failed to configure decoder: {:?}", e))?;
+            .map_err(|e| format!("Failed to configure decoder: {e:?}"))?;
 
         on_output.forget();
         on_error.forget();
@@ -135,7 +135,7 @@ impl WebDecoder {
             // `InvalidStateError`; we simply log and continue.
             if let Err(e) = decoder.close() {
                 console::error_1(
-                    &format!("[WORKER] Failed to close decoder cleanly: {:?}", e).into(),
+                    &format!("[WORKER] Failed to close decoder cleanly: {e:?}").into(),
                 );
             } else {
                 console::log_1(&"[WORKER] Video decoder closed".into());
@@ -179,7 +179,7 @@ impl Decodable for WebDecoder {
         // Initialize decoder if needed
         if self.decoder.borrow().is_none() {
             if let Err(e) = self.initialize_decoder() {
-                console::error_1(&format!("[WORKER] Failed to initialize decoder: {:?}", e).into());
+                console::error_1(&format!("[WORKER] Failed to initialize decoder: {e:?}").into());
                 return;
             }
         }
@@ -197,7 +197,7 @@ impl Decodable for WebDecoder {
             match EncodedVideoChunk::new(&init) {
                 Ok(chunk) => {
                     if let Err(e) = decoder.decode(&chunk) {
-                        console::error_1(&format!("[WORKER] Decoder error: {:?}", e).into());
+                        console::error_1(&format!("[WORKER] Decoder error: {e:?}").into());
 
                         // Release the immutable borrow so we can safely mutate within
                         // `reset_pipeline()`.
@@ -208,7 +208,7 @@ impl Decodable for WebDecoder {
                     }
                 }
                 Err(e) => {
-                    console::error_1(&format!("[WORKER] Failed to create chunk: {:?}", e).into());
+                    console::error_1(&format!("[WORKER] Failed to create chunk: {e:?}").into());
                 }
             }
         }
@@ -240,7 +240,7 @@ pub fn main() {
             Ok(message) => handle_worker_message(message),
             Err(e) => {
                 console::error_1(
-                    &format!("[WORKER] Failed to deserialize message: {:?}", e).into(),
+                    &format!("[WORKER] Failed to deserialize message: {e:?}").into(),
                 );
             }
         }
@@ -278,7 +278,7 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
                 Ok(jb) => *jb_opt = Some(jb),
                 Err(e) => {
                     console::error_1(
-                        &format!("[WORKER] Failed to initialize jitter buffer: {:?}", e).into(),
+                        &format!("[WORKER] Failed to initialize jitter buffer: {e:?}").into(),
                     );
                     return;
                 }
@@ -324,10 +324,7 @@ fn start_jitter_buffer_interval() {
     });
 
     console::log_1(
-        &format!(
-            "[WORKER] Started jitter buffer check interval ({}ms)",
-            JITTER_BUFFER_CHECK_INTERVAL_MS
-        )
+        &format!("[WORKER] Started jitter buffer check interval with {JITTER_BUFFER_CHECK_INTERVAL_MS}ms interval")
         .into(),
     );
 }

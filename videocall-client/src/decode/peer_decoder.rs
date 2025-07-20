@@ -131,12 +131,12 @@ impl VideoPeerDecoder {
                     ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
 
                     if let Err(e) = ctx.draw_image_with_video_frame(&video_frame, 0.0, 0.0) {
-                        log::error!("Error drawing video frame: {:?}", e);
+                        log::error!("Error drawing video frame: {e:?}");
                     } else {
-                        log::debug!("Rendered video frame ({}x{})", width, height);
+                        log::debug!("Rendered video frame ({width}x{height})");
                     }
                 } else {
-                    log::error!("Canvas element with id '{}' not found", canvas_id);
+                    log::error!("Canvas element with id '{canvas_id}' not found");
                 }
             }
         }
@@ -207,7 +207,7 @@ pub struct StandardAudioPeerDecoder {
 impl StandardAudioPeerDecoder {
     pub fn new(speaker_device_id: Option<String>) -> Result<Self, JsValue> {
         let error = Closure::wrap(Box::new(move |e: JsValue| {
-            error!("{:?}", e);
+            error!("{e:?}");
         }) as Box<dyn FnMut(JsValue)>);
         let audio_stream_generator =
             MediaStreamTrackGenerator::new(&MediaStreamTrackGeneratorInit::new("audio")).unwrap();
@@ -223,15 +223,15 @@ impl StandardAudioPeerDecoder {
             if let Err(e) = writable.get_writer().map(|writer| {
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Err(e) = JsFuture::from(writer.ready()).await {
-                        error!("write chunk error {:?}", e);
+                        error!("write chunk error {e:?}");
                     }
                     if let Err(e) = JsFuture::from(writer.write_with_chunk(&audio_data)).await {
-                        error!("write chunk error {:?}", e);
+                        error!("write chunk error {e:?}");
                     };
                     writer.release_lock();
                 });
             }) {
-                error!("error {:?}", e);
+                error!("error {e:?}");
             }
         }) as Box<dyn FnMut(AudioData)>);
         let decoder = AudioDecoderWrapper::new(&AudioDecoderInit::new(
@@ -256,7 +256,7 @@ impl StandardAudioPeerDecoder {
 impl Drop for StandardAudioPeerDecoder {
     fn drop(&mut self) {
         if let Err(e) = self._audio_context.close() {
-            log::error!("Error closing audio context: {:?}", e);
+            error!("Error closing audio context: {e:?}");
         }
     }
 }
@@ -265,7 +265,7 @@ impl PeerDecode for StandardAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let first_frame = !self.decoded;
         let current_state = self.decoder.state();
-        log::debug!("Audio decoder state before decode: {:?}", current_state);
+        log::debug!("Audio decoder state before decode: {current_state:?}");
 
         match current_state {
             CodecState::Configured => {
@@ -274,7 +274,7 @@ impl PeerDecode for StandardAudioPeerDecoder {
                     packet.audio_metadata.sequence
                 );
                 if let Err(e) = self.decoder.decode(packet.clone()) {
-                    log::error!("Error decoding audio packet: {:?}", e);
+                    log::error!("Error decoding audio packet: {e:?}");
                     return Err(anyhow::anyhow!("Failed to decode audio packet"));
                 }
                 self.decoded = true;
@@ -294,12 +294,12 @@ impl PeerDecode for StandardAudioPeerDecoder {
                     AUDIO_CHANNELS,
                     AUDIO_SAMPLE_RATE,
                 )) {
-                    log::error!("Failed to reconfigure audio decoder: {:?}", e);
+                    log::error!("Failed to reconfigure audio decoder: {e:?}");
                     return Err(anyhow::anyhow!("Failed to reconfigure audio decoder"));
                 }
             }
             _ => {
-                log::warn!("Unexpected audio decoder state: {:?}", current_state);
+                log::warn!("Unexpected audio decoder state: {current_state:?}");
             }
         }
 

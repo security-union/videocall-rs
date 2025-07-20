@@ -84,7 +84,7 @@ impl<T> JitterBuffer<T> {
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
-        println!("[JITTER_BUFFER] Inserting frame: {}", seq);
+        println!("[JITTER_BUFFER] Inserting frame: {seq}");
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
@@ -97,12 +97,11 @@ impl<T> JitterBuffer<T> {
                     && last_decoded.saturating_sub(seq) > STREAM_RESTART_BACKTRACK_THRESHOLD
                 {
                     println!(
-                        "[JITTER_BUFFER] Detected keyframe with older sequence ({} <= {}). Assuming stream restart – flushing buffer.",
-                        seq, last_decoded
+                        "[JITTER_BUFFER] Detected keyframe with older sequence ({seq} <= {last_decoded}). Assuming stream restart – flushing buffer."
                     );
                     self.flush();
                 } else {
-                    println!("[JITTER_BUFFER] Ignoring old frame: {}", seq);
+                    println!("[JITTER_BUFFER] Ignoring old frame: {seq}");
                     self.num_consecutive_old_frames += 1;
                     if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
                         println!(
@@ -126,12 +125,12 @@ impl<T> JitterBuffer<T> {
                 println!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
                 self.drop_all_frames();
             } else {
-                println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {}", seq);
+                println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
                 return; // Reject the frame.
             }
         }
 
-        println!("[JITTER_BUFFER] Received frame: {}", seq);
+        println!("[JITTER_BUFFER] Received frame: {seq}");
 
         self.jitter_estimator.update_estimate(seq, arrival_time_ms);
         self.update_target_playout_delay();
@@ -177,8 +176,7 @@ impl<T> JitterBuffer<T> {
                     let next_continuous_seq = last_seq + 1;
                     if self.buffered_frames.contains_key(&next_continuous_seq) {
                         println!(
-                            "[JB_POLL] Seeking next continuous frame: {}",
-                            next_continuous_seq
+                            "[JB_POLL] Seeking next continuous frame: {next_continuous_seq}"
                         );
                         Some(next_continuous_seq)
                     } else {
@@ -190,13 +188,11 @@ impl<T> JitterBuffer<T> {
                             .map(|(&s, _)| s);
                         if let Some(k) = keyframe {
                             println!(
-                                "[JB_POLL] Gap after {}. Seeking next keyframe. Found: {}",
-                                last_seq, k
+                                "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
                             );
                         } else {
                             println!(
-                                "[JB_POLL] Gap after {}. No subsequent keyframe found.",
-                                last_seq
+                                "[JB_POLL] Gap after {last_seq}. No subsequent keyframe found."
                             );
                         }
                         keyframe
@@ -209,7 +205,7 @@ impl<T> JitterBuffer<T> {
                         .find(|(_, f)| f.is_keyframe())
                         .map(|(&s, _)| s);
                     if let Some(k) = keyframe {
-                        println!("[JB_POLL] Seeking first keyframe. Found: {}", k);
+                        println!("[JB_POLL] Seeking first keyframe. Found: {k}");
                     } else {
                         println!("[JB_POLL] Seeking first keyframe. None found in buffer.");
                     }
@@ -222,8 +218,8 @@ impl<T> JitterBuffer<T> {
 
                     let is_ready = time_in_buffer_ms >= self.target_playout_delay_ms;
                     println!(
-                        "[JB_POLL] Candidate {}: Time in buffer: {:.2}ms, Target: {:.2}ms -> Ready: {}",
-                        key, time_in_buffer_ms, self.target_playout_delay_ms, is_ready
+                        "[JB_POLL] Candidate {key}: Time in buffer: {time_in_buffer_ms:.2}ms, Target: {:.2}ms -> Ready: {is_ready}",
+                        self.target_playout_delay_ms
                     );
 
                     if is_ready {
@@ -238,8 +234,7 @@ impl<T> JitterBuffer<T> {
 
                             if is_first_frame || is_gap_recovery {
                                 println!(
-                                    "[JITTER_BUFFER] Keyframe {} recovery. Dropping frames before it.",
-                                    key
+                                    "[JITTER_BUFFER] Keyframe {key} recovery. Dropping frames before it."
                                 );
                                 self.drop_frames_before(key);
                             }
@@ -267,9 +262,9 @@ impl<T> JitterBuffer<T> {
 
     /// Pushes a single frame to the shared decodable queue.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
+        let seq = frame.sequence_number();
         println!(
-            "[JITTER_BUFFER] Pushing frame {} to decoder.",
-            frame.sequence_number()
+            "[JITTER_BUFFER] Pushing frame {seq} to decoder."
         );
         self.decoder.decode(frame);
     }
@@ -290,7 +285,7 @@ impl<T> JitterBuffer<T> {
 
         self.dropped_frames_count += keys_to_drop.len() as u64;
         for key in keys_to_drop {
-            println!("[JITTER_BUFFER] Dropping stale frame: {}", key);
+            println!("[JITTER_BUFFER] Dropping stale frame: {key}");
             self.buffered_frames.remove(&key);
         }
     }
@@ -300,7 +295,7 @@ impl<T> JitterBuffer<T> {
         let num_dropped = self.buffered_frames.len() as u64;
         self.buffered_frames.clear();
         self.dropped_frames_count += num_dropped;
-        println!("[JITTER_BUFFER] Dropped all {} frames.", num_dropped);
+        println!("[JITTER_BUFFER] Dropped all {num_dropped} frames.");
     }
 
     /// Flushes the jitter buffer, resetting its state completely.

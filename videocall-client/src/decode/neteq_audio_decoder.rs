@@ -69,7 +69,7 @@ impl NetEqAudioPeerDecoder {
         // Send PCM data to the worklet - it handles all timing internally
         if let Err(e) = pcm_player.port().unwrap().post_message(&message) {
             web_sys::console::warn_1(
-                &format!("Safari: Failed to send PCM to worklet: {:?}", e).into(),
+                &format!("Safari: Failed to send PCM to worklet: {e:?}").into(),
             );
         }
     }
@@ -137,7 +137,7 @@ impl NetEqAudioPeerDecoder {
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Err(e) = JsFuture::from(promise).await {
                         web_sys::console::warn_1(
-                            &format!("Safari: Failed to set audio output device: {:?}", e).into(),
+                            &format!("Safari: Failed to set audio output device: {e:?}").into(),
                         );
                     } else {
                         web_sys::console::log_1(
@@ -160,7 +160,7 @@ impl NetEqAudioPeerDecoder {
         // Ensure AudioContext is running
         if let Err(e) = audio_context.resume() {
             web_sys::console::warn_1(
-                &format!("[neteq-audio-decoder] AudioContext resume error: {:?}", e).into(),
+                &format!("[neteq-audio-decoder] AudioContext resume error: {e:?}").into(),
             );
         }
 
@@ -385,11 +385,7 @@ impl NetEqAudioPeerDecoder {
         send_cb.forget();
 
         web_sys::console::log_1(
-            &format!(
-                "NetEq audio decoder initialized for peer {} (muted: {})",
-                peer_id, initial_muted
-            )
-            .into(),
+            &format!("NetEq audio decoder initialized for peer: {peer_id}, initial_muted: {initial_muted}").into(),
         );
 
         // Create decoder with explicit mute state
@@ -440,7 +436,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                 if let Err(e) =
                     serde_wasm_bindgen::to_value(&insert).map(|msg| self.worker.post_message(&msg))
                 {
-                    log::error!("Failed to dispatch NetEq insert message: {:?}", e);
+                    log::error!("Failed to dispatch NetEq insert message: {e:?}");
                     // Still report success so the caller doesn't reset the whole peer.
                 }
 
@@ -472,7 +468,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
         if let Err(e) =
             serde_wasm_bindgen::to_value(&flush_msg).map(|msg| self.worker.post_message(&msg))
         {
-            log::error!("Failed to dispatch NetEq flush message: {:?}", e);
+            log::error!("Failed to dispatch NetEq flush message: {e:?}");
         } else {
             log::debug!(
                 "Sent flush message to NetEq worker for peer {}",
@@ -498,8 +494,8 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
         if let Err(e) =
             serde_wasm_bindgen::to_value(&mute_msg).map(|msg| self.worker.post_message(&msg))
         {
-            log::error!("Failed to dispatch NetEq mute message: {:?}", e);
-            web_sys::console::error_1(&format!("Failed to send mute message: {:?}", e).into());
+            log::error!("Failed to dispatch NetEq mute message: {e:?}");
+            web_sys::console::error_1(&format!("Failed to send mute message: {e:?}").into());
         } else {
             log::debug!(
                 "Sent mute message to NetEq worker for peer {} (muted: {})",

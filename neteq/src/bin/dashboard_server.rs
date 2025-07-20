@@ -126,10 +126,10 @@ async fn dashboard_handler(
     match fs::read_to_string(&state.dashboard_file).await {
         Ok(content) => Ok(Html(content)),
         Err(e) => {
-            eprintln!("Error reading dashboard file: {}", e);
+            eprintln!("Error reading dashboard file: {e}");
             Err((
                 StatusCode::NOT_FOUND,
-                format!("Dashboard file not found: {}", e),
+                format!("Dashboard file not found: {e}"),
             ))
         }
     }
@@ -148,10 +148,10 @@ async fn stats_handler(
             Ok(response)
         }
         Err(e) => {
-            eprintln!("Error reading stats file: {}", e);
+            eprintln!("Error reading stats file: {e}");
             Err((
                 StatusCode::NOT_FOUND,
-                format!("Stats file not found: {}", e),
+                format!("Stats file not found: {e}"),
             ))
         }
     }
@@ -187,7 +187,7 @@ async fn static_file_handler(
             Ok(response)
         }
         Err(e) => {
-            eprintln!("Error reading static file {}: {}", file_path, e);
+            eprintln!("Error reading static file {file_path}: {e}");
             Err((StatusCode::NOT_FOUND, "File not found".to_string()))
         }
     }

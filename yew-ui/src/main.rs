@@ -22,14 +22,8 @@ mod constants;
 mod context;
 mod pages;
 
-use constants::{E2EE_ENABLED, LOGIN_URL, WEBTRANSPORT_ENABLED};
-use videocall_types::truthy;
-
 use yew::prelude::*;
-
-#[macro_use]
-extern crate lazy_static;
-use components::{attendants::AttendantsComponent, matomo::MatomoTracker, top_bar::TopBar};
+use components::matomo::MatomoTracker;
 use enum_display::EnumDisplay;
 use gloo_utils::window;
 use pages::home::Home;
@@ -81,7 +75,7 @@ fn switch(routes: Route) -> Html {
 #[function_component(Login)]
 fn login() -> Html {
     let login = Callback::from(|_: MouseEvent| {
-        window().location().set_href(&*crate::constants::LOGIN_URL).ok();
+        window().location().set_href(&crate::constants::LOGIN_URL).ok();
     });
     html! {<>
         <input type="image" onclick={login.clone()} src="/assets/btn_google.png" />

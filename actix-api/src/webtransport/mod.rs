@@ -227,8 +227,8 @@ async fn handle_session(
     let session = Arc::new(RwLock::new(session));
     let should_run = Arc::new(AtomicBool::new(true));
 
-    let subject = format!("room.{}.*", lobby_id).replace(' ', "_");
-    let specific_subject: Subject = format!("room.{}.{}", lobby_id, username)
+    let subject = format!("room.{lobby_id}.*").replace(' ', "_");
+    let specific_subject: Subject = format!("room.{lobby_id}.{username}")
         .replace(' ', "_")
         .into();
     let mut sub = match nc
@@ -236,12 +236,12 @@ async fn handle_session(
         .await
     {
         Ok(sub) => {
-            info!("Subscribed to subject {}", subject);
+            info!("Subscribed to subject {subject}");
             sub
         }
         Err(e) => {
-            let err = format!("error subscribing to subject {}: {}", subject, e);
-            error!("{}", err);
+            let err = format!("error subscribing to subject {subject}: {e}");
+            error!("{err}");
             return Err(anyhow!(err));
         }
     };
@@ -353,12 +353,12 @@ async fn handle_quic_connection(
                 .await
             {
                 Ok(sub) => {
-                    info!("Subscribed to subject {}", subject);
+                    info!("Subscribed to subject {subject}");
                     sub
                 }
                 Err(e) => {
-                    let err = format!("error subscribing to subject {}: {}", subject, e);
-                    error!("{}", err);
+                    let err = format!("error subscribing to subject {subject}: {e}");
+                    error!("{err}");
                     return;
                 }
             };

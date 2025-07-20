@@ -20,9 +20,9 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     host::Host, peer_list::PeerList,
 };
-use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST, ACTIX_WEBSOCKET};
+use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM};
 use gloo_utils::window;
-use log::{debug, error, warn};
+use log::{error, warn};
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
@@ -203,8 +203,8 @@ impl AttendantsComponent {
         media_device_access.on_denied = {
             let link = ctx.link().clone();
             Callback::from(move |e| {
-                let complete_error = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({:?})", e);
-                error!("{}", complete_error);
+                let complete_error = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({e:?})");
+                error!("{complete_error}");
                 link.send_message(WsAction::MediaPermissionsError(complete_error.to_string()))
             })
         };
@@ -275,7 +275,7 @@ impl AttendantsComponent {
             if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
                 audio.set_volume(0.4); // Set moderate volume
                 if let Err(e) = audio.play() {
-                    log::warn!("Failed to play notification sound: {:?}", e);
+                    log::warn!("Failed to play notification sound: {e:?}");
                 }
             } else {
                 log::warn!("Failed to create audio element for notification sound");
@@ -369,7 +369,7 @@ impl Component for AttendantsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        debug!("AttendantsComponent update: {:?}", msg);
+        log::debug!("AttendantsComponent update: {msg:?}");
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
@@ -379,7 +379,7 @@ impl Component for AttendantsComponent {
 
                     if let Err(e) = self.client.connect() {
                         ctx.link()
-                            .send_message(WsAction::Log(format!("Connection failed: {e}")));
+                            .send_message(WsAction::Log(format!("Connection failed: {e:?}")));
                     }
                     log::info!("Connected in attendants");
                     self.meeting_joined = true;
@@ -387,11 +387,11 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => true,
                 WsAction::Log(msg) => {
-                    warn!("{}", msg);
+                    warn!("{msg}");
                     false
                 }
                 WsAction::Lost(reason) => {
-                    warn!("Lost with reason {:?}", reason);
+                    warn!("Lost with reason {reason:?}");
                     ctx.link().send_message(WsAction::Connect);
                     true
                 }
@@ -439,7 +439,7 @@ impl Component for AttendantsComponent {
                 }
             },
             Msg::OnPeerAdded(email) => {
-                log::info!("New user joined: {}", email);
+                log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
                 true

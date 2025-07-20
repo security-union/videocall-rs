@@ -9,16 +9,28 @@ rustlemania-ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: add-safari-to-neteq-638ec04b # Using latest since staging tag doesn't exist yet
+    tag: high-availability-6744e3ac # Using latest since staging tag doesn't exist yet
   
   resources:
     limits:
-      cpu: "50m" # 50% of a single CPU
-      memory: "10Mi" # 512 MiB of memory
+      cpu: "400m" # 50% of a single CPU
+      memory: "400Mi" # 512 MiB of memory
     requests:
-      cpu: "20m" # 25% of a single CPU
-      memory: "10Mi" # 256 MiB of memory
-  
+      cpu: "200m" # 25% of a single CPU
+      memory: "200Mi" # 256 MiB of memory
+  env:
+    - name: RUST_LOG
+      value: info
+    - name: ACTIX_UI_BACKEND_URL
+      value: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
+    - name: WEBTRANSPORT_HOST
+      value: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
+    - name: WEBTRANSPORT_ENABLED
+      value: "true"
+    - name: E2EE_ENABLED
+      value: "false"
+    - name: USERS_ALLOWED_TO_STREAM
+      value: ""
   service:
     type: ClusterIP
     port: 80

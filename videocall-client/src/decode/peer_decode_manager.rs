@@ -44,6 +44,7 @@ pub enum PeerDecodeError {
     NoMediaType,
     NoPacketType,
     PacketParseError,
+    SameUserPacket(String),
 }
 
 #[derive(Debug)]
@@ -66,6 +67,7 @@ impl Display for PeerDecodeError {
             PeerDecodeError::PacketParseError => {
                 write!(f, "Failed to parse to protobuf MediaPacket")
             }
+            PeerDecodeError::SameUserPacket(s) => write!(f, "SameUserPacket: {s}"),
         }
     }
 }
@@ -294,6 +296,20 @@ impl Peer {
                     },
                 ))
             }
+            MediaType::RTT => {
+                // RTT packets are handled by ConnectionManager, not by peer decoders
+                debug!(
+                    "Received RTT packet for peer {} - ignoring in peer decoder",
+                    self.email
+                );
+                Ok((
+                    media_type,
+                    DecodeStatus {
+                        rendered: false,
+                        first_frame: false,
+                    },
+                ))
+            }
         }
     }
 
@@ -369,7 +385,7 @@ impl PeerDecodeManager {
         self.connected_peers.remove_if(pred);
     }
 
-    pub fn decode(&mut self, response: PacketWrapper) -> Result<(), PeerDecodeError> {
+    pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if let Some(peer) = self.connected_peers.get_mut(&email) {
@@ -379,6 +395,9 @@ impl PeerDecodeManager {
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {
+                    if media_type != MediaType::RTT && packet.email == userid {
+                        return Err(PeerDecodeError::SameUserPacket(email.clone()));
+                    }
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_frame(&email, media_type, packet.data.len() as u64);
                     }

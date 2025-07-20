@@ -16,13 +16,18 @@
  * conditions.
  */
 
+use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     host::Host, peer_list::PeerList,
 };
-use crate::constants::{CANVAS_LIMIT, USERS_ALLOWED_TO_STREAM};
+use crate::constants::{
+    CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
+};
+use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
 use gloo_utils::window;
-use log::{error, warn};
+use log::{debug, error, warn};
+use serde_json;
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
@@ -78,6 +83,7 @@ pub enum Msg {
     NetEqStatsUpdated(String, String), // (peer_id, stats_json)
     NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
     NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
+    ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
     HangUp,
 }
 
@@ -129,6 +135,8 @@ pub struct AttendantsComponent {
     pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
     pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
     pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
+    pub connection_manager_state: Option<String>, // connection manager diagnostics (serialized)
+    pub connection_manager_events: Vec<SerializableDiagEvent>, // accumulate individual events
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -144,10 +152,19 @@ impl AttendantsComponent {
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
+        let websocket_urls = ACTIX_WEBSOCKET
+            .split(',')
+            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .collect::<Vec<String>>();
+        let webtransport_urls = WEBTRANSPORT_HOST
+            .split(',')
+            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .collect::<Vec<String>>();
+
         let opts = VideoCallClientOptions {
             userid: email.clone(),
-            websocket_url: format!("{}/{}/{}", *crate::constants::ACTIX_WEBSOCKET, email, id),
-            webtransport_url: format!("{}/{}/{}", *crate::constants::WEBTRANSPORT_HOST, email, id),
+            websocket_urls,
+            webtransport_urls,
             enable_e2ee: ctx.props().e2ee_enabled,
             enable_webtransport: ctx.props().webtransport_enabled,
             on_connected: {
@@ -190,6 +207,8 @@ impl AttendantsComponent {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
+            rtt_testing_period_ms: *SERVER_ELECTION_PERIOD_MS,
+            rtt_probe_interval_ms: Some(200),
         };
         VideoCallClient::new(opts)
     }
@@ -289,7 +308,6 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        log::info!("AttendantsComponent::create called");
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
         let self_ = Self {
@@ -309,6 +327,8 @@ impl Component for AttendantsComponent {
             neteq_stats_per_peer: HashMap::new(),
             neteq_buffer_per_peer: HashMap::new(),
             neteq_jitter_per_peer: HashMap::new(),
+            connection_manager_state: None,
+            connection_manager_events: Vec::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -355,8 +375,17 @@ impl Component for AttendantsComponent {
                                 }
                             }
                         }
+                    } else if evt.subsystem == "connection_manager" {
+                        let serializable_evt = SerializableDiagEvent::from(evt);
+                        link.send_message(Msg::ConnectionManagerUpdate(
+                            serde_json::to_string(&serializable_evt).unwrap_or_default(),
+                        ));
+                    } else {
+                        let subsystem = evt.subsystem;
+                        log::debug!("AttendantsComponent: Received event for unknown subsystem: {subsystem}");
                     }
                 }
+                log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
             });
         }
         self_
@@ -369,7 +398,7 @@ impl Component for AttendantsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        log::debug!("AttendantsComponent update: {msg:?}");
+        debug!("AttendantsComponent update: {msg:?}");
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
@@ -573,6 +602,26 @@ impl Component for AttendantsComponent {
                 }
                 false
             }
+            Msg::ConnectionManagerUpdate(event_json) => {
+                // Parse the SerializableDiagEvent from JSON
+                if let Ok(event) = serde_json::from_str::<SerializableDiagEvent>(&event_json) {
+                    // Accumulate connection manager events
+                    self.connection_manager_events.push(event);
+
+                    // Keep only the last 20 events to avoid memory bloat
+                    if self.connection_manager_events.len() > 20 {
+                        self.connection_manager_events.remove(0);
+                    }
+
+                    // Serialize the accumulated events for the diagnostics component
+                    if let Ok(serialized) = serde_json::to_string(&self.connection_manager_events) {
+                        self.connection_manager_state = Some(serialized);
+                    }
+                } else {
+                    log::error!("AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {event_json}");
+                }
+                true
+            }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
                 let _ = window().location().reload(); // Refresh page for clean state
@@ -693,7 +742,7 @@ impl Component for AttendantsComponent {
                     { // Invitation overlay when there are no connected peers
                         if num_display_peers == 0 {
                             html! {
-                                <div id="invite-overlay" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.9); padding: 1.5rem 2rem; border-radius: 8px; width: 90%; max-width: 420px; z-index: 3000; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3); text-align: center;">
+                                <div id="invite-overlay" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.9); padding: 1.5rem 2rem; border-radius: 8px; width: 90%; max-width: 420px; z-index: 0; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3); text-align: center;">
                                     <h3 style="margin-top:0;">{"Your meeting's ready"}</h3>
                                     <p style="font-size: 0.9rem; opacity: 0.8;">{"Share this meeting link with others you want in the meeting"}</p>
                                     <div style="display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;">
@@ -989,6 +1038,7 @@ impl Component for AttendantsComponent {
                     video_enabled={self.video_enabled}
                     mic_enabled={self.mic_enabled}
                     share_screen={self.share_screen}
+                    connection_manager_state={self.connection_manager_state.clone()}
                 />
             </div>
         }

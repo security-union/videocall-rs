@@ -62,4 +62,8 @@ lazy_static! {
     pub static ref E2EE_ENABLED: bool = truthy(std::option_env!("E2EE_ENABLED"));
     pub static ref USERS_ALLOWED_TO_STREAM: Vec<String> =
         split_users(std::option_env!("USERS_ALLOWED_TO_STREAM"));
+    pub static ref SERVER_ELECTION_PERIOD_MS: u64 = std::option_env!("SERVER_ELECTION_PERIOD_MS")
+        .unwrap_or("2000")
+        .parse()
+        .expect("Failed to parse SERVER_ELECTION_PERIOD_MS");
 }

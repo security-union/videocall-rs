@@ -1,0 +1,9 @@
+apiVersion: v2
+name: webtransport-us-east
+version: 0.1.0
+description: WebTransport server for US East region with LoadBalancer
+
+dependencies:
+  - name: rustlemania-webtransport
+    version: 0.1.0
+    repository: file://../../../rustlemania-webtransport 

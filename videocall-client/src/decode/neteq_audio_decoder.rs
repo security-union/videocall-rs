@@ -385,7 +385,8 @@ impl NetEqAudioPeerDecoder {
         send_cb.forget();
 
         web_sys::console::log_1(
-            &format!("NetEq audio decoder initialized for peer: {peer_id}, initial_muted: {initial_muted}").into(),
+            &format!("NetEq audio decoder initialized for peer {peer_id} (muted: {initial_muted})")
+                .into(),
         );
 
         // Create decoder with explicit mute state

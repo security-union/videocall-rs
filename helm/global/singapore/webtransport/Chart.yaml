@@ -1,0 +1,9 @@
+apiVersion: v2
+name: webtransport-singapore
+version: 0.1.0
+description: WebTransport server for Singapore region with LoadBalancer
+
+dependencies:
+  - name: rustlemania-webtransport
+    version: 0.1.0
+    repository: file://../../../rustlemania-webtransport 

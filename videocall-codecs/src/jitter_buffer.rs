@@ -170,47 +170,44 @@ impl<T> JitterBuffer<T> {
         loop {
             let mut found_frame_to_move = false;
 
-            let next_decodable_key: Option<u64> =
-                if let Some(last_seq) = self.last_decoded_sequence_number {
-                    // CASE 1: We are in a continuous stream. Look for the next frame.
-                    let next_continuous_seq = last_seq + 1;
-                    if self.buffered_frames.contains_key(&next_continuous_seq) {
-                        println!(
-                            "[JB_POLL] Seeking next continuous frame: {next_continuous_seq}"
-                        );
-                        Some(next_continuous_seq)
-                    } else {
-                        // CASE 2: Gap detected. Look for the next keyframe after the gap.
-                        let keyframe = self
-                            .buffered_frames
-                            .iter()
-                            .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
-                            .map(|(&s, _)| s);
-                        if let Some(k) = keyframe {
-                            println!(
-                                "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
-                            );
-                        } else {
-                            println!(
-                                "[JB_POLL] Gap after {last_seq}. No subsequent keyframe found."
-                            );
-                        }
-                        keyframe
-                    }
+            let next_decodable_key: Option<u64> = if let Some(last_seq) =
+                self.last_decoded_sequence_number
+            {
+                // CASE 1: We are in a continuous stream. Look for the next frame.
+                let next_continuous_seq = last_seq + 1;
+                if self.buffered_frames.contains_key(&next_continuous_seq) {
+                    println!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
+                    Some(next_continuous_seq)
                 } else {
-                    // CASE 3: We have never decoded. We MUST start with a keyframe.
+                    // CASE 2: Gap detected. Look for the next keyframe after the gap.
                     let keyframe = self
                         .buffered_frames
                         .iter()
-                        .find(|(_, f)| f.is_keyframe())
+                        .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
                         .map(|(&s, _)| s);
                     if let Some(k) = keyframe {
-                        println!("[JB_POLL] Seeking first keyframe. Found: {k}");
+                        println!(
+                            "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
+                        );
                     } else {
-                        println!("[JB_POLL] Seeking first keyframe. None found in buffer.");
+                        println!("[JB_POLL] Gap after {last_seq}. No subsequent keyframe found.");
                     }
                     keyframe
-                };
+                }
+            } else {
+                // CASE 3: We have never decoded. We MUST start with a keyframe.
+                let keyframe = self
+                    .buffered_frames
+                    .iter()
+                    .find(|(_, f)| f.is_keyframe())
+                    .map(|(&s, _)| s);
+                if let Some(k) = keyframe {
+                    println!("[JB_POLL] Seeking first keyframe. Found: {k}");
+                } else {
+                    println!("[JB_POLL] Seeking first keyframe. None found in buffer.");
+                }
+                keyframe
+            };
 
             if let Some(key) = next_decodable_key {
                 if let Some(frame) = self.buffered_frames.get(&key) {

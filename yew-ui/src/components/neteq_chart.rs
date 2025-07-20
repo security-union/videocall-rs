@@ -266,7 +266,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height) // Default to bottom if invalid
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}") // Default to bottom if invalid
                     }
                 })
                 .collect::<Vec<_>>()
@@ -282,7 +283,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height) // Default to bottom if invalid
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}") // Default to bottom if invalid
                     }
                 })
                 .collect::<Vec<_>>()
@@ -322,7 +324,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -338,7 +341,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -385,7 +389,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -402,7 +407,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -449,7 +455,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -467,7 +474,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -511,11 +519,7 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     let x = margin_left + (i as f64 / (data_len - 1).max(1) as f64 * plot_width);
                     let y = margin_top + plot_height
                         - ((stats.calls_per_sec as f64).max(0.0) / max_calls * plot_height);
-                    if y.is_finite() {
-                        format!("{x:.1},{y:.1}")
-                    } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
-                    }
+                    format!("{x:.1},{y:.1}")
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -527,11 +531,7 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     let x = margin_left + (i as f64 / (data_len - 1).max(1) as f64 * plot_width);
                     let y = margin_top + plot_height
                         - ((stats.avg_frames as f64).max(0.0) / max_frames * plot_height * 0.5);
-                    if y.is_finite() {
-                        format!("{x:.1},{y:.1}")
-                    } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
-                    }
+                    format!("{x:.1},{y:.1}")
                 })
                 .collect::<Vec<_>>()
                 .join(" ");

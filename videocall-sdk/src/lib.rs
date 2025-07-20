@@ -172,15 +172,18 @@ impl WebTransportClient {
                     let count = certs.len();
                     for cert in certs {
                         root_store.add(cert).map_err(|e| {
-                            WebTransportError::CertificateError(format!("Failed to add certificate: {e}"))
+                            WebTransportError::CertificateError(format!(
+                                "Failed to add certificate: {e}"
+                            ))
                         })?;
                     }
                     count
                 }
                 Err(e) => {
                     error!("Failed to load native certificates: {e}");
-                    return Err(WebTransportError::CertificateError(format!("Failed to load native certificates: {e}")));
-
+                    return Err(WebTransportError::CertificateError(format!(
+                        "Failed to load native certificates: {e}"
+                    )));
                 }
             };
             info!("Loaded {cert_count} native certificates");
@@ -297,9 +300,9 @@ impl WebTransportClient {
         });
 
         // Store the listener handle
-        let mut listener_guard = datagram_listener_mutex.lock().map_err(|e| {
-            WebTransportError::RuntimeError(format!("Failed to acquire lock: {e}"))
-        })?;
+        let mut listener_guard = datagram_listener_mutex
+            .lock()
+            .map_err(|e| WebTransportError::RuntimeError(format!("Failed to acquire lock: {e}")))?;
         *listener_guard = Some(handle);
 
         info!("Successfully subscribed to inbound datagrams");
@@ -307,9 +310,10 @@ impl WebTransportClient {
     }
 
     pub fn stop_datagram_listener(&self) -> Result<(), WebTransportError> {
-        let mut listener_guard = self.datagram_listener.lock().map_err(|e| {
-            WebTransportError::RuntimeError(format!("Failed to acquire lock: {e}"))
-        })?;
+        let mut listener_guard = self
+            .datagram_listener
+            .lock()
+            .map_err(|e| WebTransportError::RuntimeError(format!("Failed to acquire lock: {e}")))?;
 
         if let Some(handle) = listener_guard.take() {
             handle.abort();

@@ -6,6 +6,7 @@ message MediaPacket {
     AUDIO = 1;
     SCREEN = 2;
     HEARTBEAT = 3;
+    RTT = 4;  // Client to Server RTT
   }
   MediaType media_type = 1;
   string email = 2;

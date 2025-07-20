@@ -29,7 +29,7 @@ pub fn configure_audio_context(
     audio_stream_generator: &MediaStreamTrackGenerator,
     sink_id: Option<String>,
 ) -> anyhow::Result<AudioContext> {
-    info!("Configuring audio context with sample rate: {AUDIO_SAMPLE_RATE} Hz");
+    info!("Configuring audio context with sample rate: {AUDIO_SAMPLE_RATE}");
 
     let js_tracks = Array::new();
     js_tracks.push(audio_stream_generator);

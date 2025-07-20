@@ -375,7 +375,9 @@ impl CameraEncoder {
                             new_config.set_bitrate(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             if let Err(e) = video_encoder.configure(&new_config) {
-                                error!("Error reconfiguring camera encoder after resolution change: {e:?}");
+                                error!(
+                                    "Error reconfiguring camera encoder with new dimensions: {e:?}"
+                                );
                             }
                         }
 

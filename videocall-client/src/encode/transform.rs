@@ -40,19 +40,8 @@ pub fn transform_video_chunk(
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
-    
-    // Ensure buffer is large enough
-    if buffer.len() < byte_length {
-        log::error!("Buffer too small: needed {} bytes, got {} bytes", byte_length, buffer.len());
-        return PacketWrapper::default();
-    }
-    
-    // Only copy if there's actual data
-    if byte_length > 0 {
-        if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(&mut buffer[..byte_length])) {
-            log::error!("Error copying video chunk: {e:?}");
-            return PacketWrapper::default();
-        }
+    if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
+        log::error!("Error copying video chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
         data: buffer[0..byte_length].to_vec(),
@@ -88,19 +77,8 @@ pub fn transform_screen_chunk(
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
-    
-    // Ensure buffer is large enough
-    if buffer.len() < byte_length {
-        log::error!("Buffer too small for screen chunk: needed {} bytes, got {} bytes", byte_length, buffer.len());
-        return PacketWrapper::default();
-    }
-    
-    // Only copy if there's actual data
-    if byte_length > 0 {
-        if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(&mut buffer[..byte_length])) {
-            log::error!("Error copying screen chunk: {e:?}");
-            return PacketWrapper::default();
-        }
+    if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
+        log::error!("Error copying video chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),
@@ -135,20 +113,8 @@ pub fn transform_audio_chunk(
     sequence: u64,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
-    let byte_length = chunk.byte_length() as usize;
-    
-    // Ensure buffer is large enough
-    if buffer.len() < byte_length {
-        log::error!("Buffer too small for audio chunk: needed {} bytes, got {} bytes", byte_length, buffer.len());
-        return PacketWrapper::default();
-    }
-    
-    // Only copy if there's actual data
-    if byte_length > 0 {
-        if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(&mut buffer[..byte_length])) {
-            log::error!("Error copying audio chunk: {e:?}");
-            return PacketWrapper::default();
-        }
+    if let Err(e) = chunk.copy_to_with_u8_array(&buffer_to_uint8array(buffer)) {
+        log::error!("Error copying audio chunk: {e:?}");
     }
     let mut media_packet: MediaPacket = MediaPacket {
         email: email.to_owned(),

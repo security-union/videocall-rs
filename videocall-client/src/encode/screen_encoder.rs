@@ -386,7 +386,7 @@ impl ScreenEncoder {
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             if let Err(e) = screen_encoder.configure(&new_config) {
                                 error!(
-                                    "Error reconfiguring screen encoder with new dimensions: {e:?}",
+                                    "Error reconfiguring screen encoder with new dimensions: {e:?}"
                                 );
                             }
                         }

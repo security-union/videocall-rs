@@ -1,7 +1,24 @@
 +++
 title = "Error Handling is Critical: How Delta's Lying Machines Taught Me Everything Wrong About UX"
 date = 2025-07-20
-description = "A disaster at Delta airport reveals why honest error messages aren't just nice-to-have features—they're the difference between functional software and digital chaos."
+description = "A Delta airport payment disaster reveals why honest error messages and proper UX design aren't just nice-to-have features—they're the difference between functional software and digital chaos. Learn from Three Mile Island's design failures."
+authors = ["Dario Lencina Talarico"]
+slug = "error-handling-critical-delta-ux-disaster"
+tags = ["error-handling", "ux-design", "software-engineering", "user-experience", "payment-systems", "three-mile-island", "system-design", "frontend-development"]
+categories = ["Software Engineering", "UX Design", "System Design"]
+keywords = ["error handling", "error messages", "UX design", "user experience", "software engineering", "payment processing", "system feedback", "Three Mile Island", "Delta airlines", "user interface design", "frontend development", "software reliability"]
+
+# Social media meta tags
+[extra]
+og_title = "Error Handling is Critical: How Delta's Lying Machines Taught Me Everything Wrong About UX"
+og_description = "A hilarious yet instructive tale of how Delta's payment system charged me 19 times while lying about it—and what software engineers can learn from Three Mile Island about honest error messages."
+og_image = "/images/deltafail.jpg"
+og_type = "article"
+twitter_card = "summary_large_image"
+twitter_title = "Error Handling is Critical: Delta's UX Disaster Story"
+twitter_description = "How I accidentally paid $200 for one checked bag because Delta's machines lie about their status—and what Three Mile Island teaches us about honest error messages."
+twitter_image = "/images/deltafail.jpg"
+reading_time = "8"
 +++
 
 # Error Handling is Critical: How Delta's Lying Machines Taught Me Everything Wrong About UX
@@ -48,7 +65,7 @@ That's when I realized what was happening. The machine wasn't having trouble rea
     <img src="/images/deltafail2.jpg" alt="Delta fail" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />
 </p>
 
-## The $200 Lesson in Why Error Messages Matter
+## The $665 Lesson in Why Error Messages Matter
 
 When the dust settled, I had:
 - 10 charges on my Amex

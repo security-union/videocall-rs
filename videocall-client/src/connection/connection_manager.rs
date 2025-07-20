@@ -99,14 +99,13 @@ pub struct ConnectionManagerOptions {
 #[derive(Debug)]
 pub struct ConnectionManager {
     connections: HashMap<String, Connection>,
-    active_connection_id: Option<String>,
+    active_connection_id: Rc<RefCell<Option<String>>>,
     rtt_measurements: HashMap<String, ServerRttMeasurement>,
     election_state: ElectionState,
     rtt_reporter: Option<Interval>,
     rtt_probe_timer: Option<Interval>,
     election_timer: Option<Interval>,
     rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
-    lost_connections: Rc<RefCell<Vec<String>>>, // connection_ids that were lost and need handling
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
 }
@@ -123,11 +122,10 @@ impl ConnectionManager {
         info!("ConnectionManager starting with {total_servers} servers");
 
         let rtt_responses = Rc::new(RefCell::new(Vec::new()));
-        let lost_connections = Rc::new(RefCell::new(Vec::new()));
 
         let mut manager = Self {
             connections: HashMap::new(),
-            active_connection_id: None,
+            active_connection_id: Rc::new(RefCell::new(None)),
             rtt_measurements: HashMap::new(),
             election_state: ElectionState::Failed {
                 reason: "Not started".to_string(),
@@ -137,7 +135,6 @@ impl ConnectionManager {
             rtt_probe_timer: None,
             election_timer: None,
             rtt_responses,
-            lost_connections,
             options,
             aes,
         };
@@ -185,7 +182,8 @@ impl ConnectionManager {
                 webtransport_url: String::new(), // Not used for WebSocket
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
-                on_connection_lost: self.create_connection_lost_callback(conn_id.clone()),
+                on_connection_lost: self
+                    .create_connection_lost_callback(conn_id.clone(), url.clone()),
                 peer_monitor: self.options.peer_monitor.clone(),
             };
 
@@ -221,7 +219,8 @@ impl ConnectionManager {
                 webtransport_url: url.clone(),
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
-                on_connection_lost: self.create_connection_lost_callback(conn_id.clone()),
+                on_connection_lost: self
+                    .create_connection_lost_callback(conn_id.clone(), url.clone()),
                 peer_monitor: self.options.peer_monitor.clone(),
             };
 
@@ -310,18 +309,42 @@ impl ConnectionManager {
     fn create_connected_callback(&self, connection_id: String) -> Callback<()> {
         Callback::from(move |_| {
             debug!("Connection {connection_id} established");
-            // Mark connection as connected - this will be handled externally
         })
     }
 
     /// Create callback for connection lost
-    fn create_connection_lost_callback(&self, connection_id: String) -> Callback<JsValue> {
-        let lost_queue = self.lost_connections.clone();
+    fn create_connection_lost_callback(
+        &self,
+        connection_id: String,
+        server_url: String,
+    ) -> Callback<JsValue> {
+        let on_state_changed = self.options.on_state_changed.clone();
+        let active_connection_id = self.active_connection_id.clone();
+
+        // We need a way to update the manager's internal state, but we can't move `self` into the callback
+        // The 1Hz timer in ConnectionController will handle updating internal state
+        // This callback focuses on immediate UI notification
+
         Callback::from(move |error| {
             warn!("Connection {connection_id} lost: {error:?}");
-            // push to lost queue for handling in main loop
-            if let Ok(mut q) = lost_queue.try_borrow_mut() {
-                q.push(connection_id.clone());
+
+            // If this was the active connection, report failure to trigger UI reconnection
+            if Some(connection_id.as_str()) == active_connection_id.borrow().as_deref() {
+                // Clear the active connection ID so is_connected() returns false
+                *active_connection_id.borrow_mut() = None;
+
+                let failure_state = ConnectionState::Failed {
+                    error: format!("Active connection {connection_id} lost"),
+                    last_known_server: Some(server_url.clone()),
+                };
+
+                info!("Active connection lost, clearing internal state and emitting Failed state to trigger UI reconnection");
+                on_state_changed.emit(failure_state);
+            } else {
+                info!(
+                    "Non-active connection lost: {connection_id}, current active: {:?}",
+                    active_connection_id.borrow()
+                );
             }
         })
     }
@@ -414,7 +437,9 @@ impl ConnectionManager {
                     measurement.average_rtt.unwrap_or(0.0)
                 );
 
-                self.active_connection_id = Some(connection_id.clone());
+                self.active_connection_id
+                    .borrow_mut()
+                    .replace(connection_id.clone());
 
                 // Mark as active
                 if let Some(mut_measurement) = self.rtt_measurements.get_mut(&connection_id) {
@@ -488,11 +513,12 @@ impl ConnectionManager {
 
     /// Close all unused connections after election
     fn close_unused_connections(&mut self) {
-        let active_id = self.active_connection_id.as_ref();
+        let active_connection_borrow = self.active_connection_id.borrow();
+        let active_id = active_connection_borrow.as_deref();
         let mut to_remove = Vec::new();
 
         for connection_id in self.connections.keys() {
-            if Some(connection_id) != active_id {
+            if Some(connection_id.as_str()) != active_id {
                 to_remove.push(connection_id.clone());
             }
         }
@@ -544,7 +570,8 @@ impl ConnectionManager {
     fn report_diagnostics(&self) {
         debug!(
             "ConnectionManager::report_diagnostics - Active: {:?}, Election State: {:?}",
-            self.active_connection_id, self.election_state
+            self.active_connection_id.borrow(),
+            self.election_state
         );
 
         let mut metrics = Vec::new();
@@ -728,7 +755,8 @@ impl ConnectionManager {
                 error: reason.clone(),
                 last_known_server: self
                     .active_connection_id
-                    .as_ref()
+                    .borrow()
+                    .as_deref()
                     .and_then(|id| self.rtt_measurements.get(id))
                     .map(|m| m.url.clone()),
             },
@@ -739,7 +767,7 @@ impl ConnectionManager {
 
     /// Send packet through active connection
     pub fn send_packet(&self, packet: PacketWrapper) -> Result<()> {
-        if let Some(active_id) = &self.active_connection_id {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
                 connection.send_packet(packet);
                 return Ok(());
@@ -751,7 +779,7 @@ impl ConnectionManager {
 
     /// Set video enabled on active connection
     pub fn set_video_enabled(&self, enabled: bool) -> Result<()> {
-        if let Some(active_id) = &self.active_connection_id {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
                 connection.set_video_enabled(enabled);
                 return Ok(());
@@ -763,7 +791,7 @@ impl ConnectionManager {
 
     /// Set audio enabled on active connection
     pub fn set_audio_enabled(&self, enabled: bool) -> Result<()> {
-        if let Some(active_id) = &self.active_connection_id {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
                 connection.set_audio_enabled(enabled);
                 return Ok(());
@@ -775,7 +803,7 @@ impl ConnectionManager {
 
     /// Set screen enabled on active connection
     pub fn set_screen_enabled(&self, enabled: bool) -> Result<()> {
-        if let Some(active_id) = &self.active_connection_id {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
                 connection.set_screen_enabled(enabled);
                 return Ok(());
@@ -787,7 +815,7 @@ impl ConnectionManager {
 
     /// Check if manager has an active connection
     pub fn is_connected(&self) -> bool {
-        self.active_connection_id.is_some()
+        self.active_connection_id.borrow().is_some()
             && matches!(self.election_state, ElectionState::Elected { .. })
     }
 
@@ -857,7 +885,8 @@ impl ConnectionManager {
                 error: reason.clone(),
                 last_known_server: self
                     .active_connection_id
-                    .as_ref()
+                    .borrow()
+                    .as_deref()
                     .and_then(|id| self.rtt_measurements.get(id))
                     .map(|m| m.url.clone()),
             },

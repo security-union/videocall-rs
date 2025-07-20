@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use super::super::connection::{ConnectionManager, ConnectionManagerOptions, ConnectionState};
+use super::super::connection::{ConnectionController, ConnectionManagerOptions, ConnectionState};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
@@ -112,7 +112,7 @@ struct InnerOptions {
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
-    connection_manager: Option<ConnectionManager>,
+    connection_controller: Option<ConnectionController>,
     connection_state: ConnectionState,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
@@ -204,7 +204,7 @@ impl VideoCallClient {
                     userid: options.userid.clone(),
                     on_peer_added: options.on_peer_added.clone(),
                 },
-                connection_manager: None,
+                connection_controller: None,
                 connection_state: ConnectionState::Failed {
                     error: "Not connected".to_string(),
                     last_known_server: None,
@@ -304,6 +304,7 @@ impl VideoCallClient {
                             inner.connection_state = state.clone();
                         }
                     }
+                    info!("Connection state changed: {state:?} in video call client");
 
                     match state {
                         ConnectionState::Connected { .. } => {
@@ -339,56 +340,10 @@ impl VideoCallClient {
             election_period_ms,
         };
 
-        let connection_manager = ConnectionManager::new(manager_options, self.aes.clone())?;
+        let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
 
         let mut borrowed = self.inner.try_borrow_mut()?;
-        borrowed.connection_manager = Some(connection_manager);
-
-        // Set up 1Hz diagnostics reporting timer
-        let inner_ref = Rc::downgrade(&self.inner);
-        let _diagnostics_timer = gloo::timers::callback::Interval::new(1000, move || {
-            if let Some(inner) = inner_ref.upgrade() {
-                if let Ok(mut inner) = inner.try_borrow_mut() {
-                    if let Some(connection_manager) = &mut inner.connection_manager {
-                        connection_manager.trigger_diagnostics_report();
-                    }
-                }
-            }
-        });
-
-        // Set up RTT probing timer (200ms intervals)
-        let rtt_probe_interval = self.options.rtt_probe_interval_ms.unwrap_or(200);
-        let inner_ref_rtt = Rc::downgrade(&self.inner);
-        let _rtt_timer =
-            gloo::timers::callback::Interval::new(rtt_probe_interval as u32, move || {
-                if let Some(inner) = inner_ref_rtt.upgrade() {
-                    if let Ok(mut inner) = inner.try_borrow_mut() {
-                        if let Some(connection_manager) = &mut inner.connection_manager {
-                            if let Err(e) = connection_manager.send_rtt_probes() {
-                                debug!("Failed to send RTT probes: {e}");
-                            }
-                        }
-                    }
-                }
-            });
-
-        // Set up election completion checking timer (100ms intervals)
-        let inner_ref_election = Rc::downgrade(&self.inner);
-        let _election_timer = gloo::timers::callback::Interval::new(100, move || {
-            if let Some(inner) = inner_ref_election.upgrade() {
-                if let Ok(mut inner) = inner.try_borrow_mut() {
-                    if let Some(connection_manager) = &mut inner.connection_manager {
-                        connection_manager.check_and_complete_election();
-                    }
-                }
-            }
-        });
-
-        // Keep the timers alive (stored in Inner but we'll ignore the warning for now)
-        // TODO: Properly store timers to prevent them from being dropped
-        std::mem::forget(_diagnostics_timer);
-        std::mem::forget(_rtt_timer);
-        std::mem::forget(_election_timer);
+        borrowed.connection_controller = Some(connection_controller);
 
         info!("ConnectionManager created with RTT testing and 1Hz diagnostics reporting");
         Ok(())
@@ -464,25 +419,10 @@ impl VideoCallClient {
             election_period_ms: 100, // Very short election period for direct connection
         };
 
-        let connection_manager = ConnectionManager::new(manager_options, self.aes.clone())?;
+        let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
 
         let mut borrowed = self.inner.try_borrow_mut()?;
-        borrowed.connection_manager = Some(connection_manager);
-
-        // Set up 1Hz diagnostics reporting timer even for direct connections
-        let inner_ref = Rc::downgrade(&self.inner);
-        let _diagnostics_timer = gloo::timers::callback::Interval::new(1000, move || {
-            if let Some(inner) = inner_ref.upgrade() {
-                if let Ok(mut inner) = inner.try_borrow_mut() {
-                    if let Some(connection_manager) = &mut inner.connection_manager {
-                        connection_manager.trigger_diagnostics_report();
-                    }
-                }
-            }
-        });
-
-        // Keep the timer alive
-        std::mem::forget(_diagnostics_timer);
+        borrowed.connection_controller = Some(connection_controller);
 
         info!("Direct connection established with diagnostics reporting");
         Ok(())
@@ -503,6 +443,7 @@ impl VideoCallClient {
     ///
     pub fn connect(&mut self) -> anyhow::Result<()> {
         // Always use RTT testing - it handles single server case efficiently
+        info!("Connecting with RTT testing");
         self.connect_with_rtt_testing()
     }
 
@@ -531,8 +472,8 @@ impl VideoCallClient {
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
         match self.inner.try_borrow() {
             Ok(inner) => {
-                if let Some(connection_manager) = &inner.connection_manager {
-                    if let Err(e) = connection_manager.send_packet(media) {
+                if let Some(connection_controller) = &inner.connection_controller {
+                    if let Err(e) = connection_controller.send_packet(media) {
                         error!("Failed to send packet: {e}");
                     }
                 } else {
@@ -548,8 +489,8 @@ impl VideoCallClient {
     /// Returns `true` if the client is currently connected to a server.
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_manager) = &inner.connection_manager {
-                return connection_manager.is_connected();
+            if let Some(connection_controller) = &inner.connection_controller {
+                return connection_controller.is_connected();
             }
         };
         false
@@ -615,21 +556,21 @@ impl VideoCallClient {
         &self.options.userid
     }
 
-    /// Get current connection state from ConnectionManager
+    /// Get current connection state from ConnectionController
     pub fn get_connection_state(&self) -> Option<ConnectionState> {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_manager) = &inner.connection_manager {
-                return Some(connection_manager.get_connection_state());
+            if let Some(connection_controller) = &inner.connection_controller {
+                return Some(connection_controller.get_connection_state());
             }
         }
         None
     }
 
-    /// Get RTT measurements from ConnectionManager (for debugging)
+    /// Get RTT measurements from ConnectionController (for debugging)
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_manager) = &inner.connection_manager {
-                let measurements = connection_manager.get_rtt_measurements();
+            if let Some(connection_controller) = &inner.connection_controller {
+                let measurements = connection_controller.get_rtt_measurements_clone();
                 let mut result = HashMap::new();
                 for (connection_id, measurement) in measurements {
                     if let Some(avg_rtt) = measurement.average_rtt {
@@ -644,19 +585,20 @@ impl VideoCallClient {
 
     /// Send RTT probes manually (for testing)
     pub fn send_rtt_probes(&self) -> anyhow::Result<()> {
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            if let Some(connection_manager) = &mut inner.connection_manager {
-                return connection_manager.send_rtt_probes();
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(_connection_controller) = &inner.connection_controller {
+                // RTT probes are now handled automatically by ConnectionController timers
+                return Ok(());
             }
         }
-        Err(anyhow!("No connection manager available"))
+        Err(anyhow!("No connection controller available"))
     }
 
     /// Check and complete election if testing period is over
     pub fn check_election_completion(&self) {
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            if let Some(connection_manager) = &mut inner.connection_manager {
-                connection_manager.check_and_complete_election();
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(_connection_controller) = &inner.connection_controller {
+                // Election completion is now handled automatically by ConnectionController timers
             }
         }
     }
@@ -705,14 +647,14 @@ impl VideoCallClient {
 
     pub fn set_video_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_manager) = &inner.connection_manager {
-                if let Err(e) = connection_manager.set_video_enabled(enabled) {
+            if let Some(connection_controller) = &inner.connection_controller {
+                if let Err(e) = connection_controller.set_video_enabled(enabled) {
                     error!("Failed to set video enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set video enabled: {enabled}");
                 }
             } else {
-                debug!("No connection manager available for set_video_enabled({enabled})");
+                debug!("No connection controller available for set_video_enabled({enabled})");
             }
         } else {
             error!("Unable to borrow inner for set_video_enabled({enabled})");
@@ -721,14 +663,14 @@ impl VideoCallClient {
 
     pub fn set_audio_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_manager) = &inner.connection_manager {
-                if let Err(e) = connection_manager.set_audio_enabled(enabled) {
+            if let Some(connection_controller) = &inner.connection_controller {
+                if let Err(e) = connection_controller.set_audio_enabled(enabled) {
                     error!("Failed to set audio enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set audio enabled: {enabled}");
                 }
             } else {
-                debug!("No connection manager available for set_audio_enabled({enabled})");
+                debug!("No connection controller available for set_audio_enabled({enabled})");
             }
         } else {
             error!("Unable to borrow inner for set_audio_enabled({enabled})");
@@ -737,14 +679,14 @@ impl VideoCallClient {
 
     pub fn set_screen_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
-            if let Some(connection_manager) = &inner.connection_manager {
-                if let Err(e) = connection_manager.set_screen_enabled(enabled) {
+            if let Some(connection_controller) = &inner.connection_controller {
+                if let Err(e) = connection_controller.set_screen_enabled(enabled) {
                     error!("Failed to set screen enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set screen enabled: {enabled}");
                 }
             } else {
-                debug!("No connection manager available for set_screen_enabled({enabled})");
+                debug!("No connection controller available for set_screen_enabled({enabled})");
             }
         } else {
             error!("Unable to borrow inner for set_screen_enabled({enabled})");
@@ -822,8 +764,8 @@ impl Inner {
                     Ok(data) => {
                         debug!(">> {} sending AES key", self.options.userid);
 
-                        // Send AES key packet via ConnectionManager
-                        if let Some(connection_manager) = &self.connection_manager {
+                        // Send AES key packet via ConnectionController
+                        if let Some(connection_controller) = &self.connection_controller {
                             let packet = PacketWrapper {
                                 packet_type: PacketType::AES_KEY.into(),
                                 email: self.options.userid.clone(),
@@ -831,11 +773,11 @@ impl Inner {
                                 ..Default::default()
                             };
 
-                            if let Err(e) = connection_manager.send_packet(packet) {
+                            if let Err(e) = connection_controller.send_packet(packet) {
                                 error!("Failed to send AES key packet: {e}");
                             }
                         } else {
-                            error!("No connection manager available for AES key");
+                            error!("No connection controller available for AES key");
                         }
                     }
                     Err(e) => {
@@ -897,8 +839,8 @@ impl Inner {
                     Ok(data) => {
                         debug!(">> {userid} sending public key");
 
-                        // Send RSA public key packet via ConnectionManager
-                        if let Some(connection_manager) = &self.connection_manager {
+                        // Send RSA public key packet via ConnectionController
+                        if let Some(connection_controller) = &self.connection_controller {
                             let packet = PacketWrapper {
                                 packet_type: PacketType::RSA_PUB_KEY.into(),
                                 email: userid,
@@ -906,11 +848,11 @@ impl Inner {
                                 ..Default::default()
                             };
 
-                            if let Err(e) = connection_manager.send_packet(packet) {
+                            if let Err(e) = connection_controller.send_packet(packet) {
                                 error!("Failed to send RSA public key packet: {e}");
                             }
                         } else {
-                            error!("No connection manager available for RSA public key");
+                            error!("No connection controller available for RSA public key");
                         }
                     }
                     Err(e) => {

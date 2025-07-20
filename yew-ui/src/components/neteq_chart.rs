@@ -196,7 +196,7 @@ pub fn neteq_chart(props: &NetEqChartProps) -> Html {
     html! {
         <div class="neteq-chart">
             <div class="chart-title">{ chart_type.label() }</div>
-            <svg width={width.to_string()} height={height.to_string()} viewBox={format!("0 0 {} {}", width, height)} preserveAspectRatio="none">
+            <svg width={width.to_string()} height={height.to_string()} viewBox={format!("0 0 {width} {height}")} preserveAspectRatio="none">
                 // Y-axis
                 <line x1={margin_left.to_string()} y1="5" x2={margin_left.to_string()} y2={(plot_height + 5.0).to_string()} stroke="#666" stroke-width="1" />
                 // X-axis
@@ -321,9 +321,10 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     let y = margin_top + plot_height
                         - ((stats.expand_rate as f64).max(0.0) / max_rate * plot_height);
                     if y.is_finite() {
-                        format!("{:.1},{:.1}", x, y)
+                        format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -401,9 +402,10 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     let y = margin_top + plot_height
                         - ((stats.underruns as f64).max(0.0) / max_underruns * plot_height * 0.3);
                     if y.is_finite() {
-                        format!("{:.1},{:.1}", x, y)
+                        format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -448,9 +450,10 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                     let y = margin_top + plot_height
                         - ((stats.reorder_rate as f64).max(0.0) / max_reorder_rate * plot_height);
                     if y.is_finite() {
-                        format!("{:.1},{:.1}", x, y)
+                        format!("{x:.1},{y:.1}")
                     } else {
-                        format!("{:.1},{:.1}", x, margin_top + plot_height)
+                        let height = margin_top + plot_height;
+                        format!("{x:.1},{height:.1}")
                     }
                 })
                 .collect::<Vec<_>>()

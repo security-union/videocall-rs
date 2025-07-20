@@ -35,7 +35,7 @@ impl Component for BrowserCompatibility {
         log::info!("Checking browser compatibility");
         let error = Self::check_browser_compatibility();
         if let Some(error) = &error {
-            log::error!("Browser compatibility check failed: {}", error);
+            log::error!("Browser compatibility check failed: {error}");
         } else {
             log::info!("Browser compatibility check passed");
         }

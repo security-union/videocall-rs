@@ -19,6 +19,10 @@ twitter_title = "Error Handling is Critical: Delta's UX Disaster Story"
 twitter_description = "How I accidentally paid $200 for one checked bag because Delta's machines lie about their status—and what Three Mile Island teaches us about honest error messages."
 twitter_image = "/images/deltafail.jpg"
 reading_time = "8"
+
+[taxonomies]
+tags = ["error-handling", "ux-design", "software-engineering", "user-experience", "payment-systems", "three-mile-island", "system-design", "frontend-development"]
+authors = ["Dario Lencina Talarico"]
 +++
 
 # Error Handling is Critical: How Delta's Lying Machines Taught Me Everything Wrong About UX

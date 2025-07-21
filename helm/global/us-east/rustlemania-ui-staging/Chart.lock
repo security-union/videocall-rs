@@ -1,0 +1,6 @@
+dependencies:
+- name: rustlemania-ui-staging
+  repository: file://../../../rustlemania-ui-staging
+  version: 0.1.0
+digest: sha256:78d5a52e9cd6215aaddd59ff147451374a86f87e3934a20725888d66aa6308b5
+generated: "2025-07-21T02:25:17.468221-04:00"

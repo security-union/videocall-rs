@@ -1,0 +1,6 @@
+dependencies:
+- name: engineering-vlog
+  repository: file://../../../engineering-vlog
+  version: 0.1.0
+digest: sha256:a67291067dd8bf3a6cff9004b27e9b6e20a8c0e0bf1c11a781eb2b38fe3b9b4e
+generated: "2025-07-21T02:16:28.176866-04:00"

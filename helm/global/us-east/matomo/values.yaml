@@ -1,0 +1,59 @@
+# US East Matomo configuration using Bitnami chart
+# Regional deployment configuration for matomo.videocall.rs
+
+# Service configuration - ensure ClusterIP only (not LoadBalancer)
+service:
+  type: ClusterIP
+
+# Ingress configuration for US East - use shared ingress controller
+ingress:
+  enabled: true
+  ingressClassName: "nginx"
+  annotations:
+    cert-manager.io/issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hostname: "matomo.videocall.rs"
+  path: "/"
+  pathType: Prefix
+  tls: true
+  tlsSecret: "matomo-us-east-tls"
+
+# Matomo application configuration
+matomoConfiguration:
+  host: "matomo.videocall.rs"
+  username: "admin"
+  password: "MatomoPassword123!"
+  email: "admin@videocall.rs"
+  siteName: "VideoCall Analytics"
+  siteUrl: "https://videocall.rs"
+
+# MariaDB configuration
+mariadb:
+  enabled: true
+  auth:
+    rootPassword: "MariaDBRootPassword123!"
+    database: "matomo"
+    username: "matomo"
+    password: "MatomoDBPassword123!"
+  primary:
+    service:
+      type: ClusterIP
+    persistence:
+      enabled: true
+      size: 8Gi
+
+# Resources
+resources:
+  limits:
+    cpu: 250m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+# Persistence
+persistence:
+  enabled: true
+  size: 10Gi
+  accessModes:
+    - ReadWriteOnce 

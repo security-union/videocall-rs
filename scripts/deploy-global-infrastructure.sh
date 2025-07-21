@@ -26,13 +26,20 @@ declare -r SINGAPORE_CONTEXT="do-sgp1-videocall-singapore"
 # Chart directories
 declare -r HELM_DIR="${PROJECT_ROOT}/helm"
 declare -a CHARTS=(
+    # Deploy ingress controllers FIRST (required for UDP routing and HTTP ingresses)
+    "global/us-east/ingress-nginx"
+    "global/singapore/ingress-nginx"
+    # Then deploy services that depend on ingress
     "global/us-east/websocket"
     "global/us-east/webtransport"
     "global/singapore/websocket"
     "global/singapore/webtransport"
-    # Ingress controller wrapper charts (must be deployed before WebSocket/UI ingresses can work)
-    "global/us-east/ingress-nginx"
-    "global/singapore/ingress-nginx"
+    # Additional services deployed to US East cluster for consolidation
+    "global/us-east/engineering-vlog"
+    "global/us-east/matomo"
+    "global/us-east/rustlemania-ui"
+    "global/us-east/rustlemania-ui-staging" 
+    "global/us-east/videocall-website"
 )
 
 # Infrastructure components that need to be deployed first
@@ -47,6 +54,12 @@ declare -a CERTIFICATE_FILES=(
     "global/singapore/webtransport/certificate.yaml" 
     "global/us-east/websocket/certificate.yaml"
     "global/us-east/webtransport/certificate.yaml"
+    # Additional certificates for consolidated services
+    "global/us-east/engineering-vlog/certificate.yaml"
+    "global/us-east/matomo/certificate.yaml"
+    "global/us-east/rustlemania-ui/certificate.yaml"
+    "global/us-east/rustlemania-ui-staging/certificate.yaml"
+    "global/us-east/videocall-website/certificate.yaml"
 )
 
 # DigitalOcean DNS secret file
@@ -60,6 +73,7 @@ get_charts_for_region() {
             printf '%s\n' "${CHARTS[@]}"
             ;;
         "us-east")
+            # Include global/us-east charts and global chart deployments for US East
             printf '%s\n' "${CHARTS[@]}" | grep "global/us-east"
             ;;
         "singapore")
@@ -122,6 +136,10 @@ get_context_for_chart() {
         "global/singapore/ingress-nginx")
             echo "${SINGAPORE_CONTEXT}"
             ;;
+        # Additional services deployed to US East for consolidation
+        "global/us-east/engineering-vlog"|"global/us-east/matomo"|"global/us-east/rustlemania-ui"|"global/us-east/rustlemania-ui-staging"|"global/us-east/videocall-website")
+            echo "${US_EAST_CONTEXT}"
+            ;;
         *)
             echo "unknown"
             ;;
@@ -147,6 +165,22 @@ get_release_name_for_chart() {
             ;;
         "global/singapore/ingress-nginx")
             echo "ingress-nginx-singapore"
+            ;;
+        # Additional services deployed to US East for consolidation
+        "global/us-east/engineering-vlog")
+            echo "engineering-vlog-us-east"
+            ;;
+        "global/us-east/matomo")
+            echo "matomo-us-east"
+            ;;
+        "global/us-east/rustlemania-ui")
+            echo "videocall-ui-us-east"
+            ;;
+        "global/us-east/rustlemania-ui-staging")
+            echo "videocall-staging-ui-us-east"
+            ;;
+        "global/us-east/videocall-website")
+            echo "videocall-website-us-east"
             ;;
         *)
             echo "unknown"
@@ -270,7 +304,8 @@ This script will:
 3. Update helm dependencies for selected charts
 4. Deploy SSL certificates for selected endpoints
 5. Deploy WebSocket and WebTransport services to selected regions
-6. Verify deployments and check certificate status
+6. Deploy consolidated services to US East (website, engineering blog, matomo, videocall-ui, videocall-staging-ui, videocall-website)
+7. Verify deployments and check certificate status
 
 Contexts used:
 - US East: ${US_EAST_CONTEXT}
@@ -313,6 +348,7 @@ validate_prerequisites() {
     local charts=($(get_charts_for_region "${DEPLOY_REGION}"))
     for chart in "${charts[@]}"; do
         local chart_path="${HELM_DIR}/${chart}"
+        
         if [[ ! -f "${chart_path}/Chart.yaml" ]]; then
             error_exit "Chart not found: ${chart_path}/Chart.yaml"
         fi
@@ -375,6 +411,25 @@ update_dependencies() {
     
     local charts=($(get_charts_for_region "${DEPLOY_REGION}"))
     
+    # Add required helm repositories first
+    local repos_added=false
+    for chart in "${charts[@]}"; do
+        if [[ "${chart}" == "global/us-east/matomo" ]] && [[ "${DRY_RUN}" == "false" ]]; then
+            if ! helm repo list | grep -q bitnami; then
+                log_info "Adding bitnami helm repository for ${chart}"
+                helm repo add bitnami https://charts.bitnami.com/bitnami
+                repos_added=true
+            fi
+        fi
+    done
+    
+    # Update repositories if any were added
+    if [[ "${repos_added}" == "true" ]] && [[ "${DRY_RUN}" == "false" ]]; then
+        log_info "Updating helm repositories"
+        helm repo update
+    fi
+    
+    # Update chart dependencies
     for chart in "${charts[@]}"; do
         local chart_path="${HELM_DIR}/${chart}"
         log_info "Updating dependencies for ${chart}"
@@ -412,7 +467,7 @@ deploy_chart() {
     fi
     log_info "Switched to context: ${context}"
     
-    # Deploy with helm
+    # Standard local chart deployment for all regional charts
     if ! (cd "${chart_path}" && helm upgrade --install "${release_name}" . -f values.yaml --timeout 300s); then
         error_exit "Failed to deploy ${chart}"
     fi
@@ -661,6 +716,44 @@ verify_deployments() {
         
         log_info "  WebSocket Certificate: ${ws_cert}"
         log_info "  WebTransport Certificate: ${wt_cert}"
+        
+        # Check additional services deployed to US East for consolidation
+        if [[ "$context" == "$US_EAST_CONTEXT" ]]; then
+            echo ""
+            log_info "  CONSOLIDATED SERVICES STATUS:"
+            
+            # Check deployments for new services
+            local website_deployment=$(kubectl get deployment website-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local blog_deployment=$(kubectl get deployment engineering-vlog-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local matomo_deployment=$(kubectl get deployment matomo-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local ui_deployment=$(kubectl get deployment videocall-ui-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local staging_deployment=$(kubectl get deployment videocall-staging-ui-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local videocall_website_deployment=$(kubectl get deployment videocall-website-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            
+            log_info "    Website: ${website_deployment} replicas ready"
+            log_info "    Engineering Blog: ${blog_deployment} replicas ready"
+            log_info "    Matomo: ${matomo_deployment} replicas ready"
+            log_info "    Videocall UI: ${ui_deployment} replicas ready"
+            log_info "    Videocall Staging UI: ${staging_deployment} replicas ready"
+            log_info "    Videocall Website: ${videocall_website_deployment} replicas ready"
+            
+            # Check ingresses for new services
+            local website_ingress=$(kubectl get ingress website-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
+            local blog_ingress=$(kubectl get ingress engineering-vlog-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
+            local matomo_ingress=$(kubectl get ingress matomo-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
+            local ui_ingress=$(kubectl get ingress videocall-ui-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
+            local staging_ingress=$(kubectl get ingress videocall-staging-ui-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
+            local videocall_website_ingress=$(kubectl get ingress videocall-website-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
+            
+            echo ""
+            log_info "  INGRESS IP ADDRESSES:"
+            log_info "    Website: ${website_ingress}"
+            log_info "    Engineering Blog: ${blog_ingress}"
+            log_info "    Matomo: ${matomo_ingress}"
+            log_info "    Videocall UI: ${ui_ingress}"
+            log_info "    Videocall Staging UI: ${staging_ingress}"
+            log_info "    Videocall Website: ${videocall_website_ingress}"
+        fi
     
     echo ""
     done

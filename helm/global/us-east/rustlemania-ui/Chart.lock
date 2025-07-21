@@ -1,0 +1,6 @@
+dependencies:
+- name: rustlemania-ui
+  repository: file://../../../rustlemania-ui
+  version: 0.1.0
+digest: sha256:1441cd7f33c817ea1cac2973052ba8abc2f74dde02dc3b9d3074b49146130a56
+generated: "2025-07-21T02:25:13.176687-04:00"

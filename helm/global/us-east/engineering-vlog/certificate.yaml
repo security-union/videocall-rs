@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: engineering-vlog-us-east-tls
+  namespace: default
+spec:
+  secretName: engineering-vlog-us-east-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: Issuer
+  dnsNames:
+    - engineering.videocall.rs 

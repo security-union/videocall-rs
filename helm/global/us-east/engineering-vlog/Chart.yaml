@@ -1,0 +1,9 @@
+apiVersion: v2
+name: engineering-vlog-us-east
+version: 0.1.0
+description: Engineering blog for US East region
+
+dependencies:
+  - name: engineering-vlog
+    version: 0.1.0
+    repository: file://../../../engineering-vlog 

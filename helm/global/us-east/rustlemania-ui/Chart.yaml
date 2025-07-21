@@ -1,0 +1,9 @@
+apiVersion: v2
+name: rustlemania-ui-us-east
+version: 0.1.0
+description: Videocall UI for US East region
+
+dependencies:
+  - name: rustlemania-ui
+    version: 0.1.0
+    repository: file://../../../rustlemania-ui 

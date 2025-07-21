@@ -1,0 +1,9 @@
+apiVersion: v2
+name: videocall-website-us-east
+version: 0.1.0
+description: Videocall website for US East region
+
+dependencies:
+  - name: videocall-website
+    version: 0.1.0
+    repository: file://../../../videocall-website 

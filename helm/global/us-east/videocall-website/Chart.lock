@@ -1,0 +1,6 @@
+dependencies:
+- name: videocall-website
+  repository: file://../../../videocall-website
+  version: 0.1.0
+digest: sha256:523b3be3e256968b05ddda9ca2468591de52527b3c44927ab7d2b1c606ef7ae5
+generated: "2025-07-21T02:25:21.765988-04:00"

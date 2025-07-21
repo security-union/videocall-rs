@@ -39,7 +39,15 @@ videocall-website:
           - path: /
             pathType: Prefix
             service:
-              name: "videocall-website-us-east"  # This matches fullnameOverride
+              name: "videocall-website"  # Use the actual service name
+              port:
+                number: 80
+      - host: www.videocall.rs
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: "videocall-website"  # Use the actual service name
               port:
                 number: 80
     tls:

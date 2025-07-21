@@ -1,65 +1,11 @@
 # US East Matomo configuration using Bitnami chart
-# Regional deployment configuration for analytics.rustlemania.com
+# Regional deployment configuration for matomo.videocall.rs
 
-# Bitnami Matomo image configuration
-image:
-  registry: docker.io
-  repository: bitnami/matomo
-  tag: ""
-  pullPolicy: IfNotPresent
-
-# Single replica for US East
-replicaCount: 1
-
-# Regional resource configuration
-resources:
-  limits:
-    cpu: 250m
-    memory: 512Mi
-  requests:
-    cpu: 100m
-    memory: 256Mi
-
-# Matomo application configuration
-matomoConfiguration:
-  host: "matomo.videocall.rs"
-  username: "admin"
-  password: "MatomoPassword123!"
-  email: "admin@videocall.rs"
-  siteName: "VideoCall Analytics"
-  siteUrl: "https://videocall.rs"
-
-# MariaDB subchart configuration
-mariadb:
-  enabled: true
-  auth:
-    rootPassword: "MariaDBRootPassword123!"
-    database: "matomo"
-    username: "matomo"
-    password: "MatomoDBPassword123!"
-  primary:
-    resources:
-      limits:
-        cpu: 200m
-        memory: 256Mi
-      requests:
-        cpu: 50m
-        memory: 256Mi
-    persistence:
-      enabled: true
-      size: 8Gi
-
-# Service configuration
+# Service configuration - ensure ClusterIP only (not LoadBalancer)
 service:
   type: ClusterIP
-  ports:
-    http: 80
 
-# Node selector for US East region
-nodeSelector:
-  topology.kubernetes.io/region: "nyc1"
-
-# Ingress configuration for US East
+# Ingress configuration for US East - use shared ingress controller
 ingress:
   enabled: true
   ingressClassName: "nginx"
@@ -72,7 +18,40 @@ ingress:
   tls: true
   tlsSecret: "matomo-us-east-tls"
 
-# Persistence configuration
+# Matomo application configuration
+matomoConfiguration:
+  host: "matomo.videocall.rs"
+  username: "admin"
+  password: "MatomoPassword123!"
+  email: "admin@videocall.rs"
+  siteName: "VideoCall Analytics"
+  siteUrl: "https://videocall.rs"
+
+# MariaDB configuration
+mariadb:
+  enabled: true
+  auth:
+    rootPassword: "MariaDBRootPassword123!"
+    database: "matomo"
+    username: "matomo"
+    password: "MatomoDBPassword123!"
+  primary:
+    service:
+      type: ClusterIP
+    persistence:
+      enabled: true
+      size: 8Gi
+
+# Resources
+resources:
+  limits:
+    cpu: 250m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+# Persistence
 persistence:
   enabled: true
   size: 10Gi

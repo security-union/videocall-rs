@@ -9,4 +9,5 @@ spec:
     name: letsencrypt-prod
     kind: Issuer
   dnsNames:
-    - videocall.rs 
+    - videocall.rs
+    - www.videocall.rs 

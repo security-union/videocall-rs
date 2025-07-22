@@ -1,0 +1,48 @@
+# US East Engineering Blog configuration
+engineering-vlog:
+  nameOverride: "engineering-vlog-us-east"
+  fullnameOverride: "engineering-vlog-us-east"
+
+  replicaCount: 1
+
+  image:
+    repository: securityunion/videocall-engineering-vlog
+    pullPolicy: Always
+    tag: delta-article-21fa671f
+
+  resources:
+    limits:
+      cpu: "50m"
+      memory: "32Mi"
+    requests:
+      cpu: "20m"
+      memory: "32Mi"
+
+  # Service configuration (uses chart's service.yaml template)
+  service:
+    type: ClusterIP
+    port: 80
+
+  # Node selector for US East region
+  nodeSelector:
+    topology.kubernetes.io/region: "nyc1"
+
+  ingress:
+    enabled: true
+    className: "nginx"
+    annotations:
+      cert-manager.io/issuer: "letsencrypt-prod"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: engineering.videocall.rs
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: "engineering-vlog-us-east"  # This matches fullnameOverride
+              port:
+                number: 80
+    tls:
+      - secretName: engineering-vlog-us-east-tls
+        hosts:
+          - engineering.videocall.rs 

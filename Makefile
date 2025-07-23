@@ -3,7 +3,7 @@ COMPOSE = docker compose -f docker/docker-compose.yaml
 .PHONY: test up down build connect_to_db clippy-fix fmt check clean help
 
 test:
-	$(COMPOSE) run --rm websocket-api bash -c "cd /app/actix-api && cargo test"
+	$(COMPOSE) run websocket-api bash -c "cd /app/actix-api && cargo test"
 
 up:
 	$(COMPOSE) up
@@ -15,16 +15,16 @@ build:
 	$(COMPOSE) build
 
 connect_to_db:
-	$(COMPOSE) run --rm postgres bash -c "psql -h postgres -d actix-api-db -U postgres"
+	$(COMPOSE) run postgres bash -c "psql -h postgres -d actix-api-db -U postgres"
 
 clippy-fix:
-	$(COMPOSE) run --rm yew-ui bash -c "cd /app && cargo clippy --fix"
+	$(COMPOSE) run yew-ui bash -c "cd /app && cargo clippy --fix"
 
 fmt:
-	$(COMPOSE) run --rm yew-ui bash -c "cd /app && cargo fmt"
+	$(COMPOSE) run yew-ui bash -c "cd /app && cargo fmt"
 
 check:
-	$(COMPOSE) run --rm websocket-api bash -c "cd /app && cargo clippy --all -- --deny warnings && cargo fmt --check"
+	$(COMPOSE) run websocket-api bash -c "cd /app && cargo clippy --all -- --deny warnings && cargo fmt --check"
 
 clean:
 	$(COMPOSE) down --remove-orphans --volumes --rmi all

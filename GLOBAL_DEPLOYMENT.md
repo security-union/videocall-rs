@@ -3,17 +3,18 @@
 ## Architecture Overview
 
 ### Objective
-Deploy videocall.rs to Singapore region to serve Vietnam customers with low latency, using cross-region NATS connectivity for international calls.
+Deploy videocall.rs globally using client-side RTT-based server selection, using cross_region NATS connectivity for global communication.
 
 ### Regional Strategy
 - **Primary Region**: US East (NYC1) - Existing deployment
 - **Secondary Region**: Singapore (SGP1) - New deployment for Asia-Pacific
 - **Cross-Region Communication**: DigitalOcean VPC peering for private connectivity
+- **Client-Side Selection**: RTT-based server election eliminates need for geographic load balancing
 
 ### Traffic Routing
-- **Vietnam/SE Asia** → Singapore region (20-40ms latency)
-- **Americas/Europe** → US East region
-- **Cross-region calls** → NATS gateway mesh via VPC peering
+- **Client Election**: Each client tests all available servers and selects the fastest
+- **RTT-Based Selection**: Server with lowest latency wins, regardless of geographic assumptions
+- **Cross-region calls**: NATS gateway mesh via VPC peering enables global communication
 
 ## Technical Design
 
@@ -32,9 +33,11 @@ US East VPC (10.100.0.0/16) ←--VPC Peering--→ Singapore VPC (10.110.0.0/16)
 - **NodePort Services**: Gateway ports exposed via private node IPs
 - **JetStream**: Message persistence and delivery guarantees
 
-### Cloudflare Routing
-- Geographic DNS policies route users to nearest region
-- Health check based failover between regions
+### Client-Side RTT-Based Routing
+- Each client connects to all available servers simultaneously
+- RTT measurements determine optimal server selection
+- Automatic failover to next-best server if primary fails
+- No DNS propagation delays or geographic assumptions
 
 ## System Implementation
 
@@ -88,192 +91,21 @@ helm/global/
     └── websocket/
 ```
 
-#### Chart Configuration (Official NATS Helm Chart):
+#### Chart Configuration
+Both regions use the official NATS Helm chart (v0.19.15) with gateway configuration:
 
-**helm/global/us-east/nats/Chart.yaml:**
-```yaml
-apiVersion: v2
-name: nats-us-east
-version: 0.1.0
-description: NATS cluster for US East region with cross-region gateway
+**Key Configuration Points:**
+- **US East**: 3-replica cluster with 5Gi storage
+- **Singapore**: 2-replica cluster with 3Gi storage  
+- **Gateway Mode**: Cross-region communication via private VPC endpoints
+- **JetStream**: Enabled for message persistence
 
-dependencies:
-  - name: nats
-    version: 0.19.15
-    repository: https://nats-io.github.io/k8s/helm/charts/
-```
+#### NodePort Services for Cross-Region Gateway Access
+NodePort services expose gateway ports (30722) for cross-region NATS communication via private VPC endpoints.
 
-**helm/global/us-east/nats/values.yaml:**
-```yaml
-# US East NATS configuration with Singapore gateway
-nats:
-  config:
-    nats:
-      natsbox:
-        enabled: true
-      cluster:
-        enabled: true
-        replicas: 3
-        noAdvertise: true
-      jetstream:
-        enabled: true
-        fileStore:
-          pvc:
-            size: 5Gi
-            storageClassName: do-block-storage
-        memStore:
-          enabled: true
-          maxSize: 1Gi
-      auth:
-        enabled: false
-      resources:
-        limits:
-          cpu: 300m
-          memory: 384Mi
-        requests:
-          cpu: 150m
-          memory: 192Mi
-  # Gateway configuration using official NATS chart format
-  gateway:
-    enabled: true
-    port: 7222
-    merge:
-      name: "us-east-1"
-      gateways:
-        - name: "singapore"
-          urls:
-            - "nats://10.110.0.2:30722"  # Singapore private IP + NodePort
-  service:
-    name: nats-us-east
-    type: ClusterIP
-    ports:
-      client:
-        enabled: true
-        port: 4222
-      monitor:
-        enabled: true
-        port: 8222
-      gateway:
-        enabled: true
-        port: 7222
-```
-
-**helm/global/singapore/nats/values.yaml:**
-```yaml
-# Singapore NATS configuration with US East gateway
-nats:
-  config:
-    nats:
-      natsbox:
-        enabled: true
-      cluster:
-        enabled: true
-        replicas: 2  # Smaller cluster for Singapore
-        noAdvertise: true
-      jetstream:
-        enabled: true
-        fileStore:
-          pvc:
-            size: 3Gi  # Smaller storage for Singapore
-            storageClassName: do-block-storage
-        memStore:
-          enabled: true
-          maxSize: 512Mi
-      auth:
-        enabled: false
-      resources:
-        limits:
-          cpu: 200m
-          memory: 256Mi
-        requests:
-          cpu: 100m
-          memory: 128Mi
-  # Gateway configuration using official NATS chart format
-  gateway:
-    enabled: true
-    port: 7222
-    merge:
-      name: "singapore"
-      gateways:
-        - name: "us-east-1"
-          urls:
-            - "nats://10.100.0.2:30722"  # US East private IP + NodePort
-  service:
-    name: nats-singapore
-    type: ClusterIP
-    ports:
-      client:
-        enabled: true
-        port: 4222
-      monitor:
-        enabled: true
-        port: 8222
-      gateway:
-        enabled: true
-        port: 7222
-```
-
-#### NodePort Services for Cross-Region Gateway Access:
-
-**NodePort Services Created:**
-```bash
-# US East gateway NodePort
-kubectl --context do-nyc1-videocall-us-east apply -f - <<EOF
-apiVersion: v1
-kind: Service
-metadata:
-  name: nats-us-east-gateway-nodeport
-spec:
-  type: NodePort
-  selector:
-    app.kubernetes.io/name: nats
-    app.kubernetes.io/instance: nats-us-east
-  ports:
-  - name: client
-    port: 4222
-    targetPort: 4222
-    nodePort: 30422
-  - name: gateway
-    port: 7222
-    targetPort: 7222
-    nodePort: 30722
-EOF
-
-# Singapore gateway NodePort
-kubectl --context do-sgp1-videocall-singapore apply -f - <<EOF
-apiVersion: v1
-kind: Service
-metadata:
-  name: nats-singapore-gateway-nodeport
-spec:
-  type: NodePort
-  selector:
-    app.kubernetes.io/name: nats
-    app.kubernetes.io/instance: nats-singapore
-  ports:
-  - name: client
-    port: 4222
-    targetPort: 4222
-    nodePort: 30422
-  - name: gateway
-    port: 7222
-    targetPort: 7222
-    nodePort: 30722
-EOF
-```
-
-#### Deployment Commands:
-```bash
-# Deploy US East NATS with official chart
-cd helm/global/us-east/nats
-helm dependency update
-helm install nats-us-east . --values values.yaml --kube-context do-nyc1-videocall-us-east
-
-# Deploy Singapore NATS with official chart
-cd helm/global/singapore/nats
-helm dependency update
-helm install nats-singapore . --values values.yaml --kube-context do-sgp1-videocall-singapore
-```
+**Gateway Endpoints:**
+- **US East**: `10.100.0.2:30722`
+- **Singapore**: `10.110.0.2:30722`
 
 **Deployment Results:**
 - **US East NATS**: `nats-us-east-0` (3/3 Running) ✅
@@ -283,57 +115,20 @@ helm install nats-singapore . --values values.yaml --kube-context do-sgp1-videoc
 
 ### Phase 2.5: NATS Connectivity Verification ✅
 
-#### Network Connectivity Testing:
+#### Network Connectivity Testing
+Verification confirmed bidirectional connectivity between regions:
 
-**VPC Peering Verification:**
-```bash
-# Singapore → US East connectivity
-kubectl --context do-sgp1-videocall-singapore exec -it nats-singapore-0 -- ping -c 3 10.100.0.2
-# Result: 234ms average latency, 0% packet loss ✅
-
-# US East → Singapore connectivity  
-kubectl --context do-nyc1-videocall-us-east exec -it nats-us-east-0 -- ping -c 3 10.110.0.2
-# Result: 235ms average latency, 0% packet loss ✅
-```
+**VPC Peering Results:**
+- **Singapore → US East**: 234ms average latency, 0% packet loss ✅
+- **US East → Singapore**: 235ms average latency, 0% packet loss ✅
 
 **Gateway Port Accessibility:**
-```bash
-# Singapore can reach US East gateway port
-kubectl --context do-sgp1-videocall-singapore exec -it nats-singapore-0 -- nc -zv 10.100.0.2 30722
-# Result: 10.100.0.2 (10.100.0.2:30722) open ✅
+- Both regions can reach each other's gateway ports (30722) ✅
 
-# US East can reach Singapore gateway port
-kubectl --context do-nyc1-videocall-us-east exec -it nats-us-east-0 -- nc -zv 10.110.0.2 30722  
-# Result: 10.110.0.2 (10.110.0.2:30722) open ✅
-```
-
-**NATS Gateway Status Verification:**
-```bash
-# Check US East gateway listening
-kubectl --context do-nyc1-videocall-us-east exec -it nats-us-east-0 -- netstat -tlnp | grep 7222
-# Result: tcp 0 0 :::7222 :::* LISTEN 7/nats-server ✅
-
-# Check gateway configuration
-kubectl --context do-nyc1-videocall-us-east exec -it nats-us-east-0 -- cat /etc/nats-config/nats.conf | grep -A 10 gateway
-# Result: Gateway block present, port 7222 configured ✅
-```
-
-**NATS Gateway Logs Verification:**
-```bash
-# US East gateway logs
-kubectl --context do-nyc1-videocall-us-east logs nats-us-east-0 -c nats | grep -i gateway
-# Results:
-# [INF] Gateway name is default
-# [INF] Listening for gateways connections on 0.0.0.0:7222
-# [INF] Processing inbound gateway connection ✅
-
-# Singapore gateway logs  
-kubectl --context do-sgp1-videocall-singapore logs nats-singapore-0 -c nats | grep -i gateway
-# Results:
-# [INF] Gateway name is default
-# [INF] Listening for gateways connections on 0.0.0.0:7222  
-# [INF] Processing inbound gateway connection ✅
-```
+**NATS Gateway Status:**
+- Both regions listening on port 7222 ✅
+- Gateway configuration blocks present ✅
+- Inbound connections being processed ✅
 
 **Test Results Summary:**
 - **Network Infrastructure**: ✅ Private VPC peering working (~234ms latency)
@@ -343,27 +138,6 @@ kubectl --context do-sgp1-videocall-singapore logs nats-singapore-0 -c nats | gr
 - **NodePort Services**: ✅ Gateway ports accessible via 30722
 
 ### Phase 2.6: Generated Configuration Verification ✅
-
-**Dry Run Output (US East):**
-```yaml
-# Generated nats.conf via helm --dry-run
-port: 4222
-http: 8222
-
-gateway {
-  name: default
-  port: 7222
-  gateways: [
-    # Currently empty - infrastructure ready for gateway endpoints
-  ]
-}
-
-jetstream {
-  max_mem: 1Gi
-  store_dir: /data
-  max_file: 5Gi
-}
-```
 
 **Key Achievements:**
 - ✅ **Official NATS Chart**: Successfully migrated from custom rustlemania-nats chart
@@ -378,65 +152,13 @@ jetstream {
 
 After multiple attempts with different gateway configuration approaches, the final working solution used the exact format from [Synadia Labs NATS configuration](https://github.com/synadia-io/nats-k8s/blob/main/DEVELOPMENT.md#gateways):
 
-**Final Working Values Structure:**
-```yaml
-# helm/global/us-east/nats/values.yaml
-nats:
-  config:
-    nats:
-      # ... existing cluster config ...
-  gateway:
-    enabled: true
-    port: 7222
-    name: "us-east-1"  # CRITICAL: Unique gateway name per region
-    gateways:
-      - name: "singapore"  # Remote gateway name
-        urls:
-          - "nats://10.110.0.2:30722"  # Private VPC endpoint
+**Final Working Configuration:**
+The breakthrough solution used the exact format from Synadia Labs NATS configuration with unique gateway names per region and proper private VPC endpoints.
 
-# helm/global/singapore/nats/values.yaml  
-nats:
-  config:
-    nats:
-      # ... existing cluster config ...
-  gateway:
-    enabled: true
-    port: 7222
-    name: "singapore"  # CRITICAL: Unique gateway name per region
-    gateways:
-      - name: "us-east-1"  # Remote gateway name
-        urls:
-          - "nats://10.100.0.2:30722"  # Private VPC endpoint
-```
-
-**Final Deployment Commands:**
-```bash
-# Deploy US East with corrected gateway config
-cd helm/global/us-east/nats
-helm upgrade nats-us-east . --values values.yaml --kube-context do-nyc1-videocall-us-east
-
-# Deploy Singapore with corrected gateway config
-cd helm/global/singapore/nats
-helm upgrade nats-singapore . --values values.yaml --kube-context do-sgp1-videocall-singapore
-```
-
-**Verification of Working Configuration:**
-```bash
-# Check generated gateway config shows populated gateways array
-helm template nats-us-east . --values values.yaml | grep -A 20 "gateway {"
-
-# Output confirms working configuration:
-gateway {
-  name: us-east-1
-  port: 7222
-  gateways: [
-    {
-      name: singapore
-      urls: [nats://10.110.0.2:30722]
-    },
-  ]
-}
-```
+**Key Configuration Points:**
+- **US East Gateway**: `name: "us-east-1"` with Singapore endpoint
+- **Singapore Gateway**: `name: "singapore"` with US East endpoint
+- **Private Endpoints**: Using VPC private IPs via NodePort services
 
 **User Verification Confirmed**: ✅ Cross-region NATS gateway connectivity working
 
@@ -487,162 +209,66 @@ gateway {
 4. **Configuration Layer**: Validate generated config files
 5. **Only then**: Modify gateway endpoint configuration
 
-### Phase 3: Singapore Service Deployments  
-**Status**: ⏳ Pending - NATS infrastructure ready
+### Phase 3: Singapore Service Deployments ✅
 
-### Phase 4: Cloudflare Geographic Routing
-**Status**: ⏳ Pending
+#### Service Configuration
+Singapore services are configured in `helm/global/singapore/` with separate directories for:
+- **websocket/**: WebSocket server configuration
+- **webtransport/**: WebTransport server configuration
 
-### Phase 5: Cloudflare Load Balancer Test Deployment ✅
+Both services connect to the Singapore NATS cluster and are configured with Singapore-specific ingress hosts and node selectors.
 
-#### Objective
-Deploy videocall.rs services globally using Cloudflare Load Balancer with UDP support for WebTransport, using a new test domain to validate the architecture before migrating the production domain.
+**Status**: ✅ Complete - Singapore services deployed and operational
 
-#### Architecture Design
+### Phase 4: Client-Side RTT-Based Selection ✅
 
-**Cloudflare Load Balancer Configuration:**
-```yaml
-Load Balancer: videocall-test-global
-Domain: webtransport.video
+#### Implementation Overview
+The client-side RTT-based server selection is implemented in the `videocall-client` crate with two main components:
 
-# Origin Pools
-Pool 1: us-east-pool
-├── Origins:
-│   ├── us-east.webtransport.video:443 (WebSocket)
-│   └── us-east.webtransport.video:443 (WebTransport UDP)
-├── Health Check: /healthz
-├── Region: US East
-└── Traffic Steering: Geographic (Americas/Europe)
+**Key Components:**
+- **ConnectionManager**: Orchestrates server testing and election
+- **ConnectionController**: Manages timers and diagnostics reporting
 
-Pool 2: singapore-pool
-├── Origins:
-│   ├── singapore.webtransport.video:443 (WebSocket)
-│   └── singapore.webtransport.video:443 (WebTransport UDP)
-├── Health Check: /healthz
-├── Region: Asia Pacific
-└── Traffic Steering: Geographic (Asia/Australia)
+**Election Process:**
+1. **Simultaneous Connection**: Client opens connections to all servers
+2. **RTT Probes**: 200ms interval probes to measure actual latency
+3. **Tournament Mode**: Servers compete based on real performance
+4. **Winner Selection**: Server with lowest average RTT wins
+5. **Continuous Monitoring**: Background RTT measurements for failover
+
+**Status**: ✅ Complete - Client-side selection operational and tested
+
+## Implementation Summary
+
+### Current Architecture
+The global deployment uses a client-side RTT-based selection approach rather than traditional load balancers:
+
+**Key Components:**
+- **Regional Services**: WebSocket and WebTransport servers in US East and Singapore
+- **NATS Super-Cluster**: Cross-region communication via gateway mesh
+- **Client Election**: RTT-based server selection eliminates need for geographic routing
+- **Automatic Failover**: Seamless migration between servers based on performance
+
+**Benefits of This Approach:**
+- **No Vendor Lock-in**: Works with any cloud provider or infrastructure
+- **Real Performance**: Based on actual RTT measurements, not geographic assumptions
+- **Instant Failover**: No DNS propagation delays
+- **Cost Effective**: No expensive load balancer services required
+
+### Directory Structure
+```
+helm/global/
+├── us-east/
+│   ├── nats/          # US East NATS cluster with gateway
+│   ├── websocket/     # US East WebSocket server
+│   └── webtransport/  # US East WebTransport server
+└── singapore/
+    ├── nats/          # Singapore NATS cluster with gateway
+    ├── websocket/     # Singapore WebSocket server
+    └── webtransport/  # Singapore WebTransport server
 ```
 
-**Protocol Support:**
-- ✅ **HTTP/HTTPS**: UI and API traffic
-- ✅ **WebSocket**: Real-time signaling
-- ✅ **UDP/QUIC**: WebTransport protocol support
-- ✅ **HTTP/3**: Modern protocol support
-
-**Traffic Routing Strategy:**
-1. **Geographic Routing**: Route users to nearest region
-2. **Health-Based Failover**: Automatic failover between regions
-3. **Performance-Based**: Route to fastest responding region
-4. **Protocol-Aware**: Handle different protocols appropriately
-
-#### Implementation Plan
-
-**Step 1: Domain Setup**
-- Register new test domain (webtransport.video)
-- Add domain to Cloudflare DNS
-- Configure DNS records for regional endpoints
-
-**Step 2: Cloudflare Load Balancer Creation**
-- Create Load Balancer in Cloudflare dashboard
-- Configure origin pools for both regions
-- Set up health checks for each protocol
-- Configure traffic steering rules
-
-**Step 3: Regional Service Deployment**
-- Deploy WebTransport servers to both regions
-- Deploy WebSocket servers to both regions  
-- Deploy UI servers to both regions
-- Configure TLS certificates for test domain
-
-**Step 4: Load Balancer Integration**
-- Point test domain to Cloudflare Load Balancer
-- Configure origin endpoints
-- Test health checks and failover
-- Validate UDP traffic routing
-
-**Step 5: End-to-End Testing**
-- Test WebTransport connections via Cloudflare
-- Test WebSocket connections via Cloudflare
-- Test geographic routing functionality
-- Test failover scenarios
-
-#### Technical Requirements
-
-**Cloudflare Load Balancer Features:**
-- **UDP Support**: Required for WebTransport/QUIC
-- **Global Edge Network**: 200+ data centers
-- **Health Checks**: HTTP/HTTPS health monitoring
-- **Traffic Steering**: Geographic and performance-based routing
-- **SSL/TLS**: Automatic certificate management
-
-**Regional Infrastructure:**
-- **US East**: Existing DigitalOcean cluster + NATS
-- **Singapore**: Existing DigitalOcean cluster + NATS
-- **Cross-Region**: NATS gateway connectivity (already working)
-
-**Service Components:**
-- **WebTransport Servers**: UDP/QUIC protocol handling
-- **WebSocket Servers**: TCP protocol handling  
-- **UI Servers**: HTTP/HTTPS serving
-- **Health Endpoints**: /healthz for load balancer monitoring
-
-#### Expected Benefits
-
-**Performance Improvements:**
-- **Lower Latency**: Edge computing reduces round-trip time
-- **Better Reliability**: Global failover capabilities
-- **Protocol Support**: Full UDP support for WebTransport
-- **DDoS Protection**: Built-in security features
-
-**Operational Benefits:**
-- **Geographic Distribution**: Route users to nearest region
-- **Automatic Failover**: Health-based routing
-- **SSL Management**: Automatic certificate handling
-- **Monitoring**: Built-in analytics and metrics
-
-#### Risk Mitigation
-
-**Testing Strategy:**
-- **New Domain**: No impact on existing videocall.rs
-- **Gradual Migration**: Test thoroughly before production
-- **Rollback Plan**: Can easily revert to current setup
-- **Monitoring**: Comprehensive health checks and alerts
-
-**Fallback Options:**
-- **Current Setup**: Keep existing DigitalOcean deployment
-- **Hybrid Approach**: Use Cloudflare for some protocols only
-- **Alternative Providers**: Consider other UDP-capable load balancers
-
-#### Success Criteria
-
-**Functional Requirements:**
-- ✅ WebTransport connections work via Cloudflare
-- ✅ WebSocket connections work via Cloudflare
-- ✅ Geographic routing functions correctly
-- ✅ Health checks and failover work properly
-- ✅ TLS/SSL certificates work automatically
-
-**Performance Requirements:**
-- ✅ Latency improvement over current setup
-- ✅ Reliable cross-region connectivity
-- ✅ Proper UDP traffic handling
-- ✅ Automatic failover under load
-
-**Operational Requirements:**
-- ✅ Monitoring and alerting in place
-- ✅ Easy deployment and rollback procedures
-- ✅ Documentation for ongoing maintenance
-- ✅ Cost optimization and resource management
-
-#### Next Steps
-
-1. **Domain Registration**: Secure test domain
-2. **Cloudflare Setup**: Create Load Balancer configuration
-3. **Service Deployment**: Deploy regional services
-4. **Integration Testing**: Connect services to Cloudflare
-5. **End-to-End Validation**: Test complete user flows
-
-**Status**: ⏳ Planning Complete - Ready for Step-by-Step Implementation
+**Status**: ✅ Complete - Global deployment operational with client-side RTT-based selection
 
 ---
 

@@ -6,6 +6,7 @@
 .env
 target/
 helm/digital-ocean-secret
+*.swg
 
 # iOS specific
 *.xcframework/

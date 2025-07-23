@@ -1,17 +1,21 @@
 +++
-title = "The Dario Way: How to Add High Availability Without Selling Your Soul to AWS"
+title = "The Dario Way: How to Add High Availability Without Selling Your Soul to Cloudflare"
 date = 2025-07-23
-description = "A brutally honest guide to adding geosteering and load balancing that actually works, featuring RTT-based server selection and zero vendor lock-in"
+description = "Client-side RTT election for real-time media streaming and high availability across regions"
 [taxonomies]
 tags = ["rust", "high-availability", "load-balancing", "geosteering", "engineering"]
 authors = ["Dario Lencina Talarico"]
 +++
 
-# The Dario Way: How to Add High Availability Without Selling Your Soul to AWS
+# The Dario Way: How to Add High Availability Without Selling Your Soul to Cloudflare
 
 <p style="text-align:center; margin-top:1em; margin-bottom:1em;">
     <img src="/images/election-process.gif" alt="election process" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />
 </p>
+
+## Executive Summary
+
+Real-time media streaming stalls when users traverse half the globe to reach your backend. Instead of relying on coarse geo-DNS, we let the client run a three-second RTT election across every regional WebSocket and WebTransport endpoint and then lock onto the fastest. This article walks through the design, measurable impact, and practical steps for any infrastructure—including AWS.
 
 ## The Problem That Keeps Us Up at Night
 
@@ -23,13 +27,12 @@ This is the story of how we solved this problem the hard way, the right way, and
 
 Most engineers, when faced with this problem, immediately reach for the "enterprise solution":
 
-1. **DNS-based geo steering**: "Let's just use CloudFlare/Route53 and call it a day!"
-2. **CDN magic**: "The CDN will handle it!" 
-3. **Application load balancers**: "AWS ALB has geo proximity routing!"
+1. **DNS-based geo steering** (Cloudflare Geo Steering, AWS Route 53 latency/geo records) — quick to set up but only approximates “closeness.”
+2. **CDN magic** — great for static assets, not so much for long-lived, real-time transports.
+3. **AWS Global Accelerator** — robust anycast plus health checks, yet still chooses endpoints by proximity, not observed performance.
 
-Here's the thing nobody tells you about these solutions: they're all lying to you. DNS-based geo steering uses coarse geographic approximations that think your user in downtown Singapore is "close" to a server in Mumbai. CDNs are great for static content but terrible for WebTransport connections. And AWS ALB? Well, let's just say the pricing makes you wonder if Jeff Bezos personally hand-delivers each packet.
+These offerings do what they promise, but we wanted a system driven by **real RTT measured by the client**, not the provider’s best guess of who’s “closest.”
 
-But the real kicker? None of these solutions actually measure what matters: **real-world network performance between your actual user and your actual servers**.
 
 ## What This Actually Solves
 
@@ -88,6 +91,12 @@ Here's the secret sauce: all our regional servers are connected via NATS gateway
 
 Your client in Singapore connects to the Singapore server, your friend in New York connects to the US East server, but you're both in the same call because NATS handles the inter-region message routing. It's like having a really fast, really reliable postal service that speaks binary.
 
+### High-Level Architecture
+
+<p style="text-align:center; margin-top:1em; margin-bottom:1em;">
+    <img src="/images/global-architecture.png" alt="global architecture" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />
+</p>
+
 ## Implementation Reality Check
 
 ### The Connection Manager
@@ -134,7 +143,7 @@ Let's talk about what this actually looks like in practice. Here's the before an
 
 ### The Hard Numbers
 - **Average connection time**: Reduced by 60% globally
-- **RTT for APAC users**: Dropped from ~200ms to ~20ms  
+- **RTT for APAC users**: Dropped from ~200ms to ~40ms  
 - **Infrastructure costs**: Actually decreased because we're not paying for fancy geo-routing services
 - **Developer happiness**: Increased because the system actually works as expected
 - **On-call engineer stress**: Reduced by approximately "a lot"

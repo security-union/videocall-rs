@@ -5,6 +5,40 @@
 ### Objective
 Deploy videocall.rs globally using client-side RTT-based server selection, using cross_region NATS connectivity for global communication.
 
+## Diagram
+
+```mermaid
+flowchart LR
+    Client(["Client App"])
+
+    subgraph "US East"
+        direction TB
+        USE_WS["WS"]
+        USE_WT["WT"]
+        USE_NATS["NATS"]
+        USE_WS --> USE_NATS
+        USE_WT --> USE_NATS
+    end
+
+    subgraph "Singapore"
+        direction TB
+        SG_WS["WS"]
+        SG_WT["WT"]
+        SG_NATS["NATS"]
+        SG_WS --> SG_NATS
+        SG_WT --> SG_NATS
+    end
+
+    Client -- "RTT probes" --> USE_WS
+    Client -- "RTT probes" --> USE_WT
+    Client -- "RTT probes" --> SG_WS
+    Client -- "RTT probes" --> SG_WT
+
+    Client -.-> Selected(("Fastest Connection"))
+
+    USE_NATS --- SG_NATS
+``` 
+
 ### Regional Strategy
 - **Primary Region**: US East (NYC1) - Existing deployment
 - **Secondary Region**: Singapore (SGP1) - New deployment for Asia-Pacific

@@ -35,6 +35,7 @@ graph TD
 
 - **Web Client**: Built with Yew (Rust-to-WebAssembly framework)
   - **`yew-ui`** Web frontend built with the Yew framework and compiled to WebAssembly
+  - **`tailwind-yew`** css
   - **`videocall-client`** Client library for native integration
 - **CLI Client**: Native Rust client for headless devices
   - **`videocall-cli`** Command-line interface for headless video streaming

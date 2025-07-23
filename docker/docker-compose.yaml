@@ -20,8 +20,8 @@ services:
       - ENABLE_OAUTH=false
       - LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
-      - RUST_BACKTRACE=full
-      - RUST_LOG=debug
+      - RUST_BACKTRACE=1
+      # - RUST_LOG=debug
       - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
       - E2EE_ENABLED=${E2EE_ENABLED:-false}
       - USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM:-}

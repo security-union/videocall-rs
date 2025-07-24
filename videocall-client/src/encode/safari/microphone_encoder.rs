@@ -216,7 +216,7 @@ impl MicrophoneEncoder {
                         transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
                     client.send_packet(packet);
                     sequence_number += 1;
-                    log::debug!("Sent audio frame with sequence: {}", sequence_number - 1);
+                    log::debug!("Sent audio frame with sequence: {sequence_number}");
                 } else {
                     log::error!("Received non-MessageEvent: {chunk:?}");
                 }

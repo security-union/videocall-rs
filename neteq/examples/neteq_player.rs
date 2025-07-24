@@ -84,7 +84,8 @@ struct Args {
     min_delay_ms: u32,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     // ── Parse CLI ─────────────────────────────────────────────────────────────
@@ -201,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut n = neteq.lock().unwrap();
         n.register_decoder(
             111,
-            Box::new(OpusDecoder::new(sample_rate, channels).unwrap()),
+            Box::new(OpusDecoder::new(sample_rate, channels).await.unwrap()),
         );
     }
 

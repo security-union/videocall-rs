@@ -149,7 +149,10 @@ async fn stats_handler(
         }
         Err(e) => {
             eprintln!("Error reading stats file: {e}");
-            Err((StatusCode::NOT_FOUND, format!("Stats file not found: {e}")))
+            Err((
+                StatusCode::NOT_FOUND,
+                format!("Stats file not found: {e}"),
+            ))
         }
     }
 }

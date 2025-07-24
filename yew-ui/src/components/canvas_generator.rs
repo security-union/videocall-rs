@@ -29,37 +29,42 @@ use yew::virtual_dom::VNode;
 use yew::{html, Html};
 
 pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
-    peers
-        .iter()
-        .map(|key| {
-            if !USERS_ALLOWED_TO_STREAM.is_empty()
-                && !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
-            {
+    log::info!("Generating canvas for peers: {peers:?}");
+    let peers_clone = peers.clone();
+    peers_clone
+        .into_iter()
+        .map(move |key| {
+            if !USERS_ALLOWED_TO_STREAM.is_empty() && !USERS_ALLOWED_TO_STREAM.contains(&key) {
                 return html! {};
             }
-            let screen_share_css = if client.is_awaiting_peer_screen_frame(key) {
+            let screen_share_css = if client.is_awaiting_peer_screen_frame(&key) {
                 "grid-item hidden"
             } else {
                 "grid-item"
             };
-            let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
-            let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
-            let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
+            let is_video_enabled_for_peer = client.is_video_enabled_for_peer(&key);
+            let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(&key);
+            let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(&key);
 
+            let key_clone_for_button = key.clone();
             let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
             let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+            log::info!("Rendering pin icon for peer: {key}");
+            
             html! {
                 <>
-                    // Canvas for Screen share.
                     if is_screen_share_enabled_for_peer {
                         <div class={screen_share_css} id={(*screen_share_div_id).clone()}>
                             <div class="canvas-container">
                                 <canvas id={format!("screen-share-{}", &key)}></canvas>
                                 <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
                                 <button onclick={Callback::from(move |_| {
+                                    log::info!("Pin button clicked for: {key_clone_for_button}");
                                     toggle_pinned_div(&(*screen_share_div_id).clone());
-                                })} class="pin-icon">
-                                    <PushPinIcon/>
+                                })} class="pin-button">
+                                    <div class="pin-icon">
+                                        <PushPinIcon />
+                                    </div>
                                 </button>
                             </div>
                         </div>
@@ -67,6 +72,7 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
                         <>
                         </>
                     }
+                    
                     <div class="grid-item" id={(*peer_video_div_id).clone()}>
                         // One canvas for the User Video
                         <div class="canvas-container">

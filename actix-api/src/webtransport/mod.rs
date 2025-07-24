@@ -250,12 +250,12 @@ async fn handle_session(
         .await
     {
         Ok(sub) => {
-            info!("Subscribed to subject {}", subject);
+            info!("Subscribed to subject {subject}");
             sub
         }
         Err(e) => {
             let err = format!("error subscribing to subject {subject}: {e}");
-            error!("{}", err);
+            error!("{err}");
             return Err(anyhow!(err));
         }
     };
@@ -394,12 +394,12 @@ async fn handle_quic_connection(
                 .await
             {
                 Ok(sub) => {
-                    info!("Subscribed to subject {}", subject);
+                    info!("Subscribed to subject {subject}");
                     sub
                 }
                 Err(e) => {
                     let err = format!("error subscribing to subject {subject}: {e}");
-                    error!("{}", err);
+                    error!("{err}");
                     return;
                 }
             };

@@ -239,7 +239,9 @@ pub fn main() {
         match serde_wasm_bindgen::from_value::<WorkerMessage>(event.data()) {
             Ok(message) => handle_worker_message(message),
             Err(e) => {
-                console::error_1(&format!("[WORKER] Failed to deserialize message: {e:?}").into());
+                console::error_1(
+                    &format!("[WORKER] Failed to deserialize message: {e:?}").into(),
+                );
             }
         }
     }) as Box<dyn FnMut(_)>);
@@ -322,9 +324,7 @@ fn start_jitter_buffer_interval() {
     });
 
     console::log_1(
-        &format!(
-            "[WORKER] Started jitter buffer check interval ({JITTER_BUFFER_CHECK_INTERVAL_MS}ms)"
-        )
+        &format!("[WORKER] Started jitter buffer check interval with {JITTER_BUFFER_CHECK_INTERVAL_MS}ms interval")
         .into(),
     );
 }

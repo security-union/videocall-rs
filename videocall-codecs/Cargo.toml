@@ -23,6 +23,9 @@ crate-type = ["cdylib", "rlib"]
 name = "worker_decoder"
 path = "src/bin/worker_decoder.rs"
 required-features = ["wasm"]
+test = false
+bench = false
+doc = false
 
 [[bin]]
 name = "poc_decoder"

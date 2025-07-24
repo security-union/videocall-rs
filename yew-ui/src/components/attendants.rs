@@ -19,12 +19,12 @@
 use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
-    peer_list::PeerList,
+    host::Host, peer_list::PeerList,
 };
 use crate::constants::{
     CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
 };
-use crate::{components::host::Host, constants::ACTIX_WEBSOCKET};
+use crate::constants::ACTIX_WEBSOCKET;
 use gloo_utils::window;
 use log::{debug, error, warn};
 use serde_json;
@@ -408,7 +408,7 @@ impl Component for AttendantsComponent {
 
                     if let Err(e) = self.client.connect() {
                         ctx.link()
-                            .send_message(WsAction::Log(format!("Connection failed: {e}")));
+                            .send_message(WsAction::Log(format!("Connection failed: {e:?}")));
                     }
                     log::info!("Connected in attendants");
                     self.meeting_joined = true;

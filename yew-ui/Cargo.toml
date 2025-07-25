@@ -16,7 +16,7 @@ readme = "../README.md"
 yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = { workspace = true }
 videocall-types = { path= "../videocall-types", version = "2.0.0" }
-videocall-client = { path= "../videocall-client", version = "1.1.11", features = ["neteq_ff"] }
+videocall-client = { path= "../videocall-client", version = "1.1.12", features = ["neteq_ff"] }
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.1" }
 console_error_panic_hook = "0.1.7"
 console_log = "1.0.0"

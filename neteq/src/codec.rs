@@ -33,7 +33,6 @@ pub trait AudioDecoder {
 }
 
 // Platform-specific codec implementations
-#[cfg(feature = "web")]
 mod native_opus;
 #[cfg(feature = "web")]
 mod safari_decoder;
@@ -42,6 +41,10 @@ mod wasm_stub;
 
 #[cfg(feature = "web")]
 pub use safari_decoder::SafariOpusDecoder;
+
+// Always export NativeOpusDecoder for native targets
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_opus::NativeOpusDecoder;
 
 #[cfg(not(feature = "web"))]
 pub use wasm_stub::*;
@@ -126,8 +129,8 @@ impl AudioDecoder for UnifiedOpusDecoder {
 }
 
 // Convenience type alias for the recommended decoder
-#[cfg(feature = "web")]
+#[cfg(target_arch = "wasm32")]
 pub type OpusDecoder = UnifiedOpusDecoder;
 
-#[cfg(not(feature = "web"))]
-pub type OpusDecoder = wasm_stub::OpusDecoder;
+#[cfg(not(target_arch = "wasm32"))]
+pub type OpusDecoder = native_opus::NativeOpusDecoder;

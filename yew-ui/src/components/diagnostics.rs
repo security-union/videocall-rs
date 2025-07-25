@@ -982,7 +982,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     html! {
         <div id="diagnostics-sidebar" class={if props.is_open {"visible"} else {""}}>
             <div class="sidebar-header">
-                <h2>{"NetEq Performance Dashboard"}</h2>
+                <h2>{"Call Diagnostics"}</h2>
                 <button class="close-button" onclick={close_handler}>{"×"}</button>
             </div>
             <div class="sidebar-content">

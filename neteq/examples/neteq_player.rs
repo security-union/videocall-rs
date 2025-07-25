@@ -26,6 +26,7 @@ use web_time::{Duration, Instant};
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::BufferSize;
+
 use neteq::codec::OpusDecoder;
 use neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
 use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
@@ -83,7 +84,6 @@ struct Args {
     )]
     min_delay_ms: u32,
 }
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let json_stats = args.json_stats;
     let volume = args.volume.clamp(0.0, 2.0); // Allow up to 200% volume, minimum 0% (mute)
 
-    log::info!("Loading WAV file: {}", wav_path);
+    log::info!("Loading WAV file: {wav_path}");
     log::info!(
         "Audio volume: {:.1}% ({})",
         volume * 100.0,
@@ -104,9 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if reorder_window_ms > 0 || max_jitter_ms > 0 {
         log::info!(
-            "Network simulation enabled: max_jitter={}ms, reorder_window={}ms",
-            max_jitter_ms,
-            reorder_window_ms
+            "Network simulation enabled: max_jitter={max_jitter_ms}ms, reorder_window={reorder_window_ms}ms"
         );
     } else {
         log::info!("Network simulation disabled (no jitter or reordering)");
@@ -131,10 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         original_sample_rate
     } else {
         // Default to 48kHz if not supported
-        log::warn!(
-            "Sample rate {} Hz not supported by Opus, using 48000 Hz",
-            original_sample_rate
-        );
+        log::warn!("Sample rate {original_sample_rate} Hz not supported by Opus, using 48000 Hz");
         48000
     };
 
@@ -142,19 +137,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         original_channels
     } else {
         log::warn!(
-            "Opus only supports mono/stereo, downmixing {} channels to stereo",
-            original_channels
+            "Opus only supports mono/stereo, downmixing {original_channels} channels to stereo"
         );
         2
     };
 
     if sample_rate != original_sample_rate || channels != original_channels {
         log::info!(
-            "Audio will be converted: {}Hz/{}ch -> {}Hz/{}ch",
-            original_sample_rate,
-            original_channels,
-            sample_rate,
-            channels
+            "Audio will be converted: {original_sample_rate}Hz/{original_channels}ch -> {sample_rate}Hz/{channels}ch"
         );
     }
 
@@ -182,11 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let neteq = Arc::new(Mutex::new(NetEq::new(neteq_cfg)?));
 
-    log::info!(
-        "NetEq initialised (sample_rate {} Hz, channels {}).",
-        sample_rate,
-        channels
-    );
+    log::info!("NetEq initialised (sample_rate {sample_rate} Hz, channels {channels}).");
 
     if args.no_neteq {
         log::info!(
@@ -199,10 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Register Opus decoder for payload type 111.
     {
         let mut n = neteq.lock().unwrap();
-        n.register_decoder(
-            111,
-            Box::new(OpusDecoder::new(sample_rate, channels).unwrap()),
-        );
+        n.register_decoder(111, Box::new(OpusDecoder::new(sample_rate, channels)?));
     }
 
     // ── Warm-start NetEq with a few packets before audio begins ─────────────
@@ -494,7 +477,7 @@ fn build_stream_f32(
     volume: f32,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let mut leftover: Vec<f32> = Vec::new();
-    let err_fn = |e| eprintln!("Stream error: {}", e);
+    let err_fn = |e| eprintln!("Stream error: {e}");
     device.build_output_stream(
         cfg,
         move |output: &mut [f32], _| {
@@ -516,7 +499,7 @@ fn build_stream_i16(
     volume: f32,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let mut leftover: Vec<f32> = Vec::new();
-    let err_fn = |e| eprintln!("Stream error: {}", e);
+    let err_fn = |e| eprintln!("Stream error: {e}");
     device.build_output_stream(
         cfg,
         move |output: &mut [i16], _| {
@@ -542,7 +525,7 @@ fn build_stream_u16(
     volume: f32,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let mut leftover: Vec<f32> = Vec::new();
-    let err_fn = |e| eprintln!("Stream error: {}", e);
+    let err_fn = |e| eprintln!("Stream error: {e}");
     device.build_output_stream(
         cfg,
         move |output: &mut [u16], _| {
@@ -577,7 +560,7 @@ fn fill_output_neteq(
                         leftover.extend_from_slice(&frame.samples);
                     }
                     Err(e) => {
-                        log::warn!("BUFFER UNDERRUN: NetEq get_audio error: {:?}", e);
+                        log::warn!("BUFFER UNDERRUN: NetEq get_audio error: {e:?}");
                         underrun_occurred = true;
                         // fill silence and return
                         for s in &mut buffer[idx..] {
@@ -587,7 +570,7 @@ fn fill_output_neteq(
                     }
                 },
                 Err(poison) => {
-                    log::error!("NetEq mutex poisoned: {}", poison);
+                    log::error!("NetEq mutex poisoned: {poison}");
                     underrun_occurred = true;
                     for s in &mut buffer[idx..] {
                         *s = 0.0;

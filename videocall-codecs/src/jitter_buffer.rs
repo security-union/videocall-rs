@@ -260,9 +260,7 @@ impl<T> JitterBuffer<T> {
     /// Pushes a single frame to the shared decodable queue.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
         let seq = frame.sequence_number();
-        println!(
-            "[JITTER_BUFFER] Pushing frame {seq} to decoder."
-        );
+        println!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
     }
 

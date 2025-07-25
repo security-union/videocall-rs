@@ -151,9 +151,7 @@ impl PacketBuffer {
                 }
             }
 
-            log::debug!(
-                "Partial flush: removed {remove_count} packets, kept {keep_count}"
-            );
+            log::debug!("Partial flush: removed {remove_count} packets, kept {keep_count}");
             return Ok(BufferReturnCode::PartialFlush);
         }
 

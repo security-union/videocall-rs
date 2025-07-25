@@ -491,7 +491,9 @@ impl PeerDecodeManager {
                         log::info!("Successfully rebuilt audio decoder for peer: {key} with speaker device (muted: {current_muted})");
                     }
                     Err(e) => {
-                        log::error!("Failed to rebuild audio decoder for peer: {key}, error: {e:?}");
+                        log::error!(
+                            "Failed to rebuild audio decoder for peer: {key}, error: {e:?}"
+                        );
                         // Keep the old decoder rather than breaking audio completely
                     }
                 }

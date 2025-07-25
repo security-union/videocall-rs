@@ -52,7 +52,7 @@ pub trait FormatDecoder: Clone + Sized + Send + Sync {
 
 /// A Zero-Size-Type that contains the definition to convert a given image stream to an RGB888 in the [`Buffer`](crate::buffer::Buffer)'s [`.decode_image()`](crate::buffer::Buffer::decode_image)
 ///
-/// ```ignore
+/// ```.ignore
 /// use image::{ImageBuffer, Rgb};
 /// let image: ImageBuffer<Rgb<u8>, Vec<u8>> = buffer.to_image::<RgbFormat>();
 /// ```
@@ -133,7 +133,7 @@ impl FormatDecoder for RgbFormat {
 
 /// A Zero-Size-Type that contains the definition to convert a given image stream to an RGBA8888 in the [`Buffer`](crate::buffer::Buffer)'s [`.decode_image()`](crate::buffer::Buffer::decode_image)
 ///
-/// ```ignore
+/// ```.ignore
 /// use image::{ImageBuffer, Rgba};
 /// let image: ImageBuffer<Rgba<u8>, Vec<u8>> = buffer.to_image::<RgbAFormat>();
 /// ```
@@ -229,7 +229,7 @@ impl FormatDecoder for RgbAFormat {
 
 /// A Zero-Size-Type that contains the definition to convert a given image stream to an Luma8(Grayscale 8-bit) in the [`Buffer`](crate::buffer::Buffer)'s [`.decode_image()`](crate::buffer::Buffer::decode_image)
 ///
-/// ```ignore
+/// ```.ignore
 /// use image::{ImageBuffer, Luma};
 /// let image: ImageBuffer<Luma<u8>, Vec<u8>> = buffer.to_image::<LumaFormat>();
 /// ```
@@ -327,7 +327,7 @@ impl FormatDecoder for LumaFormat {
 
 /// A Zero-Size-Type that contains the definition to convert a given image stream to an LumaA8(Grayscale 8-bit with 8-bit alpha) in the [`Buffer`](crate::buffer::Buffer)'s [`.decode_image()`](crate::buffer::Buffer::decode_image)
 ///
-/// ```ignore
+/// ```.ignore
 /// use image::{ImageBuffer, LumaA};
 /// let image: ImageBuffer<LumaA<u8>, Vec<u8>> = buffer.to_image::<LumaAFormat>();
 /// ```

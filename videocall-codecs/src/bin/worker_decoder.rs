@@ -239,9 +239,7 @@ pub fn main() {
         match serde_wasm_bindgen::from_value::<WorkerMessage>(event.data()) {
             Ok(message) => handle_worker_message(message),
             Err(e) => {
-                console::error_1(
-                    &format!("[WORKER] Failed to deserialize message: {e:?}").into(),
-                );
+                console::error_1(&format!("[WORKER] Failed to deserialize message: {e:?}").into());
             }
         }
     }) as Box<dyn FnMut(_)>);

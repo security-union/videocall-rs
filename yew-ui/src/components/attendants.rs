@@ -21,10 +21,10 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     host::Host, peer_list::PeerList,
 };
+use crate::constants::ACTIX_WEBSOCKET;
 use crate::constants::{
     CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
 };
-use crate::constants::ACTIX_WEBSOCKET;
 use gloo_utils::window;
 use log::{debug, error, warn};
 use serde_json;

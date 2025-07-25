@@ -205,31 +205,21 @@ impl Clone for SelectableDevices {
 ///
 ///  Outline of usage is:
 ///
-/// ```no_run
-/// # use videocall_client::MediaDeviceList;
-/// # use yew::Callback;
-/// # use wasm_bindgen::JsValue;
-/// 
-/// // Create a new device list
+/// ```
 /// let mut media_device_list = MediaDeviceList::new();
-/// 
-/// // Set up callbacks for device selection
-/// media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
-///     
-/// });
-/// 
-/// media_device_list.video_inputs.on_selected = Callback::from(|device_id: String| {
-///     
-/// });
-/// 
-/// media_device_list.audio_outputs.on_selected = Callback::from(|device_id: String| {
-///     
-/// });
-/// 
-/// // Load available devices
+/// media_device_list.audio_inputs.on_selected = ...; // callback
+/// media_device_list.video_inputs.on_selected = ...; // callback
+/// media_device_list.audio_outputs.on_selected = ...; // callback
+///
 /// media_device_list.load();
-/// 
-
+///
+/// let microphones = media_device_list.audio_inputs.devices();
+/// let cameras = media_device_list.video_inputs.devices();
+/// let speakers = media_device_list.audio_outputs.devices();
+/// media_device_list.audio_inputs.select(&microphones[i].device_id);
+/// media_device_list.video_inputs.select(&cameras[i].device_id);
+/// media_device_list.audio_outputs.select(&speakers[i].device_id);
+///
 /// ```
 pub struct MediaDeviceList<P: MediaDevicesProvider + Clone = BrowserMediaDevicesProvider> {
     /// The list of audio input devices. This field is `pub` for access through it, but should be considerd "read-only".
@@ -534,27 +524,11 @@ impl MediaDeviceList {
     /// After constructing, the user should set the [`on_selected`](SelectableDevices::on_selected)
     /// callbacks, e.g.:
     ///
-    /// ```no_run
-    /// # use videocall_client::MediaDeviceList;
-    /// # use yew::Callback;
-    /// 
-    /// let mut media_device_list = MediaDeviceList::new();
-    /// 
-    /// // Set up callbacks for device selection
-    /// media_device_list.audio_inputs.on_selected = Callback::from(|_device_id: String| {
-    ///     
-    /// });
-    /// 
-    /// media_device_list.video_inputs.on_selected = Callback::from(|_device_id: String| {
-    ///     
-    /// });
-    /// 
-    /// media_device_list.audio_outputs.on_selected = Callback::from(|_device_id: String| {
-    ///     
-    /// });
-    /// 
-    /// // Don't forget to call load() to populate the device lists
-    /// media_device_list.load();
+    /// ```
+    /// let media_device_list = MediaDeviceList::new();
+    /// media_device_list.audio_inputs.on_selected = ...; // callback
+    /// media_device_list.video_inputs.on_selected = ...; // callback
+    /// media_device_list.audio_outputs.on_selected = ...; // callback
     /// ```
     ///
     /// After constructing, [`load()`](Self::load) needs to be called to populate the lists.

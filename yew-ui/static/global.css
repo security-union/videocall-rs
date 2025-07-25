@@ -1137,7 +1137,7 @@ body {
   opacity: 0.6 !important;
   background-color: rgba(0, 0, 0, 0.5) !important;
   border-radius: 50% !important;
-  padding: 5px 8px !important;
+  padding: 5px 5px !important;
   text-align: center !important;
   line-height: 1 !important;
   cursor: pointer !important;
@@ -1148,8 +1148,8 @@ body {
 
 /* Style for the pin icon SVG */
 .grid-item .canvas-container .pin-icon svg {
-  width: 1.5em !important;
-  height: 1.5em !important;
+  width: 1.5rem !important;
+  height: 1.5rem !important;
   display: block !important;
 }
 

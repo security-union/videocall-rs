@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.24](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.23...videocall-cli-v1.0.24) - 2025-07-25
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.23](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.22...videocall-cli-v1.0.23) - 2025-07-25
+
+### Other
+
+- Fix pin icon positioning and visibility on iOS and desktop ([#324](https://github.com/security-union/videocall-rs/pull/324)) ([#338](https://github.com/security-union/videocall-rs/pull/338))
+
+## [1.0.22](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.21...videocall-cli-v1.0.22) - 2025-07-22
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [1.0.21](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.20...videocall-cli-v1.0.21) - 2025-07-21
 
 ### Other

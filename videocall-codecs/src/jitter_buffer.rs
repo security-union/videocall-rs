@@ -215,8 +215,8 @@ impl<T> JitterBuffer<T> {
 
                     let is_ready = time_in_buffer_ms >= self.target_playout_delay_ms;
                     println!(
-                        "[JB_POLL] Candidate {}: Time in buffer: {:.2}ms, Target: {:.2}ms -> Ready: {}",
-                        key, time_in_buffer_ms, self.target_playout_delay_ms, is_ready
+                        "[JB_POLL] Candidate {key}: Time in buffer: {time_in_buffer_ms:.2}ms, Target: {:.2}ms -> Ready: {is_ready}",
+                        self.target_playout_delay_ms
                     );
 
                     if is_ready {
@@ -259,10 +259,8 @@ impl<T> JitterBuffer<T> {
 
     /// Pushes a single frame to the shared decodable queue.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
-        println!(
-            "[JITTER_BUFFER] Pushing frame {} to decoder.",
-            frame.sequence_number()
-        );
+        let seq = frame.sequence_number();
+        println!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
     }
 

@@ -322,9 +322,7 @@ fn start_jitter_buffer_interval() {
     });
 
     console::log_1(
-        &format!(
-            "[WORKER] Started jitter buffer check interval ({JITTER_BUFFER_CHECK_INTERVAL_MS}ms)"
-        )
+        &format!("[WORKER] Started jitter buffer check interval with {JITTER_BUFFER_CHECK_INTERVAL_MS}ms interval")
         .into(),
     );
 }

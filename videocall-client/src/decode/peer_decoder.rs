@@ -256,7 +256,7 @@ impl StandardAudioPeerDecoder {
 impl Drop for StandardAudioPeerDecoder {
     fn drop(&mut self) {
         if let Err(e) = self._audio_context.close() {
-            log::error!("Error closing audio context: {e:?}");
+            error!("Error closing audio context: {e:?}");
         }
     }
 }

@@ -1125,4 +1125,51 @@ body {
 .error {
   color: #ff5555;
   font-size: 0.9rem;
-} 
+}
+
+/* Pin Icon Fixes - High Specificity Override */
+.grid-item .canvas-container .pin-icon {
+  visibility: visible !important; /* Always visible on mobile */
+  position: absolute !important;
+  top: 10px !important;
+  left: 10px !important;
+  transform: none !important; /* Remove centering transform */
+  opacity: 0.6 !important;
+  background-color: rgba(0, 0, 0, 0.5) !important;
+  border-radius: 50% !important;
+  padding: 5px 5px !important;
+  text-align: center !important;
+  line-height: 1 !important;
+  cursor: pointer !important;
+  z-index: 10 !important;
+  transition: opacity 0.2s ease !important;
+  border: none !important;
+}
+
+/* Style for the pin icon SVG */
+.grid-item .canvas-container .pin-icon svg {
+  width: 1.5rem !important;
+  height: 1.5rem !important;
+  display: block !important;
+}
+
+/* Hide pin icon by default on desktop, show on hover */
+@media (min-width: 768px) {
+  .grid-item .canvas-container .pin-icon {
+    visibility: hidden !important;
+    opacity: 0 !important;
+  }
+  
+  .grid-item .canvas-container:hover .pin-icon {
+    visibility: visible !important;
+    opacity: 0.6 !important;
+  }
+}
+
+/* Ensure pin is always visible on mobile */
+@media (max-width: 767px) {
+  .grid-item .canvas-container .pin-icon {
+    visibility: visible !important;
+    opacity: 0.6 !important;
+  }
+}

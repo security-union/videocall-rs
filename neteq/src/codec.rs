@@ -33,7 +33,7 @@ pub trait AudioDecoder {
 }
 
 // Platform-specific codec implementations
-#[cfg(feature = "web")]
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 mod native_opus;
 #[cfg(feature = "web")]
 mod safari_decoder;
@@ -43,8 +43,48 @@ mod wasm_stub;
 #[cfg(feature = "web")]
 pub use safari_decoder::SafariOpusDecoder;
 
+// Always export NativeOpusDecoder for native targets
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+pub use native_opus::NativeOpusDecoder;
+
 #[cfg(not(feature = "web"))]
 pub use wasm_stub::*;
+
+// Stub implementation for when native feature is not available
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
+pub struct StubOpusDecoder {
+    sample_rate: u32,
+    channels: u8,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
+impl StubOpusDecoder {
+    pub fn new(sample_rate: u32, channels: u8) -> Result<Self> {
+        log::warn!("Using stub Opus decoder - no actual decoding will occur");
+        Ok(Self {
+            sample_rate,
+            channels,
+        })
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
+impl AudioDecoder for StubOpusDecoder {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    fn decode(&mut self, _encoded: &[u8]) -> Result<Vec<f32>> {
+        // Return silence for 20ms frame
+        let samples_per_channel = (self.sample_rate as f32 * 0.02) as usize;
+        let total_samples = samples_per_channel * self.channels as usize;
+        Ok(vec![0.0; total_samples])
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Unified Opus Decoder - Browser Detection & Selection
@@ -126,8 +166,12 @@ impl AudioDecoder for UnifiedOpusDecoder {
 }
 
 // Convenience type alias for the recommended decoder
-#[cfg(feature = "web")]
+#[cfg(target_arch = "wasm32")]
 pub type OpusDecoder = UnifiedOpusDecoder;
 
-#[cfg(not(feature = "web"))]
-pub type OpusDecoder = wasm_stub::OpusDecoder;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+pub type OpusDecoder = native_opus::NativeOpusDecoder;
+
+// For non-wasm32 targets without native feature, use stub
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "native")))]
+pub type OpusDecoder = StubOpusDecoder;

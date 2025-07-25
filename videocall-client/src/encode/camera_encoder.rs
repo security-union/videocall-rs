@@ -85,6 +85,10 @@ impl CameraEncoder {
     ///
     /// * `video_elem_id` - the the ID of an `HtmlVideoElement` to which the camera will be connected.  It does not need to currently exist.
     ///
+    /// * `initial_bitrate` - the initial bitrate for the encoder, in kbps.
+    ///
+    /// * `on_encoder_settings_update` - a callback that will be called when the encoder settings change.
+    ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
     pub fn new(

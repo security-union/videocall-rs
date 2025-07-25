@@ -190,7 +190,6 @@ pub fn neteq_chart(props: &NetEqChartProps) -> Html {
             .collect::<Vec<_>>()
             .join(" ")
     };
-
     let time_span = data_len.saturating_sub(1);
 
     html! {

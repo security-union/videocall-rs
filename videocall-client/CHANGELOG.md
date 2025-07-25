@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.12](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.11...videocall-client-v1.1.12) - 2025-07-25
+
+### Other
+
+- Fix net eq 2 ([#340](https://github.com/security-union/videocall-rs/pull/340))
+- Fix pin icon positioning and visibility on iOS and desktop ([#324](https://github.com/security-union/videocall-rs/pull/324)) ([#338](https://github.com/security-union/videocall-rs/pull/338))
+
 ## [1.1.11](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.10...videocall-client-v1.1.11) - 2025-07-20
 
 ### Other

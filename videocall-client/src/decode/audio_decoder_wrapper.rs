@@ -107,7 +107,7 @@ impl MediaDecoderTrait for AudioDecoderWrapper {
     }
 
     fn configure(&self, config: &Self::ConfigType) -> Result<(), JsValue> {
-        info!("Configuring audio decoder (MediaDecoderTrait) with config: {config:?}");
+        info!("Configuring audio decoder (MediaDecoderTrait) with config: {config:?}",);
         self.0.configure(config)
     }
 

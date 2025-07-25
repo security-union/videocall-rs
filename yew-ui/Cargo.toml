@@ -1,6 +1,6 @@
 [package]
 name = "videocall-ui"
-version = "1.0.13"
+version = "1.0.14"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A Yew UI for the videocall project"

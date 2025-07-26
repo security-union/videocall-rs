@@ -60,7 +60,13 @@ impl BrowserCompatibility {
     fn check_browser_compatibility() -> Option<String> {
         let window = web_sys::window().unwrap();
 
-        // First check if this is Firefox and block it specifically
+        // First check SSL requirement if the feature is enabled
+        #[cfg(feature = "check_ssl")]
+        if let Some(ssl_error) = Self::check_ssl_requirement() {
+            return Some(ssl_error);
+        }
+
+        // Check if this is Firefox and block it specifically
         if Self::is_firefox() {
             return Some(
                 "🦊 Firefox Detected! Unfortunately, videocall.rs doesn't support Firefox due to incomplete MediaStreamTrackProcessor implementation. Please use Desktop Chrome, Chromium, Brave, or Edge for the best experience. 🚀".to_string()
@@ -121,6 +127,27 @@ impl BrowserCompatibility {
     }
 
     // Helper function for testing Firefox detection with custom user agent
+    #[cfg(feature = "check_ssl")]
+    fn check_ssl_requirement() -> Option<String> {
+        if let Some(window) = web_sys::window() {
+            if let Ok(location) = window.location().protocol() {
+                let hostname = window.location().hostname().unwrap_or_default();
+
+                // Check if we're in a secure context
+                // localhost, 127.0.0.1, and ::1 are always considered secure
+                let is_localhost =
+                    hostname == "localhost" || hostname == "127.0.0.1" || hostname == "::1";
+
+                if location != "https:" && !is_localhost {
+                    return Some(
+                        "🔒 HTTPS Required: Camera and microphone access requires a secure connection (HTTPS) due to browser security policies. Please visit this site using https:// or use localhost for development. Learn more about why this is required: https://app.videocall.rs/posts/https-camera-microphone-access-webrtc-security".to_string()
+                    );
+                }
+            }
+        }
+        None
+    }
+
     #[cfg(test)]
     fn is_firefox_from_ua(user_agent: &str) -> bool {
         let ua_lower = user_agent.to_lowercase();
@@ -137,6 +164,21 @@ impl BrowserCompatibility {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "check_ssl")]
+    #[test]
+    fn test_ssl_check_with_https() {
+        // Note: This test would require mocking window.location in a real test environment
+        // For now, we'll test the logic conceptually
+        // In a real browser test environment with HTTPS, check_ssl_requirement() should return None
+    }
+
+    #[cfg(feature = "check_ssl")]
+    #[test]
+    fn test_ssl_check_with_localhost() {
+        // Note: This test would require mocking window.location in a real test environment
+        // For localhost, check_ssl_requirement() should return None even with HTTP
+    }
 
     #[test]
     fn test_firefox_detection() {

@@ -14,7 +14,7 @@ COPY . .
 WORKDIR /app/yew-ui
 
 RUN rustup target add wasm32-unknown-unknown
-RUN trunk build --release
+RUN trunk build --release --features check_ssl
 
 FROM nginx:1.21.5-alpine as production
 

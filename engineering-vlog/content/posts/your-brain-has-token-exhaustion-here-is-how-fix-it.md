@@ -12,13 +12,13 @@ tags = ["ai", "productivity", "creativity", "time-management", "remote-work", "a
 authors = ["Dario Lencina Talarico"]
 +++
 
->   **Warning: this article is written by my dumb ass human brain and fleshy fingers, no AI was harmed in the process other than SEO optimization and read proofing.**
+>   **Warning: this article is written by my pedestrian human brain and fleshy fingers, no AI was harmed in the process other than SEO optimization and read proofing.**
 
 # Coding with AI still has flaws, but it is a force multiplier and you should use it now. 
 
-While everyone seems to focus in a mindset of scarsity zero sum game, trying to fight AI, making fun of the obvious flaws, the 6 finger hands, the basic algebra issues, as a creator, new, full time employee, AI helps me to build my dream apps with the limited amount of time I got, this includes videocall.rs
+While everyone seems to focus in a mindset of scarsity zero sum game, trying to fight AI, making fun of the obvious flaws, the 6 finger hands, the basic algebra issues, as a creator, new father and full time employee at May Mobility, AI helps me to build my dream apps with the limited amount of time I got, this includes primarily [videocall.s](https://videocall.rs) and [Remote Shutter](https://apps.apple.com/us/app/remote-shutter-camera-connect/id633274861)
 
-Picture this, it is sunday 4:57 am, my brain won't let me sleep, I am on a mission, I want to rewrite my already successful remote shutter app (add link), I want to incorportate tiktok/short creation. It used to be the case that I needed to hire a designer, and a developer to be able to deliver new features in a timely matter, now with AI that is all out the window.
+Picture this, it is sunday 4:57 am, my brain won't let me sleep, I am on a mission, I want to rewrite my already successful remote shutter app, I want to incorportate tiktok/short creation, but prior to that, I need to rewrite significant chunks of the UI in SwiftUI, as many of you know, a few years ago, Apple pivoted from Storyboards to SwiftUI. It used to be the case that I needed to hire a designer, and a developer to be able to deliver new features in a timely matter, now with AI that is all out the window.
 
 <p style="text-align:center; margin-top:1em; margin-bottom:1em;">
     <img src="/images/mom_and_baby.PNG" alt="mom and baby" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />

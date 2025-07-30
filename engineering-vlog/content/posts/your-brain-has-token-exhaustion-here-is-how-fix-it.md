@@ -1,40 +1,39 @@
 +++
-title = "Coding with AI still has flaws, but it is a force multiplier and you should use it now."
-date = 2025-07-27
-description = "Coding with AI still has flaws, but it is a force multiplier and you should use it now."
+title = "AI is Still Garbage at Complex Reasoning, But Here's How to Make It Work"
+date = 2025-07-30
+description = "The real story of AI collaboration: where it fails, where it succeeds, and how to actually leverage it for 10x productivity gains."
 authors = ["Dario Lencina Talarico"]
 slug = "your-brain-has-token-exhaustion-here-is-how-fix-it"
-tags = ["ai", "productivity", "creativity", "time-management", "remote-work", "ai-productivity", "ai-creativity", "ai-time-management", "ai-remote-work"]
-categories = ["Productivity", "Creativity", "Time Management", "Remote Work"]
-keywords = ["ai", "productivity", "creativity", "time-management", "remote-work", "ai-productivity", "ai-creativity", "ai-time-management", "ai-remote-work"]
+tags = ["ai", "productivity", "cursor", "claude", "software-development", "ai-limitations", "ai-productivity"]
+categories = ["Software Development", "AI", "Productivity"]
+keywords = ["ai", "cursor", "claude", "productivity", "software-development", "ai-limitations"]
 [taxonomies]
-tags = ["ai", "productivity", "creativity", "time-management", "remote-work", "ai-productivity", "ai-creativity", "ai-time-management", "ai-remote-work"]
+tags = ["ai", "productivity", "cursor", "claude", "software-development", "ai-limitations"]
 authors = ["Dario Lencina Talarico"]
 +++
 
->   **Warning: this article is written by my pedestrian human brain and fleshy fingers, no AI was harmed in the process other than SEO optimization and read proofing.**
+> **Warning: This article contains actual technical insights, not AI hype. If you're looking for "AI will solve everything" content, look elsewhere.**
 
-# Coding with AI still has flaws, but it is a force multiplier and you should use it now. 
+# AI is Still Garbage at Complex Reasoning, But Here's How to Make It Work
 
-While everyone seems to focus in a mindset of scarsity zero sum game, trying to fight AI, making fun of the obvious flaws, the 6 finger hands, the basic algebra issues, as a creator, new father and full time employee at May Mobility, AI helps me to build my dream apps with the limited amount of time I got, this includes primarily [videocall.s](https://videocall.rs) and [Remote Shutter](https://apps.apple.com/us/app/remote-shutter-camera-connect/id633274861)
+It's 4:57 AM on a Sunday. My brain won't shut off because I'm obsessing over rewriting my 10-year-old iOS app. I'm a new father with maybe 4 hours of focused time per day (on top of my 8 hour work day), and I need to modernize [Remote Shutter](https://apps.apple.com/us/app/remote-shutter-camera-connect/id633274861) from Storyboards to SwiftUI. For context, Remote Shutter is a camera app that lets you control your iPhone's camera remotely via Multipeer Connectivity - essentially turning your iPhone into a wireless camera that can stream video to other devices.
 
-Picture this, it is sunday 4:57 am, my brain won't let me sleep, I am on a mission, I want to rewrite my already successful remote shutter app, I want to incorportate tiktok/short creation, but prior to that, I need to rewrite significant chunks of the UI in SwiftUI, as many of you know, a few years ago, Apple pivoted from Storyboards to SwiftUI. It used to be the case that I needed to hire a designer, and a developer to be able to deliver new features in a timely matter, now with AI that is all out the window.
+Here's the brutal truth: AI is still terrible at understanding complex codebases, but I figured out how to make it work. This isn't another "AI is amazing" fluff piece. This is the real story of where AI fails, where it succeeds, and how to actually leverage it for 10x productivity gains.
 
-<p style="text-align:center; margin-top:1em; margin-bottom:1em;">
-    <img src="/images/mom_and_baby.PNG" alt="mom and baby" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />
-</p>
+## The Real Problem: Cognitive Bottleneck
 
-Even when it still needs human guidance, just like Waymos which are known to use remote assistance, AI is a force multiplier, within 10 minutes I was able to prototype a new feature, and I was able to do it with the help of AI.
+I've been coding for 15+ years, from embedded systems to distributed architectures. The fundamental limitation has always been the same: I can only think about one complex problem at a time. When I'm architecting a new feature, I can't simultaneously write boilerplate code, handle edge cases, and maintain consistent patterns.
 
-I crank up the Dark Side of the Moon, because listening to AI slop like Brazilian Phonk is a step too far for this boomer. Although I listen through it through YouTube music, so my inner self is judging me, if I was still cool I would play it on my stereo. (of course I bought the physical album as I am typing, mine is in the homeland Mexico)
+AI changes this equation, but not in the way most people think.
 
+## The Actual Process: Where AI Failed and Succeeded
 
-I open the Remote Shutter app. Look at the storyboard that I wrote more than 10 years ago, and confindently say: "I am going to tear you down motha f*cka" because as you know, all the cool kids are writing their iOS apps in SwiftUI, Storyboards are for boomer developers (which I am XD), (yes I also have thousands of Objective C lines) I am that old.
+### The Initial Prompt (That Failed)
 
-So, I select Claude 4.5 and ask:
+I started with Claude 4.5 and this prompt:
 
 ```
-I want to rewrite @MonitorViewController entirely in SwiftUI, preserve all existing functionality but modernize the look and feel. 
+I want to rewrite @MonitorViewController entirely in SwiftUI, preserve all existing functionality but modernize the look and feel using the latest Apple design guidelines.
 
 You'll have to modify the @MainPeer.storyboard to point to the new SwiftUI view.
 
@@ -42,6 +41,10 @@ Preserve localizations, and all existing functionality.
 
 Do not dive heads first, first tell me what you think about this feature, then produce a plan, and WHEN APPROVED, then execute the plan.
 ```
+
+**What happened:** Claude gave me a generic MVVM implementation that didn't compile and completely missed the existing architecture. It generated 300 lines of broken code.
+
+**Why it failed:** AI did not have the right rules to succeed, by default, Claude wont think about compiling the code, it will just generate stuff then use a very light linter to check for errors.
 
 ## 💡 Pro Tip
 
@@ -53,31 +56,156 @@ Do not dive heads first, first tell me what you think about this feature, then p
     <img src="/images/ai-bad-newb-post.png" alt="election process" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />
 </p>
 
-Anyways, we go back and forth, within 20 prompts, I was able to get a working prototype, and I am happy. Let me know if you want to see the back and forth in detail, yes, I had to type like 2 lines of code, because somehow Claude 4 forgot about how Optionals work in Swift for a second, yet it produced a beautiful working prototype that required about 600 lines of code.
+### The Real Conversation (That Worked)
 
-<p style="text-align:center; margin-top:1em; margin-bottom:1em;">
-    <img src="/images/broken-state.png" alt="election process" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />
-</p>
+After the first failure, I restructured the approach:
+
+```
+Claude, here's the current MonitorViewController architecture:
+- Uses MVVM pattern
+- Handles video streaming via Apple Multipeer Connectivity
+- Manages connection state via the [Theater actor framework](https://github.com/darioalessandro/Theater)
+
+Can you analyze this and propose a SwiftUI migration strategy that preserves the existing patterns?
+
+Always compile and test code before sending it to me. If there are compilation errors, fix them first. Never send uncompilable code.
+```
+
+**What happened:** Claude now understood the context and proposed a realistic migration plan.
+
+**Why it worked:** I gave it the architectural context it needed. AI is garbage at inferring context, but decent at following patterns once you show them.
+
+### The Compilation Rule
+
+After getting broken code three times, I added this Cursor rule:
+
+```
+Always compile and test code before sending it to me. If there are compilation errors, fix them first. Never send uncompilable code.
+```
+
+**Result:** Claude now validates its own code before sending it. This alone saved me hours of debugging.
+
+**Warning:** seems like sometimes Claude will get frustrated and start taking shortcuts just to "overfit" the rule, so you need to be careful with the rules you add, and you need to be careful with the prompts you give it.
+
+## The Systems-Level Shift: From Player to Coach
+
+Here's the real insight: AI doesn't make you a better coder. It makes you a better architect.
+
+### Before AI:
+- I was the player: writing every line of code
+- Focused on implementation details
+- Could only tackle one problem at a time
+- Limited by my typing speed and energy
+
+### After AI:
+- I'm the coach: designing the plays, delegating execution
+- Focused on architectural decisions and patterns
+- Can explore multiple approaches simultaneously
+- Limited by my ability to think clearly and communicate
+
+### The Real Productivity Gains
+
+**Time Savings:**
+- 2 hours of AI collaboration = at least 10 hours of manual coding, and that is 10 good hours, not changing diapers and feeding the baby.
+- 600 lines of working SwiftUI code generated
+- Only 20 lines of manual fixes needed
+
+**Quality Improvements:**
+- Consistent MVVM patterns across the Monitor side of the app, migrated partially to SwiftUI, but the rest of the app is still in Storyboards.
+- Better error handling (AI is actually good at edge cases)
+- Modern Apple design guidelines followed
+
+**Cognitive Benefits:**
+- Could think about multiple architectural approaches simultaneously
+- Focused on the "what" and "why," not the "how"
+- Maintained energy for the hard problems
+
+## Where AI Still Sucks (And How to Work Around It)
+
+### 1. Context Understanding
+**The Problem:** AI has limited understanding of your existing codebase, business logic, or architectural decisions, sure it can scan the codebase, but it will not understand the context, it will not understand the patterns, it will not understand the business logic, yet.
+
+**The Workaround:** Feed it context explicitly. Show it the existing patterns, explain the business logic, paste relevant code sections.
+
+### 2. Complex Reasoning
+**The Problem:** AI can't reason about complex interactions between components.
+
+**The Workaround:** Break complex problems into smaller, well-defined tasks. Let AI handle the implementation, you handle the integration.
+
+### 3. Edge Cases
+**The Problem:** AI misses subtle edge cases that experienced developers catch.
+
+**The Workaround:** Always review AI-generated code for edge cases. Use it for the happy path, handle edge cases manually.
+
+### 4. Context Window Limitations
+**The Problem:** AI forgets previous conversations and context.
+
+**The Workaround:** Keep conversations focused on single tasks. Restart when context gets too complex.
+
+## The Cursor-Specific Advantages
+
+Cursor isn't just another AI editor. Here's what actually matters:
+
+### 1. Codebase Context
+Cursor understands your entire codebase, not just the current file. This is huge for maintaining consistency across projects.
+
+### 2. Rule System
+The compilation rule I mentioned? That's just the start. You can create rules for:
+- Code style consistency
+- Error handling patterns
+- Testing requirements
+- Documentation standards
+
+### 3. Real-Time Collaboration
+Cursor's AI can see your changes in real-time and suggest improvements. It's like having a senior developer pair-programming with you.
+
+## The Paradigm Shift: Manager Mindset
+
+The biggest change isn't technical—it's psychological. I now think like a manager delegating work:
+
+### Before:
+- "How do I implement this feature?"
+- "What's the best way to structure this code?"
+- "How do I handle this edge case?"
+
+### After:
+- "What's the right architecture for this feature?"
+- "What patterns should I establish?"
+- "What are the critical decisions I need to make?"
+
+## Actionable Takeaways
+
+### 1. Start with Context
+Always give AI the architectural context it needs. Don't assume it understands your codebase.
+
+### 2. Use the Rule System
+Create Cursor rules for common patterns and requirements. This prevents AI from making the same mistakes repeatedly.
 
 
-Along of those 20 prompts I tested the prototype, if it was backend code, I would have produced unit tests, but you know XCode and friends, many times the code had regressions, so I recommend that you git commit your code often, and you can always revert to a previous version if you need to.
 
-Working UI:
+### 3. Break Down Complex Problems
+Don't ask AI to solve complex, multi-faceted problems. Break them into smaller, well-defined tasks.
 
-<p style="text-align:center; margin-top:1em; margin-bottom:1em;">
-    <img src="/images/working-ui2.gif" alt="election process" style="max-width:600px; width:100%; height:auto; border-radius:4px;" />
-</p>
+### 4. Review and Validate
+Always review AI-generated code. Use it for implementation, not for critical architectural decisions.
 
-Reality check: 
+### 5. Focus on Patterns
+AI is good at following patterns but bad at creating them. You establish the patterns, AI implements them.
 
-It Still does not work in 1 prompt, I do not think you can prompt your way to success, but I see myself like the coach of the AI, AI has much more stamina, energy, and focus than I ever will, it does not get tired, well, its context window is limited, so I have to start from scratch often, but that is a minor nuisance compared to the benefits that it brings.
+## The Reality Check
 
-# The potential for human freedom
-I have never held a leadership position, mostly because I love programming and I am really good at it, from unlocking your Corvette to buying your tickets through Ticketmaster (I know evil company) I am behind that (to so me degree there are many devs working on that stuff nowadays), but the reality is that my time is limited, my WPM (Words Per Minute) are around 100, and when I am really thinking through a problem probably it drops to 50 or less. 
+AI isn't going to replace developers. It's going to make good developers 10x more productive and bad developers obsolete.
 
-My throughput is limited, AI is a force multiplier. It can turn the 2 hours session between 5 am and 7 am into 20 hours of work. 
+The key is understanding that AI is a tool, not a replacement. It handles the repetitive tasks while you focus on the hard problems. It implements the patterns while you design them.
 
-Now I know how Managers feel, and it is freaking awesome, the idea that you can deliver 10x more than you could have done by yourself, and you can do it in a fraction of the time.
+## The Future
+
+This is just the beginning. As AI gets better at understanding context and reasoning about complex systems, the productivity gains will be even more dramatic.
+
+But the fundamental principle remains the same: AI handles implementation, humans handle architecture. AI follows patterns, humans create them.
+
+The developers who thrive in this new world will be the ones who learn to think like architects and managers, not just coders.
+
 
 
 

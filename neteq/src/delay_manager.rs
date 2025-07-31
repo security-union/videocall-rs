@@ -21,6 +21,9 @@ use web_time::{Duration, Instant};
 
 use crate::{NetEqError, Result};
 
+/// Start delay in milliseconds - matches libwebrtc's kStartDelayMs
+const kStartDelayMs: u32 = 80;
+
 /// Configuration for the delay manager
 #[derive(Debug, Clone)]
 pub struct DelayConfig {
@@ -183,7 +186,7 @@ impl DelayManager {
         let arrival_delay_tracker = RelativeArrivalDelayTracker::new(config.clone());
 
         Self {
-            target_level_ms: config.base_minimum_delay_ms,
+            target_level_ms: kStartDelayMs.max(config.base_minimum_delay_ms), // Start with 80ms or minimum delay
             effective_minimum_delay_ms: config.base_minimum_delay_ms,
             minimum_delay_ms: config.base_minimum_delay_ms,
             maximum_delay_ms: 0, // No maximum by default
@@ -219,7 +222,8 @@ impl DelayManager {
         self.arrival_delay_tracker.reset();
         self.filtered_delay = 0.0;
         self.initialized = false;
-        self.target_level_ms = self.config.base_minimum_delay_ms;
+        self.target_level_ms = kStartDelayMs.max(self.config.base_minimum_delay_ms);
+        // Reset to 80ms like WebRTC
     }
 
     /// Get the current target delay in milliseconds
@@ -361,7 +365,7 @@ mod tests {
         let config = DelayConfig::default();
         let delay_manager = DelayManager::new(config);
 
-        assert_eq!(delay_manager.target_delay_ms(), 0);
+        assert_eq!(delay_manager.target_delay_ms(), 80); // Now starts with kStartDelayMs
         assert_eq!(delay_manager.get_base_minimum_delay(), 0);
     }
 
@@ -396,7 +400,7 @@ mod tests {
 
         // Set minimum delay
         assert!(delay_manager.set_minimum_delay(50).unwrap());
-        assert_eq!(delay_manager.target_delay_ms(), 50);
+        assert_eq!(delay_manager.target_delay_ms(), 80); // max(80, 50) = 80
 
         // Set maximum delay
         assert!(delay_manager.set_maximum_delay(200).unwrap());
@@ -425,6 +429,6 @@ mod tests {
 
         // Reset and check state
         delay_manager.reset();
-        assert_eq!(delay_manager.target_delay_ms(), 0);
+        assert_eq!(delay_manager.target_delay_ms(), 80); // Reset to kStartDelayMs
     }
 }

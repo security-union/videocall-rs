@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
+use crate::buffer_level_filter::BufferLevelFilter;
 use crate::delay_manager::{DelayConfig, DelayManager};
 use crate::packet::AudioPacket;
 use crate::statistics::{
@@ -158,6 +159,7 @@ pub struct NetEq {
     config: NetEqConfig,
     packet_buffer: PacketBuffer,
     delay_manager: DelayManager,
+    buffer_level_filter: BufferLevelFilter,
     statistics: StatisticsCalculator,
     accelerate: Box<dyn TimeStretcher + Send>,
     preemptive_expand: Box<dyn TimeStretcher + Send>,
@@ -173,6 +175,8 @@ pub struct NetEq {
     decoders: HashMap<u8, Box<dyn crate::codec::AudioDecoder + Send>>,
     /// Audio queue for bypass mode (direct decoding without jitter buffer)
     bypass_audio_queue: VecDeque<f32>,
+    /// Time-stretched samples tracking for buffer level filtering
+    time_stretched_samples: i32,
 }
 
 impl NetEq {
@@ -207,6 +211,7 @@ impl NetEq {
         delay_manager.set_minimum_delay(config.min_delay_ms)?;
 
         let statistics = StatisticsCalculator::new();
+        let buffer_level_filter = BufferLevelFilter::new(config.sample_rate);
 
         // Create time stretchers
         let accelerate: Box<dyn TimeStretcher + Send> =
@@ -218,6 +223,7 @@ impl NetEq {
             config,
             packet_buffer,
             delay_manager,
+            buffer_level_filter,
             statistics,
             accelerate,
             preemptive_expand,
@@ -230,6 +236,7 @@ impl NetEq {
             leftover_samples: Vec::new(),
             decoders: HashMap::new(),
             bypass_audio_queue: VecDeque::new(),
+            time_stretched_samples: 0,
         })
     }
 
@@ -417,42 +424,69 @@ impl NetEq {
     pub fn flush(&mut self) {
         self.packet_buffer.flush(&mut self.statistics);
         self.delay_manager.reset();
+        self.buffer_level_filter.reset();
         self.last_decode_timestamp = None;
         self.consecutive_expands = 0;
         self.leftover_samples.clear();
+        self.time_stretched_samples = 0;
     }
 
     fn get_decision(&mut self) -> Result<Operation> {
+        // Update buffer level filter first
+        let current_buffer_samples = self.current_buffer_size_samples();
+        let target_delay_ms = self.delay_manager.target_delay_ms();
+
+        self.buffer_level_filter
+            .set_target_buffer_level(target_delay_ms);
+        self.buffer_level_filter
+            .update(current_buffer_samples, self.time_stretched_samples);
+
+        // Reset time-stretched samples after using them
+        self.time_stretched_samples = 0;
+
         // Check if we have packets
         if self.packet_buffer.is_empty() {
-            // Safely increment without risking overflow in debug builds.
             self.consecutive_expands = self.consecutive_expands.saturating_add(1);
             return Ok(Operation::Expand);
         }
 
-        let current_buffer_ms = self.current_buffer_size_ms();
-        let target_delay_ms = self.delay_manager.target_delay_ms();
+        // Use WebRTC-style threshold calculations
+        let samples_per_ms = self.config.sample_rate / 1000;
+        let target_level_samples = target_delay_ms * samples_per_ms;
 
-        // Check if buffer is too full (need to accelerate)
-        if current_buffer_ms > target_delay_ms + 20 {
+        // WebRTC constants - matches libwebrtc decision_logic.cc
+        const kDecelerationTargetLevelOffsetMs: u32 = 85;
+
+        // Calculate thresholds like WebRTC
+        let low_limit = std::cmp::max(
+            target_level_samples * 3 / 4,
+            target_level_samples.saturating_sub(kDecelerationTargetLevelOffsetMs * samples_per_ms),
+        );
+        let high_limit = std::cmp::max(target_level_samples, low_limit + 20 * samples_per_ms);
+
+        let buffer_level_samples = self.buffer_level_filter.filtered_current_level();
+
+        // Fast accelerate: 4x high limit (aggressive acceleration for large buffers)
+        if buffer_level_samples >= (high_limit << 2) as usize {
             self.consecutive_expands = 0;
-            if self.config.enable_fast_accelerate && current_buffer_ms > target_delay_ms + 40 {
-                return Ok(Operation::FastAccelerate);
-            } else {
-                return Ok(Operation::Accelerate);
-            }
+            return Ok(Operation::FastAccelerate);
         }
 
-        // Check if buffer is getting low (preemptive expand)
-        if current_buffer_ms < target_delay_ms.saturating_sub(10) && !self.packet_buffer.is_empty()
-        {
+        // Normal accelerate: at high limit
+        if buffer_level_samples >= high_limit as usize {
+            self.consecutive_expands = 0;
+            return Ok(Operation::Accelerate);
+        }
+
+        // Preemptive expand: below low limit
+        if buffer_level_samples < low_limit as usize && !self.packet_buffer.is_empty() {
             self.consecutive_expands = 0;
             return Ok(Operation::PreemptiveExpand);
         }
 
-        // Check for continuous expansion limit
-        if self.consecutive_expands > 100 {
-            // Reset after too many expands
+        // Check for continuous expansion limit (WebRTC uses much higher limits)
+        if self.consecutive_expands > 600 {
+            // ~6 seconds at 10ms frames
             self.flush();
             return Ok(Operation::Normal);
         }
@@ -578,7 +612,11 @@ impl NetEq {
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
 
+            // Track removed samples for buffer level filtering
+            self.time_stretched_samples -= samples_removed as i32;
+
             frame.speech_type = SpeechType::Normal;
+            frame.vad_activity = extended_frame.vad_activity; // Preserve VAD from decoded audio
         } else {
             self.decode_normal(frame)?;
         }
@@ -612,7 +650,11 @@ impl NetEq {
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
 
+            // Track removed samples for buffer level filtering
+            self.time_stretched_samples -= samples_removed as i32;
+
             frame.speech_type = SpeechType::Normal;
+            frame.vad_activity = extended_frame.vad_activity; // Preserve VAD from decoded audio
         } else {
             self.decode_normal(frame)?;
         }
@@ -641,7 +683,11 @@ impl NetEq {
                 samples_added as u64,
             );
 
+            // Track added samples for buffer level filtering
+            self.time_stretched_samples += samples_added as i32;
+
             frame.speech_type = SpeechType::Normal;
+            // VAD activity already preserved from decode_normal call
         } else {
             self.decode_normal(frame)?;
         }
@@ -703,6 +749,15 @@ impl NetEq {
         self.packet_buffer.get_span_duration_ms()
     }
 
+    /// Get current buffer size in samples
+    pub fn current_buffer_size_samples(&self) -> usize {
+        // Convert milliseconds to samples for the buffer duration
+        let buffer_duration_ms = self.packet_buffer.get_span_duration_ms();
+        let buffer_samples =
+            (buffer_duration_ms as u64 * self.config.sample_rate as u64 / 1000) as usize;
+        buffer_samples + self.leftover_samples.len()
+    }
+
     /// Register a decoder for a given RTP payload type.
     pub fn register_decoder(
         &mut self,
@@ -751,7 +806,7 @@ mod tests {
         let neteq = NetEq::new(config).unwrap();
 
         assert!(neteq.is_empty());
-        assert_eq!(neteq.target_delay_ms(), 0);
+        assert_eq!(neteq.target_delay_ms(), 80); // Now starts with kStartDelayMs
     }
 
     #[test]

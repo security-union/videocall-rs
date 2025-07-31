@@ -23,6 +23,7 @@
 //! and adaptive buffering for real-time audio applications.
 
 pub mod buffer;
+pub mod buffer_level_filter;
 pub mod codec;
 pub mod delay_manager;
 pub mod error;
@@ -52,7 +53,7 @@ mod tests {
         let neteq = NetEq::new(config).unwrap();
 
         // Test basic operations
-        assert_eq!(neteq.target_delay_ms(), 0);
+        assert_eq!(neteq.target_delay_ms(), 80); // Now starts with kStartDelayMs
         assert!(neteq.is_empty());
     }
 }

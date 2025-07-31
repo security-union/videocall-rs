@@ -25,6 +25,7 @@ log = "0.4.19"
 gloo-timers = "0.2.6"
 gloo-utils = "0.1"
 yew-router = "0.18"
+neteq = { path = "../neteq", version = "0.2.4" }
 wasm-bindgen-futures = { workspace = true }
 enum-display = "0.1.4"
 futures = "0.3.31"

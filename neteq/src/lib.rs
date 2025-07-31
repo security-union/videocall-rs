@@ -33,6 +33,8 @@ pub mod signal;
 pub mod statistics;
 pub mod time_stretch;
 
+pub use statistics::q14;
+
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub mod web;
 

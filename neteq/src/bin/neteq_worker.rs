@@ -200,7 +200,7 @@ mod wasm_worker {
                             let obj = js_sys::Object::new();
                             let _ = js_sys::Reflect::set(
                                 &obj,
-                                &JsValue::from_str("type"),
+                                &JsValue::from_str("cmd"),
                                 &JsValue::from_str("stats"),
                             );
                             let _ =

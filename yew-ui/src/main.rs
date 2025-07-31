@@ -21,6 +21,7 @@ mod components;
 mod constants;
 mod context;
 mod pages;
+mod types;
 
 use constants::LOGIN_URL;
 

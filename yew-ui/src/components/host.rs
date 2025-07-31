@@ -17,6 +17,7 @@
  */
 
 use crate::constants::*;
+use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
@@ -40,9 +41,9 @@ pub enum Msg {
     DisableMicrophone,
     EnableVideo(bool),
     DisableVideo,
-    AudioDeviceChanged(String),
-    VideoDeviceChanged(String),
-    SpeakerDeviceChanged(String),
+    AudioDeviceChanged(DeviceInfo),
+    VideoDeviceChanged(DeviceInfo),
+    SpeakerDeviceChanged(DeviceInfo),
     CameraEncoderSettingsUpdated(String),
     MicrophoneEncoderSettingsUpdated(String),
     ScreenEncoderSettingsUpdated(String),
@@ -266,8 +267,8 @@ impl Component for Host {
             Msg::AudioDeviceChanged(audio) => {
                 log::info!("Audio device changed: {audio}");
                 // Update the MediaDeviceList selection
-                self.media_devices.audio_inputs.select(&audio);
-                if self.microphone.select(audio) {
+                self.media_devices.audio_inputs.select(&audio.device_id);
+                if self.microphone.select(audio.device_id.clone()) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
                         link.send_message(Msg::EnableMicrophone(true));
@@ -279,8 +280,8 @@ impl Component for Host {
             Msg::VideoDeviceChanged(video) => {
                 log::info!("Video device changed: {video}");
                 // Update the MediaDeviceList selection
-                self.media_devices.video_inputs.select(&video);
-                if self.camera.select(video) {
+                self.media_devices.video_inputs.select(&video.device_id);
+                if self.camera.select(video.device_id.clone()) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
                         link.send_message(Msg::EnableVideo(true));
@@ -291,9 +292,13 @@ impl Component for Host {
             }
             Msg::SpeakerDeviceChanged(speaker) => {
                 // Update the MediaDeviceList selection
-                self.media_devices.audio_outputs.select(&speaker);
+                self.media_devices.audio_outputs.select(&speaker.device_id);
                 // Update the speaker device for all connected peers
-                if let Err(e) = ctx.props().client.update_speaker_device(Some(speaker)) {
+                if let Err(e) = ctx
+                    .props()
+                    .client
+                    .update_speaker_device(Some(speaker.device_id.clone()))
+                {
                     log::error!("Failed to update speaker device: {e:?}");
                 }
                 true
@@ -335,26 +340,34 @@ impl Component for Host {
                 }
             }
             Msg::DevicesLoaded => {
+                let audio_device_id = self.media_devices.audio_inputs.selected();
+                let video_device_id = self.media_devices.video_inputs.selected();
+                let speaker_device_id = self.media_devices.audio_outputs.selected();
+
                 ctx.link().send_message(Msg::AudioDeviceChanged(
-                    self.media_devices.audio_inputs.selected(),
+                    self.create_device_info_from_id(&audio_device_id, "audio_input"),
                 ));
                 ctx.link().send_message(Msg::VideoDeviceChanged(
-                    self.media_devices.video_inputs.selected(),
+                    self.create_device_info_from_id(&video_device_id, "video_input"),
                 ));
                 ctx.link().send_message(Msg::SpeakerDeviceChanged(
-                    self.media_devices.audio_outputs.selected(),
+                    self.create_device_info_from_id(&speaker_device_id, "audio_output"),
                 ));
                 true
             }
             Msg::DevicesChanged => {
+                let audio_device_id = self.media_devices.audio_inputs.selected();
+                let video_device_id = self.media_devices.video_inputs.selected();
+                let speaker_device_id = self.media_devices.audio_outputs.selected();
+
                 ctx.link().send_message(Msg::AudioDeviceChanged(
-                    self.media_devices.audio_inputs.selected(),
+                    self.create_device_info_from_id(&audio_device_id, "audio_input"),
                 ));
                 ctx.link().send_message(Msg::VideoDeviceChanged(
-                    self.media_devices.video_inputs.selected(),
+                    self.create_device_info_from_id(&video_device_id, "video_input"),
                 ));
                 ctx.link().send_message(Msg::SpeakerDeviceChanged(
-                    self.media_devices.audio_outputs.selected(),
+                    self.create_device_info_from_id(&speaker_device_id, "audio_output"),
                 ));
                 true
             }
@@ -450,5 +463,40 @@ impl Component for Host {
         self.camera.stop();
         self.microphone.stop();
         self.screen.stop();
+    }
+}
+
+impl Host {
+    /// Helper method to create DeviceInfo from device ID by looking up the device name
+    fn create_device_info_from_id(&self, device_id: &str, device_type: &str) -> DeviceInfo {
+        let device_name = match device_type {
+            "audio_input" => self
+                .media_devices
+                .audio_inputs
+                .devices()
+                .iter()
+                .find(|device| device.device_id() == device_id)
+                .map(|device| device.label())
+                .unwrap_or_else(|| "Unknown Microphone".to_string()),
+            "video_input" => self
+                .media_devices
+                .video_inputs
+                .devices()
+                .iter()
+                .find(|device| device.device_id() == device_id)
+                .map(|device| device.label())
+                .unwrap_or_else(|| "Unknown Camera".to_string()),
+            "audio_output" => self
+                .media_devices
+                .audio_outputs
+                .devices()
+                .iter()
+                .find(|device| device.device_id() == device_id)
+                .map(|device| device.label())
+                .unwrap_or_else(|| "Unknown Speaker".to_string()),
+            _ => "Unknown Device".to_string(),
+        };
+
+        DeviceInfo::new(device_id.to_string(), device_name)
     }
 }

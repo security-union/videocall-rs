@@ -57,6 +57,19 @@ mod wasm_worker {
         },
     }
 
+    /// Messages sent from worker back to main thread
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "camelCase")]
+    enum WorkerResponse {
+        WorkerReady {
+            mute_state: bool,
+        },
+        Stats {
+            #[serde(skip_serializing, skip_deserializing)]
+            stats: JsValue, // Will be set manually since JsValue doesn't serialize
+        },
+    }
+
     thread_local! {
         static NETEQ: std::cell::RefCell<Option<WebNetEq>> = const { std::cell::RefCell::new(None) };
         static IS_MUTED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) }; // Start muted by default
@@ -131,6 +144,26 @@ mod wasm_worker {
                                             )
                                             .into(),
                                         );
+
+                                        // Send WorkerReady confirmation to main thread
+                                        let ready_msg = WorkerResponse::WorkerReady {
+                                            mute_state: is_muted,
+                                        };
+                                        if let Ok(js_msg) = serde_wasm_bindgen::to_value(&ready_msg)
+                                        {
+                                            let _ = js_sys::global()
+                                                .unchecked_into::<DedicatedWorkerGlobalScope>()
+                                                .post_message(&js_msg);
+                                            console::log_1(
+                                                &"✅ Sent WorkerReady confirmation to main thread"
+                                                    .into(),
+                                            );
+                                        } else {
+                                            console::error_1(
+                                                &"❌ Failed to serialize WorkerReady message"
+                                                    .into(),
+                                            );
+                                        }
                                     });
                                 }
                                 Err(e) => {
@@ -158,11 +191,16 @@ mod wasm_worker {
                 NETEQ.with(|cell| {
                     if let Some(eq) = cell.borrow().as_ref() {
                         if let Ok(js_val) = eq.get_statistics() {
-                            // Build { cmd: "stats", stats: <object> }
+                            // Send structured stats message using WorkerResponse
+                            let stats_msg = WorkerResponse::Stats {
+                                stats: js_val.clone(), // Clone for the message
+                            };
+
+                            // Manual construction since JsValue doesn't serialize properly
                             let obj = js_sys::Object::new();
                             let _ = js_sys::Reflect::set(
                                 &obj,
-                                &JsValue::from_str("cmd"),
+                                &JsValue::from_str("type"),
                                 &JsValue::from_str("stats"),
                             );
                             let _ =
@@ -331,14 +369,29 @@ mod wasm_worker {
             }
             WorkerMsg::Mute { muted } => {
                 IS_MUTED.with(|muted_cell| {
+                    let old_state = *muted_cell.borrow();
                     *muted_cell.borrow_mut() = muted;
+                    let now = js_sys::Date::now();
+
                     console::log_2(
                         &"[neteq-worker] audio muted:".into(),
                         &JsValue::from_bool(muted),
                     );
-                    console::log_1(
-                        &format!("🔇 NetEq worker received mute message: {}", muted).into(),
+                    log::info!(
+                        "🔇 NetEq worker mute state: {} -> {} at {:.0}ms",
+                        old_state,
+                        muted,
+                        now
                     );
+
+                    if old_state != muted {
+                        log::info!("⚡ Mute state CHANGED for worker at {:.0}ms", now);
+                    } else {
+                        log::info!(
+                            "🔄 Mute state unchanged (redundant message) at {:.0}ms",
+                            now
+                        );
+                    }
                 });
             }
             WorkerMsg::SetDiagnostics { enabled } => {

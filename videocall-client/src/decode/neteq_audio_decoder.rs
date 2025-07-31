@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_wasm_bindgen;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
@@ -35,6 +36,19 @@ enum WorkerMsg {
     },
 }
 
+/// Messages received from worker (matches neteq_worker.rs)
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum WorkerResponse {
+    WorkerReady {
+        mute_state: bool,
+    },
+    Stats {
+        #[serde(skip)]
+        stats: JsValue, // Will be processed manually
+    },
+}
+
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
 #[derive(Debug)]
 pub struct NetEqAudioPeerDecoder {
@@ -43,9 +57,40 @@ pub struct NetEqAudioPeerDecoder {
     decoded: bool,
     peer_id: String, // Track which peer this decoder belongs to
     _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
+
+    // Message queueing system
+    pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
+    worker_ready: Rc<RefCell<bool>>,
 }
 
 impl NetEqAudioPeerDecoder {
+    /// Send message through queue (immediate if worker ready, otherwise queued)
+    fn send_worker_message(&self, msg: WorkerMsg) {
+        let is_ready = *self.worker_ready.borrow();
+
+        if is_ready {
+            // Worker ready - send immediately
+            self.send_message_immediate(msg);
+        } else {
+            // Worker not ready - queue the message
+            log::info!(
+                "🔄 Queueing message for peer {} (worker not ready)",
+                self.peer_id
+            );
+            self.pending_messages.borrow_mut().push_back(msg);
+        }
+    }
+
+    /// Send message immediately to worker
+    fn send_message_immediate(&self, msg: WorkerMsg) {
+        if let Err(e) =
+            serde_wasm_bindgen::to_value(&msg).map(|js_msg| self.worker.post_message(&js_msg))
+        {
+            log::error!("Failed to send worker message: {e:?}");
+            web_sys::console::error_1(&format!("Failed to send worker message: {e:?}").into());
+        }
+    }
+
     /// Create a NetEq worker.
     fn create_neteq_worker() -> Result<Worker, JsValue> {
         let window = web_sys::window().expect("no window");
@@ -84,15 +129,12 @@ impl NetEqAudioPeerDecoder {
 
         // CRITICAL: Verify actual sample rate Safari is using
         let actual_sample_rate = audio_context.sample_rate();
-        web_sys::console::log_2(
-            &"Safari AudioContext sample rate:".into(),
-            &JsValue::from_f64(actual_sample_rate as f64),
-        );
+        log::info!("Safari AudioContext sample rate: {}", actual_sample_rate);
 
         if (actual_sample_rate - 48000.0).abs() > 1.0 {
-            web_sys::console::warn_2(
-                &"⚠️ Safari AudioContext sample rate mismatch! Expected 48000, got:".into(),
-                &JsValue::from_f64(actual_sample_rate as f64),
+            log::warn!(
+                "⚠️ Safari AudioContext sample rate mismatch! Expected 48000, got: {}",
+                actual_sample_rate
             );
         }
 
@@ -125,7 +167,7 @@ impl NetEqAudioPeerDecoder {
         )?;
         pcm_player.port()?.post_message(&config_message)?;
 
-        web_sys::console::log_1(&"Safari: Configured PCM worklet for 48kHz playback".into());
+        log::info!("Safari: Configured PCM worklet for 48kHz playback");
 
         // Set sink device if specified (Safari supports setSinkId)
         if let Some(device_id) = speaker_device_id {
@@ -135,13 +177,9 @@ impl NetEqAudioPeerDecoder {
                 let promise = audio_context.set_sink_id_with_str(&device_id);
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Err(e) = JsFuture::from(promise).await {
-                        web_sys::console::warn_1(
-                            &format!("Safari: Failed to set audio output device: {e:?}").into(),
-                        );
+                        log::warn!("Safari: Failed to set audio output device: {e:?}");
                     } else {
-                        web_sys::console::log_1(
-                            &"Safari: Successfully set audio output device".into(),
-                        );
+                        log::info!("Safari: Successfully set audio output device");
                     }
                 });
             }
@@ -183,12 +221,12 @@ impl NetEqAudioPeerDecoder {
             return;
         }
 
-        web_sys::console::log_1(&"Initializing AudioWorklet for PCM playback".into());
+        log::info!("Initializing AudioWorklet for PCM playback");
 
         match Self::create_safari_audio_context(speaker_device_id).await {
             Ok((_, worklet)) => {
                 *pcm_player.borrow_mut() = Some(worklet);
-                web_sys::console::log_1(&"AudioWorklet initialized successfully".into());
+                log::info!("AudioWorklet initialized successfully");
             }
             Err(e) => {
                 web_sys::console::error_2(&"Failed to initialize worklet:".into(), &e);
@@ -308,11 +346,15 @@ impl NetEqAudioPeerDecoder {
         audio_context: AudioContext,
         peer_id: String,
         speaker_device_id: Option<String>,
+        worker_ready: Rc<RefCell<bool>>,
+        pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
+        worker: Worker,
     ) -> Closure<dyn FnMut(MessageEvent)> {
         Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
 
             if data.is_instance_of::<Float32Array>() {
+                // High-performance PCM path (unchanged)
                 let pcm = Float32Array::from(data);
                 Self::handle_pcm_data(
                     pcm,
@@ -321,7 +363,52 @@ impl NetEqAudioPeerDecoder {
                     speaker_device_id.clone(),
                 );
             } else if data.is_object() {
-                Self::handle_stats_message(&data, &peer_id);
+                // Try to parse as WorkerResponse first
+                if let Ok(response) = serde_wasm_bindgen::from_value::<WorkerResponse>(data.clone())
+                {
+                    match response {
+                        WorkerResponse::WorkerReady { mute_state } => {
+                            // Handle worker ready - flush queue
+                            log::info!(
+                                "✅ Worker ready for peer {} (worker mute: {})",
+                                peer_id,
+                                mute_state
+                            );
+
+                            *worker_ready.borrow_mut() = true;
+
+                            // Flush queued messages in FIFO order
+                            let mut queue = pending_messages.borrow_mut();
+                            let queue_length = queue.len();
+
+                            if queue_length > 0 {
+                                log::info!(
+                                    "📤 Flushing {} queued messages for peer {}",
+                                    queue_length,
+                                    peer_id
+                                );
+
+                                // Send each queued message immediately
+                                while let Some(msg) = queue.pop_front() {
+                                    if let Err(e) = serde_wasm_bindgen::to_value(&msg)
+                                        .map(|js_msg| worker.post_message(&js_msg))
+                                    {
+                                        log::error!("Failed to send queued message: {e:?}");
+                                    } else {
+                                        log::info!("📤 Sent queued message: {:?}", msg);
+                                    }
+                                }
+                            }
+                        }
+                        WorkerResponse::Stats { .. } => {
+                            // Handle stats message (fallback to old method for now)
+                            Self::handle_stats_message(&data, &peer_id);
+                        }
+                    }
+                } else {
+                    // Fallback to old stats message handling
+                    Self::handle_stats_message(&data, &peer_id);
+                }
             }
         }) as Box<dyn FnMut(_)>)
     }
@@ -362,12 +449,28 @@ impl NetEqAudioPeerDecoder {
 
         let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
 
-        // Set up worker message handling
+        // Create decoder with explicit mute state first
+        let mut decoder = Self {
+            worker: worker.clone(),
+            audio_context: audio_context.clone(),
+            decoded: false,
+            peer_id: peer_id.clone(),
+            _pcm_player: pcm_player_ref.clone(),
+
+            // Message queueing system
+            pending_messages: Rc::new(RefCell::new(VecDeque::new())),
+            worker_ready: Rc::new(RefCell::new(false)),
+        };
+
+        // Set up worker message handling with decoder's queue references
         let on_message_closure = Self::create_message_handler(
             pcm_player_ref.clone(),
             audio_context.clone(),
             peer_id.clone(),
             speaker_device_id.clone(),
+            decoder.worker_ready.clone(),
+            decoder.pending_messages.clone(),
+            worker.clone(),
         );
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
@@ -395,28 +498,14 @@ impl NetEqAudioPeerDecoder {
             )?;
         send_cb.forget();
 
-        web_sys::console::log_1(
-            &format!("NetEq audio decoder initialized for peer {peer_id} (muted: {initial_muted})")
-                .into(),
-        );
-
-        // Create decoder with explicit mute state
-        let mut decoder = Self {
-            worker,
-            audio_context,
-            decoded: false,
-            peer_id,
-            _pcm_player: pcm_player_ref,
-        };
+        log::info!("NetEq audio decoder initialized for peer {peer_id} (muted: {initial_muted})");
 
         // Set the initial mute state explicitly
         decoder.set_muted(initial_muted);
-        web_sys::console::log_1(
-            &format!(
-                "✅ NetEq decoder initialized for peer {} with muted: {}",
-                decoder.peer_id, initial_muted
-            )
-            .into(),
+        log::info!(
+            "✅ NetEq decoder initialized for peer {} with muted: {}",
+            decoder.peer_id,
+            initial_muted
         );
 
         Ok(Box::new(decoder))
@@ -434,22 +523,15 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         match packet.audio_metadata.as_ref() {
             Some(audio_meta) => {
-                // Normal path – send the packet to the NetEq worker.
+                // Normal path – send the packet to the NetEq worker through queue
                 let insert = WorkerMsg::Insert {
                     seq: audio_meta.sequence as u16,
                     timestamp: packet.timestamp as u32,
                     payload: packet.data.clone(),
                 };
 
-                // Any serialisation or postMessage error will simply be logged. We don't want it
-                // to bubble up and force a complete decoder reset, which leads to the video
-                // worker being recreated ("Terminating worker" loops observed in the console).
-                if let Err(e) =
-                    serde_wasm_bindgen::to_value(&insert).map(|msg| self.worker.post_message(&msg))
-                {
-                    log::error!("Failed to dispatch NetEq insert message: {e:?}");
-                    // Still report success so the caller doesn't reset the whole peer.
-                }
+                // Send through queue (will be immediate if worker ready, queued otherwise)
+                self.send_worker_message(insert);
 
                 let first_frame = !self.decoded;
                 self.decoded = true;
@@ -474,52 +556,48 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
     }
 
     fn flush(&mut self) {
-        // Send flush message to NetEq worker to clear the buffer
-        let flush_msg = WorkerMsg::Flush;
-        if let Err(e) =
-            serde_wasm_bindgen::to_value(&flush_msg).map(|msg| self.worker.post_message(&msg))
-        {
-            log::error!("Failed to dispatch NetEq flush message: {e:?}");
-        } else {
-            log::debug!(
-                "Sent flush message to NetEq worker for peer {}",
-                self.peer_id
-            );
-        }
+        // Send flush message to NetEq worker through queue
+        self.send_worker_message(WorkerMsg::Flush);
+        log::debug!(
+            "Sent flush message to NetEq worker for peer {}",
+            self.peer_id
+        );
     }
 
     fn set_muted(&mut self, muted: bool) {
-        // Send mute message to NetEq worker to stop/start audio production
+        // Send mute message to NetEq worker through queue
         let mute_msg = WorkerMsg::Mute { muted };
+        let now = js_sys::Date::now();
+        let is_ready = *self.worker_ready.borrow();
+        let queue_length = self.pending_messages.borrow().len();
 
-        // Use console.log for immediate visibility in browser console
-        web_sys::console::log_2(
-            &format!(
-                "[MUTE DEBUG] Sending mute message for peer {}",
-                self.peer_id
-            )
-            .into(),
-            &JsValue::from_bool(muted),
+        // Enhanced logging for mute state tracking
+        log::info!(
+            "🔇 [MUTE DEBUG] Peer {} set_muted({}) at {:.0}ms - worker_ready: {}, queue_length: {}",
+            self.peer_id,
+            muted,
+            now,
+            is_ready,
+            queue_length
         );
 
-        if let Err(e) =
-            serde_wasm_bindgen::to_value(&mute_msg).map(|msg| self.worker.post_message(&msg))
-        {
-            log::error!("Failed to dispatch NetEq mute message: {e:?}");
-            web_sys::console::error_1(&format!("Failed to send mute message: {e:?}").into());
-        } else {
-            log::debug!(
-                "Sent mute message to NetEq worker for peer {} (muted: {})",
-                self.peer_id,
-                muted
-            );
-            web_sys::console::log_1(
-                &format!(
-                    "✅ Mute message sent successfully for peer {} (muted: {})",
-                    self.peer_id, muted
-                )
-                .into(),
-            );
-        }
+        self.send_worker_message(mute_msg);
+
+        log::debug!(
+            "Sent mute message to NetEq worker for peer {} (muted: {})",
+            self.peer_id,
+            muted
+        );
+        log::info!(
+            "✅ Mute message {} for peer {} (muted: {}) at {:.0}ms",
+            if is_ready {
+                "sent immediately"
+            } else {
+                "queued"
+            },
+            self.peer_id,
+            muted,
+            now
+        );
     }
 }

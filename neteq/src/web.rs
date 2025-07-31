@@ -81,9 +81,7 @@ impl WebNetEq {
                 .map_err(Self::map_err)?
         };
 
-        web_sys::console::log_1(
-            &format!("NetEq initialized with decoder: {}", decoder.decoder_type()).into(),
-        );
+        log::info!("NetEq initialized with decoder: {}", decoder.decoder_type());
 
         neteq.register_decoder(111, Box::new(decoder));
 

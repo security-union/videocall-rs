@@ -129,12 +129,11 @@ impl NetEqAudioPeerDecoder {
 
         // CRITICAL: Verify actual sample rate Safari is using
         let actual_sample_rate = audio_context.sample_rate();
-        log::info!("Safari AudioContext sample rate: {}", actual_sample_rate);
+        log::info!("Safari AudioContext sample rate: {actual_sample_rate}");
 
         if (actual_sample_rate - 48000.0).abs() > 1.0 {
             log::warn!(
-                "⚠️ Safari AudioContext sample rate mismatch! Expected 48000, got: {}",
-                actual_sample_rate
+                "⚠️ Safari AudioContext sample rate mismatch! Expected 48000, got: {actual_sample_rate}"
             );
         }
 
@@ -370,9 +369,7 @@ impl NetEqAudioPeerDecoder {
                         WorkerResponse::WorkerReady { mute_state } => {
                             // Handle worker ready - flush queue
                             log::info!(
-                                "✅ Worker ready for peer {} (worker mute: {})",
-                                peer_id,
-                                mute_state
+                                "✅ Worker ready for peer {peer_id} (worker mute: {mute_state})"
                             );
 
                             *worker_ready.borrow_mut() = true;
@@ -383,9 +380,7 @@ impl NetEqAudioPeerDecoder {
 
                             if queue_length > 0 {
                                 log::info!(
-                                    "📤 Flushing {} queued messages for peer {}",
-                                    queue_length,
-                                    peer_id
+                                    "📤 Flushing {queue_length} queued messages for peer {peer_id}"
                                 );
 
                                 // Send each queued message immediately
@@ -395,7 +390,7 @@ impl NetEqAudioPeerDecoder {
                                     {
                                         log::error!("Failed to send queued message: {e:?}");
                                     } else {
-                                        log::info!("📤 Sent queued message: {:?}", msg);
+                                        log::info!("📤 Sent queued message: {msg:?}");
                                     }
                                 }
                             }

@@ -610,89 +610,237 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
         };
 
         html! {
-            <div class="neteq-status">
-                <div class="status-grid">
-                    <div class="status-item">
-                        <div class={buffer_class}>{stats.buffer_ms}</div>
-                        <div class="status-label">{"Buffer (ms)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.target_ms}</div>
-                        <div class="status-label">{"Target (ms)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.packets}</div>
-                        <div class="status-label">{"Packets"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class={underrun_class}>{stats.underruns}</div>
-                        <div class="status-label">{"Underruns"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{format!("{:.1}", stats.expand_rate)}</div>
-                        <div class="status-label">{"Expand Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{format!("{:.1}", stats.accel_rate)}</div>
-                        <div class="status-label">{"Accel Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.reorder_rate}</div>
-                        <div class="status-label">{"Reorder Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.reordered_packets}</div>
-                        <div class="status-label">{"Reordered Packets"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.max_reorder_distance}</div>
-                        <div class="status-label">{"Max Reorder Distance"}</div>
+            <>
+                <style>
+                    {r#"
+                    .neteq-status {
+                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    }
+                    
+                    .status-grid {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                        gap: 12px;
+                        padding: 8px;
+                    }
+                    
+                    .status-item {
+                        background: rgba(255, 255, 255, 0.05);
+                        border-radius: 8px;
+                        padding: 12px 8px;
+                        text-align: center;
+                        border: 1px solid rgba(255, 255, 255, 0.1);
+                        transition: all 0.2s ease;
+                    }
+                    
+                    .status-item:hover {
+                        background: rgba(255, 255, 255, 0.08);
+                        border-color: rgba(255, 255, 255, 0.2);
+                    }
+                    
+                    .status-value {
+                        font-size: 28px;
+                        font-weight: 700;
+                        line-height: 1;
+                        margin-bottom: 4px;
+                        color: #ffffff;
+                        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+                    }
+                    
+                    .status-value.good {
+                        color: #10b981;
+                    }
+                    
+                    .status-value.warning {
+                        color: #f59e0b;
+                    }
+                    
+                    .status-label {
+                        font-size: 11px;
+                        font-weight: 600;
+                        text-transform: uppercase;
+                        letter-spacing: 0.5px;
+                        color: #d1d5db;
+                        margin-bottom: 2px;
+                        line-height: 1.2;
+                    }
+                    
+                    .status-subtitle {
+                        font-size: 9px;
+                        color: #9ca3af;
+                        line-height: 1.2;
+                        font-weight: 400;
+                        margin-top: 2px;
+                    }
+                    "#}
+                </style>
+                <div class="neteq-status">
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <div class={buffer_class}>{stats.buffer_ms}</div>
+                            <div class="status-label">{"BUFFER (MS)"}</div>
+                            <div class="status-subtitle">{"Audio data buffered for playback"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.target_ms}</div>
+                            <div class="status-label">{"TARGET (MS)"}</div>
+                            <div class="status-subtitle">{"Optimal buffer size for network"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.packets}</div>
+                            <div class="status-label">{"PACKETS"}</div>
+                            <div class="status-subtitle">{"Encoded packets awaiting decode"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class={underrun_class}>{stats.underruns}</div>
+                            <div class="status-label">{"UNDERRUNS"}</div>
+                            <div class="status-subtitle">{"Times audio buffer ran empty"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{format!("{:.1}", stats.expand_rate)}</div>
+                            <div class="status-label">{"EXPAND RATE"}</div>
+                            <div class="status-subtitle">{"Audio stretching when buffer low (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{format!("{:.1}", stats.accel_rate)}</div>
+                            <div class="status-label">{"ACCEL RATE"}</div>
+                            <div class="status-subtitle">{"Audio compression when buffer full (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.reorder_rate}</div>
+                            <div class="status-label">{"REORDER RATE"}</div>
+                            <div class="status-subtitle">{"Out-of-order packet frequency (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.reordered_packets}</div>
+                            <div class="status-label">{"REORDERED PACKETS"}</div>
+                            <div class="status-subtitle">{"Total packets received out-of-order"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.max_reorder_distance}</div>
+                            <div class="status-label">{"MAX REORDER DISTANCE"}</div>
+                            <div class="status-subtitle">{"Largest gap in packet sequence"}</div>
+                        </div>
                     </div>
                 </div>
-            </div>
+            </>
         }
     } else {
         html! {
-            <div class="neteq-status">
-                <div class="status-grid">
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Buffer (ms)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Target (ms)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Packets"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Underruns"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Expand Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Accel Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Reorder Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Reordered Packets"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Max Reorder Distance"}</div>
+            <>
+                <style>
+                    {r#"
+                    .neteq-status {
+                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    }
+                    
+                    .status-grid {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                        gap: 12px;
+                        padding: 8px;
+                    }
+                    
+                    .status-item {
+                        background: rgba(255, 255, 255, 0.05);
+                        border-radius: 8px;
+                        padding: 12px 8px;
+                        text-align: center;
+                        border: 1px solid rgba(255, 255, 255, 0.1);
+                        transition: all 0.2s ease;
+                    }
+                    
+                    .status-item:hover {
+                        background: rgba(255, 255, 255, 0.08);
+                        border-color: rgba(255, 255, 255, 0.2);
+                    }
+                    
+                    .status-value {
+                        font-size: 28px;
+                        font-weight: 700;
+                        line-height: 1;
+                        margin-bottom: 4px;
+                        color: #ffffff;
+                        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+                    }
+                    
+                    .status-value.good {
+                        color: #10b981;
+                    }
+                    
+                    .status-value.warning {
+                        color: #f59e0b;
+                    }
+                    
+                    .status-label {
+                        font-size: 11px;
+                        font-weight: 600;
+                        text-transform: uppercase;
+                        letter-spacing: 0.5px;
+                        color: #d1d5db;
+                        margin-bottom: 2px;
+                        line-height: 1.2;
+                    }
+                    
+                    .status-subtitle {
+                        font-size: 9px;
+                        color: #9ca3af;
+                        line-height: 1.2;
+                        font-weight: 400;
+                        margin-top: 2px;
+                    }
+                    "#}
+                </style>
+                <div class="neteq-status">
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"BUFFER (MS)"}</div>
+                            <div class="status-subtitle">{"Audio data buffered for playback"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"TARGET (MS)"}</div>
+                            <div class="status-subtitle">{"Optimal buffer size for network"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"PACKETS"}</div>
+                            <div class="status-subtitle">{"Encoded packets awaiting decode"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"UNDERRUNS"}</div>
+                            <div class="status-subtitle">{"Times audio buffer ran empty"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"EXPAND RATE"}</div>
+                            <div class="status-subtitle">{"Audio stretching when buffer low (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"ACCEL RATE"}</div>
+                            <div class="status-subtitle">{"Audio compression when buffer full (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"REORDER RATE"}</div>
+                            <div class="status-subtitle">{"Out-of-order packet frequency (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"REORDERED PACKETS"}</div>
+                            <div class="status-subtitle">{"Total packets received out-of-order"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"MAX REORDER DISTANCE"}</div>
+                            <div class="status-subtitle">{"Largest gap in packet sequence"}</div>
+                        </div>
                     </div>
                 </div>
-            </div>
+            </>
         }
     }
 }

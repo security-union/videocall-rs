@@ -22,15 +22,16 @@
 /// - Higher values (closer to 1.0) = more smoothing, slower response to changes
 /// - Lower values (closer to 0.0) = less smoothing, faster response to changes
 ///
-/// The value 0.9 provides good balance between:
-/// - Filtering out short-term fluctuations due to network jitter
+/// The value 0.8 provides improved balance between:
+/// - Filtering out short-term fluctuations due to network jitter  
 /// - Responding to actual buffer level trends quickly enough for effective control
 ///
 /// Engineering rationale:
 /// - Time constant τ = -frame_duration / ln(smoothing_factor)
-/// - With 0.9 and 10ms frames: τ ≈ 95ms response time
-/// - This allows ~10 frames to reach 63% of a step change
-const BUFFER_LEVEL_SMOOTHING_FACTOR: f64 = 0.9;
+/// - With 0.8 and 10ms frames: τ ≈ 45ms response time (improved from 95ms)
+/// - This allows ~5 frames to reach 63% of a step change (was 10 frames)
+/// - Provides faster response for late-joining peer scenarios
+const BUFFER_LEVEL_SMOOTHING_FACTOR: f64 = 0.8;
 
 /// Buffer level filter for smoothing buffer measurements
 ///

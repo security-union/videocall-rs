@@ -41,9 +41,9 @@ pub struct NetEqAudioPeerDecoder {
     worker: Worker,
     audio_context: AudioContext,
     decoded: bool,
-    _on_message_closure: Closure<dyn FnMut(MessageEvent)>, // Keep closure alive
     peer_id: String, // Track which peer this decoder belongs to
     _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
+    speaker_device_id: Option<String>, // Store the selected device ID
 }
 
 impl NetEqAudioPeerDecoder {
@@ -156,6 +156,7 @@ impl NetEqAudioPeerDecoder {
         pcm: Float32Array,
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
         audio_context: &AudioContext,
+        speaker_device_id: Option<String>,
     ) {
         // Ensure AudioContext is running
         if let Err(e) = audio_context.resume() {
@@ -166,7 +167,7 @@ impl NetEqAudioPeerDecoder {
 
         let pcm_player_clone = pcm_player.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            Self::ensure_worklet_initialized(&pcm_player_clone).await;
+            Self::ensure_worklet_initialized(&pcm_player_clone, speaker_device_id).await;
 
             if let Some(ref worklet) = *pcm_player_clone.borrow() {
                 Self::send_pcm_to_safari_worklet(worklet, &pcm);
@@ -175,14 +176,17 @@ impl NetEqAudioPeerDecoder {
     }
 
     /// Ensure AudioWorklet is initialized (lazy initialization)
-    async fn ensure_worklet_initialized(pcm_player: &Rc<RefCell<Option<AudioWorkletNode>>>) {
+    async fn ensure_worklet_initialized(
+        pcm_player: &Rc<RefCell<Option<AudioWorkletNode>>>,
+        speaker_device_id: Option<String>,
+    ) {
         if pcm_player.borrow().is_some() {
             return;
         }
 
         web_sys::console::log_1(&"Initializing AudioWorklet for PCM playback".into());
 
-        match Self::create_safari_audio_context(None).await {
+        match Self::create_safari_audio_context(speaker_device_id).await {
             Ok((_, worklet)) => {
                 *pcm_player.borrow_mut() = Some(worklet);
                 web_sys::console::log_1(&"AudioWorklet initialized successfully".into());
@@ -304,13 +308,19 @@ impl NetEqAudioPeerDecoder {
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
         audio_context: AudioContext,
         peer_id: String,
+        speaker_device_id: Option<String>,
     ) -> Closure<dyn FnMut(MessageEvent)> {
         Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
 
             if data.is_instance_of::<Float32Array>() {
                 let pcm = Float32Array::from(data);
-                Self::handle_pcm_data(pcm, pcm_player.clone(), &audio_context);
+                Self::handle_pcm_data(
+                    pcm,
+                    pcm_player.clone(),
+                    &audio_context,
+                    speaker_device_id.clone(),
+                );
             } else if data.is_object() {
                 Self::handle_stats_message(&data, &peer_id);
             }
@@ -340,11 +350,11 @@ impl NetEqAudioPeerDecoder {
         let audio_context = AudioContext::new_with_context_options(&options)?;
 
         // Set sink device if specified
-        if let Some(device_id) = speaker_device_id {
+        if let Some(device_id) = &speaker_device_id {
             if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
                 .unwrap_or(false)
             {
-                let promise = audio_context.set_sink_id_with_str(&device_id);
+                let promise = audio_context.set_sink_id_with_str(device_id);
                 wasm_bindgen_futures::spawn_local(async move {
                     let _ = JsFuture::from(promise).await;
                 });
@@ -358,9 +368,11 @@ impl NetEqAudioPeerDecoder {
             pcm_player_ref.clone(),
             audio_context.clone(),
             peer_id.clone(),
+            speaker_device_id.clone(),
         );
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
+        on_message_closure.forget();
 
         // Initialize worker
         let init_msg = WorkerMsg::Init {
@@ -394,9 +406,9 @@ impl NetEqAudioPeerDecoder {
             worker,
             audio_context,
             decoded: false,
-            _on_message_closure: on_message_closure,
             peer_id,
             _pcm_player: pcm_player_ref,
+            speaker_device_id: speaker_device_id.clone(),
         };
 
         // Set the initial mute state explicitly

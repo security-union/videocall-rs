@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::types::DeviceInfo;
 use videocall_client::utils::is_ios;
 use wasm_bindgen::JsCast;
 use web_sys::{HtmlSelectElement, MediaDeviceInfo};
@@ -31,9 +32,9 @@ pub struct DeviceSelectorProps {
     pub selected_microphone_id: Option<String>,
     pub selected_camera_id: Option<String>,
     pub selected_speaker_id: Option<String>,
-    pub on_camera_select: Callback<String>,
-    pub on_microphone_select: Callback<String>,
-    pub on_speaker_select: Callback<String>,
+    pub on_camera_select: Callback<DeviceInfo>,
+    pub on_microphone_select: Callback<DeviceInfo>,
+    pub on_speaker_select: Callback<DeviceInfo>,
 }
 
 impl Component for DeviceSelector {
@@ -58,14 +59,26 @@ impl Component for DeviceSelector {
                 .value()
         }
 
+        fn find_device_by_id(devices: &[MediaDeviceInfo], device_id: &str) -> Option<DeviceInfo> {
+            devices
+                .iter()
+                .find(|device| device.device_id() == device_id)
+                .map(DeviceInfo::from_media_device_info)
+        }
+
         html! {
             <div class={"device-selector-wrapper"}>
                 <label for={"audio-select"}>{ "Audio:" }</label>
                 <select id={"audio-select"} class={"device-selector"}
-                        onchange={ctx.link().callback(move |e: Event| {
-                            let device_id = selection(e);
-                            on_microphone_select.emit(device_id);
-                        })}
+                        onchange={
+                            let microphones = ctx.props().microphones.clone();
+                            ctx.link().callback(move |e: Event| {
+                                let device_id = selection(e);
+                                if let Some(device_info) = find_device_by_id(&microphones, &device_id) {
+                                    on_microphone_select.emit(device_info);
+                                }
+                            })
+                        }
                 >
                     { for ctx.props().microphones.iter().map(|device| html! {
                         <option value={device.device_id()} selected={ctx.props().selected_microphone_id.as_deref() == Some(&device.device_id())}>
@@ -76,10 +89,15 @@ impl Component for DeviceSelector {
                 <br/>
                 <label for={"video-select"}>{ "Video:" }</label>
                 <select id={"video-select"} class={"device-selector"}
-                        onchange={ctx.link().callback(move |e:Event| {
-                            let device_id = selection(e);
-                            on_camera_select.emit(device_id);
-                        })}
+                        onchange={
+                            let cameras = ctx.props().cameras.clone();
+                            ctx.link().callback(move |e:Event| {
+                                let device_id = selection(e);
+                                if let Some(device_info) = find_device_by_id(&cameras, &device_id) {
+                                    on_camera_select.emit(device_info);
+                                }
+                            })
+                        }
                 >
                     { for ctx.props().cameras.iter().map(|device| html! {
                         <option value={device.device_id()} selected={ctx.props().selected_camera_id.as_deref() == Some(&device.device_id())}>
@@ -94,10 +112,15 @@ impl Component for DeviceSelector {
                             <>
                                 <label for={"speaker-select"}>{ "Speaker:" }</label>
                                 <select id={"speaker-select"} class={"device-selector"}
-                                        onchange={ctx.link().callback(move |e: Event| {
-                                            let device_id = selection(e);
-                                            on_speaker_select.emit(device_id);
-                                        })}
+                                        onchange={
+                                            let speakers = ctx.props().speakers.clone();
+                                            ctx.link().callback(move |e: Event| {
+                                                let device_id = selection(e);
+                                                if let Some(device_info) = find_device_by_id(&speakers, &device_id) {
+                                                    on_speaker_select.emit(device_info);
+                                                }
+                                            })
+                                        }
                                 >
                                     { for ctx.props().speakers.iter().map(|device| html! {
                                         <option value={device.device_id()} selected={ctx.props().selected_speaker_id.as_deref() == Some(&device.device_id())}>

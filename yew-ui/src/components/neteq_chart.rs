@@ -74,8 +74,8 @@ impl From<RawNetEqStats> for NetEqStats {
             buffer_ms: raw.current_buffer_size_ms,
             target_ms: raw.target_delay_ms,
             packets: raw.packet_count as u32,
-            expand_rate: raw.network.expand_rate as f32,
-            accel_rate: raw.network.accelerate_rate as f32,
+            expand_rate: neteq::q14::to_per_mille(raw.network.expand_rate), // Convert Q14 to per-mille (‰)
+            accel_rate: neteq::q14::to_per_mille(raw.network.accelerate_rate), // Convert Q14 to per-mille (‰)
             calls_per_sec: 0, // Not available in raw data
             avg_frames: 0,    // Not available in raw data
             underruns: 0,     // Not available in raw data (could map from concealment events)

@@ -592,6 +592,69 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
 pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
     let NetEqStatusDisplayProps { latest_stats } = props;
 
+    // Common CSS styles for both branches
+    let common_styles = r#"
+        .neteq-status {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            padding: 8px;
+        }
+        
+        .status-item {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 12px 8px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.2s ease;
+        }
+        
+        .status-item:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+        
+        .status-value {
+            font-size: 28px;
+            font-weight: 700;
+            line-height: 1;
+            margin-bottom: 4px;
+            color: #ffffff;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+        }
+        
+        .status-value.good {
+            color: #10b981;
+        }
+        
+        .status-value.warning {
+            color: #f59e0b;
+        }
+        
+        .status-label {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #d1d5db;
+            margin-bottom: 2px;
+            line-height: 1.2;
+        }
+        
+        .status-subtitle {
+            font-size: 9px;
+            color: #9ca3af;
+            line-height: 1.2;
+            font-weight: 400;
+            margin-top: 2px;
+        }
+    "#;
+
     if let Some(stats) = latest_stats {
         let buffer_class = if stats.buffer_ms == 0 {
             "status-value warning"
@@ -611,69 +674,7 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
 
         html! {
             <>
-                <style>
-                    {r#"
-                    .neteq-status {
-                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                    }
-                    
-                    .status-grid {
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-                        gap: 12px;
-                        padding: 8px;
-                    }
-                    
-                    .status-item {
-                        background: rgba(255, 255, 255, 0.05);
-                        border-radius: 8px;
-                        padding: 12px 8px;
-                        text-align: center;
-                        border: 1px solid rgba(255, 255, 255, 0.1);
-                        transition: all 0.2s ease;
-                    }
-                    
-                    .status-item:hover {
-                        background: rgba(255, 255, 255, 0.08);
-                        border-color: rgba(255, 255, 255, 0.2);
-                    }
-                    
-                    .status-value {
-                        font-size: 28px;
-                        font-weight: 700;
-                        line-height: 1;
-                        margin-bottom: 4px;
-                        color: #ffffff;
-                        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-                    }
-                    
-                    .status-value.good {
-                        color: #10b981;
-                    }
-                    
-                    .status-value.warning {
-                        color: #f59e0b;
-                    }
-                    
-                    .status-label {
-                        font-size: 11px;
-                        font-weight: 600;
-                        text-transform: uppercase;
-                        letter-spacing: 0.5px;
-                        color: #d1d5db;
-                        margin-bottom: 2px;
-                        line-height: 1.2;
-                    }
-                    
-                    .status-subtitle {
-                        font-size: 9px;
-                        color: #9ca3af;
-                        line-height: 1.2;
-                        font-weight: 400;
-                        margin-top: 2px;
-                    }
-                    "#}
-                </style>
+                <style>{common_styles}</style>
                 <div class="neteq-status">
                     <div class="status-grid">
                         <div class="status-item">
@@ -728,69 +729,7 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
     } else {
         html! {
             <>
-                <style>
-                    {r#"
-                    .neteq-status {
-                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                    }
-                    
-                    .status-grid {
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-                        gap: 12px;
-                        padding: 8px;
-                    }
-                    
-                    .status-item {
-                        background: rgba(255, 255, 255, 0.05);
-                        border-radius: 8px;
-                        padding: 12px 8px;
-                        text-align: center;
-                        border: 1px solid rgba(255, 255, 255, 0.1);
-                        transition: all 0.2s ease;
-                    }
-                    
-                    .status-item:hover {
-                        background: rgba(255, 255, 255, 0.08);
-                        border-color: rgba(255, 255, 255, 0.2);
-                    }
-                    
-                    .status-value {
-                        font-size: 28px;
-                        font-weight: 700;
-                        line-height: 1;
-                        margin-bottom: 4px;
-                        color: #ffffff;
-                        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-                    }
-                    
-                    .status-value.good {
-                        color: #10b981;
-                    }
-                    
-                    .status-value.warning {
-                        color: #f59e0b;
-                    }
-                    
-                    .status-label {
-                        font-size: 11px;
-                        font-weight: 600;
-                        text-transform: uppercase;
-                        letter-spacing: 0.5px;
-                        color: #d1d5db;
-                        margin-bottom: 2px;
-                        line-height: 1.2;
-                    }
-                    
-                    .status-subtitle {
-                        font-size: 9px;
-                        color: #9ca3af;
-                        line-height: 1.2;
-                        font-weight: 400;
-                        margin-top: 2px;
-                    }
-                    "#}
-                </style>
+                <style>{common_styles}</style>
                 <div class="neteq-status">
                     <div class="status-grid">
                         <div class="status-item">

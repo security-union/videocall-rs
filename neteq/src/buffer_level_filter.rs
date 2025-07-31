@@ -16,6 +16,22 @@
  * conditions.
  */
 
+/// Exponential smoothing factor for buffer level filtering.
+///
+/// This value controls the responsiveness of the buffer level filter:
+/// - Higher values (closer to 1.0) = more smoothing, slower response to changes
+/// - Lower values (closer to 0.0) = less smoothing, faster response to changes
+///
+/// The value 0.9 provides good balance between:
+/// - Filtering out short-term fluctuations due to network jitter
+/// - Responding to actual buffer level trends quickly enough for effective control
+///
+/// Engineering rationale:
+/// - Time constant τ = -frame_duration / ln(smoothing_factor)
+/// - With 0.9 and 10ms frames: τ ≈ 95ms response time
+/// - This allows ~10 frames to reach 63% of a step change
+const BUFFER_LEVEL_SMOOTHING_FACTOR: f64 = 0.9;
+
 /// Buffer level filter for smoothing buffer measurements
 ///
 /// This filter prevents oscillating acceleration/deceleration decisions by
@@ -45,7 +61,7 @@ impl BufferLevelFilter {
             filtered_level_samples: 0.0,
             target_level_ms: 0,
             sample_rate_hz,
-            smoothing_factor: 0.9, // WebRTC-like smoothing factor
+            smoothing_factor: BUFFER_LEVEL_SMOOTHING_FACTOR,
             initialized: false,
         }
     }

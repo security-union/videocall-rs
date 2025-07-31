@@ -30,6 +30,20 @@ use crate::statistics::{
 use crate::time_stretch::{TimeStretchFactory, TimeStretcher};
 use crate::{NetEqError, Result};
 
+/// Offset used to calculate the lower threshold for preemptive expansion.
+///
+/// This constant prevents aggressive preemptive expansion when buffer levels
+/// are still reasonable:
+/// - Without offset: low_limit = target * 0.75 (can be too aggressive)
+/// - With offset: low_limit = max(target * 0.75, target - 85ms)
+///
+/// Engineering rationale:
+/// - 85ms represents ~4 packets of typical 20ms duration
+/// - Provides stable lower bound regardless of target delay variations
+/// - Prevents preemptive expansion during normal operation
+/// - WebRTC tuned this value across diverse network conditions
+const K_DECELERATION_TARGET_LEVEL_OFFSET_MS: u32 = 85;
+
 /// NetEQ configuration
 #[derive(Debug, Clone)]
 pub struct NetEqConfig {
@@ -175,8 +189,10 @@ pub struct NetEq {
     decoders: HashMap<u8, Box<dyn crate::codec::AudioDecoder + Send>>,
     /// Audio queue for bypass mode (direct decoding without jitter buffer)
     bypass_audio_queue: VecDeque<f32>,
-    /// Time-stretched samples tracking for buffer level filtering
-    time_stretched_samples: i32,
+    /// Sample memory for time-stretching operations (matches WebRTC sample_memory_)
+    sample_memory: i32,
+    /// Flag indicating if time-scale operation was performed in previous call
+    prev_time_scale: bool,
 }
 
 impl NetEq {
@@ -236,7 +252,8 @@ impl NetEq {
             leftover_samples: Vec::new(),
             decoders: HashMap::new(),
             bypass_audio_queue: VecDeque::new(),
-            time_stretched_samples: 0,
+            sample_memory: 0,
+            prev_time_scale: false,
         })
     }
 
@@ -428,7 +445,8 @@ impl NetEq {
         self.last_decode_timestamp = None;
         self.consecutive_expands = 0;
         self.leftover_samples.clear();
-        self.time_stretched_samples = 0;
+        self.sample_memory = 0;
+        self.prev_time_scale = false;
     }
 
     fn get_decision(&mut self) -> Result<Operation> {
@@ -436,13 +454,21 @@ impl NetEq {
         let current_buffer_samples = self.current_buffer_size_samples();
         let target_delay_ms = self.delay_manager.target_delay_ms();
 
+        // Filter buffer level like WebRTC's FilterBufferLevel method
         self.buffer_level_filter
             .set_target_buffer_level(target_delay_ms);
-        self.buffer_level_filter
-            .update(current_buffer_samples, self.time_stretched_samples);
 
-        // Reset time-stretched samples after using them
-        self.time_stretched_samples = 0;
+        // Calculate time-stretched samples (matches WebRTC decision_logic.cc:233-237)
+        let mut time_stretched_samples = 0i32; // time_stretched_cn_samples in WebRTC
+        if self.prev_time_scale {
+            time_stretched_samples += self.sample_memory;
+        }
+
+        self.buffer_level_filter
+            .update(current_buffer_samples, time_stretched_samples);
+
+        // Reset for next frame (matches WebRTC decision_logic.cc:245-246)
+        self.prev_time_scale = false;
 
         // Check if we have packets
         if self.packet_buffer.is_empty() {
@@ -454,13 +480,11 @@ impl NetEq {
         let samples_per_ms = self.config.sample_rate / 1000;
         let target_level_samples = target_delay_ms * samples_per_ms;
 
-        // WebRTC constants - matches libwebrtc decision_logic.cc
-        const kDecelerationTargetLevelOffsetMs: u32 = 85;
-
         // Calculate thresholds like WebRTC
         let low_limit = std::cmp::max(
             target_level_samples * 3 / 4,
-            target_level_samples.saturating_sub(kDecelerationTargetLevelOffsetMs * samples_per_ms),
+            target_level_samples
+                .saturating_sub(K_DECELERATION_TARGET_LEVEL_OFFSET_MS * samples_per_ms),
         );
         let high_limit = std::cmp::max(target_level_samples, low_limit + 20 * samples_per_ms);
 
@@ -612,8 +636,9 @@ impl NetEq {
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
 
-            // Track removed samples for buffer level filtering
-            self.time_stretched_samples -= samples_removed as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
+            self.sample_memory += samples_removed as i32;
+            self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
             frame.vad_activity = extended_frame.vad_activity; // Preserve VAD from decoded audio
@@ -650,8 +675,9 @@ impl NetEq {
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
 
-            // Track removed samples for buffer level filtering
-            self.time_stretched_samples -= samples_removed as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
+            self.sample_memory += samples_removed as i32;
+            self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
             frame.vad_activity = extended_frame.vad_activity; // Preserve VAD from decoded audio
@@ -683,8 +709,10 @@ impl NetEq {
                 samples_added as u64,
             );
 
-            // Track added samples for buffer level filtering
-            self.time_stretched_samples += samples_added as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
+            // Note: Preemptive expand adds samples, so we subtract from sample_memory
+            self.sample_memory -= samples_added as i32;
+            self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
             // VAD activity already preserved from decode_normal call

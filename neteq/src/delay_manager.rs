@@ -21,8 +21,19 @@ use web_time::{Duration, Instant};
 
 use crate::{NetEqError, Result};
 
-/// Start delay in milliseconds - matches libwebrtc's kStartDelayMs
-const kStartDelayMs: u32 = 80;
+/// Initial target delay when NetEQ starts operation.
+///
+/// This value provides a buffer against early underruns while the adaptive
+/// delay manager learns the network characteristics:
+/// - Too low: Risk of underruns before adaptation kicks in
+/// - Too high: Unnecessary initial latency
+///
+/// Engineering rationale:
+/// - 80ms accommodates typical network jitter (±40ms)
+/// - Allows 4 packets of 20ms each in buffer initially
+/// - WebRTC empirically validated this across diverse networks
+/// - Provides safety margin during cold start before statistics stabilize
+const K_START_DELAY_MS: u32 = 80;
 
 /// Configuration for the delay manager
 #[derive(Debug, Clone)]
@@ -186,7 +197,7 @@ impl DelayManager {
         let arrival_delay_tracker = RelativeArrivalDelayTracker::new(config.clone());
 
         Self {
-            target_level_ms: kStartDelayMs.max(config.base_minimum_delay_ms), // Start with 80ms or minimum delay
+            target_level_ms: K_START_DELAY_MS.max(config.base_minimum_delay_ms), // Start with 80ms or minimum delay
             effective_minimum_delay_ms: config.base_minimum_delay_ms,
             minimum_delay_ms: config.base_minimum_delay_ms,
             maximum_delay_ms: 0, // No maximum by default
@@ -222,7 +233,7 @@ impl DelayManager {
         self.arrival_delay_tracker.reset();
         self.filtered_delay = 0.0;
         self.initialized = false;
-        self.target_level_ms = kStartDelayMs.max(self.config.base_minimum_delay_ms);
+        self.target_level_ms = K_START_DELAY_MS.max(self.config.base_minimum_delay_ms);
         // Reset to 80ms like WebRTC
     }
 

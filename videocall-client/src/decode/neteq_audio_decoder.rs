@@ -43,7 +43,6 @@ pub struct NetEqAudioPeerDecoder {
     decoded: bool,
     peer_id: String, // Track which peer this decoder belongs to
     _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
-    speaker_device_id: Option<String>, // Store the selected device ID
 }
 
 impl NetEqAudioPeerDecoder {
@@ -408,7 +407,6 @@ impl NetEqAudioPeerDecoder {
             decoded: false,
             peer_id,
             _pcm_player: pcm_player_ref,
-            speaker_device_id: speaker_device_id.clone(),
         };
 
         // Set the initial mute state explicitly

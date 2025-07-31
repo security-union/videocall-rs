@@ -159,7 +159,7 @@ pub mod q14 {
     /// ```
     #[inline]
     pub fn from_float(ratio: f64) -> u16 {
-        ((ratio * SCALE).min(SCALE).max(0.0)) as u16
+        (ratio * SCALE).clamp(0.0, SCALE) as u16
     }
 
     /// Convert per-mille (‰) back to Q14 integer

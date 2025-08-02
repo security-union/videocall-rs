@@ -760,7 +760,7 @@ impl NetEq {
     fn generate_comfort_noise(&mut self, frame: &mut AudioFrame) -> Result<()> {
         // Generate comfort noise
         for sample in &mut frame.samples {
-            *sample = (simple_random() - 0.5) * 0.001; // Very quiet comfort noise
+            *sample = (simple_random() - 0.5) * 0.000005; // Much quieter comfort noise
         }
 
         frame.speech_type = SpeechType::Cng;

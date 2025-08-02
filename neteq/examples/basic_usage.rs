@@ -32,9 +32,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_packets_in_buffer: 50,
         max_delay_ms: 500,
         min_delay_ms: 20,
-        enable_fast_accelerate: true,
-        enable_muted_state: false,
-        enable_rtx_handling: false,
         for_test_no_time_stretching: false,
         ..Default::default()
     };

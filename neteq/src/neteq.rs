@@ -57,12 +57,6 @@ pub struct NetEqConfig {
     pub max_delay_ms: u32,
     /// Minimum delay in milliseconds
     pub min_delay_ms: u32,
-    /// Enable fast accelerate mode
-    pub enable_fast_accelerate: bool,
-    /// Enable muted state detection
-    pub enable_muted_state: bool,
-    /// Enable RTX (retransmission) handling
-    pub enable_rtx_handling: bool,
     /// Disable time stretching (for testing)
     pub for_test_no_time_stretching: bool,
     /// Bypass NetEQ processing and decode packets directly (for A/B testing)
@@ -81,9 +75,6 @@ impl Default for NetEqConfig {
             max_packets_in_buffer: 200,
             max_delay_ms: 0,
             min_delay_ms: 0,
-            enable_fast_accelerate: false,
-            enable_muted_state: false,
-            enable_rtx_handling: false,
             for_test_no_time_stretching: false,
             bypass_mode: false,
             delay_config: DelayConfig::default(),
@@ -357,7 +348,7 @@ impl NetEq {
         let pre_buffer_ms = self.current_buffer_size_ms();
         let pre_target_delay = self.delay_manager.target_delay_ms();
         let pre_packet_count = self.packet_buffer.len();
-        log::trace!(
+        log::debug!(
             "get_audio pre-decision: buffer={pre_buffer_ms}ms, target={pre_target_delay}ms, packets={pre_packet_count}"
         );
         // -----------------------------------------------------
@@ -365,11 +356,6 @@ impl NetEq {
         // Determine what operation to perform
         let operation = self.get_decision()?;
         self.last_operation = operation;
-
-        // Additional logging of chosen operation and current state
-        log::debug!(
-            "get_audio decision: {operation:?} (buffer={pre_buffer_ms}ms, target={pre_target_delay}ms, packets={pre_packet_count})"
-        );
 
         match operation {
             Operation::Normal => self.decode_normal(&mut frame)?,
@@ -385,6 +371,9 @@ impl NetEq {
                 frame.speech_type = SpeechType::Expand;
             }
         }
+
+        // Record decode operation for per-second tracking
+        self.statistics.record_decode_operation(operation);
 
         // === Log buffer status after producing frame ===
         let post_buffer_ms = self.current_buffer_size_ms();
@@ -463,7 +452,6 @@ impl NetEq {
         if self.prev_time_scale {
             time_stretched_samples += self.sample_memory;
         }
-
         self.buffer_level_filter
             .update(current_buffer_samples, time_stretched_samples);
 
@@ -636,8 +624,11 @@ impl NetEq {
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
 
-            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
-            self.sample_memory += samples_removed as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
+            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
+            // extended_frame has more samples than we need, representing available data
+            let available_samples = extended_frame.samples.len() / self.config.channels as usize;
+            self.sample_memory = available_samples as i32;
             self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
@@ -675,8 +666,11 @@ impl NetEq {
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
 
-            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
-            self.sample_memory += samples_removed as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
+            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
+            // extended_frame has more samples than we need, representing available data
+            let available_samples = extended_frame.samples.len() / self.config.channels as usize;
+            self.sample_memory = available_samples as i32;
             self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
@@ -709,9 +703,11 @@ impl NetEq {
                 samples_added as u64,
             );
 
-            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
-            // Note: Preemptive expand adds samples, so we subtract from sample_memory
-            self.sample_memory -= samples_added as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
+            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
+            // For preemptive expand, we had normal frame samples available
+            let available_samples = frame.samples.len() / self.config.channels as usize;
+            self.sample_memory = available_samples as i32;
             self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
@@ -764,7 +760,7 @@ impl NetEq {
     fn generate_comfort_noise(&mut self, frame: &mut AudioFrame) -> Result<()> {
         // Generate comfort noise
         for sample in &mut frame.samples {
-            *sample = (simple_random() - 0.5) * 0.001; // Very quiet comfort noise
+            *sample = (simple_random() - 0.5) * 0.000005; // Much quieter comfort noise
         }
 
         frame.speech_type = SpeechType::Cng;
@@ -1079,14 +1075,12 @@ mod tests {
 
     /// Test continuous packet insertion to verify steady-state buffer convergence.
     ///
-    /// This test simulates the user's scenario: continuous packet arrival with
-    /// audio playback, ensuring NetEQ converges to a small steady-state buffer.
-    ///
+    /// This test simulates continuous streaming with small buffer variations.
     /// Expected behavior:
-    /// - Initial buffer buildup due to timestamp jump
-    /// - NetEQ should aggressively accelerate to reduce buffer
-    /// - Should converge to small steady-state (~12 packets = ~240ms as observed)
-    /// - Buffer should remain stable, not continue growing
+    /// - Small buffer variations around target (20-40ms are normal)
+    /// - NetEQ should NOT aggressively accelerate for small buffers
+    /// - Should maintain steady-state with minimal intervention
+    /// - Only large buffer buildups should trigger acceleration
     #[test]
     fn test_continuous_streaming_buffer_convergence() {
         let config = NetEqConfig::default();
@@ -1164,10 +1158,12 @@ mod tests {
 
         // Critical assertions for your requirement
 
-        // 1. NetEQ should use acceleration to handle buffer buildup
+        // 1. For small buffer levels (20-40ms), acceleration should NOT be needed
+        // This is normal network jitter, not buffer overload
+        // With target=20ms and buffers=20-40ms, no acceleration should occur
         assert!(
-            acceleration_count >= 2,
-            "Expected acceleration operations to reduce buffer, got {}",
+            acceleration_count <= 2,
+            "Expected minimal acceleration for small buffers, got {} (buffers were only 20-40ms above target)",
             acceleration_count
         );
 

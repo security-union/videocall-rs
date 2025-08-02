@@ -28,22 +28,16 @@ pub struct WebNetEq {
     neteq: std::cell::RefCell<Option<NetEq>>,
     sample_rate: u32,
     channels: u8,
-    enable_fast_accelerate: bool,
 }
 
 #[wasm_bindgen]
 impl WebNetEq {
     #[wasm_bindgen(constructor)]
-    pub fn new(
-        sample_rate: u32,
-        channels: u8,
-        enable_fast_accelerate: bool,
-    ) -> Result<WebNetEq, JsValue> {
+    pub fn new(sample_rate: u32, channels: u8) -> Result<WebNetEq, JsValue> {
         Ok(WebNetEq {
             neteq: std::cell::RefCell::new(None), // Will be initialized in init()
             sample_rate,
             channels,
-            enable_fast_accelerate,
         })
     }
 
@@ -72,7 +66,6 @@ impl WebNetEq {
             sample_rate: self.sample_rate,
             channels: self.channels,
             min_delay_ms: 80,
-            enable_fast_accelerate: self.enable_fast_accelerate,
             ..Default::default()
         };
         let mut neteq = NetEq::new(cfg).map_err(Self::map_err)?;

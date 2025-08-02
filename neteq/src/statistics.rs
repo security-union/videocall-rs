@@ -180,8 +180,32 @@ pub mod q14 {
     }
 }
 
+use crate::neteq::Operation;
 use serde::{Deserialize, Serialize};
 use web_time::{Duration, Instant};
+
+/// Decode operation counters for real-time monitoring
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperationCounters {
+    /// Normal decode operations per second
+    pub normal_per_sec: f32,
+    /// Expand operations per second (packet loss concealment)
+    pub expand_per_sec: f32,
+    /// Accelerate operations per second (time compression)
+    pub accelerate_per_sec: f32,
+    /// Fast accelerate operations per second
+    pub fast_accelerate_per_sec: f32,
+    /// Preemptive expand operations per second (time expansion)
+    pub preemptive_expand_per_sec: f32,
+    /// Merge operations per second (blending)
+    pub merge_per_sec: f32,
+    /// Comfort noise operations per second
+    pub comfort_noise_per_sec: f32,
+    /// DTMF operations per second
+    pub dtmf_per_sec: f32,
+    /// Undefined/error operations per second
+    pub undefined_per_sec: f32,
+}
 
 /// Network statistics similar to libWebRTC's NetEqNetworkStatistics
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,6 +234,8 @@ pub struct NetworkStatistics {
     pub total_packets_received: u32,
     pub reorder_rate_permyriad: u16, // Reordering rate in per-myriad (‰)
     pub max_reorder_distance: u16,   // Maximum sequence number distance for reordered packets
+    /// Real-time decode operation counters
+    pub operation_counters: OperationCounters,
 }
 
 /// Lifetime statistics that persist over the NetEQ lifetime
@@ -277,6 +303,12 @@ pub struct StatisticsCalculator {
     total_output_samples: u64,
     /// Total expanded samples for rate calculations
     total_expanded_samples: u64,
+    /// Operation counters for rolling window tracking
+    operation_counts: [u32; 9], // One for each Operation variant
+    /// Last time operation rates were calculated
+    last_operation_update: Instant,
+    /// Window duration for operation rate calculation (1 second)
+    operation_window_duration: Duration,
 }
 
 impl Default for StatisticsCalculator {
@@ -298,6 +330,9 @@ impl StatisticsCalculator {
             _last_update: now,
             total_output_samples: 0,
             total_expanded_samples: 0,
+            operation_counts: [0; 9],
+            last_operation_update: now,
+            operation_window_duration: Duration::from_secs(1),
         }
     }
 
@@ -372,6 +407,65 @@ impl StatisticsCalculator {
                     self.network_stats.expand_rate = q14::from_float(ratio);
                 }
             }
+        }
+    }
+
+    /// Record a decode operation for per-second tracking
+    pub fn record_decode_operation(&mut self, operation: Operation) {
+        let now = Instant::now();
+
+        // Convert operation to array index
+        let index = match operation {
+            Operation::Normal => 0,
+            Operation::Merge => 1,
+            Operation::Expand => 2,
+            Operation::Accelerate => 3,
+            Operation::FastAccelerate => 4,
+            Operation::PreemptiveExpand => 5,
+            Operation::ComfortNoise => 6,
+            Operation::Dtmf => 7,
+            Operation::Undefined => 8,
+        };
+
+        // Increment counter
+        self.operation_counts[index] += 1;
+
+        // Update operation counters per second if window has elapsed
+        if now.duration_since(self.last_operation_update) >= self.operation_window_duration {
+            self.update_operation_rates(now);
+        }
+    }
+
+    /// Update operation rates (operations per second)
+    fn update_operation_rates(&mut self, now: Instant) {
+        let elapsed = now.duration_since(self.last_operation_update);
+        let elapsed_secs = elapsed.as_secs_f32();
+
+        if elapsed_secs > 0.0 {
+            self.network_stats.operation_counters.normal_per_sec =
+                self.operation_counts[0] as f32 / elapsed_secs;
+            self.network_stats.operation_counters.merge_per_sec =
+                self.operation_counts[1] as f32 / elapsed_secs;
+            self.network_stats.operation_counters.expand_per_sec =
+                self.operation_counts[2] as f32 / elapsed_secs;
+            self.network_stats.operation_counters.accelerate_per_sec =
+                self.operation_counts[3] as f32 / elapsed_secs;
+            self.network_stats
+                .operation_counters
+                .fast_accelerate_per_sec = self.operation_counts[4] as f32 / elapsed_secs;
+            self.network_stats
+                .operation_counters
+                .preemptive_expand_per_sec = self.operation_counts[5] as f32 / elapsed_secs;
+            self.network_stats.operation_counters.comfort_noise_per_sec =
+                self.operation_counts[6] as f32 / elapsed_secs;
+            self.network_stats.operation_counters.dtmf_per_sec =
+                self.operation_counts[7] as f32 / elapsed_secs;
+            self.network_stats.operation_counters.undefined_per_sec =
+                self.operation_counts[8] as f32 / elapsed_secs;
+
+            // Reset counters for next window
+            self.operation_counts.fill(0);
+            self.last_operation_update = now;
         }
     }
 

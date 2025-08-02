@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/security-union/videocall-rs/compare/neteq-v0.3.1...neteq-v0.4.0) - 2025-08-02
+
+### Other
+
+- rewrite filter buffer, add a ton of tests  ([#356](https://github.com/security-union/videocall-rs/pull/356))
+
 ## [0.3.1](https://github.com/security-union/videocall-rs/compare/neteq-v0.3.0...neteq-v0.3.1) - 2025-08-02
 
 ### Other

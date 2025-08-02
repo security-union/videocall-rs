@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.17](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.16...videocall-client-v1.1.17) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq
+
 ## [1.1.16](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.15...videocall-client-v1.1.16) - 2025-08-02
 
 ### Other

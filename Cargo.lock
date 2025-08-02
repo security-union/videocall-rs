@@ -6460,7 +6460,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "1.0.29"
+version = "1.0.30"
 dependencies = [
  "anyhow",
  "clap",
@@ -6659,7 +6659,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.0.19"
+version = "1.0.20"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

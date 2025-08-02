@@ -357,7 +357,7 @@ impl NetEq {
         let pre_buffer_ms = self.current_buffer_size_ms();
         let pre_target_delay = self.delay_manager.target_delay_ms();
         let pre_packet_count = self.packet_buffer.len();
-        log::trace!(
+        log::debug!(
             "get_audio pre-decision: buffer={pre_buffer_ms}ms, target={pre_target_delay}ms, packets={pre_packet_count}"
         );
         // -----------------------------------------------------
@@ -367,9 +367,10 @@ impl NetEq {
         self.last_operation = operation;
 
         // Additional logging of chosen operation and current state
-        log::debug!(
+        #[cfg(feature = "web")]
+        web_sys::console::log_1(&format!(
             "get_audio decision: {operation:?} (buffer={pre_buffer_ms}ms, target={pre_target_delay}ms, packets={pre_packet_count})"
-        );
+        ).into());
 
         match operation {
             Operation::Normal => self.decode_normal(&mut frame)?,
@@ -463,7 +464,6 @@ impl NetEq {
         if self.prev_time_scale {
             time_stretched_samples += self.sample_memory;
         }
-
         self.buffer_level_filter
             .update(current_buffer_samples, time_stretched_samples);
 
@@ -636,8 +636,11 @@ impl NetEq {
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
 
-            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
-            self.sample_memory += samples_removed as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
+            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
+            // extended_frame has more samples than we need, representing available data
+            let available_samples = extended_frame.samples.len() / self.config.channels as usize;
+            self.sample_memory = available_samples as i32;
             self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
@@ -675,8 +678,11 @@ impl NetEq {
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
 
-            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
-            self.sample_memory += samples_removed as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
+            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
+            // extended_frame has more samples than we need, representing available data
+            let available_samples = extended_frame.samples.len() / self.config.channels as usize;
+            self.sample_memory = available_samples as i32;
             self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
@@ -709,9 +715,11 @@ impl NetEq {
                 samples_added as u64,
             );
 
-            // Track time-stretching for buffer level filtering (matches WebRTC AddSampleMemory)
-            // Note: Preemptive expand adds samples, so we subtract from sample_memory
-            self.sample_memory -= samples_added as i32;
+            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
+            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
+            // For preemptive expand, we had normal frame samples available
+            let available_samples = frame.samples.len() / self.config.channels as usize;
+            self.sample_memory = available_samples as i32;
             self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;

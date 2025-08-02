@@ -1017,7 +1017,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                             <div class="chart-container">
                                 <NetEqAdvancedChart
                                     stats_history={neteq_stats_history.clone()}
-                                    chart_type={AdvancedChartType::NetworkAdaptation}
+                                    chart_type={AdvancedChartType::DecodeOperations}
                                     width={290}
                                     height={200}
                                 />

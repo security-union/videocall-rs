@@ -120,7 +120,7 @@ mod wasm_worker {
         // populated.
         NETEQ.with(|cell| {
             if cell.borrow().is_none() {
-                match WebNetEq::new(48_000, 1, true) {
+                match WebNetEq::new(48_000, 1) {
                     Ok(eq) => {
                         // Spawn async initialization
                         wasm_bindgen_futures::spawn_local(async move {

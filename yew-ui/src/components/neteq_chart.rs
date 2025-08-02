@@ -56,6 +56,16 @@ pub struct NetEqStats {
     pub max_reorder_distance: u32,
     pub sequence_number: u32,
     pub rtp_timestamp: u32,
+    // Operation counters per second
+    pub normal_per_sec: f32,
+    pub expand_per_sec: f32,
+    pub accelerate_per_sec: f32,
+    pub fast_accelerate_per_sec: f32,
+    pub preemptive_expand_per_sec: f32,
+    pub merge_per_sec: f32,
+    pub comfort_noise_per_sec: f32,
+    pub dtmf_per_sec: f32,
+    pub undefined_per_sec: f32,
 }
 
 // Convert from the raw NetEQ structure to the UI structure
@@ -76,6 +86,15 @@ impl From<RawNetEqStats> for NetEqStats {
             max_reorder_distance: raw.network.max_reorder_distance as u32,
             sequence_number: 0, // Not available in raw data
             rtp_timestamp: 0,   // Not available in raw data
+            normal_per_sec: raw.network.operation_counters.normal_per_sec,
+            expand_per_sec: raw.network.operation_counters.expand_per_sec,
+            accelerate_per_sec: raw.network.operation_counters.accelerate_per_sec,
+            fast_accelerate_per_sec: raw.network.operation_counters.fast_accelerate_per_sec,
+            preemptive_expand_per_sec: raw.network.operation_counters.preemptive_expand_per_sec,
+            merge_per_sec: raw.network.operation_counters.merge_per_sec,
+            comfort_noise_per_sec: raw.network.operation_counters.comfort_noise_per_sec,
+            dtmf_per_sec: raw.network.operation_counters.dtmf_per_sec,
+            undefined_per_sec: raw.network.operation_counters.undefined_per_sec,
         }
     }
 }
@@ -197,20 +216,20 @@ pub fn base_chart(props: &BaseChartProps) -> Html {
                 { for legend_elements }
 
                 // Y-axis labels
-                <text x={(margin_left - 10.0).to_string()} y={(plot_height + margin_top + 4.0).to_string()} fill="#aaa" font-size="9" text-anchor="end">{"0"}</text>
-                <text x={(margin_left - 10.0).to_string()} y={(margin_top + plot_height / 2.0 + 4.0).to_string()} fill="#aaa" font-size="9" text-anchor="end">{format!("{:.1}", config.max_value / 2.0)}</text>
-                <text x={(margin_left - 10.0).to_string()} y={(margin_top + 4.0).to_string()} fill="#aaa" font-size="9" text-anchor="end">{format!("{:.1}", config.max_value)}</text>
+                <text x={(margin_left - 10.0).to_string()} y={(plot_height + margin_top + 4.0).to_string()} fill="#aaa" font-size="12" text-anchor="end">{"0"}</text>
+                <text x={(margin_left - 10.0).to_string()} y={(margin_top + plot_height / 2.0 + 4.0).to_string()} fill="#aaa" font-size="12" text-anchor="end">{format!("{:.1}", config.max_value / 2.0)}</text>
+                <text x={(margin_left - 10.0).to_string()} y={(margin_top + 4.0).to_string()} fill="#aaa" font-size="12" text-anchor="end">{format!("{:.1}", config.max_value)}</text>
 
                 // X-axis time labels - REVERSED (0s on right, older time on left)
-                <text x={(margin_left + plot_width).to_string()} y={(chart_height - 10.0).to_string()} fill="#aaa" font-size="10" text-anchor="middle">{"0s"}</text>
-                <text x={(margin_left + plot_width / 2.0).to_string()} y={(chart_height - 10.0).to_string()} fill="#aaa" font-size="10" text-anchor="middle">{ format!("{}s", data_len / 2) }</text>
-                <text x={margin_left.to_string()} y={(chart_height - 10.0).to_string()} fill="#aaa" font-size="10" text-anchor="middle">{ format!("{}s", data_len) }</text>
+                <text x={(margin_left + plot_width).to_string()} y={(chart_height - 10.0).to_string()} fill="#aaa" font-size="13" text-anchor="middle">{"0s"}</text>
+                <text x={(margin_left + plot_width / 2.0).to_string()} y={(chart_height - 10.0).to_string()} fill="#aaa" font-size="13" text-anchor="middle">{ format!("{}s", data_len / 2) }</text>
+                <text x={margin_left.to_string()} y={(chart_height - 10.0).to_string()} fill="#aaa" font-size="13" text-anchor="middle">{ format!("{}s", data_len) }</text>
 
                 // Y-axis unit label
-                <text x="5" y={(margin_top + plot_height / 2.0).to_string()} fill="#aaa" font-size="8" transform={format!("rotate(-90, 5, {})", margin_top + plot_height / 2.0)}>{config.y_axis_label}</text>
+                <text x="5" y={(margin_top + plot_height / 2.0).to_string()} fill="#aaa" font-size="11" transform={format!("rotate(-90, 5, {})", margin_top + plot_height / 2.0)}>{config.y_axis_label}</text>
 
                 // Chart title
-                <text x={(chart_width / 2.0).to_string()} y="15" fill="#fff" font-size="12" text-anchor="middle" font-weight="bold">{ config.title }</text>
+                <text x={(chart_width / 2.0).to_string()} y="15" fill="#fff" font-size="14" text-anchor="middle" font-weight="bold">{ config.title }</text>
             </svg>
         </div>
     }
@@ -246,7 +265,7 @@ pub enum ChartType {
 #[derive(PartialEq, Clone)]
 pub enum AdvancedChartType {
     BufferVsTarget,
-    NetworkAdaptation,
+    DecodeOperations,
     QualityMetrics,
     ReorderingAnalysis,
     SystemPerformance,
@@ -272,7 +291,7 @@ impl AdvancedChartType {
     fn title(&self) -> &'static str {
         match self {
             AdvancedChartType::BufferVsTarget => "Buffer Size vs Target",
-            AdvancedChartType::NetworkAdaptation => "Network Adaptation Rates",
+            AdvancedChartType::DecodeOperations => "Decode Operations Per Second",
             AdvancedChartType::QualityMetrics => "Packet Count & Audio Quality",
             AdvancedChartType::ReorderingAnalysis => "Packet Reordering Analysis",
             AdvancedChartType::SystemPerformance => "System Performance",
@@ -335,12 +354,12 @@ pub fn neteq_chart(props: &NetEqChartProps) -> Html {
                 }
 
                 // Y-axis labels
-                <text x="0" y="10" fill="#888" font-size="8">{ max_val }</text>
-                <text x="0" y={(plot_height + 5.0).to_string()} fill="#888" font-size="8">{"0"}</text>
+                <text x="0" y="10" fill="#888" font-size="11">{ max_val }</text>
+                <text x="0" y={(plot_height + 5.0).to_string()} fill="#888" font-size="11">{"0"}</text>
 
                 // X-axis labels
-                <text x={margin_left.to_string()} y={(chart_height - 1.0).to_string()} fill="#888" font-size="8">{"0s"}</text>
-                <text x={(chart_width - 20.0).to_string()} y={(chart_height - 1.0).to_string()} fill="#888" font-size="8">{ format!("{}s", time_span) }</text>
+                <text x={margin_left.to_string()} y={(chart_height - 1.0).to_string()} fill="#888" font-size="11">{"0s"}</text>
+                <text x={(chart_width - 20.0).to_string()} y={(chart_height - 1.0).to_string()} fill="#888" font-size="11">{ format!("{}s", time_span) }</text>
             </svg>
         </div>
     }
@@ -381,32 +400,78 @@ impl ChartConfig {
         }
     }
 
-    pub fn network_adaptation(stats_history: &[NetEqStats]) -> Self {
-        let max_rate = stats_history
+    pub fn decode_operations(stats_history: &[NetEqStats]) -> Self {
+        // Find max operations per second across all operation types
+        let max_ops = stats_history
             .iter()
-            .map(|s| s.expand_rate.max(s.accel_rate))
+            .map(|s| {
+                s.normal_per_sec
+                    .max(s.expand_per_sec)
+                    .max(s.accelerate_per_sec)
+                    .max(s.fast_accelerate_per_sec)
+                    .max(s.preemptive_expand_per_sec)
+                    .max(s.merge_per_sec)
+                    .max(s.comfort_noise_per_sec)
+                    .max(s.dtmf_per_sec)
+            })
             .fold(1.0f32, f32::max)
             .max(1.0) as f64;
 
-        let expand_data: Vec<f64> = stats_history.iter().map(|s| s.expand_rate as f64).collect();
-
-        let accel_data: Vec<f64> = stats_history.iter().map(|s| s.accel_rate as f64).collect();
+        // Extract data for the most important operation types
+        let normal_data: Vec<f64> = stats_history
+            .iter()
+            .map(|s| s.normal_per_sec as f64)
+            .collect();
+        let expand_data: Vec<f64> = stats_history
+            .iter()
+            .map(|s| s.expand_per_sec as f64)
+            .collect();
+        let accelerate_data: Vec<f64> = stats_history
+            .iter()
+            .map(|s| s.accelerate_per_sec as f64)
+            .collect();
+        let preemptive_data: Vec<f64> = stats_history
+            .iter()
+            .map(|s| s.preemptive_expand_per_sec as f64)
+            .collect();
+        let merge_data: Vec<f64> = stats_history
+            .iter()
+            .map(|s| s.merge_per_sec as f64)
+            .collect();
 
         Self {
-            title: "Network Adaptation Rates",
-            y_axis_label: "Rate (‰)",
-            max_value: max_rate,
+            title: "Decode Operations Per Second",
+            y_axis_label: "Operations/sec",
+            max_value: max_ops,
             series: vec![
                 ChartSeries {
-                    data_points: expand_data,
-                    color: "#dc3545",
-                    label: "Expand Rate",
+                    data_points: normal_data,
+                    color: "#28a745", // Green for normal operation
+                    label: "Normal",
                     scale_factor: 1.0,
                 },
                 ChartSeries {
-                    data_points: accel_data,
-                    color: "#fd7e14",
-                    label: "Accel Rate",
+                    data_points: expand_data,
+                    color: "#dc3545", // Red for packet loss concealment
+                    label: "Expand",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: accelerate_data,
+                    color: "#fd7e14", // Orange for time compression
+                    label: "Accelerate",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: preemptive_data,
+                    color: "#6f42c1", // Purple for preemptive expansion
+                    label: "Preemptive Expand",
+                    scale_factor: 1.0,
+                },
+                ChartSeries {
+                    data_points: merge_data,
+                    color: "#17a2b8", // Cyan for merge operations
+                    label: "Merge",
                     scale_factor: 1.0,
                 },
             ],
@@ -566,7 +631,7 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
 
     let config = match chart_type {
         AdvancedChartType::BufferVsTarget => ChartConfig::buffer_vs_target(stats_history),
-        AdvancedChartType::NetworkAdaptation => ChartConfig::network_adaptation(stats_history),
+        AdvancedChartType::DecodeOperations => ChartConfig::decode_operations(stats_history),
         AdvancedChartType::QualityMetrics => ChartConfig::quality_metrics(stats_history),
         AdvancedChartType::ReorderingAnalysis => ChartConfig::reordering_analysis(stats_history),
         AdvancedChartType::SystemPerformance => ChartConfig::system_performance(stats_history),

@@ -372,6 +372,9 @@ impl NetEq {
             }
         }
 
+        // Record decode operation for per-second tracking
+        self.statistics.record_decode_operation(operation);
+
         // === Log buffer status after producing frame ===
         let post_buffer_ms = self.current_buffer_size_ms();
         let post_packet_count = self.packet_buffer.len();

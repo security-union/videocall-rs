@@ -286,7 +286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .as_millis();
 
                     let json_line = format!(
-                        "{{\"timestamp\":{},\"buffer_ms\":{},\"target_ms\":{},\"packets\":{},\"expand_rate\":{:.1},\"accel_rate\":{:.1},\"calls_per_sec\":{},\"avg_frames\":{},\"underruns\":{},\"reorder_rate\":{},\"reordered_packets\":{},\"max_reorder_distance\":{},\"sequence_number\":{},\"rtp_timestamp\":{}}}\n",
+                        "{{\"timestamp\":{},\"buffer_ms\":{},\"target_ms\":{},\"packets\":{},\"expand_rate\":{:.1},\"accel_rate\":{:.1},\"calls_per_sec\":{},\"avg_frames\":{},\"underruns\":{},\"reorder_rate\":{},\"reordered_packets\":{},\"max_reorder_distance\":{},\"sequence_number\":{},\"rtp_timestamp\":{},\"normal_operations\":{:.1},\"expand_operations\":{:.1},\"accelerate_operations\":{:.1},\"preemptive_expand_operations\":{:.1},\"merge_operations\":{:.1}}}\n",
                         timestamp,
                         stats.current_buffer_size_ms,
                         stats.target_delay_ms,
@@ -300,7 +300,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         stats.network.reordered_packets,
                         stats.network.max_reorder_distance,
                         0, // We'll update this when we track actual sequence numbers
-                        0  // We'll update this when we track actual RTP timestamps
+                        0, // We'll update this when we track actual RTP timestamps
+                        stats.network.operation_counters.normal_per_sec,
+                        stats.network.operation_counters.expand_per_sec,
+                        stats.network.operation_counters.accelerate_per_sec,
+                        stats.network.operation_counters.preemptive_expand_per_sec,
+                        stats.network.operation_counters.merge_per_sec,
                     );
 
                     let _ = file.write_all(json_line.as_bytes());

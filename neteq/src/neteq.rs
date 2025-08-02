@@ -452,7 +452,7 @@ impl NetEq {
     fn get_decision(&mut self) -> Result<Operation> {
         // Update buffer level filter first
         let current_buffer_samples = self.current_buffer_size_samples();
-        let target_delay_ms = self.delay_manager.target_delay_ms();
+        let target_delay_ms: u32 = self.delay_manager.target_delay_ms();
 
         // Filter buffer level like WebRTC's FilterBufferLevel method
         self.buffer_level_filter

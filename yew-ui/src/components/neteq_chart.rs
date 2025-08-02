@@ -2,43 +2,6 @@ pub use neteq::NetEqStats as RawNetEqStats;
 use serde::{Deserialize, Serialize};
 use yew::prelude::*;
 
-// NetEQ structures from the actual NetEQ crate (for parsing)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetworkStatistics {
-    pub current_buffer_size_ms: u16,
-    pub preferred_buffer_size_ms: u16,
-    pub jitter_peaks_found: u16,
-    pub expand_rate: u16,
-    pub speech_expand_rate: u16,
-    pub preemptive_rate: u16,
-    pub accelerate_rate: u16,
-    pub mean_waiting_time_ms: i32,
-    pub median_waiting_time_ms: i32,
-    pub min_waiting_time_ms: i32,
-    pub max_waiting_time_ms: i32,
-    pub reordered_packets: u32,
-    pub total_packets_received: u32,
-    pub reorder_rate_permyriad: u16,
-    pub max_reorder_distance: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LifetimeStatistics {
-    pub total_samples_received: u64,
-    pub concealed_samples: u64,
-    pub concealment_events: u64,
-    pub jitter_buffer_delay_ms: u64,
-    pub jitter_buffer_emitted_count: u64,
-    pub jitter_buffer_target_delay_ms: u64,
-    pub inserted_samples_for_deceleration: u64,
-    pub removed_samples_for_acceleration: u64,
-    pub silent_concealed_samples: u64,
-    pub relative_packet_arrival_delay_ms: u64,
-    pub jitter_buffer_packets_received: u64,
-    pub buffer_flushes: u64,
-    pub late_packets_discarded: u64,
-}
-
 // UI-friendly structure for charts (keeping the old one)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NetEqStats {

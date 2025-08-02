@@ -3597,7 +3597,7 @@ dependencies = [
 
 [[package]]
 name = "neteq"
-version = "0.2.4"
+version = "0.3.0"
 dependencies = [
  "axum",
  "clap",
@@ -6460,7 +6460,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "1.0.26"
+version = "1.0.27"
 dependencies = [
  "anyhow",
  "clap",
@@ -6483,7 +6483,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "1.1.14"
+version = "1.1.15"
 dependencies = [
  "aes",
  "anyhow",
@@ -6659,7 +6659,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.0.16"
+version = "1.0.17"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

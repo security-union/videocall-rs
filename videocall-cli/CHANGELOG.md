@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.27](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.26...videocall-cli-v1.0.27) - 2025-08-02
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [1.0.26](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.25...videocall-cli-v1.0.26) - 2025-07-31
 
 ### Other

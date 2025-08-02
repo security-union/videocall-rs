@@ -16,24 +16,6 @@
  * conditions.
  */
 
-/// Exponential smoothing factor for buffer level filtering.
-///
-/// This value controls the responsiveness of the buffer level filter:
-/// - Higher values (closer to 1.0) = more smoothing, slower response to changes
-/// - Lower values (closer to 0.0) = less smoothing, faster response to changes
-///
-/// The value 0.8 provides improved balance between:
-/// - Filtering out short-term fluctuations due to network jitter  
-/// - Responding to actual buffer level trends quickly enough for effective control
-///
-/// Engineering rationale:
-/// - Time constant τ = -frame_duration / ln(smoothing_factor)
-/// - With 0.6 and 10ms frames: τ ≈ 20ms response time (much faster)
-/// - This allows ~2-3 frames to reach 63% of a step change
-/// - Provides much faster response for late-joining peer scenarios
-/// - Reduces lag between raw and filtered buffer levels
-const BUFFER_LEVEL_SMOOTHING_FACTOR: f64 = 0.6;
-
 /// Buffer level filter for smoothing buffer measurements
 ///
 /// This filter prevents oscillating acceleration/deceleration decisions by
@@ -46,14 +28,10 @@ const BUFFER_LEVEL_SMOOTHING_FACTOR: f64 = 0.6;
 pub struct BufferLevelFilter {
     /// Current filtered buffer level in samples
     filtered_level_samples: f64,
-    /// Target buffer level in milliseconds (set by delay manager)
-    target_level_ms: u32,
+    /// Filter coefficient (dynamic based on target delay)
+    level_factor: f64,
     /// Sample rate for conversions
     sample_rate_hz: u32,
-    /// Exponential smoothing factor (0.0 to 1.0)
-    smoothing_factor: f64,
-    /// Whether the filter has been initialized
-    initialized: bool,
 }
 
 impl BufferLevelFilter {
@@ -61,50 +39,64 @@ impl BufferLevelFilter {
     pub fn new(sample_rate_hz: u32) -> Self {
         Self {
             filtered_level_samples: 0.0,
-            target_level_ms: 0,
+            level_factor: 253.0 / 256.0, // Default coefficient (α ≈ 0.988)
             sample_rate_hz,
-            smoothing_factor: BUFFER_LEVEL_SMOOTHING_FACTOR,
-            initialized: false,
         }
     }
 
     /// Update the filter with new buffer size and time-stretched samples
     ///
+    /// Hybrid approach:
+    /// 1. Use WebRTC's conservative filtering for normal operations
+    /// 2. Become more responsive for large buffer jumps (late-joining peers, bursts)
+    /// 3. Apply exponential filter to raw buffer_size_samples
+    /// 4. Then subtract time_stretched_samples
+    ///
     /// # Arguments
     /// * `buffer_size_samples` - Current raw buffer size in samples
     /// * `time_stretched_samples` - Samples added/removed by time-stretching operations
     pub fn update(&mut self, buffer_size_samples: usize, time_stretched_samples: i32) {
-        let current_level = buffer_size_samples as f64 - time_stretched_samples as f64;
-
-        if !self.initialized {
-            self.filtered_level_samples = current_level.max(0.0);
-            self.initialized = true;
+        // Detect large buffer jumps that need faster response
+        let buffer_jump = (buffer_size_samples as f64 - self.filtered_level_samples).abs();
+        // Smart threshold: prevent false triggers on startup but catch real overloads
+        // - If current level is very low (<100), use higher threshold (startup protection)
+        // - Otherwise use normal threshold for established operation
+        let buffer_jump_threshold = if self.filtered_level_samples < 100.0 {
+            // Startup scenario: need much larger jump to trigger aggressive mode
+            (buffer_size_samples as f64 * 0.75).max(3000.0) // 75% of target or 3000 samples
         } else {
-            // Exponential smoothing: filtered = α × current + (1-α) × previous
-            self.filtered_level_samples = self.smoothing_factor * self.filtered_level_samples
-                + (1.0 - self.smoothing_factor) * current_level;
+            // Normal operation: use responsive threshold
+            (self.filtered_level_samples * 3.0).max(1500.0)
+        };
 
-            // Prevent filtered level from diverging too far from raw buffer
-            // If raw buffer is more than 2x target, don't let filter go below target/2
-            let raw_buffer_samples = buffer_size_samples as f64;
-            let target_samples = self.target_level_ms as f64 * self.sample_rate_hz as f64 / 1000.0;
+        // Choose coefficient based on buffer jump size
+        let effective_factor = if buffer_jump > buffer_jump_threshold {
+            // Large jump detected - use much more responsive coefficient temporarily
+            // WebRTC uses α≈0.988, we use α≈0.7 for large jumps (30% new value vs 1.2%)
+            0.7
+        } else {
+            // Normal WebRTC conservative behavior
+            self.level_factor
+        };
 
-            if raw_buffer_samples > target_samples * 2.0 {
-                self.filtered_level_samples = self.filtered_level_samples.max(target_samples * 0.5);
-            }
-        }
+        // Step 1: Apply exponential smoothing to raw buffer size (WebRTC's order)
+        // filtered = α × previous_filtered + (1-α) × buffer_size_samples
+        let filtered_level = effective_factor * self.filtered_level_samples
+            + (1.0 - effective_factor) * buffer_size_samples as f64;
 
-        // Ensure filtered level never goes negative
-        self.filtered_level_samples = self.filtered_level_samples.max(0.0);
+        // Step 2: Account for time-scale operations and ensure non-negative
+        // Subtract time_stretched_samples AFTER filtering (WebRTC's approach)
+        self.filtered_level_samples = (filtered_level - time_stretched_samples as f64).max(0.0);
     }
 
     /// Set the filtered buffer level directly (used for buffer flush scenarios)
+    /// Matches WebRTC's SetFilteredBufferLevel
     pub fn set_filtered_buffer_level(&mut self, buffer_size_samples: usize) {
         self.filtered_level_samples = buffer_size_samples as f64;
-        self.initialized = true;
     }
 
     /// Get the current filtered buffer level in samples
+    /// Matches WebRTC's filtered_current_level()
     pub fn filtered_current_level(&self) -> usize {
         self.filtered_level_samples.max(0.0) as usize
     }
@@ -118,28 +110,44 @@ impl BufferLevelFilter {
         (samples as u64 * 1000 / self.sample_rate_hz as u64) as u32
     }
 
-    /// Set the target buffer level (called by delay manager)
+    /// Set the target buffer level and adjust filter coefficient accordingly
+    /// Matches WebRTC's SetTargetBufferLevel exactly
     pub fn set_target_buffer_level(&mut self, target_level_ms: u32) {
-        self.target_level_ms = target_level_ms;
+        // WebRTC's dynamic coefficient selection based on target delay
+        self.level_factor = if target_level_ms <= 20 {
+            251.0 / 256.0 // α ≈ 0.980 - Most responsive for low latency
+        } else if target_level_ms <= 60 {
+            252.0 / 256.0 // α ≈ 0.984
+        } else if target_level_ms <= 140 {
+            253.0 / 256.0 // α ≈ 0.988 - Default
+        } else {
+            254.0 / 256.0 // α ≈ 0.992 - Most smoothing for high latency
+        };
     }
 
-    /// Get the target buffer level in samples
-    pub fn target_level_samples(&self) -> usize {
+    /// Get the target buffer level in samples (for convenience)
+    pub fn target_level_samples(&self, target_level_ms: u32) -> usize {
         if self.sample_rate_hz == 0 {
             return 0;
         }
-        (self.target_level_ms as u64 * self.sample_rate_hz as u64 / 1000) as usize
+        (target_level_ms as u64 * self.sample_rate_hz as u64 / 1000) as usize
     }
 
     /// Reset the filter state
+    /// Matches WebRTC's Reset method
     pub fn reset(&mut self) {
         self.filtered_level_samples = 0.0;
-        self.initialized = false;
+        self.level_factor = 253.0 / 256.0; // Reset to default coefficient
     }
 
     /// Update sample rate (called when sample rate changes)
     pub fn set_sample_rate(&mut self, sample_rate_hz: u32) {
         self.sample_rate_hz = sample_rate_hz;
+    }
+
+    /// Get current filter coefficient for debugging/testing
+    pub fn get_filter_coefficient(&self) -> f64 {
+        self.level_factor
     }
 }
 
@@ -158,14 +166,25 @@ mod tests {
     fn test_buffer_level_filter_update() {
         let mut filter = BufferLevelFilter::new(16000);
 
-        // First update should set the level directly
+        // WebRTC behavior: first update applies exponential filter from 0
         filter.update(1000, 0);
-        assert_eq!(filter.filtered_current_level(), 1000);
+        let first_level = filter.filtered_current_level();
+        // With coefficient 253: (253*0>>8) + (256-253)*1000 = 3000 Q8 = ~12 samples
+        assert!(first_level >= 10 && first_level <= 15);
 
         // Subsequent updates should be smoothed
         filter.update(2000, 0);
         let filtered_level = filter.filtered_current_level();
-        assert!(filtered_level > 1000 && filtered_level < 2000);
+
+        println!(
+            "First level: {}, Second level: {}",
+            first_level, filtered_level
+        );
+
+        // With hybrid approach: 2000 vs ~12 is a large jump (>3x threshold), triggers aggressive mode
+        // α=0.7: filtered = 0.7 * 12 + 0.3 * 2000 = 8.4 + 600 = ~608
+        // Should increase significantly due to large jump detection, but less than raw 2000
+        assert!(filtered_level > first_level && filtered_level < 1000);
     }
 
     #[test]
@@ -174,7 +193,11 @@ mod tests {
 
         // Update with time-stretched samples
         filter.update(1000, 100); // 100 samples were time-stretched
-        assert_eq!(filter.filtered_current_level(), 900);
+        let result = filter.filtered_current_level();
+
+        // With WebRTC: filtered = ((253*0>>8) + (256-253)*1000) - 100*256 = 3000 - 25600 = negative -> 0
+        // WebRTC clamps negative values to 0
+        assert_eq!(result, 0);
     }
 
     #[test]
@@ -183,7 +206,6 @@ mod tests {
 
         filter.set_filtered_buffer_level(500);
         assert_eq!(filter.filtered_current_level(), 500);
-        assert!(filter.initialized);
     }
 
     #[test]
@@ -191,7 +213,7 @@ mod tests {
         let mut filter = BufferLevelFilter::new(16000);
 
         filter.set_target_buffer_level(100); // 100ms
-        assert_eq!(filter.target_level_samples(), 1600); // 100ms * 16000Hz / 1000 = 1600 samples
+        assert_eq!(filter.target_level_samples(100), 1600); // 100ms * 16000Hz / 1000 = 1600 samples
     }
 
     #[test]
@@ -207,11 +229,15 @@ mod tests {
         let mut filter = BufferLevelFilter::new(16000);
 
         filter.update(1000, 0);
-        assert_eq!(filter.filtered_current_level(), 1000);
+        let before_reset = filter.filtered_current_level();
+        // WebRTC behavior: first update gives α*0 + (1-α)*1000 = small value
+        assert!(
+            before_reset > 0,
+            "Filter should have non-zero value after update"
+        );
 
         filter.reset();
         assert_eq!(filter.filtered_current_level(), 0);
-        assert!(!filter.initialized);
     }
 
     // === NEW TESTS TO DEBUG THE STUCK FILTER ===
@@ -224,9 +250,15 @@ mod tests {
         // Simulate the exact scenario from user logs:
         // Raw buffer around 11k samples (230ms), filtered stuck at 1920 samples (40ms)
 
-        // Initialize with some value
-        filter.update(1920, 0); // Start at 1920 samples (40ms)
-        assert_eq!(filter.filtered_current_level(), 1920);
+        // Initialize with WebRTC-style behavior (starts from 0)
+        filter.update(1920, 0); // First update with 1920 samples
+        let initial_level = filter.filtered_current_level();
+        // WebRTC behavior: starts from 0, so gets small initial value
+        assert!(
+            initial_level >= 20 && initial_level <= 30,
+            "Expected ~23, got {}",
+            initial_level
+        );
 
         // Now try updating with much higher raw buffer values
         for i in 1..=10 {
@@ -247,17 +279,16 @@ mod tests {
 
             // With smoothing_factor 0.6: new = 0.6 * old + 0.4 * current
             // Expected: new = 0.6 * 1920 + 0.4 * 11000 = 1152 + 4400 = 5552
-            let expected = (0.6 * prev_filtered as f64 + 0.4 * raw_samples as f64) as usize;
 
             if i == 1 {
-                // First update should move significantly
+                // First large jump (from ~23 to 11100) should trigger aggressive mode
+                // α=0.7: filtered = 0.7 * 23 + 0.3 * 11100 = 16.1 + 3330 = ~3346
                 assert!(
-                    new_filtered > 4000,
-                    "Filter should move from {} toward {}, got {} (expected ~{})",
+                    new_filtered > 3000,
+                    "Filter should use aggressive mode for large jump from {} to {}, got {}",
                     prev_filtered,
                     raw_samples,
-                    new_filtered,
-                    expected
+                    new_filtered
                 );
             }
         }
@@ -298,18 +329,40 @@ mod tests {
     #[test]
     fn test_mathematical_correctness() {
         let mut filter = BufferLevelFilter::new(48000);
+        filter.set_target_buffer_level(100); // Set target for coefficient selection
 
-        // Simple test without bounds or complications
-        filter.update(1000, 0); // Initialize
-        assert_eq!(filter.filtered_current_level(), 1000);
+        // Test WebRTC-style behavior: starts from 0, applies exponential filter
+        filter.update(1000, 0);
+        let first_result = filter.filtered_current_level();
+        // With α=253/256≈0.988: filtered = 0.988*0 + 0.012*1000 ≈ 12
+        assert!(
+            first_result >= 10 && first_result <= 15,
+            "First update should be ~12, got {}",
+            first_result
+        );
 
-        // Update with higher value
+        // Test small increment (conservative behavior)
+        // Jump from ~12 to 100 should be below threshold (12*3=36, but min is 1000, so need <1000 jump)
+        filter.update(100, 0);
+        let small_increment = filter.filtered_current_level();
+        // Small change, should use conservative coefficient
+        // α=253/256: filtered = 0.988*12 + 0.012*100 ≈ 11.8 + 1.2 ≈ 13
+        assert!(
+            small_increment >= 10 && small_increment <= 20,
+            "Small increment should be ~13, got {}",
+            small_increment
+        );
+
+        // Test large jump (aggressive behavior)
         filter.update(5000, 0);
-        let result = filter.filtered_current_level();
-
-        // Expected: 0.6 * 1000 + 0.4 * 5000 = 600 + 2000 = 2600
-        let expected = (0.6 * 1000.0 + 0.4 * 5000.0) as usize;
-        assert_eq!(result, expected, "Mathematical error in smoothing");
+        let large_jump = filter.filtered_current_level();
+        // Large jump detected (5000 vs ~26), should use α=0.7
+        // filtered = 0.7*26 + 0.3*5000 = 18.2 + 1500 = ~1518
+        assert!(
+            large_jump >= 1400 && large_jump <= 1600,
+            "Large jump should trigger aggressive mode ~1518, got {}",
+            large_jump
+        );
     }
 
     #[test]
@@ -317,9 +370,14 @@ mod tests {
         let mut filter = BufferLevelFilter::new(48000);
         filter.set_target_buffer_level(80); // 80ms target
 
-        // Initialize filter
-        filter.update(1920, 0); // Start at 1920 samples (40ms)
-        assert_eq!(filter.filtered_current_level(), 1920);
+        // Initialize filter with WebRTC behavior
+        filter.update(1920, 0); // Start with 1920 samples
+        let initial_level = filter.filtered_current_level();
+        assert!(
+            initial_level >= 20 && initial_level <= 30,
+            "Expected ~23, got {}",
+            initial_level
+        );
 
         // Simulate the exact scenario from logs:
         // Raw buffer is high (11k+ samples) but time-stretched samples make current_level = 1920
@@ -339,11 +397,12 @@ mod tests {
             println!("Test iteration {}: raw={}, time_stretched={}, current_level={}, prev_filtered={}, new_filtered={}", 
                 i, raw_samples, time_stretched_samples, raw_samples as i32 - time_stretched_samples, prev_filtered, new_filtered);
 
-            // If time_stretched_samples cancels out raw buffer growth, filter should stay at 1920
-            if time_stretched_samples as usize == raw_samples - 1920 {
-                assert_eq!(
-                    new_filtered, 1920,
-                    "Filter should be stuck at 1920 due to time-stretched compensation"
+            // If time_stretched_samples cancels out raw buffer growth, filter should stay low
+            if time_stretched_samples as usize == raw_samples - initial_level as usize {
+                assert!(
+                    new_filtered >= 20 && new_filtered <= 30,
+                    "Filter should be stuck at low value due to time-stretched compensation, got {}",
+                    new_filtered
                 );
             }
         }
@@ -357,12 +416,36 @@ mod tests {
         // Test if filter gets reset repeatedly
         filter.update(11000, 0); // Set to high value
         let high_value = filter.filtered_current_level();
-        assert!(high_value > 5000);
+        println!(
+            "DEBUG: After update(11000, 0), filtered_level = {}",
+            high_value
+        );
+
+        // Expected: large jump from 0 to 11000 should trigger aggressive mode (11000 > 5000 threshold)
+        // α=0.7: filtered = 0.7 * 0 + 0.3 * 11000 = 3300
+        assert!(
+            high_value > 3000,
+            "Large jump should result in significant increase, got {}",
+            high_value
+        );
 
         // Reset and re-initialize at 1920
         filter.reset();
         filter.update(1920, 0);
-        assert_eq!(filter.filtered_current_level(), 1920);
+        let after_reset = filter.filtered_current_level();
+        println!(
+            "DEBUG: After reset and update(1920, 0), filtered_level = {}",
+            after_reset
+        );
+
+        // After reset, filter starts from 0 again
+        // Jump 0→1920 is below 5000 threshold, so should use conservative filtering
+        // α=253/256: filtered = 0.988 * 0 + 0.012 * 1920 = ~23
+        assert!(
+            after_reset >= 20 && after_reset <= 30,
+            "After reset should use conservative filtering, got {}",
+            after_reset
+        );
 
         // If this happens every frame, filter would be stuck at 1920
         println!("RESET BUG: Filter reset from {} to 1920", high_value);
@@ -374,8 +457,13 @@ mod tests {
         filter.set_target_buffer_level(80);
 
         // Simulate the bug scenario: sample_memory keeps accumulating
-        filter.update(1920, 0); // Initialize
-        assert_eq!(filter.filtered_current_level(), 1920);
+        filter.update(1920, 0); // Initialize with WebRTC behavior
+        let initial_level = filter.filtered_current_level();
+        assert!(
+            initial_level >= 20 && initial_level <= 30,
+            "Expected ~23, got {}",
+            initial_level
+        );
 
         // Simulate multiple frames where sample_memory is NOT reset (the old bug)
         let mut accumulated_sample_memory = 0i32;
@@ -550,6 +638,64 @@ mod tests {
 
         println!(
             "✅ Our NetEQ fix produces reasonable time_stretched_samples, filter moves correctly"
+        );
+    }
+
+    #[test]
+    fn test_webrtc_compatible_behavior() {
+        let mut filter = BufferLevelFilter::new(16000);
+
+        // Test dynamic coefficient selection (WebRTC behavior)
+        filter.set_target_buffer_level(15); // <= 20ms
+        assert!((filter.get_filter_coefficient() - 251.0 / 256.0).abs() < 0.001);
+
+        filter.set_target_buffer_level(40); // <= 60ms
+        assert!((filter.get_filter_coefficient() - 252.0 / 256.0).abs() < 0.001);
+
+        filter.set_target_buffer_level(100); // <= 140ms
+        assert!((filter.get_filter_coefficient() - 253.0 / 256.0).abs() < 0.001);
+
+        filter.set_target_buffer_level(200); // > 140ms
+        assert!((filter.get_filter_coefficient() - 254.0 / 256.0).abs() < 0.001);
+
+        // Test that filter is much more conservative than before
+        filter.reset();
+        filter.set_target_buffer_level(80); // Default coefficient 253
+
+        // Initialize with 1000 samples
+        filter.update(1000, 0);
+        let initial_level = filter.filtered_current_level();
+        println!("Initial level after first update: {}", initial_level);
+
+        // WebRTC starts from 0, so first update: (253*0>>8) + (256-253)*1000 = 3000 Q8 = 11-12 samples
+        // This is expected WebRTC behavior - very gradual response from zero state
+        assert!(
+            initial_level >= 10 && initial_level <= 15,
+            "Expected 10-15, got {}",
+            initial_level
+        );
+
+        // Large jump to 5000 samples - hybrid behavior test
+        filter.update(5000, 0);
+        let after_jump = filter.filtered_current_level();
+
+        // With smart threshold: jump from ~11 to 5000 (4989) exceeds startup threshold (3750)
+        // So uses aggressive mode: α=0.7: new = 0.7*11 + 0.3*5000 = 7.7 + 1500 = ~1508
+        let expected_aggressive = (0.7 * initial_level as f64 + 0.3 * 5000.0) as usize;
+        println!(
+            "After jump: {}, expected: {}",
+            after_jump, expected_aggressive
+        );
+        assert!(
+            after_jump >= expected_aggressive - 50 && after_jump <= expected_aggressive + 50,
+            "Expected aggressive mode ~{}, got {}",
+            expected_aggressive,
+            after_jump
+        );
+
+        println!(
+            "✅ Hybrid filter correctly uses aggressive mode for large jumps: {}",
+            after_jump
         );
     }
 }

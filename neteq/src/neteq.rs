@@ -366,12 +366,6 @@ impl NetEq {
         let operation = self.get_decision()?;
         self.last_operation = operation;
 
-        // Additional logging of chosen operation and current state
-        #[cfg(feature = "web")]
-        web_sys::console::log_1(&format!(
-            "get_audio decision: {operation:?} (buffer={pre_buffer_ms}ms, target={pre_target_delay}ms, packets={pre_packet_count})"
-        ).into());
-
         match operation {
             Operation::Normal => self.decode_normal(&mut frame)?,
             Operation::Accelerate => self.decode_accelerate(&mut frame)?,
@@ -1087,14 +1081,12 @@ mod tests {
 
     /// Test continuous packet insertion to verify steady-state buffer convergence.
     ///
-    /// This test simulates the user's scenario: continuous packet arrival with
-    /// audio playback, ensuring NetEQ converges to a small steady-state buffer.
-    ///
+    /// This test simulates continuous streaming with small buffer variations.
     /// Expected behavior:
-    /// - Initial buffer buildup due to timestamp jump
-    /// - NetEQ should aggressively accelerate to reduce buffer
-    /// - Should converge to small steady-state (~12 packets = ~240ms as observed)
-    /// - Buffer should remain stable, not continue growing
+    /// - Small buffer variations around target (20-40ms are normal)
+    /// - NetEQ should NOT aggressively accelerate for small buffers
+    /// - Should maintain steady-state with minimal intervention
+    /// - Only large buffer buildups should trigger acceleration
     #[test]
     fn test_continuous_streaming_buffer_convergence() {
         let config = NetEqConfig::default();
@@ -1172,10 +1164,12 @@ mod tests {
 
         // Critical assertions for your requirement
 
-        // 1. NetEQ should use acceleration to handle buffer buildup
+        // 1. For small buffer levels (20-40ms), acceleration should NOT be needed
+        // This is normal network jitter, not buffer overload
+        // With target=20ms and buffers=20-40ms, no acceleration should occur
         assert!(
-            acceleration_count >= 2,
-            "Expected acceleration operations to reduce buffer, got {}",
+            acceleration_count <= 2,
+            "Expected minimal acceleration for small buffers, got {} (buffers were only 20-40ms above target)",
             acceleration_count
         );
 

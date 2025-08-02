@@ -550,12 +550,13 @@ mod tests {
         // 1. Set sample_memory to available samples for time-stretching
         // 2. Use it for decision
         // 3. Subtract consumed samples after successful operation
+
         for frame in 1..=10 {
             let raw_samples = 11000 + frame * 100;
             let samples_left = 2000; // Assume we have 2000 samples available
 
             // WebRTC pattern: SET sample_memory to available samples (not accumulate)
-            webrtc_sample_memory = samples_left; // Line 1304: set_sample_memory(samples_left + extracted_samples)
+            let mut webrtc_sample_memory = samples_left; // Line 1304: set_sample_memory(samples_left + extracted_samples)
 
             // Use for this frame's decision
             let time_stretched_samples = webrtc_sample_memory;

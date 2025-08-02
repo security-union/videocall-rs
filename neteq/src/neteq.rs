@@ -57,12 +57,6 @@ pub struct NetEqConfig {
     pub max_delay_ms: u32,
     /// Minimum delay in milliseconds
     pub min_delay_ms: u32,
-    /// Enable fast accelerate mode
-    pub enable_fast_accelerate: bool,
-    /// Enable muted state detection
-    pub enable_muted_state: bool,
-    /// Enable RTX (retransmission) handling
-    pub enable_rtx_handling: bool,
     /// Disable time stretching (for testing)
     pub for_test_no_time_stretching: bool,
     /// Bypass NetEQ processing and decode packets directly (for A/B testing)
@@ -81,9 +75,6 @@ impl Default for NetEqConfig {
             max_packets_in_buffer: 200,
             max_delay_ms: 0,
             min_delay_ms: 0,
-            enable_fast_accelerate: false,
-            enable_muted_state: false,
-            enable_rtx_handling: false,
             for_test_no_time_stretching: false,
             bypass_mode: false,
             delay_config: DelayConfig::default(),

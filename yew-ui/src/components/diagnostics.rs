@@ -961,6 +961,12 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
             </div>
             <div class="sidebar-content">
 
+                // Application Version
+                <div class="diagnostics-section">
+                    <h3>{"Application Version"}</h3>
+                    <pre>{format!("VideoCall UI: {}", env!("CARGO_PKG_VERSION"))}</pre>
+                </div>
+
                 // Connection Manager Status - Now at the top for visibility
                 <div class="diagnostics-section">
                     <h3>{"Connection Manager"}</h3>

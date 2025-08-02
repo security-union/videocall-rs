@@ -51,3 +51,6 @@ jobs:
 
       - name: Run wasm-pack tests for videocall-codecs
         run: cd videocall-codecs && cargo test
+      
+      - name: Run tests for neteq
+        run: cd neteq && cargo test

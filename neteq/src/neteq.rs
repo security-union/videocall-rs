@@ -891,12 +891,12 @@ mod tests {
 
         let mut counter = 0;
         for p in packets {
+            counter += 10;
             neteq.insert_packet(p).unwrap();
             assert_eq!(neteq.current_buffer_size_ms(), counter);
-            counter += 10;
         }
 
-        assert_eq!(neteq.current_buffer_size_ms(), 40);
+        assert_eq!(neteq.current_buffer_size_ms(), 50);
 
         // NetEQ should still deliver a normal speech frame
         let frame = neteq.get_audio().unwrap();

@@ -191,11 +191,6 @@ mod wasm_worker {
                 NETEQ.with(|cell| {
                     if let Some(eq) = cell.borrow().as_ref() {
                         if let Ok(js_val) = eq.get_statistics() {
-                            // Send structured stats message using WorkerResponse
-                            let stats_msg = WorkerResponse::Stats {
-                                stats: js_val.clone(), // Clone for the message
-                            };
-
                             // Manual construction since JsValue doesn't serialize properly
                             let obj = js_sys::Object::new();
                             let _ = js_sys::Reflect::set(

@@ -283,7 +283,7 @@ impl PacketBuffer {
         }
     }
 
-    /// Get the total duration of packets in the buffer
+    /// Get the total duration of packets in the buffer (timestamp span)
     pub fn get_span_duration_ms(&self) -> u32 {
         if self.buffer.is_empty() {
             return 0;
@@ -303,6 +303,12 @@ impl PacketBuffer {
         // Convert samples to milliseconds (assuming first packet sample rate)
         let sample_rate = self.buffer.front().unwrap().sample_rate;
         (span_samples * 1000) / sample_rate
+    }
+
+    /// Get the total content duration of packets in the buffer (sum of packet durations)
+    /// This is more reliable than span_duration when packets have close timestamps
+    pub fn get_total_content_duration_ms(&self) -> u32 {
+        self.buffer.iter().map(|packet| packet.duration_ms).sum()
     }
 
     /// Get the total number of samples in the buffer

@@ -90,7 +90,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let stats = neteq.get_statistics();
             println!(
                 "Packet {}: Buffer size: {}ms, Target delay: {}ms, Packets: {}",
-                i, stats.current_buffer_size_ms, stats.target_delay_ms, stats.packet_count
+                i,
+                stats.current_buffer_size_ms,
+                stats.target_delay_ms,
+                stats.packets_awaiting_decode
             );
         }
     }

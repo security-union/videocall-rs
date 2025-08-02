@@ -65,7 +65,7 @@ impl WebNetEq {
         let cfg = NetEqConfig {
             sample_rate: self.sample_rate,
             channels: self.channels,
-            min_delay_ms: 200,
+            min_delay_ms: 80,
             ..Default::default()
         };
         let mut neteq = NetEq::new(cfg).map_err(Self::map_err)?;

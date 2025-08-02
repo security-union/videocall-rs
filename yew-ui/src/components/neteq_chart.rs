@@ -1,3 +1,4 @@
+pub use neteq::NetEqStats as RawNetEqStats;
 use serde::{Deserialize, Serialize};
 use yew::prelude::*;
 
@@ -38,22 +39,13 @@ pub struct LifetimeStatistics {
     pub late_packets_discarded: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RawNetEqStats {
-    pub network: NetworkStatistics,
-    pub lifetime: LifetimeStatistics,
-    pub current_buffer_size_ms: u32,
-    pub target_delay_ms: u32,
-    pub packet_count: usize,
-}
-
 // UI-friendly structure for charts (keeping the old one)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NetEqStats {
     pub timestamp: u64,
     pub buffer_ms: u32,
     pub target_ms: u32,
-    pub packets: u32,
+    pub packets_awaiting_decode: u32,
     pub expand_rate: f32,
     pub accel_rate: f32,
     pub calls_per_sec: u64,
@@ -73,9 +65,9 @@ impl From<RawNetEqStats> for NetEqStats {
             timestamp: 0, // We don't have a timestamp in the raw data, use 0 or current time
             buffer_ms: raw.current_buffer_size_ms,
             target_ms: raw.target_delay_ms,
-            packets: raw.packet_count as u32,
-            expand_rate: raw.network.expand_rate as f32,
-            accel_rate: raw.network.accelerate_rate as f32,
+            packets_awaiting_decode: raw.packets_awaiting_decode as u32,
+            expand_rate: neteq::q14::to_per_mille(raw.network.expand_rate), // Convert Q14 to per-mille (‰)
+            accel_rate: neteq::q14::to_per_mille(raw.network.accelerate_rate), // Convert Q14 to per-mille (‰)
             calls_per_sec: 0, // Not available in raw data
             avg_frames: 0,    // Not available in raw data
             underruns: 0,     // Not available in raw data (could map from concealment events)
@@ -368,7 +360,7 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
         AdvancedChartType::QualityMetrics => {
             let max_packets = stats_history
                 .iter()
-                .map(|s| s.packets)
+                .map(|s| s.packets_awaiting_decode)
                 .max()
                 .unwrap_or(1)
                 .max(1) as f64;
@@ -385,7 +377,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                 .map(|(i, stats)| {
                     let x = margin_left + (i as f64 / (data_len - 1).max(1) as f64 * plot_width);
                     let y = margin_top + plot_height
-                        - ((stats.packets as f64).max(0.0) / max_packets * plot_height);
+                        - ((stats.packets_awaiting_decode as f64).max(0.0) / max_packets
+                            * plot_height);
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
@@ -592,6 +585,69 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
 pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
     let NetEqStatusDisplayProps { latest_stats } = props;
 
+    // Common CSS styles for both branches
+    let common_styles = r#"
+        .neteq-status {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            padding: 8px;
+        }
+        
+        .status-item {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 12px 8px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.2s ease;
+        }
+        
+        .status-item:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+        
+        .status-value {
+            font-size: 28px;
+            font-weight: 700;
+            line-height: 1;
+            margin-bottom: 4px;
+            color: #ffffff;
+            text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+        }
+        
+        .status-value.good {
+            color: #10b981;
+        }
+        
+        .status-value.warning {
+            color: #f59e0b;
+        }
+        
+        .status-label {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #d1d5db;
+            margin-bottom: 2px;
+            line-height: 1.2;
+        }
+        
+        .status-subtitle {
+            font-size: 9px;
+            color: #9ca3af;
+            line-height: 1.2;
+            font-weight: 400;
+            margin-top: 2px;
+        }
+    "#;
+
     if let Some(stats) = latest_stats {
         let buffer_class = if stats.buffer_ms == 0 {
             "status-value warning"
@@ -610,89 +666,113 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
         };
 
         html! {
-            <div class="neteq-status">
-                <div class="status-grid">
-                    <div class="status-item">
-                        <div class={buffer_class}>{stats.buffer_ms}</div>
-                        <div class="status-label">{"Buffer (ms)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.target_ms}</div>
-                        <div class="status-label">{"Target (ms)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.packets}</div>
-                        <div class="status-label">{"Packets"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class={underrun_class}>{stats.underruns}</div>
-                        <div class="status-label">{"Underruns"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{format!("{:.1}", stats.expand_rate)}</div>
-                        <div class="status-label">{"Expand Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{format!("{:.1}", stats.accel_rate)}</div>
-                        <div class="status-label">{"Accel Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.reorder_rate}</div>
-                        <div class="status-label">{"Reorder Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.reordered_packets}</div>
-                        <div class="status-label">{"Reordered Packets"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{stats.max_reorder_distance}</div>
-                        <div class="status-label">{"Max Reorder Distance"}</div>
+            <>
+                <style>{common_styles}</style>
+                <div class="neteq-status">
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <div class={buffer_class}>{stats.buffer_ms}</div>
+                            <div class="status-label">{"BUFFER (MS)"}</div>
+                            <div class="status-subtitle">{"Audio data buffered for playback"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.target_ms}</div>
+                            <div class="status-label">{"TARGET (MS)"}</div>
+                            <div class="status-subtitle">{"Optimal buffer size for network"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.packets_awaiting_decode}</div>
+                            <div class="status-label">{"PACKETS"}</div>
+                            <div class="status-subtitle">{"Encoded packets awaiting decode"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class={underrun_class}>{stats.underruns}</div>
+                            <div class="status-label">{"UNDERRUNS"}</div>
+                            <div class="status-subtitle">{"Times audio buffer ran empty"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{format!("{:.1}", stats.expand_rate)}</div>
+                            <div class="status-label">{"EXPAND RATE"}</div>
+                            <div class="status-subtitle">{"Audio stretching when buffer low (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{format!("{:.1}", stats.accel_rate)}</div>
+                            <div class="status-label">{"ACCEL RATE"}</div>
+                            <div class="status-subtitle">{"Audio compression when buffer full (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.reorder_rate}</div>
+                            <div class="status-label">{"REORDER RATE"}</div>
+                            <div class="status-subtitle">{"Out-of-order packet frequency (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.reordered_packets}</div>
+                            <div class="status-label">{"REORDERED PACKETS"}</div>
+                            <div class="status-subtitle">{"Total packets received out-of-order"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{stats.max_reorder_distance}</div>
+                            <div class="status-label">{"MAX REORDER DISTANCE"}</div>
+                            <div class="status-subtitle">{"Largest gap in packet sequence"}</div>
+                        </div>
                     </div>
                 </div>
-            </div>
+            </>
         }
     } else {
         html! {
-            <div class="neteq-status">
-                <div class="status-grid">
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Buffer (ms)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Target (ms)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Packets"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Underruns"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Expand Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Accel Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Reorder Rate (‰)"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Reordered Packets"}</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{"--"}</div>
-                        <div class="status-label">{"Max Reorder Distance"}</div>
+            <>
+                <style>{common_styles}</style>
+                <div class="neteq-status">
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"BUFFER (MS)"}</div>
+                            <div class="status-subtitle">{"Audio data buffered for playback"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"TARGET (MS)"}</div>
+                            <div class="status-subtitle">{"Optimal buffer size for network"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"PACKETS"}</div>
+                            <div class="status-subtitle">{"Encoded packets awaiting decode"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"UNDERRUNS"}</div>
+                            <div class="status-subtitle">{"Times audio buffer ran empty"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"EXPAND RATE"}</div>
+                            <div class="status-subtitle">{"Audio stretching when buffer low (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"ACCEL RATE"}</div>
+                            <div class="status-subtitle">{"Audio compression when buffer full (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"REORDER RATE"}</div>
+                            <div class="status-subtitle">{"Out-of-order packet frequency (‰)"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"REORDERED PACKETS"}</div>
+                            <div class="status-subtitle">{"Total packets received out-of-order"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"MAX REORDER DISTANCE"}</div>
+                            <div class="status-subtitle">{"Largest gap in packet sequence"}</div>
+                        </div>
                     </div>
                 </div>
-            </div>
+            </>
         }
     }
 }

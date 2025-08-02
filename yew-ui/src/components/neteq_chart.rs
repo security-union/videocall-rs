@@ -1,3 +1,4 @@
+pub use neteq::NetEqStats as RawNetEqStats;
 use serde::{Deserialize, Serialize};
 use yew::prelude::*;
 
@@ -38,22 +39,13 @@ pub struct LifetimeStatistics {
     pub late_packets_discarded: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RawNetEqStats {
-    pub network: NetworkStatistics,
-    pub lifetime: LifetimeStatistics,
-    pub current_buffer_size_ms: u32,
-    pub target_delay_ms: u32,
-    pub packet_count: usize,
-}
-
 // UI-friendly structure for charts (keeping the old one)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NetEqStats {
     pub timestamp: u64,
     pub buffer_ms: u32,
     pub target_ms: u32,
-    pub packets: u32,
+    pub packets_awaiting_decode: u32,
     pub expand_rate: f32,
     pub accel_rate: f32,
     pub calls_per_sec: u64,
@@ -73,7 +65,7 @@ impl From<RawNetEqStats> for NetEqStats {
             timestamp: 0, // We don't have a timestamp in the raw data, use 0 or current time
             buffer_ms: raw.current_buffer_size_ms,
             target_ms: raw.target_delay_ms,
-            packets: raw.packet_count as u32,
+            packets_awaiting_decode: raw.packets_awaiting_decode as u32,
             expand_rate: neteq::q14::to_per_mille(raw.network.expand_rate), // Convert Q14 to per-mille (‰)
             accel_rate: neteq::q14::to_per_mille(raw.network.accelerate_rate), // Convert Q14 to per-mille (‰)
             calls_per_sec: 0, // Not available in raw data
@@ -368,7 +360,7 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
         AdvancedChartType::QualityMetrics => {
             let max_packets = stats_history
                 .iter()
-                .map(|s| s.packets)
+                .map(|s| s.packets_awaiting_decode)
                 .max()
                 .unwrap_or(1)
                 .max(1) as f64;
@@ -385,7 +377,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
                 .map(|(i, stats)| {
                     let x = margin_left + (i as f64 / (data_len - 1).max(1) as f64 * plot_width);
                     let y = margin_top + plot_height
-                        - ((stats.packets as f64).max(0.0) / max_packets * plot_height);
+                        - ((stats.packets_awaiting_decode as f64).max(0.0) / max_packets
+                            * plot_height);
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
@@ -688,7 +681,7 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
                             <div class="status-subtitle">{"Optimal buffer size for network"}</div>
                         </div>
                         <div class="status-item">
-                            <div class="status-value">{stats.packets}</div>
+                            <div class="status-value">{stats.packets_awaiting_decode}</div>
                             <div class="status-label">{"PACKETS"}</div>
                             <div class="status-subtitle">{"Encoded packets awaiting decode"}</div>
                         </div>

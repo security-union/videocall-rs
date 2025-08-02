@@ -6670,6 +6670,7 @@ dependencies = [
  "js-sys",
  "lazy_static",
  "log",
+ "neteq",
  "regex",
  "serde",
  "serde_json",

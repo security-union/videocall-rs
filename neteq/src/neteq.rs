@@ -122,7 +122,7 @@ pub struct NetEqStats {
     pub lifetime: LifetimeStatistics,
     pub current_buffer_size_ms: u32,
     pub target_delay_ms: u32,
-    pub packet_count: usize,
+    pub packets_awaiting_decode: usize,
 }
 
 /// Audio frame output from NetEQ
@@ -413,7 +413,7 @@ impl NetEq {
             lifetime: self.statistics.lifetime_statistics().clone(),
             current_buffer_size_ms: self.current_buffer_size_ms(),
             target_delay_ms: self.delay_manager.target_delay_ms(),
-            packet_count: self.packet_buffer.len(),
+            packets_awaiting_decode: self.packet_buffer.len(),
         }
     }
 
@@ -774,13 +774,15 @@ impl NetEq {
     }
 
     pub fn current_buffer_size_ms(&self) -> u32 {
-        self.packet_buffer.get_span_duration_ms()
+        // Use total content duration instead of timestamp span
+        // This handles cases where packets have close/identical timestamps
+        self.packet_buffer.get_total_content_duration_ms()
     }
 
     /// Get current buffer size in samples
     pub fn current_buffer_size_samples(&self) -> usize {
         // Convert milliseconds to samples for the buffer duration
-        let buffer_duration_ms = self.packet_buffer.get_span_duration_ms();
+        let buffer_duration_ms = self.current_buffer_size_ms(); // Use the fixed calculation
         let buffer_samples =
             (buffer_duration_ms as u64 * self.config.sample_rate as u64 / 1000) as usize;
         buffer_samples + self.leftover_samples.len()
@@ -1198,6 +1200,107 @@ mod tests {
             "Steady-state ({}ms) should be much smaller than peak ({}ms)",
             steady_state_avg,
             max_buffer
+        );
+    }
+
+    /// Test buffer duration calculation fix for identical timestamps
+    ///
+    /// This test verifies the fix for the issue where packets with identical timestamps
+    /// (common in network bursts or late-joining scenarios) would report 0ms span_duration
+    /// but should use content_duration for accurate buffering decisions.
+    ///
+    /// Before fix: span_duration = 0ms, no acceleration triggered
+    /// After fix: content_duration = packets × duration, acceleration triggered correctly
+    #[test]
+    fn test_buffer_duration_calculation_with_identical_timestamps() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Create 30 packets with IDENTICAL timestamps (simulating network burst)
+        let base_timestamp = 1000u32;
+        let packet_duration_ms = 20u32;
+        let num_packets = 30u32;
+
+        for i in 0..num_packets {
+            // All packets have the same timestamp - this simulates burst arrival
+            let packet = create_test_packet(i as u16, base_timestamp, packet_duration_ms);
+            neteq.insert_packet(packet).unwrap();
+        }
+
+        // Test the buffer calculations
+        let span_duration = neteq.packet_buffer.get_span_duration_ms();
+        let content_duration = neteq.packet_buffer.get_total_content_duration_ms();
+        let buffer_size_ms = neteq.current_buffer_size_ms();
+
+        println!("Buffer calculation test:");
+        println!("  Packets: {}", neteq.packet_buffer.len());
+        println!("  Span duration: {}ms", span_duration);
+        println!("  Content duration: {}ms", content_duration);
+        println!("  Buffer size: {}ms", buffer_size_ms);
+
+        // Verify the problem and the fix
+        assert_eq!(
+            span_duration, 0,
+            "Span duration should be 0ms for identical timestamps"
+        );
+
+        assert_eq!(
+            content_duration,
+            num_packets * packet_duration_ms,
+            "Content duration should be sum of all packet durations: {} packets × {}ms = {}ms",
+            num_packets,
+            packet_duration_ms,
+            num_packets * packet_duration_ms
+        );
+
+        assert_eq!(
+            buffer_size_ms, content_duration,
+            "NetEQ should use content duration, not span duration"
+        );
+
+        // Verify acceleration decision is made correctly
+        let stats = neteq.get_statistics();
+        let target_delay = stats.target_delay_ms;
+
+        // With 600ms of content (30 × 20ms), we should have enough to trigger acceleration
+        // Convert to samples for decision logic
+        let buffer_samples = (content_duration as u64 * 16000 / 1000) as usize; // 16kHz sample rate
+        let target_samples = (target_delay as u64 * 16000 / 1000) as usize;
+        let high_limit = std::cmp::max(target_samples, target_samples * 3 / 4 + 20 * 16); // 20ms margin
+
+        println!("Decision thresholds:");
+        println!("  Buffer samples: {}", buffer_samples);
+        println!("  Target samples: {}", target_samples);
+        println!("  High limit: {}", high_limit);
+
+        assert!(
+            buffer_samples > high_limit,
+            "Buffer ({} samples) should exceed high limit ({} samples) to trigger acceleration",
+            buffer_samples,
+            high_limit
+        );
+
+        // Test the decision logic by calling get_audio multiple times
+        let mut acceleration_count = 0;
+        for _ in 0..10 {
+            let pre_buffer = neteq.current_buffer_size_ms();
+            let _frame = neteq.get_audio().unwrap();
+            let post_buffer = neteq.current_buffer_size_ms();
+
+            // If buffer reduced significantly, acceleration likely occurred
+            if pre_buffer > post_buffer + 30 {
+                acceleration_count += 1;
+            }
+        }
+
+        assert!(
+            acceleration_count > 0,
+            "NetEQ should have performed acceleration with 600ms buffer, but saw no acceleration operations"
+        );
+
+        println!(
+            "✅ Buffer duration calculation test passed - acceleration triggered {} times",
+            acceleration_count
         );
     }
 }

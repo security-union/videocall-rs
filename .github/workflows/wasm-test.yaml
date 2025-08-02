@@ -53,4 +53,4 @@ jobs:
         run: cd videocall-codecs && cargo test
       
       - name: Run tests for neteq
-        run: cd neteq && cargo test --features web
+        run: cd neteq && cargo test --no-default-features --features web

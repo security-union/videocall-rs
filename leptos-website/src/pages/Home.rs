@@ -52,7 +52,7 @@ pub fn Home() -> impl IntoView {
             <HeroHeader/>
             
             // Apple-style content sections with generous spacing
-            <div class="max-w-7xl mx-auto relative space-y-32 py-24">
+            <div class="max-w-7xl mx-auto relative space-y-32 py-24 px-4 sm:px-6 lg:px-8">
                 <SolutionsSection/>
                 <DevelopersSection/>
                 <CompanySection/>

@@ -31,9 +31,10 @@ pub fn HeroHeader() -> impl IntoView {
                         // Logo
                         <A href="/" class="flex-shrink-0 transition-opacity hover:opacity-80">
                             <img
-                                class="h-8 w-auto"
+                                class="h-14 w-auto brightness-100 contrast-100"
                                 src="/images/videocall_logo.svg"
                                 alt="VideoCall.rs"
+                                style="filter: drop-shadow(0 0 1px rgba(255,255,255,0.1));"
                             />
                         </A>
 
@@ -130,7 +131,7 @@ fn SocialLinks() -> impl IntoView {
                 class="text-foreground-tertiary hover:text-foreground-secondary transition-colors"
                 aria-label="DigitalOcean"
             >
-                <div class="h-5 w-16">
+                <div class="h-10 w-32">
                     <DigitalOceanIcon />
                 </div>
             </a>

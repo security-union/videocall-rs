@@ -44,7 +44,7 @@ pub fn PricingSection() -> impl IntoView {
                         "You manage updates and security".to_string(),
                     ]
                     button_text="Get the Helm Chart"
-                    button_href="https://github.com/security-union/videocall-rs"
+                    button_href="https://github.com/security-union/videocall-rs/tree/main/helm"
                     variant=ButtonVariant::Secondary
                 />
 
@@ -59,7 +59,7 @@ pub fn PricingSection() -> impl IntoView {
                         "Regular updates & security patches".to_string(),
                     ]
                     button_text="Get Started"
-                    button_href="#contact"
+                    button_href="https://app.videocall.rs"
                     variant=ButtonVariant::Primary
                     highlighted=true
                 />
@@ -75,7 +75,7 @@ pub fn PricingSection() -> impl IntoView {
                         "On-premise deployment options".to_string(),
                     ]
                     button_text="Contact Sales"
-                    button_href="#contact"
+                    button_href="mailto:contact@videocall.rs"
                     variant=ButtonVariant::Secondary
                 />
             </div>

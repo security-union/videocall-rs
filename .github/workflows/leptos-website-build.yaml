@@ -1,37 +1,39 @@
-name: Leptos Website Build Check
+name: Leptos Website Build
 
 on:
-  pull_request:
+  push:
+    branches: [ main ]
     paths:
       - 'leptos-website/**'
-  push:
-    branches:
-      - main
+  pull_request:
     paths:
       - 'leptos-website/**'
 
 jobs:
-  build:
-    name: Build Leptos Website
+  leptos-build:
+    name: Leptos Website Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@nightly-2024-11-01
+        uses: actions-rs/toolchain@v1
         with:
-          targets: wasm32-unknown-unknown
+          toolchain: nightly-2024-11-01
+          target: wasm32-unknown-unknown
+          override: true
+          profile: minimal
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Cache dependencies
+        uses: actions/cache@v3
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            leptos-website/target
-          key: ${{ runner.os }}-leptos-${{ hashFiles('leptos-website/Cargo.lock') }}
+            target
+          key: ${{ runner.os }}-cargo-leptos-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-leptos-
+            ${{ runner.os }}-cargo-leptos-
 
       - name: Install cargo-leptos
         run: cargo install --locked cargo-leptos@0.2.29
@@ -40,20 +42,17 @@ jobs:
         run: cargo install wasm-bindgen-cli@0.2.100 --locked
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v3
         with:
           node-version: '18'
           cache: 'npm'
           cache-dependency-path: leptos-website/package-lock.json
 
       - name: Install Node dependencies
-        working-directory: leptos-website
-        run: npm install
+        run: cd leptos-website && npm install
 
       - name: Build Tailwind CSS
-        working-directory: leptos-website
-        run: npx tailwindcss -i input.css -o style/output.css --config tailwind.config.js --minify
+        run: cd leptos-website && npx tailwindcss -i input.css -o style/output.css --config tailwind.config.js --minify
 
       - name: Build Leptos website
-        working-directory: leptos-website
-        run: cargo leptos build --release
+        run: cd leptos-website && cargo leptos build --release

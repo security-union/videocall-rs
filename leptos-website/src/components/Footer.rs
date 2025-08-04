@@ -45,12 +45,6 @@ pub fn Footer() -> impl IntoView {
                     <nav class="w-full md:w-auto">
                         <ul class="grid grid-cols-2 sm:grid-cols-3 md:flex md:flex-row gap-x-10 gap-y-6 text-foreground-muted">
                             <li>
-                                <a href="#solutions" class="relative hover:text-foreground transition-colors group block">
-                                    <span>{"Solutions"}</span>
-                                    <span class="absolute -bottom-1 left-0 w-0 h-[1px] bg-primary group-hover:w-full transition-all duration-300"></span>
-                                </a>
-                            </li>
-                            <li>
                                 <a href="#developers" class="relative hover:text-foreground transition-colors group block">
                                     <span>{"Developers"}</span>
                                     <span class="absolute -bottom-1 left-0 w-0 h-[1px] bg-primary group-hover:w-full transition-all duration-300"></span>

@@ -44,7 +44,7 @@ pub fn CTAButton(
     #[prop(default = false)] disabled: bool,
 ) -> impl IntoView {
     let base_classes = "inline-flex items-center justify-center font-medium transition-all duration-200 ease-out focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50 disabled:cursor-not-allowed";
-    
+
     let variant_classes = match variant {
         ButtonVariant::Primary => "bg-primary text-white hover:bg-primary-dark focus:ring-primary/20 shadow-sm hover:shadow-md",
         ButtonVariant::Secondary => "bg-background-secondary text-foreground border border-border hover:bg-background-tertiary hover:border-border-secondary focus:ring-primary/20",
@@ -57,15 +57,18 @@ pub fn CTAButton(
         ButtonSize::Large => "px-8 py-4 text-lg rounded-xl",
     };
 
-    let combined_class = format!("{} {} {} {}", base_classes, variant_classes, size_classes, class);
+    let combined_class = format!(
+        "{} {} {} {}",
+        base_classes, variant_classes, size_classes, class
+    );
 
     let content = children();
 
     view! {
         {move || match &href {
             Some(href) => view! {
-                <a 
-                    href=href 
+                <a
+                    href=href
                     class=&combined_class
                     class:pointer-events-none=disabled
                 >
@@ -73,7 +76,7 @@ pub fn CTAButton(
                 </a>
             }.into_view(),
             None => view! {
-                <button 
+                <button
                     class=&combined_class
                     disabled=disabled
                 >
@@ -85,7 +88,7 @@ pub fn CTAButton(
 }
 
 /// Simplified button with icon for backward compatibility
-#[component] 
+#[component]
 pub fn ButtonWithIcon(
     #[prop(into)] text: String,
     #[prop(into)] icon_svg: String,
@@ -95,14 +98,14 @@ pub fn ButtonWithIcon(
     #[prop(default = None)] href: Option<String>,
 ) -> impl IntoView {
     view! {
-        <CTAButton 
+        <CTAButton
             variant=variant
             size=size
             class=class
             href=href
         >
             <div class="flex items-center space-x-2">
-                <div 
+                <div
                     class="w-5 h-5 flex-shrink-0"
                     inner_html=&icon_svg
                 ></div>

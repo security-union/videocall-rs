@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use crate::components::CTAButton::{CTAButton, ButtonSize, ButtonVariant};
+use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
 use leptos::*;
 
 #[component]
@@ -36,7 +36,7 @@ pub fn DevelopersSection() -> impl IntoView {
                     link_text="Explore on GitHub"
                     link_href="https://github.com/security-union/videocall-rs"
                 />
-                
+
                 <DeveloperCard
                     title="High Performance"
                     description="Written in Rust to ensure exceptional performance and reliability for your video calls."
@@ -60,7 +60,7 @@ pub fn DevelopersSection() -> impl IntoView {
                     <div class="max-w-2xl">
                         <h3 class="text-2xl font-semibold mb-4 text-foreground">"Join our GitHub community"</h3>
                         <p class="text-foreground-secondary mb-6">"Contribute to our open-source project, report issues, or just star the repo to show your support. We welcome developers of all experience levels!"</p>
-                        
+
                         <div class="flex flex-wrap gap-4 mb-6">
                             <div class="flex items-center bg-background-secondary px-4 py-2 rounded-lg">
                                 <svg class="w-5 h-5 text-primary mr-2" fill="currentColor" viewBox="0 0 20 20">
@@ -83,7 +83,7 @@ pub fn DevelopersSection() -> impl IntoView {
                             </div>
                         </div>
                     </div>
-                    
+
                     <CTAButton
                         variant=ButtonVariant::Secondary
                         size=ButtonSize::Medium
@@ -116,7 +116,7 @@ fn DeveloperCard(
                 <h3 class="text-xl font-semibold mb-3 text-foreground">{title}</h3>
                 <p class="text-foreground-secondary mb-4">{description}</p>
             </div>
-            
+
             <CTAButton
                 variant=ButtonVariant::Secondary
                 size=ButtonSize::Small

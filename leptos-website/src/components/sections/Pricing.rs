@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use crate::components::CTAButton::{CTAButton, ButtonSize, ButtonVariant};
+use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
 use leptos::*;
 
 #[component]
@@ -115,7 +115,7 @@ fn PricingCard(
             } else {
                 view! {}.into_view()
             }}
-            
+
             <div class="text-center mb-8">
                 <h3 class="text-subheadline text-foreground mb-2">
                     {title}

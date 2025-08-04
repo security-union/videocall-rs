@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use crate::components::CTAButton::{CTAButton, ButtonSize, ButtonVariant};
+use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
 use leptos::*;
 
 #[component]
@@ -40,7 +40,7 @@ pub fn CompanySection() -> impl IntoView {
                             </div>
                             <h3 class="text-2xl font-semibold text-foreground">"Our Mission"</h3>
                         </div>
-                        
+
                         <p class="text-foreground-secondary text-lg mb-8 leading-relaxed">
                             "We're building the future of real-time communication. Our mission is to make video conferencing more accessible, performant, and reliable through open-source innovation."
                         </p>
@@ -51,7 +51,7 @@ pub fn CompanySection() -> impl IntoView {
                             <h4 class="text-lg font-semibold text-foreground mb-2">"Open Source First"</h4>
                             <p class="text-foreground-secondary">"We believe in transparency and community-driven development."</p>
                         </div>
-                        
+
                         <div class="border-l-4 border-primary pl-4">
                             <h4 class="text-lg font-semibold text-foreground mb-2">"Built with Rust"</h4>
                             <p class="text-foreground-secondary">"Leveraging Rust's performance and reliability for better video calls."</p>
@@ -70,7 +70,7 @@ pub fn CompanySection() -> impl IntoView {
                             </div>
                             <h3 class="text-2xl font-semibold text-foreground">"Join Us"</h3>
                         </div>
-                        
+
                         <p class="text-foreground-secondary text-lg mb-8 leading-relaxed">
                             "We're always looking for talented individuals who share our passion for building great software."
                         </p>
@@ -85,7 +85,7 @@ pub fn CompanySection() -> impl IntoView {
                         >
                             "View Open Positions"
                         </CTAButton>
-                        
+
                         <CTAButton
                             variant=ButtonVariant::Secondary
                             size=ButtonSize::Medium

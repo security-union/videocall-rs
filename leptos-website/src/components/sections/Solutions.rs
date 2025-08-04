@@ -16,9 +16,11 @@
  * conditions.
  */
 
-use crate::components::CTAButton::{CTAButton, ButtonSize, ButtonVariant};
+use crate::components::CTAButton::{ButtonSize, ButtonVariant, CTAButton};
 use leptos::*;
 
+// TODO: put back when we have a use case for it
+#[allow(dead_code)]
 #[component]
 pub fn SolutionsSection() -> impl IntoView {
     view! {
@@ -42,7 +44,7 @@ pub fn SolutionsSection() -> impl IntoView {
                         "Simpler server infrastructure".to_string(),
                     ]
                     link_text="Learn More"
-                    link_href="https://github.com/security-union/videocall-rs"
+                    link_href="https://github.com/security-union/videocall-rs/blob/main/ARCHITECTURE.md"
                 />
 
                 <SolutionCard
@@ -54,7 +56,7 @@ pub fn SolutionsSection() -> impl IntoView {
                         "Real-time optimization".to_string(),
                     ]
                     link_text="See Performance"
-                    link_href="https://github.com/security-union/videocall-rs/wiki/Performance"
+                    link_href="https://github.com/security-union/videocall-rs/blob/main/ARCHITECTURE.md"
                 />
 
                 <SolutionCard

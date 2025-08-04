@@ -40,7 +40,6 @@ pub fn HeroHeader() -> impl IntoView {
 
                         // Desktop Navigation
                         <div class="hidden md:flex items-center space-x-8">
-                            <NavLink href="#solutions" text="Solutions" />
                             <NavLink href="#developers" text="Developers" />
                             <NavLink href="#company" text="Company" />
                             <NavLink href="#customers" text="Customers" />
@@ -197,11 +196,6 @@ fn MobileMenu() -> impl IntoView {
             )
         >
             <div class="px-4 py-6 space-y-4">
-                <MobileNavLink
-                    href="#solutions"
-                    text="Solutions"
-                    on_click=move || set_menu_open.set(false)
-                />
                 <MobileNavLink
                     href="#developers"
                     text="Developers"

@@ -1,0 +1,59 @@
+name: Leptos Website Build Check
+
+on:
+  pull_request:
+    paths:
+      - 'leptos-website/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'leptos-website/**'
+
+jobs:
+  build:
+    name: Build Leptos Website
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly-2024-11-01
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            leptos-website/target
+          key: ${{ runner.os }}-leptos-${{ hashFiles('leptos-website/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-leptos-
+
+      - name: Install cargo-leptos
+        run: cargo install --locked cargo-leptos@0.2.29
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli@0.2.100 --locked
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: leptos-website/package-lock.json
+
+      - name: Install Node dependencies
+        working-directory: leptos-website
+        run: npm install
+
+      - name: Build Tailwind CSS
+        working-directory: leptos-website
+        run: npx tailwindcss -i input.css -o style/output.css --config tailwind.config.js --minify
+
+      - name: Build Leptos website
+        working-directory: leptos-website
+        run: cargo leptos build --release

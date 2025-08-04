@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.17](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.16...videocall-client-v1.1.17) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq
+
+## [1.1.16](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.15...videocall-client-v1.1.16) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq
+
+## [1.1.15](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.14...videocall-client-v1.1.15) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq
+
+## [1.1.14](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.13...videocall-client-v1.1.14) - 2025-07-31
+
+### Other
+
+- updated the following local packages: neteq
+
+## [1.1.13](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.12...videocall-client-v1.1.13) - 2025-07-31
+
+### Other
+
+- speaker selection, neteq worker audio reproduction ([#345](https://github.com/security-union/videocall-rs/pull/345))
+
 ## [1.1.12](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.11...videocall-client-v1.1.12) - 2025-07-25
 
 ### Other

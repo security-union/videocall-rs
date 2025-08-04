@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.20](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.19...videocall-ui-v1.0.20) - 2025-08-02
+
+### Other
+
+- Fix crash on the yew-ui due to discrepancy in yew-ui stats data structure ([#358](https://github.com/security-union/videocall-rs/pull/358))
+
+## [1.0.19](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.18...videocall-ui-v1.0.19) - 2025-08-02
+
+### Other
+
+- rewrite filter buffer, add a ton of tests  ([#356](https://github.com/security-union/videocall-rs/pull/356))
+
+## [1.0.18](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.17...videocall-ui-v1.0.18) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq, videocall-client
+
+## [1.0.17](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.16...videocall-ui-v1.0.17) - 2025-08-02
+
+### Other
+
+- Fix neteq buffering and show app version ([#352](https://github.com/security-union/videocall-rs/pull/352))
+
+## [1.0.16](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.15...videocall-ui-v1.0.16) - 2025-07-31
+
+### Other
+
+- updated the following local packages: videocall-client
+
+## [1.0.15](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.14...videocall-ui-v1.0.15) - 2025-07-31
+
+### Other
+
+- speaker selection, neteq worker audio reproduction ([#345](https://github.com/security-union/videocall-rs/pull/345))
+
 ## [1.0.14](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.13...videocall-ui-v1.0.14) - 2025-07-25
 
 ### Other

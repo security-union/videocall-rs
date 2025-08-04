@@ -32,7 +32,7 @@ pub fn PricingSection() -> impl IntoView {
                 </p>
             </div>
 
-            <div class="grid md:grid-cols-3 gap-8 lg:gap-12 max-w-6xl mx-auto">
+            <div class="grid md:grid-cols-2 gap-8 lg:gap-12 max-w-4xl mx-auto">
                 <PricingCard
                     title="Self-Hosted"
                     price="Free"
@@ -46,23 +46,24 @@ pub fn PricingSection() -> impl IntoView {
                     button_text="Get the Helm Chart"
                     button_href="https://github.com/security-union/videocall-rs/tree/main/helm"
                     variant=ButtonVariant::Secondary
+                    highlighted=false
                 />
 
-                <PricingCard
-                    title="Managed Cloud"
-                    price="Coming Soon"
-                    description="Fully managed service with guaranteed uptime and support"
-                    features=vec![
-                        "99.9% uptime SLA".to_string(),
-                        "Auto-scaling infrastructure".to_string(),
-                        "24/7 support".to_string(),
-                        "Regular updates & security patches".to_string(),
-                    ]
-                    button_text="Get Started"
-                    button_href="https://app.videocall.rs"
-                    variant=ButtonVariant::Primary
-                    highlighted=true
-                />
+                // <PricingCard
+                //     title="Managed Cloud"
+                //     price="Get started for free"
+                //     description="Fully managed service with guaranteed uptime and support"
+                //     features=vec![
+                //         "99.9% uptime SLA".to_string(),
+                //         "Auto-scaling infrastructure".to_string(),
+                //         "24/7 support".to_string(),
+                //         "Regular updates & security patches".to_string(),
+                //     ]
+                //     button_text="Get Started"
+                //     button_href="https://app.videocall.rs"
+                //     variant=ButtonVariant::Secondary
+                //     highlighted=false
+                // />
 
                 <PricingCard
                     title="Enterprise"
@@ -75,8 +76,9 @@ pub fn PricingSection() -> impl IntoView {
                         "On-premise deployment options".to_string(),
                     ]
                     button_text="Contact Sales"
-                    button_href="mailto:contact@videocall.rs"
-                    variant=ButtonVariant::Secondary
+                    button_href="mailto:support@securityunion.dev"
+                    variant=ButtonVariant::Primary
+                    highlighted=true
                 />
             </div>
         </section>

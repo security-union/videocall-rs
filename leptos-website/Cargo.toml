@@ -57,6 +57,7 @@ serde = "1.0.218"
 [features]
 default = ["csr"]
 csr = ["leptos/csr", "leptos_meta/csr", "leptos_router/csr"]
+testimonials = []
 hydrate = [
 	"leptos/hydrate",
 	"leptos_meta/hydrate",

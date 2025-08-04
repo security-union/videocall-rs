@@ -48,21 +48,34 @@ pub fn CustomersSection() -> impl IntoView {
                 />
             </div>
 
-            // Testimonials
-            <div class="grid md:grid-cols-2 gap-8 lg:gap-12">
-                <TestimonialCard
-                    quote="The performance and reliability of videocall.rs has been exceptional. The WebTransport implementation makes a real difference in latency."
-                    author="Sarah Chen"
-                    role="Tech Lead at DevCorp"
-                />
-                
-                <TestimonialCard
-                    quote="Being open source and built with Rust gives us confidence in both the security and performance of the platform."
-                    author="Mark Thompson"
-                    role="CTO at StartupX"
-                />
-            </div>
+            {testimonials_section()}
         </section>
+    }
+}
+
+#[cfg(feature = "testimonials")]
+fn testimonials_section() -> impl IntoView {
+    view! {
+        <div class="grid md:grid-cols-2 gap-8 lg:gap-12">
+            <TestimonialCard
+                quote="The performance and reliability of videocall.rs has been exceptional. The WebTransport implementation makes a real difference in latency."
+                author="Sarah Chen"
+                role="Tech Lead at DevCorp"
+            />
+            
+            <TestimonialCard
+                quote="Being open source and built with Rust gives us confidence in both the security and performance of the platform."
+                author="Mark Thompson"
+                role="CTO at StartupX"
+            />
+        </div>
+    }
+}
+
+#[cfg(not(feature = "testimonials"))]
+fn testimonials_section() -> impl IntoView {
+    view! {
+        // Testimonials section disabled - enable with "testimonials" feature flag
     }
 }
 
@@ -85,6 +98,7 @@ fn StatCard(
     }
 }
 
+#[cfg(feature = "testimonials")]
 #[component]
 fn TestimonialCard(
     quote: &'static str,

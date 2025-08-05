@@ -16,192 +16,223 @@
  * conditions.
  */
 
-#![allow(dead_code)]
-
-use crate::components::SecondaryButton;
-use crate::components::SphereLogo::*;
 use crate::icons::DigitalOceanIcon;
 use leptos::*;
-use leptos_meta::Style;
 use leptos_router::A;
 
 #[component]
 pub fn HeroHeader() -> impl IntoView {
     view! {
-        <HamburgerProvider>
-            <Style>{include_str!("./HeroHeader.css")}</Style>
-            <div class="max-w-[1920px] mx-auto relative">
-                <div class="relative bg-no-repeat bg-center bg-[length:100%_100%] w-[calc(100%+25px)]  h-full top-0 4xl:top-[-10px] left-[-15px] 4xl:left-0 hero-header drop-shadow-[10px_10px_0px_#190E3825] bg-background min-h-[50vh] text-white">
-                    <div class="pl-6 pr-4 md:pl-8 md:pr-6 lg:pl-12 lg:pr-8 pt-2 md:pt-4 lg:pt-8 text-white  w-full ">
-                        <div class="flex w-full items-center justify-between max-w-4xl mx-auto">
-                            <A href="/">
-                                <img
-                                    class="block w-[90px] h-[38px] sm:w-28 sm:h-auto"
-                                    src="/images/videocall_logo.svg"
-                                    alt="Home"
-                                />
-                            </A>
-                            <ShowWhenOpen is=false>
-                                <div class="hidden lg:block">
-                                    <div class="flex gap-1 xl:gap-4 justify-center items-center">
-                                        <a
-                                            href="#solutions"
-                                            class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                        >
-                                            "Solutions"
-                                        </a>
-                                        <a
-                                            href="#developers"
-                                            class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                        >
-                                            "Developers"
-                                        </a>
-                                        <a
-                                            href="#company"
-                                            class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                        >
-                                            "Company"
-                                        </a>
-                                        <a
-                                            href="#customers"
-                                            class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                        >
-                                            "Customers"
-                                        </a>
-                                        <a
-                                            href="#pricing"
-                                            class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                        >
-                                            "Pricing"
-                                        </a>
-                                    </div>
-                                </div>
-                            </ShowWhenOpen>
-                            <div>
-                                <div class="flex gap-4 md:gap-6 justify-center items-center">
-                                    <a href="https://discord.gg/XRdt6WfZyf">
-                                        <img
-                                            class="block h-6 w-6"
-                                            src="/images/discord_logo.svg"
-                                            alt="Discord"
-                                        />
-                                    </a>
-                                    <a href="https://github.com/security-union/videocall-rs">
-                                        <img
-                                            class="block h-6 w-6"
-                                            src="/images/github_logo.svg"
-                                            alt="GitHub"
-                                        />
-                                    </a>
-                                    <a href="https://m.do.co/c/6de4e19c5193" class="block h-8 w-24">
-                                        <DigitalOceanIcon />
-                                    </a>
-                                    <DarkModeToggle/>
-                                </div>
-                            </div>
+        <MobileMenuProvider>
+            // Apple-style translucent navigation
+            <nav class="sticky top-0 z-50 backdrop-blur-md bg-background/90 border-b border-border/10">
+                <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                    <div class="flex justify-between items-center h-16">
+                        // Logo
+                        <A href="/" class="flex-shrink-0 transition-opacity hover:opacity-80">
+                            <img
+                                class="h-14 w-auto brightness-100 contrast-100"
+                                src="/images/videocall_logo.svg"
+                                alt="VideoCall.rs"
+                                style="filter: drop-shadow(0 0 1px rgba(255,255,255,0.1));"
+                            />
+                        </A>
+
+                        // Desktop Navigation
+                        <div class="hidden md:flex items-center space-x-8">
+                            <NavLink href="#developers" text="Developers" />
+                            <NavLink href="#company" text="Company" />
+                            <NavLink href="#customers" text="Customers" />
+                            <NavLink href="#pricing" text="Pricing" />
                         </div>
-                        <ShowWhenOpen is=true>
-                            <div class="max-w-4xl mx-auto mt-8 pb-16 lg:hidden">
-                                <div class="flex flex-col gap-2">
-                                    <a
-                                        href="#solutions"
-                                        class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                    >
-                                        "Solutions"
-                                    </a>
-                                    <a
-                                        href="#developers"
-                                        class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                    >
-                                        "Developers"
-                                    </a>
-                                    <a
-                                        href="#company"
-                                        class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                    >
-                                        "Company"
-                                    </a>
-                                    <a
-                                        href="#customers"
-                                        class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                    >
-                                        "Customers"
-                                    </a>
-                                    <a
-                                        href="#pricing"
-                                        class="font-medium transition-all text-gray-300 hover:text-white hover:bg-primary/10 px-4 py-2 rounded-md"
-                                    >
-                                        "Pricing"
-                                    </a>
-                                </div>
-                            </div>
-                        </ShowWhenOpen>
-                        <ShowWhenOpen is=false>
-                            <div class="max-w-4xl mx-auto relative">
-                                <div class="flex gap-12 justify-start xl:justify-between items-center pt-12 pb-24 md:py-24">
-                                    <div class="md:mt-[-60px] lg:mt-[-60px]">
-                                        <h1 class="font-bold text-4xl lg:text-5xl tracking-tight text-white">
-                                            "Ultra-low latency videocalls"
-                                        </h1>
-                                        <p class="mt-2 text-gray-300 max-w-[40ch]">
-                                            "Always open-source, always awesome, powered by Rust"
-                                        </p>
-                                        <SecondaryButton
-                                            title="Watch How It Works"
-                                            href=Some("https://www.youtube.com/watch?v=kZ9isFw1TQ8&list=PLxM2CWwQlzBtmhdaK2IeuQvpepKC6BYLOs".to_string())
-                                            class="mt-4"
-                                        />
-                                    </div>
-                                    <div class="w-[40%]"></div>
-                                    <div class="max-w-[320px] md:max-w-[360px] lg:max-w-[400px] hidden md:block w-full h-full absolute right-0 top-4 aspect-square">
-                                        <SphereLogo/>
-                                    </div>
-                                </div>
-                            </div>
-                        </ShowWhenOpen>
+
+                        // Right side icons
+                        <div class="flex items-center space-x-4">
+                            <SocialLinks />
+                            <MobileMenuButton />
+                        </div>
                     </div>
                 </div>
-            </div>
-        </HamburgerProvider>
+
+                // Mobile Navigation Menu
+                <MobileMenu />
+            </nav>
+
+            // Hero Section - Apple-style
+            <section class="relative overflow-hidden bg-background">
+                <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                    <div class="pt-24 pb-32 lg:pt-32 lg:pb-40">
+                        <div class="text-center max-w-4xl mx-auto">
+                            <h1 class="text-hero text-foreground mb-6">
+                                "Ultra-low latency "
+                                <span class="text-primary">"videocalls"</span>
+                            </h1>
+                            <p class="text-body-large text-foreground-secondary mb-12 max-w-2xl mx-auto">
+                                "Always open-source, always awesome, powered by Rust"
+                            </p>
+                            <div class="flex flex-col sm:flex-row gap-4 justify-center items-center">
+                                <a
+                                    href="https://app.videocall.rs"
+                                    class="btn-primary text-lg px-8 py-4"
+                                >
+                                    "Create a meeting"
+                                </a>
+                                <a
+                                    href="https://www.youtube.com/watch?v=kZ9isFw1TQ8&list=PLxM2CWwQlzBtmhdaK2IeuQvpepKC6BYLOs"
+                                    class="btn-secondary text-lg px-8 py-4"
+                                >
+                                    "Watch How It Works"
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                // Subtle background pattern
+                <div class="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-background-secondary/10 pointer-events-none"></div>
+            </section>
+        </MobileMenuProvider>
+    }
+}
+
+#[component]
+fn NavLink(href: &'static str, text: &'static str) -> impl IntoView {
+    view! {
+        <a
+            href=href
+            class="text-foreground-secondary hover:text-foreground transition-colors duration-200 text-sm font-medium"
+        >
+            {text}
+        </a>
+    }
+}
+
+#[component]
+fn SocialLinks() -> impl IntoView {
+    view! {
+        <div class="flex items-center space-x-3">
+            <a
+                href="https://discord.gg/XRdt6WfZyf"
+                class="text-foreground-tertiary hover:text-foreground-secondary transition-colors"
+                aria-label="Discord"
+            >
+                <img class="h-5 w-5" src="/images/discord_logo.svg" alt="Discord" />
+            </a>
+            <a
+                href="https://github.com/security-union/videocall-rs"
+                class="text-foreground-tertiary hover:text-foreground-secondary transition-colors"
+                aria-label="GitHub"
+            >
+                <img class="h-5 w-5" src="/images/github_logo.svg" alt="GitHub" />
+            </a>
+            <a
+                href="https://m.do.co/c/6de4e19c5193"
+                class="text-foreground-tertiary hover:text-foreground-secondary transition-colors"
+                aria-label="DigitalOcean"
+            >
+                <div class="h-10 w-32">
+                    <DigitalOceanIcon />
+                </div>
+            </a>
+        </div>
     }
 }
 
 #[island]
-fn HamburgerProvider(children: Children) -> impl IntoView {
+fn MobileMenuProvider(children: Children) -> impl IntoView {
     provide_context(RwSignal::new(false));
-
     children()
 }
 
 #[island]
-fn DarkModeToggle() -> impl IntoView {
-    let (hamburger_menu_open, set_hamburger_menu_open) = expect_context::<RwSignal<bool>>().split();
+fn MobileMenuButton() -> impl IntoView {
+    let (menu_open, set_menu_open) = expect_context::<RwSignal<bool>>().split();
 
     view! {
-        <button on:click=move |_| set_hamburger_menu_open.update(|n| *n = !*n)>
-            <img
-                class=" h-6 w-6 block lg:hidden"
-                src=move || match hamburger_menu_open() {
-                    true => "/images/x_close.svg",
-                    false => "/images/mobile_menu.svg",
-                }
-                alt="Toggle Menu"
-            />
+        <button
+            class="md:hidden p-2 text-foreground-secondary hover:text-foreground transition-colors"
+            on:click=move |_| set_menu_open.update(|n| *n = !*n)
+            aria-label="Toggle navigation menu"
+        >
+            <svg
+                class="h-6 w-6"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+            >
+                <path
+                    class=move || if menu_open() { "hidden" } else { "" }
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M4 6h16M4 12h16M4 18h16"
+                />
+                <path
+                    class=move || if menu_open() { "" } else { "hidden" }
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="2"
+                    d="M6 18L18 6M6 6l12 12"
+                />
+            </svg>
         </button>
     }
 }
 
 #[island]
-fn ShowWhenOpen(is: bool, children: Children) -> impl IntoView {
-    let hamburger_menu_open = expect_context::<RwSignal<bool>>().read_only();
+fn MobileMenu() -> impl IntoView {
+    let menu_open = expect_context::<RwSignal<bool>>().read_only();
+    let set_menu_open = expect_context::<RwSignal<bool>>().write_only();
 
     view! {
-        <div style:display=move || if hamburger_menu_open() == is {
-            "contents"
-        } else {
-            "none"
-        }>
-            {children()}
+        <div
+            class=move || format!(
+                "md:hidden absolute top-full left-0 right-0 bg-background-secondary/95 backdrop-blur-md border-b border-border transition-all duration-300 ease-out {}",
+                if menu_open() {
+                    "opacity-100 translate-y-0"
+                } else {
+                    "opacity-0 -translate-y-2 pointer-events-none"
+                }
+            )
+        >
+            <div class="px-4 py-6 space-y-4">
+                <MobileNavLink
+                    href="#developers"
+                    text="Developers"
+                    on_click=move || set_menu_open.set(false)
+                />
+                <MobileNavLink
+                    href="#company"
+                    text="Company"
+                    on_click=move || set_menu_open.set(false)
+                />
+                <MobileNavLink
+                    href="#customers"
+                    text="Customers"
+                    on_click=move || set_menu_open.set(false)
+                />
+                <MobileNavLink
+                    href="#pricing"
+                    text="Pricing"
+                    on_click=move || set_menu_open.set(false)
+                />
+            </div>
         </div>
+    }
+}
+
+#[component]
+fn MobileNavLink<F>(href: &'static str, text: &'static str, on_click: F) -> impl IntoView
+where
+    F: Fn() + 'static,
+{
+    view! {
+        <a
+            href=href
+            class="block text-foreground-secondary hover:text-foreground transition-colors duration-200 text-base font-medium py-2"
+            on:click=move |_| on_click()
+        >
+            {text}
+        </a>
     }
 }

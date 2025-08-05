@@ -100,10 +100,6 @@ codegen-units = 1
 [package.metadata.leptos]
 # The name used by wasm-bindgen/cargo-leptos for the JS/WASM bundle. Defaults to the crate name
 output-name = "leptos_website"
-# Enables additional file hashes on outputted css, js, and wasm files
-hash-files = true
-# Sets the name for the file cargo-leptos uses to track the most recent hashes
-hash-file-name = "hash.txt"
 # The site root folder is where cargo-leptos generate all output. WARNING: all content of this folder will be erased on a rebuild. Use it in your server setup.
 site-root = "target/site"
 # The site-root relative folder where all compiled output (JS, WASM and CSS) is written

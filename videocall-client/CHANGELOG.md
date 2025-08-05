@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.18](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.17...videocall-client-v1.1.18) - 2025-08-05
+
+### Other
+
+- Fix website hash and local yew not connecting to single server ([#366](https://github.com/security-union/videocall-rs/pull/366))
+
 ## [1.1.17](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.16...videocall-client-v1.1.17) - 2025-08-02
 
 ### Other

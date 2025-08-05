@@ -417,7 +417,7 @@ impl VideoCallClient {
                     }
                 })
             },
-            election_period_ms: 100, // Very short election period for direct connection
+            election_period_ms: 1000, // Allow enough time for single connection to establish and get RTT
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;

@@ -56,19 +56,24 @@ impl Default for SystemSpecs {
 }
 
 /// Collect the specs that are synchronously available in the browser.
-pub fn gather_system_specs() -> SystemSpecs {
-    let window: Window = match web_sys::window() {
-        Some(w) => w,
-        None => return SystemSpecs::default(),
-    };
+pub fn gather_system_specs() -> anyhow::Result<SystemSpecs> {
+    let window: Window = web_sys::window().ok_or(anyhow::anyhow!("No window found"))?;
     let navigator: Navigator = window.navigator();
-    let screen: Option<Screen> = window.screen();
+    let screen: Screen = window
+        .screen()
+        .map_err(|e| anyhow::anyhow!("No screen found: {e:?}"))?;
 
     let mut specs = SystemSpecs::default();
 
     // User agent & platform
-    specs.user_agent = navigator.user_agent().ok();
-    specs.platform = navigator.platform();
+    specs.user_agent = navigator
+        .user_agent()
+        .map_err(|e| anyhow::anyhow!("No user agent found: {e:?}"))
+        .ok();
+    specs.platform = navigator
+        .platform()
+        .map_err(|e| anyhow::anyhow!("No platform found: {e:?}"))
+        .ok();
 
     // CPU cores & device memory (the latter is non-standard, use JS reflection)
     let cores = navigator.hardware_concurrency();
@@ -94,15 +99,10 @@ pub fn gather_system_specs() -> SystemSpecs {
         }
     }
 
-    // Screen information
-    if let Some(scr) = screen {
-        let width = scr.width().unwrap_or(0) as i32;
-        let height = scr.height().unwrap_or(0) as i32;
-        let depth = scr.color_depth().unwrap_or(0) as i32;
-        specs.screen_width = Some(width as u32);
-        specs.screen_height = Some(height as u32);
-        specs.color_depth = Some(depth as u32);
-    }
+    specs.screen_width = screen.width().ok().map(|v| v as u32);
+    specs.screen_height = screen.height().ok().map(|v| v as u32);
+    specs.color_depth = screen.color_depth().ok().map(|v| v as u32);
+
     specs.pixel_ratio = Some(window.device_pixel_ratio());
 
     // Network Information API (experimental – guarded)
@@ -120,5 +120,5 @@ pub fn gather_system_specs() -> SystemSpecs {
         }
     }
 
-    specs
+    Ok(specs)
 }

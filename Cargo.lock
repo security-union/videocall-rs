@@ -6661,6 +6661,7 @@ dependencies = [
 name = "videocall-ui"
 version = "1.0.20"
 dependencies = [
+ "anyhow",
  "console_error_panic_hook",
  "console_log",
  "enum-display",

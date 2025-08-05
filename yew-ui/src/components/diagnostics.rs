@@ -954,6 +954,13 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         })
     };
 
+    let system_specs = gather_system_specs();
+    if let Err(e) = &system_specs {
+        log::error!("Failed to gather system specs: {e:?}");
+    }
+    let system_specs =
+        serde_json::to_string_pretty(&system_specs.unwrap_or_default()).unwrap_or_default();
+
     html! {
         <div id="diagnostics-sidebar" class={if props.is_open {"visible"} else {""}}>
             <div class="sidebar-header">
@@ -971,7 +978,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 // Host System Specs
                 <div class="diagnostics-section">
                     <h3>{"Host System"}</h3>
-                    <pre>{serde_json::to_string_pretty(&gather_system_specs()).unwrap_or_default()}</pre>
+                    <pre>{system_specs}</pre>
                 </div>
 
                 // Connection Manager Status - Now at the top for visibility

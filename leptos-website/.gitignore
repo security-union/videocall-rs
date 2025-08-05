@@ -12,8 +12,4 @@ yarn-debug.log*
 yarn-error.log*
 
 # Package manager lock files
-package-lock.json
 yarn.lock
-
-# Tailwind output
-style/output.css

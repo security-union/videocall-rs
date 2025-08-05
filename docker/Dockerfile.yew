@@ -1,4 +1,4 @@
-FROM securityunion/yew:fix-meeting-creation-2b98f21e
+FROM securityunion/yew:main-68edb47a
 
 RUN rustup component add clippy
 RUN rustup component add rustfmt

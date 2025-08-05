@@ -30,6 +30,27 @@ cfg_if! {
         use leptos_website::fallback::file_and_error_handler;
         use leptos_axum::{generate_route_list, LeptosRoutes};
         use tower_http::{compression::CompressionLayer};
+        use axum::http::HeaderValue;
+
+        // Middleware to add no-cache headers
+        async fn add_no_cache_headers<B>(req: axum::http::Request<B>, next: axum::middleware::Next<B>) -> axum::response::Response {
+            let mut response = next.run(req).await;
+            
+            response.headers_mut().insert(
+                "Cache-Control",
+                HeaderValue::from_static("no-cache, no-store, must-revalidate, max-age=0")
+            );
+            response.headers_mut().insert(
+                "Pragma",
+                HeaderValue::from_static("no-cache")
+            );
+            response.headers_mut().insert(
+                "Expires",
+                HeaderValue::from_static("0")
+            );
+            
+            response
+        }
 
         #[tokio::main]
         async fn main() {
@@ -45,7 +66,8 @@ cfg_if! {
             .leptos_routes(&leptos_options, routes, App)
             .fallback(file_and_error_handler)
             .with_state(leptos_options)
-            .layer(CompressionLayer::new());
+            .layer(CompressionLayer::new())
+            .layer(axum::middleware::from_fn(add_no_cache_headers));
 
             // run our app with hyper
             // `axum::Server` is a re-export of `hyper::Server`

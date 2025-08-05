@@ -315,12 +315,6 @@ impl VideoCallClient {
             return Err(anyhow!("No servers provided for RTT testing"));
         }
 
-        if total_servers == 1 {
-            // Only one server available, connect directly without RTT testing
-            info!("Only one server available, skipping RTT testing and connecting directly");
-            return self.connect_direct();
-        }
-
         let election_period_ms = self.options.rtt_testing_period_ms;
 
         info!("RTT testing period: {election_period_ms}ms");
@@ -397,85 +391,6 @@ impl VideoCallClient {
         borrowed.connection_controller = Some(connection_controller);
 
         info!("ConnectionManager created with RTT testing and 1Hz diagnostics reporting");
-        Ok(())
-    }
-
-    /// Connect directly to a single server without RTT testing (legacy fallback)
-    fn connect_direct(&mut self) -> anyhow::Result<()> {
-        info!("Connecting directly to single server without RTT testing");
-
-        // For now, just use the ConnectionManager even for single server
-        // This ensures consistent diagnostics reporting
-        let websocket_urls = self.options.websocket_urls.clone();
-        let webtransport_urls = if self.options.enable_webtransport {
-            self.options.webtransport_urls.clone()
-        } else {
-            Vec::new()
-        };
-
-        let manager_options = ConnectionManagerOptions {
-            websocket_urls,
-            webtransport_urls,
-            userid: self.options.userid.clone(),
-            on_inbound_media: {
-                let inner = Rc::downgrade(&self.inner);
-                Callback::from(move |packet| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(mut inner) = inner.try_borrow_mut() {
-                            inner.on_inbound_media(packet);
-                        }
-                    }
-                })
-            },
-            on_state_changed: {
-                let on_connected = self.options.on_connected.clone();
-                let on_connection_lost = self.options.on_connection_lost.clone();
-                let inner = Rc::downgrade(&self.inner);
-                Callback::from(move |state: ConnectionState| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(mut inner) = inner.try_borrow_mut() {
-                            inner.connection_state = state.clone();
-                        }
-                    }
-
-                    match state {
-                        ConnectionState::Connected { .. } => {
-                            on_connected.emit(());
-                        }
-                        ConnectionState::Failed { error, .. } => {
-                            on_connection_lost.emit(JsValue::from_str(&error));
-                        }
-                        _ => {}
-                    }
-                })
-            },
-            peer_monitor: {
-                let inner = Rc::downgrade(&self.inner);
-                let on_connection_lost = self.options.on_connection_lost.clone();
-                Callback::from(move |_| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow_mut() {
-                            Ok(mut inner) => {
-                                inner.peer_decode_manager.run_peer_monitor();
-                            }
-                            Err(_) => {
-                                on_connection_lost.emit(JsValue::from_str(
-                                    "Unable to borrow inner -- not starting peer monitor",
-                                ));
-                            }
-                        }
-                    }
-                })
-            },
-            election_period_ms: 100, // Very short election period for direct connection
-        };
-
-        let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
-
-        let mut borrowed = self.inner.try_borrow_mut()?;
-        borrowed.connection_controller = Some(connection_controller);
-
-        info!("Direct connection established with diagnostics reporting");
         Ok(())
     }
 

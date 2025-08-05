@@ -19,6 +19,7 @@
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
+use crate::components::system_specs::gather_system_specs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use videocall_diagnostics::{DiagEvent, MetricValue};
@@ -965,6 +966,12 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 <div class="diagnostics-section">
                     <h3>{"Application Version"}</h3>
                     <pre>{format!("VideoCall UI: {}", env!("CARGO_PKG_VERSION"))}</pre>
+                </div>
+
+                // Host System Specs
+                <div class="diagnostics-section">
+                    <h3>{"Host System"}</h3>
+                    <pre>{serde_json::to_string_pretty(&gather_system_specs()).unwrap_or_default()}</pre>
                 </div>
 
                 // Connection Manager Status - Now at the top for visibility

@@ -1,6 +1,7 @@
 FROM node:18-alpine
 
 RUN npm install -g tailwindcss
+ENV PATH="/usr/local/bin:$PATH"
 
 # Create a wrapper script
 RUN echo '#!/bin/sh\ntailwindcss "$@"' > /usr/local/bin/tailwind-run.sh && \

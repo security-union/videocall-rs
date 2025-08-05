@@ -81,7 +81,7 @@ services:
       - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
       - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
       - OAUTH_REDIRECT_URL=http://localhost:${ACTIX_PORT:-8080}/login/callback
-      - RUST_LOG=debug
+      - RUST_LOG=debug,async_nats=info
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222
       - CARGO_TARGET_DIR=/app/actix-api/target

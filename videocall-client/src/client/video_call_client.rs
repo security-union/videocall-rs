@@ -33,10 +33,10 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use web_time::{SystemTime, UNIX_EPOCH};
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -208,20 +208,21 @@ impl VideoCallClient {
 
         // Create health reporter if enabled
         let health_reporter = if options.enable_health_reporting {
-            let session_id = format!("session_{}", 
+            let session_id = format!(
+                "session_{}",
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs()
             );
-            
+
             let mut reporter = HealthReporter::new(session_id, options.userid.clone());
-            
+
             // Set health reporting interval if provided
             if let Some(interval) = options.health_reporting_interval_ms {
                 reporter.set_health_interval(interval);
             }
-            
+
             Some(Rc::new(RefCell::new(reporter)))
         } else {
             None
@@ -269,10 +270,10 @@ impl VideoCallClient {
                 reporter.set_send_packet_callback(Callback::from(move |packet| {
                     client_clone.send_packet(packet);
                 }));
-                
+
                 // Start real diagnostics subscription (not mock channels)
                 reporter.start_diagnostics_subscription();
-                
+
                 // Start health reporting
                 reporter.start_health_reporting();
                 debug!("Health reporting started with real diagnostics subscription");
@@ -902,8 +903,6 @@ impl Inner {
             }
         }
     }
-
-
 
     fn send_public_key(&self) {
         if !self.options.enable_e2ee {

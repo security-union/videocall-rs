@@ -21,11 +21,11 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
-use web_time::{SystemTime, UNIX_EPOCH};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen_futures::spawn_local;
+use web_time::{SystemTime, UNIX_EPOCH};
 use yew::prelude::Callback;
 
 /// Health data cached for a specific peer
@@ -118,7 +118,7 @@ impl HealthReporter {
 
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
-            
+
             let receiver = subscribe();
             while let Ok(event) = receiver.recv_async().await {
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
@@ -132,8 +132,14 @@ impl HealthReporter {
     }
 
     /// Process a diagnostics event and update peer health data
-    fn process_diagnostics_event(event: DiagEvent, peer_health_data: &Rc<RefCell<HashMap<String, PeerHealthData>>>) {
-        let peer_id = event.stream_id.clone().unwrap_or_else(|| "unknown".to_string());
+    fn process_diagnostics_event(
+        event: DiagEvent,
+        peer_health_data: &Rc<RefCell<HashMap<String, PeerHealthData>>>,
+    ) {
+        let peer_id = event
+            .stream_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Handle NetEQ events (audio)
         if event.subsystem == "neteq" {
@@ -157,7 +163,10 @@ impl HealthReporter {
                             if let MetricValue::U64(buffer_ms) = &metric.value {
                                 // Update can_listen based on buffer health
                                 peer_data.can_listen = *buffer_ms > 0;
-                                debug!("Updated audio health (buffer: {}ms) for peer: {}", buffer_ms, peer_id);
+                                debug!(
+                                    "Updated audio health (buffer: {}ms) for peer: {}",
+                                    buffer_ms, peer_id
+                                );
                             }
                         }
                         _ => {}
@@ -220,18 +229,15 @@ impl HealthReporter {
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {}ms", interval_ms);
-            
+
             loop {
                 // Wait for the interval
                 gloo_timers::future::TimeoutFuture::new(interval_ms as u32).await;
 
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
                     if let Ok(health_map) = peer_health_data.try_borrow() {
-                        let health_packet = Self::create_health_packet(
-                            &session_id,
-                            &reporting_peer,
-                            &health_map,
-                        );
+                        let health_packet =
+                            Self::create_health_packet(&session_id, &reporting_peer, &health_map);
 
                         if let Some(packet) = health_packet {
                             send_callback.emit(packet);
@@ -246,8 +252,6 @@ impl HealthReporter {
         });
     }
 
-
-
     /// Create a health packet from current peer health data
     fn create_health_packet(
         session_id: &str,
@@ -260,7 +264,7 @@ impl HealthReporter {
 
         // Build the peer stats map for the connectivity matrix
         let mut peer_stats = serde_json::Map::new();
-        
+
         for (peer_id, health_data) in health_map.iter() {
             let peer_stat = json!({
                 "can_listen": health_data.can_listen,
@@ -282,7 +286,7 @@ impl HealthReporter {
         });
 
         let health_json = health_data.to_string();
-        
+
         Some(PacketWrapper {
             packet_type: PacketType::HEALTH.into(),
             email: reporting_peer.to_string(),
@@ -315,7 +319,7 @@ impl HealthReporter {
                     )
                 })
                 .collect::<serde_json::Map<_, _>>();
-            
+
             Some(Value::Object(summary))
         } else {
             None

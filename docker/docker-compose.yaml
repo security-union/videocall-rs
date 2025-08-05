@@ -61,12 +61,12 @@ services:
     working_dir: /app/leptos-website
     command: bash -c "cargo leptos watch"
     environment:
-      - LEPTOS_SITE_ADDR="0.0.0.0:91"
+      - LEPTOS_SITE_ADDR="0.0.0.0:4600"
       - CARGO_TARGET_DIR=/app/leptos-website/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
     ports:
-      - "91:91"
+      - "4600:4600"
   
   websocket-api:
     build:

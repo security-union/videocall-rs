@@ -1,10 +1,6 @@
 name: Publish Website to Docker image
 
 on:
-  # pull_request:
-  #   paths:
-  #     - 'leptos-website/**'
-  #     - 'docker/Dockerfile.website'
   push:
     branches:
       - main
@@ -22,7 +18,6 @@ jobs:
         id: checkout
 
       - name: Log in to Docker Hub
-        if: github.event_name == 'push'
         uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -41,7 +36,7 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.website
-          push: ${{ github.event_name == 'push' }}
+          push: true
           tags: |
             securityunion/video-call-rs-website:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
             securityunion/video-call-rs-website:latest

@@ -18,70 +18,99 @@
 
 use leptos::*;
 
-#[derive(Clone)]
-pub struct IconProps {
-    pub path: String,
-    pub size: String,
+/// Apple-style button variants
+#[derive(Clone, PartialEq)]
+pub enum ButtonVariant {
+    Primary,
+    Secondary,
+    Tertiary,
+}
+
+/// Apple-style button sizes
+#[derive(Clone, PartialEq)]
+pub enum ButtonSize {
+    Small,
+    Medium,
+    Large,
 }
 
 #[component]
 pub fn CTAButton(
-    title: String,
-    icon: IconProps,
-    #[prop(default = false)] animated: bool,
+    children: Children,
+    #[prop(default = ButtonVariant::Primary)] variant: ButtonVariant,
+    #[prop(default = ButtonSize::Medium)] size: ButtonSize,
     #[prop(default = String::new())] class: String,
     #[prop(default = None)] href: Option<String>,
-    #[prop(default = None)] style: Option<String>,
+    #[prop(default = false)] disabled: bool,
 ) -> impl IntoView {
-    let base_class = "cta-button".to_string();
-    let combined_class = format!("{} {}", base_class, class);
+    let base_classes = "inline-flex items-center justify-center font-medium transition-all duration-200 ease-out focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-background disabled:opacity-50 disabled:cursor-not-allowed";
 
-    let icon_size = icon.size.to_string();
-    let icon_path = icon.path.to_string();
-
-    let button_content = move || {
-        view! {
-            {/* Glow effect div for hover */}
-            <div class="cta-glow" style={style.clone()}></div>
-
-            {/* Button content */}
-            <div class="flex items-center justify-center">
-                <svg
-                    class=move || {
-                        let mut classes = vec![&icon_size, "mr-6"];
-                        if animated {
-                            classes.push("transition-transform duration-300");
-                        }
-                        classes.join(" ")
-                    }
-                    xmlns="http://www.w3.org/2000/svg"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke-width="1.5"
-                    stroke="currentColor"
-                >
-                    <path stroke-linecap="round" stroke-linejoin="round" d=&icon_path/>
-                </svg>
-                <span>{title.clone()}</span>
-            </div>
-        }
+    let variant_classes = match variant {
+        ButtonVariant::Primary => "bg-primary text-white hover:bg-primary-dark focus:ring-primary/20 shadow-sm hover:shadow-md",
+        ButtonVariant::Secondary => "bg-background-secondary text-foreground border border-border hover:bg-background-tertiary hover:border-border-secondary focus:ring-primary/20",
+        ButtonVariant::Tertiary => "text-primary hover:text-primary-dark hover:bg-primary/5 focus:ring-primary/20",
     };
 
-    let combined_class = combined_class.clone();
-    let content = button_content();
+    let size_classes = match size {
+        ButtonSize::Small => "px-4 py-2 text-sm rounded-md",
+        ButtonSize::Medium => "px-6 py-3 text-base rounded-lg",
+        ButtonSize::Large => "px-8 py-4 text-lg rounded-xl",
+    };
+
+    let combined_class = format!(
+        "{} {} {} {}",
+        base_classes, variant_classes, size_classes, class
+    );
+
+    let content = children();
 
     view! {
         {move || match &href {
             Some(href) => view! {
-                <a href=href class=&combined_class>
+                <a
+                    href=href
+                    class=&combined_class
+                    class:pointer-events-none=disabled
+                >
                     {content.clone()}
                 </a>
             }.into_view(),
             None => view! {
-                <button class=&combined_class>
+                <button
+                    class=&combined_class
+                    disabled=disabled
+                >
                     {content.clone()}
                 </button>
             }.into_view()
         }}
+    }
+}
+
+/// Simplified button with icon for backward compatibility
+#[component]
+pub fn ButtonWithIcon(
+    #[prop(into)] text: String,
+    #[prop(into)] icon_svg: String,
+    #[prop(default = ButtonVariant::Primary)] variant: ButtonVariant,
+    #[prop(default = ButtonSize::Medium)] size: ButtonSize,
+    #[prop(default = String::new())] class: String,
+    #[prop(default = None)] href: Option<String>,
+) -> impl IntoView {
+    view! {
+        <CTAButton
+            variant=variant
+            size=size
+            class=class
+            href=href
+        >
+            <div class="flex items-center space-x-2">
+                <div
+                    class="w-5 h-5 flex-shrink-0"
+                    inner_html=&icon_svg
+                ></div>
+                <span>{text}</span>
+            </div>
+        </CTAButton>
     }
 }

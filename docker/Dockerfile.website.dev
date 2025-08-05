@@ -14,6 +14,7 @@ RUN cargo install wasm-bindgen-cli@0.2.100 --locked
 
 RUN cargo install trunk --version 0.17.5 --locked
 
+
 WORKDIR /app
 
 

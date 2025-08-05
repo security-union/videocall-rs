@@ -25,6 +25,7 @@ use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
 use crate::health_reporter::HealthReporter;
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
+use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info};
 use protobuf::Message;
@@ -693,6 +694,14 @@ impl VideoCallClient {
                 sender_diagnostics.add_sender_channel(tx, media_type);
             }
         }
+    }
+
+    /// Subscribe to the global diagnostics broadcast system
+    ///
+    /// Returns a receiver that will receive all diagnostic events from across the system.
+    /// This is the new preferred way to access diagnostics data using the MPMC broadcast pattern.
+    pub fn subscribe_global_diagnostics(&self) -> async_broadcast::Receiver<DiagEvent> {
+        subscribe_global_diagnostics()
     }
 
     /// Remove a peer from health tracking

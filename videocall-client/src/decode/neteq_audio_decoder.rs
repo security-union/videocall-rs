@@ -268,7 +268,7 @@ impl NetEqAudioPeerDecoder {
 
     /// Emit raw stats JSON for debugging
     fn emit_stats_diagnostics(json_str: &str, peer_id: &str) {
-        let _ = global_sender().send(DiagEvent {
+        let _ = global_sender().try_broadcast(DiagEvent {
             subsystem: "neteq",
             stream_id: Some(peer_id.to_string()),
             ts_ms: now_ms(),
@@ -298,7 +298,7 @@ impl NetEqAudioPeerDecoder {
             .get("jitter_buffer_delay_ms")
             .and_then(|v| v.as_u64())
         {
-            let _ = global_sender().send(DiagEvent {
+            let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
                 stream_id: Some(peer_id.to_string()),
                 ts_ms: now_ms(),
@@ -310,7 +310,7 @@ impl NetEqAudioPeerDecoder {
             .get("jitter_buffer_target_delay_ms")
             .and_then(|v| v.as_u64())
         {
-            let _ = global_sender().send(DiagEvent {
+            let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
                 stream_id: Some(peer_id.to_string()),
                 ts_ms: now_ms(),
@@ -330,7 +330,7 @@ impl NetEqAudioPeerDecoder {
             .get("current_buffer_size_ms")
             .and_then(|v| v.as_u64())
         {
-            let _ = global_sender().send(DiagEvent {
+            let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
                 stream_id: Some(peer_id.to_string()),
                 ts_ms: now_ms(),

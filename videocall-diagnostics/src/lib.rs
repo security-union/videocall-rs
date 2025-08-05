@@ -21,6 +21,7 @@
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 
 // === Diagnostic data structures ===
 
@@ -51,20 +52,23 @@ pub enum MetricValue {
     Text(String),
 }
 
-// === Simple global broadcast bus (flume multi-producer multi-consumer) ===
+// === Simple global broadcast bus ===
 
-use flume::{Receiver, Sender};
+use async_broadcast::{broadcast, Receiver, Sender};
 
-static BUS: Lazy<(Sender<DiagEvent>, Receiver<DiagEvent>)> = Lazy::new(flume::unbounded);
+static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
+    let (s, _) = broadcast(256); // Capacity of 256 messages.
+    s
+});
 
 /// Obtain a sender that can publish diagnostics events.
-pub fn global_sender() -> &'static Sender<DiagEvent> {
-    &BUS.0
+pub fn global_sender() -> Sender<DiagEvent> {
+    SENDER.deref().clone()
 }
 
 /// Subscribe to the diagnostics stream. Each subscriber receives **all** future events.
 pub fn subscribe() -> Receiver<DiagEvent> {
-    BUS.1.clone()
+    SENDER.deref().new_receiver()
 }
 
 // === Helper utilities ===

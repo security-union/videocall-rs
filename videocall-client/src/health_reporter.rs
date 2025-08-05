@@ -119,8 +119,8 @@ impl HealthReporter {
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
 
-            let receiver = subscribe();
-            while let Ok(event) = receiver.recv_async().await {
+            let mut receiver = subscribe();
+            while let Ok(event) = receiver.recv().await {
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
                     Self::process_diagnostics_event(event, &peer_health_data);
                 } else {
@@ -173,6 +173,54 @@ impl HealthReporter {
                     }
                 }
             }
+        }
+        // Handle decoder events (from local DiagnosticManager)
+        else if event.subsystem == "decoder" {
+            if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
+                let peer_data = health_map
+                    .entry(peer_id.clone())
+                    .or_insert_with(|| PeerHealthData::new(peer_id.clone()));
+
+                for metric in &event.metrics {
+                    match metric.name {
+                        "fps" => {
+                            if let MetricValue::F64(fps) = &metric.value {
+                                // Update health based on FPS (consider >0 as active)
+                                peer_data.can_see = *fps > 0.0;
+                                debug!(
+                                    "Updated video health (FPS: {:.2}) for peer: {}",
+                                    fps, peer_id
+                                );
+                            }
+                        }
+                        "media_type" => {
+                            if let MetricValue::Text(media_type) = &metric.value {
+                                // Handle audio vs video media type
+                                if media_type.contains("AUDIO") {
+                                    peer_data.can_listen = true;
+                                } else if media_type.contains("VIDEO")
+                                    || media_type.contains("SCREEN")
+                                {
+                                    peer_data.can_see = true;
+                                }
+                                debug!(
+                                    "Updated media health ({}) for peer: {}",
+                                    media_type, peer_id
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Handle sender events (from local SenderDiagnosticManager)
+        else if event.subsystem == "sender" {
+            debug!(
+                "Received sender event for peer: {} at {}",
+                peer_id, event.ts_ms
+            );
+            // Sender events are mainly for server reporting, less impact on health status
         }
         // Handle video events
         else if event.subsystem == "video_decoder" || event.subsystem == "video" {

@@ -24,8 +24,8 @@ pub mod health_processor {
     use actix_web::{HttpResponse, Responder};
     use lazy_static::lazy_static;
     use prometheus::{
-        register_counter, register_gauge, register_histogram, Counter, Encoder, Gauge, Histogram,
-        TextEncoder,
+        register_counter, register_gauge_vec, register_histogram, Counter, Encoder, GaugeVec,
+        Histogram, TextEncoder,
     };
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -55,24 +55,16 @@ pub mod health_processor {
             "Total number of health reports received"
         )
         .unwrap();
-        static ref ACTIVE_SESSIONS: Gauge = register_gauge!(
-            "videocall_active_sessions_total",
-            "Number of active video call sessions"
+        static ref PEER_CAN_LISTEN: GaugeVec = register_gauge_vec!(
+            "videocall_peer_can_listen",
+            "Indicates if a peer can receive audio from another peer (1=yes, 0=no)",
+            &["session_id", "from_peer", "to_peer"]
         )
         .unwrap();
-        static ref PEER_CONNECTIONS: Gauge = register_gauge!(
-            "videocall_peer_connections_total",
-            "Number of active peer connections"
-        )
-        .unwrap();
-        static ref AUDIO_RECEPTION_FAILURES: Counter = register_counter!(
-            "videocall_audio_reception_failures_total",
-            "Number of peers unable to receive audio"
-        )
-        .unwrap();
-        static ref VIDEO_RECEPTION_FAILURES: Counter = register_counter!(
-            "videocall_video_reception_failures_total",
-            "Number of peers unable to receive video"
+        static ref PEER_CAN_SEE: GaugeVec = register_gauge_vec!(
+            "videocall_peer_can_see",
+            "Indicates if a peer can receive video from another peer (1=yes, 0=no)",
+            &["session_id", "from_peer", "to_peer"]
         )
         .unwrap();
         static ref SESSION_QUALITY: Histogram = register_histogram!(
@@ -88,36 +80,37 @@ pub mod health_processor {
         HEALTH_REPORTS_TOTAL.inc();
 
         debug!(
-            "Processing health report from {} in session {} with {} peer connections",
-            health_data.reporting_peer,
-            health_data.session_id,
-            health_data.peer_stats.len()
+            "Processing health report from {} in session {}",
+            health_data.reporting_peer, health_data.session_id
         );
 
-        // Update peer connection count
-        PEER_CONNECTIONS.set(health_data.peer_stats.len() as f64);
-
-        // Analyze connectivity and update metrics
-        let mut audio_failures = 0;
-        let mut video_failures = 0;
         let mut quality_scores = Vec::new();
 
         for (remote_peer, stats) in &health_data.peer_stats {
+            let from_peer = &health_data.reporting_peer;
+            let to_peer = remote_peer;
+            let session_id = &health_data.session_id;
+
+            // Set can_listen gauge
+            PEER_CAN_LISTEN
+                .with_label_values(&[session_id, from_peer, to_peer])
+                .set(if stats.can_listen { 1.0 } else { 0.0 });
+
+            // Set can_see gauge
+            PEER_CAN_SEE
+                .with_label_values(&[session_id, from_peer, to_peer])
+                .set(if stats.can_see { 1.0 } else { 0.0 });
+
             if !stats.can_listen {
-                audio_failures += 1;
-                AUDIO_RECEPTION_FAILURES.inc();
                 debug!(
                     "Audio reception failure: {} cannot hear {}",
-                    health_data.reporting_peer, remote_peer
+                    from_peer, to_peer
                 );
             }
-
             if !stats.can_see {
-                video_failures += 1;
-                VIDEO_RECEPTION_FAILURES.inc();
                 debug!(
                     "Video reception failure: {} cannot see {}",
-                    health_data.reporting_peer, remote_peer
+                    from_peer, to_peer
                 );
             }
 
@@ -134,21 +127,12 @@ pub mod health_processor {
             let avg_quality: f64 = quality_scores.iter().sum::<f64>() / quality_scores.len() as f64;
             SESSION_QUALITY.observe(avg_quality);
         }
-
-        debug!(
-            "Health metrics updated: {} audio failures, {} video failures, quality_scores: {:?}",
-            audio_failures, video_failures, quality_scores
-        );
     }
 
     /// Extract audio quality score from NetEQ stats (0.0 = poor, 1.0 = excellent)
     fn extract_audio_quality(neteq_stats: &serde_json::Value) -> Option<f64> {
-        // Extract expand_rate and accel_rate from NetEQ stats
         let expand_rate = neteq_stats.get("expand_rate")?.as_f64().unwrap_or(0.0);
         let accel_rate = neteq_stats.get("accel_rate")?.as_f64().unwrap_or(0.0);
-
-        // Quality score: 1.0 - (expand + accelerate rates as fraction)
-        // expand_rate and accel_rate are in per-mille (‰), so divide by 1000
         let quality = 1.0 - ((expand_rate + accel_rate) / 1000.0).min(1.0);
         Some(quality.max(0.0))
     }

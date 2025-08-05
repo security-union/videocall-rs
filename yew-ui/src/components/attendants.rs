@@ -188,18 +188,9 @@ impl AttendantsComponent {
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
             enable_diagnostics: true,
-            on_diagnostics_update: Some({
-                let link = ctx.link().clone();
-                Callback::from(move |stats| {
-                    link.send_message(Msg::from(WsAction::DiagnosticsUpdated(stats)))
-                })
-            }),
-            on_sender_stats_update: Some({
-                let link = ctx.link().clone();
-                Callback::from(move |stats| {
-                    link.send_message(Msg::from(WsAction::SenderStatsUpdated(stats)))
-                })
-            }),
+            // Disable old callback system - using broadcast system instead
+            on_diagnostics_update: None,
+            on_sender_stats_update: None,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
@@ -344,8 +335,8 @@ impl Component for AttendantsComponent {
         {
             let link = ctx.link().clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let rx = subscribe();
-                while let Ok(evt) = rx.recv_async().await {
+                let mut rx = subscribe();
+                while let Ok(evt) = rx.recv().await {
                     if evt.subsystem == "neteq" {
                         for m in &evt.metrics {
                             if m.name == "stats_json" {
@@ -382,6 +373,82 @@ impl Component for AttendantsComponent {
                         link.send_message(Msg::ConnectionManagerUpdate(
                             serde_json::to_string(&serializable_evt).unwrap_or_default(),
                         ));
+                    } else if evt.subsystem == "decoder" {
+                        // Process decoder diagnostics events (FPS, bitrate, etc.)
+                        log::debug!(
+                            "AttendantsComponent: Received decoder event for peer {:?}",
+                            evt.stream_id
+                        );
+                        let mut decoder_stats = String::new();
+                        for metric in &evt.metrics {
+                            match metric.name {
+                                "fps" => {
+                                    if let MetricValue::F64(fps) = &metric.value {
+                                        decoder_stats.push_str(&format!("FPS: {:.2}\n", fps));
+                                    }
+                                }
+                                "bitrate_kbps" => {
+                                    if let MetricValue::F64(bitrate) = &metric.value {
+                                        decoder_stats
+                                            .push_str(&format!("Bitrate: {:.1} kbps\n", bitrate));
+                                    }
+                                }
+                                "media_type" => {
+                                    if let MetricValue::Text(media_type) = &metric.value {
+                                        decoder_stats
+                                            .push_str(&format!("Media Type: {}\n", media_type));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !decoder_stats.is_empty() {
+                            let peer_id = evt
+                                .stream_id
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            decoder_stats.push_str(&format!(
+                                "Peer: {}\nTimestamp: {}\n",
+                                peer_id, evt.ts_ms
+                            ));
+                            link.send_message(Msg::WsAction(WsAction::DiagnosticsUpdated(
+                                decoder_stats,
+                            )));
+                        }
+                    } else if evt.subsystem == "sender" {
+                        // Process sender diagnostics events
+                        log::debug!(
+                            "AttendantsComponent: Received sender event for peer {:?}",
+                            evt.stream_id
+                        );
+                        let mut sender_stats = String::new();
+                        for metric in &evt.metrics {
+                            match metric.name {
+                                "sender_id" => {
+                                    if let MetricValue::Text(sender_id) = &metric.value {
+                                        sender_stats.push_str(&format!("Sender: {}\n", sender_id));
+                                    }
+                                }
+                                "target_id" => {
+                                    if let MetricValue::Text(target_id) = &metric.value {
+                                        sender_stats.push_str(&format!("Target: {}\n", target_id));
+                                    }
+                                }
+                                "media_type" => {
+                                    if let MetricValue::Text(media_type) = &metric.value {
+                                        sender_stats
+                                            .push_str(&format!("Media Type: {}\n", media_type));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !sender_stats.is_empty() {
+                            sender_stats.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
+                            link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
+                                sender_stats,
+                            )));
+                        }
                     } else {
                         let subsystem = evt.subsystem;
                         log::debug!("AttendantsComponent: Received event for unknown subsystem: {subsystem}");

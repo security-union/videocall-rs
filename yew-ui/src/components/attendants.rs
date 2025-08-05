@@ -197,7 +197,22 @@ impl AttendantsComponent {
             websocket_urls,
             webtransport_urls,
             enable_e2ee: ctx.props().e2ee_enabled,
-            enable_webtransport: ctx.props().webtransport_enabled,
+            enable_webtransport: {
+                let mut use_wt = ctx.props().webtransport_enabled;
+                if let Some(win) = web_sys::window() {
+                    if let Ok(href) = win.location().href() {
+                        if let Ok(url) = web_sys::Url::new(&href) {
+                            if let Some(wt_override) = url.search_params().get("webtransport") {
+                                let wt_override = wt_override.to_lowercase();
+                                if wt_override == "off" || wt_override == "false" || wt_override == "0" {
+                                    use_wt = false;
+                                }
+                            }
+                        }
+                    }
+                }
+                use_wt
+            },
             on_connected: {
                 let link = ctx.link().clone();
                 Callback::from(move |_| link.send_message(Msg::from(WsAction::Connected)))

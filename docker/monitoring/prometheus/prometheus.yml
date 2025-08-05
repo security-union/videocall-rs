@@ -1,0 +1,29 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'videocall-websocket-api'
+    static_configs:
+      - targets: ['websocket-api:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  - job_name: 'videocall-webtransport-api'
+    static_configs:
+      - targets: ['webtransport-api:5321']  # Health endpoint
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093

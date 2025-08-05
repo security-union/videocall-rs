@@ -40,6 +40,7 @@ use sec_api::{
         AuthRequest,
     },
     db::{get_pool, PostgresPool},
+    diagnostics::health_processor,
     models::{AppConfig, AppState},
 };
 use tracing::{debug, error, info};
@@ -182,6 +183,11 @@ pub async fn ws_connect(
     start_with_codec(actor, &req, stream, codec)
 }
 
+#[get("/metrics")]
+pub async fn metrics() -> impl Responder {
+    health_processor::metrics_handler().await
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -214,6 +220,7 @@ async fn main() -> std::io::Result<()> {
                 .wrap(cors)
                 .app_data(web::Data::new(AppState { chat: chat.clone() }))
                 .service(ws_connect)
+                .service(metrics)
         } else {
             let pool = if db_enabled { Some(get_pool()) } else { None };
             App::new()
@@ -231,6 +238,7 @@ async fn main() -> std::io::Result<()> {
                 .service(handle_google_oauth_callback)
                 .service(login)
                 .service(ws_connect)
+                .service(metrics)
         }
     })
     .bind((

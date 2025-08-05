@@ -821,6 +821,14 @@ impl Inner {
                     error!("Failed to parse diagnostics packet");
                 }
             }
+            Ok(PacketType::HEALTH) => {
+                // Health packets are sent from client to server for monitoring
+                // Clients should not receive health packets, so we ignore them
+                debug!(
+                    "Received unexpected health packet from {}, ignoring",
+                    response.email
+                );
+            }
             Err(e) => {
                 error!("Failed to parse diagnostics packet: {e}");
             }

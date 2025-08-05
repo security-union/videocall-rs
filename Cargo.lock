@@ -881,7 +881,7 @@ dependencies = [
  "chrono",
  "dotenv",
  "futures",
- "protobuf",
+ "protobuf 3.7.1",
  "rand 0.8.5",
  "tokio",
  "tokio-tungstenite",
@@ -4331,6 +4331,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+dependencies = [
+ "cfg-if 1.0.1",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "protobuf 2.28.0",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "prost"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4352,6 +4367,12 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
+
+[[package]]
+name = "protobuf"
+version = "2.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
 
 [[package]]
 name = "protobuf"
@@ -6438,8 +6459,10 @@ dependencies = [
  "base64 0.13.1",
  "bytes",
  "futures",
+ "lazy_static",
  "oauth2",
- "protobuf",
+ "prometheus",
+ "protobuf 3.7.1",
  "quinn 0.11.8",
  "r2d2",
  "r2d2_postgres",
@@ -6468,7 +6491,7 @@ dependencies = [
  "env-libvpx-sys",
  "image 0.25.6",
  "opus",
- "protobuf",
+ "protobuf 3.7.1",
  "quinn 0.10.2",
  "rustls 0.21.12",
  "thiserror 1.0.69",
@@ -6497,7 +6520,7 @@ dependencies = [
  "neteq",
  "pidgeon",
  "prost",
- "protobuf",
+ "protobuf 3.7.1",
  "rand 0.8.5",
  "rsa",
  "serde",
@@ -6651,7 +6674,7 @@ dependencies = [
 name = "videocall-types"
 version = "2.0.0"
 dependencies = [
- "protobuf",
+ "protobuf 3.7.1",
  "serde",
  "serde_json",
  "yew-websocket",

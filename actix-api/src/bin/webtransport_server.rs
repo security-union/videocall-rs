@@ -18,13 +18,21 @@
 
 use std::net::ToSocketAddrs;
 
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use tracing::{error, info};
 
-use sec_api::webtransport::{self, Certs};
+use sec_api::{
+    diagnostics::health_processor,
+    webtransport::{self, Certs},
+};
 
 async fn health_responder() -> impl Responder {
     HttpResponse::Ok().body("Ok")
+}
+
+#[get("/metrics")]
+pub async fn metrics() -> impl Responder {
+    health_processor::metrics_handler().await
 }
 
 #[actix_rt::main]
@@ -63,10 +71,13 @@ async fn main() {
     let listen = opt.listen;
     actix_rt::spawn(async move {
         info!("Starting http server: {:?}", listen);
-        let server =
-            HttpServer::new(|| App::new().route("/healthz", web::get().to(health_responder)))
-                .bind(&health_listen)
-                .unwrap();
+        let server = HttpServer::new(|| {
+            App::new()
+                .route("/healthz", web::get().to(health_responder))
+                .service(metrics)
+        })
+        .bind(&health_listen)
+        .unwrap();
         if let Err(e) = server.run().await {
             error!("http server error: {}", e);
         }

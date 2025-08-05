@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::diagnostics::health_processor;
 use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
 use futures::StreamExt;
@@ -352,6 +353,9 @@ async fn handle_session(
                     if let Err(e) = session.send_datagram(buf) {
                         error!("Error echoing RTT datagram: {}", e);
                     }
+                } else if health_processor::is_health_packet_bytes(&buf) {
+                    // Process health packet for diagnostics (don't relay)
+                    health_processor::process_health_packet_bytes(&buf);
                 } else {
                     // Normal datagram processing - publish to NATS
                     let nc = nc.clone();
@@ -476,6 +480,9 @@ async fn handle_quic_connection(
                                         error!("Error opening QUIC echo stream: {}", e);
                                     }
                                 }
+                            } else if health_processor::is_health_packet_bytes(&d) {
+                                // Process health packet for diagnostics (don't relay)
+                                health_processor::process_health_packet_bytes(&d);
                             } else {
                                 // Normal packet processing - publish to NATS
                                 let specific_subject =

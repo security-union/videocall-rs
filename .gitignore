@@ -58,3 +58,7 @@ Carthage/Build/
 
 
 deployment-**.log
+
+# Leptos website build artifacts
+leptos-website/package-lock.json
+leptos-website/style/output.css

@@ -152,10 +152,41 @@ impl AttendantsComponent {
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
-        let websocket_urls = ACTIX_WEBSOCKET
-            .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
-            .collect::<Vec<String>>();
+        // Allow ?backend=ws(s)://host[:port]/base override for dev/prod mixing
+        let websocket_urls = {
+            if let Some(win) = web_sys::window() {
+                if let Ok(href) = win.location().href() {
+                    if let Ok(url) = web_sys::Url::new(&href) {
+                        if let Some(override_base) = url.search_params().get("backend") {
+                            vec![format!(
+                                "{}/lobby/{email}/{id}",
+                                override_base.trim_end_matches('/')
+                            )]
+                        } else {
+                            ACTIX_WEBSOCKET
+                                .split(',')
+                                .map(|s| format!("{s}/lobby/{email}/{id}"))
+                                .collect::<Vec<String>>()
+                        }
+                    } else {
+                        ACTIX_WEBSOCKET
+                            .split(',')
+                            .map(|s| format!("{s}/lobby/{email}/{id}"))
+                            .collect::<Vec<String>>()
+                    }
+                } else {
+                    ACTIX_WEBSOCKET
+                        .split(',')
+                        .map(|s| format!("{s}/lobby/{email}/{id}"))
+                        .collect::<Vec<String>>()
+                }
+            } else {
+                ACTIX_WEBSOCKET
+                    .split(',')
+                    .map(|s| format!("{s}/lobby/{email}/{id}"))
+                    .collect::<Vec<String>>()
+            }
+        };
         let webtransport_urls = WEBTRANSPORT_HOST
             .split(',')
             .map(|s| format!("{s}/lobby/{email}/{id}"))

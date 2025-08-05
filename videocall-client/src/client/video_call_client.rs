@@ -22,6 +22,7 @@ use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
+use crate::health_reporter::HealthReporter;
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
 
@@ -32,6 +33,7 @@ use rsa::RsaPublicKey;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use web_time::{SystemTime, UNIX_EPOCH};
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -93,6 +95,12 @@ pub struct VideoCallClientOptions {
     /// How often to send diagnostics updates in milliseconds (default: 1000)
     pub diagnostics_update_interval_ms: Option<u64>,
 
+    /// `true` to enable health reporting to server; `false` to disable
+    pub enable_health_reporting: bool,
+
+    /// How often to send health packets in milliseconds (default: 5000)
+    pub health_reporting_interval_ms: Option<u64>,
+
     /// Callback for encoder settings
     pub on_encoder_settings_update: Option<Callback<String>>,
 
@@ -120,6 +128,7 @@ struct Inner {
     peer_decode_manager: PeerDecodeManager,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
+    health_reporter: Option<Rc<RefCell<HealthReporter>>>,
 }
 
 /// The client struct for a video call connection.
@@ -197,6 +206,27 @@ impl VideoCallClient {
             None
         };
 
+        // Create health reporter if enabled
+        let health_reporter = if options.enable_health_reporting {
+            let session_id = format!("session_{}", 
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            );
+            
+            let mut reporter = HealthReporter::new(session_id, options.userid.clone());
+            
+            // Set health reporting interval if provided
+            if let Some(interval) = options.health_reporting_interval_ms {
+                reporter.set_health_interval(interval);
+            }
+            
+            Some(Rc::new(RefCell::new(reporter)))
+        } else {
+            None
+        };
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -218,6 +248,7 @@ impl VideoCallClient {
                 ),
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
+                health_reporter: health_reporter.clone(),
             })),
             aes,
             _diagnostics: diagnostics.clone(),
@@ -229,6 +260,23 @@ impl VideoCallClient {
             diagnostics.set_packet_handler(Callback::from(move |packet| {
                 client_clone.send_diagnostic_packet(packet);
             }));
+        }
+
+        // Set up health reporter with packet sending callback
+        if let Some(health_reporter) = &health_reporter {
+            if let Ok(mut reporter) = health_reporter.try_borrow_mut() {
+                let client_clone = client.clone();
+                reporter.set_send_packet_callback(Callback::from(move |packet| {
+                    client_clone.send_packet(packet);
+                }));
+                
+                // Start real diagnostics subscription (not mock channels)
+                reporter.start_diagnostics_subscription();
+                
+                // Start health reporting
+                reporter.start_health_reporting();
+                debug!("Health reporting started with real diagnostics subscription");
+            }
         }
 
         client
@@ -646,6 +694,18 @@ impl VideoCallClient {
         }
     }
 
+    /// Remove a peer from health tracking
+    pub fn remove_peer_health(&self, peer_id: &str) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(health_reporter) = &inner.health_reporter {
+                if let Ok(reporter) = health_reporter.try_borrow() {
+                    reporter.remove_peer(peer_id);
+                    debug!("Removed peer from health tracking: {}", peer_id);
+                }
+            }
+        }
+    }
+
     pub fn set_video_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -842,6 +902,8 @@ impl Inner {
             }
         }
     }
+
+
 
     fn send_public_key(&self) {
         if !self.options.enable_e2ee {

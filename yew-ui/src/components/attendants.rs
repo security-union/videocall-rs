@@ -201,6 +201,8 @@ impl AttendantsComponent {
                 })
             }),
             diagnostics_update_interval_ms: Some(1000),
+            enable_health_reporting: true,
+            health_reporting_interval_ms: Some(5000),
             on_encoder_settings_update: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |settings| {

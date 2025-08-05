@@ -34,6 +34,9 @@ enum WorkerMsg {
     Mute {
         muted: bool,
     },
+    SetDiagnostics {
+        enabled: bool,
+    },
 }
 
 /// Messages received from worker (matches neteq_worker.rs)
@@ -501,6 +504,13 @@ impl NetEqAudioPeerDecoder {
             "✅ NetEq decoder initialized for peer {} with muted: {}",
             decoder.peer_id,
             initial_muted
+        );
+
+        // Enable diagnostics in the NetEQ worker
+        decoder.send_worker_message(WorkerMsg::SetDiagnostics { enabled: true });
+        log::info!(
+            "🔧 Enabled diagnostics for NetEq worker for peer {}",
+            decoder.peer_id
         );
 
         Ok(Box::new(decoder))

@@ -23,4 +23,5 @@ flume = "0.11"
 async-broadcast = "0.7.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = "0.3" 
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4" 

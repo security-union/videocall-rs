@@ -16,17 +16,17 @@ crate-type = ["cdylib", "rlib"]
 cached = { version = "0.43", optional = true }
 console_error_panic_hook = "0.1.7"
 cfg-if = "1.0.0"
-leptos = { git = "https://github.com/leptos-rs/leptos", features = [
+leptos = { version = "0.5.1", features = [
 	"nightly",
 	"experimental-islands",
 ] }
-leptos_axum = { git = "https://github.com/leptos-rs/leptos", optional = true, features = [
+leptos_axum = { version = "0.5.1", optional = true, features = [
 	"experimental-islands",
 ] }
-leptos_meta = { git = "https://github.com/leptos-rs/leptos", features = [
+leptos_meta = { version = "0.5.1", features = [
 	"nightly",
 ] }
-leptos_router = { git = "https://github.com/leptos-rs/leptos", features = [
+leptos_router = { version = "0.5.1", features = [
 	"nightly",
 ] }
 log = "0.4.17"
@@ -57,6 +57,7 @@ serde = "1.0.218"
 [features]
 default = ["csr"]
 csr = ["leptos/csr", "leptos_meta/csr", "leptos_router/csr"]
+testimonials = []
 hydrate = [
 	"leptos/hydrate",
 	"leptos_meta/hydrate",

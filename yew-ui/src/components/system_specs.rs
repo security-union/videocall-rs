@@ -7,11 +7,10 @@
  */
 
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::{Navigator, Screen, Window};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct SystemSpecs {
     /// Raw browser user-agent string
     pub user_agent: Option<String>,
@@ -37,24 +36,6 @@ pub struct SystemSpecs {
     pub network_downlink_mbps: Option<f64>,
 }
 
-impl Default for SystemSpecs {
-    fn default() -> Self {
-        Self {
-            user_agent: None,
-            platform: None,
-            cpu_cores: None,
-            device_memory_gb: None,
-            languages: vec![],
-            screen_width: None,
-            screen_height: None,
-            color_depth: None,
-            pixel_ratio: None,
-            network_type: None,
-            network_downlink_mbps: None,
-        }
-    }
-}
-
 /// Collect the specs that are synchronously available in the browser.
 pub fn gather_system_specs() -> anyhow::Result<SystemSpecs> {
     let window: Window = web_sys::window().ok_or(anyhow::anyhow!("No window found"))?;
@@ -63,27 +44,21 @@ pub fn gather_system_specs() -> anyhow::Result<SystemSpecs> {
         .screen()
         .map_err(|e| anyhow::anyhow!("No screen found: {e:?}"))?;
 
-    let mut specs = SystemSpecs::default();
-
-    // User agent & platform
-    specs.user_agent = navigator
-        .user_agent()
-        .map_err(|e| anyhow::anyhow!("No user agent found: {e:?}"))
-        .ok();
-    specs.platform = navigator
-        .platform()
-        .map_err(|e| anyhow::anyhow!("No platform found: {e:?}"))
-        .ok();
-
-    // CPU cores & device memory (the latter is non-standard, use JS reflection)
-    let cores = navigator.hardware_concurrency();
-    if cores > 0.0 {
-        specs.cpu_cores = Some(cores as u32);
-    }
-
-    specs.device_memory_gb = js_sys::Reflect::get(&navigator, &JsValue::from_str("deviceMemory"))
-        .ok()
-        .and_then(|v| v.as_f64());
+    let mut specs: SystemSpecs = SystemSpecs {
+        user_agent: navigator
+            .user_agent()
+            .map_err(|e| anyhow::anyhow!("No user agent found: {e:?}"))
+            .ok(),
+        platform: navigator
+            .platform()
+            .map_err(|e| anyhow::anyhow!("No platform found: {e:?}"))
+            .ok(),
+        cpu_cores: Some(navigator.hardware_concurrency() as u32),
+        device_memory_gb: js_sys::Reflect::get(&navigator, &JsValue::from_str("deviceMemory"))
+            .ok()
+            .and_then(|v| v.as_f64()),
+        ..Default::default()
+    };
 
     // Languages – `languages()` is not yet in web_sys, fallback to primary language
     let langs_val = js_sys::Reflect::get(&navigator, &JsValue::from_str("languages")).ok();

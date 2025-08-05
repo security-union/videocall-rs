@@ -13,7 +13,6 @@ categories = ["web-programming", "multimedia"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-cached = { version = "0.43", optional = true }
 console_error_panic_hook = "0.1.7"
 cfg-if = "1.0.0"
 leptos = { version = "0.5.1", features = [
@@ -75,7 +74,6 @@ ssr = [
 	"leptos_router/ssr",
 	"dep:leptos_axum",
 	"dep:femark",
-	"dep:cached",
 	"dep:axum-extra",
 ]
 

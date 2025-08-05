@@ -1,7 +1,7 @@
 FROM rust:1.83-slim-bookworm as builder
 
 # Due to https://github.com/leptos-rs/cargo-leptos/issues/271
-ENV LEPTOS_HASH_FILES=true
+ENV LEPTOS_HASH_FILES=false
 
 RUN rustup default nightly-2024-11-01
 

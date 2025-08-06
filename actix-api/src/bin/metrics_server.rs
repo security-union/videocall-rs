@@ -111,8 +111,9 @@ fn process_health_packet_to_metrics(health_packet: &Value) -> anyhow::Result<()>
 
                 // Process NetEQ metrics from neteq_stats object
                 if let Some(neteq_stats) = peer_obj.get("neteq_stats") {
-                    if let Some(audio_buffer_ms) =
-                        neteq_stats.get("audio_buffer_ms").and_then(|v| v.as_f64())
+                    if let Some(audio_buffer_ms) = neteq_stats
+                        .get("current_buffer_size_ms")
+                        .and_then(|v| v.as_f64())
                     {
                         NETEQ_AUDIO_BUFFER_MS
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
@@ -156,6 +157,7 @@ async fn nats_health_consumer(
     info!("Subscribed to NATS topic: health.diagnostics.>");
 
     while let Some(message) = subscription.next().await {
+        debug!("Received health message from NATS: {}", message.subject);
         if let Err(e) = handle_health_message(message, &health_store).await {
             error!("Failed to handle health message: {}", e);
         }

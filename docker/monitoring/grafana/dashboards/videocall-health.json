@@ -176,13 +176,13 @@
       },
       "targets": [
         {
-          "expr": "videocall_session_quality_score",
+          "expr": "videocall_peer_can_listen{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "Session Quality Score",
+          "legendFormat": "{{from_peer}} can hear {{to_peer}} ({{meeting_id}})",
           "refId": "A"
         }
       ],
-      "title": "Session Quality Score",
+      "title": "Audio Connectivity Status",
       "type": "timeseries"
     },
     {
@@ -601,13 +601,13 @@
       },
       "targets": [
         {
-          "expr": "videocall_peer_can_listen{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "expr": "videocall_peer_can_see{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
           "interval": "",
-          "legendFormat": "{{from_peer}} can hear {{to_peer}} ({{meeting_id}})",
+          "legendFormat": "{{from_peer}} can see {{to_peer}} ({{meeting_id}})",
           "refId": "A"
         }
       ],
-      "title": "Peer Audio Health Matrix",
+      "title": "Peer Video Health Matrix",
       "type": "timeseries"
     }
   ],

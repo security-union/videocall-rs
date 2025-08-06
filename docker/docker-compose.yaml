@@ -119,7 +119,7 @@ services:
       - REGION=${REGION:-us-east}
       - SERVER_ID=${SERVER_ID:-server-1}
       - SERVICE_TYPE=metrics
-      - RUST_LOG=info,async_nats=info
+      - RUST_LOG=debug,async_nats=info
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
@@ -175,6 +175,14 @@ services:
     ports:
       - "4222:4222"
       - "8222:8222"
+
+  nats-box:
+    image: natsio/nats-box:latest
+    depends_on:
+      - nats
+    environment:
+      - NATS_URL=nats:4222
+    command: ["sleep", "infinity"]
 
   postgres:
     image: postgres:12

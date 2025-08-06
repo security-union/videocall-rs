@@ -24,7 +24,8 @@ pub mod health_processor {
     use actix_web::{HttpResponse, Responder};
     use prometheus::{Encoder, TextEncoder};
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
+    use tokio::time::sleep;
     use tracing::{debug, warn};
 
     // Health data structure matching RFC design
@@ -91,7 +92,7 @@ pub mod health_processor {
 
         client.publish(topic.clone(), json_payload.into()).await?;
         debug!("Published health data to NATS topic: {}", topic);
-
+        sleep(Duration::from_secs(1)).await;
         Ok(())
     }
 

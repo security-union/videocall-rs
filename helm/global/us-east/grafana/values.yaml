@@ -69,6 +69,12 @@ grafana:
           access: proxy
           isDefault: true
   
+  # Dashboard provisioning
+  dashboards:
+    default:
+      videocall-health:
+        file: dashboards/videocall-health.json
+  
   # Security context
   securityContext:
     runAsUser: 472

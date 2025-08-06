@@ -193,6 +193,9 @@ get_release_name_for_chart() {
         "global/us-east/grafana")
             echo "grafana-us-east"
             ;;
+        "global/us-east/metrics-api")
+            echo "metrics-api-us-east"
+            ;;
         *)
             echo "unknown"
             ;;

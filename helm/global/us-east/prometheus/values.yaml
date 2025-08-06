@@ -17,7 +17,7 @@ prometheus:
     # Persistence (minimal)
     persistentVolume:
       enabled: true
-      size: 2Gi
+      size: 8Gi
       storageClass: "do-block-storage"
     
     # Retention
@@ -36,8 +36,8 @@ prometheus:
     
     # Global scrape configuration
     global:
-      scrape_interval: 30s
-      evaluation_interval: 30s
+      scrape_interval: 15s
+      evaluation_interval: 15s
     
   # Alertmanager (disabled for minimal setup)
   alertmanager:
@@ -65,20 +65,19 @@ prometheus:
   # Server configuration files
   serverFiles:
     prometheus.yml:
-      global:
-        scrape_interval: 30s
-        evaluation_interval: 30s
+      rule_files:
+        - "alert_rules.yml"
       
       scrape_configs:
         - job_name: 'prometheus'
           static_configs:
             - targets: ['localhost:9090']
-        
+
         - job_name: 'videocall-metrics-api'
           static_configs:
-            - targets: ['metrics-api:9091']
+            - targets: ['metrics-api-us-east:9091']
           metrics_path: '/metrics'
-          scrape_interval: 30s
+          scrape_interval: 10s
         
         # Kubernetes API server
         - job_name: 'kubernetes-apiservers'
@@ -110,3 +109,70 @@ prometheus:
               regex: (.+)
               target_label: __metrics_path__
               replacement: /api/v1/nodes/${1}/proxy/metrics
+    
+    alert_rules.yml:
+      groups:
+        - name: videocall_alerts
+          rules:
+            - alert: HighAudioReceptionFailures
+              expr: rate(videocall_audio_reception_failures_total[5m]) > 0.1
+              for: 2m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High audio reception failures detected"
+                description: "Audio reception failure rate is {{ $value }} failures/sec"
+            
+            - alert: HighVideoReceptionFailures
+              expr: rate(videocall_video_reception_failures_total[5m]) > 0.1
+              for: 2m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High video reception failures detected"
+                description: "Video reception failure rate is {{ $value }} failures/sec"
+            
+            - alert: LowAudioConnectivity
+              expr: videocall_peer_can_listen < 0.5
+              for: 1m
+              labels:
+                severity: critical
+              annotations:
+                summary: "Low audio connectivity detected"
+                description: "Audio connectivity is {{ $value }}%"
+            
+            - alert: LowVideoConnectivity
+              expr: videocall_peer_can_see < 0.5
+              for: 1m
+              labels:
+                severity: critical
+              annotations:
+                summary: "Low video connectivity detected"
+                description: "Video connectivity is {{ $value }}%"
+            
+            - alert: HighNetEQBuffer
+              expr: videocall_neteq_audio_buffer_ms > 200
+              for: 2m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High NetEQ audio buffer detected"
+                description: "NetEQ audio buffer is {{ $value }}ms"
+            
+            - alert: HighPacketDecodeQueue
+              expr: videocall_neteq_packets_awaiting_decode > 20
+              for: 2m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High packet decode queue detected"
+                description: "{{ $value }} packets awaiting decode"
+            
+            - alert: HighDecodeOperations
+              expr: rate(videocall_neteq_normal_ops_per_sec[5m]) + rate(videocall_neteq_expand_ops_per_sec[5m]) + rate(videocall_neteq_accelerate_ops_per_sec[5m]) > 50
+              for: 2m
+              labels:
+                severity: warning
+              annotations:
+                summary: "High decode operations detected"
+                description: "{{ $value }} decode operations per second"

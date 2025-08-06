@@ -17,8 +17,11 @@ type HealthDataStore = Arc<Mutex<HashMap<String, Value>>>;
 // Import shared Prometheus metrics
 #[cfg(feature = "diagnostics")]
 use sec_api::metrics::{
-    ACTIVE_SESSIONS_TOTAL, MEETING_PARTICIPANTS, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_PACKETS_AWAITING_DECODE, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL,
+    ACTIVE_SESSIONS_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC, NETEQ_DTMF_OPS_PER_SEC,
+    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_FAST_ACCELERATE_OPS_PER_SEC, NETEQ_MERGE_OPS_PER_SEC,
+    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC,
+    NETEQ_UNDEFINED_OPS_PER_SEC, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL,
 };
 
 #[cfg(feature = "diagnostics")]
@@ -127,6 +130,146 @@ fn process_health_packet_to_metrics(health_packet: &Value) -> anyhow::Result<()>
                         NETEQ_PACKETS_AWAITING_DECODE
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
                             .set(packets_awaiting);
+                    }
+
+                    // Process NetEQ operation metrics from network.operation_counters
+                    if let Some(network) = neteq_stats.get("network") {
+                        if let Some(operation_counters) = network.get("operation_counters") {
+                            // Normal operations per second
+                            if let Some(normal_ops) = operation_counters
+                                .get("normal_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_NORMAL_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(normal_ops);
+                            }
+
+                            // Expand operations per second
+                            if let Some(expand_ops) = operation_counters
+                                .get("expand_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_EXPAND_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(expand_ops);
+                            }
+
+                            // Accelerate operations per second
+                            if let Some(accelerate_ops) = operation_counters
+                                .get("accelerate_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_ACCELERATE_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(accelerate_ops);
+                            }
+
+                            // Fast accelerate operations per second
+                            if let Some(fast_accelerate_ops) = operation_counters
+                                .get("fast_accelerate_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_FAST_ACCELERATE_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(fast_accelerate_ops);
+                            }
+
+                            // Preemptive expand operations per second
+                            if let Some(preemptive_expand_ops) = operation_counters
+                                .get("preemptive_expand_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(preemptive_expand_ops);
+                            }
+
+                            // Merge operations per second
+                            if let Some(merge_ops) = operation_counters
+                                .get("merge_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_MERGE_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(merge_ops);
+                            }
+
+                            // Comfort noise operations per second
+                            if let Some(comfort_noise_ops) = operation_counters
+                                .get("comfort_noise_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_COMFORT_NOISE_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(comfort_noise_ops);
+                            }
+
+                            // DTMF operations per second
+                            if let Some(dtmf_ops) = operation_counters
+                                .get("dtmf_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_DTMF_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(dtmf_ops);
+                            }
+
+                            // Undefined operations per second
+                            if let Some(undefined_ops) = operation_counters
+                                .get("undefined_per_sec")
+                                .and_then(|v| v.as_f64())
+                            {
+                                NETEQ_UNDEFINED_OPS_PER_SEC
+                                    .with_label_values(&[
+                                        meeting_id,
+                                        session_id,
+                                        reporting_peer,
+                                        peer_id,
+                                    ])
+                                    .set(undefined_ops);
+                            }
+                        }
                     }
                 }
             }

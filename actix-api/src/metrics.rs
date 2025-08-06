@@ -66,6 +66,78 @@ lazy_static! {
     )
     .expect("Failed to create neteq_packets_awaiting_decode metric");
 
+    /// NetEQ normal decode operations per second
+    pub static ref NETEQ_NORMAL_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_normal_ops_per_sec",
+        "Normal decode operations per second",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_normal_ops_per_sec metric");
+
+    /// NetEQ expand operations per second
+    pub static ref NETEQ_EXPAND_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_expand_ops_per_sec",
+        "Expand operations per second (packet loss concealment)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_expand_ops_per_sec metric");
+
+    /// NetEQ accelerate operations per second
+    pub static ref NETEQ_ACCELERATE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_accelerate_ops_per_sec",
+        "Accelerate operations per second (time compression)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_accelerate_ops_per_sec metric");
+
+    /// NetEQ fast accelerate operations per second
+    pub static ref NETEQ_FAST_ACCELERATE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_fast_accelerate_ops_per_sec",
+        "Fast accelerate operations per second",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_fast_accelerate_ops_per_sec metric");
+
+    /// NetEQ preemptive expand operations per second
+    pub static ref NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_preemptive_expand_ops_per_sec",
+        "Preemptive expand operations per second (time expansion)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_preemptive_expand_ops_per_sec metric");
+
+    /// NetEQ merge operations per second
+    pub static ref NETEQ_MERGE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_merge_ops_per_sec",
+        "Merge operations per second (blending)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_merge_ops_per_sec metric");
+
+    /// NetEQ comfort noise operations per second
+    pub static ref NETEQ_COMFORT_NOISE_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_comfort_noise_ops_per_sec",
+        "Comfort noise operations per second",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_comfort_noise_ops_per_sec metric");
+
+    /// NetEQ DTMF operations per second
+    pub static ref NETEQ_DTMF_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_dtmf_ops_per_sec",
+        "DTMF operations per second",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_dtmf_ops_per_sec metric");
+
+    /// NetEQ undefined operations per second
+    pub static ref NETEQ_UNDEFINED_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_undefined_ops_per_sec",
+        "Undefined operations per second",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_undefined_ops_per_sec metric");
+
     /// Total number of active sessions
     pub static ref ACTIVE_SESSIONS_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_active_sessions_total",

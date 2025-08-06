@@ -284,8 +284,8 @@ fn process_health_packet_to_metrics(health_packet: &Value) -> anyhow::Result<()>
     Ok(())
 }
 
-#[allow(unused_variables)]
 #[cfg(not(feature = "diagnostics"))]
+#[allow(unused)]
 fn process_health_packet_to_metrics(_health_packet: &Value) -> anyhow::Result<()> {
     // No-op when diagnostics feature is disabled
     Ok(())

@@ -284,6 +284,7 @@ fn process_health_packet_to_metrics(health_packet: &Value) -> anyhow::Result<()>
     Ok(())
 }
 
+#[allow(unused_variables)]
 #[cfg(not(feature = "diagnostics"))]
 fn process_health_packet_to_metrics(_health_packet: &Value) -> anyhow::Result<()> {
     // No-op when diagnostics feature is disabled
@@ -375,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
                 web::get().to(|| async { HttpResponse::Ok().body("OK") }),
             )
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .bind(format!("0.0.0.0:{port}"))?
     .run()
     .await?;
 

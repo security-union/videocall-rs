@@ -3,7 +3,7 @@ metricsApi:
   # Image configuration
   image:
     repository: securityunion/rustlemania-api
-    tag: "high-availability-cf63fcce"
+    tag: "add-diagnostics-96d1ea6a"
     pullPolicy: Always
   
   # Minimal resources for cost optimization

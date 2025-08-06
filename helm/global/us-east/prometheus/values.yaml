@@ -2,14 +2,14 @@
 prometheus:
   # Prometheus server configuration
   server:
-    # Minimal resources
+    # Minimal resources (reduced for limited cluster)
     resources:
       limits:
-        cpu: 200m
-        memory: 512Mi
-      requests:
-        cpu: 100m
+        cpu: 50m
         memory: 256Mi
+      requests:
+        cpu: 25m
+        memory: 128Mi
     
     # Single replica
     replicaCount: 1
@@ -56,11 +56,11 @@ prometheus:
     enabled: true
     resources:
       limits:
-        cpu: 50m
-        memory: 64Mi
-      requests:
         cpu: 25m
         memory: 32Mi
+      requests:
+        cpu: 10m
+        memory: 16Mi
   
   # Server configuration files
   serverFiles:

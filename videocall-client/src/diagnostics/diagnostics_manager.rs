@@ -771,8 +771,7 @@ impl SenderDiagnosticWorker {
                     ],
                 };
                 debug!(
-                    "Broadcasting sender event for target {}: sender={}, media_type={:?}",
-                    target_id, sender_id, media_type
+                    "Broadcasting sender event for target {target_id}: sender={sender_id}, media_type={media_type:?}"
                 );
                 let _ = global_sender().try_broadcast(event);
 

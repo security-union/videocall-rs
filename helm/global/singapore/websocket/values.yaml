@@ -8,7 +8,7 @@ rustlemania-websocket:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: high-availability-cf63fcce
+    tag: add-diagnostics-96d1ea6a
 
   env:
     - name: RUST_LOG
@@ -25,6 +25,10 @@ rustlemania-websocket:
       value: abc
     - name: REGION
       value: "singapore"
+    - name: SERVER_ID
+      value: $(POD_NAME)
+    - name: SERVICE_TYPE
+      value: websocket
 
   resources:
     limits:

@@ -28,6 +28,10 @@ rustlemania-webtransport:
       value: /certs/tls.key
     - name: REGION
       value: "us-east"
+    - name: SERVER_ID
+      value: $(POD_NAME)
+    - name: SERVICE_TYPE
+      value: webtransport
 
   resources:
     limits:

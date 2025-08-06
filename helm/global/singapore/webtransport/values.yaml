@@ -5,6 +5,11 @@ rustlemania-webtransport:
 
   replicaCount: 1
 
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: add-diagnostics-96d1ea6a
+
   command: ['webtransport_server']
   tlsSecret: webtransport-singapore-tls
 
@@ -23,6 +28,10 @@ rustlemania-webtransport:
       value: /certs/tls.key
     - name: REGION
       value: "singapore"
+    - name: SERVER_ID
+      value: $(POD_NAME)
+    - name: SERVICE_TYPE
+      value: webtransport
 
   resources:
     limits:

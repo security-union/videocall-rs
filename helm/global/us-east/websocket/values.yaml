@@ -23,6 +23,11 @@ rustlemania-websocket:
       value: abc
     - name: REGION
       value: "us-east"
+    - name: SERVER_ID
+      value: $(POD_NAME)
+    - name: SERVICE_TYPE
+      value: websocket
+
 
   resources:
     limits:

@@ -182,8 +182,7 @@ impl HealthReporter {
                                 // Update can_listen based on buffer health
                                 peer_data.can_listen = *buffer_ms > 0;
                                 debug!(
-                                    "Updated audio health (buffer: {}ms) for peer: {} (from {})",
-                                    buffer_ms, target_peer, reporting_peer
+                                    "Updated audio health (buffer: {buffer_ms}ms) for peer: {target_peer} (from {reporting_peer})"
                                 );
                             }
                         }

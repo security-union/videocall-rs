@@ -278,7 +278,7 @@ impl NetEqAudioPeerDecoder {
 
         let _ = global_sender().try_broadcast(DiagEvent {
             subsystem: "neteq",
-            stream_id: Some(format!("{}->{}", current_user, peer_id)), // reporting_peer->target_peer
+            stream_id: Some(format!("{current_user}->{peer_id}")), // reporting_peer->target_peer
             ts_ms: now_ms(),
             metrics: vec![
                 metric!("stats_json", json_str.to_string()),
@@ -312,7 +312,7 @@ impl NetEqAudioPeerDecoder {
         {
             let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
-                stream_id: Some(format!("current_user->{}", peer_id)),
+                stream_id: Some(format!("current_user->{peer_id}")),
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("jitter_buffer_delay_ms", jitter),
@@ -328,7 +328,7 @@ impl NetEqAudioPeerDecoder {
         {
             let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
-                stream_id: Some(format!("current_user->{}", peer_id)),
+                stream_id: Some(format!("current_user->{peer_id}")),
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("jitter_buffer_target_delay_ms", target),
@@ -353,7 +353,7 @@ impl NetEqAudioPeerDecoder {
         {
             let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
-                stream_id: Some(format!("current_user->{}", peer_id)),
+                stream_id: Some(format!("current_user->{peer_id}")),
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("audio_buffer_ms", buf),
@@ -370,7 +370,7 @@ impl NetEqAudioPeerDecoder {
         {
             let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
-                stream_id: Some(format!("current_user->{}", peer_id)),
+                stream_id: Some(format!("current_user->{peer_id}")),
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("packets_awaiting_decode", packets),

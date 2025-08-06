@@ -34,7 +34,7 @@ use actix::{
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
 use protobuf::Message as ProtobufMessage;
-use tracing::{debug, error, info, trace};
+use tracing::{error, info, trace};
 use uuid::Uuid;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;

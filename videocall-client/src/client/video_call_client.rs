@@ -631,7 +631,7 @@ impl VideoCallClient {
             if let Some(health_reporter) = &inner.health_reporter {
                 if let Ok(reporter) = health_reporter.try_borrow() {
                     reporter.remove_peer(peer_id);
-                    debug!("Removed peer from health tracking: {}", peer_id);
+                    debug!("Removed peer from health tracking: {peer_id}");
                 }
             }
         }

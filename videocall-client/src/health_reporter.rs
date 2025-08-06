@@ -171,8 +171,7 @@ impl HealthReporter {
                                     peer_data.update_audio_stats(neteq_json);
                                     peer_data.can_listen = true;
                                     debug!(
-                                        "Updated NetEQ stats for peer: {} (from {})",
-                                        target_peer, reporting_peer
+                                        "Updated NetEQ stats for peer: {target_peer} (from {reporting_peer})"
                                     );
                                 }
                             }

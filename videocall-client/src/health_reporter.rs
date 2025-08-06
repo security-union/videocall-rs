@@ -190,8 +190,7 @@ impl HealthReporter {
                         "packets_awaiting_decode" => {
                             if let MetricValue::U64(packets) = &metric.value {
                                 debug!(
-                                    "Updated packets awaiting decode: {} for peer: {} (from {})",
-                                    packets, target_peer, reporting_peer
+                                    "Updated packets awaiting decode: {packets} for peer: {target_peer} (from {reporting_peer})"
                                 );
                             }
                         }
@@ -214,8 +213,7 @@ impl HealthReporter {
                                 // Update health based on FPS (consider >0 as active)
                                 peer_data.can_see = *fps > 0.0;
                                 debug!(
-                                    "Updated video health (FPS: {:.2}) for peer: {} (from {})",
-                                    fps, target_peer, reporting_peer
+                                    "Updated video health (FPS: {fps:.2}) for peer: {target_peer} (from {reporting_peer})"
                                 );
                             }
                         }
@@ -230,8 +228,7 @@ impl HealthReporter {
                                     peer_data.can_see = true;
                                 }
                                 debug!(
-                                    "Updated media health ({}) for peer: {} (from {})",
-                                    media_type, target_peer, reporting_peer
+                                    "Updated media health ({media_type}) for peer: {target_peer} (from {reporting_peer})"
                                 );
                             }
                         }
@@ -283,7 +280,7 @@ impl HealthReporter {
                 }
 
                 peer_data.update_video_stats(video_stats);
-                debug!("Updated video health for peer: {}", target_peer);
+                debug!("Updated video health for peer: {target_peer}");
             }
         }
     }
@@ -303,7 +300,7 @@ impl HealthReporter {
         let interval_ms = self.health_interval_ms;
 
         spawn_local(async move {
-            debug!("Started health reporting with interval: {}ms", interval_ms);
+            debug!("Started health reporting with interval: {interval_ms}ms");
 
             loop {
                 // Wait for the interval
@@ -320,7 +317,7 @@ impl HealthReporter {
 
                         if let Some(packet) = health_packet {
                             send_callback.emit(packet);
-                            debug!("Sent health packet for session: {}", session_id);
+                            debug!("Sent health packet for session: {session_id}");
                         }
                     }
                 } else {
@@ -380,7 +377,7 @@ impl HealthReporter {
     pub fn remove_peer(&self, peer_id: &str) {
         if let Ok(mut health_map) = self.peer_health_data.try_borrow_mut() {
             health_map.remove(peer_id);
-            debug!("Removed peer from health tracking: {}", peer_id);
+            debug!("Removed peer from health tracking: {peer_id}");
         }
     }
 

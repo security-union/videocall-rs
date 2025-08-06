@@ -32,6 +32,7 @@ on:
           - 'core-services'     # websocket, webtransport
           - 'ui-services'       # rustlemania-ui, videocall-website
           - 'infrastructure'    # cert-manager, ingress
+          - 'monitoring'        # prometheus, grafana
       dry_run:
         description: 'Dry Run (show what would be deployed)'
         required: false
@@ -219,6 +220,10 @@ jobs:
               echo "📦 Deploying infrastructure components only"
               # The script handles service filtering internally
               ;;
+            "monitoring")
+              echo "📦 Deploying monitoring components only"
+              # The script handles service filtering internally
+              ;;
             *)
               echo "📦 Deploying all services"
               ;;
@@ -368,7 +373,7 @@ jobs:
           
           | Region | Status | Services Deployed |
           |--------|--------|------------------|
-          | US East | ✅ Success | WebSocket, WebTransport, UI Services |
+          | US East | ✅ Success | WebSocket, WebTransport, UI Services, Monitoring |
           | Singapore | ✅ Success | WebSocket, WebTransport |
           
           ## 🔗 Access Points
@@ -377,6 +382,7 @@ jobs:
           - **WebSocket**: \`wss://websocket-us-east.videocall.rs\`
           - **WebTransport**: \`https://webtransport-us-east.videocall.rs\`
           - **UI**: \`https://ui-us-east.videocall.rs\`
+          - **Grafana**: \`https://grafana.videocall.rs\`
           
           ### Singapore Region  
           - **WebSocket**: \`wss://websocket-singapore.videocall.rs\`

@@ -1,0 +1,112 @@
+# Prometheus values for videocall monitoring (minimal resources)
+prometheus:
+  # Prometheus server configuration
+  server:
+    # Minimal resources
+    resources:
+      limits:
+        cpu: 200m
+        memory: 512Mi
+      requests:
+        cpu: 100m
+        memory: 256Mi
+    
+    # Single replica
+    replicaCount: 1
+    
+    # Persistence (minimal)
+    persistentVolume:
+      enabled: true
+      size: 2Gi
+      storageClass: "do-block-storage"
+    
+    # Retention
+    retention: "7d"
+    
+    # Service configuration
+    service:
+      type: ClusterIP
+      servicePort: 80
+    
+    # Security context
+    securityContext:
+      runAsUser: 65534
+      runAsGroup: 65534
+      fsGroup: 65534
+    
+    # Global scrape configuration
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+    
+  # Alertmanager (disabled for minimal setup)
+  alertmanager:
+    enabled: false
+  
+  # Node exporter (disabled for minimal setup)
+  nodeExporter:
+    enabled: false
+  
+  # Pushgateway (disabled for minimal setup)
+  pushgateway:
+    enabled: false
+  
+  # Kube-state-metrics (minimal)
+  kubeStateMetrics:
+    enabled: true
+    resources:
+      limits:
+        cpu: 50m
+        memory: 64Mi
+      requests:
+        cpu: 25m
+        memory: 32Mi
+  
+  # Server configuration files
+  serverFiles:
+    prometheus.yml:
+      global:
+        scrape_interval: 30s
+        evaluation_interval: 30s
+      
+      scrape_configs:
+        - job_name: 'prometheus'
+          static_configs:
+            - targets: ['localhost:9090']
+        
+        - job_name: 'videocall-metrics-api'
+          static_configs:
+            - targets: ['metrics-api:9091']
+          metrics_path: '/metrics'
+          scrape_interval: 30s
+        
+        # Kubernetes API server
+        - job_name: 'kubernetes-apiservers'
+          kubernetes_sd_configs:
+            - role: endpoints
+          scheme: https
+          tls_config:
+            ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+          relabel_configs:
+            - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+              action: keep
+              regex: default;kubernetes;https
+        
+        # Kubernetes nodes
+        - job_name: 'kubernetes-nodes'
+          kubernetes_sd_configs:
+            - role: node
+          scheme: https
+          tls_config:
+            ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+          relabel_configs:
+            - action: labelmap
+              regex: __meta_kubernetes_node_label_(.+)
+            - target_label: __address__
+              replacement: kubernetes.default.svc:443
+            - source_labels: [__meta_kubernetes_node_name]
+              regex: (.+)
+              target_label: __metrics_path__
+              replacement: /api/v1/nodes/${1}/proxy/metrics

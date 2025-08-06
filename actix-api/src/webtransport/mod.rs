@@ -30,7 +30,7 @@ use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
-use tracing::{debug, error, info, trace_span};
+use tracing::{debug, error, info, trace, trace_span};
 use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -308,7 +308,7 @@ async fn handle_session(
                         Ok(buf) => {
                             // Check if this is an RTT packet that should be echoed back
                             if is_rtt_packet(&buf) {
-                                debug!("Echoing RTT packet back via WebTransport");
+                                trace!("Echoing RTT packet back via WebTransport");
                                 match session_clone.open_uni().await {
                                     Ok(mut echo_stream) => {
                                         if let Err(e) = echo_stream.write_all(&buf).await {
@@ -468,7 +468,7 @@ async fn handle_quic_connection(
                         } else {
                             // Check if this is an RTT packet that should be echoed back
                             if is_rtt_packet(&d) {
-                                debug!("Echoing RTT packet back via QUIC");
+                                trace!("Echoing RTT packet back via QUIC");
                                 let session_read = session_for_echo.clone();
                                 match session_read.open_uni().await {
                                     Ok(mut echo_stream) => {

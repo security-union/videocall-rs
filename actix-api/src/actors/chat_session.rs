@@ -176,7 +176,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 
                 // Check if this is an RTT packet that should be echoed back
                 if self.is_rtt_packet(&msg_bytes) {
-                    debug!("Echoing RTT packet back to sender: {}", self.email);
+                    trace!("Echoing RTT packet back to sender: {}", self.email);
                     ctx.binary(msg_bytes);
                 } else if health_processor::is_health_packet_bytes(&msg_bytes) {
                     // Process health packet for diagnostics (don't relay to other peers)

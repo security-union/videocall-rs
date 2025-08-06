@@ -163,6 +163,7 @@ impl AttendantsComponent {
 
         let opts = VideoCallClientOptions {
             userid: email.clone(),
+            meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
             enable_e2ee: ctx.props().e2ee_enabled,
@@ -203,6 +204,7 @@ impl AttendantsComponent {
             rtt_testing_period_ms: *SERVER_ELECTION_PERIOD_MS,
             rtt_probe_interval_ms: Some(200),
         };
+
         VideoCallClient::new(opts)
     }
 
@@ -341,30 +343,58 @@ impl Component for AttendantsComponent {
                         for m in &evt.metrics {
                             if m.name == "stats_json" {
                                 if let MetricValue::Text(json) = &m.value {
-                                    let peer_id = evt
+                                    // Parse the new format: "reporting_peer->target_peer"
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
                                     link.send_message(Msg::NetEqStatsUpdated(
-                                        peer_id,
+                                        format!("{}->{}", reporting_peer, target_peer),
                                         json.clone(),
                                     ));
                                 }
-                            } else if m.name == "current_buffer_size_ms" {
+                            } else if m.name == "audio_buffer_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    let peer_id = evt
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    link.send_message(Msg::NetEqBufferUpdated(peer_id, *v));
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
+                                    link.send_message(Msg::NetEqBufferUpdated(
+                                        format!("{}->{}", reporting_peer, target_peer),
+                                        *v,
+                                    ));
                                 }
                             } else if m.name == "jitter_buffer_delay_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    let peer_id = evt
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    link.send_message(Msg::NetEqJitterUpdated(peer_id, *v));
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
+                                    link.send_message(Msg::NetEqJitterUpdated(
+                                        format!("{}->{}", reporting_peer, target_peer),
+                                        *v,
+                                    ));
                                 }
                             }
                         }

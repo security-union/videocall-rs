@@ -10,15 +10,9 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  - job_name: 'videocall-websocket-api'
+  - job_name: 'videocall-metrics-api'
     static_configs:
-      - targets: ['websocket-api:8080']
-    metrics_path: '/metrics'
-    scrape_interval: 10s
-
-  - job_name: 'videocall-webtransport-api'
-    static_configs:
-      - targets: ['webtransport-api:5321']  # Health endpoint
+      - targets: ['metrics-api:9091']
     metrics_path: '/metrics'
     scrape_interval: 10s
 

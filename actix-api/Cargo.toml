@@ -23,6 +23,10 @@ path = "src/bin/webtransport_server.rs"
 name = "websocket_server"
 path = "src/bin/websocket_server.rs"
 
+[[bin]]
+name = "metrics_server"
+path = "src/bin/metrics_server.rs"
+
 [dependencies]
 actix = "0.13.0"
 actix-cors = "0.6.1"

@@ -84,6 +84,9 @@ services:
       - RUST_LOG=debug,async_nats=info
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222
+      - REGION=${REGION:-us-east}
+      - SERVER_ID=${SERVER_ID:-server-1}
+      - SERVICE_TYPE=websocket
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
@@ -104,6 +107,36 @@ services:
       - postgres
       - nats
 
+  metrics-api:
+    build:
+      dockerfile: ../docker/Dockerfile.actix
+      context: ../docker
+    working_dir: /app/actix-api
+    command: bash -c "cargo watch -x \"run -r --bin metrics_server --features diagnostics\""
+    environment:
+      - METRICS_PORT=9091
+      - NATS_URL=nats:4222
+      - REGION=${REGION:-us-east}
+      - SERVER_ID=${SERVER_ID:-server-1}
+      - SERVICE_TYPE=metrics
+      - RUST_LOG=info,async_nats=info
+      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+    ports:
+      - "9091:9091"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-actix-web-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-actix-web-cargo-target-cache:/usr/local/cargo/target
+      - rustlemania-actix-web-target-cache:/app/actix-api/target
+    depends_on:
+      - nats
+
   webtransport-api:
     build:
       dockerfile: ../docker/Dockerfile.actix
@@ -113,6 +146,9 @@ services:
     environment:
       - RUST_LOG=info
       - NATS_URL=nats:4222
+      - REGION=${REGION:-us-east}
+      - SERVER_ID=${SERVER_ID:-server-1}
+      - SERVICE_TYPE=webtransport
       - LISTEN_URL=0.0.0.0:4433
       - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
@@ -165,7 +201,7 @@ services:
       - ./monitoring/prometheus:/etc/prometheus
       - prometheus_data:/prometheus
     depends_on:
-      - websocket-api
+      - metrics-api
 
   grafana:
     image: grafana/grafana:latest

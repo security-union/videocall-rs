@@ -72,6 +72,9 @@ pub struct VideoCallClientOptions {
     /// remote peers' clients.
     pub userid: String,
 
+    /// The meeting ID that this client is joining
+    pub meeting_id: String,
+
     /// The urls to which WebSocket connections should be made (comma-separated)
     pub websocket_urls: Vec<String>,
 
@@ -218,6 +221,9 @@ impl VideoCallClient {
             );
 
             let mut reporter = HealthReporter::new(session_id, options.userid.clone());
+
+            // Set the meeting ID
+            reporter.set_meeting_id(options.meeting_id.clone());
 
             // Set health reporting interval if provided
             if let Some(interval) = options.health_reporting_interval_ms {

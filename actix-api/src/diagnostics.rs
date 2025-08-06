@@ -22,11 +22,7 @@
 #[cfg(feature = "diagnostics")]
 pub mod health_processor {
     use actix_web::{HttpResponse, Responder};
-    use lazy_static::lazy_static;
-    use prometheus::{
-        register_counter, register_gauge_vec, register_histogram, Counter, Encoder, GaugeVec,
-        Histogram, TextEncoder,
-    };
+    use prometheus::{Encoder, TextEncoder};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use tracing::{debug, warn};
@@ -35,6 +31,7 @@ pub mod health_processor {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct PeerHealthData {
         pub session_id: String,
+        pub meeting_id: String, // Add meeting_id field
         pub reporting_peer: String,
         pub timestamp_ms: u64,
         pub peer_stats: HashMap<String, PeerStats>,
@@ -48,85 +45,54 @@ pub mod health_processor {
         pub video_stats: Option<serde_json::Value>,
     }
 
-    // Prometheus metrics
-    lazy_static! {
-        static ref HEALTH_REPORTS_TOTAL: Counter = register_counter!(
-            "videocall_health_reports_total",
-            "Total number of health reports received"
-        )
-        .unwrap();
-        static ref PEER_CAN_LISTEN: GaugeVec = register_gauge_vec!(
-            "videocall_peer_can_listen",
-            "Indicates if a peer can receive audio from another peer (1=yes, 0=no)",
-            &["session_id", "from_peer", "to_peer"]
-        )
-        .unwrap();
-        static ref PEER_CAN_SEE: GaugeVec = register_gauge_vec!(
-            "videocall_peer_can_see",
-            "Indicates if a peer can receive video from another peer (1=yes, 0=no)",
-            &["session_id", "from_peer", "to_peer"]
-        )
-        .unwrap();
-        static ref SESSION_QUALITY: Histogram = register_histogram!(
-            "videocall_session_quality_score",
-            "Overall session quality scores (0.0-1.0)",
-            vec![0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
-        )
-        .unwrap();
-    }
+    // Import shared Prometheus metrics
+    use crate::metrics::{
+        ACTIVE_SESSIONS_TOTAL, HEALTH_REPORTS_TOTAL, MEETING_PARTICIPANTS, NETEQ_AUDIO_BUFFER_MS,
+        NETEQ_PACKETS_AWAITING_DECODE, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL,
+        SESSION_QUALITY,
+    };
 
     /// Process a health packet and update Prometheus metrics
     pub fn process_health_packet(health_data: &PeerHealthData) {
-        HEALTH_REPORTS_TOTAL.inc();
-
         debug!(
-            "Processing health report from {} in session {}",
-            health_data.reporting_peer, health_data.session_id
+            "Publishing health report from {} in session {} for meeting {} to NATS",
+            health_data.reporting_peer, health_data.session_id, health_data.meeting_id
         );
 
-        let mut quality_scores = Vec::new();
+        // Publish to NATS instead of processing locally
+        publish_health_to_nats(health_data.clone());
+    }
 
-        for (remote_peer, stats) in &health_data.peer_stats {
-            let from_peer = &health_data.reporting_peer;
-            let to_peer = remote_peer;
-            let session_id = &health_data.session_id;
-
-            // Set can_listen gauge
-            PEER_CAN_LISTEN
-                .with_label_values(&[session_id, from_peer, to_peer])
-                .set(if stats.can_listen { 1.0 } else { 0.0 });
-
-            // Set can_see gauge
-            PEER_CAN_SEE
-                .with_label_values(&[session_id, from_peer, to_peer])
-                .set(if stats.can_see { 1.0 } else { 0.0 });
-
-            if !stats.can_listen {
-                debug!(
-                    "Audio reception failure: {} cannot hear {}",
-                    from_peer, to_peer
-                );
+    fn publish_health_to_nats(health_data: PeerHealthData) {
+        tokio::spawn(async move {
+            if let Err(e) = publish_health_to_nats_async(health_data).await {
+                warn!("Failed to publish health data to NATS: {}", e);
             }
-            if !stats.can_see {
-                debug!(
-                    "Video reception failure: {} cannot see {}",
-                    from_peer, to_peer
-                );
-            }
+        });
+    }
 
-            // Calculate quality score from NetEQ stats if available
-            if let Some(neteq_stats) = &stats.neteq_stats {
-                if let Some(quality) = extract_audio_quality(neteq_stats) {
-                    quality_scores.push(quality);
-                }
-            }
-        }
+    async fn publish_health_to_nats_async(
+        health_data: PeerHealthData,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
 
-        // Record overall session quality (average of peer qualities)
-        if !quality_scores.is_empty() {
-            let avg_quality: f64 = quality_scores.iter().sum::<f64>() / quality_scores.len() as f64;
-            SESSION_QUALITY.observe(avg_quality);
-        }
+        let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
+        let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| "server-1".to_string());
+        let service_type =
+            std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
+
+        let client = async_nats::connect(&nats_url).await?;
+        let topic = format!(
+            "health.diagnostics.{}.{}.{}",
+            region, service_type, server_id
+        );
+
+        let json_payload = serde_json::to_string(&health_data)?;
+
+        client.publish(topic.clone(), json_payload.into()).await?;
+        debug!("Published health data to NATS topic: {}", topic);
+
+        Ok(())
     }
 
     /// Extract audio quality score from NetEQ stats (0.0 = poor, 1.0 = excellent)

@@ -84,6 +84,7 @@ impl PeerHealthData {
 #[derive(Debug)]
 pub struct HealthReporter {
     session_id: String,
+    meeting_id: String, // Add meeting_id field
     reporting_peer: String,
     peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>>,
     send_packet_callback: Option<Callback<PacketWrapper>>,
@@ -95,11 +96,17 @@ impl HealthReporter {
     pub fn new(session_id: String, reporting_peer: String) -> Self {
         Self {
             session_id,
+            meeting_id: "".to_string(), // Will be set later
             reporting_peer,
             peer_health_data: Rc::new(RefCell::new(HashMap::new())),
             send_packet_callback: None,
             health_interval_ms: 5000, // Send health every 5 seconds
         }
+    }
+
+    /// Set the meeting ID
+    pub fn set_meeting_id(&mut self, meeting_id: String) {
+        self.meeting_id = meeting_id;
     }
 
     /// Set the callback for sending packets
@@ -136,17 +143,25 @@ impl HealthReporter {
         event: DiagEvent,
         peer_health_data: &Rc<RefCell<HashMap<String, PeerHealthData>>>,
     ) {
-        let peer_id = event
+        let stream_id = event
             .stream_id
             .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| "unknown->unknown".to_string());
+
+        // Parse the new format: "reporting_peer->target_peer"
+        let parts: Vec<&str> = stream_id.split("->").collect();
+        let (reporting_peer, target_peer) = if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            ("unknown", "unknown")
+        };
 
         // Handle NetEQ events (audio)
         if event.subsystem == "neteq" {
             if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
                 let peer_data = health_map
-                    .entry(peer_id.clone())
-                    .or_insert_with(|| PeerHealthData::new(peer_id.clone()));
+                    .entry(target_peer.to_string())
+                    .or_insert_with(|| PeerHealthData::new(target_peer.to_string()));
 
                 for metric in &event.metrics {
                     match metric.name {
@@ -155,17 +170,28 @@ impl HealthReporter {
                                 if let Ok(neteq_json) = serde_json::from_str::<Value>(json_str) {
                                     peer_data.update_audio_stats(neteq_json);
                                     peer_data.can_listen = true;
-                                    debug!("Updated NetEQ stats for peer: {}", peer_id);
+                                    debug!(
+                                        "Updated NetEQ stats for peer: {} (from {})",
+                                        target_peer, reporting_peer
+                                    );
                                 }
                             }
                         }
-                        "current_buffer_size_ms" => {
+                        "audio_buffer_ms" => {
                             if let MetricValue::U64(buffer_ms) = &metric.value {
                                 // Update can_listen based on buffer health
                                 peer_data.can_listen = *buffer_ms > 0;
                                 debug!(
-                                    "Updated audio health (buffer: {}ms) for peer: {}",
-                                    buffer_ms, peer_id
+                                    "Updated audio health (buffer: {}ms) for peer: {} (from {})",
+                                    buffer_ms, target_peer, reporting_peer
+                                );
+                            }
+                        }
+                        "packets_awaiting_decode" => {
+                            if let MetricValue::U64(packets) = &metric.value {
+                                debug!(
+                                    "Updated packets awaiting decode: {} for peer: {} (from {})",
+                                    packets, target_peer, reporting_peer
                                 );
                             }
                         }
@@ -178,8 +204,8 @@ impl HealthReporter {
         else if event.subsystem == "decoder" {
             if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
                 let peer_data = health_map
-                    .entry(peer_id.clone())
-                    .or_insert_with(|| PeerHealthData::new(peer_id.clone()));
+                    .entry(target_peer.to_string())
+                    .or_insert_with(|| PeerHealthData::new(target_peer.to_string()));
 
                 for metric in &event.metrics {
                     match metric.name {
@@ -188,8 +214,8 @@ impl HealthReporter {
                                 // Update health based on FPS (consider >0 as active)
                                 peer_data.can_see = *fps > 0.0;
                                 debug!(
-                                    "Updated video health (FPS: {:.2}) for peer: {}",
-                                    fps, peer_id
+                                    "Updated video health (FPS: {:.2}) for peer: {} (from {})",
+                                    fps, target_peer, reporting_peer
                                 );
                             }
                         }
@@ -204,8 +230,8 @@ impl HealthReporter {
                                     peer_data.can_see = true;
                                 }
                                 debug!(
-                                    "Updated media health ({}) for peer: {}",
-                                    media_type, peer_id
+                                    "Updated media health ({}) for peer: {} (from {})",
+                                    media_type, target_peer, reporting_peer
                                 );
                             }
                         }
@@ -218,7 +244,7 @@ impl HealthReporter {
         else if event.subsystem == "sender" {
             debug!(
                 "Received sender event for peer: {} at {}",
-                peer_id, event.ts_ms
+                target_peer, event.ts_ms
             );
             // Sender events are mainly for server reporting, less impact on health status
         }
@@ -226,8 +252,8 @@ impl HealthReporter {
         else if event.subsystem == "video_decoder" || event.subsystem == "video" {
             if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
                 let peer_data = health_map
-                    .entry(peer_id.clone())
-                    .or_insert_with(|| PeerHealthData::new(peer_id.clone()));
+                    .entry(target_peer.to_string())
+                    .or_insert_with(|| PeerHealthData::new(target_peer.to_string()));
 
                 // Extract video stats from metrics
                 let mut video_stats = json!({
@@ -257,7 +283,7 @@ impl HealthReporter {
                 }
 
                 peer_data.update_video_stats(video_stats);
-                debug!("Updated video health for peer: {}", peer_id);
+                debug!("Updated video health for peer: {}", target_peer);
             }
         }
     }
@@ -271,6 +297,7 @@ impl HealthReporter {
 
         let peer_health_data = Rc::downgrade(&self.peer_health_data);
         let session_id = self.session_id.clone();
+        let meeting_id = self.meeting_id.clone();
         let reporting_peer = self.reporting_peer.clone();
         let send_callback = self.send_packet_callback.clone().unwrap();
         let interval_ms = self.health_interval_ms;
@@ -284,8 +311,12 @@ impl HealthReporter {
 
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
                     if let Ok(health_map) = peer_health_data.try_borrow() {
-                        let health_packet =
-                            Self::create_health_packet(&session_id, &reporting_peer, &health_map);
+                        let health_packet = Self::create_health_packet(
+                            &session_id,
+                            &meeting_id,
+                            &reporting_peer,
+                            &health_map,
+                        );
 
                         if let Some(packet) = health_packet {
                             send_callback.emit(packet);
@@ -303,6 +334,7 @@ impl HealthReporter {
     /// Create a health packet from current peer health data
     fn create_health_packet(
         session_id: &str,
+        meeting_id: &str,
         reporting_peer: &str,
         health_map: &HashMap<String, PeerHealthData>,
     ) -> Option<PacketWrapper> {
@@ -325,6 +357,7 @@ impl HealthReporter {
 
         let health_data = json!({
             "session_id": session_id,
+            "meeting_id": meeting_id,
             "reporting_peer": reporting_peer,
             "timestamp_ms": SystemTime::now()
                 .duration_since(UNIX_EPOCH)

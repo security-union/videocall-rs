@@ -20,7 +20,7 @@ spec:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.metricsApi.image.repository }}:{{ .Values.metricsApi.image.tag }}"
           imagePullPolicy: {{ .Values.metricsApi.image.pullPolicy }}
-          command: ["/app/actix-api/target/release/metrics_server"]
+          command: ["/usr/bin/metrics_server"]
           workingDir: /app/actix-api
           ports:
             - name: http

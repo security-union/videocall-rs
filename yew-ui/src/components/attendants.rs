@@ -356,7 +356,7 @@ impl Component for AttendantsComponent {
                                     };
 
                                     link.send_message(Msg::NetEqStatsUpdated(
-                                        format!("{}->{}", reporting_peer, target_peer),
+                                        format!("{reporting_peer}->{target_peer}"),
                                         json.clone(),
                                     ));
                                 }
@@ -374,7 +374,7 @@ impl Component for AttendantsComponent {
                                     };
 
                                     link.send_message(Msg::NetEqBufferUpdated(
-                                        format!("{}->{}", reporting_peer, target_peer),
+                                        format!("{reporting_peer}->{target_peer}"),
                                         *v,
                                     ));
                                 }
@@ -392,7 +392,7 @@ impl Component for AttendantsComponent {
                                     };
 
                                     link.send_message(Msg::NetEqJitterUpdated(
-                                        format!("{}->{}", reporting_peer, target_peer),
+                                        format!("{reporting_peer}->{target_peer}"),
                                         *v,
                                     ));
                                 }
@@ -420,13 +420,13 @@ impl Component for AttendantsComponent {
                                 "bitrate_kbps" => {
                                     if let MetricValue::F64(bitrate) = &metric.value {
                                         decoder_stats
-                                            .push_str(&format!("Bitrate: {:.1} kbps\n", bitrate));
+                                            .push_str(&format!("Bitrate: {bitrate:.1} kbps\n"));
                                     }
                                 }
                                 "media_type" => {
                                     if let MetricValue::Text(media_type) = &metric.value {
                                         decoder_stats
-                                            .push_str(&format!("Media Type: {}\n", media_type));
+                                            .push_str(&format!("Media Type: {media_type}\n"));
                                     }
                                 }
                                 _ => {}
@@ -456,18 +456,18 @@ impl Component for AttendantsComponent {
                             match metric.name {
                                 "sender_id" => {
                                     if let MetricValue::Text(sender_id) = &metric.value {
-                                        sender_stats.push_str(&format!("Sender: {}\n", sender_id));
+                                        sender_stats.push_str(&format!("Sender: {sender_id}\n"));
                                     }
                                 }
                                 "target_id" => {
                                     if let MetricValue::Text(target_id) = &metric.value {
-                                        sender_stats.push_str(&format!("Target: {}\n", target_id));
+                                        sender_stats.push_str(&format!("Target: {target_id}\n"));
                                     }
                                 }
                                 "media_type" => {
                                     if let MetricValue::Text(media_type) = &metric.value {
                                         sender_stats
-                                            .push_str(&format!("Media Type: {}\n", media_type));
+                                            .push_str(&format!("Media Type: {media_type}\n"));
                                     }
                                 }
                                 _ => {}

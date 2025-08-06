@@ -414,7 +414,7 @@ impl Component for AttendantsComponent {
                             match metric.name {
                                 "fps" => {
                                     if let MetricValue::F64(fps) = &metric.value {
-                                        decoder_stats.push_str(&format!("FPS: {:.2}\n", fps));
+                                        decoder_stats.push_str(&format!("FPS: {fps:.2}\n"));
                                     }
                                 }
                                 "bitrate_kbps" => {

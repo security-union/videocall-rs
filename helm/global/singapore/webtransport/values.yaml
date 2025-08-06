@@ -5,13 +5,13 @@ rustlemania-webtransport:
 
   replicaCount: 1
 
+  command: ['webtransport_server']
+  tlsSecret: webtransport-singapore-tls
+  
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
     tag: add-diagnostics-96d1ea6a
-
-  command: ['webtransport_server']
-  tlsSecret: webtransport-singapore-tls
 
   env:
     - name: RUST_LOG

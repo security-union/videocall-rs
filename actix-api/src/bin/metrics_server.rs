@@ -296,7 +296,10 @@ async fn nats_health_consumer(
     health_store: HealthDataStore,
 ) -> anyhow::Result<()> {
     // Subscribe to all health diagnostics topics from all regions
-    let mut subscription = nats_client.subscribe("health.diagnostics.>").await?;
+    let queue_group = "metrics-server-health-diagnostics";
+    let mut subscription = nats_client
+        .queue_subscribe("health.diagnostics.>", queue_group.to_string())
+        .await?;
 
     info!("Subscribed to NATS topic: health.diagnostics.>");
 

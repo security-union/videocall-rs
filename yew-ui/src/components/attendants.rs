@@ -167,8 +167,8 @@ impl AttendantsComponent {
             id,
             ctx.props().webtransport_enabled
         );
-        log::info!("YEW-UI: WebSocket URLs: {:?}", websocket_urls);
-        log::info!("YEW-UI: WebTransport URLs: {:?}", webtransport_urls);
+        log::info!("YEW-UI: WebSocket URLs: {websocket_urls:?}");
+        log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
 
         let opts = VideoCallClientOptions {
             userid: email.clone(),
@@ -182,8 +182,7 @@ impl AttendantsComponent {
                 let webtransport_enabled = ctx.props().webtransport_enabled;
                 Callback::from(move |_| {
                     log::info!(
-                        "YEW-UI: Connection established (webtransport_enabled={})",
-                        webtransport_enabled
+                        "YEW-UI: Connection established (webtransport_enabled={webtransport_enabled})",
                     );
                     link.send_message(Msg::from(WsAction::Connected))
                 })

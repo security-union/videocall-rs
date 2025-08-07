@@ -24,7 +24,6 @@ use protobuf::Message;
 use quinn::crypto::rustls::HandshakeData;
 use quinn::VarInt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use serde::de;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;

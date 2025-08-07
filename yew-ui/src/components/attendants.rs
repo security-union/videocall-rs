@@ -425,11 +425,6 @@ impl Component for AttendantsComponent {
                             serde_json::to_string(&serializable_evt).unwrap_or_default(),
                         ));
                     } else if evt.subsystem == "decoder" {
-                        // Process decoder diagnostics events (FPS, bitrate, etc.)
-                        log::info!(
-                            "YEW-UI: Received decoder diagnostic event for peer {:?} at timestamp {}",
-                            evt.stream_id, evt.ts_ms
-                        );
                         let mut decoder_stats = String::new();
                         for metric in &evt.metrics {
                             match metric.name {
@@ -467,11 +462,6 @@ impl Component for AttendantsComponent {
                             )));
                         }
                     } else if evt.subsystem == "sender" {
-                        // Process sender diagnostics events
-                        log::info!(
-                            "YEW-UI: Received sender diagnostic event for peer {:?} at timestamp {}",
-                            evt.stream_id, evt.ts_ms
-                        );
                         let mut sender_stats = String::new();
                         for metric in &evt.metrics {
                             match metric.name {

@@ -11,7 +11,7 @@ rustlemania-webtransport:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: add-diagnostics-572e337e
+    tag: add-diagnostics-2e94b645
 
   env:
     - name: RUST_LOG

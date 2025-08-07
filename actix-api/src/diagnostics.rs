@@ -24,8 +24,7 @@ pub mod health_processor {
     use actix_web::{HttpResponse, Responder};
     use prometheus::{Encoder, TextEncoder};
     use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, time::Duration};
-    use tokio::time::sleep;
+    use std::collections::HashMap;
     use tracing::{debug, warn};
 
     // Health data structure matching RFC design
@@ -54,19 +53,19 @@ pub mod health_processor {
     };
 
     /// Process a health packet and update Prometheus metrics
-    pub fn process_health_packet(health_data: &PeerHealthData) {
+    pub fn process_health_packet(health_data: &PeerHealthData, client: async_nats::client::Client) {
         debug!(
             "Publishing health report from {} in session {} for meeting {} to NATS",
             health_data.reporting_peer, health_data.session_id, health_data.meeting_id
         );
 
         // Publish to NATS instead of processing locally
-        publish_health_to_nats(health_data.clone());
+        publish_health_to_nats(health_data.clone(), client);
     }
 
-    fn publish_health_to_nats(health_data: PeerHealthData) {
+    fn publish_health_to_nats(health_data: PeerHealthData, client: async_nats::client::Client) {
         tokio::spawn(async move {
-            if let Err(e) = publish_health_to_nats_async(health_data).await {
+            if let Err(e) = publish_health_to_nats_async(health_data, client).await {
                 warn!("Failed to publish health data to NATS: {}", e);
             }
         });
@@ -74,15 +73,13 @@ pub mod health_processor {
 
     async fn publish_health_to_nats_async(
         health_data: PeerHealthData,
+        client: async_nats::client::Client,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
-
         let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
         let server_id = std::env::var("SERVER_ID").unwrap_or_else(|_| "server-1".to_string());
         let service_type =
             std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
 
-        let client = async_nats::connect(&nats_url).await?;
         let topic = format!(
             "health.diagnostics.{}.{}.{}",
             region, service_type, server_id
@@ -92,7 +89,6 @@ pub mod health_processor {
 
         client.publish(topic.clone(), json_payload.into()).await?;
         debug!("Published health data to NATS topic: {}", topic);
-        sleep(Duration::from_secs(1)).await;
         Ok(())
     }
 
@@ -146,7 +142,7 @@ pub mod health_processor {
     }
 
     /// Process health packet for diagnostics collection from binary data
-    pub fn process_health_packet_bytes(data: &[u8]) {
+    pub fn process_health_packet_bytes(data: &[u8], nc: async_nats::client::Client) {
         use protobuf::Message;
         use tracing::{debug, error};
         use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -157,7 +153,7 @@ pub mod health_processor {
 
                 match parse_health_packet(&packet_wrapper.data) {
                     Ok(health_data) => {
-                        process_health_packet(&health_data);
+                        process_health_packet(&health_data, nc.clone());
                         debug!(
                             "Successfully processed health data for session {}",
                             health_data.session_id
@@ -191,7 +187,7 @@ pub mod health_processor {
     }
 
     /// No-op when diagnostics feature is disabled
-    pub fn process_health_packet(_data: &PeerHealthData) {
+    pub fn process_health_packet(_data: &PeerHealthData, _nc: async_nats::client::Client) {
         // No-op when diagnostics disabled
     }
 
@@ -208,7 +204,7 @@ pub mod health_processor {
     }
 
     /// Process health packet for diagnostics collection from binary data (stub)
-    pub fn process_health_packet_bytes(_data: &[u8]) {
+    pub fn process_health_packet_bytes(_data: &[u8], _nc: async_nats::client::Client) {
         // No-op when diagnostics disabled
     }
 }

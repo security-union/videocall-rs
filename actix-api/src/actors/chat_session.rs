@@ -51,10 +51,16 @@ pub struct WsChatSession {
     pub addr: Addr<ChatServer>,
     pub heartbeat: Instant,
     pub email: Email,
+    pub nats_client: async_nats::client::Client,
 }
 
 impl WsChatSession {
-    pub fn new(addr: Addr<ChatServer>, room: String, email: String) -> Self {
+    pub fn new(
+        addr: Addr<ChatServer>,
+        room: String,
+        email: String,
+        nats_client: async_nats::client::Client,
+    ) -> Self {
         info!("new session with room {} and email {}", room, email);
 
         WsChatSession {
@@ -63,6 +69,7 @@ impl WsChatSession {
             room,
             email,
             addr,
+            nats_client,
         }
     }
 
@@ -180,7 +187,10 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                     ctx.binary(msg_bytes);
                 } else if health_processor::is_health_packet_bytes(&msg_bytes) {
                     // Process health packet for diagnostics (don't relay to other peers)
-                    health_processor::process_health_packet_bytes(&msg_bytes);
+                    health_processor::process_health_packet_bytes(
+                        &msg_bytes,
+                        self.nats_client.clone(),
+                    );
                 } else {
                     // Normal packet processing - forward to chat server
                     ctx.notify(Packet {

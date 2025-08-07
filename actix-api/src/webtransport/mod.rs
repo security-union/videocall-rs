@@ -303,7 +303,7 @@ async fn handle_session(
                 let specific_subject = specific_subject.clone();
                 let session_clone = session.clone();
                 tokio::spawn(async move {
-                    let result = uni_stream.read_to_end(1_000_000).await;
+                    let result = uni_stream.read_to_end(usize::MAX).await;
                     match result {
                         Ok(buf) => {
                             // Check if this is an RTT packet that should be echoed back
@@ -355,7 +355,7 @@ async fn handle_session(
                     }
                 } else if health_processor::is_health_packet_bytes(&buf) {
                     // Process health packet for diagnostics (don't relay)
-                    health_processor::process_health_packet_bytes(&buf);
+                    health_processor::process_health_packet_bytes(&buf, nc.clone());
                 } else {
                     // Normal datagram processing - publish to NATS
                     let nc = nc.clone();
@@ -482,7 +482,7 @@ async fn handle_quic_connection(
                                 }
                             } else if health_processor::is_health_packet_bytes(&d) {
                                 // Process health packet for diagnostics (don't relay)
-                                health_processor::process_health_packet_bytes(&d);
+                                health_processor::process_health_packet_bytes(&d, nc.clone());
                             } else {
                                 // Normal packet processing - publish to NATS
                                 let specific_subject =

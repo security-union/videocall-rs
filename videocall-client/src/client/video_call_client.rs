@@ -447,20 +447,14 @@ impl VideoCallClient {
             Ok(inner) => {
                 if let Some(connection_controller) = &inner.connection_controller {
                     if let Err(e) = connection_controller.send_packet(media) {
-                        error!("Failed to send {:?} packet: {e}", packet_type);
+                        error!("Failed to send {packet_type:?} packet: {e}");
                     }
                 } else {
-                    error!(
-                        "No connection manager available for {:?} packet",
-                        packet_type
-                    );
+                    error!("No connection manager available for {packet_type:?} packet");
                 }
             }
             Err(_) => {
-                error!(
-                    "Unable to borrow inner -- dropping {:?} packet {media:?}",
-                    packet_type
-                )
+                error!("Unable to borrow inner -- dropping {packet_type:?} packet {media:?}")
             }
         }
     }

@@ -45,13 +45,6 @@ pub mod health_processor {
         pub video_stats: Option<serde_json::Value>,
     }
 
-    // Import shared Prometheus metrics
-    use crate::metrics::{
-        ACTIVE_SESSIONS_TOTAL, HEALTH_REPORTS_TOTAL, MEETING_PARTICIPANTS, NETEQ_AUDIO_BUFFER_MS,
-        NETEQ_PACKETS_AWAITING_DECODE, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL,
-        SESSION_QUALITY,
-    };
-
     /// Process a health packet and update Prometheus metrics
     pub fn process_health_packet(health_data: &PeerHealthData, client: async_nats::client::Client) {
         debug!(
@@ -90,14 +83,6 @@ pub mod health_processor {
         client.publish(topic.clone(), json_payload.into()).await?;
         debug!("Published health data to NATS topic: {}", topic);
         Ok(())
-    }
-
-    /// Extract audio quality score from NetEQ stats (0.0 = poor, 1.0 = excellent)
-    fn extract_audio_quality(neteq_stats: &serde_json::Value) -> Option<f64> {
-        let expand_rate = neteq_stats.get("expand_rate")?.as_f64().unwrap_or(0.0);
-        let accel_rate = neteq_stats.get("accel_rate")?.as_f64().unwrap_or(0.0);
-        let quality = 1.0 - ((expand_rate + accel_rate) / 1000.0).min(1.0);
-        Some(quality.max(0.0))
     }
 
     /// Parse health packet from JSON bytes

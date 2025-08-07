@@ -2,9 +2,9 @@ use actix_web::{web, App, HttpResponse, HttpServer, Result};
 use async_nats::{Client, Message};
 use futures::StreamExt;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
 use tracing::{debug, error, info};
 
@@ -22,6 +22,10 @@ struct SessionInfo {
     meeting_id: String,
     reporting_peer: String,
     last_seen: Instant,
+    // Peers we have published metrics for in this session (as to_peer)
+    to_peers: HashSet<String>,
+    // Peer IDs we have published peer connection metrics for
+    peer_ids: HashSet<String>,
 }
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
@@ -47,14 +51,7 @@ async fn metrics_handler(
     // Clean up stale sessions before processing metrics
     cleanup_stale_sessions(&session_tracker);
 
-    // Process all stored health data and update Prometheus metrics
-    for (server_key, health_packet) in health_data.iter() {
-        debug!("Processing health data from {}", server_key);
-
-        if let Err(e) = process_health_packet_to_metrics(health_packet, &session_tracker) {
-            error!("Failed to process health packet from {}: {}", server_key, e);
-        }
-    }
+    // Do not mutate metrics here. Metrics are updated only on fresh NATS messages.
 
     // Encode metrics for Prometheus
     let encoder = TextEncoder::new();
@@ -124,20 +121,42 @@ fn cleanup_stale_sessions(_session_tracker: &SessionTracker) {
 #[cfg(feature = "diagnostics")]
 /// Remove all Prometheus metrics for a given session
 fn remove_session_metrics(session_info: &SessionInfo) {
-    // Note: Prometheus doesn't have a direct "remove" method for gauges
-    // Instead, we set them to 0 to indicate they're inactive
-    ACTIVE_SESSIONS_TOTAL
-        .with_label_values(&[&session_info.meeting_id, &session_info.session_id])
-        .set(0.0);
+    // Remove series for this session using precise label combinations
+    let _ = ACTIVE_SESSIONS_TOTAL
+        .remove_label_values(&[&session_info.meeting_id, &session_info.session_id]);
 
-    // Remove peer-specific metrics for this session
-    // We need to iterate through all possible peer combinations
-    // This is a limitation of Prometheus - we can't easily remove specific label combinations
-    // For now, we'll set them to 0 and rely on the cleanup to prevent accumulation
+    // Remove all peer connection series we set
+    for peer_id in &session_info.peer_ids {
+        let _ = PEER_CONNECTIONS_TOTAL.remove_label_values(&[&session_info.meeting_id, peer_id]);
+    }
 
+    // Remove all to_peer series we set for this session
+    for to_peer in &session_info.to_peers {
+        let labels = [
+            &session_info.meeting_id,
+            &session_info.session_id,
+            &session_info.reporting_peer,
+            to_peer.as_str(),
+        ];
+        let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
+        let _ = PEER_CAN_SEE.remove_label_values(&labels);
+        let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
+        let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
+        let _ = NETEQ_NORMAL_OPS_PER_SEC.remove_label_values(&labels);
+        let _ = NETEQ_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
+        let _ = NETEQ_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
+        let _ = NETEQ_FAST_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
+        let _ = NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
+        let _ = NETEQ_MERGE_OPS_PER_SEC.remove_label_values(&labels);
+        let _ = NETEQ_COMFORT_NOISE_OPS_PER_SEC.remove_label_values(&labels);
+        let _ = NETEQ_DTMF_OPS_PER_SEC.remove_label_values(&labels);
+        let _ = NETEQ_UNDEFINED_OPS_PER_SEC.remove_label_values(&labels);
+    }
+
+    // Meeting participants is recomputed on next scrape; no need to force remove
     debug!(
-        "Set session {} metrics to 0 (inactive)",
-        session_info.session_id
+        "Removed all series for session {} (meeting: {}, peer: {})",
+        session_info.session_id, session_info.meeting_id, session_info.reporting_peer
     );
 }
 
@@ -179,209 +198,260 @@ fn process_health_packet_to_metrics(
                 meeting_id: meeting_id.to_string(),
                 reporting_peer: reporting_peer.to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             },
         );
     }
 
-    // Set active session metric
-    ACTIVE_SESSIONS_TOTAL
-        .with_label_values(&[meeting_id, session_id])
-        .set(1.0);
+    // Check if this session is active (not cleaned up)
+    let is_session_active = {
+        let tracker = session_tracker.lock().unwrap();
+        let session_key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+        tracker.contains_key(&session_key)
+    };
 
-    // Process peer health data
-    if let Some(peers) = health_packet.get("peer_stats").and_then(|v| v.as_object()) {
-        let mut participants_count = 0;
+    // Only publish metrics for active sessions
+    if is_session_active {
+        // Set active session metric
+        ACTIVE_SESSIONS_TOTAL
+            .with_label_values(&[meeting_id, session_id])
+            .set(1.0);
 
-        for (peer_id, peer_data) in peers {
-            participants_count += 1;
+        // Process peer health data
+        if let Some(peers) = health_packet.get("peer_stats").and_then(|v| v.as_object()) {
+            let mut participants_count = 0;
 
-            // Set peer connection metric
-            PEER_CONNECTIONS_TOTAL
-                .with_label_values(&[meeting_id, peer_id])
-                .set(1.0);
+            for (peer_id, peer_data) in peers {
+                participants_count += 1;
 
-            if let Some(peer_obj) = peer_data.as_object() {
-                // Process can_listen
-                if let Some(can_listen) = peer_obj.get("can_listen").and_then(|v| v.as_bool()) {
-                    PEER_CAN_LISTEN
-                        .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
-                        .set(if can_listen { 1.0 } else { 0.0 });
+                // Set peer connection metric
+                PEER_CONNECTIONS_TOTAL
+                    .with_label_values(&[meeting_id, peer_id])
+                    .set(1.0);
+                // Track peer_id used for connections
+                {
+                    let mut tracker = session_tracker.lock().unwrap();
+                    let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                    if let Some(info) = tracker.get_mut(&key) {
+                        info.peer_ids.insert(peer_id.clone());
+                    }
                 }
 
-                // Process can_see
-                if let Some(can_see) = peer_obj.get("can_see").and_then(|v| v.as_bool()) {
-                    PEER_CAN_SEE
-                        .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
-                        .set(if can_see { 1.0 } else { 0.0 });
-                }
-
-                // Process NetEQ metrics from neteq_stats object
-                if let Some(neteq_stats) = peer_obj.get("neteq_stats") {
-                    if let Some(audio_buffer_ms) = neteq_stats
-                        .get("current_buffer_size_ms")
-                        .and_then(|v| v.as_f64())
-                    {
-                        NETEQ_AUDIO_BUFFER_MS
+                if let Some(peer_obj) = peer_data.as_object() {
+                    // Process can_listen
+                    if let Some(can_listen) = peer_obj.get("can_listen").and_then(|v| v.as_bool()) {
+                        PEER_CAN_LISTEN
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
-                            .set(audio_buffer_ms);
+                            .set(if can_listen { 1.0 } else { 0.0 });
+                        // Track to_peer used
+                        let mut tracker = session_tracker.lock().unwrap();
+                        let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                        if let Some(info) = tracker.get_mut(&key) {
+                            info.to_peers.insert(peer_id.clone());
+                        }
                     }
 
-                    if let Some(packets_awaiting) = neteq_stats
-                        .get("packets_awaiting_decode")
-                        .and_then(|v| v.as_f64())
-                    {
-                        NETEQ_PACKETS_AWAITING_DECODE
+                    // Process can_see
+                    if let Some(can_see) = peer_obj.get("can_see").and_then(|v| v.as_bool()) {
+                        PEER_CAN_SEE
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
-                            .set(packets_awaiting);
+                            .set(if can_see { 1.0 } else { 0.0 });
+                        let mut tracker = session_tracker.lock().unwrap();
+                        let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                        if let Some(info) = tracker.get_mut(&key) {
+                            info.to_peers.insert(peer_id.clone());
+                        }
                     }
 
-                    // Process NetEQ operation metrics from network.operation_counters
-                    if let Some(network) = neteq_stats.get("network") {
-                        if let Some(operation_counters) = network.get("operation_counters") {
-                            // Normal operations per second
-                            if let Some(normal_ops) = operation_counters
-                                .get("normal_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_NORMAL_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(normal_ops);
+                    // Process NetEQ metrics from neteq_stats object
+                    if let Some(neteq_stats) = peer_obj.get("neteq_stats") {
+                        if let Some(audio_buffer_ms) = neteq_stats
+                            .get("current_buffer_size_ms")
+                            .and_then(|v| v.as_f64())
+                        {
+                            NETEQ_AUDIO_BUFFER_MS
+                                .with_label_values(&[
+                                    meeting_id,
+                                    session_id,
+                                    reporting_peer,
+                                    peer_id,
+                                ])
+                                .set(audio_buffer_ms);
+                            let mut tracker = session_tracker.lock().unwrap();
+                            let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                            if let Some(info) = tracker.get_mut(&key) {
+                                info.to_peers.insert(peer_id.clone());
                             }
+                        }
 
-                            // Expand operations per second
-                            if let Some(expand_ops) = operation_counters
-                                .get("expand_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_EXPAND_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(expand_ops);
+                        if let Some(packets_awaiting) = neteq_stats
+                            .get("packets_awaiting_decode")
+                            .and_then(|v| v.as_f64())
+                        {
+                            NETEQ_PACKETS_AWAITING_DECODE
+                                .with_label_values(&[
+                                    meeting_id,
+                                    session_id,
+                                    reporting_peer,
+                                    peer_id,
+                                ])
+                                .set(packets_awaiting);
+                            let mut tracker = session_tracker.lock().unwrap();
+                            let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                            if let Some(info) = tracker.get_mut(&key) {
+                                info.to_peers.insert(peer_id.clone());
                             }
+                        }
 
-                            // Accelerate operations per second
-                            if let Some(accelerate_ops) = operation_counters
-                                .get("accelerate_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_ACCELERATE_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(accelerate_ops);
-                            }
+                        // Process NetEQ operation metrics from network.operation_counters
+                        if let Some(network) = neteq_stats.get("network") {
+                            if let Some(operation_counters) = network.get("operation_counters") {
+                                // Normal operations per second
+                                if let Some(normal_ops) = operation_counters
+                                    .get("normal_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_NORMAL_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(normal_ops);
+                                }
 
-                            // Fast accelerate operations per second
-                            if let Some(fast_accelerate_ops) = operation_counters
-                                .get("fast_accelerate_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_FAST_ACCELERATE_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(fast_accelerate_ops);
-                            }
+                                // Expand operations per second
+                                if let Some(expand_ops) = operation_counters
+                                    .get("expand_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_EXPAND_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(expand_ops);
+                                }
 
-                            // Preemptive expand operations per second
-                            if let Some(preemptive_expand_ops) = operation_counters
-                                .get("preemptive_expand_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(preemptive_expand_ops);
-                            }
+                                // Accelerate operations per second
+                                if let Some(accelerate_ops) = operation_counters
+                                    .get("accelerate_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_ACCELERATE_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(accelerate_ops);
+                                }
 
-                            // Merge operations per second
-                            if let Some(merge_ops) = operation_counters
-                                .get("merge_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_MERGE_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(merge_ops);
-                            }
+                                // Fast accelerate operations per second
+                                if let Some(fast_accelerate_ops) = operation_counters
+                                    .get("fast_accelerate_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_FAST_ACCELERATE_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(fast_accelerate_ops);
+                                }
 
-                            // Comfort noise operations per second
-                            if let Some(comfort_noise_ops) = operation_counters
-                                .get("comfort_noise_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_COMFORT_NOISE_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(comfort_noise_ops);
-                            }
+                                // Preemptive expand operations per second
+                                if let Some(preemptive_expand_ops) = operation_counters
+                                    .get("preemptive_expand_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(preemptive_expand_ops);
+                                }
 
-                            // DTMF operations per second
-                            if let Some(dtmf_ops) = operation_counters
-                                .get("dtmf_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_DTMF_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(dtmf_ops);
-                            }
+                                // Merge operations per second
+                                if let Some(merge_ops) = operation_counters
+                                    .get("merge_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_MERGE_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(merge_ops);
+                                }
 
-                            // Undefined operations per second
-                            if let Some(undefined_ops) = operation_counters
-                                .get("undefined_per_sec")
-                                .and_then(|v| v.as_f64())
-                            {
-                                NETEQ_UNDEFINED_OPS_PER_SEC
-                                    .with_label_values(&[
-                                        meeting_id,
-                                        session_id,
-                                        reporting_peer,
-                                        peer_id,
-                                    ])
-                                    .set(undefined_ops);
+                                // Comfort noise operations per second
+                                if let Some(comfort_noise_ops) = operation_counters
+                                    .get("comfort_noise_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_COMFORT_NOISE_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(comfort_noise_ops);
+                                }
+
+                                // DTMF operations per second
+                                if let Some(dtmf_ops) = operation_counters
+                                    .get("dtmf_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_DTMF_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(dtmf_ops);
+                                }
+
+                                // Undefined operations per second
+                                if let Some(undefined_ops) = operation_counters
+                                    .get("undefined_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    NETEQ_UNDEFINED_OPS_PER_SEC
+                                        .with_label_values(&[
+                                            meeting_id,
+                                            session_id,
+                                            reporting_peer,
+                                            peer_id,
+                                        ])
+                                        .set(undefined_ops);
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Update meeting participants count
-        MEETING_PARTICIPANTS
-            .with_label_values(&[meeting_id])
-            .set(participants_count as f64);
+            // Update meeting participants count
+            MEETING_PARTICIPANTS
+                .with_label_values(&[meeting_id])
+                .set(participants_count as f64);
+        }
     }
 
     Ok(())
@@ -400,6 +470,7 @@ fn process_health_packet_to_metrics(
 async fn nats_health_consumer(
     nats_client: Client,
     health_store: HealthDataStore,
+    session_tracker: SessionTracker,
 ) -> anyhow::Result<()> {
     // Subscribe to all health diagnostics topics from all regions
     let queue_group = "metrics-server-health-diagnostics";
@@ -411,7 +482,7 @@ async fn nats_health_consumer(
 
     while let Some(message) = subscription.next().await {
         debug!("Received health message from NATS: {}", message.subject);
-        if let Err(e) = handle_health_message(message, &health_store).await {
+        if let Err(e) = handle_health_message(message, &health_store, &session_tracker).await {
             error!("Failed to handle health message: {}", e);
         }
     }
@@ -422,6 +493,7 @@ async fn nats_health_consumer(
 async fn handle_health_message(
     message: Message,
     health_store: &HealthDataStore,
+    session_tracker: &SessionTracker,
 ) -> anyhow::Result<()> {
     let topic = &message.subject;
     let payload = std::str::from_utf8(&message.payload)?;
@@ -430,6 +502,28 @@ async fn handle_health_message(
 
     // Parse JSON health packet
     let health_packet: Value = serde_json::from_str(payload)?;
+
+    // Freshness guard: discard stale packets
+    let now_ms: u128 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let packet_ts_ms_opt: Option<u128> = health_packet
+        .get("ts_ms")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u128);
+
+    // 30 seconds timeout
+    let is_fresh = match packet_ts_ms_opt {
+        Some(ts) => now_ms.saturating_sub(ts) <= 30_000,
+        None => true, // if unknown, accept
+    };
+
+    if is_fresh {
+        // Update Prometheus metrics immediately on ingest
+        if let Err(e) = process_health_packet_to_metrics(&health_packet, session_tracker) {
+            error!("Failed to process health packet for metrics: {}", e);
+        }
+    } else {
+        debug!("Discarded stale health packet on topic {}", topic);
+    }
 
     // Store latest health data using topic as key
     {
@@ -471,8 +565,9 @@ async fn main() -> anyhow::Result<()> {
     // Start NATS consumer in background
     let nats_store = health_store.clone();
     let nats_client_clone = nats_client.clone();
+    let nats_tracker = session_tracker.clone();
     task::spawn(async move {
-        if let Err(e) = nats_health_consumer(nats_client_clone, nats_store).await {
+        if let Err(e) = nats_health_consumer(nats_client_clone, nats_store, nats_tracker).await {
             error!("NATS consumer failed: {}", e);
         }
     });
@@ -564,6 +659,8 @@ mod tests {
             meeting_id: "meeting_456".to_string(),
             reporting_peer: "alice".to_string(),
             last_seen: Instant::now(),
+            to_peers: HashSet::new(),
+            peer_ids: HashSet::new(),
         };
 
         assert_eq!(session_info.session_id, "session_123");
@@ -585,6 +682,8 @@ mod tests {
                 meeting_id: "meeting_1".to_string(),
                 reporting_peer: "alice".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             tracker_guard.insert(session_key.clone(), session_info);
             assert_eq!(tracker_guard.len(), 1);
@@ -624,6 +723,8 @@ mod tests {
                 meeting_id: "meeting_1".to_string(),
                 reporting_peer: "alice".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
         }
@@ -637,6 +738,8 @@ mod tests {
                 meeting_id: "meeting_1".to_string(),
                 reporting_peer: "bob".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             // Simulate old timestamp by subtracting 40 seconds
             session_info.last_seen = session_info.last_seen - Duration::from_secs(40);
@@ -754,6 +857,8 @@ mod tests {
                 meeting_id: "meeting_1".to_string(),
                 reporting_peer: "alice".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             tracker_guard.insert(session_key1, session_info1);
 
@@ -764,6 +869,8 @@ mod tests {
                 meeting_id: "meeting_1".to_string(),
                 reporting_peer: "bob".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             session_info2.last_seen = session_info2.last_seen - Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
@@ -775,6 +882,8 @@ mod tests {
                 meeting_id: "meeting_2".to_string(),
                 reporting_peer: "charlie".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             tracker_guard.insert(session_key3, session_info3);
         }
@@ -805,6 +914,8 @@ mod tests {
             meeting_id: "test_meeting".to_string(),
             reporting_peer: "test_peer".to_string(),
             last_seen: Instant::now(),
+            to_peers: HashSet::new(),
+            peer_ids: HashSet::new(),
         };
 
         // This test verifies that remove_session_metrics doesn't panic
@@ -829,6 +940,8 @@ mod tests {
                 meeting_id: "meeting_concurrent".to_string(),
                 reporting_peer: "concurrent_peer".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
         });
@@ -877,6 +990,8 @@ mod tests {
                 meeting_id: "meeting_boundary".to_string(),
                 reporting_peer: "boundary_peer".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             // Set to exactly 30 seconds ago (timeout boundary)
             session_info.last_seen = session_info.last_seen - Duration::from_secs(30);

@@ -73,7 +73,7 @@
 //!
 //! ## Encoder creation:
 //! ```no_run
-//! use videocall_client::{VideoCallClient, CameraEncoder, MicrophoneEncoder, ScreenEncoder};
+//! use videocall_client::{VideoCallClient, CameraEncoder, ScreenEncoder, create_microphone_encoder};
 //! use yew::Callback;
 //!
 //! # use videocall_client::VideoCallClientOptions;
@@ -88,28 +88,28 @@
 //! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
-//! let camera = CameraEncoder::new(
+//! let mut camera = CameraEncoder::new(
 //!     client.clone(),
 //!     "video-element",
 //!     1000000, // 1 Mbps initial bitrate
 //!     Callback::noop()
 //! );
-//! let microphone = MicrophoneEncoder::new(
+//! let mut microphone = create_microphone_encoder(
 //!     client.clone(),
 //!     128, // 128 kbps bitrate
 //!     Callback::noop()
 //! );
-//! let screen = ScreenEncoder::new(
+//! let mut screen = ScreenEncoder::new(
 //!     client,
 //!     2000, // 2 Mbps bitrate
 //!     Callback::noop()
 //! );
 //!
 //! // Select devices and start/stop encoding
-//! camera.select("camera-device-id");
+//! camera.select("camera-device-id".to_string());
 //! camera.start();
 //! camera.stop();
-//! microphone.select("microphone-device-id");
+//! microphone.select("microphone-device-id".to_string());
 //! microphone.start();
 //! microphone.stop();
 //! screen.set_enabled(true);
@@ -150,10 +150,10 @@
 //! let microphones = media_device_list.audio_inputs.devices();
 //! let cameras = media_device_list.video_inputs.devices();
 //! if let Some(mic) = microphones.first() {
-//!     media_device_list.audio_inputs.select(&mic.device_id);
+//!     media_device_list.audio_inputs.select(&mic.device_id());
 //! }
 //! if let Some(camera) = cameras.first() {
-//!     media_device_list.video_inputs.select(&camera.device_id);
+//!     media_device_list.video_inputs.select(&camera.device_id());
 //! }
 //!
 //! ```

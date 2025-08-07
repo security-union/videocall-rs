@@ -226,13 +226,13 @@ impl Clone for SelectableDevices {
 /// let cameras = media_device_list.video_inputs.devices();
 /// let speakers = media_device_list.audio_outputs.devices();
 /// if let Some(mic) = microphones.first() {
-///     media_device_list.audio_inputs.select(&mic.device_id);
+///     media_device_list.audio_inputs.select(&mic.device_id());
 /// }
 /// if let Some(camera) = cameras.first() {
-///     media_device_list.video_inputs.select(&camera.device_id);
+///     media_device_list.video_inputs.select(&camera.device_id());
 /// }
 /// if let Some(speaker) = speakers.first() {
-///     media_device_list.audio_outputs.select(&speaker.device_id);
+///     media_device_list.audio_outputs.select(&speaker.device_id());
 /// }
 ///
 /// ```

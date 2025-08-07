@@ -11,11 +11,11 @@ rustlemania-webtransport:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: add-diagnostics-96d1ea6a
+    tag: add-diagnostics-572e337e
 
   env:
     - name: RUST_LOG
-      value: debug,quinn=warn
+      value: debug,quinn=warn,async_nats=info
     - name: NATS_URL
       value: nats-us-east:4222  # Connect to US East NATS cluster
     - name: LISTEN_URL

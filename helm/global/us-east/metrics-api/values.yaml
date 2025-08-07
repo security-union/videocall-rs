@@ -4,7 +4,7 @@ metricsApi:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: add-diagnostics-6f36bb2a
+    tag: add-diagnostics-572e337e
   
   # Minimal resources for cost optimization
   resources:

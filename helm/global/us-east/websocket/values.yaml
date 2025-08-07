@@ -8,7 +8,7 @@ rustlemania-websocket:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: add-diagnostics-96d1ea6a
+    tag: add-diagnostics-572e337e
 
   env:
     - name: RUST_LOG

@@ -594,6 +594,8 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(all(test, feature = "diagnostics"))]
 mod tests {
     use super::*;
+    use actix_web::web;
+    use prometheus::Encoder;
     use serde_json::json;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -614,6 +616,34 @@ mod tests {
                 .as_millis() as u64,
             "peer_stats": peer_stats
         })
+    }
+
+    fn series_exists(metric_name: &str, expected_labels: &[(&str, &str)]) -> bool {
+        let families = prometheus::gather();
+        for family in families {
+            if family.get_name() == metric_name {
+                for metric in family.get_metric() {
+                    let mut all_match = true;
+                    for (lname, lval) in expected_labels {
+                        let mut found = false;
+                        for label in metric.get_label() {
+                            if label.get_name() == *lname && label.get_value() == *lval {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Helper function to create test peer stats with NetEQ data
@@ -791,6 +821,83 @@ mod tests {
             assert_eq!(session_info.meeting_id, "meeting_456");
             assert_eq!(session_info.reporting_peer, "alice");
         }
+    }
+
+    #[test]
+    fn test_metrics_handler_does_not_process_cached_health() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let health_store: HealthDataStore = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut peer_stats = serde_json::Map::new();
+        let (peer_id, peer_stat) = create_test_peer_stats("bob", true, false, 100.0, 5.0);
+        peer_stats.insert(peer_id, peer_stat);
+
+        let packet =
+            create_test_health_packet("session_cached", "meeting_cached", "alice", peer_stats);
+        {
+            let mut store = health_store.lock().unwrap();
+            store.insert("health.diagnostics.test".to_string(), packet);
+        }
+
+        // metrics_handler should not mutate metrics/tracker from cached store
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        {
+            let tracker_clone = tracker.clone();
+            rt.block_on(async move {
+                let resp =
+                    metrics_handler(web::Data::new(health_store), web::Data::new(tracker_clone))
+                        .await;
+                assert!(resp.is_ok());
+            });
+        }
+
+        let guard = tracker.lock().unwrap();
+        assert!(guard.is_empty());
+    }
+
+    #[test]
+    fn test_remove_session_metrics_removes_exported_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // Publish metrics
+        let mut peer_stats = serde_json::Map::new();
+        let (peer_id, peer_stat) = create_test_peer_stats("bob", true, true, 150.0, 8.0);
+        peer_stats.insert(peer_id.clone(), peer_stat);
+        let meeting_id = "meeting_rm";
+        let session_id = "session_rm";
+        let reporting_peer = "alice";
+        let packet = create_test_health_packet(session_id, meeting_id, reporting_peer, peer_stats);
+        let result = process_health_packet_to_metrics(&packet, &tracker);
+        assert!(result.is_ok());
+
+        // Confirm a series exists
+        assert!(series_exists(
+            "videocall_neteq_packets_awaiting_decode",
+            &[
+                ("meeting_id", meeting_id),
+                ("session_id", session_id),
+                ("from_peer", reporting_peer),
+                ("to_peer", "bob"),
+            ],
+        ));
+
+        // Remove and ensure it disappears
+        let session_key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+        let info = {
+            let guard = tracker.lock().unwrap();
+            guard.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(!series_exists(
+            "videocall_neteq_packets_awaiting_decode",
+            &[
+                ("meeting_id", meeting_id),
+                ("session_id", session_id),
+                ("from_peer", reporting_peer),
+                ("to_peer", "bob"),
+            ],
+        ));
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::constants::{
     CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
 };
 use gloo_utils::window;
-use log::{debug, error, warn};
+use log::{error, warn};
 use serde_json;
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
@@ -161,6 +161,15 @@ impl AttendantsComponent {
             .map(|s| format!("{s}/lobby/{email}/{id}"))
             .collect::<Vec<String>>();
 
+        log::info!(
+            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}",
+            email,
+            id,
+            ctx.props().webtransport_enabled
+        );
+        log::info!("YEW-UI: WebSocket URLs: {:?}", websocket_urls);
+        log::info!("YEW-UI: WebTransport URLs: {:?}", webtransport_urls);
+
         let opts = VideoCallClientOptions {
             userid: email.clone(),
             meeting_id: id.clone(),
@@ -170,11 +179,25 @@ impl AttendantsComponent {
             enable_webtransport: ctx.props().webtransport_enabled,
             on_connected: {
                 let link = ctx.link().clone();
-                Callback::from(move |_| link.send_message(Msg::from(WsAction::Connected)))
+                let webtransport_enabled = ctx.props().webtransport_enabled;
+                Callback::from(move |_| {
+                    log::info!(
+                        "YEW-UI: Connection established (webtransport_enabled={})",
+                        webtransport_enabled
+                    );
+                    link.send_message(Msg::from(WsAction::Connected))
+                })
             },
             on_connection_lost: {
                 let link = ctx.link().clone();
-                Callback::from(move |_| link.send_message(Msg::from(WsAction::Lost(None))))
+                let webtransport_enabled = ctx.props().webtransport_enabled;
+                Callback::from(move |_| {
+                    log::warn!(
+                        "YEW-UI: Connection lost (webtransport_enabled={})",
+                        webtransport_enabled
+                    );
+                    link.send_message(Msg::from(WsAction::Lost(None)))
+                })
             },
             on_peer_added: {
                 let link = ctx.link().clone();
@@ -405,9 +428,9 @@ impl Component for AttendantsComponent {
                         ));
                     } else if evt.subsystem == "decoder" {
                         // Process decoder diagnostics events (FPS, bitrate, etc.)
-                        log::debug!(
-                            "AttendantsComponent: Received decoder event for peer {:?}",
-                            evt.stream_id
+                        log::info!(
+                            "YEW-UI: Received decoder diagnostic event for peer {:?} at timestamp {}",
+                            evt.stream_id, evt.ts_ms
                         );
                         let mut decoder_stats = String::new();
                         for metric in &evt.metrics {
@@ -447,9 +470,9 @@ impl Component for AttendantsComponent {
                         }
                     } else if evt.subsystem == "sender" {
                         // Process sender diagnostics events
-                        log::debug!(
-                            "AttendantsComponent: Received sender event for peer {:?}",
-                            evt.stream_id
+                        log::info!(
+                            "YEW-UI: Received sender diagnostic event for peer {:?} at timestamp {}",
+                            evt.stream_id, evt.ts_ms
                         );
                         let mut sender_stats = String::new();
                         for metric in &evt.metrics {
@@ -481,7 +504,8 @@ impl Component for AttendantsComponent {
                         }
                     } else {
                         let subsystem = evt.subsystem;
-                        log::debug!("AttendantsComponent: Received event for unknown subsystem: {subsystem}");
+                        log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 
+                                   subsystem, evt.stream_id, evt.ts_ms);
                     }
                 }
                 log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
@@ -497,7 +521,7 @@ impl Component for AttendantsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        debug!("AttendantsComponent update: {msg:?}");
+        log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
@@ -513,7 +537,10 @@ impl Component for AttendantsComponent {
                     self.meeting_joined = true;
                     true
                 }
-                WsAction::Connected => true,
+                WsAction::Connected => {
+                    log::info!("YEW-UI: Connection established successfully!");
+                    true
+                }
                 WsAction::Log(msg) => {
                     warn!("{msg}");
                     false
@@ -554,6 +581,7 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::DiagnosticsUpdated(stats) => {
+                    log::debug!("YEW-UI: Diagnostics UI updated: {}", stats);
                     self.diagnostics_data = Some(stats);
                     true
                 }

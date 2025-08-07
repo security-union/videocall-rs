@@ -24,6 +24,7 @@ use protobuf::Message;
 use quinn::crypto::rustls::HandshakeData;
 use quinn::VarInt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde::de;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -226,14 +227,14 @@ async fn run_webtransport_connection(
     info!("accepted session");
 
     // Run the session
-    if let Err(err) = handle_session(session, &username, &lobby_id, nc).await {
+    if let Err(err) = handle_webtransport_session(session, &username, &lobby_id, nc).await {
         info!("closing session: {}", err);
     }
     Ok(())
 }
 
 #[tracing::instrument(level = "trace", skip(session))]
-async fn handle_session(
+async fn handle_webtransport_session(
     session: Session,
     username: &str,
     lobby_id: &str,
@@ -319,6 +320,10 @@ async fn handle_session(
                                         error!("Error opening echo stream: {}", e);
                                     }
                                 }
+                            } else if health_processor::is_health_packet_bytes(&buf) {
+                                // Process health packet for diagnostics (don't relay)
+                                info!("WT-SERVER: Received health packet via unidirectional stream (size: {} bytes) - processing locally", buf.len());
+                                health_processor::process_health_packet_bytes(&buf, nc.clone());
                             } else {
                                 // Normal packet processing - publish to NATS
                                 tokio::spawn(async move {

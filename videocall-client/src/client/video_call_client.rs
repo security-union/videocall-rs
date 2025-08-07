@@ -442,18 +442,25 @@ impl VideoCallClient {
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
+        let packet_type = media.packet_type.enum_value();
         match self.inner.try_borrow() {
             Ok(inner) => {
                 if let Some(connection_controller) = &inner.connection_controller {
                     if let Err(e) = connection_controller.send_packet(media) {
-                        error!("Failed to send packet: {e}");
+                        error!("Failed to send {:?} packet: {e}", packet_type);
                     }
                 } else {
-                    error!("No connection manager available");
+                    error!(
+                        "No connection manager available for {:?} packet",
+                        packet_type
+                    );
                 }
             }
             Err(_) => {
-                error!("Unable to borrow inner -- dropping send packet {media:?}")
+                error!(
+                    "Unable to borrow inner -- dropping {:?} packet {media:?}",
+                    packet_type
+                )
             }
         }
     }

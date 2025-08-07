@@ -15,6 +15,7 @@ use prometheus::{Encoder, TextEncoder};
 type HealthDataStore = Arc<Mutex<HashMap<String, Value>>>;
 
 // Session tracking for cleanup
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct SessionInfo {
     session_id: String,
@@ -115,6 +116,7 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker) {
 
 #[cfg(not(feature = "diagnostics"))]
 /// Clean up sessions that haven't reported in the last 30 seconds (stub)
+#[allow(dead_code)]
 fn cleanup_stale_sessions(_session_tracker: &SessionTracker) {
     // No-op when diagnostics feature is disabled
 }
@@ -141,6 +143,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
 
 #[cfg(not(feature = "diagnostics"))]
 /// Remove all Prometheus metrics for a given session (stub)
+#[allow(dead_code)]
 fn remove_session_metrics(_session_info: &SessionInfo) {
     // No-op when diagnostics feature is disabled
 }

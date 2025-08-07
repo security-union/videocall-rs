@@ -40,49 +40,121 @@
 //!
 //! ## Client creation and connection:
 //! ```no_run
-//! let options = VideoCallClientOptions {...}; // set parameters and callbacks for various events
-//! let client = VideoCallClient::new(options);
+//! use videocall_client::{VideoCallClient, VideoCallClientOptions};
+//! use yew::Callback;
 //!
-//! client.connect();
+//! let options = VideoCallClientOptions {
+//!     enable_e2ee: true,
+//!     enable_webtransport: true,
+//!     on_peer_added: Callback::noop(),
+//!     on_peer_first_frame: Callback::noop(),
+//!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
+//!     get_peer_screen_canvas_id: Callback::from(|_| "screen-canvas".to_string()),
+//!     userid: "user123".to_string(),
+//!     meeting_id: "room456".to_string(),
+//!     websocket_urls: vec!["ws://localhost:8080".to_string()],
+//!     webtransport_urls: vec!["https://localhost:8443".to_string()],
+//!     on_connected: Callback::noop(),
+//!     on_connection_lost: Callback::noop(),
+//!     on_diagnostics_update: None,
+//!     on_sender_stats_update: None,
+//!     enable_diagnostics: false,
+//!     diagnostics_update_interval_ms: None,
+//!     enable_health_reporting: false,
+//!     health_reporting_interval_ms: None,
+//!     on_encoder_settings_update: None,
+//!     rtt_testing_period_ms: 3000,
+//!     rtt_probe_interval_ms: None,
+//! };
+//! let mut client = VideoCallClient::new(options);
+//!
+//! client.connect().unwrap();
 //! ```
 //!
 //! ## Encoder creation:
 //! ```no_run
-//! let camera = CameraEncoder.new(client, video_element_id);
-//! let microphone = MicrophoneEncoder.new(client);
-//! let screen = ScreenEncoder.new(client);
+//! use videocall_client::{VideoCallClient, CameraEncoder, MicrophoneEncoder, ScreenEncoder};
+//! use yew::Callback;
 //!
-//! camera.select(video_device);
+//! # use videocall_client::VideoCallClientOptions;
+//! # let options = VideoCallClientOptions {
+//! #     enable_e2ee: false, enable_webtransport: false, on_peer_added: Callback::noop(),
+//! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
+//! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), userid: "user".to_string(),
+//! #     meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
+//! #     on_connected: Callback::noop(), on_connection_lost: Callback::noop(), on_diagnostics_update: None,
+//! #     on_sender_stats_update: None, enable_diagnostics: false, diagnostics_update_interval_ms: None,
+//! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
+//! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
+//! # };
+//! # let client = VideoCallClient::new(options);
+//! let camera = CameraEncoder::new(
+//!     client.clone(),
+//!     "video-element",
+//!     1000000, // 1 Mbps initial bitrate
+//!     Callback::noop()
+//! );
+//! let microphone = MicrophoneEncoder::new(
+//!     client.clone(),
+//!     128, // 128 kbps bitrate
+//!     Callback::noop()
+//! );
+//! let screen = ScreenEncoder::new(
+//!     client,
+//!     2000, // 2 Mbps bitrate
+//!     Callback::noop()
+//! );
+//!
+//! // Select devices and start/stop encoding
+//! camera.select("camera-device-id");
 //! camera.start();
 //! camera.stop();
-//! microphone.select(video_device);
+//! microphone.select("microphone-device-id");
 //! microphone.start();
 //! microphone.stop();
-//! screen.start();
-//! screen.stop();
+//! screen.set_enabled(true);
+//! screen.set_enabled(false);
 //! ```
 //!
 //! ## Device access permission:
 //!
 //! ```no_run
-//! let media_device_access = MediaDeviceAccess::new();
-//! media_device_access.on_granted = ...; // callback
-//! media_device_access.on_denied = ...; // callback
+//! use videocall_client::MediaDeviceAccess;
+//! use yew::Callback;
+//!
+//! let mut media_device_access = MediaDeviceAccess::new();
+//! media_device_access.on_granted = Callback::from(|_| {
+//!     web_sys::console::log_1(&"Access granted!".into());
+//! });
+//! media_device_access.on_denied = Callback::from(|error| {
+//!     web_sys::console::log_2(&"Access denied:".into(), &error);
+//! });
 //! media_device_access.request();
 //! ```
 //!
 //! ### Device query and listing:
 //! ```no_run
-//! let media_device_list = MediaDeviceList::new();
-//! media_device_list.audio_inputs.on_selected = ...; // callback
-//! media_device_access.video_inputs.on_selected = ...; // callback
+//! use videocall_client::MediaDeviceList;
+//! use yew::Callback;
+//!
+//! let mut media_device_list = MediaDeviceList::new();
+//! media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
+//!     web_sys::console::log_2(&"Audio device selected:".into(), &device_id.into());
+//! });
+//! media_device_list.video_inputs.on_selected = Callback::from(|device_id: String| {
+//!     web_sys::console::log_2(&"Video device selected:".into(), &device_id.into());
+//! });
 //!
 //! media_device_list.load();
 //!
 //! let microphones = media_device_list.audio_inputs.devices();
 //! let cameras = media_device_list.video_inputs.devices();
-//! media_device_list.audio_inputs.select(&microphones[i].device_id);
-//! media_device_list.video_inputs.select(&cameras[i].device_id);
+//! if let Some(mic) = microphones.first() {
+//!     media_device_list.audio_inputs.select(&mic.device_id);
+//! }
+//! if let Some(camera) = cameras.first() {
+//!     media_device_list.video_inputs.select(&camera.device_id);
+//! }
 //!
 //! ```
 

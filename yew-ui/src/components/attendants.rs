@@ -192,8 +192,7 @@ impl AttendantsComponent {
                 let webtransport_enabled = ctx.props().webtransport_enabled;
                 Callback::from(move |_| {
                     log::warn!(
-                        "YEW-UI: Connection lost (webtransport_enabled={})",
-                        webtransport_enabled
+                        "YEW-UI: Connection lost (webtransport_enabled={webtransport_enabled})",
                     );
                     link.send_message(Msg::from(WsAction::Lost(None)))
                 })
@@ -580,7 +579,7 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::DiagnosticsUpdated(stats) => {
-                    log::debug!("YEW-UI: Diagnostics UI updated: {}", stats);
+                    log::debug!("YEW-UI: Diagnostics UI updated: {stats}");
                     self.diagnostics_data = Some(stats);
                     true
                 }

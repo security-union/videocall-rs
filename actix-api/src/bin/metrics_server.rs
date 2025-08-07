@@ -1128,6 +1128,8 @@ mod tests {
             meeting_id: "meeting_456".to_string(),
             reporting_peer: "alice".to_string(),
             last_seen: Instant::now(),
+            to_peers: HashSet::new(),
+            peer_ids: HashSet::new(),
         };
 
         assert_eq!(session_info.session_id, "session_123");
@@ -1148,6 +1150,8 @@ mod tests {
                 meeting_id: "meeting_1".to_string(),
                 reporting_peer: "alice".to_string(),
                 last_seen: Instant::now(),
+                to_peers: HashSet::new(),
+                peer_ids: HashSet::new(),
             };
             tracker_guard.insert(session_key.clone(), session_info);
             assert_eq!(tracker_guard.len(), 1);

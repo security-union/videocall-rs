@@ -47,7 +47,7 @@ async fn metrics_handler(
     data: web::Data<HealthDataStore>,
     session_tracker: web::Data<SessionTracker>,
 ) -> Result<HttpResponse> {
-    let health_data = data.lock().unwrap();
+    drop(data.lock().unwrap());
 
     // Clean up stale sessions before processing metrics
     cleanup_stale_sessions(&session_tracker);
@@ -595,6 +595,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -928,8 +929,6 @@ mod tests {
         let (peer_id, peer_stat) = create_test_peer_stats("bob", true, false, 100.0, 5.0);
         peer_stats.insert(peer_id, peer_stat);
 
-        let packet =
-            create_test_health_packet("session_cached", "meeting_cached", "alice", peer_stats);
         {
             let mut store = health_store.lock().unwrap();
             // Store a dummy JSON value; cached store is not used for metrics anyway
@@ -1035,7 +1034,7 @@ mod tests {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
         // Test minimal packet
-        let mut peer_stats = std::collections::HashMap::new();
+        let peer_stats = std::collections::HashMap::new();
         let hp = create_test_health_packet("session_123", "meeting_123", "alice", peer_stats);
         let result = process_health_packet_to_metrics_pb(&hp, &tracker);
         assert!(result.is_ok());

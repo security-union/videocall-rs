@@ -24,3 +24,34 @@ pub mod encoder;
 pub mod frame;
 pub mod jitter_buffer;
 pub mod jitter_estimator;
+
+// Diagnostics helper to publish video metrics via the shared event bus.
+#[cfg(feature = "wasm")]
+pub mod video_diagnostics {
+    use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+
+    /// Publish video stats to the global diagnostics stream. `stream_id` should be
+    /// in the format "from_peer->to_peer" to align with health reporting expectations.
+    pub fn report_video_stats(stream_id: String, fps: Option<f64>, frames_buffered: Option<u64>) {
+        let mut metrics = Vec::new();
+        if let Some(f) = fps {
+            metrics.push(metric!("fps_received", f));
+        }
+        if let Some(b) = frames_buffered {
+            metrics.push(metric!("frames_buffered", b));
+        }
+
+        if metrics.is_empty() {
+            return;
+        }
+
+        let event = DiagEvent {
+            subsystem: "video",
+            stream_id: Some(stream_id),
+            ts_ms: now_ms(),
+            metrics,
+        };
+        // Best-effort broadcast; ignore backpressure errors
+        let _ = global_sender().try_broadcast(event);
+    }
+}

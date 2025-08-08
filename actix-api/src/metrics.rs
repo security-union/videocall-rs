@@ -169,4 +169,20 @@ lazy_static! {
         vec![0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
     )
     .expect("Failed to create session_quality metric");
+
+    /// Per-pair video packets buffered in the decoder/jitter buffer
+    pub static ref VIDEO_PACKETS_BUFFERED: GaugeVec = register_gauge_vec!(
+        "videocall_video_packets_buffered",
+        "Number of video packets/frames currently buffered awaiting decode",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_packets_buffered metric");
+
+    /// Per-pair video framerate as observed by the receiver
+    pub static ref VIDEO_FPS: GaugeVec = register_gauge_vec!(
+        "videocall_video_fps",
+        "Video frames per second observed by the receiver",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create video_fps metric");
 }

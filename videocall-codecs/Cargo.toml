@@ -43,7 +43,8 @@ wasm = [
     "console_error_panic_hook",
     "serde-wasm-bindgen",
     "js-sys",
-    "wasm-bindgen-futures"
+    "wasm-bindgen-futures",
+    "videocall-diagnostics"
 ]
 
 [dependencies]
@@ -77,6 +78,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "HtmlElement",
     "HtmlLinkElement",
 ] }
+videocall-diagnostics = { path = "../videocall-diagnostics", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env-libvpx-sys = { workspace = true }

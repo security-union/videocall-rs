@@ -433,12 +433,14 @@ impl DiagnosticWorker {
                 // Always publish to global diagnostics broadcast system (independent of packet handler)
                 let event = DiagEvent {
                     subsystem: "decoder",
-                    stream_id: Some(peer_id.clone()),
+                    stream_id: None,
                     ts_ms: now_ms(),
                     metrics: vec![
                         metric!("fps", tracker.fps),
                         metric!("bitrate_kbps", tracker.current_bitrate),
                         metric!("media_type", format!("{:?}", media_type)),
+                        metric!("from_peer", self.userid.clone()),
+                        metric!("to_peer", peer_id.clone()),
                     ],
                 };
                 debug!(
@@ -446,6 +448,20 @@ impl DiagnosticWorker {
                     peer_id, media_type, tracker.fps, tracker.current_bitrate
                 );
                 let _ = global_sender().try_broadcast(event);
+
+                // Also publish a normalized video event that the health reporter uses for UI + server
+                let video_event = DiagEvent {
+                    subsystem: "video",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        metric!("fps_received", tracker.fps),
+                        metric!("bitrate_kbps", tracker.current_bitrate),
+                        metric!("from_peer", self.userid.clone()),
+                        metric!("to_peer", peer_id.clone()),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(video_event);
 
                 // Only create and send protobuf packets if packet handler is set (legacy system)
                 if let Some(handler) = &self.packet_handler {

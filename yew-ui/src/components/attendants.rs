@@ -490,6 +490,18 @@ impl Component for AttendantsComponent {
                                 sender_stats,
                             )));
                         }
+                    } else if evt.subsystem == "video" {
+                        // Known subsystem used for Grafana/metrics; UI does not render it
+                        log::debug!(
+                            "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
+                            evt.ts_ms
+                        );
+                    } else if evt.subsystem == "peer_status" {
+                        // Known subsystem for mute/camera state; UI does not render it
+                        log::debug!(
+                            "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
+                            evt.ts_ms
+                        );
                     } else {
                         let subsystem = evt.subsystem;
                         log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 

@@ -73,6 +73,7 @@ trait VideoFrameDecoder {
     fn push_frame(&self, frame: FrameBuffer);
     fn is_waiting_for_keyframe(&self) -> bool;
     fn flush(&self);
+    fn set_stream_id(&self, _stream_id: String) {}
 }
 
 struct WasmVideoFrameDecoder {
@@ -91,6 +92,8 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
     fn flush(&self) {
         self.decoder.flush()
     }
+
+    fn set_stream_id(&self, _stream_id: String) {}
 }
 
 impl VideoPeerDecoder {
@@ -111,6 +114,9 @@ impl VideoPeerDecoder {
         });
         Ok(Self { decoder })
     }
+
+    /// Provide a diagnostics stream id to the underlying decoder (no-op; ids will be attached later in pipeline).
+    pub fn set_stream_id(&self, _stream_id: String) {}
 
     fn render_to_canvas(canvas_id: &str, video_frame: web_sys::VideoFrame) {
         if let Some(window) = web_sys::window() {

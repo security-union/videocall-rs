@@ -143,18 +143,37 @@ impl HealthReporter {
         event: DiagEvent,
         peer_health_data: &Rc<RefCell<HashMap<String, PeerHealthData>>>,
     ) {
-        let stream_id = event
-            .stream_id
-            .clone()
-            .unwrap_or_else(|| "unknown->unknown".to_string());
+        // Prefer structured from/to fields if present; fall back to stream_id if set
+        let mut reporting_peer: Option<String> = None;
+        let mut target_peer: Option<String> = None;
+        for metric in &event.metrics {
+            match metric.name {
+                "from_peer" => {
+                    if let MetricValue::Text(s) = &metric.value {
+                        reporting_peer = Some(s.clone());
+                    }
+                }
+                "to_peer" => {
+                    if let MetricValue::Text(s) = &metric.value {
+                        target_peer = Some(s.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
 
-        // Parse the new format: "reporting_peer->target_peer"
-        let parts: Vec<&str> = stream_id.split("->").collect();
-        let (reporting_peer, target_peer) = if parts.len() == 2 {
-            (parts[0], parts[1])
-        } else {
-            ("unknown", "unknown")
-        };
+        // Fallback to stream_id parsing if structured fields are absent
+        if reporting_peer.is_none() || target_peer.is_none() {
+            if let Some(sid) = event.stream_id.clone() {
+                let parts: Vec<&str> = sid.split("->").collect();
+                if parts.len() == 2 {
+                    reporting_peer.get_or_insert(parts[0].to_string());
+                    target_peer.get_or_insert(parts[1].to_string());
+                }
+            }
+        }
+        let reporting_peer = reporting_peer.unwrap_or_else(|| "unknown".to_string());
+        let target_peer = target_peer.unwrap_or_else(|| "unknown".to_string());
 
         // Handle NetEQ events (audio)
         if event.subsystem == "neteq" {
@@ -171,7 +190,7 @@ impl HealthReporter {
                                     peer_data.update_audio_stats(neteq_json);
                                     peer_data.can_listen = true;
                                     debug!(
-                                        "Updated NetEQ stats for peer: {target_peer} (from {reporting_peer})"
+                                     "Updated NetEQ stats for peer: {target_peer} (from {reporting_peer})"
                                     );
                                 }
                             }
@@ -261,6 +280,17 @@ impl HealthReporter {
                             if let MetricValue::F64(fps) = &metric.value {
                                 video_stats["fps_received"] = json!(fps);
                                 peer_data.can_see = *fps > 0.0;
+                            }
+                        }
+                        "frames_buffered" | "packets_buffered" => {
+                            match &metric.value {
+                                MetricValue::U64(v) => {
+                                    video_stats["frames_buffered"] = json!(v);
+                                }
+                                MetricValue::F64(v) => {
+                                    video_stats["frames_buffered"] = json!(v);
+                                }
+                                _ => {}
                             }
                         }
                         "frames_decoded" => {

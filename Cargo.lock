@@ -6605,6 +6605,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen 0.6.5",
  "serde_json",
+ "videocall-diagnostics",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

@@ -321,7 +321,7 @@ async fn handle_webtransport_session(
                                 }
                             } else if health_processor::is_health_packet_bytes(&buf) {
                                 // Process health packet for diagnostics (don't relay)
-                                info!("WT-SERVER: Received health packet via unidirectional stream (size: {} bytes) - processing locally", buf.len());
+                                debug!("WT-SERVER: Received health packet via unidirectional stream (size: {} bytes) - processing locally", buf.len());
                                 health_processor::process_health_packet_bytes(&buf, nc.clone());
                             } else {
                                 // Normal packet processing - publish to NATS

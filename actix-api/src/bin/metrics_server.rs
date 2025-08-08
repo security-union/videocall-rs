@@ -39,6 +39,7 @@ use sec_api::metrics::{
     NETEQ_EXPAND_OPS_PER_SEC, NETEQ_FAST_ACCELERATE_OPS_PER_SEC, NETEQ_MERGE_OPS_PER_SEC,
     NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC,
     NETEQ_UNDEFINED_OPS_PER_SEC, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL,
+    VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
 };
 
 #[cfg(feature = "diagnostics")]
@@ -442,6 +443,38 @@ fn process_health_packet_to_metrics(
                                         .set(undefined_ops);
                                 }
                             }
+                        }
+                    }
+
+                    // Process video metrics from video_stats object
+                    if let Some(video_stats) = peer_obj.get("video_stats") {
+                        if let Some(fps) = video_stats
+                            .get("fps_received")
+                            .and_then(|v| v.as_f64())
+                        {
+                            VIDEO_FPS
+                                .with_label_values(&[
+                                    meeting_id,
+                                    session_id,
+                                    reporting_peer,
+                                    peer_id,
+                                ])
+                                .set(fps);
+                        }
+
+                        if let Some(packets_buffered) = video_stats
+                            .get("frames_buffered")
+                            .or_else(|| video_stats.get("packets_buffered"))
+                            .and_then(|v| v.as_f64())
+                        {
+                            VIDEO_PACKETS_BUFFERED
+                                .with_label_values(&[
+                                    meeting_id,
+                                    session_id,
+                                    reporting_peer,
+                                    peer_id,
+                                ])
+                                .set(packets_buffered);
                         }
                     }
                 }

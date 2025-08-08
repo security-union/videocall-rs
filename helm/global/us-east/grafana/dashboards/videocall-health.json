@@ -18,6 +18,31 @@
   "id": null,
   "links": [],
   "panels": [
+    
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "min": 0, "max": 1, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 903,
+      "options": {"legend": {"displayMode": "list","placement": "bottom"},"tooltip": {"mode": "single"}},
+      "targets": [
+        {"expr": "videocall_self_audio_enabled{meeting_id=~\"$meeting_id\"}", "legendFormat": "{{peer_id}} ({{meeting_id}})", "refId": "A"}
+      ],
+      "title": "Self Audio Enabled",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "min": 0, "max": 1, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 904,
+      "options": {"legend": {"displayMode": "list","placement": "bottom"},"tooltip": {"mode": "single"}},
+      "targets": [
+        {"expr": "videocall_self_video_enabled{meeting_id=~\"$meeting_id\"}", "legendFormat": "{{peer_id}} ({{meeting_id}})", "refId": "A"}
+      ],
+      "title": "Self Video Enabled",
+      "type": "timeseries"
+    },
     {
       "datasource": "Prometheus",
       "fieldConfig": {
@@ -88,14 +113,9 @@
         }
       },
       "targets": [
-        {
-          "expr": "videocall_health_reports_total",
-          "interval": "",
-          "legendFormat": "Health Reports Total",
-          "refId": "A"
-        }
+        {"expr": "videocall_video_packets_buffered{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}", "legendFormat": "{{from_peer}} → {{to_peer}} ({{meeting_id}})", "refId": "A"}
       ],
-      "title": "Health Reports Received",
+      "title": "Video Packets Buffered",
       "type": "timeseries"
     },
     {
@@ -255,20 +275,9 @@
         }
       },
       "targets": [
-        {
-          "expr": "rate(videocall_audio_reception_failures_total[5m])",
-          "interval": "",
-          "legendFormat": "Audio Reception Failures/sec",
-          "refId": "A"
-        },
-        {
-          "expr": "rate(videocall_video_reception_failures_total[5m])",
-          "interval": "",
-          "legendFormat": "Video Reception Failures/sec",
-          "refId": "B"
-        }
+        {"expr": "videocall_video_fps{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}", "legendFormat": "{{from_peer}} → {{to_peer}} ({{meeting_id}})", "refId": "A"}
       ],
-      "title": "Reception Failures Rate",
+      "title": "Video FPS",
       "type": "timeseries"
     },
     {
@@ -838,4 +847,4 @@
   "title": "VideoCall Health Monitoring",
   "uid": "videocall-health",
   "version": 1
-} 
+}

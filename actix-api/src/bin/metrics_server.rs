@@ -1,12 +1,14 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Result};
 use async_nats::{Client, Message};
 use futures::StreamExt;
-use serde_json::Value;
+use protobuf::Message as PbMessage;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
 use tracing::{debug, error, info};
+use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
 
 #[cfg(feature = "diagnostics")]
 use prometheus::{Encoder, TextEncoder};
@@ -170,24 +172,27 @@ fn remove_session_metrics(_session_info: &SessionInfo) {
 }
 
 #[cfg(feature = "diagnostics")]
-fn process_health_packet_to_metrics(
-    health_packet: &Value,
+fn process_health_packet_to_metrics_pb(
+    health_packet: &PbHealthPacket,
     session_tracker: &SessionTracker,
 ) -> anyhow::Result<()> {
-    let meeting_id = health_packet
-        .get("meeting_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let meeting_id = if health_packet.meeting_id.is_empty() {
+        "unknown"
+    } else {
+        &health_packet.meeting_id
+    };
 
-    let session_id = health_packet
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let session_id = if health_packet.session_id.is_empty() {
+        "unknown"
+    } else {
+        &health_packet.session_id
+    };
 
-    let reporting_peer = health_packet
-        .get("reporting_peer")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    let reporting_peer = if health_packet.reporting_peer.is_empty() {
+        "unknown"
+    } else {
+        &health_packet.reporting_peer
+    };
 
     // Update session tracker
     {
@@ -221,47 +226,35 @@ fn process_health_packet_to_metrics(
             .set(1.0);
 
         // Self-state reported by the sender (authoritative)
-        if let Some(audio_enabled) = health_packet
-            .get("reporting_audio_enabled")
-            .and_then(|v| v.as_bool())
-        {
-            debug!(
-                "Setting SELF_AUDIO_ENABLED for meeting={}, peer={}, value={}",
-                meeting_id, reporting_peer, audio_enabled
-            );
-            SELF_AUDIO_ENABLED
-                .with_label_values(&[meeting_id, reporting_peer])
-                .set(if audio_enabled { 1.0 } else { 0.0 });
-        } else {
-            debug!(
-                "No reporting_audio_enabled found in health packet for peer: {}",
-                reporting_peer
-            );
-        }
+        debug!(
+            "Setting SELF_AUDIO_ENABLED for meeting={}, peer={}, value={}",
+            meeting_id, reporting_peer, health_packet.reporting_audio_enabled
+        );
+        SELF_AUDIO_ENABLED
+            .with_label_values(&[meeting_id, reporting_peer])
+            .set(if health_packet.reporting_audio_enabled {
+                1.0
+            } else {
+                0.0
+            });
 
-        if let Some(video_enabled) = health_packet
-            .get("reporting_video_enabled")
-            .and_then(|v| v.as_bool())
-        {
-            debug!(
-                "Setting SELF_VIDEO_ENABLED for meeting={}, peer={}, value={}",
-                meeting_id, reporting_peer, video_enabled
-            );
-            SELF_VIDEO_ENABLED
-                .with_label_values(&[meeting_id, reporting_peer])
-                .set(if video_enabled { 1.0 } else { 0.0 });
-        } else {
-            debug!(
-                "No reporting_video_enabled found in health packet for peer: {}",
-                reporting_peer
-            );
-        }
+        debug!(
+            "Setting SELF_VIDEO_ENABLED for meeting={}, peer={}, value={}",
+            meeting_id, reporting_peer, health_packet.reporting_video_enabled
+        );
+        SELF_VIDEO_ENABLED
+            .with_label_values(&[meeting_id, reporting_peer])
+            .set(if health_packet.reporting_video_enabled {
+                1.0
+            } else {
+                0.0
+            });
 
         // Process peer health data
-        if let Some(peers) = health_packet.get("peer_stats").and_then(|v| v.as_object()) {
+        if !health_packet.peer_stats.is_empty() {
             let mut participants_count = 0;
 
-            for (peer_id, peer_data) in peers {
+            for (peer_id, peer_data) in &health_packet.peer_stats {
                 participants_count += 1;
 
                 // Set peer connection metric
@@ -277,9 +270,10 @@ fn process_health_packet_to_metrics(
                     }
                 }
 
-                if let Some(peer_obj) = peer_data.as_object() {
+                {
                     // Process can_listen
-                    if let Some(can_listen) = peer_obj.get("can_listen").and_then(|v| v.as_bool()) {
+                    {
+                        let can_listen = peer_data.can_listen;
                         PEER_CAN_LISTEN
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
                             .set(if can_listen { 1.0 } else { 0.0 });
@@ -292,7 +286,8 @@ fn process_health_packet_to_metrics(
                     }
 
                     // Process can_see
-                    if let Some(can_see) = peer_obj.get("can_see").and_then(|v| v.as_bool()) {
+                    {
+                        let can_see = peer_data.can_see;
                         PEER_CAN_SEE
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
                             .set(if can_see { 1.0 } else { 0.0 });
@@ -304,11 +299,8 @@ fn process_health_packet_to_metrics(
                     }
 
                     // Process NetEQ metrics from neteq_stats object
-                    if let Some(neteq_stats) = peer_obj.get("neteq_stats") {
-                        if let Some(audio_buffer_ms) = neteq_stats
-                            .get("current_buffer_size_ms")
-                            .and_then(|v| v.as_f64())
-                        {
+                    if let Some(neteq_stats) = peer_data.neteq_stats.as_ref() {
+                        if neteq_stats.current_buffer_size_ms != 0.0 {
                             NETEQ_AUDIO_BUFFER_MS
                                 .with_label_values(&[
                                     meeting_id,
@@ -316,7 +308,7 @@ fn process_health_packet_to_metrics(
                                     reporting_peer,
                                     peer_id,
                                 ])
-                                .set(audio_buffer_ms);
+                                .set(neteq_stats.current_buffer_size_ms);
                             let mut tracker = session_tracker.lock().unwrap();
                             let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
                             if let Some(info) = tracker.get_mut(&key) {
@@ -324,10 +316,7 @@ fn process_health_packet_to_metrics(
                             }
                         }
 
-                        if let Some(packets_awaiting) = neteq_stats
-                            .get("packets_awaiting_decode")
-                            .and_then(|v| v.as_f64())
-                        {
+                        if neteq_stats.packets_awaiting_decode != 0.0 {
                             NETEQ_PACKETS_AWAITING_DECODE
                                 .with_label_values(&[
                                     meeting_id,
@@ -335,7 +324,7 @@ fn process_health_packet_to_metrics(
                                     reporting_peer,
                                     peer_id,
                                 ])
-                                .set(packets_awaiting);
+                                .set(neteq_stats.packets_awaiting_decode);
                             let mut tracker = session_tracker.lock().unwrap();
                             let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
                             if let Some(info) = tracker.get_mut(&key) {
@@ -344,12 +333,9 @@ fn process_health_packet_to_metrics(
                         }
 
                         // Process NetEQ operation metrics from network.operation_counters
-                        if let Some(network) = neteq_stats.get("network") {
-                            if let Some(operation_counters) = network.get("operation_counters") {
+                        if let Some(network) = neteq_stats.network.as_ref() {
+                            if let Some(operation_counters) = network.operation_counters.as_ref() {
                                 // Normal operations per second
-                                if let Some(normal_ops) = operation_counters
-                                    .get("normal_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_NORMAL_OPS_PER_SEC
                                         .with_label_values(&[
@@ -358,13 +344,10 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(normal_ops);
+                                        .set(operation_counters.normal_per_sec);
                                 }
 
                                 // Expand operations per second
-                                if let Some(expand_ops) = operation_counters
-                                    .get("expand_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_EXPAND_OPS_PER_SEC
                                         .with_label_values(&[
@@ -373,13 +356,10 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(expand_ops);
+                                        .set(operation_counters.expand_per_sec);
                                 }
 
                                 // Accelerate operations per second
-                                if let Some(accelerate_ops) = operation_counters
-                                    .get("accelerate_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_ACCELERATE_OPS_PER_SEC
                                         .with_label_values(&[
@@ -388,13 +368,10 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(accelerate_ops);
+                                        .set(operation_counters.accelerate_per_sec);
                                 }
 
                                 // Fast accelerate operations per second
-                                if let Some(fast_accelerate_ops) = operation_counters
-                                    .get("fast_accelerate_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_FAST_ACCELERATE_OPS_PER_SEC
                                         .with_label_values(&[
@@ -403,13 +380,10 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(fast_accelerate_ops);
+                                        .set(operation_counters.fast_accelerate_per_sec);
                                 }
 
                                 // Preemptive expand operations per second
-                                if let Some(preemptive_expand_ops) = operation_counters
-                                    .get("preemptive_expand_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC
                                         .with_label_values(&[
@@ -418,13 +392,10 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(preemptive_expand_ops);
+                                        .set(operation_counters.preemptive_expand_per_sec);
                                 }
 
                                 // Merge operations per second
-                                if let Some(merge_ops) = operation_counters
-                                    .get("merge_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_MERGE_OPS_PER_SEC
                                         .with_label_values(&[
@@ -433,13 +404,10 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(merge_ops);
+                                        .set(operation_counters.merge_per_sec);
                                 }
 
                                 // Comfort noise operations per second
-                                if let Some(comfort_noise_ops) = operation_counters
-                                    .get("comfort_noise_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_COMFORT_NOISE_OPS_PER_SEC
                                         .with_label_values(&[
@@ -448,13 +416,10 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(comfort_noise_ops);
+                                        .set(operation_counters.comfort_noise_per_sec);
                                 }
 
                                 // DTMF operations per second
-                                if let Some(dtmf_ops) = operation_counters
-                                    .get("dtmf_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_DTMF_OPS_PER_SEC
                                         .with_label_values(&[
@@ -463,13 +428,10 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(dtmf_ops);
+                                        .set(operation_counters.dtmf_per_sec);
                                 }
 
                                 // Undefined operations per second
-                                if let Some(undefined_ops) = operation_counters
-                                    .get("undefined_per_sec")
-                                    .and_then(|v| v.as_f64())
                                 {
                                     NETEQ_UNDEFINED_OPS_PER_SEC
                                         .with_label_values(&[
@@ -478,16 +440,15 @@ fn process_health_packet_to_metrics(
                                             reporting_peer,
                                             peer_id,
                                         ])
-                                        .set(undefined_ops);
+                                        .set(operation_counters.undefined_per_sec);
                                 }
                             }
                         }
                     }
 
                     // Process video metrics from video_stats object
-                    if let Some(video_stats) = peer_obj.get("video_stats") {
-                        if let Some(fps) = video_stats.get("fps_received").and_then(|v| v.as_f64())
-                        {
+                    if let Some(video_stats) = peer_data.video_stats.as_ref() {
+                        if video_stats.fps_received != 0.0 {
                             VIDEO_FPS
                                 .with_label_values(&[
                                     meeting_id,
@@ -495,16 +456,12 @@ fn process_health_packet_to_metrics(
                                     reporting_peer,
                                     peer_id,
                                 ])
-                                .set(fps);
+                                .set(video_stats.fps_received);
                         }
 
-                        if let Some(packets_buffered) = video_stats
-                            .get("frames_buffered")
-                            .or_else(|| video_stats.get("packets_buffered"))
-                            .and_then(|v| v.as_f64())
-                        {
+                        if video_stats.frames_buffered != 0.0 {
                             debug!("Setting VIDEO_PACKETS_BUFFERED for meeting={}, session={}, from_peer={}, to_peer={}, value={}", 
-                                   meeting_id, session_id, reporting_peer, peer_id, packets_buffered);
+                                   meeting_id, session_id, reporting_peer, peer_id, video_stats.frames_buffered);
                             VIDEO_PACKETS_BUFFERED
                                 .with_label_values(&[
                                     meeting_id,
@@ -512,25 +469,20 @@ fn process_health_packet_to_metrics(
                                     reporting_peer,
                                     peer_id,
                                 ])
-                                .set(packets_buffered);
-                        } else {
-                            debug!("No frames_buffered/packets_buffered found in video_stats for peer: {} -> {}", reporting_peer, peer_id);
-                            debug!("video_stats content: {:?}", video_stats);
+                                .set(video_stats.frames_buffered);
                         }
                     }
 
                     // Process explicit peer status flags if present
-                    if let Some(audio_enabled) =
-                        peer_obj.get("audio_enabled").and_then(|v| v.as_bool())
                     {
+                        let audio_enabled = peer_data.audio_enabled;
                         PEER_AUDIO_ENABLED
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
                             .set(if audio_enabled { 1.0 } else { 0.0 });
                     }
 
-                    if let Some(video_enabled) =
-                        peer_obj.get("video_enabled").and_then(|v| v.as_bool())
                     {
+                        let video_enabled = peer_data.video_enabled;
                         PEER_VIDEO_ENABLED
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
                             .set(if video_enabled { 1.0 } else { 0.0 });
@@ -587,19 +539,14 @@ async fn handle_health_message(
     session_tracker: &SessionTracker,
 ) -> anyhow::Result<()> {
     let topic = &message.subject;
-    let payload = std::str::from_utf8(&message.payload)?;
-
     debug!("Received health data from topic: {}", topic);
 
-    // Parse JSON health packet
-    let health_packet: Value = serde_json::from_str(payload)?;
+    // Parse protobuf health packet
+    let health_packet: PbHealthPacket = PbHealthPacket::parse_from_bytes(&message.payload)?;
 
     // Freshness guard: discard stale packets
     let now_ms: u128 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let packet_ts_ms_opt: Option<u128> = health_packet
-        .get("ts_ms")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u128);
+    let packet_ts_ms_opt: Option<u128> = Some(health_packet.timestamp_ms as u128);
 
     // 30 seconds timeout
     let is_fresh = match packet_ts_ms_opt {
@@ -609,7 +556,7 @@ async fn handle_health_message(
 
     if is_fresh {
         // Update Prometheus metrics immediately on ingest
-        if let Err(e) = process_health_packet_to_metrics(&health_packet, session_tracker) {
+        if let Err(e) = process_health_packet_to_metrics_pb(&health_packet, session_tracker) {
             error!("Failed to process health packet for metrics: {}", e);
         }
     } else {
@@ -619,7 +566,13 @@ async fn handle_health_message(
     // Store latest health data using topic as key
     {
         let mut store = health_store.lock().unwrap();
-        store.insert(topic.to_string(), health_packet);
+        let json_val = json!({
+            "session_id": health_packet.session_id,
+            "meeting_id": health_packet.meeting_id,
+            "reporting_peer": health_packet.reporting_peer,
+            "timestamp_ms": health_packet.timestamp_ms,
+        });
+        store.insert(topic.to_string(), json_val);
     }
 
     debug!("Stored health data for {}", topic);
@@ -687,26 +640,30 @@ mod tests {
     use super::*;
     use actix_web::web;
     use prometheus::Encoder;
-    use serde_json::json;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use videocall_types::protos::health_packet::{
+        HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
+        NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
+        PeerStats as PbPeerStats, VideoStats as PbVideoStats,
+    };
 
-    /// Helper function to create a test health packet
+    /// Helper function to create a test health packet (protobuf)
     fn create_test_health_packet(
         session_id: &str,
         meeting_id: &str,
         reporting_peer: &str,
-        peer_stats: serde_json::Map<String, serde_json::Value>,
-    ) -> Value {
-        json!({
-            "session_id": session_id,
-            "meeting_id": meeting_id,
-            "reporting_peer": reporting_peer,
-            "timestamp_ms": SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            "peer_stats": peer_stats
-        })
+        peer_stats: std::collections::HashMap<String, PbPeerStats>,
+    ) -> PbHealthPacket {
+        let mut hp = PbHealthPacket::new();
+        hp.session_id = session_id.to_string();
+        hp.meeting_id = meeting_id.to_string();
+        hp.reporting_peer = reporting_peer.to_string();
+        hp.timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        hp.peer_stats = peer_stats;
+        hp
     }
 
     fn series_exists(metric_name: &str, expected_labels: &[(&str, &str)]) -> bool {
@@ -737,40 +694,65 @@ mod tests {
         false
     }
 
-    /// Helper function to create test peer stats with NetEQ data
+    /// Helper function to create test peer stats with NetEQ data (protobuf)
     fn create_test_peer_stats(
         peer_id: &str,
         can_listen: bool,
         can_see: bool,
         audio_buffer_ms: f64,
         packets_awaiting_decode: f64,
-    ) -> (String, serde_json::Value) {
-        let neteq_stats = json!({
-            "current_buffer_size_ms": audio_buffer_ms,
-            "packets_awaiting_decode": packets_awaiting_decode,
-            "network": {
-                "operation_counters": {
-                    "normal_per_sec": 10.0,
-                    "expand_per_sec": 2.0,
-                    "accelerate_per_sec": 1.0,
-                    "fast_accelerate_per_sec": 0.0,
-                    "preemptive_expand_per_sec": 5.0,
-                    "merge_per_sec": 0.0,
-                    "comfort_noise_per_sec": 0.0,
-                    "dtmf_per_sec": 0.0,
-                    "undefined_per_sec": 0.0
-                }
-            }
-        });
+    ) -> (String, PbPeerStats) {
+        let mut counters = PbNetEqOperationCounters::new();
+        counters.normal_per_sec = 10.0;
+        counters.expand_per_sec = 2.0;
+        counters.accelerate_per_sec = 1.0;
+        counters.fast_accelerate_per_sec = 0.0;
+        counters.preemptive_expand_per_sec = 5.0;
+        counters.merge_per_sec = 0.0;
+        counters.comfort_noise_per_sec = 0.0;
+        counters.dtmf_per_sec = 0.0;
+        counters.undefined_per_sec = 0.0;
 
-        let peer_stat = json!({
-            "can_listen": can_listen,
-            "can_see": can_see,
-            "neteq_stats": neteq_stats,
-            "video_stats": null
-        });
+        let mut network = PbNetEqNetwork::new();
+        network.operation_counters = ::protobuf::MessageField::some(counters);
 
-        (peer_id.to_string(), peer_stat)
+        let mut ns = PbNetEqStats::new();
+        ns.current_buffer_size_ms = audio_buffer_ms;
+        ns.packets_awaiting_decode = packets_awaiting_decode;
+        ns.network = ::protobuf::MessageField::some(network);
+
+        let mut ps = PbPeerStats::new();
+        ps.can_listen = can_listen;
+        ps.can_see = can_see;
+        ps.audio_enabled = can_listen;
+        ps.video_enabled = can_see;
+        ps.neteq_stats = ::protobuf::MessageField::some(ns);
+        (peer_id.to_string(), ps)
+    }
+
+    /// Helper for peer stats including video
+    fn create_test_peer_stats_with_video(
+        peer_id: &str,
+        can_listen: bool,
+        can_see: bool,
+        fps_received: f64,
+        frames_buffered: f64,
+        frames_decoded: u64,
+        bitrate_kbps: u64,
+    ) -> (String, PbPeerStats) {
+        let mut vs = PbVideoStats::new();
+        vs.fps_received = fps_received;
+        vs.frames_buffered = frames_buffered;
+        vs.frames_decoded = frames_decoded;
+        vs.bitrate_kbps = bitrate_kbps;
+
+        let mut ps = PbPeerStats::new();
+        ps.can_listen = can_listen;
+        ps.can_see = can_see;
+        ps.audio_enabled = can_listen;
+        ps.video_enabled = can_see;
+        ps.video_stats = ::protobuf::MessageField::some(vs);
+        (peer_id.to_string(), ps)
     }
 
     #[test]
@@ -890,7 +872,7 @@ mod tests {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
         // Create test peer stats
-        let mut peer_stats = serde_json::Map::new();
+        let mut peer_stats = std::collections::HashMap::new();
         let (peer_id, peer_stat) = create_test_peer_stats("bob", true, false, 100.0, 5.0);
         peer_stats.insert(peer_id, peer_stat);
 
@@ -898,7 +880,7 @@ mod tests {
             create_test_health_packet("session_123", "meeting_456", "alice", peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics(&health_packet, &tracker);
+        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
         assert!(result.is_ok());
 
         // Verify session was tracked
@@ -915,11 +897,77 @@ mod tests {
     }
 
     #[test]
+    fn test_self_enabled_metrics_export() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let mut peer_stats = std::collections::HashMap::new();
+        let (peer_id, peer_stat) = create_test_peer_stats("bob", true, true, 50.0, 1.0);
+        peer_stats.insert(peer_id, peer_stat);
+
+        let mut hp = create_test_health_packet("sess_self", "meet_self", "alice", peer_stats);
+        hp.reporting_audio_enabled = true;
+        hp.reporting_video_enabled = true;
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        assert!(result.is_ok());
+
+        assert!(series_exists(
+            "videocall_self_audio_enabled",
+            &[("meeting_id", "meet_self"), ("peer_id", "alice")]
+        ));
+        assert!(series_exists(
+            "videocall_self_video_enabled",
+            &[("meeting_id", "meet_self"), ("peer_id", "alice")]
+        ));
+    }
+
+    #[test]
+    fn test_peer_enabled_and_video_buffered_metrics_export() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut peer_stats = std::collections::HashMap::new();
+        // audio enabled true, video enabled false, but with some video stats present
+        let (peer_id, ps) =
+            create_test_peer_stats_with_video("bob", true, false, 24.0, 10.0, 100, 300);
+        peer_stats.insert(peer_id.clone(), ps);
+
+        let hp = create_test_health_packet("sess_ab", "meet_ab", "alice", peer_stats);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        assert!(result.is_ok());
+
+        assert!(series_exists(
+            "videocall_peer_audio_enabled",
+            &[
+                ("meeting_id", "meet_ab"),
+                ("session_id", "sess_ab"),
+                ("from_peer", "alice"),
+                ("to_peer", "bob")
+            ]
+        ));
+        assert!(series_exists(
+            "videocall_peer_video_enabled",
+            &[
+                ("meeting_id", "meet_ab"),
+                ("session_id", "sess_ab"),
+                ("from_peer", "alice"),
+                ("to_peer", "bob")
+            ]
+        ));
+        assert!(series_exists(
+            "videocall_video_packets_buffered",
+            &[
+                ("meeting_id", "meet_ab"),
+                ("session_id", "sess_ab"),
+                ("from_peer", "alice"),
+                ("to_peer", "bob")
+            ]
+        ));
+    }
+
+    #[test]
     fn test_metrics_handler_does_not_process_cached_health() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
         let health_store: HealthDataStore = Arc::new(Mutex::new(HashMap::new()));
 
-        let mut peer_stats = serde_json::Map::new();
+        let mut peer_stats = std::collections::HashMap::new();
         let (peer_id, peer_stat) = create_test_peer_stats("bob", true, false, 100.0, 5.0);
         peer_stats.insert(peer_id, peer_stat);
 
@@ -927,7 +975,11 @@ mod tests {
             create_test_health_packet("session_cached", "meeting_cached", "alice", peer_stats);
         {
             let mut store = health_store.lock().unwrap();
-            store.insert("health.diagnostics.test".to_string(), packet);
+            // Store a dummy JSON value; cached store is not used for metrics anyway
+            store.insert(
+                "health.diagnostics.test".to_string(),
+                serde_json::json!({"cached": true}),
+            );
         }
 
         // metrics_handler should not mutate metrics/tracker from cached store
@@ -951,14 +1003,14 @@ mod tests {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
         // Publish metrics
-        let mut peer_stats = serde_json::Map::new();
+        let mut peer_stats = std::collections::HashMap::new();
         let (peer_id, peer_stat) = create_test_peer_stats("bob", true, true, 150.0, 8.0);
         peer_stats.insert(peer_id.clone(), peer_stat);
         let meeting_id = "meeting_rm";
         let session_id = "session_rm";
         let reporting_peer = "alice";
         let packet = create_test_health_packet(session_id, meeting_id, reporting_peer, peer_stats);
-        let result = process_health_packet_to_metrics(&packet, &tracker);
+        let result = process_health_packet_to_metrics_pb(&packet, &tracker);
         assert!(result.is_ok());
 
         // Confirm a series exists
@@ -996,7 +1048,7 @@ mod tests {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
         // Create comprehensive peer stats with NetEQ data
-        let mut peer_stats = serde_json::Map::new();
+        let mut peer_stats = std::collections::HashMap::new();
 
         // Add peer with full NetEQ stats
         let (peer_id1, peer_stat1) = create_test_peer_stats("bob", true, true, 150.0, 8.0);
@@ -1010,7 +1062,7 @@ mod tests {
             create_test_health_packet("session_789", "meeting_999", "alice", peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics(&health_packet, &tracker);
+        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
         assert!(result.is_ok());
 
         // Verify session tracking
@@ -1025,19 +1077,11 @@ mod tests {
     fn test_process_health_packet_to_metrics_malformed_data() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
-        // Test with missing required fields
-        let malformed_packet = json!({
-            "session_id": "session_123",
-            // Missing meeting_id and reporting_peer
-        });
-
-        let result = process_health_packet_to_metrics(&malformed_packet, &tracker);
-        assert!(result.is_ok()); // Should handle gracefully with defaults
-
-        // Test with completely invalid JSON
-        let invalid_packet = json!("not an object");
-        let result = process_health_packet_to_metrics(&invalid_packet, &tracker);
-        assert!(result.is_ok()); // Should handle gracefully
+        // Test minimal packet
+        let mut peer_stats = std::collections::HashMap::new();
+        let hp = create_test_health_packet("session_123", "meeting_123", "alice", peer_stats);
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1159,12 +1203,12 @@ mod tests {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
         // Create health packet with empty peer stats
-        let empty_peer_stats = serde_json::Map::new();
+        let empty_peer_stats = std::collections::HashMap::new();
         let health_packet =
             create_test_health_packet("session_empty", "meeting_empty", "alice", empty_peer_stats);
 
         // Process the health packet
-        let result = process_health_packet_to_metrics(&health_packet, &tracker);
+        let result = process_health_packet_to_metrics_pb(&health_packet, &tracker);
         assert!(result.is_ok());
 
         // Verify session was still tracked even with empty peer stats

@@ -17,11 +17,17 @@
  */
 
 use log::{debug, warn};
+use protobuf::Message;
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
+use videocall_types::protos::health_packet::{
+    HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
+    NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
+    PeerStats as PbPeerStats, VideoStats as PbVideoStats,
+};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen_futures::spawn_local;
@@ -446,41 +452,113 @@ impl HealthReporter {
             return None;
         }
 
-        // Build the peer stats map for the connectivity matrix
-        let mut peer_stats = serde_json::Map::new();
+        // Build protobuf HealthPacket with structured stats
+        let mut pb = PbHealthPacket::new();
+        pb.session_id = session_id.to_string();
+        pb.meeting_id = meeting_id.to_string();
+        pb.reporting_peer = reporting_peer.to_string();
+        pb.timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        pb.reporting_audio_enabled = self_audio_enabled;
+        pb.reporting_video_enabled = self_video_enabled;
 
         for (peer_id, health_data) in health_map.iter() {
-            let peer_stat = json!({
-                "can_listen": health_data.can_listen,
-                "can_see": health_data.can_see,
-                "audio_enabled": health_data.can_listen,
-                "video_enabled": health_data.can_see,
-                "neteq_stats": health_data.last_neteq_stats,
-                "video_stats": health_data.last_video_stats
-            });
-            peer_stats.insert(peer_id.clone(), peer_stat);
+            let mut ps = PbPeerStats::new();
+            ps.can_listen = health_data.can_listen;
+            ps.can_see = health_data.can_see;
+            // Map enabled flags conservatively to connectivity signals for now
+            ps.audio_enabled = health_data.can_listen;
+            ps.video_enabled = health_data.can_see;
+
+            // NetEQ mapping
+            if let Some(neteq) = &health_data.last_neteq_stats {
+                let mut ns = PbNetEqStats::new();
+                if let Some(v) = neteq.get("current_buffer_size_ms").and_then(|v| v.as_f64()) {
+                    ns.current_buffer_size_ms = v;
+                }
+                if let Some(v) = neteq
+                    .get("packets_awaiting_decode")
+                    .and_then(|v| v.as_f64())
+                {
+                    ns.packets_awaiting_decode = v;
+                }
+                if let Some(network) = neteq.get("network") {
+                    let mut nn = PbNetEqNetwork::new();
+                    if let Some(counters) = network.get("operation_counters") {
+                        let mut oc = PbNetEqOperationCounters::new();
+                        if let Some(v) = counters.get("normal_per_sec").and_then(|v| v.as_f64()) {
+                            oc.normal_per_sec = v;
+                        }
+                        if let Some(v) = counters.get("expand_per_sec").and_then(|v| v.as_f64()) {
+                            oc.expand_per_sec = v;
+                        }
+                        if let Some(v) = counters.get("accelerate_per_sec").and_then(|v| v.as_f64())
+                        {
+                            oc.accelerate_per_sec = v;
+                        }
+                        if let Some(v) = counters
+                            .get("fast_accelerate_per_sec")
+                            .and_then(|v| v.as_f64())
+                        {
+                            oc.fast_accelerate_per_sec = v;
+                        }
+                        if let Some(v) = counters
+                            .get("preemptive_expand_per_sec")
+                            .and_then(|v| v.as_f64())
+                        {
+                            oc.preemptive_expand_per_sec = v;
+                        }
+                        if let Some(v) = counters.get("merge_per_sec").and_then(|v| v.as_f64()) {
+                            oc.merge_per_sec = v;
+                        }
+                        if let Some(v) = counters
+                            .get("comfort_noise_per_sec")
+                            .and_then(|v| v.as_f64())
+                        {
+                            oc.comfort_noise_per_sec = v;
+                        }
+                        if let Some(v) = counters.get("dtmf_per_sec").and_then(|v| v.as_f64()) {
+                            oc.dtmf_per_sec = v;
+                        }
+                        if let Some(v) = counters.get("undefined_per_sec").and_then(|v| v.as_f64())
+                        {
+                            oc.undefined_per_sec = v;
+                        }
+                        nn.operation_counters = ::protobuf::MessageField::some(oc);
+                    }
+                    ns.network = ::protobuf::MessageField::some(nn);
+                }
+                ps.neteq_stats = ::protobuf::MessageField::some(ns);
+            }
+
+            // Video mapping
+            if let Some(video) = &health_data.last_video_stats {
+                let mut vs = PbVideoStats::new();
+                if let Some(v) = video.get("fps_received").and_then(|v| v.as_f64()) {
+                    vs.fps_received = v;
+                }
+                if let Some(v) = video.get("frames_buffered").and_then(|v| v.as_f64()) {
+                    vs.frames_buffered = v;
+                }
+                if let Some(v) = video.get("frames_decoded").and_then(|v| v.as_u64()) {
+                    vs.frames_decoded = v;
+                }
+                if let Some(v) = video.get("bitrate_kbps").and_then(|v| v.as_u64()) {
+                    vs.bitrate_kbps = v;
+                }
+                ps.video_stats = ::protobuf::MessageField::some(vs);
+            }
+
+            pb.peer_stats.insert(peer_id.clone(), ps);
         }
 
-        let health_data = json!({
-            "session_id": session_id,
-            "meeting_id": meeting_id,
-            "reporting_peer": reporting_peer,
-            "timestamp_ms": SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            "reporting_audio_enabled": self_audio_enabled,
-            "reporting_video_enabled": self_video_enabled,
-            "peer_stats": peer_stats
-        });
-
-        let health_json = health_data.to_string();
-        debug!("Health packet JSON: {health_json}");
-
+        let bytes = pb.write_to_bytes().unwrap_or_default();
         Some(PacketWrapper {
             packet_type: PacketType::HEALTH.into(),
             email: reporting_peer.to_string(),
-            data: health_json.into_bytes(),
+            data: bytes,
             ..Default::default()
         })
     }

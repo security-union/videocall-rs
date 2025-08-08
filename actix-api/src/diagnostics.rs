@@ -23,30 +23,17 @@
 pub mod health_processor {
     use actix_web::{HttpResponse, Responder};
     use prometheus::{Encoder, TextEncoder};
+    use protobuf::Message;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use tracing::{debug, warn};
 
     // Health data structure matching RFC design
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct PeerHealthData {
-        pub session_id: String,
-        pub meeting_id: String, // Add meeting_id field
-        pub reporting_peer: String,
-        pub timestamp_ms: u64,
-        pub peer_stats: HashMap<String, PeerStats>,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct PeerStats {
-        pub can_listen: bool,
-        pub can_see: bool,
-        pub neteq_stats: Option<serde_json::Value>,
-        pub video_stats: Option<serde_json::Value>,
-    }
+    // Use protobuf HealthPacket on the wire; keep simple structs only if needed internally.
+    use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
 
     /// Process a health packet and update Prometheus metrics
-    pub fn process_health_packet(health_data: &PeerHealthData, client: async_nats::client::Client) {
+    pub fn process_health_packet(health_data: &PbHealthPacket, client: async_nats::client::Client) {
         debug!(
             "Publishing health report from {} in session {} for meeting {} to NATS",
             health_data.reporting_peer, health_data.session_id, health_data.meeting_id
@@ -56,7 +43,7 @@ pub mod health_processor {
         publish_health_to_nats(health_data.clone(), client);
     }
 
-    fn publish_health_to_nats(health_data: PeerHealthData, client: async_nats::client::Client) {
+    fn publish_health_to_nats(health_data: PbHealthPacket, client: async_nats::client::Client) {
         tokio::spawn(async move {
             if let Err(e) = publish_health_to_nats_async(health_data, client).await {
                 warn!("Failed to publish health data to NATS: {}", e);
@@ -65,7 +52,7 @@ pub mod health_processor {
     }
 
     async fn publish_health_to_nats_async(
-        health_data: PeerHealthData,
+        health_data: PbHealthPacket,
         client: async_nats::client::Client,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
@@ -78,16 +65,15 @@ pub mod health_processor {
             region, service_type, server_id
         );
 
-        let json_payload = serde_json::to_string(&health_data)?;
-
-        client.publish(topic.clone(), json_payload.into()).await?;
+        let payload = health_data.write_to_bytes()?;
+        client.publish(topic.clone(), payload.into()).await?;
         debug!("Published health data to NATS topic: {}", topic);
         Ok(())
     }
 
     /// Parse health packet from JSON bytes
-    pub fn parse_health_packet(data: &[u8]) -> Result<PeerHealthData, serde_json::Error> {
-        serde_json::from_slice(data)
+    pub fn parse_health_packet(data: &[u8]) -> Result<PbHealthPacket, protobuf::Error> {
+        PbHealthPacket::parse_from_bytes(data)
     }
 
     /// Prometheus metrics endpoint handler

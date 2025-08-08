@@ -597,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
 
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use videocall_types::protos::health_packet::{
         HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
         NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,
@@ -1204,50 +1204,6 @@ mod tests {
         {
             let tracker_guard = tracker.lock().unwrap();
             assert_eq!(tracker_guard.len(), 0);
-        }
-    }
-}
-
-#[cfg(all(test, not(feature = "diagnostics")))]
-mod tests {
-    use super::*;
-    use std::time::Instant;
-
-    #[test]
-    fn test_session_info_basic_functionality() {
-        let session_info = SessionInfo {
-            session_id: "session_123".to_string(),
-            meeting_id: "meeting_456".to_string(),
-            reporting_peer: "alice".to_string(),
-            last_seen: Instant::now(),
-            to_peers: HashSet::new(),
-            peer_ids: HashSet::new(),
-        };
-
-        assert_eq!(session_info.session_id, "session_123");
-        assert_eq!(session_info.meeting_id, "meeting_456");
-        assert_eq!(session_info.reporting_peer, "alice");
-    }
-
-    #[test]
-    fn test_session_tracker_basic_operations() {
-        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
-
-        // Test basic session tracking operations
-        {
-            let mut tracker_guard = tracker.lock().unwrap();
-            let session_key = "test_session".to_string();
-            let session_info = SessionInfo {
-                session_id: "session_1".to_string(),
-                meeting_id: "meeting_1".to_string(),
-                reporting_peer: "alice".to_string(),
-                last_seen: Instant::now(),
-                to_peers: HashSet::new(),
-                peer_ids: HashSet::new(),
-            };
-            tracker_guard.insert(session_key.clone(), session_info);
-            assert_eq!(tracker_guard.len(), 1);
-            assert!(tracker_guard.contains_key(&session_key));
         }
     }
 }

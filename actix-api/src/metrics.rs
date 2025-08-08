@@ -185,4 +185,36 @@ lazy_static! {
         &["meeting_id", "session_id", "from_peer", "to_peer"]
     )
     .expect("Failed to create video_fps metric");
+
+    /// Whether receiving peer reports audio enabled for the sender
+    pub static ref PEER_AUDIO_ENABLED: GaugeVec = register_gauge_vec!(
+        "videocall_peer_audio_enabled",
+        "Indicates if sender's audio is enabled (1=yes, 0=no)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create peer_audio_enabled metric");
+
+    /// Whether receiving peer reports video enabled for the sender
+    pub static ref PEER_VIDEO_ENABLED: GaugeVec = register_gauge_vec!(
+        "videocall_peer_video_enabled",
+        "Indicates if sender's camera is enabled (1=yes, 0=no)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create peer_video_enabled metric");
+
+    /// Sender self-reported audio enabled (authoritative), per meeting and peer
+    pub static ref SELF_AUDIO_ENABLED: GaugeVec = register_gauge_vec!(
+        "videocall_self_audio_enabled",
+        "Sender self-reported audio enabled (1=yes, 0=no)",
+        &["meeting_id", "peer_id"]
+    )
+    .expect("Failed to create self_audio_enabled metric");
+
+    /// Sender self-reported video enabled (authoritative), per meeting and peer
+    pub static ref SELF_VIDEO_ENABLED: GaugeVec = register_gauge_vec!(
+        "videocall_self_video_enabled",
+        "Sender self-reported video enabled (1=yes, 0=no)",
+        &["meeting_id", "peer_id"]
+    )
+    .expect("Failed to create self_video_enabled metric");
 }

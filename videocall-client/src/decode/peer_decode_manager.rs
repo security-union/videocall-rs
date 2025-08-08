@@ -26,6 +26,7 @@ use log::debug;
 use protobuf::Message;
 use std::rc::Rc;
 use std::{fmt::Display, sync::Arc};
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -84,6 +85,7 @@ pub struct Peer {
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub screen_enabled: bool,
+    context_initialized: bool,
 }
 
 use std::fmt::Debug;
@@ -124,6 +126,7 @@ impl Peer {
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
+            context_initialized: false,
         })
     }
 
@@ -285,6 +288,27 @@ impl Peer {
                             self.email
                         );
                     }
+
+                    // Broadcast peer status to diagnostics with original IDs
+                    // We don't have local userid here; use reporting peer context via diagnostics elsewhere.
+                    let evt = DiagEvent {
+                        subsystem: "peer_status",
+                        stream_id: None,
+                        ts_ms: now_ms(),
+                        metrics: vec![
+                            // from_peer will be attached by higher layer that knows the local user id
+                            metric!("to_peer", self.email.clone()),
+                            metric!(
+                                "audio_enabled",
+                                if metadata.audio_enabled { 1u64 } else { 0u64 }
+                            ),
+                            metric!(
+                                "video_enabled",
+                                if metadata.video_enabled { 1u64 } else { 0u64 }
+                            ),
+                        ],
+                    };
+                    let _ = global_sender().try_broadcast(evt);
                 }
                 Ok((
                     media_type,
@@ -387,6 +411,14 @@ impl PeerDecodeManager {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         if let Some(peer) = self.connected_peers.get_mut(&email) {
+            // Set worker diagnostics context once per peer
+            if !peer.context_initialized {
+                peer.video
+                    .set_stream_context(userid.to_string(), email.clone());
+                peer.screen
+                    .set_stream_context(userid.to_string(), email.clone());
+                peer.context_initialized = true;
+            }
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();

@@ -645,6 +645,11 @@ impl VideoCallClient {
                     error!("Failed to set video enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set video enabled: {enabled}");
+                    if let Some(hr) = &inner.health_reporter {
+                        if let Ok(hrb) = hr.try_borrow() {
+                            hrb.set_reporting_video_enabled(enabled);
+                        }
+                    }
                 }
             } else {
                 debug!("No connection controller available for set_video_enabled({enabled})");
@@ -661,6 +666,11 @@ impl VideoCallClient {
                     error!("Failed to set audio enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set audio enabled: {enabled}");
+                    if let Some(hr) = &inner.health_reporter {
+                        if let Ok(hrb) = hr.try_borrow() {
+                            hrb.set_reporting_audio_enabled(enabled);
+                        }
+                    }
                 }
             } else {
                 debug!("No connection controller available for set_audio_enabled({enabled})");

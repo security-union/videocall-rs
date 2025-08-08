@@ -89,6 +89,8 @@ pub struct HealthReporter {
     peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>>,
     send_packet_callback: Option<Callback<PacketWrapper>>,
     health_interval_ms: u64,
+    reporting_audio_enabled: Rc<RefCell<bool>>,
+    reporting_video_enabled: Rc<RefCell<bool>>,
 }
 
 impl HealthReporter {
@@ -101,12 +103,28 @@ impl HealthReporter {
             peer_health_data: Rc::new(RefCell::new(HashMap::new())),
             send_packet_callback: None,
             health_interval_ms: 5000, // Send health every 5 seconds
+            reporting_audio_enabled: Rc::new(RefCell::new(false)),
+            reporting_video_enabled: Rc::new(RefCell::new(false)),
         }
     }
 
     /// Set the meeting ID
     pub fn set_meeting_id(&mut self, meeting_id: String) {
         self.meeting_id = meeting_id;
+    }
+
+    /// Update sender self-state: audio enabled (authoritative)
+    pub fn set_reporting_audio_enabled(&self, enabled: bool) {
+        if let Ok(mut ae) = self.reporting_audio_enabled.try_borrow_mut() {
+            *ae = enabled;
+        }
+    }
+
+    /// Update sender self-state: video enabled (authoritative)
+    pub fn set_reporting_video_enabled(&self, enabled: bool) {
+        if let Ok(mut ve) = self.reporting_video_enabled.try_borrow_mut() {
+            *ve = enabled;
+        }
     }
 
     /// Set the callback for sending packets
@@ -122,6 +140,8 @@ impl HealthReporter {
     /// Start subscribing to real diagnostics events via videocall_diagnostics
     pub fn start_diagnostics_subscription(&self) {
         let peer_health_data = Rc::downgrade(&self.peer_health_data);
+        let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
+        let video_enabled = Rc::downgrade(&self.reporting_video_enabled);
 
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
@@ -129,6 +149,28 @@ impl HealthReporter {
             let mut receiver = subscribe();
             while let Ok(event) = receiver.recv().await {
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
+                    // Capture self-state from sender diagnostics events
+                    if event.subsystem == "sender" {
+                        if let (Some(ae), Some(ve)) =
+                            (Weak::upgrade(&audio_enabled), Weak::upgrade(&video_enabled))
+                        {
+                            for m in &event.metrics {
+                                match m.name {
+                                    "sender_audio_enabled" => {
+                                        if let MetricValue::U64(v) = &m.value {
+                                            *ae.borrow_mut() = *v > 0;
+                                        }
+                                    }
+                                    "sender_video_enabled" => {
+                                        if let MetricValue::U64(v) = &m.value {
+                                            *ve.borrow_mut() = *v > 0;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
                     Self::process_diagnostics_event(event, &peer_health_data);
                 } else {
                     debug!("HealthReporter dropped, stopping diagnostics subscription");
@@ -262,6 +304,30 @@ impl HealthReporter {
             );
             // Sender events are mainly for server reporting, less impact on health status
         }
+        // Handle peer status events (mute/camera on/off)
+        else if event.subsystem == "peer_status" {
+            if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
+                let peer_data = health_map
+                    .entry(target_peer.to_string())
+                    .or_insert_with(|| PeerHealthData::new(target_peer.to_string()));
+
+                for metric in &event.metrics {
+                    match metric.name {
+                        "audio_enabled" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                peer_data.can_listen = *v > 0;
+                            }
+                        }
+                        "video_enabled" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                peer_data.can_see = *v > 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         // Handle video events
         else if event.subsystem == "video_decoder" || event.subsystem == "video" {
             if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
@@ -270,9 +336,12 @@ impl HealthReporter {
                     .or_insert_with(|| PeerHealthData::new(target_peer.to_string()));
 
                 // Extract video stats from metrics
-                let mut video_stats = json!({
-                    "timestamp_ms": event.ts_ms
-                });
+                let mut video_stats = match &peer_data.last_video_stats {
+                    Some(Value::Object(map)) => Value::Object(map.clone()),
+                    _ => json!({}),
+                };
+                // Always update timestamp
+                video_stats["timestamp_ms"] = json!(event.ts_ms);
 
                 for metric in &event.metrics {
                     match metric.name {
@@ -282,17 +351,15 @@ impl HealthReporter {
                                 peer_data.can_see = *fps > 0.0;
                             }
                         }
-                        "frames_buffered" | "packets_buffered" => {
-                            match &metric.value {
-                                MetricValue::U64(v) => {
-                                    video_stats["frames_buffered"] = json!(v);
-                                }
-                                MetricValue::F64(v) => {
-                                    video_stats["frames_buffered"] = json!(v);
-                                }
-                                _ => {}
+                        "frames_buffered" | "packets_buffered" => match &metric.value {
+                            MetricValue::U64(v) => {
+                                video_stats["frames_buffered"] = json!(v);
                             }
-                        }
+                            MetricValue::F64(v) => {
+                                video_stats["frames_buffered"] = json!(v);
+                            }
+                            _ => {}
+                        },
                         "frames_decoded" => {
                             if let MetricValue::U64(frames) = &metric.value {
                                 video_stats["frames_decoded"] = json!(frames);
@@ -326,6 +393,8 @@ impl HealthReporter {
         let reporting_peer = self.reporting_peer.clone();
         let send_callback = self.send_packet_callback.clone().unwrap();
         let interval_ms = self.health_interval_ms;
+        let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
+        let video_enabled = Rc::downgrade(&self.reporting_video_enabled);
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -336,11 +405,19 @@ impl HealthReporter {
 
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
                     if let Ok(health_map) = peer_health_data.try_borrow() {
+                        let self_audio_enabled = Weak::upgrade(&audio_enabled)
+                            .and_then(|ae| ae.try_borrow().ok().map(|v| *v))
+                            .unwrap_or(false);
+                        let self_video_enabled = Weak::upgrade(&video_enabled)
+                            .and_then(|ve| ve.try_borrow().ok().map(|v| *v))
+                            .unwrap_or(false);
                         let health_packet = Self::create_health_packet(
                             &session_id,
                             &meeting_id,
                             &reporting_peer,
                             &health_map,
+                            self_audio_enabled,
+                            self_video_enabled,
                         );
 
                         if let Some(packet) = health_packet {
@@ -362,6 +439,8 @@ impl HealthReporter {
         meeting_id: &str,
         reporting_peer: &str,
         health_map: &HashMap<String, PeerHealthData>,
+        self_audio_enabled: bool,
+        self_video_enabled: bool,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -374,6 +453,8 @@ impl HealthReporter {
             let peer_stat = json!({
                 "can_listen": health_data.can_listen,
                 "can_see": health_data.can_see,
+                "audio_enabled": health_data.can_listen,
+                "video_enabled": health_data.can_see,
                 "neteq_stats": health_data.last_neteq_stats,
                 "video_stats": health_data.last_video_stats
             });
@@ -388,10 +469,13 @@ impl HealthReporter {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            "reporting_audio_enabled": self_audio_enabled,
+            "reporting_video_enabled": self_video_enabled,
             "peer_stats": peer_stats
         });
 
         let health_json = health_data.to_string();
+        debug!("Health packet JSON: {}", health_json);
 
         Some(PacketWrapper {
             packet_type: PacketType::HEALTH.into(),

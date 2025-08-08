@@ -38,8 +38,9 @@ use sec_api::metrics::{
     NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC, NETEQ_DTMF_OPS_PER_SEC,
     NETEQ_EXPAND_OPS_PER_SEC, NETEQ_FAST_ACCELERATE_OPS_PER_SEC, NETEQ_MERGE_OPS_PER_SEC,
     NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC,
-    NETEQ_UNDEFINED_OPS_PER_SEC, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL,
-    VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
+    NETEQ_UNDEFINED_OPS_PER_SEC, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_FPS,
+    VIDEO_PACKETS_BUFFERED,
 };
 
 #[cfg(feature = "diagnostics")]
@@ -218,6 +219,43 @@ fn process_health_packet_to_metrics(
         ACTIVE_SESSIONS_TOTAL
             .with_label_values(&[meeting_id, session_id])
             .set(1.0);
+
+        // Self-state reported by the sender (authoritative)
+        if let Some(audio_enabled) = health_packet
+            .get("reporting_audio_enabled")
+            .and_then(|v| v.as_bool())
+        {
+            debug!(
+                "Setting SELF_AUDIO_ENABLED for meeting={}, peer={}, value={}",
+                meeting_id, reporting_peer, audio_enabled
+            );
+            SELF_AUDIO_ENABLED
+                .with_label_values(&[meeting_id, reporting_peer])
+                .set(if audio_enabled { 1.0 } else { 0.0 });
+        } else {
+            debug!(
+                "No reporting_audio_enabled found in health packet for peer: {}",
+                reporting_peer
+            );
+        }
+
+        if let Some(video_enabled) = health_packet
+            .get("reporting_video_enabled")
+            .and_then(|v| v.as_bool())
+        {
+            debug!(
+                "Setting SELF_VIDEO_ENABLED for meeting={}, peer={}, value={}",
+                meeting_id, reporting_peer, video_enabled
+            );
+            SELF_VIDEO_ENABLED
+                .with_label_values(&[meeting_id, reporting_peer])
+                .set(if video_enabled { 1.0 } else { 0.0 });
+        } else {
+            debug!(
+                "No reporting_video_enabled found in health packet for peer: {}",
+                reporting_peer
+            );
+        }
 
         // Process peer health data
         if let Some(peers) = health_packet.get("peer_stats").and_then(|v| v.as_object()) {
@@ -448,9 +486,7 @@ fn process_health_packet_to_metrics(
 
                     // Process video metrics from video_stats object
                     if let Some(video_stats) = peer_obj.get("video_stats") {
-                        if let Some(fps) = video_stats
-                            .get("fps_received")
-                            .and_then(|v| v.as_f64())
+                        if let Some(fps) = video_stats.get("fps_received").and_then(|v| v.as_f64())
                         {
                             VIDEO_FPS
                                 .with_label_values(&[
@@ -467,6 +503,8 @@ fn process_health_packet_to_metrics(
                             .or_else(|| video_stats.get("packets_buffered"))
                             .and_then(|v| v.as_f64())
                         {
+                            debug!("Setting VIDEO_PACKETS_BUFFERED for meeting={}, session={}, from_peer={}, to_peer={}, value={}", 
+                                   meeting_id, session_id, reporting_peer, peer_id, packets_buffered);
                             VIDEO_PACKETS_BUFFERED
                                 .with_label_values(&[
                                     meeting_id,
@@ -475,7 +513,27 @@ fn process_health_packet_to_metrics(
                                     peer_id,
                                 ])
                                 .set(packets_buffered);
+                        } else {
+                            debug!("No frames_buffered/packets_buffered found in video_stats for peer: {} -> {}", reporting_peer, peer_id);
+                            debug!("video_stats content: {:?}", video_stats);
                         }
+                    }
+
+                    // Process explicit peer status flags if present
+                    if let Some(audio_enabled) =
+                        peer_obj.get("audio_enabled").and_then(|v| v.as_bool())
+                    {
+                        PEER_AUDIO_ENABLED
+                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .set(if audio_enabled { 1.0 } else { 0.0 });
+                    }
+
+                    if let Some(video_enabled) =
+                        peer_obj.get("video_enabled").and_then(|v| v.as_bool())
+                    {
+                        PEER_VIDEO_ENABLED
+                            .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
+                            .set(if video_enabled { 1.0 } else { 0.0 });
                     }
                 }
             }

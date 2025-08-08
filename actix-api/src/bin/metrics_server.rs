@@ -167,7 +167,7 @@ fn process_health_packet_to_metrics_pb(
     // Update session tracker
     {
         let mut tracker = session_tracker.lock().unwrap();
-        let session_key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_peer}");
         tracker.insert(
             session_key,
             SessionInfo {
@@ -184,7 +184,7 @@ fn process_health_packet_to_metrics_pb(
     // Check if this session is active (not cleaned up)
     let is_session_active = {
         let tracker = session_tracker.lock().unwrap();
-        let session_key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_peer}");
         tracker.contains_key(&session_key)
     };
 
@@ -234,7 +234,7 @@ fn process_health_packet_to_metrics_pb(
                 // Track peer_id used for connections
                 {
                     let mut tracker = session_tracker.lock().unwrap();
-                    let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                    let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
                     if let Some(info) = tracker.get_mut(&key) {
                         info.peer_ids.insert(peer_id.clone());
                     }
@@ -249,7 +249,7 @@ fn process_health_packet_to_metrics_pb(
                             .set(if can_listen { 1.0 } else { 0.0 });
                         // Track to_peer used
                         let mut tracker = session_tracker.lock().unwrap();
-                        let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                        let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
                         if let Some(info) = tracker.get_mut(&key) {
                             info.to_peers.insert(peer_id.clone());
                         }
@@ -262,7 +262,7 @@ fn process_health_packet_to_metrics_pb(
                             .with_label_values(&[meeting_id, session_id, reporting_peer, peer_id])
                             .set(if can_see { 1.0 } else { 0.0 });
                         let mut tracker = session_tracker.lock().unwrap();
-                        let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                        let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
                         if let Some(info) = tracker.get_mut(&key) {
                             info.to_peers.insert(peer_id.clone());
                         }
@@ -280,7 +280,7 @@ fn process_health_packet_to_metrics_pb(
                                 ])
                                 .set(neteq_stats.current_buffer_size_ms);
                             let mut tracker = session_tracker.lock().unwrap();
-                            let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                            let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
                             if let Some(info) = tracker.get_mut(&key) {
                                 info.to_peers.insert(peer_id.clone());
                             }
@@ -296,7 +296,7 @@ fn process_health_packet_to_metrics_pb(
                                 ])
                                 .set(neteq_stats.packets_awaiting_decode);
                             let mut tracker = session_tracker.lock().unwrap();
-                            let key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+                            let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
                             if let Some(info) = tracker.get_mut(&key) {
                                 info.to_peers.insert(peer_id.clone());
                             }
@@ -597,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
 
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
     use videocall_types::protos::health_packet::{
         HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
         NetEqOperationCounters as PbNetEqOperationCounters, NetEqStats as PbNetEqStats,

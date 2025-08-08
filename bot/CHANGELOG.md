@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.6](https://github.com/security-union/videocall-rs/compare/bot-v1.0.5...bot-v1.0.6) - 2025-08-08
+
+### Other
+
+- updated the following local packages: videocall-types
+
 ## [1.0.5](https://github.com/security-union/videocall-rs/compare/bot-v1.0.4...bot-v1.0.5) - 2025-07-20
 
 ### Other

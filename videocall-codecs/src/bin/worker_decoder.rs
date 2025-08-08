@@ -364,7 +364,7 @@ fn check_jitter_buffer_for_ready_frames() {
                             from_cell.borrow().clone(),
                             to_cell.borrow().clone(),
                         ) {
-                            console::log_1(&format!("[WORKER] Emitting video diagnostic: from={}, to={}, frames_buffered={}", from_peer, to_peer, buffered).into());
+                            console::log_1(&format!("[WORKER] Emitting video diagnostic: from={from_peer}, to={to_peer}, frames_buffered={buffered}").into());
                             let evt = DiagEvent {
                                 subsystem: "video",
                                 stream_id: None,

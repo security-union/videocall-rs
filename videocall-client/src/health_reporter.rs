@@ -475,7 +475,7 @@ impl HealthReporter {
         });
 
         let health_json = health_data.to_string();
-        debug!("Health packet JSON: {}", health_json);
+        debug!("Health packet JSON: {health_json}");
 
         Some(PacketWrapper {
             packet_type: PacketType::HEALTH.into(),

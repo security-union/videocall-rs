@@ -56,10 +56,7 @@ pub mod health_processor {
         let service_type =
             std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
 
-        let topic = format!(
-            "health.diagnostics.{}.{}.{}",
-            region, service_type, server_id
-        );
+        let topic = format!("health.diagnostics.{region}.{service_type}.{server_id}");
 
         let payload = health_data.write_to_bytes()?;
         client.publish(topic.clone(), payload.into()).await?;

@@ -26,7 +26,7 @@
       "id": 903,
       "options": {"legend": {"displayMode": "list","placement": "bottom"},"tooltip": {"mode": "single"}},
       "targets": [
-        {"expr": "videocall_self_audio_enabled{meeting_id=~\"$meeting_id\"}", "legendFormat": "Audio self {{peer_id}} ({{meeting_id}})", "refId": "A"}
+        {"expr": "videocall_self_audio_enabled{meeting_id=~\"$meeting_id\"}", "legendFormat": "{{peer_id}} ({{meeting_id}})", "refId": "A"}
       ],
       "title": "Self Audio Enabled",
       "type": "timeseries"
@@ -38,7 +38,7 @@
       "id": 904,
       "options": {"legend": {"displayMode": "list","placement": "bottom"},"tooltip": {"mode": "single"}},
       "targets": [
-        {"expr": "videocall_self_video_enabled{meeting_id=~\"$meeting_id\"}", "legendFormat": "Video self {{peer_id}} ({{meeting_id}})", "refId": "A"}
+        {"expr": "videocall_self_video_enabled{meeting_id=~\"$meeting_id\"}", "legendFormat": "{{peer_id}} ({{meeting_id}})", "refId": "A"}
       ],
       "title": "Self Video Enabled",
       "type": "timeseries"

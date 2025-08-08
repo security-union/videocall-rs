@@ -8,11 +8,11 @@ rustlemania-websocket:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: add-diagnostics-2e94b645
+    tag: latest
 
   env:
     - name: RUST_LOG
-      value: info
+      value: warn
     - name: ACTIX_PORT
       value: "8080"
     - name: NATS_URL

@@ -4,7 +4,7 @@ metricsApi:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: add-diagnostics-2e94b645
+    tag: latest
   
   # Minimal resources for cost optimization
   resources:
@@ -31,7 +31,7 @@ metricsApi:
     REGION: "us-east"
     SERVER_ID: "metrics-server-1"
     SERVICE_TYPE: "metrics"
-    RUST_LOG: "info,async_nats=info"
+    RUST_LOG: "warn,async_nats=warn"
   
   # Health check configuration
   livenessProbe:

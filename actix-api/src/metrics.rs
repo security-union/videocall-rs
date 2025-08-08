@@ -18,14 +18,11 @@
 
 //! Centralized Prometheus metrics for the videocall API
 
-#[cfg(feature = "diagnostics")]
 use lazy_static::lazy_static;
-#[cfg(feature = "diagnostics")]
 use prometheus::{
     register_counter, register_gauge_vec, register_histogram, Counter, GaugeVec, Histogram,
 };
 
-#[cfg(feature = "diagnostics")]
 lazy_static! {
     /// Total number of health reports received
     pub static ref HEALTH_REPORTS_TOTAL: Counter = register_counter!(

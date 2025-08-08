@@ -9,7 +9,6 @@ categories = ["network-programming", "multimedia"]
 
 [features]
 default = []
-diagnostics = ["prometheus", "lazy_static"]
 
 [lib]
 name = "sec_api"
@@ -39,9 +38,9 @@ async-nats = "0.42.0"
 base64 = "0.13.0"
 bytes = "1.4.0"
 futures = "0.3.26"
-lazy_static = { version = "1.4.0", optional = true }
+lazy_static = { version = "1.4.0" }
 oauth2 = { version = "4" }
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.13" }
 quinn = { version = "0.11.2", features = ["runtime-tokio", "ring"] }
 protobuf = "3.3.0"
 r2d2 = "0.8.10"

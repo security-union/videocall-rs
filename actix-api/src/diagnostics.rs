@@ -17,15 +17,11 @@
  */
 
 //! Health packet processing and Prometheus metrics collection
-//! Only compiled when the "diagnostics" feature is enabled
 
-#[cfg(feature = "diagnostics")]
 pub mod health_processor {
     use actix_web::{HttpResponse, Responder};
     use prometheus::{Encoder, TextEncoder};
     use protobuf::Message;
-    use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
     use tracing::{debug, warn};
 
     // Health data structure matching RFC design
@@ -136,46 +132,5 @@ pub mod health_processor {
                 }
             }
         }
-    }
-}
-
-#[cfg(not(feature = "diagnostics"))]
-pub mod health_processor {
-    use actix_web::{HttpResponse, Responder};
-    use serde_json;
-
-    // Minimal stub for when diagnostics is disabled
-    #[derive(Debug)]
-    pub struct PeerHealthData {
-        pub session_id: String,
-    }
-
-    /// Parse health packet but return minimal data when disabled
-    pub fn parse_health_packet(_data: &[u8]) -> Result<PeerHealthData, serde_json::Error> {
-        Ok(PeerHealthData {
-            session_id: "disabled".to_string(),
-        })
-    }
-
-    /// No-op when diagnostics feature is disabled
-    pub fn process_health_packet(_data: &PeerHealthData, _nc: async_nats::client::Client) {
-        // No-op when diagnostics disabled
-    }
-
-    /// Return empty metrics when disabled
-    pub async fn metrics_handler() -> impl Responder {
-        HttpResponse::Ok()
-            .content_type("text/plain")
-            .body("# Diagnostics feature disabled\n")
-    }
-
-    /// Check if a packet is a health packet (stub)
-    pub fn is_health_packet_bytes(_data: &[u8]) -> bool {
-        false
-    }
-
-    /// Process health packet for diagnostics collection from binary data (stub)
-    pub fn process_health_packet_bytes(_data: &[u8], _nc: async_nats::client::Client) {
-        // No-op when diagnostics disabled
     }
 }

@@ -10,7 +10,6 @@ use tokio::task;
 use tracing::{debug, error, info};
 use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
 
-#[cfg(feature = "diagnostics")]
 use prometheus::{Encoder, TextEncoder};
 
 // Shared state for latest health data from all servers
@@ -34,7 +33,6 @@ type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
 
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
-#[cfg(feature = "diagnostics")]
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
     NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC, NETEQ_DTMF_OPS_PER_SEC,
@@ -45,7 +43,6 @@ use sec_api::metrics::{
     VIDEO_PACKETS_BUFFERED,
 };
 
-#[cfg(feature = "diagnostics")]
 async fn metrics_handler(
     data: web::Data<HealthDataStore>,
     session_tracker: web::Data<SessionTracker>,
@@ -76,17 +73,6 @@ async fn metrics_handler(
     }
 }
 
-#[cfg(not(feature = "diagnostics"))]
-async fn metrics_handler(
-    _data: web::Data<HealthDataStore>,
-    _session_tracker: web::Data<SessionTracker>,
-) -> Result<HttpResponse> {
-    Ok(HttpResponse::Ok()
-        .content_type("text/plain")
-        .body("# Diagnostics feature not enabled\n"))
-}
-
-#[cfg(feature = "diagnostics")]
 /// Clean up sessions that haven't reported in the last 30 seconds
 fn cleanup_stale_sessions(session_tracker: &SessionTracker) {
     use std::time::Duration;
@@ -115,14 +101,6 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker) {
     }
 }
 
-#[cfg(not(feature = "diagnostics"))]
-/// Clean up sessions that haven't reported in the last 30 seconds (stub)
-#[allow(dead_code)]
-fn cleanup_stale_sessions(_session_tracker: &SessionTracker) {
-    // No-op when diagnostics feature is disabled
-}
-
-#[cfg(feature = "diagnostics")]
 /// Remove all Prometheus metrics for a given session
 fn remove_session_metrics(session_info: &SessionInfo) {
     // Remove series for this session using precise label combinations
@@ -164,14 +142,6 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     );
 }
 
-#[cfg(not(feature = "diagnostics"))]
-/// Remove all Prometheus metrics for a given session (stub)
-#[allow(dead_code)]
-fn remove_session_metrics(_session_info: &SessionInfo) {
-    // No-op when diagnostics feature is disabled
-}
-
-#[cfg(feature = "diagnostics")]
 fn process_health_packet_to_metrics_pb(
     health_packet: &PbHealthPacket,
     session_tracker: &SessionTracker,
@@ -500,16 +470,6 @@ fn process_health_packet_to_metrics_pb(
     Ok(())
 }
 
-#[cfg(not(feature = "diagnostics"))]
-#[allow(unused)]
-fn process_health_packet_to_metrics(
-    _health_packet: &Value,
-    _session_tracker: &SessionTracker,
-) -> anyhow::Result<()> {
-    // No-op when diagnostics feature is disabled
-    Ok(())
-}
-
 async fn nats_health_consumer(
     nats_client: Client,
     health_store: HealthDataStore,
@@ -635,11 +595,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "diagnostics"))]
 mod tests {
     use super::*;
-    use actix_web::web;
-    use prometheus::Encoder;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use videocall_types::protos::health_packet::{
         HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,

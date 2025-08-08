@@ -72,7 +72,7 @@ services:
       dockerfile: ../docker/Dockerfile.actix
       context: ../docker
     working_dir: /app/actix-api
-    command: bash -c "/app/dbmate/startup.sh && cargo watch -x \"run -r --bin websocket_server\""
+    command: bash -c "/app/dbmate/startup.sh && cargo watch -x \"run -r --bin websocket_server \""
     environment:
       - ACTIX_PORT=${ACTIX_PORT:-8080}
       - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:80}
@@ -81,9 +81,12 @@ services:
       - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
       - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
       - OAUTH_REDIRECT_URL=http://localhost:${ACTIX_PORT:-8080}/login/callback
-      - RUST_LOG=debug
+      - RUST_LOG=debug,async_nats=info
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222
+      - REGION=${REGION:-us-east}
+      - SERVER_ID=${SERVER_ID:-server-1}
+      - SERVICE_TYPE=websocket
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
@@ -104,15 +107,48 @@ services:
       - postgres
       - nats
 
+  metrics-api:
+    build:
+      dockerfile: ../docker/Dockerfile.actix
+      context: ../docker
+    working_dir: /app/actix-api
+    command: bash -c "cargo watch -x \"run -r --bin metrics_server \""
+    environment:
+      - METRICS_PORT=9091
+      - NATS_URL=nats:4222
+      - REGION=${REGION:-us-east}
+      - SERVER_ID=${SERVER_ID:-server-1}
+      - SERVICE_TYPE=metrics
+      - RUST_LOG=debug,async_nats=info
+      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+    ports:
+      - "9091:9091"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-actix-web-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-actix-web-cargo-target-cache:/usr/local/cargo/target
+      - rustlemania-actix-web-target-cache:/app/actix-api/target
+    depends_on:
+      - nats
+
   webtransport-api:
     build:
       dockerfile: ../docker/Dockerfile.actix
       context: ../docker
     working_dir: /app/actix-api
-    command: bash -c "cargo watch -x \"run -r --bin webtransport_server\""
+    command: bash -c "cargo watch -x \"run -r --bin webtransport_server \""
     environment:
       - RUST_LOG=info
       - NATS_URL=nats:4222
+      - REGION=${REGION:-us-east}
+      - SERVER_ID=${SERVER_ID:-server-1}
+      - SERVICE_TYPE=webtransport
       - LISTEN_URL=0.0.0.0:4433
       - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
@@ -140,6 +176,14 @@ services:
       - "4222:4222"
       - "8222:8222"
 
+  nats-box:
+    image: natsio/nats-box:latest
+    depends_on:
+      - nats
+    environment:
+      - NATS_URL=nats:4222
+    command: ["sleep", "infinity"]
+
   postgres:
     image: postgres:12
     environment:
@@ -147,6 +191,40 @@ services:
       PGPASSWORD: "docker"
     ports:
       - 5432
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: videocall-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    depends_on:
+      - metrics-api
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: videocall-grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=grafana
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
 
   
 volumes:
@@ -166,3 +244,5 @@ volumes:
   rustlemania-leptos-ui-cargo-git-cache:
   rustlemania-leptos-ui-cargo-target-cache:
   rustlemania-leptos-ui-cache:
+  prometheus_data:
+  grafana_data:

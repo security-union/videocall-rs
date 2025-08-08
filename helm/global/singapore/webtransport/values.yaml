@@ -7,10 +7,15 @@ rustlemania-webtransport:
 
   command: ['webtransport_server']
   tlsSecret: webtransport-singapore-tls
+  
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: latest
 
   env:
     - name: RUST_LOG
-      value: debug,quinn=warn
+      value: warn,quinn=warn,async_nats=warn
     - name: NATS_URL
       value: nats-singapore:4222  # Connect to Singapore NATS cluster
     - name: LISTEN_URL
@@ -23,6 +28,10 @@ rustlemania-webtransport:
       value: /certs/tls.key
     - name: REGION
       value: "singapore"
+    - name: SERVER_ID
+      value: $(POD_NAME)
+    - name: SERVICE_TYPE
+      value: webtransport
 
   resources:
     limits:

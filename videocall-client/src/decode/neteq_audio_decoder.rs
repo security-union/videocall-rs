@@ -34,6 +34,9 @@ enum WorkerMsg {
     Mute {
         muted: bool,
     },
+    SetDiagnostics {
+        enabled: bool,
+    },
 }
 
 /// Messages received from worker (matches neteq_worker.rs)
@@ -268,11 +271,20 @@ impl NetEqAudioPeerDecoder {
 
     /// Emit raw stats JSON for debugging
     fn emit_stats_diagnostics(json_str: &str, peer_id: &str) {
-        let _ = global_sender().send(DiagEvent {
+        // peer_id here is the target peer (whose audio we're decoding)
+        // We need to get the current user's ID for the reporting peer
+        // For now, we'll use a placeholder and enhance this later
+        let current_user = "current_user"; // TODO: Get from VideoCallClient
+
+        let _ = global_sender().try_broadcast(DiagEvent {
             subsystem: "neteq",
-            stream_id: Some(peer_id.to_string()),
+            stream_id: Some(format!("{current_user}->{peer_id}")), // reporting_peer->target_peer
             ts_ms: now_ms(),
-            metrics: vec![metric!("stats_json", json_str.to_string())],
+            metrics: vec![
+                metric!("stats_json", json_str.to_string()),
+                metric!("reporting_peer", current_user),
+                metric!("target_peer", peer_id.to_string()),
+            ],
         });
     }
 
@@ -298,11 +310,15 @@ impl NetEqAudioPeerDecoder {
             .get("jitter_buffer_delay_ms")
             .and_then(|v| v.as_u64())
         {
-            let _ = global_sender().send(DiagEvent {
+            let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
-                stream_id: Some(peer_id.to_string()),
+                stream_id: Some(format!("current_user->{peer_id}")),
                 ts_ms: now_ms(),
-                metrics: vec![metric!("jitter_buffer_delay_ms", jitter)],
+                metrics: vec![
+                    metric!("jitter_buffer_delay_ms", jitter),
+                    metric!("reporting_peer", "current_user"),
+                    metric!("target_peer", peer_id.to_string()),
+                ],
             });
         }
 
@@ -310,11 +326,15 @@ impl NetEqAudioPeerDecoder {
             .get("jitter_buffer_target_delay_ms")
             .and_then(|v| v.as_u64())
         {
-            let _ = global_sender().send(DiagEvent {
+            let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
-                stream_id: Some(peer_id.to_string()),
+                stream_id: Some(format!("current_user->{peer_id}")),
                 ts_ms: now_ms(),
-                metrics: vec![metric!("jitter_buffer_target_delay_ms", target)],
+                metrics: vec![
+                    metric!("jitter_buffer_target_delay_ms", target),
+                    metric!("reporting_peer", "current_user"),
+                    metric!("target_peer", peer_id.to_string()),
+                ],
             });
         }
     }
@@ -326,15 +346,37 @@ impl NetEqAudioPeerDecoder {
             None => return,
         };
 
+        // Audio data buffered for playback
         if let Some(buf) = network
             .get("current_buffer_size_ms")
             .and_then(|v| v.as_u64())
         {
-            let _ = global_sender().send(DiagEvent {
+            let _ = global_sender().try_broadcast(DiagEvent {
                 subsystem: "neteq",
-                stream_id: Some(peer_id.to_string()),
+                stream_id: Some(format!("current_user->{peer_id}")),
                 ts_ms: now_ms(),
-                metrics: vec![metric!("current_buffer_size_ms", buf)],
+                metrics: vec![
+                    metric!("audio_buffer_ms", buf),
+                    metric!("reporting_peer", "current_user"),
+                    metric!("target_peer", peer_id.to_string()),
+                ],
+            });
+        }
+
+        // Encoded packets awaiting decode
+        if let Some(packets) = network
+            .get("packets_awaiting_decode")
+            .and_then(|v| v.as_u64())
+        {
+            let _ = global_sender().try_broadcast(DiagEvent {
+                subsystem: "neteq",
+                stream_id: Some(format!("current_user->{peer_id}")),
+                ts_ms: now_ms(),
+                metrics: vec![
+                    metric!("packets_awaiting_decode", packets),
+                    metric!("reporting_peer", "current_user"),
+                    metric!("target_peer", peer_id.to_string()),
+                ],
             });
         }
     }
@@ -501,6 +543,13 @@ impl NetEqAudioPeerDecoder {
             "✅ NetEq decoder initialized for peer {} with muted: {}",
             decoder.peer_id,
             initial_muted
+        );
+
+        // Enable diagnostics in the NetEQ worker
+        decoder.send_worker_message(WorkerMsg::SetDiagnostics { enabled: true });
+        log::info!(
+            "🔧 Enabled diagnostics for NetEq worker for peer {}",
+            decoder.peer_id
         );
 
         Ok(Box::new(decoder))

@@ -1,0 +1,65 @@
+# Metrics API values for videocall monitoring (minimal resources)
+metricsApi:
+  # Image configuration
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: latest
+  
+  # Minimal resources for cost optimization
+  resources:
+    limits:
+      cpu: 50m
+      memory: 128Mi
+    requests:
+      cpu: 25m
+      memory: 64Mi
+  
+  # Single replica
+  replicas: 1
+  
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 9091
+    targetPort: 9091
+  
+  # Environment variables
+  env:
+    METRICS_PORT: "9091"
+    NATS_URL: "nats://nats-us-east:4222"
+    REGION: "us-east"
+    SERVER_ID: "metrics-server-1"
+    SERVICE_TYPE: "metrics"
+    RUST_LOG: "warn,async_nats=warn"
+  
+  # Health check configuration
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 9091
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 9091
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  
+  # Security context
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+  
+  # Pod security context
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000 

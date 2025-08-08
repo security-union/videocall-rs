@@ -41,15 +41,22 @@ mariadb:
     persistence:
       enabled: true
       size: 8Gi
+    resources:
+      limits:
+        cpu: 150m
+        memory: 256Mi
+      requests:
+        cpu: 75m
+        memory: 128Mi
 
-# Resources
+# Resources (reduced for metrics-api space)
 resources:
   limits:
-    cpu: 250m
-    memory: 512Mi
-  requests:
-    cpu: 100m
+    cpu: 150m
     memory: 256Mi
+  requests:
+    cpu: 75m
+    memory: 128Mi
 
 # Persistence
 persistence:

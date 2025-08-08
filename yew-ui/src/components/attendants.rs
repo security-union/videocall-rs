@@ -26,7 +26,7 @@ use crate::constants::{
     CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
 };
 use gloo_utils::window;
-use log::{debug, error, warn};
+use log::{error, warn};
 use serde_json;
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
@@ -161,19 +161,41 @@ impl AttendantsComponent {
             .map(|s| format!("{s}/lobby/{email}/{id}"))
             .collect::<Vec<String>>();
 
+        log::info!(
+            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}",
+            email,
+            id,
+            ctx.props().webtransport_enabled
+        );
+        log::info!("YEW-UI: WebSocket URLs: {websocket_urls:?}");
+        log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
+
         let opts = VideoCallClientOptions {
             userid: email.clone(),
+            meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
             enable_e2ee: ctx.props().e2ee_enabled,
             enable_webtransport: ctx.props().webtransport_enabled,
             on_connected: {
                 let link = ctx.link().clone();
-                Callback::from(move |_| link.send_message(Msg::from(WsAction::Connected)))
+                let webtransport_enabled = ctx.props().webtransport_enabled;
+                Callback::from(move |_| {
+                    log::info!(
+                        "YEW-UI: Connection established (webtransport_enabled={webtransport_enabled})",
+                    );
+                    link.send_message(Msg::from(WsAction::Connected))
+                })
             },
             on_connection_lost: {
                 let link = ctx.link().clone();
-                Callback::from(move |_| link.send_message(Msg::from(WsAction::Lost(None))))
+                let webtransport_enabled = ctx.props().webtransport_enabled;
+                Callback::from(move |_| {
+                    log::warn!(
+                        "YEW-UI: Connection lost (webtransport_enabled={webtransport_enabled})",
+                    );
+                    link.send_message(Msg::from(WsAction::Lost(None)))
+                })
             },
             on_peer_added: {
                 let link = ctx.link().clone();
@@ -188,19 +210,12 @@ impl AttendantsComponent {
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
             enable_diagnostics: true,
-            on_diagnostics_update: Some({
-                let link = ctx.link().clone();
-                Callback::from(move |stats| {
-                    link.send_message(Msg::from(WsAction::DiagnosticsUpdated(stats)))
-                })
-            }),
-            on_sender_stats_update: Some({
-                let link = ctx.link().clone();
-                Callback::from(move |stats| {
-                    link.send_message(Msg::from(WsAction::SenderStatsUpdated(stats)))
-                })
-            }),
+            // Disable old callback system - using broadcast system instead
+            on_diagnostics_update: None,
+            on_sender_stats_update: None,
             diagnostics_update_interval_ms: Some(1000),
+            enable_health_reporting: true,
+            health_reporting_interval_ms: Some(5000),
             on_encoder_settings_update: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |settings| {
@@ -210,6 +225,7 @@ impl AttendantsComponent {
             rtt_testing_period_ms: *SERVER_ELECTION_PERIOD_MS,
             rtt_probe_interval_ms: Some(200),
         };
+
         VideoCallClient::new(opts)
     }
 
@@ -342,36 +358,64 @@ impl Component for AttendantsComponent {
         {
             let link = ctx.link().clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let rx = subscribe();
-                while let Ok(evt) = rx.recv_async().await {
+                let mut rx = subscribe();
+                while let Ok(evt) = rx.recv().await {
                     if evt.subsystem == "neteq" {
                         for m in &evt.metrics {
                             if m.name == "stats_json" {
                                 if let MetricValue::Text(json) = &m.value {
-                                    let peer_id = evt
+                                    // Parse the new format: "reporting_peer->target_peer"
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
                                     link.send_message(Msg::NetEqStatsUpdated(
-                                        peer_id,
+                                        format!("{reporting_peer}->{target_peer}"),
                                         json.clone(),
                                     ));
                                 }
-                            } else if m.name == "current_buffer_size_ms" {
+                            } else if m.name == "audio_buffer_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    let peer_id = evt
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    link.send_message(Msg::NetEqBufferUpdated(peer_id, *v));
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
+                                    link.send_message(Msg::NetEqBufferUpdated(
+                                        format!("{reporting_peer}->{target_peer}"),
+                                        *v,
+                                    ));
                                 }
                             } else if m.name == "jitter_buffer_delay_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    let peer_id = evt
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    link.send_message(Msg::NetEqJitterUpdated(peer_id, *v));
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
+                                    link.send_message(Msg::NetEqJitterUpdated(
+                                        format!("{reporting_peer}->{target_peer}"),
+                                        *v,
+                                    ));
                                 }
                             }
                         }
@@ -380,9 +424,88 @@ impl Component for AttendantsComponent {
                         link.send_message(Msg::ConnectionManagerUpdate(
                             serde_json::to_string(&serializable_evt).unwrap_or_default(),
                         ));
+                    } else if evt.subsystem == "decoder" {
+                        let mut decoder_stats = String::new();
+                        for metric in &evt.metrics {
+                            match metric.name {
+                                "fps" => {
+                                    if let MetricValue::F64(fps) = &metric.value {
+                                        decoder_stats.push_str(&format!("FPS: {fps:.2}\n"));
+                                    }
+                                }
+                                "bitrate_kbps" => {
+                                    if let MetricValue::F64(bitrate) = &metric.value {
+                                        decoder_stats
+                                            .push_str(&format!("Bitrate: {bitrate:.1} kbps\n"));
+                                    }
+                                }
+                                "media_type" => {
+                                    if let MetricValue::Text(media_type) = &metric.value {
+                                        decoder_stats
+                                            .push_str(&format!("Media Type: {media_type}\n"));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !decoder_stats.is_empty() {
+                            let peer_id = evt
+                                .stream_id
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            decoder_stats.push_str(&format!(
+                                "Peer: {}\nTimestamp: {}\n",
+                                peer_id, evt.ts_ms
+                            ));
+                            link.send_message(Msg::WsAction(WsAction::DiagnosticsUpdated(
+                                decoder_stats,
+                            )));
+                        }
+                    } else if evt.subsystem == "sender" {
+                        let mut sender_stats = String::new();
+                        for metric in &evt.metrics {
+                            match metric.name {
+                                "sender_id" => {
+                                    if let MetricValue::Text(sender_id) = &metric.value {
+                                        sender_stats.push_str(&format!("Sender: {sender_id}\n"));
+                                    }
+                                }
+                                "target_id" => {
+                                    if let MetricValue::Text(target_id) = &metric.value {
+                                        sender_stats.push_str(&format!("Target: {target_id}\n"));
+                                    }
+                                }
+                                "media_type" => {
+                                    if let MetricValue::Text(media_type) = &metric.value {
+                                        sender_stats
+                                            .push_str(&format!("Media Type: {media_type}\n"));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !sender_stats.is_empty() {
+                            sender_stats.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
+                            link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
+                                sender_stats,
+                            )));
+                        }
+                    } else if evt.subsystem == "video" {
+                        // Known subsystem used for Grafana/metrics; UI does not render it
+                        log::debug!(
+                            "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
+                            evt.ts_ms
+                        );
+                    } else if evt.subsystem == "peer_status" {
+                        // Known subsystem for mute/camera state; UI does not render it
+                        log::debug!(
+                            "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
+                            evt.ts_ms
+                        );
                     } else {
                         let subsystem = evt.subsystem;
-                        log::debug!("AttendantsComponent: Received event for unknown subsystem: {subsystem}");
+                        log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 
+                                   subsystem, evt.stream_id, evt.ts_ms);
                     }
                 }
                 log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
@@ -398,7 +521,7 @@ impl Component for AttendantsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        debug!("AttendantsComponent update: {msg:?}");
+        log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
@@ -414,7 +537,10 @@ impl Component for AttendantsComponent {
                     self.meeting_joined = true;
                     true
                 }
-                WsAction::Connected => true,
+                WsAction::Connected => {
+                    log::info!("YEW-UI: Connection established successfully!");
+                    true
+                }
                 WsAction::Log(msg) => {
                     warn!("{msg}");
                     false
@@ -455,6 +581,7 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::DiagnosticsUpdated(stats) => {
+                    log::debug!("YEW-UI: Diagnostics UI updated: {stats}");
                     self.diagnostics_data = Some(stats);
                     true
                 }

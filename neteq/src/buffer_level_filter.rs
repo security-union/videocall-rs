@@ -170,16 +170,13 @@ mod tests {
         filter.update(1000, 0);
         let first_level = filter.filtered_current_level();
         // With coefficient 253: (253*0>>8) + (256-253)*1000 = 3000 Q8 = ~12 samples
-        assert!(first_level >= 10 && first_level <= 15);
+        assert!((10..=15).contains(&first_level));
 
         // Subsequent updates should be smoothed
         filter.update(2000, 0);
         let filtered_level = filter.filtered_current_level();
 
-        println!(
-            "First level: {}, Second level: {}",
-            first_level, filtered_level
-        );
+        println!("First level: {first_level}, Second level: {filtered_level}");
 
         // With hybrid approach: 2000 vs ~12 is a large jump (>3x threshold), triggers aggressive mode
         // α=0.7: filtered = 0.7 * 12 + 0.3 * 2000 = 8.4 + 600 = ~608
@@ -255,9 +252,8 @@ mod tests {
         let initial_level = filter.filtered_current_level();
         // WebRTC behavior: starts from 0, so gets small initial value
         assert!(
-            initial_level >= 20 && initial_level <= 30,
-            "Expected ~23, got {}",
-            initial_level
+            (20..=30).contains(&initial_level),
+            "Expected ~23, got {initial_level}"
         );
 
         // Now try updating with much higher raw buffer values
@@ -285,10 +281,7 @@ mod tests {
                 // α=0.7: filtered = 0.7 * 23 + 0.3 * 11100 = 16.1 + 3330 = ~3346
                 assert!(
                     new_filtered > 3000,
-                    "Filter should use aggressive mode for large jump from {} to {}, got {}",
-                    prev_filtered,
-                    raw_samples,
-                    new_filtered
+                    "Filter should use aggressive mode for large jump from {prev_filtered} to {raw_samples}, got {new_filtered}"
                 );
             }
         }
@@ -311,10 +304,7 @@ mod tests {
         filter.update(raw_samples, 0);
         let filtered = filter.filtered_current_level();
 
-        println!(
-            "Raw: {}, Target: {}, Filtered: {}",
-            raw_samples, target_samples, filtered
-        );
+        println!("Raw: {raw_samples}, Target: {target_samples}, Filtered: {filtered}");
         println!("Target/2: {}", target_samples / 2);
 
         // Check if it's clamped to target/2 = 1920
@@ -336,9 +326,8 @@ mod tests {
         let first_result = filter.filtered_current_level();
         // With α=253/256≈0.988: filtered = 0.988*0 + 0.012*1000 ≈ 12
         assert!(
-            first_result >= 10 && first_result <= 15,
-            "First update should be ~12, got {}",
-            first_result
+            (10..=15).contains(&first_result),
+            "First update should be ~12, got {first_result}"
         );
 
         // Test small increment (conservative behavior)
@@ -348,9 +337,8 @@ mod tests {
         // Small change, should use conservative coefficient
         // α=253/256: filtered = 0.988*12 + 0.012*100 ≈ 11.8 + 1.2 ≈ 13
         assert!(
-            small_increment >= 10 && small_increment <= 20,
-            "Small increment should be ~13, got {}",
-            small_increment
+            (10..=20).contains(&small_increment),
+            "Small increment should be ~13, got {small_increment}"
         );
 
         // Test large jump (aggressive behavior)
@@ -359,9 +347,8 @@ mod tests {
         // Large jump detected (5000 vs ~26), should use α=0.7
         // filtered = 0.7*26 + 0.3*5000 = 18.2 + 1500 = ~1518
         assert!(
-            large_jump >= 1400 && large_jump <= 1600,
-            "Large jump should trigger aggressive mode ~1518, got {}",
-            large_jump
+            (1400..=1600).contains(&large_jump),
+            "Large jump should trigger aggressive mode ~1518, got {large_jump}"
         );
     }
 
@@ -374,9 +361,8 @@ mod tests {
         filter.update(1920, 0); // Start with 1920 samples
         let initial_level = filter.filtered_current_level();
         assert!(
-            initial_level >= 20 && initial_level <= 30,
-            "Expected ~23, got {}",
-            initial_level
+            (20..=30).contains(&initial_level),
+            "Expected ~23, got {initial_level}"
         );
 
         // Simulate the exact scenario from logs:
@@ -398,11 +384,10 @@ mod tests {
                 i, raw_samples, time_stretched_samples, raw_samples as i32 - time_stretched_samples, prev_filtered, new_filtered);
 
             // If time_stretched_samples cancels out raw buffer growth, filter should stay low
-            if time_stretched_samples as usize == raw_samples - initial_level as usize {
+            if time_stretched_samples as usize == raw_samples - initial_level {
                 assert!(
-                    new_filtered >= 20 && new_filtered <= 30,
-                    "Filter should be stuck at low value due to time-stretched compensation, got {}",
-                    new_filtered
+                    (20..=30).contains(&new_filtered),
+                    "Filter should be stuck at low value due to time-stretched compensation, got {new_filtered}"
                 );
             }
         }
@@ -416,39 +401,31 @@ mod tests {
         // Test if filter gets reset repeatedly
         filter.update(11000, 0); // Set to high value
         let high_value = filter.filtered_current_level();
-        println!(
-            "DEBUG: After update(11000, 0), filtered_level = {}",
-            high_value
-        );
+        println!("DEBUG: After update(11000, 0), filtered_level = {high_value}");
 
         // Expected: large jump from 0 to 11000 should trigger aggressive mode (11000 > 5000 threshold)
         // α=0.7: filtered = 0.7 * 0 + 0.3 * 11000 = 3300
         assert!(
             high_value > 3000,
-            "Large jump should result in significant increase, got {}",
-            high_value
+            "Large jump should result in significant increase, got {high_value}"
         );
 
         // Reset and re-initialize at 1920
         filter.reset();
         filter.update(1920, 0);
         let after_reset = filter.filtered_current_level();
-        println!(
-            "DEBUG: After reset and update(1920, 0), filtered_level = {}",
-            after_reset
-        );
+        println!("DEBUG: After reset and update(1920, 0), filtered_level = {after_reset}");
 
         // After reset, filter starts from 0 again
         // Jump 0→1920 is below 5000 threshold, so should use conservative filtering
         // α=253/256: filtered = 0.988 * 0 + 0.012 * 1920 = ~23
         assert!(
-            after_reset >= 20 && after_reset <= 30,
-            "After reset should use conservative filtering, got {}",
-            after_reset
+            (20..=30).contains(&after_reset),
+            "After reset should use conservative filtering, got {after_reset}"
         );
 
         // If this happens every frame, filter would be stuck at 1920
-        println!("RESET BUG: Filter reset from {} to 1920", high_value);
+        println!("RESET BUG: Filter reset from {high_value} to 1920");
     }
 
     #[test]
@@ -460,9 +437,8 @@ mod tests {
         filter.update(1920, 0); // Initialize with WebRTC behavior
         let initial_level = filter.filtered_current_level();
         assert!(
-            initial_level >= 20 && initial_level <= 30,
-            "Expected ~23, got {}",
-            initial_level
+            (20..=30).contains(&initial_level),
+            "Expected ~23, got {initial_level}"
         );
 
         // Simulate multiple frames where sample_memory is NOT reset (the old bug)
@@ -496,8 +472,7 @@ mod tests {
                 let current_level = raw_samples as i32 - time_stretched_samples;
                 assert!(
                     current_level < 7000,
-                    "Current level should be much lower due to accumulation, got {}",
-                    current_level
+                    "Current level should be much lower due to accumulation, got {current_level}"
                 );
             }
         }
@@ -579,7 +554,7 @@ mod tests {
             let output_size_samples = 480; // 10ms at 48kHz
             webrtc_sample_memory -= samples_left + output_size_samples;
 
-            println!("  After subtract: sample_memory={}", webrtc_sample_memory);
+            println!("  After subtract: sample_memory={webrtc_sample_memory}");
         }
 
         println!("WebRTC pattern: sample_memory is set to available samples, then adjusted");
@@ -629,8 +604,7 @@ mod tests {
             let current_level = raw_buffer_samples as i32 - time_stretched_samples;
             assert!(
                 current_level > 10000,
-                "Current level should be high with reasonable time_stretched_samples, got {}",
-                current_level
+                "Current level should be high with reasonable time_stretched_samples, got {current_level}"
             );
         }
 
@@ -663,14 +637,13 @@ mod tests {
         // Initialize with 1000 samples
         filter.update(1000, 0);
         let initial_level = filter.filtered_current_level();
-        println!("Initial level after first update: {}", initial_level);
+        println!("Initial level after first update: {initial_level}");
 
         // WebRTC starts from 0, so first update: (253*0>>8) + (256-253)*1000 = 3000 Q8 = 11-12 samples
         // This is expected WebRTC behavior - very gradual response from zero state
         assert!(
-            initial_level >= 10 && initial_level <= 15,
-            "Expected 10-15, got {}",
-            initial_level
+            (10..=15).contains(&initial_level),
+            "Expected 10-15, got {initial_level}"
         );
 
         // Large jump to 5000 samples - hybrid behavior test
@@ -680,20 +653,12 @@ mod tests {
         // With smart threshold: jump from ~11 to 5000 (4989) exceeds startup threshold (3750)
         // So uses aggressive mode: α=0.7: new = 0.7*11 + 0.3*5000 = 7.7 + 1500 = ~1508
         let expected_aggressive = (0.7 * initial_level as f64 + 0.3 * 5000.0) as usize;
-        println!(
-            "After jump: {}, expected: {}",
-            after_jump, expected_aggressive
-        );
+        println!("After jump: {after_jump}, expected: {expected_aggressive}");
         assert!(
             after_jump >= expected_aggressive - 50 && after_jump <= expected_aggressive + 50,
-            "Expected aggressive mode ~{}, got {}",
-            expected_aggressive,
-            after_jump
+            "Expected aggressive mode ~{expected_aggressive}, got {after_jump}"
         );
 
-        println!(
-            "✅ Hybrid filter correctly uses aggressive mode for large jumps: {}",
-            after_jump
-        );
+        println!("✅ Hybrid filter correctly uses aggressive mode for large jumps: {after_jump}");
     }
 }

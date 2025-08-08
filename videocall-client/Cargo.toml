@@ -43,6 +43,7 @@ serde-wasm-bindgen = "0.6.5"
 serde_bytes = "0.11"
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.1" }
 serde_json = { version = "1.0" }
+async-broadcast = "0.7.2"
 
 [features]
 neteq_ff = ["neteq"]

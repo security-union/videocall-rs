@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1](https://github.com/security-union/videocall-rs/compare/videocall-types-v2.0.0...videocall-types-v2.0.1) - 2025-08-08
+
+### Other
+
+- (feature) Add diagnostics with Prometheus and Grafana ([#365](https://github.com/security-union/videocall-rs/pull/365))
+
 ## [2.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v1.0.3...videocall-types-v2.0.0) - 2025-07-20
 
 ### Other

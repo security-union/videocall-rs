@@ -19,35 +19,13 @@
 use crate::components::icons::{
     digital_ocean::DigitalOceanIcon, discord::DiscordIcon, youtube::YoutubeIcon,
 };
-use crate::context::UsernameCtx;
-use web_sys::window;
 use yew::prelude::*;
 
 #[function_component(TopBar)]
 pub fn top_bar() -> Html {
-    let username_ctx = use_context::<UsernameCtx>();
-    let change_username = if let Some(ctx) = &username_ctx {
-        let ctx = ctx.clone();
-        Some(Callback::from(move |_| {
-            // Mark that we are resetting the username so that after the
-            // user confirms the new name we can reload the page and flush
-            // any lingering connections.
-            if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                let _ = storage.set_item("vc_username_reset", "1");
-            }
-
-            // Clear only the in-memory context so the UI re-renders to the
-            // username prompt. We intentionally keep the cached value in
-            // localStorage so it appears pre-filled for convenience.
-            ctx.set(None);
-        }))
-    } else {
-        None
-    };
-
     html! {
-        <div class="top-bar">
-            <div class="flex items-center gap-3 align-middle">
+        <div class="top-bar" style="position:fixed; top:0; left:0; right:0; display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:rgba(28,28,30,0.6); backdrop-filter:saturate(180%) blur(10px); border-bottom:1px solid #38383A; z-index:100;">
+            <div class="flex items-center align-middle" style="opacity:0.9; gap:10px;">
                 <a href="https://github.com/security-union/videocall-rs" class="m-auto" target="_blank">
                     <img src="https://img.shields.io/github/stars/security-union/videocall-rs?style=social" class="w-16" alt="GitHub stars" />
                 </a>
@@ -66,13 +44,9 @@ pub fn top_bar() -> Html {
                         <DigitalOceanIcon />
                     </div>
                 </a>
-                {
-                    if let Some(onclick) = change_username {
-                        html! { <button class="btn-apple btn-secondary btn-sm" onclick={onclick}>{"Change name"}</button> }
-                    } else { html!{} }
-                }
+                { html!{} }
             </div>
-            <span class="text-caption">{ "Made with ❤️ by awesome developers from all over the world 🌏, hosted by Security Union 🛡️." }</span>
+            <span class="text-caption" style="margin-right:8px; color:#AEAEB2;">{ "Made with ❤️ by awesome developers from all over the world 🌏, hosted by Security Union 🛡️." }</span>
         </div>
     }
 }

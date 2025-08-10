@@ -29,6 +29,34 @@ use yew::virtual_dom::VNode;
 use yew::{html, Html};
 
 pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
+    // If only one peer, render it as a full-bleed tile (WhatsApp-like)
+    if peers.len() == 1 {
+        let key = &peers[0];
+        if !USERS_ALLOWED_TO_STREAM.is_empty()
+            && !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
+        {
+            return vec![];
+        }
+        let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
+        let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
+        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+        return vec![html! {
+            <div class="grid-item full-bleed" id={(*peer_video_div_id).clone()}>
+                <div class="canvas-container">
+                    { if is_video_enabled_for_peer { html!{ <UserVideo id={key.clone()} hidden={false}/> } } else { html!{ <div class="video-placeholder"><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> } } }
+                    <h4 class="floating-name">{key.clone()}</h4>
+                    <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
+                    <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
+                    <button class="change-name-fab" title="Change name" onclick={Callback::from(|_| {
+                        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) { let _ = storage.set_item("vc_username_reset", "1"); }
+                    })}>
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                    </button>
+                </div>
+            </div>
+        }];
+    }
+
     peers
         .iter()
         .map(|key| {

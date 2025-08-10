@@ -1,3 +1,68 @@
+/* Apple-style glassy modal backdrop */
+.glass-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.35);
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  z-index: 3000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.change-name-fab {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  width: 36px;
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  background: rgba(28,28,30,0.9);
+  border: 1px solid #48484A;
+  color: #FFFFFF;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05);
+  z-index: 10;
+}
+.change-name-fab:hover { background:#2C2C2E; }
+.change-name-fab svg { width: 18px; height: 18px; }
+.top-bar a img { filter: grayscale(20%); opacity: 0.9; }
+.top-bar .w-8 svg { opacity: 0.9; }
+/* Full-bleed single peer tile */
+.grid-item.full-bleed {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+}
+.grid-item.full-bleed .canvas-container,
+.grid-item.full-bleed canvas {
+  width: 100%;
+  height: 100%;
+}
+/* Video placeholder styling to ensure consistent rounded corners */
+.video-placeholder {
+  background: #1C1C1E;
+  border: 1px solid #38383A;
+  border-radius: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 180px;
+}
+.video-placeholder .placeholder-content svg {
+  width: 48px;
+  height: 48px;
+}
+.video-placeholder .placeholder-text {
+  display: block;
+  margin-top: 0.5rem;
+  color: #AEAEB2;
+}
 /* Prevent pinch zoom specifically */
 * {
   touch-action: pan-x pan-y;
@@ -444,7 +509,7 @@ body {
   left: 50%;
   transform: translateX(-50%);
   display: flex;
-  gap: 1rem;
+  gap: 1.2rem; /* add breathing room between control buttons */
   z-index: 100;
   padding: 0.6rem 1.25rem;
   background: rgba(28, 28, 30, 0.85);
@@ -468,11 +533,11 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 3.5rem;
-  height: 3.5rem;
+  width: 3.1rem;
+  height: 3.1rem;
   border-radius: 50%;
   background-color: #1C1C1E;
-  border: 1px solid #38383A;
+  border: 1px solid #48484A;
   color: white;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   cursor: pointer;

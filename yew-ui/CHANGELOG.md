@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.24](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.23...videocall-ui-v1.1.24) - 2025-08-10
+
+### Other
+
+- Add config.js to version control along with instructions ([#381](https://github.com/security-union/videocall-rs/pull/381))
+
 ## [1.0.23](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.22...videocall-ui-v1.0.23) - 2025-08-10
 
 ### Other

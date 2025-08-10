@@ -18,6 +18,9 @@ An open-source, high-performance video conferencing platform built with Rust, pr
   - [Prerequisites](#prerequisites)
   - [Docker Setup](#docker-setup)
   - [Manual Setup](#manual-setup)
+- [Runtime Configuration](#runtime-configuration-frontend-configjs)
+  - [Local/Docker](#localdocker-start-yewsh)
+  - [Kubernetes/Helm](#kuberneteshelm-configmap-configjsyaml)
 - [Usage](#usage)
 - [Performance](#performance)
 - [Security](#security)
@@ -165,6 +168,67 @@ For advanced users who prefer to run services directly on their machine:
    ```
 
 For detailed configuration options, see our [setup documentation](https://docs.videocall.rs/setup).
+
+## Runtime Configuration (Frontend config.js)
+
+The Yew UI is configured at runtime via a `window.__APP_CONFIG` object provided by a `config.js` file. There are two supported ways to supply this file:
+
+### Local/Docker: start-yew.sh
+
+When running locally (or via the provided Docker environment), `docker/start-yew.sh` generates `/app/yew-ui/scripts/config.js` on container startup from environment variables:
+
+- **API_BASE_URL → apiBaseUrl**: default `http://localhost:${ACTIX_PORT:-8080}`
+- **ACTIX_UI_BACKEND_URL → wsUrl**: default `ws://localhost:${ACTIX_PORT:-8080}`
+- **WEBTRANSPORT_HOST → webTransportHost**: default `https://127.0.0.1:4433`
+- **ENABLE_OAUTH → oauthEnabled**: default `false` (string)
+- **E2EE_ENABLED → e2eeEnabled**: default `false` (string)
+- **WEBTRANSPORT_ENABLED → webTransportEnabled**: default `false` (string)
+- **USERS_ALLOWED_TO_STREAM → usersAllowedToStream**: default empty string (comma-separated user IDs)
+- **SERVER_ELECTION_PERIOD_MS → serverElectionPeriodMs**: default `2000`
+- **AUDIO_BITRATE_KBPS → audioBitrateKbps**: default `65`
+- **VIDEO_BITRATE_KBPS → videoBitrateKbps**: default `1000`
+- **SCREEN_BITRATE_KBPS → screenBitrateKbps**: default `1000`
+
+Example override when running a container:
+
+```sh
+# Example: customize URLs and enable WebTransport
+API_BASE_URL=https://api.local \
+ACTIX_UI_BACKEND_URL=wss://api.local/ws \
+WEBTRANSPORT_HOST=https://api.local:4433 \
+WEBTRANSPORT_ENABLED=true \
+E2EE_ENABLED=true \
+make up
+```
+
+Notes:
+- Values are injected verbatim into `window.__APP_CONFIG`; booleans are strings (`"true"`/`"false"`).
+- The file is generated at container start, so update env vars and restart the container to apply changes.
+
+### Kubernetes/Helm: configmap-configjs.yaml
+
+In Kubernetes, the Helm chart `helm/rustlemania-ui/templates/configmap-configjs.yaml` creates a ConfigMap that renders `config.js` from `.Values.runtimeConfig`:
+
+```yaml
+# values.yaml
+runtimeConfig:
+  apiBaseUrl: "https://api.example.com"
+  wsUrl: "wss://api.example.com/ws"
+  webTransportHost: "https://webtransport.example.com:4433"
+  oauthEnabled: "false"
+  e2eeEnabled: "true"
+  webTransportEnabled: "true"
+  usersAllowedToStream: "alice,bob"
+  serverElectionPeriodMs: 2000
+  audioBitrateKbps: 65
+  videoBitrateKbps: 1000
+  screenBitrateKbps: 1000
+```
+
+Usage:
+- Set `runtimeConfig` in your chart values to match your environment.
+- Deploy or upgrade the release; the chart will serve `config.js` with `window.__APP_CONFIG = <your JSON>;`.
+- Prefer quoting booleans as strings to match the local env behavior unless your UI expects strict boolean types.
 
 ## Usage
 

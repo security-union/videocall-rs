@@ -59,7 +59,6 @@
 //!     enable_diagnostics: false,
 //!     diagnostics_update_interval_ms: None,
 //!     enable_health_reporting: false,
-//!     health_reporting_interval_ms: None,
 //!     on_encoder_settings_update: None,
 //!     rtt_testing_period_ms: 3000,
 //!     rtt_probe_interval_ms: None,

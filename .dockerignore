@@ -1,4 +1,3 @@
 **/target
 **/dist
 Dockerfile*
-yew-ui/scripts/config.js

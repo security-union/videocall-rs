@@ -6734,7 +6734,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.0.23"
+version = "1.1.23"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

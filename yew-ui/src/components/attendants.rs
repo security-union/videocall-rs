@@ -362,7 +362,7 @@ impl Component for AttendantsComponent {
             show_copy_toast: false,
         };
         if let Err(e) = crate::constants::app_config() {
-            log::error!("{}", e);
+            log::error!("{e:?}");
             self_.error = Some(e);
         }
         {

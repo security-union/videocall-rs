@@ -6531,7 +6531,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "1.0.35"
+version = "1.0.36"
 dependencies = [
  "anyhow",
  "clap",

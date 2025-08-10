@@ -19,19 +19,20 @@ matomo:
 
   # Matomo application configuration (using correct Bitnami schema)
   matomoUsername: "admin"
-  matomoPassword: "MatomoPassword123"
+  matomoPassword: ""  # Auto-generate secure password
   matomoEmail: "admin@videocall.rs"
   matomoWebsiteName: "VideoCall Analytics"
   matomoWebsiteHost: "https://videocall.rs"
 
-  # MariaDB configuration
+  # MariaDB configuration - auto-generate passwords
   mariadb:
     enabled: true
     auth:
-      rootPassword: "MariaDBRootPassword123!"
+      # Leave passwords empty to auto-generate secure random passwords
+      rootPassword: ""
       database: "bitnami_matomo"
       username: "bn_matomo"
-      password: "MatomoDBPassword123!"
+      password: ""
 
   # Resources (increased for Matomo installation)
   resources:

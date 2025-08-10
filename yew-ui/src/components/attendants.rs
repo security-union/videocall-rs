@@ -1118,8 +1118,6 @@ impl Component for AttendantsComponent {
                                             html! {<></>}
                                         }
                                     }
-                                    <h4 class="floating-name">{email}</h4>
-
                                     <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
 
                                 </nav>

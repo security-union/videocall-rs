@@ -188,7 +188,6 @@ h3 {
   align-items: center;
   overflow: hidden; /* Prevent content like oversized canvas from breaking layout */
   background-color: #2d2d2d; /* Slightly different background for items */
-  border-radius: 8px;
 }
 
 /* --- Layouts for specific number of peers --- */

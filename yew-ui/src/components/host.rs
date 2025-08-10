@@ -400,7 +400,7 @@ impl Component for Host {
                         }
                     } else {
                         html! {
-                            <div class="video-placeholder">
+                            <div class="video-placeholder card-apple" style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem;">
                                 <div class="placeholder-content">
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                         <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
@@ -415,7 +415,7 @@ impl Component for Host {
 
                 // Device Settings Menu Button (positioned outside the host video)
                 <button
-                    class="device-settings-menu-button"
+                    class="device-settings-menu-button btn-apple btn-secondary"
                     onclick={ctx.props().on_device_settings_toggle.clone()}
                     title="Device Settings"
                 >

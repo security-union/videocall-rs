@@ -47,7 +47,7 @@ pub fn top_bar() -> Html {
 
     html! {
         <div class="top-bar">
-            <div class="flex space-x-2 align-middle">
+            <div class="flex items-center gap-3 align-middle">
                 <a href="https://github.com/security-union/videocall-rs" class="m-auto" target="_blank">
                     <img src="https://img.shields.io/github/stars/security-union/videocall-rs?style=social" class="w-16" alt="GitHub stars" />
                 </a>
@@ -68,13 +68,11 @@ pub fn top_bar() -> Html {
                 </a>
                 {
                     if let Some(onclick) = change_username {
-                        html! {
-                            <button class="change-username-btn text-sm px-3 py-1 border rounded" onclick={onclick}>{"Change name"}</button>
-                        }
+                        html! { <button class="btn-apple btn-secondary btn-sm" onclick={onclick}>{"Change name"}</button> }
                     } else { html!{} }
                 }
             </div>
-            <span>{ "Made with ❤️ by awesome developers from all over the world 🌏, hosted by Security Union 🛡️." }</span>
+            <span class="text-caption">{ "Made with ❤️ by awesome developers from all over the world 🌏, hosted by Security Union 🛡️." }</span>
         </div>
     }
 }

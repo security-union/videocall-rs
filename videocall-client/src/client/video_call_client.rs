@@ -199,7 +199,11 @@ impl VideoCallClient {
                     .as_secs()
             );
 
-            let mut reporter = HealthReporter::new(session_id, options.userid.clone());
+            let mut reporter = HealthReporter::new(
+                session_id,
+                options.userid.clone(),
+                options.health_reporting_interval_ms.unwrap_or(5000),
+            );
 
             // Set the meeting ID
             reporter.set_meeting_id(options.meeting_id.clone());

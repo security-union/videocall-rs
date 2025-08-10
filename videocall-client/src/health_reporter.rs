@@ -97,20 +97,26 @@ pub struct HealthReporter {
     health_interval_ms: u64,
     reporting_audio_enabled: Rc<RefCell<bool>>,
     reporting_video_enabled: Rc<RefCell<bool>>,
+    active_server_url: Rc<RefCell<Option<String>>>,
+    active_server_type: Rc<RefCell<Option<String>>>,
+    active_server_rtt_ms: Rc<RefCell<Option<f64>>>,
 }
 
 impl HealthReporter {
     /// Create a new health reporter
-    pub fn new(session_id: String, reporting_peer: String) -> Self {
+    pub fn new(session_id: String, reporting_peer: String, health_interval_ms: u64) -> Self {
         Self {
             session_id,
             meeting_id: "".to_string(), // Will be set later
             reporting_peer,
             peer_health_data: Rc::new(RefCell::new(HashMap::new())),
             send_packet_callback: None,
-            health_interval_ms: 5000, // Send health every 5 seconds
+            health_interval_ms,
             reporting_audio_enabled: Rc::new(RefCell::new(false)),
             reporting_video_enabled: Rc::new(RefCell::new(false)),
+            active_server_url: Rc::new(RefCell::new(None)),
+            active_server_type: Rc::new(RefCell::new(None)),
+            active_server_rtt_ms: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -148,6 +154,9 @@ impl HealthReporter {
         let peer_health_data = Rc::downgrade(&self.peer_health_data);
         let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
         let video_enabled = Rc::downgrade(&self.reporting_video_enabled);
+        let active_server_url = Rc::downgrade(&self.active_server_url);
+        let active_server_type = Rc::downgrade(&self.active_server_type);
+        let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
 
         spawn_local(async move {
             debug!("Started health diagnostics subscription");
@@ -170,6 +179,35 @@ impl HealthReporter {
                                     "sender_video_enabled" => {
                                         if let MetricValue::U64(v) = &m.value {
                                             *ve.borrow_mut() = *v > 0;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    // Capture connection manager elected server and RTT
+                    if event.subsystem == "connection_manager" {
+                        if let (Some(url_rc), Some(typ_rc), Some(rtt_rc)) = (
+                            Weak::upgrade(&active_server_url),
+                            Weak::upgrade(&active_server_type),
+                            Weak::upgrade(&active_server_rtt_ms),
+                        ) {
+                            for m in &event.metrics {
+                                match m.name {
+                                    "active_server_url" => {
+                                        if let MetricValue::Text(v) = &m.value {
+                                            *url_rc.borrow_mut() = Some(v.clone());
+                                        }
+                                    }
+                                    "active_server_type" => {
+                                        if let MetricValue::Text(v) = &m.value {
+                                            *typ_rc.borrow_mut() = Some(v.clone());
+                                        }
+                                    }
+                                    "active_server_rtt" => {
+                                        if let MetricValue::F64(v) = &m.value {
+                                            *rtt_rc.borrow_mut() = Some(*v);
                                         }
                                     }
                                     _ => {}
@@ -401,6 +439,9 @@ impl HealthReporter {
         let interval_ms = self.health_interval_ms;
         let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
         let video_enabled = Rc::downgrade(&self.reporting_video_enabled);
+        let active_server_url = Rc::downgrade(&self.active_server_url);
+        let active_server_type = Rc::downgrade(&self.active_server_type);
+        let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
 
         spawn_local(async move {
             debug!("Started health reporting with interval: {interval_ms}ms");
@@ -417,6 +458,13 @@ impl HealthReporter {
                         let self_video_enabled = Weak::upgrade(&video_enabled)
                             .and_then(|ve| ve.try_borrow().ok().map(|v| *v))
                             .unwrap_or(false);
+                        // Snapshot active connection info for this tick
+                        let active_url = Weak::upgrade(&active_server_url)
+                            .and_then(|rc| rc.try_borrow().ok().and_then(|v| v.clone()));
+                        let active_type = Weak::upgrade(&active_server_type)
+                            .and_then(|rc| rc.try_borrow().ok().and_then(|v| v.clone()));
+                        let active_rtt = Weak::upgrade(&active_server_rtt_ms)
+                            .and_then(|rc| rc.try_borrow().ok().and_then(|v| *v));
                         let health_packet = Self::create_health_packet(
                             &session_id,
                             &meeting_id,
@@ -424,6 +472,9 @@ impl HealthReporter {
                             &health_map,
                             self_audio_enabled,
                             self_video_enabled,
+                            active_url,
+                            active_type,
+                            active_rtt,
                         );
 
                         if let Some(packet) = health_packet {
@@ -447,6 +498,9 @@ impl HealthReporter {
         health_map: &HashMap<String, PeerHealthData>,
         self_audio_enabled: bool,
         self_video_enabled: bool,
+        active_server_url: Option<String>,
+        active_server_type: Option<String>,
+        active_server_rtt_ms: Option<f64>,
     ) -> Option<PacketWrapper> {
         if health_map.is_empty() {
             return None;
@@ -463,6 +517,17 @@ impl HealthReporter {
             .as_millis() as u64;
         pb.reporting_audio_enabled = self_audio_enabled;
         pb.reporting_video_enabled = self_video_enabled;
+
+        // Include active connection info if available
+        if let Some(url) = active_server_url {
+            pb.active_server_url = url;
+        }
+        if let Some(typ) = active_server_type {
+            pb.active_server_type = typ;
+        }
+        if let Some(rtt) = active_server_rtt_ms {
+            pb.active_server_rtt_ms = rtt;
+        }
 
         for (peer_id, health_data) in health_map.iter() {
             let mut ps = PbPeerStats::new();

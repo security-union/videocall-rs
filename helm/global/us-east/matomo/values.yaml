@@ -19,7 +19,7 @@ matomo:
 
   # Matomo application configuration (using correct Bitnami schema)
   matomoUsername: "admin"
-  matomoPassword: "MatomoPassword123!"
+  matomoPassword: "MatomoPassword123"
   matomoEmail: "admin@videocall.rs"
   matomoWebsiteName: "VideoCall Analytics"
   matomoWebsiteHost: "https://videocall.rs"
@@ -28,32 +28,19 @@ matomo:
   mariadb:
     enabled: true
     auth:
-      rootPassword: "MariaDBRootPassword123!"
+      rootPassword: "MariaDBRootPassword123"
       database: "bitnami_matomo"
       username: "bn_matomo"
-      password: "MatomoDBPassword123!"
-    primary:
-      service:
-        type: ClusterIP
-      persistence:
-        enabled: true
-        size: 8Gi
-      resources:
-        limits:
-          cpu: 150m
-          memory: 256Mi
-        requests:
-          cpu: 75m
-          memory: 128Mi
+      password: "MatomoDBPassword123"
 
-  # Resources (reduced for metrics-api space)
+  # Resources (increased for Matomo installation)
   resources:
     limits:
-      cpu: 150m
-      memory: 256Mi
+      cpu: 500m
+      memory: 1Gi
     requests:
-      cpu: 75m
-      memory: 128Mi
+      cpu: 250m
+      memory: 512Mi
 
   # Persistence configuration
   persistence:

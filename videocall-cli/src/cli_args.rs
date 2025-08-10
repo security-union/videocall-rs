@@ -70,7 +70,7 @@ pub enum Mode {
 
 #[derive(Args, Debug, Clone)]
 pub struct Stream {
-    /// URL to connect to (default: us-east) but you can use any other region by passing the full URL
+    /// URL to connect to (default: us-east) but you can use any other region by passing the full URL.
     /// US: https://webtransport-us-east.webtransport.video
     /// SG: https://webtransport-singapore.webtransport.video
     #[clap(

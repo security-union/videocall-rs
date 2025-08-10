@@ -12,6 +12,7 @@ An open-source, high-performance video conferencing platform built with Rust, pr
 
 - [Overview](#overview)
 - [Features](#features)
+- [Compatibility](#compatibility)
 - [Why WebTransport Instead of WebRTC?](#why-webtransport-instead-of-webrtc)
 - [System Architecture](#system-architecture)
 - [Getting Started](#getting-started)
@@ -44,9 +45,19 @@ videocall.rs is a modern, open-source video conferencing system written entirely
 - **Multiple Transport Protocols:** Support for WebSockets and WebTransport 
 - **End-to-End Encryption (E2EE):** Optional secure communications between peers
 - **Scalable Architecture:** Designed with a pub/sub model using NATS for horizontal scaling
-- **Cross-Platform Support:** Works on Chromium-based browsers (Chrome, Edge, Brave) with Safari support in development. Firefox is not supported due to incomplete MediaStreamTrackProcessor implementation.
+- **Cross-Platform Support:** Chromium-based browsers and Safari supported
 - **Native Client Support:** CLI tool for headless video streaming from devices like Raspberry Pi
 - **Open Source:** MIT licensed for maximum flexibility
+
+## Compatibility
+
+| Browser              | Support |
+|----------------------|---------|
+| Chrome               | ✅      |
+| Brave                | ✅      |
+| Edge                 | ✅      |
+| Safari (macOS, iOS)  | ✅      |
+| Firefox              | ❌      |
 
 ## Why WebTransport Instead of WebRTC?
 
@@ -111,6 +122,7 @@ We strongly recommend using the Docker-based setup for development, as it's well
 - [Docker](https://docs.docker.com/engine/install/) and Docker Compose (for containerized setup)
 - [Rust toolchain](https://rustup.rs/) 1.85+ (for manual setup)
 - Chromium-based browser (Chrome, Edge, Brave) for frontend access - Firefox is not supported
+- Safari both in iOS and macOS are supported for frontend access
 
 ### Docker Setup
 
@@ -165,7 +177,7 @@ For advanced users who prefer to run services directly on their machine:
 
 4. Connect to:
    ```
-   http://localhost:8081/meeting/<username>/<meeting-id>
+   http://localhost:8081/meeting/<meeting-id>
    ```
 
 For detailed configuration options, see our [setup documentation](https://docs.videocall.rs/setup).
@@ -190,6 +202,8 @@ Authoritative keys and defaults: see `docker/start-yew.sh` and the Helm template
 ### Kubernetes/Helm: configmap-configjs.yaml
 
 `helm/rustlemania-ui/templates/configmap-configjs.yaml` renders `config.js` from `.Values.runtimeConfig`. Define `runtimeConfig` in your values file and deploy/upgrade. For the exact structure and latest behavior, refer to the template itself.
+
+ 
 
 ## Usage
 

@@ -797,15 +797,11 @@ impl Component for AttendantsComponent {
                 .collect(),
         );
 
-        let container_style = if self.peer_list_open || self.diagnostics_open {
-            // Use num_peers_for_styling (capped at CANVAS_LIMIT) for the CSS variable
-            format!("width: 80%; --num-peers: {};", num_peers_for_styling.max(1))
-        } else {
-            format!(
-                "width: 100%; --num-peers: {};",
-                num_peers_for_styling.max(1)
-            )
-        };
+        // Always let the grid take the whole stage; overlays should not shrink the grid
+        let container_style = format!(
+            "position: absolute; inset: 0; width: 100%; height: 100%; --num-peers: {};",
+            num_peers_for_styling.max(1)
+        );
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
@@ -841,7 +837,7 @@ impl Component for AttendantsComponent {
                     <BrowserCompatibility/>
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
                         <div style="text-align: center; color: white; margin-bottom: 2rem;">
-                            <h1>{"Ready to join the meeting?"}</h1>
+                            <h2>{"Ready to join the meeting?"}</h2>
                             <p>{"Click the button below to join and start listening to others."}</p>
                             {if let Some(error) = &self.error {
                                 html! { <p style="color: #ff6b6b; margin-top: 1rem;">{error}</p> }

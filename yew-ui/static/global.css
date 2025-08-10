@@ -147,12 +147,11 @@ body {
 
 /* Meeting page specific styles */
 .meeting-page {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
   height: 100vh;
   overflow: hidden;
-  position: fixed;
-  width: 100%;
-  top: 0;
-  left: 0;
 }
 
 /* Error display with instructions GIF */
@@ -505,8 +504,8 @@ body {
 /* Video Control Buttons */
 .video-controls-container {
   position: fixed;
-  bottom: 1.5rem;
   left: 50%;
+  bottom: 16px; /* minimal safe space */
   transform: translateX(-50%);
   display: flex;
   gap: 1.2rem; /* add breathing room between control buttons */

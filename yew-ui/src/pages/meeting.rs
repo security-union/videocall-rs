@@ -1,4 +1,4 @@
-use crate::components::{attendants::AttendantsComponent, top_bar::TopBar};
+use crate::components::attendants::AttendantsComponent;
 use crate::constants::{E2EE_ENABLED, WEBTRANSPORT_ENABLED};
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
@@ -136,15 +136,12 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                 if let Some(username) = maybe_username {
                     // --- In-meeting view ---
                     html! {
-                        <>
-                            <TopBar/>
-                            <AttendantsComponent
-                                email={username}
-                                id={props.id.clone()}
-                                webtransport_enabled={*WEBTRANSPORT_ENABLED}
-                                e2ee_enabled={*E2EE_ENABLED}
-                            />
-                        </>
+                        <AttendantsComponent
+                            email={username}
+                            id={props.id.clone()}
+                            webtransport_enabled={*WEBTRANSPORT_ENABLED}
+                            e2ee_enabled={*E2EE_ENABLED}
+                        />
                     }
                 } else {
                     // --- Username prompt view ---

@@ -28,10 +28,10 @@ matomo:
   mariadb:
     enabled: true
     auth:
-      rootPassword: "MariaDBRootPassword123"
+      rootPassword: "MariaDBRootPassword123!"
       database: "bitnami_matomo"
       username: "bn_matomo"
-      password: "MatomoDBPassword123"
+      password: "MatomoDBPassword123!"
 
   # Resources (increased for Matomo installation)
   resources:

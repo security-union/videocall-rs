@@ -1,5 +1,5 @@
 use crate::components::attendants::AttendantsComponent;
-use crate::constants::{E2EE_ENABLED, WEBTRANSPORT_ENABLED};
+use crate::constants::{e2ee_enabled, webtransport_enabled};
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
 };
@@ -139,8 +139,8 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         <AttendantsComponent
                             email={username}
                             id={props.id.clone()}
-                            webtransport_enabled={*WEBTRANSPORT_ENABLED}
-                            e2ee_enabled={*E2EE_ENABLED}
+                            webtransport_enabled={webtransport_enabled().unwrap_or(false)}
+                            e2ee_enabled={e2ee_enabled().unwrap_or(false)}
                         />
                     }
                 } else {

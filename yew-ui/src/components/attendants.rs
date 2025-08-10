@@ -21,9 +21,9 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     host::Host, peer_list::PeerList,
 };
-use crate::constants::ACTIX_WEBSOCKET;
+use crate::constants::actix_websocket_base;
 use crate::constants::{
-    CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
+    server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
@@ -155,11 +155,13 @@ impl AttendantsComponent {
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
-        let websocket_urls = ACTIX_WEBSOCKET
+        let websocket_urls = actix_websocket_base()
+            .unwrap_or_default()
             .split(',')
             .map(|s| format!("{s}/lobby/{email}/{id}"))
             .collect::<Vec<String>>();
-        let webtransport_urls = WEBTRANSPORT_HOST
+        let webtransport_urls = webtransport_host_base()
+            .unwrap_or_default()
             .split(',')
             .map(|s| format!("{s}/lobby/{email}/{id}"))
             .collect::<Vec<String>>();
@@ -170,6 +172,9 @@ impl AttendantsComponent {
             id,
             ctx.props().webtransport_enabled
         );
+        if websocket_urls.is_empty() || webtransport_urls.is_empty() {
+            log::error!("Runtime config missing or invalid: wsUrl or webTransportHost not set");
+        }
         log::info!("YEW-UI: WebSocket URLs: {websocket_urls:?}");
         log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
 
@@ -222,7 +227,7 @@ impl AttendantsComponent {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
-            rtt_testing_period_ms: *SERVER_ELECTION_PERIOD_MS,
+            rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
             rtt_probe_interval_ms: Some(200),
         };
 
@@ -326,7 +331,7 @@ impl Component for AttendantsComponent {
     fn create(ctx: &Context<Self>) -> Self {
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
-        let self_ = Self {
+        let mut self_ = Self {
             client,
             media_device_access,
             share_screen: false,
@@ -356,6 +361,10 @@ impl Component for AttendantsComponent {
             simulation_info_message: None,
             show_copy_toast: false,
         };
+        if let Err(e) = crate::constants::app_config() {
+            log::error!("{e:?}");
+            self_.error = Some(e);
+        }
         {
             let link = ctx.link().clone();
             wasm_bindgen_futures::spawn_local(async move {
@@ -914,7 +923,7 @@ impl Component for AttendantsComponent {
                     }
 
                     {
-                        if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
+                        if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
                             html! {
                                 <nav class="host">
                                     <div class="controls">
@@ -1145,7 +1154,8 @@ impl Component for AttendantsComponent {
                             }
                         } else {
                             error!("User not allowed to stream");
-                            error!("allowed users {}", USERS_ALLOWED_TO_STREAM.join(", "));
+                            let allowed = users_allowed_to_stream().unwrap_or_default();
+                            error!("allowed users {}", allowed.join(", "));
                             html! {}
                         }
                     }

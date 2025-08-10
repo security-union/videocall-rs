@@ -23,15 +23,15 @@ mod context;
 mod pages;
 mod types;
 
-use constants::LOGIN_URL;
+use constants::login_url;
 
-use yew::prelude::*;
-#[macro_use]
-extern crate lazy_static;
+use crate::constants::app_config;
+use components::config_error::ConfigError;
 use components::matomo::MatomoTracker;
 use enum_display::EnumDisplay;
 use gloo_utils::window;
 use pages::home::Home;
+use yew::prelude::*;
 use yew_router::prelude::*;
 
 use context::{load_username_from_storage, UsernameCtx};
@@ -63,6 +63,9 @@ enum Route {
 }
 
 fn switch(routes: Route) -> Html {
+    if let Err(e) = app_config() {
+        return html! { <ConfigError message={e} /> };
+    }
     let matomo = MatomoTracker::new();
     matomo.track_page_view(&routes.to_string(), &routes.to_string());
     match routes {
@@ -79,8 +82,11 @@ fn switch(routes: Route) -> Html {
 
 #[function_component(Login)]
 fn login() -> Html {
-    let login = Callback::from(|_: MouseEvent| {
-        window().location().set_href(LOGIN_URL).ok();
+    let login = Callback::from(|_: MouseEvent| match login_url() {
+        Ok(url) => {
+            let _ = window().location().set_href(&url);
+        }
+        Err(e) => log::error!("{e:?}"),
     });
     html! {<>
         <input type="image" onclick={login.clone()} src="/assets/btn_google.png" />

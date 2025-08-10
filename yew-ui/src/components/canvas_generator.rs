@@ -19,7 +19,7 @@
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
-use crate::constants::USERS_ALLOWED_TO_STREAM;
+use crate::constants::users_allowed_to_stream;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
 use wasm_bindgen::JsCast;
@@ -32,9 +32,8 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
     // If only one peer, render it as a full-bleed tile (WhatsApp-like)
     if peers.len() == 1 {
         let key = &peers[0];
-        if !USERS_ALLOWED_TO_STREAM.is_empty()
-            && !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
-        {
+        let allowed = users_allowed_to_stream().unwrap_or_default();
+        if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
             return vec![];
         }
         let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
@@ -62,8 +61,9 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
     peers
         .iter()
         .map(|key| {
-            if !USERS_ALLOWED_TO_STREAM.is_empty()
-                && !USERS_ALLOWED_TO_STREAM.iter().any(|host| host == key)
+            let allowed = users_allowed_to_stream().unwrap_or_default();
+            if !allowed.is_empty()
+                && !allowed.iter().any(|host| host == key)
             {
                 return html! {};
             }

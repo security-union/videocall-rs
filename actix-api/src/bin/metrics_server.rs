@@ -27,6 +27,8 @@ struct SessionInfo {
     to_peers: HashSet<String>,
     // Peer IDs we have published peer connection metrics for
     peer_ids: HashSet<String>,
+    // Server info we have published active server metrics for (server_url, server_type)
+    active_servers: HashSet<(String, String)>,
 }
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
@@ -113,6 +115,19 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = SELF_VIDEO_ENABLED
         .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_peer]);
 
+    // Remove active server metrics for this session
+    for (server_url, server_type) in &session_info.active_servers {
+        let server_labels = [
+            &session_info.meeting_id,
+            &session_info.session_id,
+            &session_info.reporting_peer,
+            server_url.as_str(),
+            server_type.as_str(),
+        ];
+        let _ = CLIENT_ACTIVE_SERVER.remove_label_values(&server_labels);
+        let _ = CLIENT_ACTIVE_SERVER_RTT_MS.remove_label_values(&server_labels);
+    }
+
     // Remove all peer connection series we set
     for peer_id in &session_info.peer_ids {
         let _ = PEER_CONNECTIONS_TOTAL.remove_label_values(&[&session_info.meeting_id, peer_id]);
@@ -185,6 +200,7 @@ fn process_health_packet_to_metrics_pb(
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             },
         );
     }
@@ -227,6 +243,16 @@ fn process_health_packet_to_metrics_pb(
                         server_type,
                     ])
                     .set(health_packet.active_server_rtt_ms);
+            }
+
+            // Track server info used for cleanup
+            {
+                let mut tracker = session_tracker.lock().unwrap();
+                let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                if let Some(info) = tracker.get_mut(&key) {
+                    info.active_servers
+                        .insert((server_url.to_string(), server_type.to_string()));
+                }
             }
         }
         // Set active session metric
@@ -785,6 +811,7 @@ mod tests {
             last_seen: Instant::now(),
             to_peers: HashSet::new(),
             peer_ids: HashSet::new(),
+            active_servers: HashSet::new(),
         };
 
         assert_eq!(session_info.session_id, "session_123");
@@ -808,6 +835,7 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key.clone(), session_info);
             assert_eq!(tracker_guard.len(), 1);
@@ -849,6 +877,7 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
         }
@@ -864,6 +893,7 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             };
             // Simulate old timestamp by subtracting 40 seconds
             session_info.last_seen = session_info.last_seen - Duration::from_secs(40);
@@ -1120,6 +1150,7 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key1, session_info1);
 
@@ -1132,6 +1163,7 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             };
             session_info2.last_seen = session_info2.last_seen - Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
@@ -1145,6 +1177,7 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key3, session_info3);
         }
@@ -1177,6 +1210,7 @@ mod tests {
             last_seen: Instant::now(),
             to_peers: HashSet::new(),
             peer_ids: HashSet::new(),
+            active_servers: HashSet::new(),
         };
 
         // This test verifies that remove_session_metrics doesn't panic
@@ -1203,6 +1237,7 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             };
             tracker_guard.insert(session_key, session_info);
         });
@@ -1239,6 +1274,92 @@ mod tests {
     }
 
     #[test]
+    fn test_rtt_metrics_cleanup() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // Create a health packet with RTT data
+        let mut hp = PbHealthPacket::new();
+        hp.session_id = "sess_rtt".to_string();
+        hp.meeting_id = "meet_rtt".to_string();
+        hp.reporting_peer = "alice".to_string();
+        hp.timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        hp.active_server_url = "wss://server.example.com".to_string();
+        hp.active_server_type = "websocket".to_string();
+        hp.active_server_rtt_ms = 42.5;
+
+        // Process the packet to set RTT metrics
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker);
+        assert!(result.is_ok());
+
+        // Verify server info was tracked
+        let session_key = "meet_rtt_sess_rtt_alice";
+        {
+            let tracker_guard = tracker.lock().unwrap();
+            let session_info = tracker_guard.get(session_key).unwrap();
+            assert!(session_info.active_servers.contains(&(
+                "wss://server.example.com".to_string(),
+                "websocket".to_string()
+            )));
+        }
+
+        // Verify RTT metrics exist (indirectly through successful processing)
+        assert!(series_exists(
+            "videocall_client_active_server",
+            &[
+                ("meeting_id", "meet_rtt"),
+                ("session_id", "sess_rtt"),
+                ("peer_id", "alice"),
+                ("server_url", "wss://server.example.com"),
+                ("server_type", "websocket")
+            ]
+        ));
+
+        assert!(series_exists(
+            "videocall_client_active_server_rtt_ms",
+            &[
+                ("meeting_id", "meet_rtt"),
+                ("session_id", "sess_rtt"),
+                ("peer_id", "alice"),
+                ("server_url", "wss://server.example.com"),
+                ("server_type", "websocket")
+            ]
+        ));
+
+        // Remove session metrics
+        let info = {
+            let guard = tracker.lock().unwrap();
+            guard.get(session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        // Verify RTT metrics are removed
+        assert!(!series_exists(
+            "videocall_client_active_server",
+            &[
+                ("meeting_id", "meet_rtt"),
+                ("session_id", "sess_rtt"),
+                ("peer_id", "alice"),
+                ("server_url", "wss://server.example.com"),
+                ("server_type", "websocket")
+            ]
+        ));
+
+        assert!(!series_exists(
+            "videocall_client_active_server_rtt_ms",
+            &[
+                ("meeting_id", "meet_rtt"),
+                ("session_id", "sess_rtt"),
+                ("peer_id", "alice"),
+                ("server_url", "wss://server.example.com"),
+                ("server_type", "websocket")
+            ]
+        ));
+    }
+
+    #[test]
     fn test_session_timeout_edge_cases() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1253,6 +1374,7 @@ mod tests {
                 last_seen: Instant::now(),
                 to_peers: HashSet::new(),
                 peer_ids: HashSet::new(),
+                active_servers: HashSet::new(),
             };
             // Set to exactly 30 seconds ago (timeout boundary)
             session_info.last_seen = session_info.last_seen - Duration::from_secs(30);

@@ -498,7 +498,7 @@ deploy_chart() {
     log_info "Switched to context: ${context}"
     
     # Standard local chart deployment for all regional charts
-    if ! (cd "${chart_path}" && helm upgrade --install "${release_name}" . -f values.yaml --timeout 300s); then
+    if ! (cd "${chart_path}" && helm upgrade --install "${release_name}" . -f values.yaml --timeout 300s --force); then
         error_exit "Failed to deploy ${chart}"
     fi
     

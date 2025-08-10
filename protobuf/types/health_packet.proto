@@ -57,5 +57,10 @@ message HealthPacket {
 
   // Per-peer stats keyed by peer_id (to_peer)
   map<string, PeerStats> peer_stats = 7;
+
+  // Active connection info (client-side measured)
+  string active_server_url = 8;
+  string active_server_type = 9; // "webtransport" | "websocket"
+  double active_server_rtt_ms = 10;
 }
 

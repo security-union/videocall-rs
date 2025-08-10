@@ -985,6 +985,13 @@ pub struct HealthPacket {
     ///  Per-peer stats keyed by peer_id (to_peer)
     // @@protoc_insertion_point(field:health_packet.HealthPacket.peer_stats)
     pub peer_stats: ::std::collections::HashMap<::std::string::String, PeerStats>,
+    ///  Active connection info (client-side measured)
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.active_server_url)
+    pub active_server_url: ::std::string::String,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.active_server_type)
+    pub active_server_type: ::std::string::String,
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.active_server_rtt_ms)
+    pub active_server_rtt_ms: f64,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.HealthPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1002,7 +1009,7 @@ impl HealthPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(7);
+        let mut fields = ::std::vec::Vec::with_capacity(10);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "session_id",
@@ -1038,6 +1045,21 @@ impl HealthPacket {
             "peer_stats",
             |m: &HealthPacket| { &m.peer_stats },
             |m: &mut HealthPacket| { &mut m.peer_stats },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "active_server_url",
+            |m: &HealthPacket| { &m.active_server_url },
+            |m: &mut HealthPacket| { &mut m.active_server_url },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "active_server_type",
+            |m: &HealthPacket| { &m.active_server_type },
+            |m: &mut HealthPacket| { &mut m.active_server_type },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "active_server_rtt_ms",
+            |m: &HealthPacket| { &m.active_server_rtt_ms },
+            |m: &mut HealthPacket| { &mut m.active_server_rtt_ms },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HealthPacket>(
             "HealthPacket",
@@ -1090,6 +1112,15 @@ impl ::protobuf::Message for HealthPacket {
                     is.pop_limit(old_limit);
                     self.peer_stats.insert(key, value);
                 },
+                66 => {
+                    self.active_server_url = is.read_string()?;
+                },
+                74 => {
+                    self.active_server_type = is.read_string()?;
+                },
+                81 => {
+                    self.active_server_rtt_ms = is.read_double()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -1127,6 +1158,15 @@ impl ::protobuf::Message for HealthPacket {
             entry_size += 1 + ::protobuf::rt::compute_raw_varint64_size(len) + len;
             my_size += 1 + ::protobuf::rt::compute_raw_varint64_size(entry_size) + entry_size
         };
+        if !self.active_server_url.is_empty() {
+            my_size += ::protobuf::rt::string_size(8, &self.active_server_url);
+        }
+        if !self.active_server_type.is_empty() {
+            my_size += ::protobuf::rt::string_size(9, &self.active_server_type);
+        }
+        if self.active_server_rtt_ms != 0. {
+            my_size += 1 + 8;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -1161,6 +1201,15 @@ impl ::protobuf::Message for HealthPacket {
             os.write_string(1, &k)?;
             ::protobuf::rt::write_message_field_with_cached_size(2, v, os)?;
         };
+        if !self.active_server_url.is_empty() {
+            os.write_string(8, &self.active_server_url)?;
+        }
+        if !self.active_server_type.is_empty() {
+            os.write_string(9, &self.active_server_type)?;
+        }
+        if self.active_server_rtt_ms != 0. {
+            os.write_double(10, self.active_server_rtt_ms)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -1185,6 +1234,9 @@ impl ::protobuf::Message for HealthPacket {
         self.reporting_audio_enabled = false;
         self.reporting_video_enabled = false;
         self.peer_stats.clear();
+        self.active_server_url.clear();
+        self.active_server_type.clear();
+        self.active_server_rtt_ms = 0.;
         self.special_fields.clear();
     }
 
@@ -1237,19 +1289,22 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x12#\n\rvideo_enabled\x18\x04\x20\x01(\x08R\x0cvideoEnabled\x12:\n\x0bn\
     eteq_stats\x18\x05\x20\x01(\x0b2\x19.health_packet.NetEqStatsR\nneteqSta\
     ts\x12:\n\x0bvideo_stats\x18\x06\x20\x01(\x0b2\x19.health_packet.VideoSt\
-    atsR\nvideoStats\"\xa9\x03\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\
+    atsR\nvideoStats\"\xb4\x04\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\
     \x01\x20\x01(\tR\tsessionId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tm\
     eetingId\x12%\n\x0ereporting_peer\x18\x03\x20\x01(\tR\rreportingPeer\x12\
     !\n\x0ctimestamp_ms\x18\x04\x20\x01(\x04R\x0btimestampMs\x126\n\x17repor\
     ting_audio_enabled\x18\x05\x20\x01(\x08R\x15reportingAudioEnabled\x126\n\
     \x17reporting_video_enabled\x18\x06\x20\x01(\x08R\x15reportingVideoEnabl\
     ed\x12I\n\npeer_stats\x18\x07\x20\x03(\x0b2*.health_packet.HealthPacket.\
-    PeerStatsEntryR\tpeerStats\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03key\x18\
-    \x01\x20\x01(\tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.health\
-    _packet.PeerStatsR\x05value:\x028\x01J\xd5\x10\n\x06\x12\x04\0\0;\x01\n\
-    \x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\x16\n\n\n\
-    \x02\x04\0\x12\x04\x04\0\x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\x04\x08\x1e\
-    \n\x0b\n\x04\x04\0\x02\0\x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\0\x02\0\x05\
+    PeerStatsEntryR\tpeerStats\x12*\n\x11active_server_url\x18\x08\x20\x01(\
+    \tR\x0factiveServerUrl\x12,\n\x12active_server_type\x18\t\x20\x01(\tR\
+    \x10activeServerType\x12/\n\x14active_server_rtt_ms\x18\n\x20\x01(\x01R\
+    \x11activeServerRttMs\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03key\x18\x01\
+    \x20\x01(\tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.health_pac\
+    ket.PeerStatsR\x05value:\x028\x01J\xcb\x12\n\x06\x12\x04\0\0@\x01\n\x08\
+    \n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\x16\n\n\n\x02\
+    \x04\0\x12\x04\x04\0\x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\x04\x08\x1e\n\
+    \x0b\n\x04\x04\0\x02\0\x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\0\x02\0\x05\
     \x12\x03\x05\x02\x08\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x05\t\x17\n\x0c\
     \n\x05\x04\0\x02\0\x03\x12\x03\x05\x1a\x1b\n\x0b\n\x04\x04\0\x02\x01\x12\
     \x03\x06\x02\x1c\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x06\x02\x08\n\x0c\
@@ -1320,7 +1375,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x0b\n\x04\x04\x04\x02\x05\x12\x03,\x02\x1d\n\x0c\n\x05\x04\x04\x02\x05\
     \x06\x12\x03,\x02\x0c\n\x0c\n\x05\x04\x04\x02\x05\x01\x12\x03,\r\x18\n\
     \x0c\n\x05\x04\x04\x02\x05\x03\x12\x03,\x1b\x1c\n\n\n\x02\x04\x05\x12\
-    \x04/\0;\x01\n\n\n\x03\x04\x05\x01\x12\x03/\x08\x14\n\x0b\n\x04\x04\x05\
+    \x04/\0@\x01\n\n\n\x03\x04\x05\x01\x12\x03/\x08\x14\n\x0b\n\x04\x04\x05\
     \x02\0\x12\x030\x02\x18\n\x0c\n\x05\x04\x05\x02\0\x05\x12\x030\x02\x08\n\
     \x0c\n\x05\x04\x05\x02\0\x01\x12\x030\t\x13\n\x0c\n\x05\x04\x05\x02\0\
     \x03\x12\x030\x16\x17\n\x0b\n\x04\x04\x05\x02\x01\x12\x031\x02\x18\n\x0c\
@@ -1340,8 +1395,17 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x05\x04\x05\x02\x05\x03\x12\x037!\"\n8\n\x04\x04\x05\x02\x06\x12\x03:\
     \x02(\x1a+\x20Per-peer\x20stats\x20keyed\x20by\x20peer_id\x20(to_peer)\n\
     \n\x0c\n\x05\x04\x05\x02\x06\x06\x12\x03:\x02\x18\n\x0c\n\x05\x04\x05\
-    \x02\x06\x01\x12\x03:\x19#\n\x0c\n\x05\x04\x05\x02\x06\x03\x12\x03:&'b\
-    \x06proto3\
+    \x02\x06\x01\x12\x03:\x19#\n\x0c\n\x05\x04\x05\x02\x06\x03\x12\x03:&'\n<\
+    \n\x04\x04\x05\x02\x07\x12\x03=\x02\x1f\x1a/\x20Active\x20connection\x20\
+    info\x20(client-side\x20measured)\n\n\x0c\n\x05\x04\x05\x02\x07\x05\x12\
+    \x03=\x02\x08\n\x0c\n\x05\x04\x05\x02\x07\x01\x12\x03=\t\x1a\n\x0c\n\x05\
+    \x04\x05\x02\x07\x03\x12\x03=\x1d\x1e\n+\n\x04\x04\x05\x02\x08\x12\x03>\
+    \x02\x20\"\x1e\x20\"webtransport\"\x20|\x20\"websocket\"\n\n\x0c\n\x05\
+    \x04\x05\x02\x08\x05\x12\x03>\x02\x08\n\x0c\n\x05\x04\x05\x02\x08\x01\
+    \x12\x03>\t\x1b\n\x0c\n\x05\x04\x05\x02\x08\x03\x12\x03>\x1e\x1f\n\x0b\n\
+    \x04\x04\x05\x02\t\x12\x03?\x02#\n\x0c\n\x05\x04\x05\x02\t\x05\x12\x03?\
+    \x02\x08\n\x0c\n\x05\x04\x05\x02\t\x01\x12\x03?\t\x1d\n\x0c\n\x05\x04\
+    \x05\x02\t\x03\x12\x03?\x20\"b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

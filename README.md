@@ -19,6 +19,7 @@ An open-source, high-performance video conferencing platform built with Rust, pr
   - [Docker Setup](#docker-setup)
   - [Manual Setup](#manual-setup)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
+  - [Local (no Docker)](#local-no-docker-create-yew-uiscriptsconfigjs)
   - [Local/Docker](#localdocker-start-yewsh)
   - [Kubernetes/Helm](#kuberneteshelm-configmap-configjsyaml)
 - [Usage](#usage)
@@ -171,64 +172,24 @@ For detailed configuration options, see our [setup documentation](https://docs.v
 
 ## Runtime Configuration (Frontend config.js)
 
-The Yew UI is configured at runtime via a `window.__APP_CONFIG` object provided by a `config.js` file. There are two supported ways to supply this file:
+The Yew UI is configured at runtime via a `window.__APP_CONFIG` object provided by a `config.js` file. The file is copied by Trunk and loaded at `/config.js` by `yew-ui/index.html`.
+
+### Local (no Docker): create yew-ui/scripts/config.js
+
+- Start services with `./start_dev.sh`.
+- Create `yew-ui/scripts/config.js` that assigns `window.__APP_CONFIG = Object.freeze({...})`.
+- Keep the keys in sync with the authoritative sources below. Trunk will copy the file and the app will pick it up on refresh.
+- Tip: `mkdir -p yew-ui/scripts` to ensure the directory exists.
+
+Authoritative keys and defaults: see `docker/start-yew.sh` and the Helm template referenced below.
 
 ### Local/Docker: start-yew.sh
 
-When running locally (or via the provided Docker environment), `docker/start-yew.sh` generates `/app/yew-ui/scripts/config.js` on container startup from environment variables:
-
-- **API_BASE_URL → apiBaseUrl**: default `http://localhost:${ACTIX_PORT:-8080}`
-- **ACTIX_UI_BACKEND_URL → wsUrl**: default `ws://localhost:${ACTIX_PORT:-8080}`
-- **WEBTRANSPORT_HOST → webTransportHost**: default `https://127.0.0.1:4433`
-- **ENABLE_OAUTH → oauthEnabled**: default `false` (string)
-- **E2EE_ENABLED → e2eeEnabled**: default `false` (string)
-- **WEBTRANSPORT_ENABLED → webTransportEnabled**: default `false` (string)
-- **USERS_ALLOWED_TO_STREAM → usersAllowedToStream**: default empty string (comma-separated user IDs)
-- **SERVER_ELECTION_PERIOD_MS → serverElectionPeriodMs**: default `2000`
-- **AUDIO_BITRATE_KBPS → audioBitrateKbps**: default `65`
-- **VIDEO_BITRATE_KBPS → videoBitrateKbps**: default `1000`
-- **SCREEN_BITRATE_KBPS → screenBitrateKbps**: default `1000`
-
-Example override when running a container:
-
-```sh
-# Example: customize URLs and enable WebTransport
-API_BASE_URL=https://api.local \
-ACTIX_UI_BACKEND_URL=wss://api.local/ws \
-WEBTRANSPORT_HOST=https://api.local:4433 \
-WEBTRANSPORT_ENABLED=true \
-E2EE_ENABLED=true \
-make up
-```
-
-Notes:
-- Values are injected verbatim into `window.__APP_CONFIG`; booleans are strings (`"true"`/`"false"`).
-- The file is generated at container start, so update env vars and restart the container to apply changes.
+`docker/start-yew.sh` generates `/app/yew-ui/scripts/config.js` from environment variables at container startup. For the current list of supported variables and defaults, refer directly to `docker/start-yew.sh`. Restart the container to apply changes.
 
 ### Kubernetes/Helm: configmap-configjs.yaml
 
-In Kubernetes, the Helm chart `helm/rustlemania-ui/templates/configmap-configjs.yaml` creates a ConfigMap that renders `config.js` from `.Values.runtimeConfig`:
-
-```yaml
-# values.yaml
-runtimeConfig:
-  apiBaseUrl: "https://api.example.com"
-  wsUrl: "wss://api.example.com/ws"
-  webTransportHost: "https://webtransport.example.com:4433"
-  oauthEnabled: "false"
-  e2eeEnabled: "true"
-  webTransportEnabled: "true"
-  usersAllowedToStream: "alice,bob"
-  serverElectionPeriodMs: 2000
-  audioBitrateKbps: 65
-  videoBitrateKbps: 1000
-  screenBitrateKbps: 1000
-```
-
-Usage:
-- Set `runtimeConfig` in your chart values to match your environment.
-- Deploy or upgrade the release; the chart will serve `config.js` with `window.__APP_CONFIG = <your JSON>;`.
-- Prefer quoting booleans as strings to match the local env behavior unless your UI expects strict boolean types.
+`helm/rustlemania-ui/templates/configmap-configjs.yaml` renders `config.js` from `.Values.runtimeConfig`. Define `runtimeConfig` in your values file and deploy/upgrade. For the exact structure and latest behavior, refer to the template itself.
 
 ## Usage
 

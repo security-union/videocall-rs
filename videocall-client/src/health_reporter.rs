@@ -491,6 +491,7 @@ impl HealthReporter {
     }
 
     /// Create a health packet from current peer health data
+    #[allow(clippy::too_many_arguments)]
     fn create_health_packet(
         session_id: &str,
         meeting_id: &str,

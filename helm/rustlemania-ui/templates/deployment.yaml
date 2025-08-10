@@ -40,6 +40,15 @@ spec:
               protocol: TCP
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: app-config
+              mountPath: /dist/config.js
+              subPath: config.js
+              readOnly: true
+      volumes:
+        - name: app-config
+          configMap:
+            name: {{ include "rustlemania.fullname" . }}-config
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

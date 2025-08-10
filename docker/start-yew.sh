@@ -20,6 +20,7 @@ window.__APP_CONFIG = Object.freeze({
 EOF
 
 # Ensure trunk is on PATH (common install locations)
+# trigger ci
 export PATH="$PATH:/usr/local/cargo/bin:/root/.cargo/bin"
 
 # Run the dev server

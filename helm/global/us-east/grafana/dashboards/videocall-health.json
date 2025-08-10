@@ -729,6 +729,58 @@
       ],
       "title": "Decode Operations Per Second",
       "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "id": 9,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting_id\"}",
+          "legendFormat": "{{peer_id}} → {{server_url}} ({{server_type}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Client Active Server RTT (ms)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "min": 0,
+          "max": 1,
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 48 },
+      "id": 10,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "videocall_client_active_server{meeting_id=~\"$meeting_id\"}",
+          "legendFormat": "{{peer_id}} → {{server_url}} ({{server_type}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Client Active Server (1 = connected)",
+      "type": "timeseries"
     }
   ],
   "schemaVersion": 27,

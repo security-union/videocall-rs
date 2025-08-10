@@ -214,4 +214,20 @@ lazy_static! {
         &["meeting_id", "peer_id"]
     )
     .expect("Failed to create self_video_enabled metric");
+
+    /// Client-side measured active server RTT in milliseconds
+    pub static ref CLIENT_ACTIVE_SERVER_RTT_MS: GaugeVec = register_gauge_vec!(
+        "videocall_client_active_server_rtt_ms",
+        "Client-side measured RTT to the elected server (ms)",
+        &["meeting_id", "session_id", "peer_id", "server_url", "server_type"]
+    )
+    .expect("Failed to create client_active_server_rtt_ms metric");
+
+    /// Marker that a client is connected to a given server (value = 1)
+    pub static ref CLIENT_ACTIVE_SERVER: GaugeVec = register_gauge_vec!(
+        "videocall_client_active_server",
+        "Indicates which server a client is connected to (1)",
+        &["meeting_id", "session_id", "peer_id", "server_url", "server_type"]
+    )
+    .expect("Failed to create client_active_server metric");
 }

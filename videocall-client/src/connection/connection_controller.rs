@@ -65,18 +65,34 @@ impl ConnectionController {
         timers.push(Interval::new(1000, move || {
             if let Some(inner) = inner_ref.upgrade() {
                 if let Ok(mut inner) = inner.try_borrow_mut() {
+                    // Always drive diagnostics once per second
                     inner.connection_manager.trigger_diagnostics_report();
+
+                    // After election, probe RTT at 1 Hz
+                    if matches!(
+                        inner.connection_manager.get_connection_state(),
+                        ConnectionState::Connected { .. }
+                    ) {
+                        if let Err(e) = inner.connection_manager.send_rtt_probes() {
+                            debug!("Failed to send 1Hz RTT probe post-election: {e}");
+                        }
+                    }
                 }
             }
         }));
 
-        // RTT probing timer (200ms intervals)
+        // RTT probing timer (200ms intervals) - only during election (Testing)
         let inner_ref = inner_weak.clone();
         timers.push(Interval::new(200, move || {
             if let Some(inner) = inner_ref.upgrade() {
                 if let Ok(mut inner) = inner.try_borrow_mut() {
-                    if let Err(e) = inner.connection_manager.send_rtt_probes() {
-                        debug!("Failed to send RTT probes: {e}");
+                    if matches!(
+                        inner.connection_manager.get_connection_state(),
+                        ConnectionState::Testing { .. }
+                    ) {
+                        if let Err(e) = inner.connection_manager.send_rtt_probes() {
+                            debug!("Failed to send RTT probes during election: {e}");
+                        }
                     }
                 }
             }

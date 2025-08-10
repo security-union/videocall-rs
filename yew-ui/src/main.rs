@@ -86,7 +86,7 @@ fn login() -> Html {
         Ok(url) => {
             let _ = window().location().set_href(&url);
         }
-        Err(e) => log::error!("{}", e),
+        Err(e) => log::error!("{e:?}"),
     });
     html! {<>
         <input type="image" onclick={login.clone()} src="/assets/btn_google.png" />

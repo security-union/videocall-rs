@@ -1,7 +1,5 @@
 FROM securityunion/yew:main-68edb47a as build
 
-
-
 WORKDIR /app
 COPY . .
 WORKDIR /app/yew-ui

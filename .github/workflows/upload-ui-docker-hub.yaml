@@ -8,6 +8,7 @@ on:
     branches:
       - main
       - add-diagnostics
+      - add-dynamic-ui-config
     paths:
       - 'yew-ui/**'
       - 'types/**'

@@ -6,5 +6,6 @@ metadata:
     {{- include "rustlemania.labels" . | nindent 4 }}
 data:
   config.js: |-
-    {{- $cfg := default dict .Values.runtimeConfig -}}
+    {{ $cfg := default dict .Values.runtimeConfig }}
     window.__APP_CONFIG = Object.freeze({{ $cfg | toJson }});
+    

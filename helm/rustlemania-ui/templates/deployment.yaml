@@ -42,7 +42,7 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - name: app-config
-              mountPath: /dist/config.js
+              mountPath: /usr/share/nginx/html/config.js
               subPath: config.js
               readOnly: true
       volumes:

@@ -88,6 +88,21 @@ body {
   background-color: #000000;
 }
 
+/* Design tokens (accent + surfaces) */
+:root {
+  --bg: #0B0F16;
+  --surface: rgba(255, 255, 255, 0.06);
+  --surface-strong: rgba(255, 255, 255, 0.08);
+  --hairline: rgba(255, 255, 255, 0.14);
+  --text-subtle: #AEAEB2;
+  --accent-1: #0A84FF; /* electric blue */
+  --accent-2: #8E66FF; /* indigo-violet */
+  --accent-3: #BF5AF2; /* pink-violet */
+  --blur-strong: 20px;
+  --radius-xl: 20px;
+  --shadow-elev-1: 0 10px 30px rgba(0,0,0,0.35);
+}
+
 /* Apple-like component primitives (mirrors leptos-website/input.css) */
 .btn-apple {
   display: inline-flex;
@@ -101,14 +116,17 @@ body {
   outline: none;
 }
 .btn-primary {
-  background: #007AFF;
   color: #fff;
+  background: #0A84FF;
+  border: 1px solid rgba(255,255,255,0.08);
+  box-shadow: 0 8px 18px rgba(10,132,255,0.22), inset 0 1px 0 rgba(255,255,255,0.10);
 }
-.btn-primary:hover { background: #0A84FF; }
+.btn-primary:hover { background: #2593FF; }
+.btn-apple:active { transform: translateY(0); filter: brightness(0.96); }
 .btn-secondary {
-  background: #1C1C1E;
+  background: rgba(255,255,255,0.04);
   color: #FFFFFF;
-  border: 1px solid #38383A;
+  border: 1px solid var(--hairline);
 }
 .btn-secondary:hover { background: #2C2C2E; border-color: #48484A; }
 
@@ -117,26 +135,34 @@ body {
 
 /* Apple input */
 .input-apple {
-  background: #1C1C1E;
-  border: 1px solid #38383A;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
   color: #FFFFFF;
   transition: all 0.2s ease;
   font-size: 1.0625rem;
-  padding: 0.875rem 1rem;
-  border-radius: 0.75rem;
+  padding: 0.8rem 1rem;
+  border-radius: 9999px;
   width: 100%;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
 }
 .input-apple::placeholder { color: #8E8E93; }
-.input-apple:hover { border-color: #48484A; background: #2C2C2E; }
-.input-apple:focus { outline: none; box-shadow: 0 0 0 2px rgba(0,122,255,0.25); border-color: #0A84FF; }
+.input-apple:hover { border-color: #48484A; background: var(--surface-strong); }
+.input-apple:focus {
+  outline: none;
+  border-color: transparent;
+  box-shadow:
+    0 0 0 2px rgba(255,255,255,0.08),
+    0 0 0 4px rgba(10,132,255,0.35);
+}
 
 /* Apple card */
 .card-apple {
-  background-color: #1C1C1E;
-  border: 1px solid #38383A;
-  border-radius: 0.75rem;
-  padding: 1.5rem;
-  backdrop-filter: blur(8px);
+  background-color: rgba(255,255,255,0.045);
+  border: 1px solid var(--hairline);
+  border-radius: 1rem;
+  padding: 1.25rem 1.25rem 1rem 1.25rem;
+  backdrop-filter: blur(22px);
+  box-shadow: 0 20px 45px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05);
 }
 
 /* Apple text hierarchy */
@@ -197,7 +223,9 @@ body {
   justify-content: center;
   align-items: flex-start;
   padding: 2rem 0;
-  background: #000000;
+  background: radial-gradient(1200px 800px at 20% 10%, rgba(14, 28, 54, 0.7), transparent 60%),
+              radial-gradient(1000px 700px at 80% 70%, rgba(28, 10, 50, 0.55), transparent 60%),
+              linear-gradient(180deg, #05070B 0%, #0B0F16 100%);
   overflow-y: auto;
   overflow-x: hidden;
   z-index: 0;
@@ -210,11 +238,11 @@ body {
   position: relative;
   z-index: 2;
   max-width: 90%;
-  width: 650px;
-  background: linear-gradient(180deg, rgba(28,28,30,0.92) 0%, rgba(28,28,30,0.82) 100%);
-  backdrop-filter: blur(16px);
+  width: 560px;
+  background: linear-gradient(180deg, rgba(28,28,30,0.72) 0%, rgba(28,28,30,0.62) 100%);
+  backdrop-filter: blur(18px);
   border-radius: 1rem;
-  border: 1px solid #38383A;
+  border: 1px solid var(--hairline);
   box-shadow: 0 25px 50px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255,255,255,0.04);
   transition: all 0.3s ease;
 }
@@ -675,14 +703,48 @@ body {
 }
 
 /* Hero Header for the meeting entry page */
-.hero-container::before { content: none; }
-.hero-container::after { content: none; }
+.hero-container::before,
+.hero-container::after {
+  content: '';
+  position: fixed;
+  inset: -20% -20% -20% -20%;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Aurora layer with extremely subtle motion */
+.hero-container::before {
+  background:
+    radial-gradient(800px 600px at 15% 10%, rgba(10,132,255,0.10), transparent 60%),
+    radial-gradient(700px 500px at 85% 75%, rgba(191,90,242,0.08), transparent 60%);
+  filter: blur(60px);
+  animation: aurora-drift 40s ease-in-out infinite alternate;
+}
+
+.hero-container::after {
+  background: radial-gradient(700px 500px at 70% 15%, rgba(142,102,255,0.10), transparent 60%);
+  filter: blur(60px);
+  animation: aurora-drift-2 52s ease-in-out infinite alternate;
+}
+
+@keyframes aurora-drift {
+  0% { transform: translate3d(0,0,0) scale(1); }
+  100% { transform: translate3d(2%, -1%, 0) scale(1.05); }
+}
+@keyframes aurora-drift-2 {
+  0% { transform: translate3d(0,0,0) scale(1); }
+  100% { transform: translate3d(-2%, 1%, 0) scale(1.06); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-container::before, .hero-container::after { animation: none; }
+}
 
 .hero-content::before { content: none; }
 .hero-content:hover { transform: translateY(-2px); box-shadow: 0 30px 60px rgba(0,0,0,0.4); }
 
 .hero-title {
-  font-size: 2.5rem;
+  font-size: 2.4rem;
   font-weight: 800;
   margin-bottom: 0.5rem;
   color: #FFFFFF;
@@ -691,7 +753,7 @@ body {
 }
 
 .hero-subtitle {
-  color: rgba(255, 255, 255, 0.85);
+  color: rgba(255, 255, 255, 0.8);
   font-weight: 400;
 }
 
@@ -799,21 +861,21 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0.5rem 1rem; /* more space inside pills */
-  background: #1C1C1E;
+  padding: 0.5rem 1rem;
+  background: rgba(255,255,255,0.04);
   color: #FFFFFF;
   font-size: 0.8rem;
   font-weight: 600;
   letter-spacing: 0.02em;
   border-radius: 9999px;
-  border: 1px solid #38383A;
+  border: 1px solid var(--hairline);
   box-shadow: 0 2px 6px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.04);
   transition: all 0.2s ease;
 }
 
 .tech-badge:hover {
   transform: translateY(-1px);
-  background: #2C2C2E;
+  background: linear-gradient(135deg, rgba(10,132,255,0.16), rgba(142,102,255,0.14));
   box-shadow: 0 6px 12px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255,255,255,0.06);
 }
 
@@ -906,28 +968,32 @@ body {
 
 /* Features Section */
 .features-container {
-  background: linear-gradient(180deg, #1C1C1E, #1C1C1E);
+  background: rgba(28,28,30,0.5);
   border-radius: 0.75rem;
-  border: 1px solid #38383A;
+  border: 1px solid var(--hairline);
   overflow: hidden;
   height: 100%;
   box-shadow: 0 10px 24px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.03);
+  backdrop-filter: blur(14px);
 }
 
 .features-tabs {
   display: flex;
-  border-bottom: 1px solid #38383A;
-  background: #1C1C1E;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: none;
+  background: rgba(255,255,255,0.04);
 }
 
 .feature-tab {
   flex: 1;
-  padding: 0.75rem 1rem;
+  padding: 0.6rem 0.9rem;
   font-size: 0.875rem;
   font-weight: 600;
-  color: rgba(255, 255, 255, 0.7);
-  background: transparent;
-  border: none;
+  color: rgba(255, 255, 255, 0.75);
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--hairline);
+  border-radius: 9999px;
   cursor: pointer;
   transition: all 0.2s ease;
   position: relative;
@@ -936,23 +1002,16 @@ body {
 
 .feature-tab:hover {
   color: rgba(255, 255, 255, 0.95);
-  background: #2C2C2E;
+  background: rgba(255,255,255,0.07);
 }
 
 .feature-tab.active {
   color: #fff;
-  background: #2C2C2E;
+  background: linear-gradient(135deg, rgba(10,132,255,0.35), rgba(142,102,255,0.35));
+  border-color: color-mix(in srgb, var(--hairline) 50%, transparent);
 }
 
-.feature-tab.active::after {
-  content: '';
-  position: absolute;
-  bottom: -1px;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: #0A84FF;
-}
+.feature-tab.active::after { content: none; }
 
 .feature-content {
   padding: 1.25rem;

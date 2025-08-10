@@ -142,7 +142,7 @@ get_context_for_chart() {
             echo "${SINGAPORE_CONTEXT}"
             ;;
         # Additional services deployed to US East for consolidation
-        "global/us-east/engineering-vlog"|"global/us-east/matomo"|"global/us-east/rustlemania-ui"|"global/us-east/rustlemania-ui-staging"|"global/us-east/videocall-website"|"global/us-east/prometheus"|"global/us-east/grafana")
+        "global/us-east/engineering-vlog"|"global/us-east/matomo"|"global/us-east/rustlemania-ui"|"global/us-east/rustlemania-ui-staging"|"global/us-east/videocall-website"|"global/us-east/prometheus"|"global/us-east/grafana"|"global/us-east/metrics-api")
             echo "${US_EAST_CONTEXT}"
             ;;
         *)

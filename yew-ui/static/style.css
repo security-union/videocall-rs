@@ -188,7 +188,6 @@ h3 {
   align-items: center;
   overflow: hidden; /* Prevent content like oversized canvas from breaking layout */
   background-color: #2d2d2d; /* Slightly different background for items */
-  border-radius: 8px;
 }
 
 /* --- Layouts for specific number of peers --- */
@@ -522,11 +521,57 @@ canvas {
 
 .floating-name {
   position: absolute;
-  bottom: 0;
+  /* Updated: default anchor top-left with safe inset */
+  top: 12px;
+  left: 12px;
+  right: auto;
+  bottom: auto;
+
+  /* Recommendation 2: high-contrast compact chip */
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  background-color: rgba(0, 0, 0, 0.36);
+  color: rgba(255, 255, 255, 0.92);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1.2;
+  white-space: nowrap;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis; /* additional safety on narrow tiles */
+  z-index: 2; /* stay above video/placeholder */
+  user-select: none;
+}
+
+/* Slightly stronger background on hover/focus for readability */
+.floating-name:hover, .floating-name:focus {
+  background-color: rgba(0, 0, 0, 0.44);
+}
+
+/* Speaker/full-bleed view: already top-left */
+.grid-item.full-bleed .floating-name { top: 12px; }
+
+/* RTL support: mirror anchor to top-right when the element is RTL */
+.floating-name[dir="rtl"] {
+  left: auto;
+  right: 12px;
+}
+
+/* Recommendation 2: subtle bottom gradient scrim for readability */
+.grid-item .canvas-container.video-on::after {
+  content: "";
+  position: absolute;
+  left: 0;
   right: 0;
-  margin-bottom: 0;
-  background-color: black;
-  color: white;
+  bottom: 0;
+  height: 64px; /* ~56–72px */
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.24), rgba(0, 0, 0, 0));
+  pointer-events: none;
+  z-index: 1; /* below the name chip */
 }
 
 .controls {
@@ -647,6 +692,8 @@ select {
   justify-content: center;
   z-index: 2;
 }
+
+/* No additional local positioning; unified in global.css to match mic size */
 
 .audio-indicator svg {
   width: 20px;

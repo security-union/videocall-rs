@@ -58,9 +58,7 @@ resources:
     cpu: 75m
     memory: 128Mi
 
-# Persistence
-persistence:
-  enabled: true
-  size: 10Gi
-  accessModes:
-    - ReadWriteOnce 
+# Persistence (subchart override)
+matomo:
+  persistence:
+    size: 20Gi

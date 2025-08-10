@@ -25,6 +25,7 @@ use crate::constants::ACTIX_WEBSOCKET;
 use crate::constants::{
     CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
 };
+use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
 use serde_json;
@@ -85,6 +86,7 @@ pub enum Msg {
     NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
     ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
     HangUp,
+    ShowCopyToast(bool),
 }
 
 impl From<WsAction> for Msg {
@@ -146,6 +148,7 @@ pub struct AttendantsComponent {
     next_fake_peer_id_counter: usize,
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
+    show_copy_toast: bool,
 }
 
 impl AttendantsComponent {
@@ -210,9 +213,6 @@ impl AttendantsComponent {
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
             enable_diagnostics: true,
-            // Disable old callback system - using broadcast system instead
-            on_diagnostics_update: None,
-            on_sender_stats_update: None,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
@@ -354,6 +354,7 @@ impl Component for AttendantsComponent {
             next_fake_peer_id_counter: 1,
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
+            show_copy_toast: false,
         };
         {
             let link = ctx.link().clone();
@@ -749,6 +750,17 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            Msg::ShowCopyToast(show) => {
+                self.show_copy_toast = show;
+                if show {
+                    let link = ctx.link().clone();
+                    Timeout::new(1640, move || {
+                        link.send_message(Msg::ShowCopyToast(false));
+                    })
+                    .forget();
+                }
+                true
+            }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
                 let _ = window().location().reload(); // Refresh page for clean state
@@ -785,15 +797,11 @@ impl Component for AttendantsComponent {
                 .collect(),
         );
 
-        let container_style = if self.peer_list_open || self.diagnostics_open {
-            // Use num_peers_for_styling (capped at CANVAS_LIMIT) for the CSS variable
-            format!("width: 80%; --num-peers: {};", num_peers_for_styling.max(1))
-        } else {
-            format!(
-                "width: 100%; --num-peers: {};",
-                num_peers_for_styling.max(1)
-            )
-        };
+        // Always let the grid take the whole stage; overlays should not shrink the grid
+        let container_style = format!(
+            "position: absolute; inset: 0; width: 100%; height: 100%; --num-peers: {};",
+            num_peers_for_styling.max(1)
+        );
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
@@ -805,13 +813,14 @@ impl Component for AttendantsComponent {
             format!("{}/meeting/{}", origin, ctx.props().id)
         };
 
-        // Callback to copy the meeting link to clipboard
+        // Callback to copy and trigger toast via component state
         let copy_meeting_link = {
             let meeting_link = meeting_link.clone();
+            let link = ctx.link().clone();
             Callback::from(move |_| {
                 if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) {
-                    // Try to write text; ignore potential JS promise errors for now
                     let _ = clipboard.write_text(&meeting_link);
+                    link.send_message(Msg::ShowCopyToast(true));
                 }
             })
         };
@@ -826,9 +835,9 @@ impl Component for AttendantsComponent {
             return html! {
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
-                    <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #1a1a1a; z-index: 1000;">
+                    <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
                         <div style="text-align: center; color: white; margin-bottom: 2rem;">
-                            <h1>{"Ready to join the meeting?"}</h1>
+                            <h2>{"Ready to join the meeting?"}</h2>
                             <p>{"Click the button below to join and start listening to others."}</p>
                             {if let Some(error) = &self.error {
                                 html! { <p style="color: #ff6b6b; margin-top: 1rem;">{error}</p> }
@@ -837,17 +846,7 @@ impl Component for AttendantsComponent {
                             }}
                         </div>
                         <button
-                            class="join-meeting-button"
-                            style="
-                                background: #4CAF50; 
-                                color: white; 
-                                border: none; 
-                                padding: 1rem 2rem; 
-                                font-size: 1.2rem; 
-                                border-radius: 8px; 
-                                cursor: pointer;
-                                transition: background 0.3s ease;
-                            "
+                            class="btn-apple btn-primary"
                             onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}
                         >
                             {"Join Meeting"}
@@ -869,24 +868,46 @@ impl Component for AttendantsComponent {
                     { // Invitation overlay when there are no connected peers
                         if num_display_peers == 0 {
                             html! {
-                                <div id="invite-overlay" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.9); padding: 1.5rem 2rem; border-radius: 8px; width: 90%; max-width: 420px; z-index: 0; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3); text-align: center;">
-                                    <h3 style="margin-top:0;">{"Your meeting's ready"}</h3>
+                                <div id="invite-overlay" class="card-apple" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;">
+                                    <h4 style="margin-top:0;">{"Your meeting is ready!"}</h4>
                                     <p style="font-size: 0.9rem; opacity: 0.8;">{"Share this meeting link with others you want in the meeting"}</p>
                                     <div style="display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;">
                                         <input
                                             id="meeting-link-input"
                                             value={meeting_link.clone()}
                                             readonly=true
-                                            style="flex:1; padding: 0.5rem; border: none; border-radius: 4px; background: #333; color: white; font-size: 0.9rem; overflow:hidden; text-overflow: ellipsis;"/>
+                                            class="input-apple" style="flex:1; overflow:hidden; text-overflow: ellipsis;"/>
                                         <button
-                                            class="copy-link-button"
-                                            style="margin-left: 0.5rem; background: #4CAF50; color: white; border: none; padding: 0.5rem 0.75rem; border-radius: 4px; cursor: pointer;"
+                                            class={classes!("btn-apple", "btn-primary", "btn-sm", "copy-button", self.show_copy_toast.then_some("btn-pop-animate"))}
+                                            style="margin-left: 0.5rem;"
                                             onclick={copy_meeting_link}
                                         >
                                             {"Copy"}
+                                            { if self.show_copy_toast {
+                                                html!{
+                                                    <div class="sparkles" aria-hidden="true">
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                    </div>
+                                                }
+                                            } else { html!{} } }
                                         </button>
                                     </div>
                                     <p style="font-size: 0.8rem; opacity: 0.7;">{"People who use this meeting link must get your permission before they can join."}</p>
+                                    <div
+                                        class={classes!("copy-toast", self.show_copy_toast.then_some("copy-toast--visible"))}
+                                        role="alert"
+                                        aria-live="assertive"
+                                        aria-hidden={( !self.show_copy_toast ).to_string()}
+                                    >
+                                        {"Link copied to clipboard"}
+                                    </div>
                                 </div>
                             }
                         } else { html!{} }
@@ -1083,15 +1104,16 @@ impl Component for AttendantsComponent {
                                             <button
                                                 class="video-control-button danger"
                                                 onclick={ctx.link().callback(|_| Msg::HangUp)}>
+                                                <span class="tooltip">{"Hang Up"}</span>
                                                 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
                                                     <path d="M12.017 6.995c-2.306 0-4.534.408-6.215 1.507-1.737 1.135-2.788 2.944-2.797 5.451a4.8 4.8 0 0 0 .01.62c.015.193.047.512.138.763a2.557 2.557 0 0 0 2.579 1.677H7.31a2.685 2.685 0 0 0 2.685-2.684v-.645a.684.684 0 0 1 .684-.684h2.647a.686.686 0 0 1 .686.687v.645c0 .712.284 1.395.787 1.898.478.478 1.101.787 1.847.787h1.647a2.555 2.555 0 0 0 2.575-1.674c.09-.25.123-.57.137-.763.015-.2.022-.433.01-.617-.002-2.508-1.049-4.32-2.785-5.458-1.68-1.1-3.907-1.51-6.213-1.51Z"/>
                                                 </svg>
-                                                <span class="tooltip">{ "Hang Up" }</span>
                                             </button>
                                             { self.view_grid_toggle(ctx) }
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
 
                                         </nav>
+                                        { html!{} }
                                                                 {
                             if let Some(message) = &self.simulation_info_message {
                                 html!{
@@ -1117,8 +1139,6 @@ impl Component for AttendantsComponent {
                                             html! {<></>}
                                         }
                                     }
-                                    <h4 class="floating-name">{email}</h4>
-
                                     <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
 
                                 </nav>

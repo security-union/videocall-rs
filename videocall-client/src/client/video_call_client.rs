@@ -87,12 +87,6 @@ pub struct VideoCallClientOptions {
     /// Callback will be called as `callback(())` if a connection gets dropped
     pub on_connection_lost: Callback<JsValue>,
 
-    /// Callback will be called as `callback(stats_string)` with diagnostics information
-    pub on_diagnostics_update: Option<Callback<String>>,
-
-    /// Callback will be called as `callback(stats_string)` with sender diagnostics information
-    pub on_sender_stats_update: Option<Callback<String>>,
-
     /// `true` to enable diagnostics collection; `false` to disable
     pub enable_diagnostics: bool,
 
@@ -167,21 +161,11 @@ impl VideoCallClient {
         let diagnostics = if options.enable_diagnostics {
             let diagnostics = Rc::new(DiagnosticManager::new(options.userid.clone()));
 
-            // Set up diagnostics callback if provided
-            if let Some(callback) = &options.on_diagnostics_update {
-                diagnostics.set_stats_callback(callback.clone());
-            }
-
             // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 let mut diag = DiagnosticManager::new(options.userid.clone());
                 diag.set_reporting_interval(interval);
                 let diagnostics = Rc::new(diag);
-
-                // Set up diagnostics callback if provided
-                if let Some(callback) = &options.on_diagnostics_update {
-                    diagnostics.set_stats_callback(callback.clone());
-                }
 
                 Some(diagnostics)
             } else {
@@ -194,11 +178,6 @@ impl VideoCallClient {
         // Create sender diagnostics manager if diagnostics are enabled
         let sender_diagnostics = if options.enable_diagnostics {
             let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.userid.clone()));
-
-            // Set up sender diagnostics callback if provided
-            if let Some(callback) = &options.on_sender_stats_update {
-                sender_diagnostics.set_stats_callback(callback.clone());
-            }
 
             // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {

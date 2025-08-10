@@ -107,6 +107,12 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = ACTIVE_SESSIONS_TOTAL
         .remove_label_values(&[&session_info.meeting_id, &session_info.session_id]);
 
+    // Remove self-reported enabled metrics for the reporting peer in this meeting
+    let _ = SELF_AUDIO_ENABLED
+        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_peer]);
+    let _ = SELF_VIDEO_ENABLED
+        .remove_label_values(&[&session_info.meeting_id, &session_info.reporting_peer]);
+
     // Remove all peer connection series we set
     for peer_id in &session_info.peer_ids {
         let _ = PEER_CONNECTIONS_TOTAL.remove_label_values(&[&session_info.meeting_id, peer_id]);
@@ -122,6 +128,8 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         ];
         let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
         let _ = PEER_CAN_SEE.remove_label_values(&labels);
+        let _ = VIDEO_FPS.remove_label_values(&labels);
+        let _ = VIDEO_PACKETS_BUFFERED.remove_label_values(&labels);
         let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
         let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
         let _ = NETEQ_NORMAL_OPS_PER_SEC.remove_label_values(&labels);

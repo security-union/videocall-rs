@@ -210,9 +210,6 @@ impl AttendantsComponent {
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
             enable_diagnostics: true,
-            // Disable old callback system - using broadcast system instead
-            on_diagnostics_update: None,
-            on_sender_stats_update: None,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),

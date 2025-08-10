@@ -126,18 +126,21 @@ impl Component for Host {
         let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
         let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
 
+        let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
-            VIDEO_BITRATE_KBPS,
+            video_bitrate,
             camera_callback,
         );
 
         // Use the factory function to create the appropriate microphone encoder
+        let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
         let mut microphone =
-            create_microphone_encoder(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+            create_microphone_encoder(client.clone(), audio_bitrate, microphone_callback);
 
-        let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS, screen_callback);
+        let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
+        let mut screen = ScreenEncoder::new(client.clone(), screen_bitrate, screen_callback);
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.2](https://github.com/security-union/videocall-rs/compare/videocall-types-v2.0.1...videocall-types-v2.0.2) - 2025-08-10
+
+### Other
+
+- Reduce RTT freq, add RTT to stats,  ([#376](https://github.com/security-union/videocall-rs/pull/376))
+
 ## [2.0.1](https://github.com/security-union/videocall-rs/compare/videocall-types-v2.0.0...videocall-types-v2.0.1) - 2025-08-08
 
 ### Other

@@ -754,7 +754,7 @@ impl Component for AttendantsComponent {
                 self.show_copy_toast = show;
                 if show {
                     let link = ctx.link().clone();
-                    Timeout::new(1500, move || {
+                    Timeout::new(1640, move || {
                         link.send_message(Msg::ShowCopyToast(false));
                     })
                     .forget();
@@ -869,7 +869,7 @@ impl Component for AttendantsComponent {
                         if num_display_peers == 0 {
                             html! {
                                 <div id="invite-overlay" class="card-apple" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;">
-                                    <h3 style="margin-top:0;">{"Your meeting is ready!"}</h3>
+                                    <h4 style="margin-top:0;">{"Your meeting is ready!"}</h4>
                                     <p style="font-size: 0.9rem; opacity: 0.8;">{"Share this meeting link with others you want in the meeting"}</p>
                                     <div style="display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;">
                                         <input
@@ -878,15 +878,36 @@ impl Component for AttendantsComponent {
                                             readonly=true
                                             class="input-apple" style="flex:1; overflow:hidden; text-overflow: ellipsis;"/>
                                         <button
-                                            class="btn-apple btn-primary btn-sm"
+                                            class={classes!("btn-apple", "btn-primary", "btn-sm", "copy-button", self.show_copy_toast.then_some("btn-pop-animate"))}
                                             style="margin-left: 0.5rem;"
                                             onclick={copy_meeting_link}
                                         >
                                             {"Copy"}
+                                            { if self.show_copy_toast {
+                                                html!{
+                                                    <div class="sparkles" aria-hidden="true">
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                    </div>
+                                                }
+                                            } else { html!{} } }
                                         </button>
                                     </div>
                                     <p style="font-size: 0.8rem; opacity: 0.7;">{"People who use this meeting link must get your permission before they can join."}</p>
-                                    { if self.show_copy_toast { html!{ <div style="margin-top:0.75rem; background:#1C1C1E; color:#FFFFFF; border:1px solid #38383A; padding:0.5rem 0.75rem; border-radius:0.5rem; display:inline-block;">{"Link copied to clipboard"}</div> } } else { html!{} } }
+                                    <div
+                                        class={classes!("copy-toast", self.show_copy_toast.then_some("copy-toast--visible"))}
+                                        role="alert"
+                                        aria-live="assertive"
+                                        aria-hidden={( !self.show_copy_toast ).to_string()}
+                                    >
+                                        {"Link copied to clipboard"}
+                                    </div>
                                 </div>
                             }
                         } else { html!{} }

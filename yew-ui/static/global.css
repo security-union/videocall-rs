@@ -1167,47 +1167,119 @@ body {
 
 /* Pin Icon Fixes - High Specificity Override */
 .grid-item .canvas-container .pin-icon {
-  visibility: visible !important; /* Always visible on mobile */
   position: absolute !important;
-  top: 10px !important;
-  left: 10px !important;
-  transform: none !important; /* Remove centering transform */
+  top: 8px !important;
+  right: 48px !important; /* 8px edge + 32px mic + 8px gap */
+  left: auto !important;
+  transform: none !important;
   opacity: 0.6 !important;
-  background-color: rgba(0, 0, 0, 0.5) !important;
+  background-color: rgba(0, 0, 0, 0.6) !important; /* match mic */
   border-radius: 50% !important;
-  padding: 5px 5px !important;
+  padding: 6px !important; /* match mic */
   text-align: center !important;
   line-height: 1 !important;
   cursor: pointer !important;
   z-index: 10 !important;
   transition: opacity 0.2s ease !important;
   border: none !important;
+  visibility: hidden !important; /* default hidden on desktop; shown on hover via media query below */
 }
 
 /* Style for the pin icon SVG */
 .grid-item .canvas-container .pin-icon svg {
-  width: 1.5rem !important;
-  height: 1.5rem !important;
+  width: 20px !important;
+  height: 20px !important;
   display: block !important;
 }
 
 /* Hide pin icon by default on desktop, show on hover */
 @media (min-width: 768px) {
-  .grid-item .canvas-container .pin-icon {
-    visibility: hidden !important;
-    opacity: 0 !important;
-  }
-  
+  .grid-item .canvas-container .pin-icon { opacity: 0 !important; }
   .grid-item .canvas-container:hover .pin-icon {
     visibility: visible !important;
     opacity: 0.6 !important;
   }
 }
 
-/* Ensure pin is always visible on mobile */
+/* Hide pin icon on mobile – tap tile to pin instead */
 @media (max-width: 767px) {
-  .grid-item .canvas-container .pin-icon {
-    visibility: visible !important;
-    opacity: 0.6 !important;
-  }
+  .grid-item .canvas-container .pin-icon { display: none !important; }
+}
+
+/* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
+.copy-button {
+  position: relative;
+  overflow: visible;
+}
+
+.btn-pop-animate {
+  animation: btn-pop 180ms cubic-bezier(0.22, 0.61, 0.36, 1) 1;
+}
+
+@keyframes btn-pop {
+  0% { transform: scale(0.94); }
+  60% { transform: scale(1.03); }
+  100% { transform: scale(1.00); }
+}
+
+.copy-toast {
+  color: #FFFFFF;
+  background: rgba(44, 44, 46, 0.75);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.75rem;
+  display: inline-block;
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  margin-top: 0;
+  transform: translateY(6px);
+  transition: max-height 220ms ease, opacity 220ms ease, margin-top 220ms ease, transform 220ms ease;
+}
+
+.copy-toast.copy-toast--visible {
+  max-height: 40px;
+  opacity: 1;
+  margin-top: 0.75rem;
+  transform: translateY(0);
+}
+
+.sparkles {
+  position: absolute;
+  top: -10px;
+  right: -10px;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.sparkle {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  background: radial-gradient(circle, #FFD60A 10%, rgba(255,214,10,0.0) 70%);
+  border-radius: 50%;
+  opacity: 0.95;
+  mix-blend-mode: screen;
+  filter: drop-shadow(0 0 6px rgba(255, 214, 10, 0.55));
+  animation: sparkle-burst 480ms ease-out forwards;
+}
+
+.sparkle:nth-child(1) { transform: translate(0, 0); animation-delay: 0ms; }
+.sparkle:nth-child(2) { transform: translate(-2px, -2px); animation-delay: 20ms; }
+.sparkle:nth-child(3) { transform: translate(-4px, 1px); animation-delay: 40ms; }
+.sparkle:nth-child(4) { transform: translate(-1px, 3px); animation-delay: 60ms; }
+
+@keyframes sparkle-burst {
+  0% { opacity: 0; transform: translate(0,0) scale(0.6); }
+  60% { opacity: 1; }
+  100% { opacity: 0; transform: translate(10px, -16px) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn-pop-animate { animation: none; }
+  .copy-toast { animation: none; opacity: 1; transform: none; }
+  .sparkles { display: none; }
 }

@@ -42,9 +42,16 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
         let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
         return vec![html! {
             <div class="grid-item full-bleed" id={(*peer_video_div_id).clone()}>
-                <div class="canvas-container">
+                <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
+                    onclick={Callback::from({
+                        let div_id = (*peer_video_div_id).clone();
+                        move |_| {
+                            if is_mobile_viewport() { toggle_pinned_div(&div_id) }
+                        }
+                    })}
+                >
                     { if is_video_enabled_for_peer { html!{ <UserVideo id={key.clone()} hidden={false}/> } } else { html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> } } }
-                    <h4 class="floating-name">{key.clone()}</h4>
+                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
                     <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
                 </div>
@@ -76,9 +83,12 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
                     // Canvas for Screen share.
                     if is_screen_share_enabled_for_peer {
                         <div class={screen_share_css} id={(*screen_share_div_id).clone()}>
-                            <div class="canvas-container">
+                            <div class={classes!("canvas-container", "video-on")} onclick={Callback::from({
+                                let div_id = (*screen_share_div_id).clone();
+                                move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
+                            })}>
                                 <canvas id={format!("screen-share-{}", &key)}></canvas>
-                                <h4 class="floating-name">{format!("{}-screen", &key)}</h4>
+                                <h4 class="floating-name" title={format!("{}-screen", &key)} dir={"auto"}>{format!("{}-screen", &key)}</h4>
                                 <button onclick={Callback::from(move |_| {
                                     toggle_pinned_div(&(*screen_share_div_id).clone());
                                 })} class="pin-icon">
@@ -92,7 +102,12 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
                     }
                     <div class="grid-item" id={(*peer_video_div_id).clone()}>
                         // One canvas for the User Video
-                        <div class="canvas-container">
+                        <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
+                            onclick={Callback::from({
+                                let div_id = (*peer_video_div_id).clone();
+                                move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
+                            })}
+                        >
                             if is_video_enabled_for_peer {
                                 <UserVideo id={key.clone()} hidden={false}></UserVideo>
                             } else {
@@ -101,7 +116,7 @@ pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
                                     <span class="placeholder-text">{"Video Disabled"}</span>
                                 </div>
                             }
-                            <h4 class="floating-name">{key.clone()}</h4>
+                            <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
                             <div class="audio-indicator">
                                 <MicIcon muted={!is_audio_enabled_for_peer}/>
                             </div>
@@ -163,4 +178,14 @@ fn toggle_pinned_div(div_id: &str) {
             div.class_list().remove_1("grid-item-pinned").unwrap();
         }
     }
+}
+
+fn is_mobile_viewport() -> bool {
+    if let Some(win) = window() {
+        if let Ok(width) = win.inner_width() {
+            let px = width.as_f64().unwrap_or(1024.0);
+            return px < 768.0;
+        }
+    }
+    false
 }

@@ -517,14 +517,42 @@ impl Component for Host {
                 {
                     if self.show_change_name {
                         html!{
-                            <div class="glass-backdrop">
+                            <div class="glass-backdrop"
+                                onkeydown={{
+                                    let link = ctx.link().clone();
+                                    Callback::from(move |e: KeyboardEvent| {
+                                        let key = e.key();
+                                        if key == "Escape" {
+                                            e.prevent_default();
+                                            link.send_message(Msg::CancelChangeName);
+                                        } else if key == "Enter" {
+                                            e.prevent_default();
+                                            link.send_message(Msg::SaveChangeName);
+                                        }
+                                    })
+                                }}
+                            >
                                 <div class="card-apple" style="width: 380px;">
                                     <h3 style="margin-top:0;">{"Change your name"}</h3>
                                     <p style="color:#AEAEB2; margin-top:0.25rem;">{"This name will be visible to others in the meeting."}</p>
                                     <input class="input-apple" value={self.pending_name.clone()} oninput={ctx.link().callback(|e: InputEvent| {
                                         let input: web_sys::HtmlInputElement = e.target_unchecked_into();
                                         Msg::UpdatePendingName(input.value())
-                                    })} placeholder="Enter new name" pattern="^[a-zA-Z0-9_]*$" />
+                                    })} placeholder="Enter new name" pattern="^[a-zA-Z0-9_]*$" autofocus=true
+                                        onkeydown={{
+                                            let link = ctx.link().clone();
+                                            Callback::from(move |e: KeyboardEvent| {
+                                                let key = e.key();
+                                                if key == "Escape" {
+                                                    e.prevent_default();
+                                                    link.send_message(Msg::CancelChangeName);
+                                                } else if key == "Enter" {
+                                                    e.prevent_default();
+                                                    link.send_message(Msg::SaveChangeName);
+                                                }
+                                            })
+                                        }}
+                                    />
                                     { if let Some(err) = &self.change_name_error { html!{ <p style="color:#FF453A; margin-top:6px; font-size:12px;">{err}</p> } } else { html!{} } }
                                     <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
                                         <button class="btn-apple btn-secondary btn-sm" onclick={ctx.link().callback(|_| Msg::CancelChangeName)}>{"Cancel"}</button>

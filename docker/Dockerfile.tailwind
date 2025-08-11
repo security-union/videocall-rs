@@ -1,9 +1,10 @@
 FROM node:18-alpine
 
-RUN npm install -g tailwindcss
+# Install Tailwind CLI (v4 moved the CLI to @tailwindcss/cli)
+RUN npm install -g @tailwindcss/cli@latest
 
-# Create a wrapper script
-RUN echo '#!/bin/sh\ntailwindcss "$@"' > /usr/local/bin/tailwind-run.sh && \
-    chmod +x /usr/local/bin/tailwind-run.sh
+# Create a small entrypoint wrapper with correct newlines
+RUN printf '#!/bin/sh\nexec tailwindcss "$@"\n' > /usr/local/bin/tailwind-run.sh \
+    && chmod +x /usr/local/bin/tailwind-run.sh
 
 ENTRYPOINT ["/usr/local/bin/tailwind-run.sh"]

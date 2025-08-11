@@ -1,0 +1,8 @@
+@source "../index.html";
+@source "../src/**/*.rs";
+
+/* Safelist the exact utilities used by the floating label input */
+@source inline("border-blue-500 focus:border-blue-500 border-slate-300 text-slate-900 text-slate-500 text-slate-600 bg-white");
+@source inline("left-3 top-2 z-10 origin-left px-1 rounded-md w-full pt-5 pb-2 px-3 text-sm transition-all duration-200 ease-in-out");
+@source inline("peer-focus:-translate-y-3 peer-focus:scale-90 peer-focus:text-blue-600 peer-not-placeholder-shown:-translate-y-3 peer-not-placeholder-shown:scale-90 peer-not-placeholder-shown:text-slate-600");
+

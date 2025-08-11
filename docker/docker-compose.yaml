@@ -42,8 +42,9 @@ services:
         source: ../
         target: /app
     working_dir: /app/yew-ui
-    entrypoint: ["/bin/sh", "-c"]
-    command: "tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify"
+    environment:
+      - NODE_PATH=/usr/local/lib/node_modules
+    command: ["-i", "./static/tw.css", "-o", "./static/tailwind.css", "--watch=always", "--poll", "--minify"]
     
   website:
     volumes:

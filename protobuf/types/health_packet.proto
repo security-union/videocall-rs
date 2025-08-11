@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package health_packet;
+
+message NetEqOperationCounters {
+  double normal_per_sec = 1;
+  double expand_per_sec = 2;
+  double accelerate_per_sec = 3;
+  double fast_accelerate_per_sec = 4;
+  double preemptive_expand_per_sec = 5;
+  double merge_per_sec = 6;
+  double comfort_noise_per_sec = 7;
+  double dtmf_per_sec = 8;
+  double undefined_per_sec = 9;
+}
+
+message NetEqNetwork {
+  NetEqOperationCounters operation_counters = 1;
+}
+
+message NetEqStats {
+  double current_buffer_size_ms = 1;
+  double packets_awaiting_decode = 2;
+  NetEqNetwork network = 3;
+}
+
+message VideoStats {
+  double fps_received = 1;
+  double frames_buffered = 2;
+  uint64 frames_decoded = 3;
+  uint64 bitrate_kbps = 4;
+}
+
+message PeerStats {
+  // Receiver-observed connectivity booleans
+  bool can_listen = 1;
+  bool can_see = 2;
+
+  // Receiver-observed sender state flags (from peer_status)
+  bool audio_enabled = 3; // true if receiver reports sender audio enabled
+  bool video_enabled = 4; // true if receiver reports sender video enabled
+
+  // Structured stats
+  NetEqStats neteq_stats = 5;
+  VideoStats video_stats = 6;
+}
+
+message HealthPacket {
+  string session_id = 1;
+  string meeting_id = 2;
+  string reporting_peer = 3;
+  uint64 timestamp_ms = 4;
+
+  // Sender self-reported state (authoritative)
+  bool reporting_audio_enabled = 5;
+  bool reporting_video_enabled = 6;
+
+  // Per-peer stats keyed by peer_id (to_peer)
+  map<string, PeerStats> peer_stats = 7;
+
+  // Active connection info (client-side measured)
+  string active_server_url = 8;
+  string active_server_type = 9; // "webtransport" | "websocket"
+  double active_server_rtt_ms = 10;
+}
+

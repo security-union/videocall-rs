@@ -36,15 +36,9 @@ pub struct ChatServer {
 }
 
 impl ChatServer {
-    pub async fn new() -> Self {
-        let url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
+    pub async fn new(nats_connection: async_nats::client::Client) -> Self {
         ChatServer {
-            nats_connection: async_nats::ConnectOptions::new()
-                .require_tls(false)
-                .ping_interval(std::time::Duration::from_secs(10))
-                .connect(&url)
-                .await
-                .unwrap(),
+            nats_connection,
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
         }

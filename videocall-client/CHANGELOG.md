@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.20](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.19...videocall-client-v1.1.20) - 2025-08-10
+
+### Other
+
+- Reduce RTT freq, add RTT to stats,  ([#376](https://github.com/security-union/videocall-rs/pull/376))
+
+## [1.1.19](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.18...videocall-client-v1.1.19) - 2025-08-08
+
+### Other
+
+- (feature) Add diagnostics with Prometheus and Grafana ([#365](https://github.com/security-union/videocall-rs/pull/365))
+
 ## [1.1.18](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.17...videocall-client-v1.1.18) - 2025-08-05
 
 ### Other

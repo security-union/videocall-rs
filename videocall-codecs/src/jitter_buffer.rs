@@ -81,6 +81,11 @@ impl<T> JitterBuffer<T> {
         }
     }
 
+    /// Returns the current number of frames buffered and waiting in the jitter buffer.
+    pub fn buffered_frames_len(&self) -> usize {
+        self.buffered_frames.len()
+    }
+
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;

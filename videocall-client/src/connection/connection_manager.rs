@@ -636,7 +636,7 @@ impl ConnectionManager {
             debug!(
                 "ConnectionManager: Sending main connection manager diagnostics event: {event:?}"
             );
-            match global_sender().send(event) {
+            match global_sender().try_broadcast(event) {
                 Ok(_) => {
                     debug!("ConnectionManager: Successfully sent main connection manager diagnostics event");
                 }
@@ -698,7 +698,7 @@ impl ConnectionManager {
                 metrics: final_metrics,
             };
 
-            match global_sender().send(event) {
+            match global_sender().try_broadcast(event) {
                 Ok(_) => {
                     debug!(
                         "ConnectionManager: Successfully sent server diagnostics for {}",

@@ -177,7 +177,8 @@ pub async fn ws_connect(
     let (email, room) = session.into_inner();
     debug!("socket connected");
     let chat = state.chat.clone();
-    let actor = WsChatSession::new(chat, room, email);
+    let nats_client = state.nats_client.clone();
+    let actor = WsChatSession::new(chat, room, email, nats_client);
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)
 }
@@ -190,7 +191,15 @@ async fn main() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     info!("start");
-    let chat = ChatServer::new().await.start();
+
+    let nats_url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
+    let nats_client = async_nats::ConnectOptions::new()
+        .require_tls(false)
+        .ping_interval(std::time::Duration::from_secs(10))
+        .connect(&nats_url)
+        .await
+        .expect("Failed to connect to NATS");
+    let chat = ChatServer::new(nats_client.clone()).await.start();
     let oauth_client_id: String =
         std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
     let oauth_auth_url: String =
@@ -212,13 +221,19 @@ async fn main() -> std::io::Result<()> {
         if oauth_client_id.is_empty() {
             App::new()
                 .wrap(cors)
-                .app_data(web::Data::new(AppState { chat: chat.clone() }))
+                .app_data(web::Data::new(AppState {
+                    chat: chat.clone(),
+                    nats_client: nats_client.clone(),
+                }))
                 .service(ws_connect)
         } else {
             let pool = if db_enabled { Some(get_pool()) } else { None };
             App::new()
                 .app_data(web::Data::new(pool))
-                .app_data(web::Data::new(AppState { chat: chat.clone() }))
+                .app_data(web::Data::new(AppState {
+                    chat: chat.clone(),
+                    nats_client: nats_client.clone(),
+                }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),
                     oauth_auth_url: oauth_auth_url.clone(),

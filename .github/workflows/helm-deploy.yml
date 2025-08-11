@@ -1,4 +1,4 @@
-name: 🚀 Global Multi-Region Deployment
+name: 🚀 Global Multi-Region Deployment & Restart
 
 on:
   workflow_dispatch:
@@ -32,6 +32,7 @@ on:
           - 'core-services'     # websocket, webtransport
           - 'ui-services'       # rustlemania-ui, videocall-website
           - 'infrastructure'    # cert-manager, ingress
+          - 'monitoring'        # prometheus, grafana
       dry_run:
         description: 'Dry Run (show what would be deployed)'
         required: false
@@ -39,6 +40,11 @@ on:
         type: boolean
       skip_health_checks:
         description: 'Skip Health Validation (emergency deployments only)'
+        required: false
+        default: false
+        type: boolean
+      restart_only:
+        description: 'Restart Services Only (pull latest images without Helm upgrade)'
         required: false
         default: false
         type: boolean
@@ -202,7 +208,18 @@ jobs:
         run: |
           echo "🚀 Starting deployment to ${{ matrix.region }} (order: ${{ matrix.order }})"
           
-          # Build deployment command
+          # Check if restart-only mode is requested
+          if [[ "${{ github.event.inputs.restart_only }}" == "true" ]]; then
+            echo "🔄 RESTART ONLY MODE - Just restarting services to pull latest images"
+            if ! ./deploy.sh --restart; then
+              echo "❌ Service restart failed"
+              exit 1
+            fi
+            echo "✅ Services restarted successfully - latest images pulled"
+            exit 0
+          fi
+          
+          # Build deployment command for full deployment
           DEPLOY_CMD="./scripts/deploy-global-infrastructure.sh --region ${{ matrix.region }}"
           
           # Add service filtering if not deploying all
@@ -217,6 +234,10 @@ jobs:
               ;;
             "infrastructure")
               echo "📦 Deploying infrastructure components only"
+              # The script handles service filtering internally
+              ;;
+            "monitoring")
+              echo "📦 Deploying monitoring components only"
               # The script handles service filtering internally
               ;;
             *)
@@ -240,7 +261,7 @@ jobs:
           echo "✅ Deployment to ${{ matrix.region }} completed successfully"
           
       - name: 🏥 Health Check
-        if: ${{ matrix.wait_for_health && github.event.inputs.skip_health_checks != 'true' && github.event.inputs.dry_run != 'true' }}
+        if: ${{ matrix.wait_for_health && github.event.inputs.skip_health_checks != 'true' && github.event.inputs.dry_run != 'true' && github.event.inputs.restart_only != 'true' }}
         run: |
           echo "🏥 Running health checks for ${{ matrix.region }}..."
           
@@ -307,7 +328,7 @@ jobs:
     name: 🎯 Post-Deployment Validation
     runs-on: ubuntu-latest
     needs: [plan, deploy]
-    if: ${{ always() && needs.deploy.result == 'success' && github.event.inputs.dry_run != 'true' }}
+    if: ${{ always() && needs.deploy.result == 'success' && github.event.inputs.dry_run != 'true' && github.event.inputs.restart_only != 'true' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -368,7 +389,7 @@ jobs:
           
           | Region | Status | Services Deployed |
           |--------|--------|------------------|
-          | US East | ✅ Success | WebSocket, WebTransport, UI Services |
+          | US East | ✅ Success | WebSocket, WebTransport, UI Services, Monitoring |
           | Singapore | ✅ Success | WebSocket, WebTransport |
           
           ## 🔗 Access Points
@@ -377,6 +398,7 @@ jobs:
           - **WebSocket**: \`wss://websocket-us-east.videocall.rs\`
           - **WebTransport**: \`https://webtransport-us-east.videocall.rs\`
           - **UI**: \`https://ui-us-east.videocall.rs\`
+          - **Grafana**: \`https://grafana.videocall.rs\`
           
           ### Singapore Region  
           - **WebSocket**: \`wss://websocket-singapore.videocall.rs\`

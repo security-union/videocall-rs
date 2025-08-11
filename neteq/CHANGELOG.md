@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/security-union/videocall-rs/compare/neteq-v0.4.0...neteq-v0.4.1) - 2025-08-08
+
+### Other
+
+- (feature) Add diagnostics with Prometheus and Grafana ([#365](https://github.com/security-union/videocall-rs/pull/365))
+
 ## [0.4.0](https://github.com/security-union/videocall-rs/compare/neteq-v0.3.1...neteq-v0.4.0) - 2025-08-02
 
 ### Other

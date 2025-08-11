@@ -1,0 +1,902 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "min": 0, "max": 1, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 903,
+      "options": {"legend": {"displayMode": "list","placement": "bottom"},"tooltip": {"mode": "single"}},
+      "targets": [
+        {"expr": "videocall_self_audio_enabled{meeting_id=~\"$meeting_id\"}", "legendFormat": "{{peer_id}} ({{meeting_id}})", "refId": "A"}
+      ],
+      "title": "Self Audio Enabled",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "min": 0, "max": 1, "unit": "none"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 904,
+      "options": {"legend": {"displayMode": "list","placement": "bottom"},"tooltip": {"mode": "single"}},
+      "targets": [
+        {"expr": "videocall_self_video_enabled{meeting_id=~\"$meeting_id\"}", "legendFormat": "{{peer_id}} ({{meeting_id}})", "refId": "A"}
+      ],
+      "title": "Self Video Enabled",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {"expr": "videocall_video_packets_buffered{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}", "legendFormat": "{{from_peer}} → {{to_peer}} ({{meeting_id}})", "refId": "A"}
+      ],
+      "title": "Video Packets Buffered",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.3
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_peer_can_listen{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} can hear {{to_peer}} ({{meeting_id}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Audio Connectivity Status",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {"expr": "videocall_video_fps{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}", "legendFormat": "{{from_peer}} → {{to_peer}} ({{meeting_id}})", "refId": "A"}
+      ],
+      "title": "Video FPS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "count by (meeting_id) (videocall_active_sessions_total{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\"})",
+          "interval": "",
+          "legendFormat": "Active Sessions in {{meeting_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "count by (meeting_id, peer_id) (videocall_peer_connections_total{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\"})",
+          "interval": "",
+          "legendFormat": "{{peer_id}} in {{meeting_id}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Active Sessions and Connections",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100
+              },
+              {
+                "color": "red",
+                "value": 200
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_neteq_audio_buffer_ms{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} → {{to_peer}} ({{meeting_id}})",
+          "refId": "A"
+        }
+      ],
+      "title": "NetEQ Audio Buffer by Peer",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_neteq_packets_awaiting_decode{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} → {{to_peer}} ({{meeting_id}})",
+          "refId": "A"
+        }
+      ],
+      "title": "NetEQ Packets Awaiting Decode",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.5
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_peer_can_see{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} can see {{to_peer}} ({{meeting_id}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Peer Video Health Matrix",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "vis": false
+            },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "expr": "videocall_neteq_normal_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} → {{to_peer}} Normal ({{meeting_id}})",
+          "refId": "A"
+        },
+        {
+          "expr": "videocall_neteq_expand_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} → {{to_peer}} Expand ({{meeting_id}})",
+          "refId": "B"
+        },
+        {
+          "expr": "videocall_neteq_accelerate_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} → {{to_peer}} Accelerate ({{meeting_id}})",
+          "refId": "C"
+        },
+        {
+          "expr": "videocall_neteq_fast_accelerate_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} → {{to_peer}} Fast Accelerate ({{meeting_id}})",
+          "refId": "D"
+        },
+        {
+          "expr": "videocall_neteq_preemptive_expand_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} → {{to_peer}} Preemptive Expand ({{meeting_id}})",
+          "refId": "E"
+        },
+        {
+          "expr": "videocall_neteq_merge_ops_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "interval": "",
+          "legendFormat": "{{from_peer}} → {{to_peer}} Merge ({{meeting_id}})",
+          "refId": "F"
+        }
+      ],
+      "title": "Decode Operations Per Second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "id": 9,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "videocall_client_active_server_rtt_ms{meeting_id=~\"$meeting_id\"}",
+          "legendFormat": "{{peer_id}} → {{server_url}} ({{server_type}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Client Active Server RTT (ms)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "min": 0,
+          "max": 1,
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 48 },
+      "id": 10,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "videocall_client_active_server{meeting_id=~\"$meeting_id\"}",
+          "legendFormat": "{{peer_id}} → {{server_url}} ({{server_type}})",
+          "refId": "A"
+        }
+      ],
+      "title": "Client Active Server (1 = connected)",
+      "type": "timeseries"
+    }
+  ],
+  "schemaVersion": 27,
+  "style": "dark",
+  "tags": [
+    "videocall",
+    "health",
+    "diagnostics"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": "Prometheus",
+        "definition": "label_values(videocall_meeting_participants, meeting_id)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Meeting ID",
+        "multi": true,
+        "name": "meeting_id",
+        "options": [],
+        "query": {
+          "query": "label_values(videocall_meeting_participants, meeting_id)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": "Prometheus",
+        "definition": "label_values(videocall_neteq_audio_buffer_ms, session_id)",
+        "hide": 2,
+        "includeAll": true,
+        "label": "Session ID (Technical)",
+        "multi": true,
+        "name": "session_id",
+        "options": [],
+        "query": {
+          "query": "label_values(videocall_neteq_audio_buffer_ms, session_id)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": "Prometheus",
+        "definition": "label_values(videocall_neteq_audio_buffer_ms, from_peer)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "From Peer",
+        "multi": true,
+        "name": "from_peer",
+        "options": [],
+        "query": {
+          "query": "label_values(videocall_neteq_audio_buffer_ms, from_peer)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": "Prometheus",
+        "definition": "label_values(videocall_neteq_audio_buffer_ms, to_peer)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "To Peer",
+        "multi": true,
+        "name": "to_peer",
+        "options": [],
+        "query": {
+          "query": "label_values(videocall_neteq_audio_buffer_ms, to_peer)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "VideoCall Health Monitoring",
+  "uid": "videocall-health",
+  "version": 1
+}

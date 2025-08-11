@@ -256,325 +256,90 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
     // Common CSS styles for both branches
     let common_styles = r#"
         .connection-manager-display {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, system-ui, sans-serif;
             font-size: 13px;
             line-height: 1.4;
-            color: #333;
-            background: #f8f9fa;
-            border-radius: 8px;
+            color: #FFFFFF;
+            background: #1C1C1E;
+            border-radius: 12px;
             padding: 16px;
             margin-bottom: 16px;
-            border: 1px solid #e9ecef;
+            border: 1px solid #38383A;
         }
 
         .connection-manager-display h4 {
             margin: 0 0 12px 0;
             font-size: 14px;
             font-weight: 600;
-            color: #495057;
-            border-bottom: 1px solid #dee2e6;
+            color: #FFFFFF;
+            border-bottom: 1px solid #38383A;
             padding-bottom: 6px;
         }
 
         .no-data {
-            color: #6c757d;
+            color: #AEAEB2;
             font-style: italic;
             text-align: center;
             padding: 20px;
-            background: #f8f9fa;
-            border-radius: 6px;
-            border: 1px dashed #dee2e6;
+            background: #1C1C1E;
+            border-radius: 8px;
+            border: 1px dashed #38383A;
             margin: 0;
         }
 
-        .connection-status {
-            margin-bottom: 16px;
-        }
+        .connection-status { margin-bottom: 16px; }
+        .status-grid { display: grid; gap: 8px; }
+        .status-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; }
+        .status-label { font-weight: 500; color: #AEAEB2; }
+        .status-value { font-weight: 600; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
 
-        .status-grid {
-            display: grid;
-            gap: 8px;
-        }
+        .status-testing { background: #2C2C2E; color: #FF9F0A; border: 1px solid #48484A; }
+        .status-elected { background: #2C2C2E; color: #0A84FF; border: 1px solid #48484A; }
+        .status-failed { background: #2C2C2E; color: #FF453A; border: 1px solid #48484A; }
+        .status-reconnecting { background: #2C2C2E; color: #AEAEB2; border: 1px solid #48484A; }
 
-        .status-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 6px 0;
-        }
+        .progress-container { display: flex; align-items: center; gap: 8px; min-width: 120px; }
+        .progress-bar { flex: 1; height: 6px; background: #2C2C2E; border-radius: 3px; overflow: hidden; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #0A84FF, #30D158); border-radius: 3px; transition: width 0.3s ease; }
+        .progress-text { font-size: 11px; font-weight: 600; color: #FFFFFF; min-width: 35px; }
 
-        .status-label {
-            font-weight: 500;
-            color: #6c757d;
-        }
+        .active-connection { margin-bottom: 16px; padding: 12px; background: #2C2C2E; border-radius: 8px; border-left: 4px solid #0A84FF; }
+        .connection-details { display: grid; gap: 6px; }
+        .detail-item { display: flex; justify-content: space-between; align-items: center; }
+        .detail-label { font-weight: 500; color: #FFFFFF; }
+        .detail-value { font-weight: 600; }
+        .server-url { font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; font-size: 11px; background: #1C1C1E; padding: 2px 6px; border-radius: 3px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-        .status-value {
-            font-weight: 600;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 12px;
-        }
+        .connection-type { padding: 2px 8px; border-radius: 4px; font-size: 11px; }
+        .type-websocket { background: #1C1C1E; color: #0A84FF; border: 1px solid #38383A; }
+        .type-webtransport { background: #1C1C1E; color: #0A84FF; border: 1px solid #38383A; }
 
-        .status-testing {
-            background: #fff3cd;
-            color: #856404;
-            border: 1px solid #ffeaa7;
-        }
+        .rtt-value { padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; }
+        .rtt-good { background: #1C1C1E; color: #30D158; border: 1px solid #38383A; }
+        .rtt-ok { background: #1C1C1E; color: #FF9F0A; border: 1px solid #38383A; }
+        .rtt-poor { background: #1C1C1E; color: #FF453A; border: 1px solid #38383A; }
 
-        .status-elected {
-            background: #d1ecf1;
-            color: #0c5460;
-            border: 1px solid #b8daff;
-        }
+        .servers-list { margin-bottom: 16px; }
+        .servers-grid { display: grid; gap: 8px; }
+        .server-card { background: #1C1C1E; border: 1px solid #38383A; border-radius: 8px; padding: 10px; transition: all 0.2s ease; }
+        .server-card:hover { border-color: #48484A; box-shadow: 0 2px 6px rgba(0,0,0,0.35); }
+        .server-active { border-color: #0A84FF; box-shadow: 0 2px 6px rgba(10,132,255,0.25); }
+        .server-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+        .server-id { font-weight: 600; font-size: 11px; color: #FFFFFF; font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; background: #2C2C2E; padding: 2px 6px; border-radius: 3px; }
+        .server-indicators { display: flex; gap: 4px; align-items: center; }
+        .indicator { font-size: 12px; font-weight: bold; }
+        .active-indicator { color: #30D158; }
+        .status-indicator { font-size: 14px; }
+        .server-details { font-size: 11px; }
+        .server-url { color: #AEAEB2; margin-bottom: 4px; font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; word-break: break-all; }
+        .server-info { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .server-type { padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; background: #2C2C2E; border: 1px solid #38383A; color: #0A84FF; }
+        .server-rtt { padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
+        .no-rtt { color: #8E8E93; background: #1C1C1E; border: 1px solid #38383A; }
+        .measurement-count { font-size: 10px; color: #AEAEB2; background: #1C1C1E; padding: 2px 4px; border-radius: 3px; border: 1px solid #38383A; }
 
-        .status-failed {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-
-        .status-reconnecting {
-            background: #e2e3e5;
-            color: #383d41;
-            border: 1px solid #d6d8db;
-        }
-
-        .progress-container {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            min-width: 120px;
-        }
-
-        .progress-bar {
-            flex: 1;
-            height: 6px;
-            background: #e9ecef;
-            border-radius: 3px;
-            overflow: hidden;
-        }
-
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #17a2b8, #20c997);
-            border-radius: 3px;
-            transition: width 0.3s ease;
-        }
-
-        .progress-text {
-            font-size: 11px;
-            font-weight: 600;
-            color: #495057;
-            min-width: 35px;
-        }
-
-        .active-connection {
-            margin-bottom: 16px;
-            padding: 12px;
-            background: #d1ecf1;
-            border-radius: 6px;
-            border-left: 4px solid #17a2b8;
-        }
-
-        .connection-details {
-            display: grid;
-            gap: 6px;
-        }
-
-        .detail-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .detail-label {
-            font-weight: 500;
-            color: #495057;
-        }
-
-        .detail-value {
-            font-weight: 600;
-        }
-
-        .server-url {
-            font-family: Monaco, 'Courier New', monospace;
-            font-size: 11px;
-            background: rgba(0,0,0,0.05);
-            padding: 2px 6px;
-            border-radius: 3px;
-            max-width: 200px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }
-
-        .connection-type {
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-        }
-
-        .type-websocket {
-            background: #cce5ff;
-            color: #004085;
-            border: 1px solid #b3d7ff;
-        }
-
-        .type-webtransport {
-            background: #e7f3ff;
-            color: #0056b3;
-            border: 1px solid #c2e0ff;
-        }
-
-        .rtt-value {
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 11px;
-            font-weight: 600;
-        }
-
-        .rtt-good {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-
-        .rtt-ok {
-            background: #fff3cd;
-            color: #856404;
-            border: 1px solid #ffeaa7;
-        }
-
-        .rtt-poor {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-
-        .servers-list {
-            margin-bottom: 16px;
-        }
-
-        .servers-grid {
-            display: grid;
-            gap: 8px;
-        }
-
-        .server-card {
-            background: white;
-            border: 1px solid #dee2e6;
-            border-radius: 6px;
-            padding: 10px;
-            transition: all 0.2s ease;
-        }
-
-        .server-card:hover {
-            border-color: #adb5bd;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-
-        .server-active {
-            border-color: #17a2b8;
-            background: #f0fcff;
-            box-shadow: 0 2px 4px rgba(23, 162, 184, 0.15);
-        }
-
-        .server-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 6px;
-        }
-
-        .server-id {
-            font-weight: 600;
-            font-size: 11px;
-            color: #495057;
-            font-family: Monaco, 'Courier New', monospace;
-            background: rgba(0,0,0,0.05);
-            padding: 2px 6px;
-            border-radius: 3px;
-        }
-
-        .server-indicators {
-            display: flex;
-            gap: 4px;
-            align-items: center;
-        }
-
-        .indicator {
-            font-size: 12px;
-            font-weight: bold;
-        }
-
-        .active-indicator {
-            color: #28a745;
-        }
-
-        .status-indicator {
-            font-size: 14px;
-        }
-
-        .server-details {
-            font-size: 11px;
-        }
-
-        .server-url {
-            color: #6c757d;
-            margin-bottom: 4px;
-            font-family: Monaco, 'Courier New', monospace;
-            word-break: break-all;
-        }
-
-        .server-info {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-
-        .server-type {
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 10px;
-            font-weight: 600;
-        }
-
-        .server-rtt {
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 10px;
-            font-weight: 600;
-        }
-
-        .no-rtt {
-            color: #6c757d;
-            background: #f8f9fa;
-            border: 1px solid #dee2e6;
-        }
-
-        .measurement-count {
-            font-size: 10px;
-            color: #6c757d;
-            background: #f8f9fa;
-            padding: 2px 4px;
-            border-radius: 3px;
-            border: 1px solid #dee2e6;
-        }
-
-        .connection-error {
-            background: #f8d7da;
-            color: #721c24;
-            padding: 12px;
-            border-radius: 6px;
-            border-left: 4px solid #dc3545;
-        }
-
-        .error-reason {
-            margin: 6px 0 0 0;
-            font-size: 12px;
-            font-style: italic;
-        }
+        .connection-error { background: #2C2C2E; color: #FF453A; padding: 12px; border-radius: 8px; border-left: 4px solid #FF453A; }
+        .error-reason { margin: 6px 0 0 0; font-size: 12px; font-style: italic; }
     "#;
 
     if let Some(state) = parsed_state {

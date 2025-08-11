@@ -8,11 +8,11 @@ rustlemania-websocket:
   image:
     repository: securityunion/rustlemania-api
     pullPolicy: Always
-    tag: high-availability-cf63fcce
+    tag: latest
 
   env:
     - name: RUST_LOG
-      value: info
+      value: warn,async_nats=warn
     - name: ACTIX_PORT
       value: "8080"
     - name: UI_ENDPOINT
@@ -25,6 +25,10 @@ rustlemania-websocket:
       value: abc
     - name: REGION
       value: "singapore"
+    - name: SERVER_ID
+      value: $(POD_NAME)
+    - name: SERVICE_TYPE
+      value: websocket
 
   resources:
     limits:

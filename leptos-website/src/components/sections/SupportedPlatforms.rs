@@ -91,7 +91,7 @@ fn PlatformsCarousel() -> impl IntoView {
             src: "/images/platforms/chromium.svg",
         },
         PlatformItem {
-            name: "Apple",
+            name: "Mac OS",
             src: "/images/platforms/apple.svg",
         },
     ];

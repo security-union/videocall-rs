@@ -98,7 +98,7 @@ fn PlatformsCarousel() -> impl IntoView {
 
     view! {
         <div class="relative mb-12">
-            <div class="overflow-hidden">
+            <div class="overflow-hidden mask-edge-fade">
                 <div class="flex gap-4 animate-platforms-scroll will-change-transform">
                     {move || {
                         ITEMS
@@ -121,11 +121,8 @@ fn PlatformsCarousel() -> impl IntoView {
                     }}
                 </div>
             </div>
-            // Edge fade masks
-            <div class="pointer-events-none absolute inset-y-0 left-0 w-16 bg-gradient-to-r from-background to-transparent"/>
-            <div class="pointer-events-none absolute inset-y-0 right-0 w-16 bg-gradient-to-l from-background to-transparent"/>
             <style>
-                {"@keyframes platforms-scroll {{ 0% {{ transform: translateX(0); }} 100% {{ transform: translateX(-50%); }} }} .animate-platforms-scroll {{ animation: platforms-scroll 20s linear infinite; }}"}
+                {"@keyframes platforms-scroll {{ 0% {{ transform: translateX(0); }} 100% {{ transform: translateX(-50%); }} }} .animate-platforms-scroll {{ animation: platforms-scroll 20s linear infinite; }} .mask-edge-fade {{ -webkit-mask-image: linear-gradient(to right, rgba(0,0,0,0) 0, rgba(0,0,0,1) 48px, rgba(0,0,0,1) calc(100% - 48px), rgba(0,0,0,0) 100%); mask-image: linear-gradient(to right, rgba(0,0,0,0) 0, rgba(0,0,0,1) 48px, rgba(0,0,0,1) calc(100% - 48px), rgba(0,0,0,0) 100%); -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat; -webkit-mask-size: 100% 100%; mask-size: 100% 100%; }}"}
             </style>
         </div>
     }

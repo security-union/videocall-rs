@@ -1,7 +1,12 @@
 use log::LevelFilter;
 
 #[cfg(target_arch = "wasm32")]
-use log::{Level, LevelFilter, Log, Metadata, Record};
+use log::{Level, Log, Metadata, Record};
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use web_sys::{console, window};
 
 #[derive(Clone, Debug)]
 pub struct MatomoConfig {
@@ -10,8 +15,6 @@ pub struct MatomoConfig {
     pub console_level: LevelFilter,
     pub matomo_level: LevelFilter,
     pub inject_snippet: bool,
-    pub queue_capacity: usize,
-    pub max_event_len: usize,
 }
 
 impl Default for MatomoConfig {
@@ -22,8 +25,6 @@ impl Default for MatomoConfig {
             console_level: LevelFilter::Info,
             matomo_level: LevelFilter::Warn,
             inject_snippet: true,
-            queue_capacity: 256,
-            max_event_len: 300,
         }
     }
 }
@@ -113,10 +114,6 @@ fn push_to_paq(args: &JsValue) {
         if let Ok(paq) = js_sys::Reflect::get(&w, &JsValue::from_str("_paq")) {
             if let Ok(push) = js_sys::Reflect::get(&paq, &JsValue::from_str("push")) {
                 let func: js_sys::Function = push.into();
-                if let Ok(arr) = args.clone().dyn_into::<js_sys::Array>() {
-                    let cmd = arr.get(0).as_string().unwrap_or_else(|| "<unknown>".into());
-                    debug_log(&format!("_paq.push({})", cmd));
-                }
                 // Use the _paq array as the 'this' value for push
                 if let Err(e) = func.call1(&paq, args) {
                     console::error_2(&JsValue::from_str("_paq.push error"), &e);
@@ -170,20 +167,9 @@ fn maybe_inject_snippet(cfg: &MatomoConfig) {
             if let Some(head) = doc.head() {
                 let _ = head.append_child(&script);
             }
-            debug_log("inject_snippet: appended matomo.js script tag");
         }
     }
 }
-
-#[cfg(target_arch = "wasm32")]
-fn debug_log(msg: &str) {
-    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-        "[matomo-logger] {}",
-        msg
-    )));
-}
-#[cfg(not(target_arch = "wasm32"))]
-fn debug_log(_msg: &str) {}
 
 // Worker bridge API (simple): serialize log event and let host push it to Matomo.
 #[cfg(feature = "worker")]
@@ -250,8 +236,6 @@ pub mod worker {
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use super::*;
-    use wasm_bindgen::prelude::*;
-    use web_sys::{console, window};
 
     impl Log for MatomoLogger {
         fn enabled(&self, _metadata: &Metadata) -> bool {
@@ -265,10 +249,6 @@ mod imp {
     }
 
     pub fn init(config: MatomoConfig) -> Result<(), log::SetLoggerError> {
-        super::debug_log(&format!(
-            "init: inject_snippet={}, base_url={:?}, site_id={:?}, console_level={:?}, matomo_level={:?}, has_paq_pre={}",
-            config.inject_snippet, config.base_url, config.site_id, config.console_level, config.matomo_level, super::has_paq()
-        ));
         if config.inject_snippet {
             super::maybe_inject_snippet(&config);
         }
@@ -279,18 +259,42 @@ mod imp {
         let leaked: &'static MatomoLogger = Box::leak(Box::new(logger));
         log::set_logger(leaked)?;
         log::set_max_level(config.console_level.max(config.matomo_level));
-        super::debug_log(&format!(
-            "init: logger installed, has_paq_post={}",
-            super::has_paq()
-        ));
         Ok(())
     }
 
     pub fn track_page_view_impl(title: &str, url: &str) {
-        super::track_page_view(title, url);
+        // Inline implementation to avoid recursion with the public facade
+        // setCustomUrl
+        let a = js_sys::Array::new();
+        a.push(&JsValue::from_str("setCustomUrl"));
+        a.push(&JsValue::from_str(url));
+        if super::has_paq() {
+            super::push_to_paq(&a.into());
+        }
+
+        // setDocumentTitle
+        let a = js_sys::Array::new();
+        a.push(&JsValue::from_str("setDocumentTitle"));
+        a.push(&JsValue::from_str(title));
+        if super::has_paq() {
+            super::push_to_paq(&a.into());
+        }
+
+        // trackPageView
+        let a = js_sys::Array::new();
+        a.push(&JsValue::from_str("trackPageView"));
+        if super::has_paq() {
+            super::push_to_paq(&a.into());
+        }
     }
     pub fn set_user_id_impl(user_id: &str) {
-        super::set_user_id(user_id);
+        // Inline implementation to avoid recursion with the public facade
+        let a = js_sys::Array::new();
+        a.push(&JsValue::from_str("setUserId"));
+        a.push(&JsValue::from_str(user_id));
+        if super::has_paq() {
+            super::push_to_paq(&a.into());
+        }
     }
 }
 

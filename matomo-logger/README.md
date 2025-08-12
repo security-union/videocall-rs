@@ -8,6 +8,7 @@ Global logger for WASM apps that forwards Rust `log` records to both the browser
 - Console + Matomo multiplexing with independent level thresholds
 - Safe Matomo snippet injection when `_paq` is absent (configurable)
 - SPA navigation helper: `track_page_view(title, url)`
+- User attribution: `set_user_id(user_id)` (Matomo User ID)
 - Web Worker bridge (optional feature) to forward logs to main thread
 - Small, dependency-light; optimized for Yew and other WASM front-ends
 
@@ -44,8 +45,6 @@ pub struct MatomoConfig {
     pub console_level: log::LevelFilter, // default: Info
     pub matomo_level: log::LevelFilter,   // default: Warn
     pub inject_snippet: bool,             // default: true
-    pub queue_capacity: usize,            // reserved for future queueing
-    pub max_event_len: usize,             // truncate long messages (default 300)
 }
 ```
 

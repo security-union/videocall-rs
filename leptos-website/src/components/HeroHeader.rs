@@ -64,11 +64,12 @@ pub fn HeroHeader() -> impl IntoView {
                     <div class="pt-24 pb-32 lg:pt-32 lg:pb-40">
                         <div class="text-center max-w-4xl mx-auto">
                             <h1 class="text-hero text-foreground mb-6">
-                                "Ultra-low latency "
-                                <span class="text-primary">"videocalls"</span>
+                                "Ultra-low-latency "
+                                <span class="text-primary">"video calls"</span>
+                                " for web, mobile, and embedded devices"
                             </h1>
                             <p class="text-body-large text-foreground-secondary mb-12 max-w-2xl mx-auto">
-                                "Always open-source, always awesome, powered by Rust"
+                                "Build cameras, kiosks, drones, and robots with the same ultra-low-latency engine — open source and production-ready"
                             </p>
                             <div class="flex flex-col sm:flex-row gap-4 justify-center items-center">
                                 <a

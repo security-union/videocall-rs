@@ -172,7 +172,7 @@ fn maybe_inject_snippet(cfg: &MatomoConfig) {
 }
 
 // Worker bridge API (simple): serialize log event and let host push it to Matomo.
-#[cfg(feature = "worker")]
+#[cfg(all(target_arch = "wasm32", feature = "worker"))]
 pub mod worker {
     use super::*;
     use web_sys::DedicatedWorkerGlobalScope;
@@ -231,6 +231,20 @@ pub mod worker {
             let _ = scope.post_message(&obj);
         }
         fn flush(&self) {}
+    }
+}
+
+// Host build (non-wasm or no `worker` feature): provide a stub so root clippy/fmt succeeds
+#[cfg(not(all(target_arch = "wasm32", feature = "worker")))]
+pub mod worker {
+    use super::*;
+    // Accept the same signature but ignore the sender type via a generic to avoid js_sys import
+    pub fn init_with_bridge<T>(
+        _console_level: LevelFilter,
+        _matomo_level: LevelFilter,
+        _sender: T,
+    ) -> Result<(), log::SetLoggerError> {
+        Ok(())
     }
 }
 

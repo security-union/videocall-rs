@@ -79,7 +79,7 @@ pub fn HeroHeader() -> impl IntoView {
                                     "Create a meeting"
                                 </a>
                                 <a
-                                    href="https://www.youtube.com/watch?v=kZ9isFw1TQ8&list=PLxM2CWwQlzBtmhdaK2IeuQvpepKC6BYLOs"
+                                    href="https://www.youtube.com/watch?v=XQoynxQJajk"
                                     class="btn-secondary text-lg px-8 py-4"
                                 >
                                     "Watch How It Works"

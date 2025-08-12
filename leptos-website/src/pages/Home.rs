@@ -19,8 +19,8 @@
 use crate::components::sections::Company::CompanySection;
 use crate::components::sections::Customers::CustomersSection;
 use crate::components::sections::Developers::DevelopersSection;
-use crate::components::sections::SupportedPlatforms::SupportedPlatformsSection;
 use crate::components::sections::Pricing::PricingSection;
+use crate::components::sections::SupportedPlatforms::SupportedPlatformsSection;
 
 // Removed unused import
 use crate::components::HeroHeader::*;
@@ -47,8 +47,8 @@ pub fn Home() -> impl IntoView {
 
             // Apple-style content sections with generous spacing
             <div class="max-w-7xl mx-auto relative space-y-32 py-24 px-4 sm:px-6 lg:px-8">
-                <DevelopersSection/>
                 <SupportedPlatformsSection/>
+                <DevelopersSection/>
                 <CompanySection/>
                 <CustomersSection/>
                 <PricingSection/>

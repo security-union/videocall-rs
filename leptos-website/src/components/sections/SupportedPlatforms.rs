@@ -24,7 +24,7 @@ pub fn SupportedPlatformsSection() -> impl IntoView {
     view! {
         <section id="supported-platforms" class="relative">
             <div class="text-center mb-12">
-                <h2 class="text-headline text-foreground mb-4">"Supported platforms"</h2>
+                <h2 class="text-headline text-foreground mb-4">"Supported platforms and Browsers"</h2>
                 <p class="text-body-large text-foreground-secondary max-w-3xl mx-auto">
                     "Runs beautifully on modern browsers and embedded devices"
                 </p>
@@ -61,7 +61,7 @@ fn PlatformsCarousel() -> impl IntoView {
         src: &'static str,
     }
 
-    const ITEMS: [PlatformItem; 8] = [
+    const ITEMS: [PlatformItem; 10] = [
         PlatformItem {
             name: "Chrome",
             src: "/images/platforms/chrome.svg",
@@ -94,6 +94,14 @@ fn PlatformsCarousel() -> impl IntoView {
             name: "Mac OS",
             src: "/images/platforms/apple.svg",
         },
+        PlatformItem {
+            name: "iOS",
+            src: "/images/platforms/ios.svg",
+        },
+        PlatformItem {
+            name: "Android",
+            src: "/images/platforms/android.svg",
+        },
     ];
 
     view! {
@@ -106,15 +114,15 @@ fn PlatformsCarousel() -> impl IntoView {
                             .chain(ITEMS.iter())
                             .map(|item| view! {
                                 <div class="card-apple group flex-shrink-0 w-44 p-6 flex flex-col items-center justify-center">
-                                    <div class="flex items-center justify-center w-full h-20">
+                                    <div class="flex items-center justify-center w-full h-24">
                                         <img
                                             src=item.src
                                             alt=item.name
-                                            class="h-12 w-auto opacity-90 grayscale group-hover:grayscale-0 group-hover:opacity-100 transition-all duration-300"
+                                            class="h-16 w-auto opacity-90 grayscale group-hover:grayscale-0 group-hover:opacity-100 transition-all duration-300"
                                             loading="lazy"
                                         />
                                     </div>
-                                    <div class="mt-3 text-sm text-foreground-secondary">{item.name}</div>
+                                    <div class="mt-4 text-sm text-foreground-secondary">{item.name}</div>
                                 </div>
                             })
                             .collect_view()
@@ -127,4 +135,3 @@ fn PlatformsCarousel() -> impl IntoView {
         </div>
     }
 }
-

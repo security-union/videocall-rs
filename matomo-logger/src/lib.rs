@@ -36,6 +36,15 @@ pub struct MatomoLogger {
 
 impl MatomoLogger {
     pub fn init(config: MatomoConfig) -> Result<(), log::SetLoggerError> {
+        debug_log(&format!(
+            "init: inject_snippet={}, base_url={:?}, site_id={:?}, console_level={:?}, matomo_level={:?}, has_paq_pre={}",
+            config.inject_snippet,
+            config.base_url,
+            config.site_id,
+            config.console_level,
+            config.matomo_level,
+            has_paq()
+        ));
         // Optionally inject snippet when running in browser main thread
         if config.inject_snippet {
             maybe_inject_snippet(&config);
@@ -50,6 +59,10 @@ impl MatomoLogger {
         let leaked: &'static MatomoLogger = Box::leak(Box::new(logger));
         log::set_logger(leaked)?;
         log::set_max_level(config.console_level.max(config.matomo_level));
+        debug_log(&format!(
+            "init: logger installed, has_paq_post={}",
+            has_paq()
+        ));
         Ok(())
     }
 }
@@ -68,6 +81,12 @@ impl Log for MatomoLogger {
 /// Track a single-page application page view with custom title and URL.
 /// Safe to call whether or not Matomo is present; no-ops if `_paq` is missing.
 pub fn track_page_view(title: &str, url: &str) {
+    debug_log(&format!(
+        "track_page_view: title='{}' url='{}' has_paq={}",
+        title,
+        url,
+        has_paq()
+    ));
     // setCustomUrl
     let a = js_sys::Array::new();
     a.push(&JsValue::from_str("setCustomUrl"));
@@ -87,6 +106,18 @@ pub fn track_page_view(title: &str, url: &str) {
     // trackPageView
     let a = js_sys::Array::new();
     a.push(&JsValue::from_str("trackPageView"));
+    if has_paq() {
+        push_to_paq(&a.into());
+    }
+}
+
+/// Set Matomo user id (enables per-user attribution in Matomo reports).
+/// Safe to call anytime after initialization; no-ops if `_paq` is unavailable.
+pub fn set_user_id(user_id: &str) {
+    debug_log(&format!("set_user_id: '{}' has_paq={}", user_id, has_paq()));
+    let a = js_sys::Array::new();
+    a.push(&JsValue::from_str("setUserId"));
+    a.push(&JsValue::from_str(user_id));
     if has_paq() {
         push_to_paq(&a.into());
     }
@@ -152,7 +183,14 @@ fn push_to_paq(args: &JsValue) {
         if let Ok(paq) = js_sys::Reflect::get(&w, &JsValue::from_str("_paq")) {
             if let Ok(push) = js_sys::Reflect::get(&paq, &JsValue::from_str("push")) {
                 let func: js_sys::Function = push.into();
-                let _ = func.call1(&JsValue::NULL, args);
+                if let Ok(arr) = args.clone().dyn_into::<js_sys::Array>() {
+                    let cmd = arr.get(0).as_string().unwrap_or_else(|| "<unknown>".into());
+                    debug_log(&format!("_paq.push({})", cmd));
+                }
+                // Use the _paq array as the 'this' value for push
+                if let Err(e) = func.call1(&paq, args) {
+                    console::error_2(&JsValue::from_str("_paq.push error"), &e);
+                }
             }
         }
     }
@@ -201,8 +239,13 @@ fn maybe_inject_snippet(cfg: &MatomoConfig) {
             if let Some(head) = doc.head() {
                 let _ = head.append_child(&script);
             }
+            debug_log("inject_snippet: appended matomo.js script tag");
         }
     }
+}
+
+fn debug_log(msg: &str) {
+    console::log_1(&JsValue::from_str(&format!("[matomo-logger] {}", msg)));
 }
 
 // Worker bridge API (simple): serialize log event and let host push it to Matomo.

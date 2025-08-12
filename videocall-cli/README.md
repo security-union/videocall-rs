@@ -4,7 +4,7 @@
 ## ✨ Features
 - Stream video effortlessly from the CLI on your desktop, robot, or Raspberry Pi.
 - Works seamlessly with [videocall.rs](https://videocall.rs).
-- Currently Supports Chrome, Chromium and Edge.
+- Currently Supports Chrome, Safari (both mobile and desktop), Chromium and Edge.
 - Compatible with **local servers** or **production environments**.
 
 ---

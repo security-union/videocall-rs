@@ -29,7 +29,9 @@ impl Default for MatomoConfig {
 }
 
 pub struct MatomoLogger {
+    #[allow(dead_code)]
     min_console_level: LevelFilter,
+    #[allow(dead_code)]
     min_matomo_level: LevelFilter,
 }
 

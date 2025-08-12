@@ -296,7 +296,7 @@ impl ConnectionManager {
             if packet.email != userid {
                 on_inbound_media.emit(packet);
             } else {
-                warn!("Rejecting packet from same user: {}", packet.email);
+                debug!("Rejecting packet from same user: {}", packet.email);
             }
         })
     }

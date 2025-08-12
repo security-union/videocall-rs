@@ -1,3 +1,7 @@
+#![cfg(target_arch = "wasm32")]
+use log::LevelFilter;
+
+#[cfg(target_arch = "wasm32")]
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 #[derive(Clone, Debug)]

@@ -1,8 +1,4 @@
-#![cfg(target_arch = "wasm32")]
-
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use wasm_bindgen::prelude::*;
-use web_sys::{console, window};
 
 #[derive(Clone, Debug)]
 pub struct MatomoConfig {
@@ -34,95 +30,21 @@ pub struct MatomoLogger {
     min_matomo_level: LevelFilter,
 }
 
+// Public facade: works on all targets by delegating to the platform implementation.
 impl MatomoLogger {
     pub fn init(config: MatomoConfig) -> Result<(), log::SetLoggerError> {
-        debug_log(&format!(
-            "init: inject_snippet={}, base_url={:?}, site_id={:?}, console_level={:?}, matomo_level={:?}, has_paq_pre={}",
-            config.inject_snippet,
-            config.base_url,
-            config.site_id,
-            config.console_level,
-            config.matomo_level,
-            has_paq()
-        ));
-        // Optionally inject snippet when running in browser main thread
-        if config.inject_snippet {
-            maybe_inject_snippet(&config);
-        }
-
-        let logger = MatomoLogger {
-            min_console_level: config.console_level,
-            min_matomo_level: config.matomo_level,
-        };
-
-        // Leak the logger to satisfy the 'static requirement of set_logger
-        let leaked: &'static MatomoLogger = Box::leak(Box::new(logger));
-        log::set_logger(leaked)?;
-        log::set_max_level(config.console_level.max(config.matomo_level));
-        debug_log(&format!(
-            "init: logger installed, has_paq_post={}",
-            has_paq()
-        ));
-        Ok(())
+        imp::init(config)
     }
 }
 
-impl Log for MatomoLogger {
-    fn enabled(&self, _metadata: &Metadata) -> bool {
-        true
-    }
-    fn log(&self, record: &Record) {
-        log_to_console(self.min_console_level, record);
-        log_to_matomo(self.min_matomo_level, record);
-    }
-    fn flush(&self) {}
-}
-
-/// Track a single-page application page view with custom title and URL.
-/// Safe to call whether or not Matomo is present; no-ops if `_paq` is missing.
 pub fn track_page_view(title: &str, url: &str) {
-    debug_log(&format!(
-        "track_page_view: title='{}' url='{}' has_paq={}",
-        title,
-        url,
-        has_paq()
-    ));
-    // setCustomUrl
-    let a = js_sys::Array::new();
-    a.push(&JsValue::from_str("setCustomUrl"));
-    a.push(&JsValue::from_str(url));
-    if has_paq() {
-        push_to_paq(&a.into());
-    }
-
-    // setDocumentTitle
-    let a = js_sys::Array::new();
-    a.push(&JsValue::from_str("setDocumentTitle"));
-    a.push(&JsValue::from_str(title));
-    if has_paq() {
-        push_to_paq(&a.into());
-    }
-
-    // trackPageView
-    let a = js_sys::Array::new();
-    a.push(&JsValue::from_str("trackPageView"));
-    if has_paq() {
-        push_to_paq(&a.into());
-    }
+    imp::track_page_view_impl(title, url)
 }
-
-/// Set Matomo user id (enables per-user attribution in Matomo reports).
-/// Safe to call anytime after initialization; no-ops if `_paq` is unavailable.
 pub fn set_user_id(user_id: &str) {
-    debug_log(&format!("set_user_id: '{}' has_paq={}", user_id, has_paq()));
-    let a = js_sys::Array::new();
-    a.push(&JsValue::from_str("setUserId"));
-    a.push(&JsValue::from_str(user_id));
-    if has_paq() {
-        push_to_paq(&a.into());
-    }
+    imp::set_user_id_impl(user_id)
 }
 
+#[cfg(target_arch = "wasm32")]
 fn log_to_console(threshold: LevelFilter, record: &Record) {
     if record.level().to_level_filter() > threshold {
         return;
@@ -142,6 +64,7 @@ fn log_to_console(threshold: LevelFilter, record: &Record) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn log_to_matomo(threshold: LevelFilter, record: &Record) {
     if record.level().to_level_filter() > threshold {
         return;
@@ -170,6 +93,7 @@ fn log_to_matomo(threshold: LevelFilter, record: &Record) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn has_paq() -> bool {
     if let Some(w) = window() {
         js_sys::Reflect::has(&w, &JsValue::from_str("_paq")).unwrap_or(false)
@@ -178,6 +102,7 @@ fn has_paq() -> bool {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn push_to_paq(args: &JsValue) {
     if let Some(w) = window() {
         if let Ok(paq) = js_sys::Reflect::get(&w, &JsValue::from_str("_paq")) {
@@ -196,6 +121,7 @@ fn push_to_paq(args: &JsValue) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn maybe_inject_snippet(cfg: &MatomoConfig) {
     // Only in main thread with window
     let Some(w) = window() else {
@@ -244,9 +170,15 @@ fn maybe_inject_snippet(cfg: &MatomoConfig) {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn debug_log(msg: &str) {
-    console::log_1(&JsValue::from_str(&format!("[matomo-logger] {}", msg)));
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+        "[matomo-logger] {}",
+        msg
+    )));
 }
+#[cfg(not(target_arch = "wasm32"))]
+fn debug_log(_msg: &str) {}
 
 // Worker bridge API (simple): serialize log event and let host push it to Matomo.
 #[cfg(feature = "worker")]
@@ -305,4 +237,66 @@ pub mod worker {
         }
         fn flush(&self) {}
     }
+}
+
+// ---------------- Platform-specific implementations -----------------
+
+// WASM implementation
+#[cfg(target_arch = "wasm32")]
+mod imp {
+    use super::*;
+    use wasm_bindgen::prelude::*;
+    use web_sys::{console, window};
+
+    impl Log for MatomoLogger {
+        fn enabled(&self, _metadata: &Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &Record) {
+            super::log_to_console(self.min_console_level, record);
+            super::log_to_matomo(self.min_matomo_level, record);
+        }
+        fn flush(&self) {}
+    }
+
+    pub fn init(config: MatomoConfig) -> Result<(), log::SetLoggerError> {
+        super::debug_log(&format!(
+            "init: inject_snippet={}, base_url={:?}, site_id={:?}, console_level={:?}, matomo_level={:?}, has_paq_pre={}",
+            config.inject_snippet, config.base_url, config.site_id, config.console_level, config.matomo_level, super::has_paq()
+        ));
+        if config.inject_snippet {
+            super::maybe_inject_snippet(&config);
+        }
+        let logger = MatomoLogger {
+            min_console_level: config.console_level,
+            min_matomo_level: config.matomo_level,
+        };
+        let leaked: &'static MatomoLogger = Box::leak(Box::new(logger));
+        log::set_logger(leaked)?;
+        log::set_max_level(config.console_level.max(config.matomo_level));
+        super::debug_log(&format!(
+            "init: logger installed, has_paq_post={}",
+            super::has_paq()
+        ));
+        Ok(())
+    }
+
+    pub fn track_page_view_impl(title: &str, url: &str) {
+        super::track_page_view(title, url);
+    }
+    pub fn set_user_id_impl(user_id: &str) {
+        super::set_user_id(user_id);
+    }
+}
+
+// Native/no-op implementation (for clippy/fmt host builds)
+#[cfg(not(target_arch = "wasm32"))]
+mod imp {
+    use super::*;
+    pub fn init(_config: MatomoConfig) -> Result<(), log::SetLoggerError> {
+        log::set_max_level(LevelFilter::Info);
+        Ok(())
+    }
+    pub fn track_page_view_impl(_title: &str, _url: &str) {}
+    pub fn set_user_id_impl(_user_id: &str) {}
 }

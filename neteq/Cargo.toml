@@ -58,6 +58,7 @@ tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "fs"], optio
 tower = { version = "0.4", optional = true }
 tower-http = { version = "0.5", features = ["cors", "fs", "set-header"], optional = true }
 once_cell = { version = "1.19", optional = true }
+matomo-logger = { path = "../matomo-logger", optional = true, version = "0.1.0" }
 
 [features]
 default = ["native", "audio_files"]
@@ -72,6 +73,7 @@ web = [
     "gloo-utils", 
     "console_error_panic_hook",
     "once_cell",
+    "matomo-logger",
 ]
 native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
 

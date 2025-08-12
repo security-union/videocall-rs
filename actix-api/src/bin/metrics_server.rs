@@ -896,7 +896,7 @@ mod tests {
                 active_servers: HashSet::new(),
             };
             // Simulate old timestamp by subtracting 40 seconds
-            session_info.last_seen = session_info.last_seen - Duration::from_secs(40);
+            session_info.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key, session_info);
         }
 
@@ -1074,7 +1074,7 @@ mod tests {
         ));
 
         // Remove and ensure it disappears
-        let session_key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_peer}");
         let info = {
             let guard = tracker.lock().unwrap();
             guard.get(&session_key).unwrap().clone()
@@ -1165,7 +1165,7 @@ mod tests {
                 peer_ids: HashSet::new(),
                 active_servers: HashSet::new(),
             };
-            session_info2.last_seen = session_info2.last_seen - Duration::from_secs(40);
+            session_info2.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
 
             // Another fresh session
@@ -1216,9 +1216,6 @@ mod tests {
         // This test verifies that remove_session_metrics doesn't panic
         // In a real environment, this would interact with Prometheus metrics
         remove_session_metrics(&session_info);
-
-        // If we reach here, the function executed without panicking
-        assert!(true);
     }
 
     #[test]
@@ -1377,7 +1374,7 @@ mod tests {
                 active_servers: HashSet::new(),
             };
             // Set to exactly 30 seconds ago (timeout boundary)
-            session_info.last_seen = session_info.last_seen - Duration::from_secs(30);
+            session_info.last_seen -= Duration::from_secs(30);
             tracker_guard.insert(session_key, session_info);
         }
 

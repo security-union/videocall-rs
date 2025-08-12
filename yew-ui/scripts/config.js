@@ -1,3 +1,13 @@
-// Default production-safe runtime configuration.
-// These values can be overridden by mounting a different config.js at runtime.
-// Do not put secrets here.
+window.__APP_CONFIG = Object.freeze({
+  apiBaseUrl: "http://localhost:8080",
+  wsUrl: "wss://websocket-us-east.webtransport.video,wss://websocket-singapore.webtransport.video",
+  webTransportHost: "https://webtransport-us-east.webtransport.video,https://webtransport-singapore.webtransport.video",
+  oauthEnabled: "false",
+  e2eeEnabled: "false",
+  webTransportEnabled: "true",
+  usersAllowedToStream: "",
+  serverElectionPeriodMs: 2000,
+  audioBitrateKbps: 65,
+  videoBitrateKbps: 1000,
+  screenBitrateKbps: 1000
+});

@@ -51,6 +51,11 @@ web-sys = { version = "0.3", optional = true, features = [
     "HtmlDocument",
     "MediaQueryList",
     "Window",
+    "Element",
+    "HtmlElement",
+    "CssStyleDeclaration",
+    "Document",
+    "Node",
 ] }
 serde = "1.0.218"
 

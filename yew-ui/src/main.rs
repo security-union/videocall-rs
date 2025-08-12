@@ -27,9 +27,9 @@ use constants::login_url;
 
 use crate::constants::app_config;
 use components::config_error::ConfigError;
-use components::matomo::MatomoTracker;
 use enum_display::EnumDisplay;
 use gloo_utils::window;
+use matomo_logger::{MatomoConfig, MatomoLogger};
 use pages::home::Home;
 use yew::prelude::*;
 use yew_router::prelude::*;
@@ -66,8 +66,8 @@ fn switch(routes: Route) -> Html {
     if let Err(e) = app_config() {
         return html! { <ConfigError message={e} /> };
     }
-    let matomo = MatomoTracker::new();
-    matomo.track_page_view(&routes.to_string(), &routes.to_string());
+    // Track SPA navigation in Matomo
+    matomo_logger::track_page_view(&routes.to_string(), &routes.to_string());
     match routes {
         Route::Home => html! { <Home /> },
         Route::Login => html! { <Login/> },
@@ -106,14 +106,18 @@ fn app_root() -> Html {
 }
 
 fn main() {
-    #[cfg(feature = "debugAssertions")]
-    {
-        _ = console_log::init_with_level(log::Level::Debug);
-    }
-    #[cfg(not(feature = "debugAssertions"))]
-    {
-        _ = console_log::init_with_level(log::Level::Info);
-    }
+    // Initialize unified console + Matomo logging
+    let _ = MatomoLogger::init(MatomoConfig {
+        base_url: Some("https://matomo.videocall.rs/".into()),
+        site_id: Some(1),
+        console_level: if cfg!(feature = "debugAssertions") {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        },
+        matomo_level: log::LevelFilter::Warn,
+        ..Default::default()
+    });
 
     console_error_panic_hook::set_once();
     yew::Renderer::<AppRoot>::new().render();

@@ -88,13 +88,14 @@ mod wasm_worker {
         // Keep console at INFO for local visibility inside the worker
         #[cfg(feature = "matomo-logger")]
         {
-            if let Err(e) = matomo_worker::init_with_bridge(LevelFilter::Info, LevelFilter::Warn, {
-                // The bridge expects the object as 'arguments[0]'
-                js_sys::Function::new_no_args("self.postMessage(arguments[0]);")
-            }) {
-                console::error_2(
-                    &"[neteq-worker] Failed to initialize matomo worker bridge:".into(),
-                    &e,
+            if let Err(_e) =
+                matomo_worker::init_with_bridge(LevelFilter::Info, LevelFilter::Warn, {
+                    // The bridge expects the object as 'arguments[0]'
+                    js_sys::Function::new_no_args("self.postMessage(arguments[0]);")
+                })
+            {
+                console::error_1(
+                    &"[neteq-worker] Failed to initialize matomo worker bridge".into(),
                 );
             }
         }

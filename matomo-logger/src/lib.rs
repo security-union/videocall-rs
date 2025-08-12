@@ -175,19 +175,22 @@ fn maybe_inject_snippet(cfg: &MatomoConfig) {
 #[cfg(feature = "worker")]
 pub mod worker {
     use super::*;
-    use wasm_bindgen::JsCast;
+    use web_sys::DedicatedWorkerGlobalScope;
 
+    /// Install a worker-side logger that forwards WARN+ records to the main thread via postMessage.
+    /// The `sender` argument is accepted for compatibility but is ignored; the logger uses postMessage directly.
     pub fn init_with_bridge(
         console_level: LevelFilter,
         matomo_level: LevelFilter,
-        send: js_sys::Function,
+        _sender: js_sys::Function,
     ) -> Result<(), log::SetLoggerError> {
         let logger = BridgeLogger {
             console_level,
             matomo_level,
-            sender: send,
         };
-        log::set_boxed_logger(Box::new(logger))?;
+        // Leak to obtain 'static lifetime required by log::set_logger
+        let leaked: &'static BridgeLogger = Box::leak(Box::new(logger));
+        log::set_logger(leaked)?;
         log::set_max_level(console_level.max(matomo_level));
         Ok(())
     }
@@ -195,17 +198,17 @@ pub mod worker {
     struct BridgeLogger {
         console_level: LevelFilter,
         matomo_level: LevelFilter,
-        sender: js_sys::Function,
     }
     impl Log for BridgeLogger {
         fn enabled(&self, _metadata: &Metadata) -> bool {
             true
         }
         fn log(&self, record: &Record) {
-            log_to_console(self.console_level, record);
+            super::log_to_console(self.console_level, record);
             if record.level().to_level_filter() > self.matomo_level {
                 return;
             }
+            // Build a compact log object and post to main thread
             let obj = js_sys::Object::new();
             let _ =
                 js_sys::Reflect::set(&obj, &JsValue::from_str("type"), &JsValue::from_str("log"));
@@ -224,7 +227,8 @@ pub mod worker {
                 &JsValue::from_str("message"),
                 &JsValue::from_str(&format!("{}", record.args())),
             );
-            let _ = self.sender.call1(&JsValue::NULL, &obj);
+            let scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+            let _ = scope.post_message(&obj);
         }
         fn flush(&self) {}
     }

@@ -73,7 +73,7 @@ web = [
     "gloo-utils", 
     "console_error_panic_hook",
     "once_cell",
-    "matomo-logger",
+    "matomo-logger/worker",
 ]
 native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
 

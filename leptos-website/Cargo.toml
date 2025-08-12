@@ -48,8 +48,9 @@ wasm-bindgen = "=0.2.100"
 femark = { version = "=0.1.3", optional = true }
 axum-extra = { version = "0.7.4", optional = true, features = ["cookie"] }
 web-sys = { version = "0.3", optional = true, features = [
-	"HtmlDocument",
-	"MediaQueryList",
+    "HtmlDocument",
+    "MediaQueryList",
+    "Window",
 ] }
 serde = "1.0.218"
 

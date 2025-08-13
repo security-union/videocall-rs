@@ -93,6 +93,7 @@ pub struct MicrophoneEncoder {
     state: EncoderState,
     _on_encoder_settings_update: Option<Callback<String>>,
     codec: AudioWorkletCodec,
+    on_error: Option<Callback<String>>,
 }
 
 impl MicrophoneEncoder {
@@ -100,13 +101,19 @@ impl MicrophoneEncoder {
         client: VideoCallClient,
         _bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
+        on_error: Callback<String>,
     ) -> Self {
         Self {
             client,
             state: EncoderState::new(),
             _on_encoder_settings_update: Some(on_encoder_settings_update),
             codec: AudioWorkletCodec::default(),
+            on_error: Some(on_error),
         }
+    }
+
+    pub fn set_error_callback(&mut self, on_error: Callback<String>) {
+        self.on_error = Some(on_error);
     }
 
     pub fn set_encoder_control(
@@ -170,6 +177,7 @@ impl MicrophoneEncoder {
             return;
         }
         let aes = client.aes();
+        let on_error = self.on_error.clone();
         let EncoderState {
             destroy,
             enabled,
@@ -225,20 +233,39 @@ impl MicrophoneEncoder {
         let codec = self.codec.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
-            let media_devices = navigator.media_devices().unwrap();
+            let media_devices = match navigator.media_devices() {
+                Ok(md) => md,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb.emit(format!("Failed to access media devices: {e:?}"));
+                    }
+                    return;
+                }
+            };
             let constraints = MediaStreamConstraints::new();
             let media_info = web_sys::MediaTrackConstraints::new();
             media_info.set_device_id(&device_id.into());
 
             constraints.set_audio(&media_info.into());
             constraints.set_video(&Boolean::from(false));
-            let devices_query = media_devices
-                .get_user_media_with_constraints(&constraints)
-                .unwrap();
-            let device = JsFuture::from(devices_query)
-                .await
-                .unwrap()
-                .unchecked_into::<MediaStream>();
+            let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb.emit(format!("Microphone access failed: {e:?}"));
+                    }
+                    return;
+                }
+            };
+            let device = match JsFuture::from(devices_query).await {
+                Ok(ok) => ok.unchecked_into::<MediaStream>(),
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb.emit(format!("Failed to get microphone stream: {e:?}"));
+                    }
+                    return;
+                }
+            };
 
             let audio_track = Box::new(
                 device
@@ -251,10 +278,23 @@ impl MicrophoneEncoder {
 
             // Sample Rate hasn't been added to the web_sys crate
             let input_rate: u32 =
-                js_sys::Reflect::get(&track_settings, &JsValue::from_str("sampleRate"))
-                    .unwrap()
-                    .as_f64()
-                    .unwrap() as u32;
+                match js_sys::Reflect::get(&track_settings, &JsValue::from_str("sampleRate")) {
+                    Ok(v) => match v.as_f64() {
+                        Some(f) => f as u32,
+                        None => {
+                            if let Some(cb) = &on_error {
+                                cb.emit("Could not determine microphone sample rate".to_string());
+                            }
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        if let Some(cb) = &on_error {
+                            cb.emit(format!("Failed reading microphone settings: {e:?}"));
+                        }
+                        return;
+                    }
+                };
 
             log::info!("Microphone input sample rate: {input_rate} Hz");
 
@@ -262,10 +302,18 @@ impl MicrophoneEncoder {
             let options = AudioContextOptions::new();
             options.set_sample_rate(input_rate as f32);
 
-            let context = AudioContext::new_with_context_options(&options).unwrap();
+            let context = match AudioContext::new_with_context_options(&options) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb.emit(format!("Failed to create audio context: {e:?}"));
+                    }
+                    return;
+                }
+            };
             log::info!("Created AudioContext with sample rate: {input_rate} Hz");
 
-            let worklet = codec
+            let worklet = match codec
                 .create_node(
                     &context,
                     "/encoderWorker.min.js",
@@ -273,7 +321,16 @@ impl MicrophoneEncoder {
                     AUDIO_CHANNELS,
                 )
                 .await
-                .unwrap();
+            {
+                Ok(node) => node,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb.emit(format!("Failed to initialize audio encoder: {e:?}"));
+                    }
+                    let _ = context.close();
+                    return;
+                }
+            };
 
             let output_handler =
                 Closure::wrap(audio_output_handler as Box<dyn FnMut(MessageEvent)>);
@@ -290,12 +347,36 @@ impl MicrophoneEncoder {
                 }),
             });
 
-            let source_node = context.create_media_stream_source(&device).unwrap();
-            let gain_node = context.create_gain().unwrap();
-            let _ = source_node
+            let source_node = match context.create_media_stream_source(&device) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb.emit(format!("Failed to create media source: {e:?}"));
+                    }
+                    let _ = context.close();
+                    return;
+                }
+            };
+            let gain_node = match context.create_gain() {
+                Ok(g) => g,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb.emit(format!("Failed to create gain node: {e:?}"));
+                    }
+                    let _ = context.close();
+                    return;
+                }
+            };
+            if let Err(e) = source_node
                 .connect_with_audio_node(&gain_node)
-                .unwrap()
-                .connect_with_audio_node(&worklet);
+                .and_then(|n| n.connect_with_audio_node(&worklet))
+            {
+                if let Some(cb) = &on_error {
+                    cb.emit(format!("Failed to connect audio graph: {e:?}"));
+                }
+                let _ = context.close();
+                return;
+            }
 
             // Monitor for stop conditions and clean up when needed
             let check_interval = 100; // Check every 100ms

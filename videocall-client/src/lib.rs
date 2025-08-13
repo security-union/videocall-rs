@@ -94,7 +94,8 @@
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),
 //!     128, // 128 kbps bitrate
-//!     Callback::noop()
+//!     Callback::noop(),
+//!     Callback::noop(),
 //! );
 //! let mut screen = ScreenEncoder::new(
 //!     client,

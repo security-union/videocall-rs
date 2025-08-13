@@ -35,6 +35,7 @@ pub trait MicrophoneEncoderTrait {
     fn stop(&mut self);
     fn select(&mut self, device_id: String) -> bool;
     fn set_enabled(&mut self, enabled: bool) -> bool;
+    fn set_error_callback(&mut self, on_error: yew::Callback<String>);
     fn set_encoder_control(
         &mut self,
         rx: futures::channel::mpsc::UnboundedReceiver<
@@ -61,6 +62,10 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
         self.set_enabled(enabled)
     }
 
+    fn set_error_callback(&mut self, on_error: yew::Callback<String>) {
+        self.set_error_callback(on_error)
+    }
+
     fn set_encoder_control(
         &mut self,
         rx: futures::channel::mpsc::UnboundedReceiver<
@@ -76,10 +81,12 @@ pub fn create_microphone_encoder(
     client: VideoCallClient,
     bitrate_kbps: u32,
     on_encoder_settings_update: Callback<String>,
+    on_error: Callback<String>,
 ) -> Box<dyn MicrophoneEncoderTrait> {
     Box::new(MicrophoneEncoder::new(
         client,
         bitrate_kbps,
         on_encoder_settings_update,
+        on_error,
     ))
 }

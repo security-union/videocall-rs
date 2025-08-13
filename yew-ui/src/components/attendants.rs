@@ -617,7 +617,7 @@ impl Component for AttendantsComponent {
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::OnMicrophoneError(err) => {
                 // Disable mic at the top and show UI
-                log::error!("Microphone error (full): {}", err);
+                log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
                 self.mic_error = Some(err);
                 true

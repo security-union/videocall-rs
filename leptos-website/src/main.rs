@@ -35,7 +35,7 @@ cfg_if! {
         // Middleware to add no-cache headers
         async fn add_no_cache_headers<B>(req: axum::http::Request<B>, next: axum::middleware::Next<B>) -> axum::response::Response {
             let mut response = next.run(req).await;
-            
+
             response.headers_mut().insert(
                 "Cache-Control",
                 HeaderValue::from_static("no-cache, no-store, must-revalidate, max-age=0")
@@ -48,7 +48,7 @@ cfg_if! {
                 "Expires",
                 HeaderValue::from_static("0")
             );
-            
+
             response
         }
 

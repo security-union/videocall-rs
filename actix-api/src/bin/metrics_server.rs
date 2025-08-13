@@ -40,9 +40,9 @@ use sec_api::metrics::{
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC,
     NETEQ_DTMF_OPS_PER_SEC, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_FAST_ACCELERATE_OPS_PER_SEC,
     NETEQ_MERGE_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_UNDEFINED_OPS_PER_SEC, PEER_AUDIO_ENABLED,
-    PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
+    NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_UNDEFINED_OPS_PER_SEC,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
 };
 
 async fn metrics_handler(
@@ -147,6 +147,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         let _ = VIDEO_PACKETS_BUFFERED.remove_label_values(&labels);
         let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
         let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
+        let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_NORMAL_OPS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
@@ -360,6 +361,22 @@ fn process_health_packet_to_metrics_pb(
                                     peer_id,
                                 ])
                                 .set(neteq_stats.packets_awaiting_decode);
+                            let mut tracker = session_tracker.lock().unwrap();
+                            let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                            if let Some(info) = tracker.get_mut(&key) {
+                                info.to_peers.insert(peer_id.clone());
+                            }
+                        }
+
+                        if neteq_stats.packets_per_sec != 0.0 {
+                            NETEQ_PACKETS_PER_SEC
+                                .with_label_values(&[
+                                    meeting_id,
+                                    session_id,
+                                    reporting_peer,
+                                    peer_id,
+                                ])
+                                .set(neteq_stats.packets_per_sec);
                             let mut tracker = session_tracker.lock().unwrap();
                             let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
                             if let Some(info) = tracker.get_mut(&key) {
@@ -896,7 +913,7 @@ mod tests {
                 active_servers: HashSet::new(),
             };
             // Simulate old timestamp by subtracting 40 seconds
-            session_info.last_seen = session_info.last_seen - Duration::from_secs(40);
+            session_info.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key, session_info);
         }
 
@@ -1074,7 +1091,7 @@ mod tests {
         ));
 
         // Remove and ensure it disappears
-        let session_key = format!("{}_{}_{}", meeting_id, session_id, reporting_peer);
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_peer}");
         let info = {
             let guard = tracker.lock().unwrap();
             guard.get(&session_key).unwrap().clone()
@@ -1165,7 +1182,7 @@ mod tests {
                 peer_ids: HashSet::new(),
                 active_servers: HashSet::new(),
             };
-            session_info2.last_seen = session_info2.last_seen - Duration::from_secs(40);
+            session_info2.last_seen -= Duration::from_secs(40);
             tracker_guard.insert(session_key2, session_info2);
 
             // Another fresh session
@@ -1216,9 +1233,6 @@ mod tests {
         // This test verifies that remove_session_metrics doesn't panic
         // In a real environment, this would interact with Prometheus metrics
         remove_session_metrics(&session_info);
-
-        // If we reach here, the function executed without panicking
-        assert!(true);
     }
 
     #[test]
@@ -1377,7 +1391,7 @@ mod tests {
                 active_servers: HashSet::new(),
             };
             // Set to exactly 30 seconds ago (timeout boundary)
-            session_info.last_seen = session_info.last_seen - Duration::from_secs(30);
+            session_info.last_seen -= Duration::from_secs(30);
             tracker_guard.insert(session_key, session_info);
         }
 

@@ -15,9 +15,9 @@ rustlemania-ui:
     webTransportEnabled: "true"
     usersAllowedToStream: ""
     serverElectionPeriodMs: 2000
-    audioBitrateKbps: 65
-    videoBitrateKbps: 500
-    screenBitrateKbps: 500
+    audioBitrateKbps: 16
+    videoBitrateKbps: 160
+    screenBitrateKbps: 160
 
 
   image:

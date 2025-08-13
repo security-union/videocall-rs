@@ -550,6 +550,11 @@ impl HealthReporter {
                 {
                     ns.packets_awaiting_decode = v;
                 }
+                if let Some(v) = neteq.get("packets_per_sec").and_then(|v| v.as_f64()) {
+                    // new field in proto: NetEqStats.packets_per_sec
+                    // use as-is
+                    ns.packets_per_sec = v;
+                }
                 if let Some(network) = neteq.get("network") {
                     let mut nn = PbNetEqNetwork::new();
                     if let Some(counters) = network.get("operation_counters") {

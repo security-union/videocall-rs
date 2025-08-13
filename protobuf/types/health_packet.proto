@@ -22,6 +22,8 @@ message NetEqStats {
   double current_buffer_size_ms = 1;
   double packets_awaiting_decode = 2;
   NetEqNetwork network = 3;
+  // Number of audio packets received per second (rolling 1s window)
+  double packets_per_sec = 4;
 }
 
 message VideoStats {

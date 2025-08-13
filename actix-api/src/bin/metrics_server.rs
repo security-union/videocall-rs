@@ -40,9 +40,9 @@ use sec_api::metrics::{
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_COMFORT_NOISE_OPS_PER_SEC,
     NETEQ_DTMF_OPS_PER_SEC, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_FAST_ACCELERATE_OPS_PER_SEC,
     NETEQ_MERGE_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_UNDEFINED_OPS_PER_SEC, PEER_AUDIO_ENABLED,
-    PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
+    NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_UNDEFINED_OPS_PER_SEC,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
 };
 
 async fn metrics_handler(
@@ -147,6 +147,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
         let _ = VIDEO_PACKETS_BUFFERED.remove_label_values(&labels);
         let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
         let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
+        let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_NORMAL_OPS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_EXPAND_OPS_PER_SEC.remove_label_values(&labels);
         let _ = NETEQ_ACCELERATE_OPS_PER_SEC.remove_label_values(&labels);
@@ -360,6 +361,22 @@ fn process_health_packet_to_metrics_pb(
                                     peer_id,
                                 ])
                                 .set(neteq_stats.packets_awaiting_decode);
+                            let mut tracker = session_tracker.lock().unwrap();
+                            let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
+                            if let Some(info) = tracker.get_mut(&key) {
+                                info.to_peers.insert(peer_id.clone());
+                            }
+                        }
+
+                        if neteq_stats.packets_per_sec != 0.0 {
+                            NETEQ_PACKETS_PER_SEC
+                                .with_label_values(&[
+                                    meeting_id,
+                                    session_id,
+                                    reporting_peer,
+                                    peer_id,
+                                ])
+                                .set(neteq_stats.packets_per_sec);
                             let mut tracker = session_tracker.lock().unwrap();
                             let key = format!("{meeting_id}_{session_id}_{reporting_peer}");
                             if let Some(info) = tracker.get_mut(&key) {

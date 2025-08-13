@@ -781,6 +781,31 @@
       ],
       "title": "Client Active Server (1 = connected)",
       "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 56 },
+      "id": 11,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "expr": "videocall_neteq_packets_per_sec{meeting_id=~\"$meeting_id\",session_id=~\"$session_id\",from_peer=~\"$from_peer\",to_peer=~\"$to_peer\"}",
+          "legendFormat": "{{from_peer}} → {{to_peer}} ({{meeting_id}})",
+          "refId": "A"
+        }
+      ],
+      "title": "NetEQ Packets Per Second",
+      "type": "timeseries"
     }
   ],
   "schemaVersion": 27,

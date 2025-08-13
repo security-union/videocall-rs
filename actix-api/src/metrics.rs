@@ -63,6 +63,14 @@ lazy_static! {
     )
     .expect("Failed to create neteq_packets_awaiting_decode metric");
 
+    /// NetEQ packets received per second
+    pub static ref NETEQ_PACKETS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_neteq_packets_per_sec",
+        "Number of audio RTP packets received per second (rolling 1s window)",
+        &["meeting_id", "session_id", "from_peer", "to_peer"]
+    )
+    .expect("Failed to create neteq_packets_per_sec metric");
+
     /// NetEQ normal decode operations per second
     pub static ref NETEQ_NORMAL_OPS_PER_SEC: GaugeVec = register_gauge_vec!(
         "videocall_neteq_normal_ops_per_sec",

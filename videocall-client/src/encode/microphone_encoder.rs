@@ -16,77 +16,96 @@
  * conditions.
  */
 
+use crate::audio_worklet_codec::EncoderInitOptions;
+use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
+use crate::constants::AUDIO_CHANNELS;
+use crate::constants::AUDIO_SAMPLE_RATE;
+use crate::crypto::aes::Aes128State;
+use crate::encode::encoder_state::EncoderState;
+use crate::wrappers::EncodedAudioChunkTypeWrapper;
+use crate::VideoCallClient;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
-use js_sys::JsString;
-use js_sys::Reflect;
-use log::error;
-use log::info;
+use js_sys::Uint8Array;
+use protobuf::Message;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::{
+    media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
+    packet_wrapper::packet_wrapper::PacketType,
+};
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::AudioEncoder;
-use web_sys::AudioEncoderConfig;
-use web_sys::AudioEncoderInit;
-use web_sys::AudioTrack;
+use web_sys::AudioContext;
+use web_sys::AudioContextOptions;
+use web_sys::EncodedAudioChunkType;
 use web_sys::MediaStream;
 use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
-use web_sys::MediaStreamTrackProcessor;
-use web_sys::MediaStreamTrackProcessorInit;
-use web_sys::ReadableStreamDefaultReader;
+use web_sys::MessageEvent;
+use web_time::SystemTime;
 use yew::Callback;
 
-use super::super::client::VideoCallClient;
-use super::encoder_state::EncoderState;
-use super::transform::transform_audio_chunk;
+pub fn transform_audio_chunk(
+    chunk: &Uint8Array,
+    email: &str,
+    sequence: u64,
+    aes: Rc<Aes128State>,
+) -> PacketWrapper {
+    let now_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as f64;
+    // chunk length in bytes
 
-use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_CODEC;
-use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::diagnostics::EncoderBitrateController;
+    let media_packet: MediaPacket = MediaPacket {
+        email: email.to_owned(),
+        media_type: MediaType::AUDIO.into(),
+        frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
+        data: chunk.to_vec(),
+        timestamp: now_ms,
+        audio_metadata: Some(AudioMetadata {
+            sequence,
+            ..Default::default()
+        })
+        .into(),
+        ..Default::default()
+    };
+    let data = media_packet.write_to_bytes().unwrap();
+    let data = aes.encrypt(&data).unwrap();
+    PacketWrapper {
+        data,
+        email: media_packet.email,
+        packet_type: PacketType::MEDIA.into(),
+        ..Default::default()
+    }
+}
 
-// Threshold for bitrate changes, represents 20% (0.2)
-const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
-
-/// [MicrophoneEncoder] encodes the audio from a microphone and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
-///
-/// See also:
-/// * [CameraEncoder](crate::CameraEncoder)
-/// * [ScreenEncoder](crate::ScreenEncoder)
-///
 pub struct MicrophoneEncoder {
     client: VideoCallClient,
     state: EncoderState,
-    current_bitrate: Rc<AtomicU32>,
-    on_encoder_settings_update: Option<Callback<String>>,
+    _on_encoder_settings_update: Option<Callback<String>>,
+    codec: AudioWorkletCodec,
 }
 
 impl MicrophoneEncoder {
-    /// Construct a microphone encoder, with arguments:
-    ///
-    /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
-    ///
-    /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
-    /// The encoder is created without a microphone selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
     pub fn new(
         client: VideoCallClient,
-        bitrate_kbps: u32,
+        _bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
     ) -> Self {
         Self {
             client,
             state: EncoderState::new(),
-            current_bitrate: Rc::new(AtomicU32::new(bitrate_kbps)),
-            on_encoder_settings_update: Some(on_encoder_settings_update),
+            _on_encoder_settings_update: Some(on_encoder_settings_update),
+            codec: AudioWorkletCodec::default(),
         }
     }
 
@@ -94,79 +113,61 @@ impl MicrophoneEncoder {
         &mut self,
         mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
     ) {
-        let current_bitrate = self.current_bitrate.clone();
-        // For audio we'll use a dummy FPS counter - audio doesn't have FPS but the API requires it
-        let dummy_fps = Rc::new(AtomicU32::new(50));
-        let on_encoder_settings_update = self.on_encoder_settings_update.clone();
-        let enabled = self.state.enabled.clone();
+        // Consume the diagnostics receiver in an async task to prevent "receiver is gone" errors
+        // For Microphone encoder, we'll just consume the packets without processing them for now
+        // since Microphone encoder doesn't support dynamic bitrate control yet
         wasm_bindgen_futures::spawn_local(async move {
-            let mut encoder_control = EncoderBitrateController::new(
-                current_bitrate.load(Ordering::Relaxed),
-                dummy_fps.clone(),
-            );
-            while let Some(event) = diagnostics_receiver.next().await {
-                let output_wasted = encoder_control.process_diagnostics_packet(event);
-                if let Some(bitrate) = output_wasted {
-                    if enabled.load(Ordering::Acquire) {
-                        // Only update if change is greater than threshold
-                        let current = current_bitrate.load(Ordering::Relaxed) as f64;
-                        let new = bitrate;
-                        let percent_change = (new - current).abs() / current;
-
-                        if percent_change > BITRATE_CHANGE_THRESHOLD {
-                            if let Some(callback) = &on_encoder_settings_update {
-                                callback.emit(format!("Bitrate: {bitrate:.2} kbps"));
-                            }
-                            current_bitrate.store(bitrate as u32, Ordering::Relaxed);
-                        }
-                    } else if let Some(callback) = &on_encoder_settings_update {
-                        callback.emit("Disabled".to_string());
-                    }
-                }
+            while let Some(_packet) = diagnostics_receiver.next().await {
+                // TODO: Implement bitrate control for Microphone encoder if needed
+                // For now, just consume the packets to prevent the "receiver is gone" error
             }
         });
     }
 
-    /// Allows setting a callback to receive encoder settings updates
-    pub fn set_encoder_settings_callback(&mut self, callback: Callback<String>) {
-        self.on_encoder_settings_update = Some(callback);
-    }
-
-    // The next three methods delegate to self.state
-
-    /// Enables/disables the encoder.   Returns true if the new value is different from the old value.
-    ///
-    /// The encoder starts disabled, [`encoder.set_enabled(true)`](Self::set_enabled) must be
-    /// called prior to starting encoding.
-    ///
-    /// Disabling encoding after it has started will cause it to stop.
+    // delegates to self.state
     pub fn set_enabled(&mut self, value: bool) -> bool {
-        self.state.set_enabled(value)
+        let is_changed = self.state.set_enabled(value);
+        if is_changed {
+            if value {
+                let _ = self.codec.start();
+            } else {
+                // First stop the codec to prevent new audio frames
+                let _ = self.codec.stop();
+                // The monitoring loop in start() will detect the enabled flag change
+                // and stop the microphone capture within 100ms
+            };
+        }
+        is_changed
     }
-
-    /// Selects a microphone:
-    ///
-    /// * `device_id` - The value of `entry.device_id` for some entry in
-    ///   [`media_device_list.audio_inputs.devices()`](crate::MediaDeviceList::audio_inputs)
-    ///
-    /// The encoder starts without a microphone associated,
-    /// [`encoder.selected(device_id)`](Self::select) must be called prior to starting encoding.
-    pub fn select(&mut self, device_id: String) -> bool {
-        self.state.select(device_id)
+    pub fn select(&mut self, device: String) -> bool {
+        self.state.select(device)
     }
-
-    /// Stops encoding after it has been started.
     pub fn stop(&mut self) {
-        self.state.stop()
+        self.state.stop();
+        self.codec.destroy();
     }
 
-    /// Start encoding and sending the data to the client connection (if it's currently connected).
-    ///
-    /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
-    /// called, or if [`encoder.select(device_id)`](Self::select) has not been called.
     pub fn start(&mut self) {
+        let user_id = self.client.userid().clone();
         let client = self.client.clone();
-        let userid = client.userid().clone();
+        let device_id = if let Some(mic) = &self.state.selected {
+            mic.to_string()
+        } else {
+            return;
+        };
+
+        // Don't start if not enabled - this is the key fix
+        if !self.state.is_enabled() {
+            log::debug!("Microphone encoder start() called but encoder is not enabled");
+            return;
+        }
+
+        if self.state.switching.load(Ordering::Acquire) && self.codec.is_instantiated() {
+            self.stop();
+        }
+        if self.state.is_enabled() && self.codec.is_instantiated() {
+            return;
+        }
         let aes = client.aes();
         let EncoderState {
             destroy,
@@ -174,38 +175,55 @@ impl MicrophoneEncoder {
             switching,
             ..
         } = self.state.clone();
+
+        // Clone atomic values for use in different closures
+        let destroy_for_handler = destroy.clone();
+        let enabled_for_handler = enabled.clone();
+
         let audio_output_handler = {
-            let mut buffer: Vec<u8> = Vec::with_capacity(100_000);
+            log::info!("Starting Microphone audio encoder");
             let mut sequence_number = 0;
-            Box::new(move |chunk: JsValue| {
-                let chunk = web_sys::EncodedAudioChunk::from(chunk);
-                // Ensure buffer can hold the encoded audio data
-                let byte_length = chunk.byte_length() as usize;
-                if buffer.len() < byte_length {
-                    buffer.resize(byte_length, 0);
+
+            Box::new(move |chunk: MessageEvent| {
+                // Check if encoder should stop
+                if destroy_for_handler.load(Ordering::Acquire)
+                    || !enabled_for_handler.load(Ordering::Acquire)
+                {
+                    log::debug!(
+                        "Audio handler stopping: destroy={}, enabled={}",
+                        destroy_for_handler.load(Ordering::Acquire),
+                        enabled_for_handler.load(Ordering::Acquire)
+                    );
+                    return;
                 }
 
-                let packet: PacketWrapper = transform_audio_chunk(
-                    &chunk,
-                    buffer.as_mut_slice(),
-                    &userid,
-                    sequence_number,
-                    aes.clone(),
-                );
-                client.send_packet(packet);
-                sequence_number += 1;
+                // Check if this is an actual audio frame message (not control messages)
+                if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
+                    if let Some(msg_str) = message_type.as_string() {
+                        if msg_str != "page" {
+                            // This is a control message (ready, done, flushed), not an audio frame
+                            log::debug!("Received control message: {msg_str}");
+                            return;
+                        }
+                    }
+                }
+
+                let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
+                if let Ok(data) = data.dyn_into::<Uint8Array>() {
+                    let packet: PacketWrapper =
+                        transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
+                    client.send_packet(packet);
+                    sequence_number += 1;
+                    log::debug!("Sent audio frame with sequence: {sequence_number}");
+                } else {
+                    log::error!("Received non-MessageEvent: {chunk:?}");
+                }
             })
         };
-        let device_id = if let Some(vid) = &self.state.selected {
-            vid.to_string()
-        } else {
-            return;
-        };
 
-        let current_bitrate = self.current_bitrate.clone();
+        let codec = self.codec.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
-
             let media_devices = navigator.media_devices().unwrap();
             let constraints = MediaStreamConstraints::new();
             let media_info = web_sys::MediaTrackConstraints::new();
@@ -213,7 +231,6 @@ impl MicrophoneEncoder {
 
             constraints.set_audio(&media_info.into());
             constraints.set_video(&Boolean::from(false));
-
             let devices_query = media_devices
                 .get_user_media_with_constraints(&constraints)
                 .unwrap();
@@ -222,91 +239,102 @@ impl MicrophoneEncoder {
                 .unwrap()
                 .unchecked_into::<MediaStream>();
 
-            let audio_track = device
-                .get_audio_tracks()
-                .find(&mut |_: JsValue, _: u32, _: Array| true)
-                .unchecked_into::<AudioTrack>();
-
-            let media_track = audio_track.unchecked_into::<MediaStreamTrack>();
-
-            // Setup audio encoder
-            let audio_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
-                error!("error_handler error {e:?}");
-            }) as Box<dyn FnMut(JsValue)>);
-
-            let audio_output_handler =
-                Closure::wrap(audio_output_handler as Box<dyn FnMut(JsValue)>);
-
-            let audio_encoder_init = AudioEncoderInit::new(
-                audio_error_handler.as_ref().unchecked_ref(),
-                audio_output_handler.as_ref().unchecked_ref(),
+            let audio_track = Box::new(
+                device
+                    .get_audio_tracks()
+                    .find(&mut |_: JsValue, _: u32, _: Array| true)
+                    .unchecked_into::<MediaStreamTrack>(),
             );
 
-            let audio_encoder = Box::new(AudioEncoder::new(&audio_encoder_init).unwrap());
+            let track_settings = audio_track.get_settings();
 
-            // Cache the initial bitrate
-            let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
-            let audio_encoder_config = AudioEncoderConfig::new(AUDIO_CODEC);
-            audio_encoder_config.set_bitrate(local_bitrate as f64);
-            audio_encoder_config.set_sample_rate(AUDIO_SAMPLE_RATE);
-            audio_encoder_config.set_number_of_channels(AUDIO_CHANNELS);
-            if let Err(e) = audio_encoder.configure(&audio_encoder_config) {
-                error!("Error configuring microphone encoder: {e:?}");
-            }
+            // Sample Rate hasn't been added to the web_sys crate
+            let input_rate: u32 =
+                js_sys::Reflect::get(&track_settings, &JsValue::from_str("sampleRate"))
+                    .unwrap()
+                    .as_f64()
+                    .unwrap() as u32;
 
-            let audio_processor =
-                MediaStreamTrackProcessor::new(&MediaStreamTrackProcessorInit::new(&media_track))
-                    .unwrap();
-            let audio_reader = audio_processor
-                .readable()
-                .get_reader()
-                .unchecked_into::<ReadableStreamDefaultReader>();
+            log::info!("Microphone input sample rate: {input_rate} Hz");
 
-            // Start encoding audio with dynamic bitrate control
+            // Use the microphone's sample rate for the AudioContext to avoid Firefox sample rate mismatch
+            let options = AudioContextOptions::new();
+            options.set_sample_rate(input_rate as f32);
+
+            let context = AudioContext::new_with_context_options(&options).unwrap();
+            log::info!("Created AudioContext with sample rate: {input_rate} Hz");
+
+            let worklet = codec
+                .create_node(
+                    &context,
+                    "/encoderWorker.min.js",
+                    "encoder-worklet",
+                    AUDIO_CHANNELS,
+                )
+                .await
+                .unwrap();
+
+            let output_handler =
+                Closure::wrap(audio_output_handler as Box<dyn FnMut(MessageEvent)>);
+            codec.set_onmessage(output_handler.as_ref().unchecked_ref());
+            output_handler.forget();
+
+            let _ = codec.send_message(&CodecMessages::Init {
+                options: Some(EncoderInitOptions {
+                    encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
+                    original_sample_rate: Some(input_rate),
+                    encoder_bit_rate: Some(50_000_u32),
+                    encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
+                    ..Default::default()
+                }),
+            });
+
+            let source_node = context.create_media_stream_source(&device).unwrap();
+            let gain_node = context.create_gain().unwrap();
+            let _ = source_node
+                .connect_with_audio_node(&gain_node)
+                .unwrap()
+                .connect_with_audio_node(&worklet);
+
+            // Monitor for stop conditions and clean up when needed
+            let check_interval = 100; // Check every 100ms
+            let destroy_check = destroy.clone();
+            let enabled_check = enabled.clone();
+            let switching_check = switching.clone();
             loop {
-                // Check if we should stop encoding
-                if destroy.load(Ordering::Acquire)
-                    || !enabled.load(Ordering::Acquire)
-                    || switching.load(Ordering::Acquire)
+                // Wait for the check interval
+                let delay_promise = js_sys::Promise::new(&mut |resolve, _| {
+                    web_sys::window()
+                        .unwrap()
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &resolve,
+                            check_interval,
+                        )
+                        .unwrap();
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(delay_promise).await;
+
+                // Check if we should stop
+                if destroy_check.load(Ordering::Acquire)
+                    || !enabled_check.load(Ordering::Acquire)
+                    || switching_check.load(Ordering::Acquire)
                 {
-                    switching.store(false, Ordering::Release);
-                    media_track.stop();
-                    if let Err(e) = audio_encoder.close() {
-                        error!("Error closing microphone encoder: {e:?}");
+                    log::info!("Stopping Microphone audio encoder");
+                    switching_check.store(false, Ordering::Release);
+
+                    // Stop the media track
+                    audio_track.stop();
+
+                    // Close the AudioContext
+                    if let Err(e) = context.close() {
+                        log::error!("Error closing AudioContext: {e:?}");
                     }
+
+                    // Destroy the codec
+                    codec.destroy();
+
+                    log::info!("Microphone audio encoder stopped and cleaned up");
                     break;
-                }
-
-                // Update the bitrate if it has changed from diagnostics system
-                let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
-                if new_bitrate != local_bitrate {
-                    info!("📊 Updating microphone bitrate to {new_bitrate}");
-                    local_bitrate = new_bitrate;
-                    let new_config = AudioEncoderConfig::new(AUDIO_CODEC);
-                    new_config.set_bitrate(local_bitrate as f64);
-                    new_config.set_sample_rate(AUDIO_SAMPLE_RATE);
-                    new_config.set_number_of_channels(AUDIO_CHANNELS);
-                    if let Err(e) = audio_encoder.configure(&new_config) {
-                        error!("Error configuring microphone encoder: {e:?}");
-                    }
-                }
-
-                match JsFuture::from(audio_reader.read()).await {
-                    Ok(js_frame) => match Reflect::get(&js_frame, &JsString::from("value")) {
-                        Ok(value) => {
-                            let audio_frame = value.unchecked_into::<web_sys::AudioData>();
-                            if let Err(e) = audio_encoder.encode(&audio_frame) {
-                                error!("Error encoding microphone frame: {e:?}");
-                            }
-                            audio_frame.close();
-                        }
-                        Err(e) => {
-                            error!("Error getting frame value: {e:?}");
-                        }
-                    },
-                    Err(e) => {
-                        error!("Error reading frame: {e:?}");
-                    }
                 }
             }
         });

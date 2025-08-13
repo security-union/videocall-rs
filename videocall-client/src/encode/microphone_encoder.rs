@@ -139,6 +139,7 @@ impl MicrophoneEncoder {
         }
         is_changed
     }
+
     pub fn select(&mut self, device: String) -> bool {
         self.state.select(device)
     }

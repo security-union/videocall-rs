@@ -47,6 +47,17 @@ pub fn home() -> Html {
         load_username_from_storage().unwrap_or_default()
     };
 
+    // If we already have a stored username, set the Matomo user id early
+    use_effect_with((), {
+        let uid = existing_username.clone();
+        move |_| {
+            if !uid.is_empty() {
+                matomo_logger::set_user_id(&uid);
+            }
+            || ()
+        }
+    });
+
     let onsubmit = {
         let username_ref = username_ref.clone();
         let meeting_id_ref = meeting_id_ref.clone();
@@ -64,6 +75,10 @@ pub fn home() -> Html {
             }
             save_username_to_storage(&username);
             username_ctx.set(Some(username));
+            // Set Matomo user id for attribution
+            if let Some(name) = &*username_ctx {
+                matomo_logger::set_user_id(name);
+            }
             navigator.push(&Route::Meeting { id: meeting_id });
         })
     };
@@ -103,6 +118,10 @@ pub fn home() -> Html {
             let meeting_id = generate_meeting_id();
             save_username_to_storage(&username);
             username_ctx.set(Some(username));
+            // Set Matomo user id for attribution
+            if let Some(name) = &*username_ctx {
+                matomo_logger::set_user_id(name);
+            }
             navigator.push(&Route::Meeting { id: meeting_id });
         })
     };

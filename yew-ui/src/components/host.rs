@@ -54,6 +54,7 @@ pub enum Msg {
     UpdatePendingName(String),
     SaveChangeName,
     CancelChangeName,
+    MicrophoneError(String),
 }
 
 pub struct Host {
@@ -112,6 +113,11 @@ pub struct MeetingProps {
     pub device_settings_open: bool,
 
     pub on_device_settings_toggle: Callback<MouseEvent>,
+
+    /// Called when the microphone encoder reports an unrecoverable error.
+    /// The parent should disable the mic and optionally display an error.
+    #[prop_or_default]
+    pub on_microphone_error: Callback<String>,
 }
 
 impl Component for Host {
@@ -136,8 +142,13 @@ impl Component for Host {
 
         // Use the factory function to create the appropriate microphone encoder
         let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
-        let mut microphone =
-            create_microphone_encoder(client.clone(), audio_bitrate, microphone_callback);
+        let microphone_error_cb = ctx.link().callback(Msg::MicrophoneError);
+        let mut microphone = create_microphone_encoder(
+            client.clone(),
+            audio_bitrate,
+            microphone_callback,
+            microphone_error_cb.clone(),
+        );
 
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
         let mut screen = ScreenEncoder::new(client.clone(), screen_bitrate, screen_callback);
@@ -204,6 +215,7 @@ impl Component for Host {
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::DisableScreenShare);
         }
+        // Mic enable/disable is controlled upstream; reflect props only
         if self.microphone.set_enabled(ctx.props().mic_enabled) {
             self.mic_enabled = ctx.props().mic_enabled;
             ctx.link()
@@ -261,6 +273,14 @@ impl Component for Host {
                 ctx.props()
                     .on_encoder_settings_update
                     .emit(self.encoder_settings.to_string());
+                true
+            }
+            Msg::MicrophoneError(err) => {
+                log::error!("Microphone error: {err}");
+                // Cancel encoder
+                self.microphone.stop();
+                // Propagate upstream so the parent can disable mic and show UI
+                ctx.props().on_microphone_error.emit(err);
                 true
             }
             Msg::EnableVideo(should_enable) => {

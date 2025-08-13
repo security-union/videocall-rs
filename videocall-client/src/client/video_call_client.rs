@@ -823,7 +823,7 @@ impl Inner {
                 self.options.on_peer_added.emit(peer_userid);
                 self.send_public_key();
             } else {
-                log::warn!("Rejecting packet from same user: {peer_userid}");
+                log::debug!("Rejecting packet from same user: {peer_userid}");
             }
         }
     }

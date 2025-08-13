@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use web_time::{Duration, Instant};
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::buffer_level_filter::BufferLevelFilter;
@@ -114,6 +115,9 @@ pub struct NetEqStats {
     pub current_buffer_size_ms: u32,
     pub target_delay_ms: u32,
     pub packets_awaiting_decode: usize,
+    /// Number of audio packets received per second (rolling 1s window)
+    #[serde(default)]
+    pub packets_per_sec: u32,
 }
 
 /// Audio frame output from NetEQ
@@ -184,6 +188,10 @@ pub struct NetEq {
     sample_memory: i32,
     /// Flag indicating if time-scale operation was performed in previous call
     prev_time_scale: bool,
+    /// Rolling counters for packets-per-second measurement
+    packets_received_this_second: u32,
+    last_packets_second_instant: Instant,
+    packets_per_sec_snapshot: u32,
 }
 
 impl NetEq {
@@ -245,11 +253,18 @@ impl NetEq {
             bypass_audio_queue: VecDeque::new(),
             sample_memory: 0,
             prev_time_scale: false,
+            packets_received_this_second: 0,
+            last_packets_second_instant: Instant::now(),
+            packets_per_sec_snapshot: 0,
         })
     }
 
     /// Insert a packet into the jitter buffer
     pub fn insert_packet(&mut self, packet: AudioPacket) -> Result<()> {
+        // Update packets-per-second rolling counter and roll snapshot if needed
+        self.packets_received_this_second = self.packets_received_this_second.saturating_add(1);
+        self.maybe_roll_packet_rate();
+
         if self.config.bypass_mode {
             // Bypass mode: decode packet immediately and queue audio
             if let Some(decoder) = self.decoders.get_mut(&packet.header.payload_type) {
@@ -303,6 +318,9 @@ impl NetEq {
 
     /// Get 10ms of audio data
     pub fn get_audio(&mut self) -> Result<AudioFrame> {
+        // Ensure packet-rate snapshot rolls even when no packets arrive
+        // This prevents stale non-zero values when the peer stops sending
+        self.maybe_roll_packet_rate();
         if self.config.bypass_mode {
             // Bypass mode: return samples directly from queue
             let mut frame = AudioFrame::new(
@@ -395,6 +413,17 @@ impl NetEq {
         Ok(frame)
     }
 
+    /// Roll the packets-per-second window if ≥1s elapsed since last snapshot.
+    /// Safe to call frequently; no-ops if interval hasn't elapsed.
+    fn maybe_roll_packet_rate(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_packets_second_instant) >= Duration::from_secs(1) {
+            self.packets_per_sec_snapshot = self.packets_received_this_second;
+            self.packets_received_this_second = 0;
+            self.last_packets_second_instant = now;
+        }
+    }
+
     /// Get current statistics
     pub fn get_statistics(&self) -> NetEqStats {
         NetEqStats {
@@ -403,6 +432,7 @@ impl NetEq {
             current_buffer_size_ms: self.current_buffer_size_ms(),
             target_delay_ms: self.delay_manager.target_delay_ms(),
             packets_awaiting_decode: self.packet_buffer.len(),
+            packets_per_sec: self.packets_per_sec_snapshot,
         }
     }
 
@@ -436,6 +466,9 @@ impl NetEq {
         self.leftover_samples.clear();
         self.sample_memory = 0;
         self.prev_time_scale = false;
+        self.packets_received_this_second = 0;
+        self.packets_per_sec_snapshot = 0;
+        self.last_packets_second_instant = Instant::now();
     }
 
     fn get_decision(&mut self) -> Result<Operation> {

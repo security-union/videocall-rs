@@ -74,6 +74,8 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
+    OnMicrophoneError(String),
+    DismissMicError,
     UserScreenAction(UserScreenToggleAction),
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
@@ -133,6 +135,7 @@ pub struct AttendantsComponent {
     pub diagnostics_data: Option<String>,
     pub sender_stats: Option<String>,
     pub encoder_settings: Option<String>,
+    pub mic_error: Option<String>,
     pub neteq_stats: Option<String>,
     pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
     pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
@@ -344,6 +347,7 @@ impl Component for AttendantsComponent {
             diagnostics_data: None,
             sender_stats: None,
             encoder_settings: None,
+            mic_error: None,
             neteq_stats: None,
             neteq_stats_per_peer: HashMap::new(),
             neteq_buffer_per_peer: HashMap::new(),
@@ -611,6 +615,17 @@ impl Component for AttendantsComponent {
                 true
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
+            Msg::OnMicrophoneError(err) => {
+                // Disable mic at the top and show UI
+                log::error!("Microphone error (full): {err}");
+                self.mic_enabled = false;
+                self.mic_error = Some(err);
+                true
+            }
+            Msg::DismissMicError => {
+                self.mic_error = None;
+                true
+            }
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
@@ -1134,19 +1149,38 @@ impl Component for AttendantsComponent {
                         }
                                     </div>
                                     {
-                                        if media_access_granted {
-                                            html! {<Host
-                                                client={self.client.clone()}
-                                                share_screen={self.share_screen}
-                                                mic_enabled={self.mic_enabled}
-                                                video_enabled={self.video_enabled}
-                                                on_encoder_settings_update={on_encoder_settings_update}
-                                                device_settings_open={self.device_settings_open}
-                                                on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
-                                            />}
-                                        } else {
-                                            html! {<></>}
-                                        }
+                                        if let Some(err) = &self.mic_error {
+                                            let displayed: String = err.chars().take(200).collect();
+                                            html!{
+                                                <div class="glass-backdrop">
+                                                    <div class="card-apple" style="width: 380px;">
+                                                        <h4 style="margin-top:0;">{"Microphone issue"}</h4>
+                                                        <p style="color:#AEAEB2; margin-top:0.25rem;">{"We couldn't start your microphone."}</p>
+                                                        <p style="margin-top:0.5rem;">{ displayed }</p>
+                                                        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
+                                                            <button class="btn-apple btn-secondary btn-sm" onclick={ctx.link().callback(|_| Msg::DismissMicError)}>{"Close"}</button>
+                                                            <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>{"Retry"}</button>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            }
+                                        } else { html!{} }
+                                    }
+                                    {
+                                         if media_access_granted {
+                                             html! {<Host
+                                                 client={self.client.clone()}
+                                                 share_screen={self.share_screen}
+                                                 mic_enabled={self.mic_enabled}
+                                                 video_enabled={self.video_enabled}
+                                                 on_encoder_settings_update={on_encoder_settings_update}
+                                                 device_settings_open={self.device_settings_open}
+                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                             />}
+                                         } else {
+                                             html! {<></>}
+                                         }
                                     }
                                     <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
 

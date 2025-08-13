@@ -11,7 +11,9 @@ members = [
     "videocall-codecs",
     "neteq",
     "videocall-diagnostics",
+    "matomo-logger"
 ]
+
 exclude = [
     "src-tauri",
     "leptos-website",

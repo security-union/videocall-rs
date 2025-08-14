@@ -78,7 +78,7 @@ impl Component for PeerList {
             .link()
             .context::<UsernameCtx>(Callback::noop())
             .and_then(|(state, _handle)| state.as_ref().cloned())
-            .map(|name| format!("{} (You)", name))
+            .map(|name| format!("{name} (You)"))
             .unwrap_or_else(|| "(You)".to_string());
 
         html! {

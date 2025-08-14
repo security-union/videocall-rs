@@ -648,16 +648,12 @@ mod tests {
         let ui_display_rate = stats.network_stats.expand_rate as f32 / 16.384;
         assert!(
             (ui_display_rate - 166.7).abs() < 1.0,
-            "Expected ~166.7‰, got {:.1}‰",
-            ui_display_rate
+            "Expected ~166.7‰, got {ui_display_rate:.1}‰"
         );
 
         println!("✅ Expand rate calculation fix verified:");
         println!("   Q14 value: {}", stats.network_stats.expand_rate);
-        println!(
-            "   UI display: {:.1}‰ (was showing 7864.0)",
-            ui_display_rate
-        );
+        println!("   UI display: {ui_display_rate:.1}‰ (was showing 7864.0)");
     }
 
     #[test]
@@ -685,22 +681,19 @@ mod tests {
         // Should be much less than the old broken value of 7864.0
         assert!(
             ui_rate < 1000.0,
-            "Expand rate still too high: {:.1}‰ (was 7864.0)",
-            ui_rate
+            "Expand rate still too high: {ui_rate:.1}‰ (was 7864.0)"
         );
 
         // Should be approximately: (480 / (800 + 480)) * 1000 = 375‰
         let expected_rate = (480.0 / 1280.0) * 1000.0; // ≈ 375‰
         assert!(
             (ui_rate - expected_rate).abs() < 50.0,
-            "Expected ~{:.1}‰, got {:.1}‰",
-            expected_rate,
-            ui_rate
+            "Expected ~{expected_rate:.1}‰, got {ui_rate:.1}‰"
         );
 
         println!("🚀 Bug fix verified: expand rate no longer spikes to 7864.0");
         println!("   Old broken value: 7864.0‰");
-        println!("   New correct value: {:.1}‰", ui_rate);
+        println!("   New correct value: {ui_rate:.1}‰");
     }
 
     #[test]
@@ -749,16 +742,13 @@ mod tests {
 
         // Demonstrate the precision of Q14
         let precision = 1.0 / q14::SCALE;
-        println!("📏 Q14 precision: {:.6} (~0.00006)", precision);
+        println!("📏 Q14 precision: {precision:.6} (~0.00006)");
 
         // Show the difference between our approach and WebRTC's magic numbers
         let webrtc_conversion = 4096.0 / 16384.0; // WebRTC style
         let our_conversion = q14::to_float(4096); // Our style
         assert_eq!(webrtc_conversion, our_conversion);
-        println!(
-            "🎯 WebRTC compatibility: {} == {}",
-            webrtc_conversion, our_conversion
-        );
+        println!("🎯 WebRTC compatibility: {webrtc_conversion} == {our_conversion}");
     }
 
     #[test]
@@ -774,13 +764,10 @@ mod tests {
         let q14_rate = q14::from_float(ratio);
         let ui_display = q14::to_per_mille(q14_rate);
 
-        println!(
-            "📊 15% expansion: {} samples / {} total",
-            expanded_samples, total_samples
-        );
-        println!("   Ratio: {:.3}", ratio);
-        println!("   Q14:   {}", q14_rate);
-        println!("   UI:    {:.1}‰", ui_display);
+        println!("📊 15% expansion: {expanded_samples} samples / {total_samples} total");
+        println!("   Ratio: {ratio:.3}");
+        println!("   Q14:   {q14_rate}");
+        println!("   UI:    {ui_display:.1}‰");
 
         assert_eq!(ratio, 0.15);
         assert_eq!(q14_rate, 2457); // (0.15 * 16384) = 2457.6 ≈ 2457
@@ -796,8 +783,8 @@ mod tests {
             "   WebRTC raw magic: {:.1} (broken)",
             bug_scenario_ratio * 16384.0
         );
-        println!("   Our Q14 value:    {}", bug_q14);
-        println!("   Our UI display:   {:.1}‰ (correct)", bug_display);
+        println!("   Our Q14 value:    {bug_q14}");
+        println!("   Our UI display:   {bug_display:.1}‰ (correct)");
 
         assert_eq!(bug_q14, 7864); // Correct Q14 encoding
                                    // Note: due to precision, 7864/16.384 = 479.98..., which is very close to 480

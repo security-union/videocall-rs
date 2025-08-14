@@ -21,6 +21,10 @@
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures;
 
 // === Diagnostic data structures ===
 
@@ -51,20 +55,46 @@ pub enum MetricValue {
     Text(String),
 }
 
-// === Simple global broadcast bus (flume multi-producer multi-consumer) ===
+// === Simple global broadcast bus ===
 
-use flume::{Receiver, Sender};
+use async_broadcast::{broadcast, Receiver, Sender};
 
-static BUS: Lazy<(Sender<DiagEvent>, Receiver<DiagEvent>)> = Lazy::new(flume::unbounded);
+static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
+    let (s, r) = broadcast(256); // Capacity of 256 messages.
+
+    // Create a background task that keeps a receiver active
+    // This prevents the channel from closing when there are no active receivers
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut receiver = r;
+        wasm_bindgen_futures::spawn_local(async move {
+            // Keep the receiver alive to prevent channel closure
+            // This receiver will consume messages but not process them
+            while let Ok(_) = receiver.recv().await {
+                // Intentionally discard messages in the background receiver
+                // This keeps the channel open for other receivers
+            }
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // For native targets, we could use tokio::spawn here if needed
+        // For now, just drop the receiver and let the channel close if no receivers
+        std::mem::drop(r);
+    }
+
+    s
+});
 
 /// Obtain a sender that can publish diagnostics events.
-pub fn global_sender() -> &'static Sender<DiagEvent> {
-    &BUS.0
+pub fn global_sender() -> Sender<DiagEvent> {
+    SENDER.deref().clone()
 }
 
 /// Subscribe to the diagnostics stream. Each subscriber receives **all** future events.
 pub fn subscribe() -> Receiver<DiagEvent> {
-    BUS.1.clone()
+    SENDER.deref().new_receiver()
 }
 
 // === Helper utilities ===

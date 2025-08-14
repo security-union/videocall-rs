@@ -12,9 +12,12 @@
         <link data-trunk rel="css" href="./static/tailwind.css" />
         <link data-trunk rel="css" href="./static/style.css" />
         <link data-trunk rel="css" href="./static/global.css" />
+        <link data-trunk rel="copy-dir" href="./static" />
+        <link data-trunk rel="copy-file" href="./scripts/config.js" />
         <link data-trunk rel="copy-file" href="./scripts/encoderWorker.min.js" />
         <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
         <link data-trunk rel="copy-file" href="./scripts/pcmPlayerWorker.js" />
+        <script src="/config.js"></script>
 
         <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
         <link
@@ -265,22 +268,6 @@
             };	
             }	
         </script>
-        <!-- Matomo -->
-        <script>
-            var _paq = window._paq = window._paq || [];
-            /* tracker methods like "setCustomDimension" should be called before "trackPageView" */
-            _paq.push(["setDocumentTitle", document.domain + "/" + document.title]);
-            _paq.push(['trackPageView']);
-            _paq.push(['enableLinkTracking']);
-            (function() {
-            var u="//matomo.videocall.rs/";
-            _paq.push(['setTrackerUrl', u+'matomo.php']);
-            _paq.push(['setSiteId', '1']);
-            var d=document, g=d.createElement('script'), s=d.getElementsByTagName('script')[0];
-            g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
-            })();
-        </script>
-        <!-- End Matomo Code -->
     </head>
     <body class="bg-background text-foreground">
     </body>

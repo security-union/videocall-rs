@@ -30,6 +30,7 @@ pub mod sections {
     pub mod Customers;
     pub mod Developers;
     pub mod Pricing;
+    pub mod SupportedPlatforms;
 }
 
 pub use CTAButton::*;

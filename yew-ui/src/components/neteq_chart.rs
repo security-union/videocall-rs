@@ -9,6 +9,7 @@ pub struct NetEqStats {
     pub buffer_ms: u32,
     pub target_ms: u32,
     pub packets_awaiting_decode: u32,
+    pub packets_per_sec: u32,
     pub expand_rate: f32,
     pub accel_rate: f32,
     pub calls_per_sec: u64,
@@ -39,6 +40,7 @@ impl From<RawNetEqStats> for NetEqStats {
             buffer_ms: raw.current_buffer_size_ms,
             target_ms: raw.target_delay_ms,
             packets_awaiting_decode: raw.packets_awaiting_decode as u32,
+            packets_per_sec: raw.packets_per_sec,
             expand_rate: neteq::q14::to_per_mille(raw.network.expand_rate), // Convert Q14 to per-mille (‰)
             accel_rate: neteq::q14::to_per_mille(raw.network.accelerate_rate), // Convert Q14 to per-mille (‰)
             calls_per_sec: 0, // Not available in raw data
@@ -730,6 +732,11 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
                             <div class="status-subtitle">{"Encoded packets awaiting decode"}</div>
                         </div>
                         <div class="status-item">
+                            <div class="status-value">{stats.packets_per_sec}</div>
+                            <div class="status-label">{"PACKETS/S"}</div>
+                            <div class="status-subtitle">{"Audio packets received in the last second"}</div>
+                        </div>
+                        <div class="status-item">
                             <div class={underrun_class}>{stats.underruns}</div>
                             <div class="status-label">{"UNDERRUNS"}</div>
                             <div class="status-subtitle">{"Times audio buffer ran empty"}</div>
@@ -783,6 +790,11 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
                             <div class="status-value">{"--"}</div>
                             <div class="status-label">{"PACKETS"}</div>
                             <div class="status-subtitle">{"Encoded packets awaiting decode"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"PACKETS/S"}</div>
+                            <div class="status-subtitle">{"Audio packets received in the last second"}</div>
                         </div>
                         <div class="status-item">
                             <div class="status-value">{"--"}</div>

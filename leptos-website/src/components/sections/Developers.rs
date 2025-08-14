@@ -30,6 +30,20 @@ pub fn DevelopersSection() -> impl IntoView {
 
             <div class="grid md:grid-cols-3 gap-8 lg:gap-12 mb-16">
                 <DeveloperCard
+                    title="videocall-rs"
+                    description="The core library for building video calling applications. Includes WebRTC, WebTransport, and more."
+                    icon_path="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"
+                    link_text="Explore on GitHub"
+                    link_href="https://github.com/security-union/videocall-rs"
+                />
+                <DeveloperCard
+                    title="videocall-cli"
+                    description="Stream video from the command line on Raspberry Pi, robots, and servers. Small, fast, and works with videocall.rs."
+                    icon_path="M4 6h16M4 18h16M8 10l-4 3 4 3M12 13h6"
+                    link_text="Install from crates.io"
+                    link_href="https://crates.io/crates/videocall-cli"
+                />
+                <DeveloperCard
                     title="Open Source"
                     description="Our video calling platform is entirely open source, built with Rust for speed and reliability."
                     icon_path="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"

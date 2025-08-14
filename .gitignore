@@ -6,6 +6,7 @@
 .env
 target/
 helm/digital-ocean-secret
+helm/global/us-east/grafana/secret.yaml
 *.swg
 
 # iOS specific

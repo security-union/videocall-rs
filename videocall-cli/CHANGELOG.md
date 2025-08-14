@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.37](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.36...videocall-cli-v1.0.37) - 2025-08-10
+
+### Other
+
+- Add config.js to version control along with instructions ([#381](https://github.com/security-union/videocall-rs/pull/381))
+
+## [1.0.36](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.35...videocall-cli-v1.0.36) - 2025-08-10
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.35](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.34...videocall-cli-v1.0.35) - 2025-08-10
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.34](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.33...videocall-cli-v1.0.34) - 2025-08-08
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [1.0.33](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.32...videocall-cli-v1.0.33) - 2025-08-07
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [1.0.32](https://github.com/security-union/videocall-rs/compare/videocall-cli-v1.0.31...videocall-cli-v1.0.32) - 2025-08-05
 
 ### Other

@@ -34,6 +34,8 @@ pub enum WorkerMessage {
     Flush,
     /// Reset decoder to initial state (waiting for keyframe)
     Reset,
+    /// Set diagnostic context so worker can tag events with original IDs
+    SetContext { from_peer: String, to_peer: String },
 }
 
 unsafe impl Send for WasmDecoder {}
@@ -191,6 +193,21 @@ impl WasmDecoder {
             Err(e) => {
                 log::error!("Error serializing message: {e:?}");
             }
+        }
+    }
+
+    /// Provide diagnostic context to the worker so that metrics include original peer IDs
+    pub fn set_context(&self, from_peer: String, to_peer: String) {
+        let message = WorkerMessage::SetContext { from_peer, to_peer };
+        match serde_wasm_bindgen::to_value(&message) {
+            Ok(js_message) => {
+                if let Err(e) = self.worker.post_message(&js_message) {
+                    log::error!("Error posting context message to worker: {e:?}");
+                } else {
+                    log::debug!("Sent context to worker");
+                }
+            }
+            Err(e) => log::error!("Error serializing context message: {e:?}"),
         }
     }
 

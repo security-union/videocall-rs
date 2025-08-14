@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::diagnostics::health_processor;
 use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
 use futures::StreamExt;
@@ -29,7 +30,7 @@ use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
-use tracing::{debug, error, info, trace_span};
+use tracing::{debug, error, info, trace, trace_span};
 use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -225,14 +226,14 @@ async fn run_webtransport_connection(
     info!("accepted session");
 
     // Run the session
-    if let Err(err) = handle_session(session, &username, &lobby_id, nc).await {
+    if let Err(err) = handle_webtransport_session(session, &username, &lobby_id, nc).await {
         info!("closing session: {}", err);
     }
     Ok(())
 }
 
 #[tracing::instrument(level = "trace", skip(session))]
-async fn handle_session(
+async fn handle_webtransport_session(
     session: Session,
     username: &str,
     lobby_id: &str,
@@ -302,12 +303,12 @@ async fn handle_session(
                 let specific_subject = specific_subject.clone();
                 let session_clone = session.clone();
                 tokio::spawn(async move {
-                    let result = uni_stream.read_to_end(1_000_000).await;
+                    let result = uni_stream.read_to_end(usize::MAX).await;
                     match result {
                         Ok(buf) => {
                             // Check if this is an RTT packet that should be echoed back
                             if is_rtt_packet(&buf) {
-                                debug!("Echoing RTT packet back via WebTransport");
+                                trace!("Echoing RTT packet back via WebTransport");
                                 match session_clone.open_uni().await {
                                     Ok(mut echo_stream) => {
                                         if let Err(e) = echo_stream.write_all(&buf).await {
@@ -318,6 +319,10 @@ async fn handle_session(
                                         error!("Error opening echo stream: {}", e);
                                     }
                                 }
+                            } else if health_processor::is_health_packet_bytes(&buf) {
+                                // Process health packet for diagnostics (don't relay)
+                                debug!("WT-SERVER: Received health packet via unidirectional stream (size: {} bytes) - processing locally", buf.len());
+                                health_processor::process_health_packet_bytes(&buf, nc.clone());
                             } else {
                                 // Normal packet processing - publish to NATS
                                 tokio::spawn(async move {
@@ -352,6 +357,9 @@ async fn handle_session(
                     if let Err(e) = session.send_datagram(buf) {
                         error!("Error echoing RTT datagram: {}", e);
                     }
+                } else if health_processor::is_health_packet_bytes(&buf) {
+                    // Process health packet for diagnostics (don't relay)
+                    health_processor::process_health_packet_bytes(&buf, nc.clone());
                 } else {
                     // Normal datagram processing - publish to NATS
                     let nc = nc.clone();
@@ -464,7 +472,7 @@ async fn handle_quic_connection(
                         } else {
                             // Check if this is an RTT packet that should be echoed back
                             if is_rtt_packet(&d) {
-                                debug!("Echoing RTT packet back via QUIC");
+                                trace!("Echoing RTT packet back via QUIC");
                                 let session_read = session_for_echo.clone();
                                 match session_read.open_uni().await {
                                     Ok(mut echo_stream) => {
@@ -476,6 +484,9 @@ async fn handle_quic_connection(
                                         error!("Error opening QUIC echo stream: {}", e);
                                     }
                                 }
+                            } else if health_processor::is_health_packet_bytes(&d) {
+                                // Process health packet for diagnostics (don't relay)
+                                health_processor::process_health_packet_bytes(&d, nc.clone());
                             } else {
                                 // Normal packet processing - publish to NATS
                                 let specific_subject =

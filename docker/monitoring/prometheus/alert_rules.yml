@@ -1,0 +1,42 @@
+groups:
+- name: videocall.health
+  rules:
+  - alert: PeerAudioReceptionFailure
+    expr: increase(videocall_audio_reception_failures_total[5m]) > 0
+    for: 30s
+    labels:
+      severity: warning
+      component: audio-reception
+    annotations:
+      summary: "Peer audio reception failure detected"
+      description: "One or more peers cannot receive audio in the last 5 minutes"
+      
+  - alert: PeerVideoReceptionFailure  
+    expr: increase(videocall_video_reception_failures_total[5m]) > 0
+    for: 30s
+    labels:
+      severity: warning
+      component: video-reception
+    annotations:
+      summary: "Peer video reception failure detected"
+      description: "One or more peers cannot receive video in the last 5 minutes"
+
+  - alert: LowSessionQuality
+    expr: videocall_session_quality_score < 0.3
+    for: 60s
+    labels:
+      severity: warning
+      component: session-quality
+    annotations:
+      summary: "Poor session quality detected"
+      description: "Session quality score is below 30% for over 1 minute"
+
+  - alert: HealthReportsLow
+    expr: rate(videocall_health_reports_total[5m]) < 0.1
+    for: 2m
+    labels:
+      severity: critical
+      component: diagnostics-system
+    annotations:
+      summary: "Health reports not being received"
+      description: "Health report rate is very low, diagnostics system may be failing"

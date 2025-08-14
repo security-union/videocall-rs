@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::diagnostics::health_processor;
 use crate::messages::server::{ClientMessage, Packet};
 use crate::messages::session::Message;
 use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
@@ -33,7 +34,7 @@ use actix::{
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
 use protobuf::Message as ProtobufMessage;
-use tracing::{debug, error, info, trace};
+use tracing::{error, info, trace};
 use uuid::Uuid;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -50,10 +51,16 @@ pub struct WsChatSession {
     pub addr: Addr<ChatServer>,
     pub heartbeat: Instant,
     pub email: Email,
+    pub nats_client: async_nats::client::Client,
 }
 
 impl WsChatSession {
-    pub fn new(addr: Addr<ChatServer>, room: String, email: String) -> Self {
+    pub fn new(
+        addr: Addr<ChatServer>,
+        room: String,
+        email: String,
+        nats_client: async_nats::client::Client,
+    ) -> Self {
         info!("new session with room {} and email {}", room, email);
 
         WsChatSession {
@@ -62,6 +69,7 @@ impl WsChatSession {
             room,
             email,
             addr,
+            nats_client,
         }
     }
 
@@ -175,8 +183,14 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
 
                 // Check if this is an RTT packet that should be echoed back
                 if self.is_rtt_packet(&msg_bytes) {
-                    debug!("Echoing RTT packet back to sender: {}", self.email);
+                    trace!("Echoing RTT packet back to sender: {}", self.email);
                     ctx.binary(msg_bytes);
+                } else if health_processor::is_health_packet_bytes(&msg_bytes) {
+                    // Process health packet for diagnostics (don't relay to other peers)
+                    health_processor::process_health_packet_bytes(
+                        &msg_bytes,
+                        self.nats_client.clone(),
+                    );
                 } else {
                     // Normal packet processing - forward to chat server
                     ctx.notify(Packet {

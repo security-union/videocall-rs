@@ -10,7 +10,7 @@
  *
  * at your option.
  *
- * Unless you explicitly state otherwise, any contribution intentionally
+ * Unless you explicitly state otherwise, any contribution intentionallyn
  * submitted for inclusion in the work by you, as defined in the Apache-2.0
  * license, shall be dual licensed as above, without any additional terms or
  * conditions.
@@ -23,15 +23,15 @@ mod context;
 mod pages;
 mod types;
 
-use constants::LOGIN_URL;
+use constants::login_url;
 
-use yew::prelude::*;
-#[macro_use]
-extern crate lazy_static;
-use components::matomo::MatomoTracker;
+use crate::constants::app_config;
+use components::config_error::ConfigError;
 use enum_display::EnumDisplay;
 use gloo_utils::window;
+use matomo_logger::{MatomoConfig, MatomoLogger};
 use pages::home::Home;
+use yew::prelude::*;
 use yew_router::prelude::*;
 
 use context::{load_username_from_storage, UsernameCtx};
@@ -63,8 +63,11 @@ enum Route {
 }
 
 fn switch(routes: Route) -> Html {
-    let matomo = MatomoTracker::new();
-    matomo.track_page_view(&routes.to_string(), &routes.to_string());
+    if let Err(e) = app_config() {
+        return html! { <ConfigError message={e} /> };
+    }
+    // Track SPA navigation in Matomo
+    matomo_logger::track_page_view(&routes.to_string(), &routes.to_string());
     match routes {
         Route::Home => html! { <Home /> },
         Route::Login => html! { <Login/> },
@@ -79,8 +82,11 @@ fn switch(routes: Route) -> Html {
 
 #[function_component(Login)]
 fn login() -> Html {
-    let login = Callback::from(|_: MouseEvent| {
-        window().location().set_href(LOGIN_URL).ok();
+    let login = Callback::from(|_: MouseEvent| match login_url() {
+        Ok(url) => {
+            let _ = window().location().set_href(&url);
+        }
+        Err(e) => log::error!("{e:?}"),
     });
     html! {<>
         <input type="image" onclick={login.clone()} src="/assets/btn_google.png" />
@@ -100,14 +106,18 @@ fn app_root() -> Html {
 }
 
 fn main() {
-    #[cfg(feature = "debugAssertions")]
-    {
-        _ = console_log::init_with_level(log::Level::Debug);
-    }
-    #[cfg(not(feature = "debugAssertions"))]
-    {
-        _ = console_log::init_with_level(log::Level::Info);
-    }
+    // Initialize unified console + Matomo logging
+    let _ = MatomoLogger::init(MatomoConfig {
+        base_url: Some("https://matomo.videocall.rs/".into()),
+        site_id: Some(1),
+        console_level: if cfg!(feature = "debugAssertions") {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        },
+        matomo_level: log::LevelFilter::Warn,
+        ..Default::default()
+    });
 
     console_error_panic_hook::set_once();
     yew::Renderer::<AppRoot>::new().render();

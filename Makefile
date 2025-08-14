@@ -17,6 +17,9 @@ build:
 connect_to_db:
 	$(COMPOSE) run postgres bash -c "psql -h postgres -d actix-api-db -U postgres"
 
+connect_to_nats:
+	docker compose -f docker/docker-compose.yaml exec nats-box sh
+
 clippy-fix:
 	$(COMPOSE) run yew-ui bash -c "cd /app && cargo clippy --fix"
 

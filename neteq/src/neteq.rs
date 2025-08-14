@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use web_time::{Duration, Instant};
 
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::buffer_level_filter::BufferLevelFilter;
@@ -114,6 +115,9 @@ pub struct NetEqStats {
     pub current_buffer_size_ms: u32,
     pub target_delay_ms: u32,
     pub packets_awaiting_decode: usize,
+    /// Number of audio packets received per second (rolling 1s window)
+    #[serde(default)]
+    pub packets_per_sec: u32,
 }
 
 /// Audio frame output from NetEQ
@@ -184,6 +188,10 @@ pub struct NetEq {
     sample_memory: i32,
     /// Flag indicating if time-scale operation was performed in previous call
     prev_time_scale: bool,
+    /// Rolling counters for packets-per-second measurement
+    packets_received_this_second: u32,
+    last_packets_second_instant: Instant,
+    packets_per_sec_snapshot: u32,
 }
 
 impl NetEq {
@@ -245,11 +253,18 @@ impl NetEq {
             bypass_audio_queue: VecDeque::new(),
             sample_memory: 0,
             prev_time_scale: false,
+            packets_received_this_second: 0,
+            last_packets_second_instant: Instant::now(),
+            packets_per_sec_snapshot: 0,
         })
     }
 
     /// Insert a packet into the jitter buffer
     pub fn insert_packet(&mut self, packet: AudioPacket) -> Result<()> {
+        // Update packets-per-second rolling counter and roll snapshot if needed
+        self.packets_received_this_second = self.packets_received_this_second.saturating_add(1);
+        self.maybe_roll_packet_rate();
+
         if self.config.bypass_mode {
             // Bypass mode: decode packet immediately and queue audio
             if let Some(decoder) = self.decoders.get_mut(&packet.header.payload_type) {
@@ -303,6 +318,9 @@ impl NetEq {
 
     /// Get 10ms of audio data
     pub fn get_audio(&mut self) -> Result<AudioFrame> {
+        // Ensure packet-rate snapshot rolls even when no packets arrive
+        // This prevents stale non-zero values when the peer stops sending
+        self.maybe_roll_packet_rate();
         if self.config.bypass_mode {
             // Bypass mode: return samples directly from queue
             let mut frame = AudioFrame::new(
@@ -395,6 +413,17 @@ impl NetEq {
         Ok(frame)
     }
 
+    /// Roll the packets-per-second window if ≥1s elapsed since last snapshot.
+    /// Safe to call frequently; no-ops if interval hasn't elapsed.
+    fn maybe_roll_packet_rate(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_packets_second_instant) >= Duration::from_secs(1) {
+            self.packets_per_sec_snapshot = self.packets_received_this_second;
+            self.packets_received_this_second = 0;
+            self.last_packets_second_instant = now;
+        }
+    }
+
     /// Get current statistics
     pub fn get_statistics(&self) -> NetEqStats {
         NetEqStats {
@@ -403,6 +432,7 @@ impl NetEq {
             current_buffer_size_ms: self.current_buffer_size_ms(),
             target_delay_ms: self.delay_manager.target_delay_ms(),
             packets_awaiting_decode: self.packet_buffer.len(),
+            packets_per_sec: self.packets_per_sec_snapshot,
         }
     }
 
@@ -436,6 +466,9 @@ impl NetEq {
         self.leftover_samples.clear();
         self.sample_memory = 0;
         self.prev_time_scale = false;
+        self.packets_received_this_second = 0;
+        self.packets_per_sec_snapshot = 0;
+        self.last_packets_second_instant = Instant::now();
     }
 
     fn get_decision(&mut self) -> Result<Operation> {
@@ -987,8 +1020,7 @@ mod tests {
         let initial_buffer_ms = neteq.current_buffer_size_ms();
         assert!(
             initial_buffer_ms <= 100,
-            "Initial buffer should be reasonable, got {}ms",
-            initial_buffer_ms
+            "Initial buffer should be reasonable, got {initial_buffer_ms}ms"
         );
 
         // Simulate "Peer B" joining late with large timestamp jump
@@ -1011,13 +1043,11 @@ mod tests {
         // With the fix, buffer should stay reasonable (around 12 packets = ~240ms)
         // Allow some margin but ensure it's nowhere near the old 60 packets (~1200ms)
         assert!(buffer_after_late_join <= 500,
-                "Buffer should not accumulate excessively after late peer join. Got {}ms, expected ≤500ms", 
-                buffer_after_late_join);
+                "Buffer should not accumulate excessively after late peer join. Got {buffer_after_late_join}ms, expected ≤500ms");
 
         // More importantly, ensure it's significantly better than the old behavior (60 packets = 1200ms)
         assert!(buffer_after_late_join <= 600,
-                "REGRESSION DETECTION: Buffer accumulated {}ms, this exceeds acceptable threshold and may indicate the old 60-packet bug has returned", 
-                buffer_after_late_join);
+                "REGRESSION DETECTION: Buffer accumulated {buffer_after_late_join}ms, this exceeds acceptable threshold and may indicate the old 60-packet bug has returned");
 
         // Pull several audio frames and verify NetEQ handles the situation gracefully
         let mut total_operations = std::collections::HashMap::new();
@@ -1046,8 +1076,7 @@ mod tests {
             // Ensure buffer never grows excessively during processing
             assert!(
                 post_buffer <= 500,
-                "Buffer should never exceed 500ms during processing, got {}ms",
-                post_buffer
+                "Buffer should never exceed 500ms during processing, got {post_buffer}ms"
             );
         }
 
@@ -1055,22 +1084,20 @@ mod tests {
         // This confirms the fix is working - old code wouldn't accelerate enough
         let accelerate_count = total_operations.get("Accelerate").copied().unwrap_or(0);
         assert!(accelerate_count > 0,
-                "NetEQ should have used acceleration to handle late-joining peer scenario. Operations: {:?}", 
-                total_operations);
+                "NetEQ should have used acceleration to handle late-joining peer scenario. Operations: {total_operations:?}");
 
         // Final buffer should be reasonable
         let final_buffer = neteq.current_buffer_size_ms();
         assert!(
             final_buffer <= 400,
-            "Final buffer should be reasonable, got {}ms",
-            final_buffer
+            "Final buffer should be reasonable, got {final_buffer}ms"
         );
 
         println!("✅ Late-joining peer test passed:");
-        println!("   Initial buffer: {}ms", initial_buffer_ms);
-        println!("   Peak buffer: {}ms", buffer_after_late_join);
-        println!("   Final buffer: {}ms", final_buffer);
-        println!("   Operations used: {:?}", total_operations);
+        println!("   Initial buffer: {initial_buffer_ms}ms");
+        println!("   Peak buffer: {buffer_after_late_join}ms");
+        println!("   Final buffer: {final_buffer}ms");
+        println!("   Operations used: {total_operations:?}");
     }
 
     /// Test continuous packet insertion to verify steady-state buffer convergence.
@@ -1132,10 +1159,7 @@ mod tests {
 
             // Log key transition points
             if cycle % 5 == 0 {
-                println!(
-                    "Cycle {}: Buffer {}ms -> {}ms",
-                    cycle, pre_buffer, post_buffer
-                );
+                println!("Cycle {cycle}: Buffer {pre_buffer}ms -> {post_buffer}ms");
             }
         }
 
@@ -1150,11 +1174,11 @@ mod tests {
             steady_state_samples.iter().sum::<u32>() / steady_state_samples.len() as u32;
 
         println!("📊 Buffer Analysis:");
-        println!("   Initial: {}ms", initial_buffer);
-        println!("   Peak: {}ms", max_buffer);
-        println!("   Final: {}ms", final_buffer);
-        println!("   Steady-state avg: {}ms", steady_state_avg);
-        println!("   Acceleration operations: {}", acceleration_count);
+        println!("   Initial: {initial_buffer}ms");
+        println!("   Peak: {max_buffer}ms");
+        println!("   Final: {final_buffer}ms");
+        println!("   Steady-state avg: {steady_state_avg}ms");
+        println!("   Acceleration operations: {acceleration_count}");
 
         // Critical assertions for your requirement
 
@@ -1163,39 +1187,32 @@ mod tests {
         // With target=20ms and buffers=20-40ms, no acceleration should occur
         assert!(
             acceleration_count <= 2,
-            "Expected minimal acceleration for small buffers, got {} (buffers were only 20-40ms above target)",
-            acceleration_count
+            "Expected minimal acceleration for small buffers, got {acceleration_count} (buffers were only 20-40ms above target)"
         );
 
         // 2. Steady-state buffer should be reasonable (user observed ~12 packets = ~240ms, but 0ms is even better)
         assert!(
             steady_state_avg <= 300,
-            "Steady-state buffer should be small, got {}ms (expected ≤300ms)",
-            steady_state_avg
+            "Steady-state buffer should be small, got {steady_state_avg}ms (expected ≤300ms)"
         );
 
         // 3. Buffer should not continue growing indefinitely with continuous insertion
         // Allow equal in case buffer stabilizes at same level
         assert!(
             final_buffer <= max_buffer,
-            "Buffer should not exceed peak during steady-state, but final={}ms > max={}ms",
-            final_buffer,
-            max_buffer
+            "Buffer should not exceed peak during steady-state, but final={final_buffer}ms > max={max_buffer}ms"
         );
 
         // 4. Regression check: ensure we're nowhere near the old 60-packet behavior
         assert!(
             max_buffer <= 600,
-            "REGRESSION: Max buffer {}ms indicates old excessive buffering bug may have returned",
-            max_buffer
+            "REGRESSION: Max buffer {max_buffer}ms indicates old excessive buffering bug may have returned"
         );
 
         // 5. Stability check: steady-state should be much smaller than peak
         assert!(
             steady_state_avg < max_buffer / 2,
-            "Steady-state ({}ms) should be much smaller than peak ({}ms)",
-            steady_state_avg,
-            max_buffer
+            "Steady-state ({steady_state_avg}ms) should be much smaller than peak ({max_buffer}ms)"
         );
     }
 
@@ -1230,9 +1247,9 @@ mod tests {
 
         println!("Buffer calculation test:");
         println!("  Packets: {}", neteq.packet_buffer.len());
-        println!("  Span duration: {}ms", span_duration);
-        println!("  Content duration: {}ms", content_duration);
-        println!("  Buffer size: {}ms", buffer_size_ms);
+        println!("  Span duration: {span_duration}ms");
+        println!("  Content duration: {content_duration}ms");
+        println!("  Buffer size: {buffer_size_ms}ms");
 
         // Verify the problem and the fix
         assert_eq!(
@@ -1265,15 +1282,13 @@ mod tests {
         let high_limit = std::cmp::max(target_samples, target_samples * 3 / 4 + 20 * 16); // 20ms margin
 
         println!("Decision thresholds:");
-        println!("  Buffer samples: {}", buffer_samples);
-        println!("  Target samples: {}", target_samples);
-        println!("  High limit: {}", high_limit);
+        println!("  Buffer samples: {buffer_samples}");
+        println!("  Target samples: {target_samples}");
+        println!("  High limit: {high_limit}");
 
         assert!(
             buffer_samples > high_limit,
-            "Buffer ({} samples) should exceed high limit ({} samples) to trigger acceleration",
-            buffer_samples,
-            high_limit
+            "Buffer ({buffer_samples} samples) should exceed high limit ({high_limit} samples) to trigger acceleration"
         );
 
         // Test the decision logic by calling get_audio multiple times
@@ -1295,8 +1310,7 @@ mod tests {
         );
 
         println!(
-            "✅ Buffer duration calculation test passed - acceleration triggered {} times",
-            acceleration_count
+            "✅ Buffer duration calculation test passed - acceleration triggered {acceleration_count} times"
         );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "videocall-cli"
-version = "1.0.32"
+version = "1.0.37"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -43,5 +43,5 @@ videocall-nokhwa = { path = "nokhwa", version = "0.10.9", features = ["input-nat
 
 [dependencies.videocall-types]
 path = "../videocall-types"
-version = "2.0.0"
+version = "2.0.2"
 

@@ -20,6 +20,8 @@ pub mod actors;
 pub mod auth;
 pub mod constants;
 pub mod db;
+pub mod diagnostics;
 pub mod messages;
+pub mod metrics;
 pub mod models;
 pub mod webtransport;

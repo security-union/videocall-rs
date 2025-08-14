@@ -21,12 +21,13 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
     host::Host, peer_list::PeerList,
 };
-use crate::constants::ACTIX_WEBSOCKET;
+use crate::constants::actix_websocket_base;
 use crate::constants::{
-    CANVAS_LIMIT, SERVER_ELECTION_PERIOD_MS, USERS_ALLOWED_TO_STREAM, WEBTRANSPORT_HOST,
+    server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
+use gloo_timers::callback::Timeout;
 use gloo_utils::window;
-use log::{debug, error, warn};
+use log::{error, warn};
 use serde_json;
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
@@ -73,6 +74,8 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
     OnFirstFrame((String, MediaType)),
+    OnMicrophoneError(String),
+    DismissMicError,
     UserScreenAction(UserScreenToggleAction),
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
@@ -85,6 +88,7 @@ pub enum Msg {
     NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
     ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
     HangUp,
+    ShowCopyToast(bool),
 }
 
 impl From<WsAction> for Msg {
@@ -131,6 +135,7 @@ pub struct AttendantsComponent {
     pub diagnostics_data: Option<String>,
     pub sender_stats: Option<String>,
     pub encoder_settings: Option<String>,
+    pub mic_error: Option<String>,
     pub neteq_stats: Option<String>,
     pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
     pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
@@ -146,34 +151,62 @@ pub struct AttendantsComponent {
     next_fake_peer_id_counter: usize,
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
+    show_copy_toast: bool,
 }
 
 impl AttendantsComponent {
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
-        let websocket_urls = ACTIX_WEBSOCKET
+        let websocket_urls = actix_websocket_base()
+            .unwrap_or_default()
             .split(',')
             .map(|s| format!("{s}/lobby/{email}/{id}"))
             .collect::<Vec<String>>();
-        let webtransport_urls = WEBTRANSPORT_HOST
+        let webtransport_urls = webtransport_host_base()
+            .unwrap_or_default()
             .split(',')
             .map(|s| format!("{s}/lobby/{email}/{id}"))
             .collect::<Vec<String>>();
 
+        log::info!(
+            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}",
+            email,
+            id,
+            ctx.props().webtransport_enabled
+        );
+        if websocket_urls.is_empty() || webtransport_urls.is_empty() {
+            log::error!("Runtime config missing or invalid: wsUrl or webTransportHost not set");
+        }
+        log::info!("YEW-UI: WebSocket URLs: {websocket_urls:?}");
+        log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
+
         let opts = VideoCallClientOptions {
             userid: email.clone(),
+            meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
             enable_e2ee: ctx.props().e2ee_enabled,
             enable_webtransport: ctx.props().webtransport_enabled,
             on_connected: {
                 let link = ctx.link().clone();
-                Callback::from(move |_| link.send_message(Msg::from(WsAction::Connected)))
+                let webtransport_enabled = ctx.props().webtransport_enabled;
+                Callback::from(move |_| {
+                    log::info!(
+                        "YEW-UI: Connection established (webtransport_enabled={webtransport_enabled})",
+                    );
+                    link.send_message(Msg::from(WsAction::Connected))
+                })
             },
             on_connection_lost: {
                 let link = ctx.link().clone();
-                Callback::from(move |_| link.send_message(Msg::from(WsAction::Lost(None))))
+                let webtransport_enabled = ctx.props().webtransport_enabled;
+                Callback::from(move |_| {
+                    log::warn!(
+                        "YEW-UI: Connection lost (webtransport_enabled={webtransport_enabled})",
+                    );
+                    link.send_message(Msg::from(WsAction::Lost(None)))
+                })
             },
             on_peer_added: {
                 let link = ctx.link().clone();
@@ -188,28 +221,19 @@ impl AttendantsComponent {
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
             enable_diagnostics: true,
-            on_diagnostics_update: Some({
-                let link = ctx.link().clone();
-                Callback::from(move |stats| {
-                    link.send_message(Msg::from(WsAction::DiagnosticsUpdated(stats)))
-                })
-            }),
-            on_sender_stats_update: Some({
-                let link = ctx.link().clone();
-                Callback::from(move |stats| {
-                    link.send_message(Msg::from(WsAction::SenderStatsUpdated(stats)))
-                })
-            }),
             diagnostics_update_interval_ms: Some(1000),
+            enable_health_reporting: true,
+            health_reporting_interval_ms: Some(5000),
             on_encoder_settings_update: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |settings| {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
-            rtt_testing_period_ms: *SERVER_ELECTION_PERIOD_MS,
+            rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
             rtt_probe_interval_ms: Some(200),
         };
+
         VideoCallClient::new(opts)
     }
 
@@ -310,7 +334,7 @@ impl Component for AttendantsComponent {
     fn create(ctx: &Context<Self>) -> Self {
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
-        let self_ = Self {
+        let mut self_ = Self {
             client,
             media_device_access,
             share_screen: false,
@@ -323,6 +347,7 @@ impl Component for AttendantsComponent {
             diagnostics_data: None,
             sender_stats: None,
             encoder_settings: None,
+            mic_error: None,
             neteq_stats: None,
             neteq_stats_per_peer: HashMap::new(),
             neteq_buffer_per_peer: HashMap::new(),
@@ -338,40 +363,73 @@ impl Component for AttendantsComponent {
             next_fake_peer_id_counter: 1,
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
+            show_copy_toast: false,
         };
+        if let Err(e) = crate::constants::app_config() {
+            log::error!("{e:?}");
+            self_.error = Some(e);
+        }
         {
             let link = ctx.link().clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let rx = subscribe();
-                while let Ok(evt) = rx.recv_async().await {
+                let mut rx = subscribe();
+                while let Ok(evt) = rx.recv().await {
                     if evt.subsystem == "neteq" {
                         for m in &evt.metrics {
                             if m.name == "stats_json" {
                                 if let MetricValue::Text(json) = &m.value {
-                                    let peer_id = evt
+                                    // Parse the new format: "reporting_peer->target_peer"
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
                                     link.send_message(Msg::NetEqStatsUpdated(
-                                        peer_id,
+                                        format!("{reporting_peer}->{target_peer}"),
                                         json.clone(),
                                     ));
                                 }
-                            } else if m.name == "current_buffer_size_ms" {
+                            } else if m.name == "audio_buffer_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    let peer_id = evt
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    link.send_message(Msg::NetEqBufferUpdated(peer_id, *v));
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
+                                    link.send_message(Msg::NetEqBufferUpdated(
+                                        format!("{reporting_peer}->{target_peer}"),
+                                        *v,
+                                    ));
                                 }
                             } else if m.name == "jitter_buffer_delay_ms" {
                                 if let MetricValue::U64(v) = &m.value {
-                                    let peer_id = evt
+                                    let stream_id = evt
                                         .stream_id
                                         .clone()
-                                        .unwrap_or_else(|| "unknown".to_string());
-                                    link.send_message(Msg::NetEqJitterUpdated(peer_id, *v));
+                                        .unwrap_or_else(|| "unknown->unknown".to_string());
+                                    let parts: Vec<&str> = stream_id.split("->").collect();
+                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                        (parts[0], parts[1])
+                                    } else {
+                                        ("unknown", "unknown")
+                                    };
+
+                                    link.send_message(Msg::NetEqJitterUpdated(
+                                        format!("{reporting_peer}->{target_peer}"),
+                                        *v,
+                                    ));
                                 }
                             }
                         }
@@ -380,9 +438,88 @@ impl Component for AttendantsComponent {
                         link.send_message(Msg::ConnectionManagerUpdate(
                             serde_json::to_string(&serializable_evt).unwrap_or_default(),
                         ));
+                    } else if evt.subsystem == "decoder" {
+                        let mut decoder_stats = String::new();
+                        for metric in &evt.metrics {
+                            match metric.name {
+                                "fps" => {
+                                    if let MetricValue::F64(fps) = &metric.value {
+                                        decoder_stats.push_str(&format!("FPS: {fps:.2}\n"));
+                                    }
+                                }
+                                "bitrate_kbps" => {
+                                    if let MetricValue::F64(bitrate) = &metric.value {
+                                        decoder_stats
+                                            .push_str(&format!("Bitrate: {bitrate:.1} kbps\n"));
+                                    }
+                                }
+                                "media_type" => {
+                                    if let MetricValue::Text(media_type) = &metric.value {
+                                        decoder_stats
+                                            .push_str(&format!("Media Type: {media_type}\n"));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !decoder_stats.is_empty() {
+                            let peer_id = evt
+                                .stream_id
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            decoder_stats.push_str(&format!(
+                                "Peer: {}\nTimestamp: {}\n",
+                                peer_id, evt.ts_ms
+                            ));
+                            link.send_message(Msg::WsAction(WsAction::DiagnosticsUpdated(
+                                decoder_stats,
+                            )));
+                        }
+                    } else if evt.subsystem == "sender" {
+                        let mut sender_stats = String::new();
+                        for metric in &evt.metrics {
+                            match metric.name {
+                                "sender_id" => {
+                                    if let MetricValue::Text(sender_id) = &metric.value {
+                                        sender_stats.push_str(&format!("Sender: {sender_id}\n"));
+                                    }
+                                }
+                                "target_id" => {
+                                    if let MetricValue::Text(target_id) = &metric.value {
+                                        sender_stats.push_str(&format!("Target: {target_id}\n"));
+                                    }
+                                }
+                                "media_type" => {
+                                    if let MetricValue::Text(media_type) = &metric.value {
+                                        sender_stats
+                                            .push_str(&format!("Media Type: {media_type}\n"));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !sender_stats.is_empty() {
+                            sender_stats.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
+                            link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
+                                sender_stats,
+                            )));
+                        }
+                    } else if evt.subsystem == "video" {
+                        // Known subsystem used for Grafana/metrics; UI does not render it
+                        log::debug!(
+                            "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
+                            evt.ts_ms
+                        );
+                    } else if evt.subsystem == "peer_status" {
+                        // Known subsystem for mute/camera state; UI does not render it
+                        log::debug!(
+                            "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
+                            evt.ts_ms
+                        );
                     } else {
                         let subsystem = evt.subsystem;
-                        log::debug!("AttendantsComponent: Received event for unknown subsystem: {subsystem}");
+                        log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 
+                                   subsystem, evt.stream_id, evt.ts_ms);
                     }
                 }
                 log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
@@ -398,7 +535,7 @@ impl Component for AttendantsComponent {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        debug!("AttendantsComponent update: {msg:?}");
+        log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
@@ -414,7 +551,10 @@ impl Component for AttendantsComponent {
                     self.meeting_joined = true;
                     true
                 }
-                WsAction::Connected => true,
+                WsAction::Connected => {
+                    log::info!("YEW-UI: Connection established successfully!");
+                    true
+                }
                 WsAction::Log(msg) => {
                     warn!("{msg}");
                     false
@@ -455,6 +595,7 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::DiagnosticsUpdated(stats) => {
+                    log::debug!("YEW-UI: Diagnostics UI updated: {stats}");
                     self.diagnostics_data = Some(stats);
                     true
                 }
@@ -474,6 +615,17 @@ impl Component for AttendantsComponent {
                 true
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
+            Msg::OnMicrophoneError(err) => {
+                // Disable mic at the top and show UI
+                log::error!("Microphone error (full): {err}");
+                self.mic_enabled = false;
+                self.mic_error = Some(err);
+                true
+            }
+            Msg::DismissMicError => {
+                self.mic_error = None;
+                true
+            }
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
@@ -622,6 +774,17 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            Msg::ShowCopyToast(show) => {
+                self.show_copy_toast = show;
+                if show {
+                    let link = ctx.link().clone();
+                    Timeout::new(1640, move || {
+                        link.send_message(Msg::ShowCopyToast(false));
+                    })
+                    .forget();
+                }
+                true
+            }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
                 let _ = window().location().reload(); // Refresh page for clean state
@@ -658,15 +821,11 @@ impl Component for AttendantsComponent {
                 .collect(),
         );
 
-        let container_style = if self.peer_list_open || self.diagnostics_open {
-            // Use num_peers_for_styling (capped at CANVAS_LIMIT) for the CSS variable
-            format!("width: 80%; --num-peers: {};", num_peers_for_styling.max(1))
-        } else {
-            format!(
-                "width: 100%; --num-peers: {};",
-                num_peers_for_styling.max(1)
-            )
-        };
+        // Always let the grid take the whole stage; overlays should not shrink the grid
+        let container_style = format!(
+            "position: absolute; inset: 0; width: 100%; height: 100%; --num-peers: {};",
+            num_peers_for_styling.max(1)
+        );
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
@@ -678,13 +837,14 @@ impl Component for AttendantsComponent {
             format!("{}/meeting/{}", origin, ctx.props().id)
         };
 
-        // Callback to copy the meeting link to clipboard
+        // Callback to copy and trigger toast via component state
         let copy_meeting_link = {
             let meeting_link = meeting_link.clone();
+            let link = ctx.link().clone();
             Callback::from(move |_| {
                 if let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) {
-                    // Try to write text; ignore potential JS promise errors for now
                     let _ = clipboard.write_text(&meeting_link);
+                    link.send_message(Msg::ShowCopyToast(true));
                 }
             })
         };
@@ -699,9 +859,9 @@ impl Component for AttendantsComponent {
             return html! {
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
-                    <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #1a1a1a; z-index: 1000;">
+                    <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
                         <div style="text-align: center; color: white; margin-bottom: 2rem;">
-                            <h1>{"Ready to join the meeting?"}</h1>
+                            <h2>{"Ready to join the meeting?"}</h2>
                             <p>{"Click the button below to join and start listening to others."}</p>
                             {if let Some(error) = &self.error {
                                 html! { <p style="color: #ff6b6b; margin-top: 1rem;">{error}</p> }
@@ -710,17 +870,7 @@ impl Component for AttendantsComponent {
                             }}
                         </div>
                         <button
-                            class="join-meeting-button"
-                            style="
-                                background: #4CAF50; 
-                                color: white; 
-                                border: none; 
-                                padding: 1rem 2rem; 
-                                font-size: 1.2rem; 
-                                border-radius: 8px; 
-                                cursor: pointer;
-                                transition: background 0.3s ease;
-                            "
+                            class="btn-apple btn-primary"
                             onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}
                         >
                             {"Join Meeting"}
@@ -742,31 +892,53 @@ impl Component for AttendantsComponent {
                     { // Invitation overlay when there are no connected peers
                         if num_display_peers == 0 {
                             html! {
-                                <div id="invite-overlay" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.9); padding: 1.5rem 2rem; border-radius: 8px; width: 90%; max-width: 420px; z-index: 0; color: white; box-shadow: 0 4px 12px rgba(0,0,0,0.3); text-align: center;">
-                                    <h3 style="margin-top:0;">{"Your meeting's ready"}</h3>
+                                <div id="invite-overlay" class="card-apple" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;">
+                                    <h4 style="margin-top:0;">{"Your meeting is ready!"}</h4>
                                     <p style="font-size: 0.9rem; opacity: 0.8;">{"Share this meeting link with others you want in the meeting"}</p>
                                     <div style="display:flex; align-items:center; margin-top: 0.75rem; margin-bottom: 0.75rem;">
                                         <input
                                             id="meeting-link-input"
                                             value={meeting_link.clone()}
                                             readonly=true
-                                            style="flex:1; padding: 0.5rem; border: none; border-radius: 4px; background: #333; color: white; font-size: 0.9rem; overflow:hidden; text-overflow: ellipsis;"/>
+                                            class="input-apple" style="flex:1; overflow:hidden; text-overflow: ellipsis;"/>
                                         <button
-                                            class="copy-link-button"
-                                            style="margin-left: 0.5rem; background: #4CAF50; color: white; border: none; padding: 0.5rem 0.75rem; border-radius: 4px; cursor: pointer;"
+                                            class={classes!("btn-apple", "btn-primary", "btn-sm", "copy-button", self.show_copy_toast.then_some("btn-pop-animate"))}
+                                            style="margin-left: 0.5rem;"
                                             onclick={copy_meeting_link}
                                         >
                                             {"Copy"}
+                                            { if self.show_copy_toast {
+                                                html!{
+                                                    <div class="sparkles" aria-hidden="true">
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                        <span class="sparkle"></span>
+                                                    </div>
+                                                }
+                                            } else { html!{} } }
                                         </button>
                                     </div>
                                     <p style="font-size: 0.8rem; opacity: 0.7;">{"People who use this meeting link must get your permission before they can join."}</p>
+                                    <div
+                                        class={classes!("copy-toast", self.show_copy_toast.then_some("copy-toast--visible"))}
+                                        role="alert"
+                                        aria-live="assertive"
+                                        aria-hidden={( !self.show_copy_toast ).to_string()}
+                                    >
+                                        {"Link copied to clipboard"}
+                                    </div>
                                 </div>
                             }
                         } else { html!{} }
                     }
 
                     {
-                        if USERS_ALLOWED_TO_STREAM.iter().any(|host| host == &email) || USERS_ALLOWED_TO_STREAM.is_empty() {
+                        if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
                             html! {
                                 <nav class="host">
                                     <div class="controls">
@@ -956,15 +1128,16 @@ impl Component for AttendantsComponent {
                                             <button
                                                 class="video-control-button danger"
                                                 onclick={ctx.link().callback(|_| Msg::HangUp)}>
+                                                <span class="tooltip">{"Hang Up"}</span>
                                                 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
                                                     <path d="M12.017 6.995c-2.306 0-4.534.408-6.215 1.507-1.737 1.135-2.788 2.944-2.797 5.451a4.8 4.8 0 0 0 .01.62c.015.193.047.512.138.763a2.557 2.557 0 0 0 2.579 1.677H7.31a2.685 2.685 0 0 0 2.685-2.684v-.645a.684.684 0 0 1 .684-.684h2.647a.686.686 0 0 1 .686.687v.645c0 .712.284 1.395.787 1.898.478.478 1.101.787 1.847.787h1.647a2.555 2.555 0 0 0 2.575-1.674c.09-.25.123-.57.137-.763.015-.2.022-.433.01-.617-.002-2.508-1.049-4.32-2.785-5.458-1.68-1.1-3.907-1.51-6.213-1.51Z"/>
                                                 </svg>
-                                                <span class="tooltip">{ "Hang Up" }</span>
                                             </button>
                                             { self.view_grid_toggle(ctx) }
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
 
                                         </nav>
+                                        { html!{} }
                                                                 {
                             if let Some(message) = &self.simulation_info_message {
                                 html!{
@@ -976,29 +1149,47 @@ impl Component for AttendantsComponent {
                         }
                                     </div>
                                     {
-                                        if media_access_granted {
-                                            html! {<Host
-                                                client={self.client.clone()}
-                                                share_screen={self.share_screen}
-                                                mic_enabled={self.mic_enabled}
-                                                video_enabled={self.video_enabled}
-                                                on_encoder_settings_update={on_encoder_settings_update}
-                                                device_settings_open={self.device_settings_open}
-                                                on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
-                                            />}
-                                        } else {
-                                            html! {<></>}
-                                        }
+                                        if let Some(err) = &self.mic_error {
+                                            let displayed: String = err.chars().take(200).collect();
+                                            html!{
+                                                <div class="glass-backdrop">
+                                                    <div class="card-apple" style="width: 380px;">
+                                                        <h4 style="margin-top:0;">{"Microphone issue"}</h4>
+                                                        <p style="color:#AEAEB2; margin-top:0.25rem;">{"We couldn't start your microphone."}</p>
+                                                        <p style="margin-top:0.5rem;">{ displayed }</p>
+                                                        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
+                                                            <button class="btn-apple btn-secondary btn-sm" onclick={ctx.link().callback(|_| Msg::DismissMicError)}>{"Close"}</button>
+                                                            <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>{"Retry"}</button>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            }
+                                        } else { html!{} }
                                     }
-                                    <h4 class="floating-name">{email}</h4>
-
+                                    {
+                                         if media_access_granted {
+                                             html! {<Host
+                                                 client={self.client.clone()}
+                                                 share_screen={self.share_screen}
+                                                 mic_enabled={self.mic_enabled}
+                                                 video_enabled={self.video_enabled}
+                                                 on_encoder_settings_update={on_encoder_settings_update}
+                                                 device_settings_open={self.device_settings_open}
+                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                             />}
+                                         } else {
+                                             html! {<></>}
+                                         }
+                                    }
                                     <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
 
                                 </nav>
                             }
                         } else {
                             error!("User not allowed to stream");
-                            error!("allowed users {}", USERS_ALLOWED_TO_STREAM.join(", "));
+                            let allowed = users_allowed_to_stream().unwrap_or_default();
+                            error!("allowed users {}", allowed.join(", "));
                             html! {}
                         }
                     }

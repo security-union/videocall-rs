@@ -24,6 +24,9 @@
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_worker {
+    use log::LevelFilter;
+    #[cfg(feature = "matomo-logger")]
+    use matomo_logger::worker as matomo_worker;
     use neteq::WebNetEq;
     use serde::{Deserialize, Serialize};
     use wasm_bindgen::prelude::*;
@@ -80,6 +83,22 @@ mod wasm_worker {
     pub fn start() {
         console_error_panic_hook::set_once();
         console::log_1(&"[neteq-worker] starting".into());
+
+        // Initialize worker-side logger bridge: forward WARN+ to main thread (Matomo)
+        // Keep console at INFO for local visibility inside the worker
+        #[cfg(feature = "matomo-logger")]
+        {
+            if let Err(_e) =
+                matomo_worker::init_with_bridge(LevelFilter::Info, LevelFilter::Warn, {
+                    // The bridge expects the object as 'arguments[0]'
+                    js_sys::Function::new_no_args("self.postMessage(arguments[0]);")
+                })
+            {
+                console::error_1(
+                    &"[neteq-worker] Failed to initialize matomo worker bridge".into(),
+                );
+            }
+        }
 
         // Load opus-decoder library in worker context by evaluating the script directly
         let global_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();

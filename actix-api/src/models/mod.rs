@@ -22,6 +22,7 @@ use crate::actors::chat_server::ChatServer;
 
 pub struct AppState {
     pub chat: Addr<ChatServer>,
+    pub nats_client: async_nats::client::Client,
 }
 
 pub struct AppConfig {

@@ -103,7 +103,7 @@ impl Component for PeerList {
                             <ul>
                                 // show self as the first item with actual username
                                 <li><PeerListItem name={display_name.clone()} /></li>
-                                
+
                                 { for filtered_peers.iter().map(|peer|
                                     html!{
                                         <li><PeerListItem name={peer.clone()}/></li>

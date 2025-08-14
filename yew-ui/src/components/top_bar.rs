@@ -24,17 +24,9 @@ use yew::prelude::*;
 #[function_component(TopBar)]
 pub fn top_bar() -> Html {
     html! {
-        <div class="top-bar">
-            <div class="flex space-x-2 align-middle">
-            {
-                if let Some(onclick) = change_username {
-                    html! {
-                        <button class="button change-username-btn text-sm px-3 py-1 border rounded" onclick={onclick} alt="Click to change username">
-                            { username_ctx.as_ref().and_then(|ctx| ctx.as_ref().cloned()).unwrap_or_default() }
-                        </button>
-                    }
-                } else { html!{} }
-            }
+        <div class="top-bar" style="position:fixed; top:0; left:0; right:0; display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:rgba(28,28,30,0.6); backdrop-filter:saturate(180%) blur(10px); border-bottom:1px solid #38383A; z-index:100;">
+            <div class="flex items-center align-middle" style="opacity:0.9; gap:10px;">
+                { html!{} }
             </div>
         </div>
     }

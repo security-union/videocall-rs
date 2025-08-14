@@ -73,14 +73,13 @@ impl Component for PeerList {
             PeerListMsg::UpdateSearchQuery(input.value())
         });
 
-        // Get username from context and append (SELF)
-        let display_name: String = format!(
-            "{} (You)",
-            ctx.link()
-                .context::<UsernameCtx>(Callback::noop())
-                .and_then(|(state, _handle)| state.as_ref().cloned())
-                .unwrap_or_else(|| "(You)".to_string())
-        );
+        // Get username from context and append (You)
+        let display_name: String = ctx
+            .link()
+            .context::<UsernameCtx>(Callback::noop())
+            .and_then(|(state, _handle)| state.as_ref().cloned())
+            .map(|name| format!("{} (You)", name))
+            .unwrap_or_else(|| "(You)".to_string());
 
         html! {
             <>

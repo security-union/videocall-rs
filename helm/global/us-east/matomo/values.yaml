@@ -12,6 +12,9 @@ matomo:
     annotations:
       cert-manager.io/issuer: "letsencrypt-prod"
       nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
+      nginx.ingress.kubernetes.io/enable-real-ip: "true"
+      nginx.ingress.kubernetes.io/proxy-real-ip-cidr: "0.0.0.0/0"
     hostname: "matomo.videocall.rs"
     path: "/"
     pathType: Prefix
@@ -23,6 +26,39 @@ matomo:
   matomoEmail: "admin@videocall.rs"
   matomoWebsiteName: "VideoCall Analytics"
   matomoWebsiteHost: "https://videocall.rs"
+  
+  # Environment variables for real IP support (Bitnami standard)
+  extraEnvVars:
+    - name: MATOMO_ASSUME_SECURE_PROTOCOL
+      value: "1"
+    - name: MATOMO_FORCE_SSL
+      value: "1"
+
+  # Custom post-init script to configure Matomo for real IP (Bitnami standard)
+  customPostInitScripts:
+    matomo-realip-config.php: |
+      <?php
+      // Configure Matomo to trust proxy headers for real IP detection
+      $configFile = '/bitnami/matomo/config/config.ini.php';
+      $config = array(
+          '[General]',
+          'proxy_client_headers[] = HTTP_X_FORWARDED_FOR',
+          'proxy_client_headers[] = HTTP_X_REAL_IP', 
+          'proxy_client_headers[] = HTTP_CF_CONNECTING_IP',
+          'proxy_host_headers[] = HTTP_X_FORWARDED_HOST',
+          'assume_secure_protocol = 1',
+          'force_ssl = 1'
+      );
+      
+      if (file_exists($configFile)) {
+          $content = file_get_contents($configFile);
+          $configText = implode(PHP_EOL, $config);
+          if (strpos($content, 'proxy_client_headers[]') === false) {
+              $content = str_replace('[PluginsInstalled]', $configText . PHP_EOL . PHP_EOL . '[PluginsInstalled]', $content);
+              file_put_contents($configFile, $content);
+              echo "Real IP configuration added to Matomo config\n";
+          }
+      }
 
   # MariaDB configuration - auto-generate passwords
   mariadb:
@@ -34,14 +70,14 @@ matomo:
       username: "bn_matomo"
       password: ""
 
-  # Resources (increased for Matomo installation)
+  # Resources (increased for analytics load)
   resources:
     limits:
       cpu: 500m
-      memory: 1Gi
+      memory: 2Gi
     requests:
       cpu: 250m
-      memory: 512Mi
+      memory: 1Gi
 
   # Persistence configuration
   persistence:

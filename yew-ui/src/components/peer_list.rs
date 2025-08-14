@@ -17,6 +17,7 @@
  */
 
 use crate::components::peer_list_item::PeerListItem;
+use crate::context::UsernameCtx;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew::{html, Component, Context};
@@ -72,6 +73,15 @@ impl Component for PeerList {
             PeerListMsg::UpdateSearchQuery(input.value())
         });
 
+        // Get username from context and append (SELF)
+        let display_name: String = format!(
+            "{} (You)",
+            ctx.link()
+                .context::<UsernameCtx>(Callback::noop())
+                .and_then(|(state, _handle)| state.as_ref().cloned())
+                .unwrap_or_else(|| "(You)".to_string())
+        );
+
         html! {
             <>
                 <div class="sidebar-header">
@@ -92,6 +102,9 @@ impl Component for PeerList {
                         <h3>{ "In call" }</h3>
                         <div class="peer-list">
                             <ul>
+                                // show self as the first item with actual username
+                                <li><PeerListItem name={display_name.clone()} /></li>
+                                
                                 { for filtered_peers.iter().map(|peer|
                                     html!{
                                         <li><PeerListItem name={peer.clone()}/></li>

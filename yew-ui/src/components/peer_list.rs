@@ -73,8 +73,25 @@ impl Component for PeerList {
             PeerListMsg::UpdateSearchQuery(input.value())
         });
 
-        // let username_ctx = use_context::<UsernameCtx>();
-        
+
+
+
+        // // Get username from context
+        // let username_ctx = ctx.link().context::<UsernameCtx>(Callback::noop())
+        //     .and_then(|username| Some(username));
+
+        // let display_name = username_ctx
+        //     .as_ref()
+        //     .map(|u| u.0.clone()) // Assuming UsernameCtx holds a tuple struct like UsernameCtx(String)
+        //     .unwrap_or_else(|| "SELF".to_string());
+
+        // Get username from context (class component style)
+        let display_name: String = ctx
+            .link()
+            .context::<UsernameCtx>(Callback::noop()) // -> Option<(UseStateHandle<Option<String>>, ContextHandle<_>)>
+            .and_then(|(state, _handle)| state.as_ref().cloned()) // Option<String>
+            .unwrap_or_else(|| "SELF".to_string());               // String
+
         html! {
             <>
                 <div class="sidebar-header">
@@ -95,7 +112,8 @@ impl Component for PeerList {
                         <h3>{ "In call" }</h3>
                         <div class="peer-list">
                             <ul>
-                                <li><PeerListItem name={"SELF"}/></li>
+                                // show self as the first item with actual username
+                                <li><PeerListItem name={format!("{} (SELF)", display_name)} /></li>
                                 
                                 { for filtered_peers.iter().map(|peer|
                                     html!{

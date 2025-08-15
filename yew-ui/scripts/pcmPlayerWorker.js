@@ -103,7 +103,7 @@ class UltraFastPCMBuffer {
     }
 }
 
-class RustPCMPlayerProcessor extends AudioWorkletProcessor {
+class PCMPlayerProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
         
@@ -168,4 +168,4 @@ class RustPCMPlayerProcessor extends AudioWorkletProcessor {
     }
 }
 
-registerProcessor('rust-pcm-player', RustPCMPlayerProcessor);
+registerProcessor('pcm-player', PCMPlayerProcessor);

@@ -3,6 +3,17 @@
  * 
  * Highly optimized JavaScript implementation designed for low-end Android devices.
  * Uses advanced optimizations to minimize GC pressure and maximize performance.
+ * 
+ * This worklet receives PCM audio data via postMessage and plays it directly
+ * through the AudioContext.destination() without using MediaStream APIs.
+ * This approach is Safari-compatible and avoids the problematic MediaStreamTrackGenerator
+ * and related APIs that cause issues in WebKit.
+ * 
+ * Usage:
+ * 1. Load this worklet in an AudioContext
+ * 2. Send PCM data via port.postMessage({ command: 'play', pcm: Float32Array })
+ * 3. The worklet buffers and plays the audio directly
+
  */
 
 // Ultra-fast circular buffer implementation  

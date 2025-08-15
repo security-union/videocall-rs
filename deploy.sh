@@ -21,6 +21,7 @@ if [[ "${1:-}" == "--restart" ]]; then
     kubectl rollout restart deployment websocket-us-east -n default  
     kubectl rollout restart deployment webtransport-us-east -n default
     kubectl rollout restart deployment engineering-vlog-us-east -n default
+    kubectl rollout restart deployment videocall-ui-us-east -n default
     
     # Singapore context
     echo "📍 Switching to Singapore context..."

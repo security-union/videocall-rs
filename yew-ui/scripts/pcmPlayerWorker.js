@@ -13,7 +13,7 @@
  */
 
 class SimpleAudioBuffer {
-    constructor(maxSamples = 2048, channels = 1) { // Reduce from 8192 to 2048 (~43ms at 48kHz)
+    constructor(maxSamples = 4096, channels = 1) { // Reduce from 8192 to 2048 (~43ms at 48kHz)
         this.maxSamples = maxSamples;
         this.channels = channels;
         this.buffers = [];
@@ -113,9 +113,12 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         super();
         
         // Audio buffer for incoming PCM data (smaller buffer for faster consumption)
-        this.audioBuffer = new SimpleAudioBuffer(2048, 2); // Reduced from 8192 to 2048
+        this.audioBuffer = new SimpleAudioBuffer(4096, 2); // Reduced from 8192 to 2048
         this.sampleRate = 48000; // Default, will be updated
         this.channels = 2; // Default, will be updated
+        
+        // Pre-allocate output channels array to avoid creating new arrays every process() call
+        this.outputChannels = new Array(2); // Max channels
         
         // Debug counters
         this.processCallCount = 0;
@@ -131,7 +134,7 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
                 case 'configure':
                     this.sampleRate = sampleRate || 48000;
                     this.channels = channels || 1;
-                    this.audioBuffer = new SimpleAudioBuffer(2048, this.channels); // Keep small buffer
+                    this.audioBuffer = new SimpleAudioBuffer(4096, this.channels); // Keep small buffer
                     console.log(`Safari PCM worklet configured: ${this.sampleRate}Hz, ${this.channels} channels`);
                     break;
                     
@@ -182,16 +185,15 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         
         this.processCallCount++;
         
-        // Prepare output channel arrays
-        const outputChannels = [];
+        // Reuse pre-allocated output channels array instead of creating new one
         for (let ch = 0; ch < output.length; ch++) {
-            outputChannels[ch] = output[ch];
+            this.outputChannels[ch] = output[ch];
         }
         
         // Try to pull audio from buffer
         if (this.audioBuffer.isFrameAvailable(frameLength)) {
             // Pull audio data from buffer
-            this.audioBuffer.pull(outputChannels, frameLength);
+            this.audioBuffer.pull(this.outputChannels, frameLength);
             this.samplesConsumed += frameLength;
         } else {
             // No audio available, output silence

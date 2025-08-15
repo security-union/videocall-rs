@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.26](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.25...videocall-ui-v1.1.26) - 2025-08-15
+
+### Other
+
+- Disable caching and create blog post, also downgrade many messages to debug  ([#395](https://github.com/security-union/videocall-rs/pull/395))
+
 ## [1.1.25](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.24...videocall-ui-v1.1.25) - 2025-08-15
 
 ### Added

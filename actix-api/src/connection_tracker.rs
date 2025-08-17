@@ -78,6 +78,7 @@ fn get_reporting_interval() -> Duration {
     Duration::from_secs(interval_secs)
 }
 
+#[derive(Default)]
 pub struct ConnectionTracker {
     connections: Mutex<HashMap<String, ConnectionInfo>>,
     // (customer_email, meeting_id) -> reconnection_count

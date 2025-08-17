@@ -286,7 +286,7 @@ impl ConnectionTracker {
 
         tokio::spawn(async move {
             let topic = format!(
-                "server.connections.{}.{}.{}",
+                "server.connections.{region}.{service_type}.{server_instance}",
                 region, service_type, server_instance
             );
 
@@ -344,10 +344,7 @@ impl ConnectionTracker {
             let server_instance = self.server_instance.clone();
 
             tokio::spawn(async move {
-                let topic = format!(
-                    "server.connections.{}.{}.{}",
-                    region, service_type, server_instance
-                );
+                let topic = format!("server.connections.{region}.{service_type}.{server_instance}");
 
                 match packet.write_to_bytes() {
                     Ok(payload) => {

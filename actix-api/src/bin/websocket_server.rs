@@ -32,6 +32,7 @@ use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
+use prometheus::{Encoder, TextEncoder};
 use reqwest::header::LOCATION;
 use sec_api::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},
@@ -39,6 +40,7 @@ use sec_api::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
+    connection_tracker::{ConnectionTracker, GLOBAL_TRACKER},
     db::{get_pool, PostgresPool},
     models::{AppConfig, AppState},
 };
@@ -167,6 +169,26 @@ where
     Ok(res.streaming(WebsocketContext::with_codec(actor, stream, codec)))
 }
 
+/// Prometheus metrics endpoint for server-side connection tracking
+async fn metrics_handler() -> actix_web::Result<HttpResponse> {
+    let encoder = TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let mut buffer = Vec::new();
+
+    match encoder.encode(&metric_families, &mut buffer) {
+        Ok(_) => {
+            let output = String::from_utf8_lossy(&buffer);
+            Ok(HttpResponse::Ok()
+                .content_type("text/plain; version=0.0.4")
+                .body(output.to_string()))
+        }
+        Err(e) => {
+            error!("Failed to encode metrics: {}", e);
+            Ok(HttpResponse::InternalServerError().body("Failed to encode metrics"))
+        }
+    }
+}
+
 #[get("/lobby/{email}/{room}")]
 pub async fn ws_connect(
     session: web::Path<(String, String)>,
@@ -200,6 +222,16 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to NATS");
     let chat = ChatServer::new(nats_client.clone()).await.start();
+
+    // Initialize global connection tracker with NATS client
+    if let Err(_) = ConnectionTracker::init_nats_client(nats_client.clone()) {
+        error!("Failed to initialize NATS client for connection tracker");
+    }
+
+    // Start periodic data reporting (1 Hz)
+    tokio::spawn(async move {
+        GLOBAL_TRACKER.start_periodic_reporting().await;
+    });
     let oauth_client_id: String =
         std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
     let oauth_auth_url: String =
@@ -226,6 +258,7 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                 }))
                 .service(ws_connect)
+                .route("/metrics", web::get().to(metrics_handler))
         } else {
             let pool = if db_enabled { Some(get_pool()) } else { None };
             App::new()
@@ -246,6 +279,7 @@ async fn main() -> std::io::Result<()> {
                 .service(handle_google_oauth_callback)
                 .service(login)
                 .service(ws_connect)
+                .route("/metrics", web::get().to(metrics_handler))
         }
     })
     .bind((

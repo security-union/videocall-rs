@@ -1,7 +1,6 @@
 {
-  "dashboard": {
-    "id": null,
-    "title": "Server Connection & Data Analytics",
+  "id": null,
+  "title": "Server Connection & Data Analytics",
     "tags": ["videocall", "server", "connections", "metrics"],
     "style": "dark",
     "timezone": "browser",
@@ -12,8 +11,9 @@
         "type": "stat",
         "targets": [
           {
-            "expr": "sum by (protocol) (videocall_server_connections_active)",
-            "refId": "A"
+            "expr": "sum by (protocol, server_instance) (videocall_server_connections_active)",
+            "refId": "A",
+            "legendFormat": "{{server_instance}} - {{protocol}}"
           }
         ],
         "fieldConfig": {
@@ -69,7 +69,7 @@
         "type": "table",
         "targets": [
           {
-            "expr": "topk(10, sum by (customer_email, protocol) (videocall_server_connections_active))",
+            "expr": "topk(10, sum by (customer_email, protocol, server_instance) (videocall_server_connections_active))",
             "refId": "A",
             "format": "table"
           }
@@ -109,9 +109,9 @@
         "type": "timeseries",
         "targets": [
           {
-            "expr": "sum by (direction, protocol) (rate(videocall_server_data_bytes_total[5m]))",
+            "expr": "sum by (direction, protocol, server_instance) (rate(videocall_server_data_bytes_total[5m]))",
             "refId": "A",
-            "legendFormat": "{{protocol}} {{direction}}"
+            "legendFormat": "{{server_instance}} - {{protocol}} {{direction}}"
           }
         ],
         "fieldConfig": {
@@ -184,9 +184,9 @@
         "type": "timeseries",
         "targets": [
           {
-            "expr": "sum by (event_type, protocol) (rate(videocall_server_connection_events_total[5m]))",
+            "expr": "sum by (event_type, protocol, server_instance) (rate(videocall_server_connection_events_total[5m]))",
             "refId": "A",
-            "legendFormat": "{{protocol}} {{event_type}}"
+            "legendFormat": "{{server_instance}} - {{protocol}} {{event_type}}"
           }
         ],
         "fieldConfig": {
@@ -259,8 +259,9 @@
         "type": "stat",
         "targets": [
           {
-            "expr": "sum by (protocol) (rate(videocall_server_reconnections_total[1h]))",
-            "refId": "A"
+            "expr": "sum by (protocol, server_instance) (rate(videocall_server_reconnections_total[1h]))",
+            "refId": "A",
+            "legendFormat": "{{server_instance}} - {{protocol}}"
           }
         ],
         "fieldConfig": {
@@ -385,7 +386,7 @@
         "type": "table",
         "targets": [
           {
-            "expr": "topk(20, sum by (customer_email, protocol) (increase(videocall_server_data_bytes_total[1h])))",
+            "expr": "topk(20, sum by (customer_email, protocol, server_instance) (increase(videocall_server_data_bytes_total[1h])))",
             "refId": "A",
             "format": "table"
           }
@@ -444,8 +445,7 @@
       "from": "now-1h",
       "to": "now"
     },
-    "timepicker": {},
-    "version": 0,
-    "weekStart": ""
-  }
+  "timepicker": {},
+  "version": 0,
+  "weekStart": ""
 }

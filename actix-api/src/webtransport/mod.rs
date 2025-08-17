@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use crate::connection_tracker::{DataTracker, GLOBAL_TRACKER};
+use crate::connection_tracker::{ConnectionTracker, DataTracker, GLOBAL_TRACKER};
 use crate::diagnostics::health_processor;
 use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
@@ -153,6 +153,16 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
         async_nats::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
             .await
             .unwrap();
+
+    // Initialize global connection tracker with NATS client
+    if let Err(_) = ConnectionTracker::init_nats_client(nc.clone()) {
+        error!("Failed to initialize NATS client for connection tracker");
+    }
+
+    // Start periodic data reporting (1 Hz)
+    tokio::spawn(async move {
+        GLOBAL_TRACKER.start_periodic_reporting().await;
+    });
 
     // 2. Accept new quic connections and spawn a new task to handle them
     while let Some(new_conn) = server.accept().await {

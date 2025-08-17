@@ -29,7 +29,6 @@ metricsApi:
     METRICS_PORT: "9091"
     NATS_URL: "nats://nats-us-east:4222"
     REGION: "us-east"
-    SERVER_ID: "metrics-server-1"
     SERVICE_TYPE: "metrics"
     RUST_LOG: "warn,async_nats=warn"
   

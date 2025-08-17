@@ -33,8 +33,14 @@ spec:
               value: {{ .Values.metricsApi.env.NATS_URL | quote }}
             - name: REGION
               value: {{ .Values.metricsApi.env.REGION | quote }}
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: SERVER_ID
-              value: {{ .Values.metricsApi.env.SERVER_ID | quote }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: SERVICE_TYPE
               value: {{ .Values.metricsApi.env.SERVICE_TYPE | quote }}
             - name: RUST_LOG

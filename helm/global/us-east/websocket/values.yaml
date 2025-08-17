@@ -23,10 +23,18 @@ rustlemania-websocket:
       value: abc
     - name: REGION
       value: "us-east"
+    - name: HOSTNAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVER_ID
-      value: $(POD_NAME)
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVICE_TYPE
       value: websocket
+    - name: SERVER_STATS_INTERVAL_SECS
+      value: "5"
 
 
   resources:

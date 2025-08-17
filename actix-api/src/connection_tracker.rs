@@ -16,16 +16,18 @@
  * conditions.
  */
 
-//! Connection tracking module for server-side metrics
+//! Connection tracking module for server-side metrics via NATS
 
-use crate::metrics::{
-    SERVER_CONNECTIONS_ACTIVE, SERVER_CONNECTION_DURATION_SECONDS, SERVER_CONNECTION_EVENTS_TOTAL,
-    SERVER_DATA_BYTES_TOTAL, SERVER_RECONNECTIONS_TOTAL,
-};
+use async_nats::Client;
+use protobuf::Message;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use tracing::{debug, info};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::time::interval;
+use tracing::{debug, error, info, warn};
+use videocall_types::protos::server_connection_packet::{
+    ConnectionMetadata, DataTransferInfo, EventType, ServerConnectionPacket,
+};
 
 /// Data tracking helper functions to keep DRY across WebTransport/QUIC
 pub struct DataTracker;
@@ -53,33 +55,116 @@ pub struct ConnectionInfo {
     pub session_id: String,
     pub customer_email: String,
     pub meeting_id: String,
-    pub protocol: String,
+    pub protocol: String, // "websocket", "webtransport", "quic"
     pub start_time: Instant,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub last_data_report: Instant,
 }
 
-/// Global connection tracker for server metrics
+// Global NATS client for server connection events
+static NATS_CLIENT: OnceLock<Client> = OnceLock::new();
+
+/// Default server stats reporting interval in seconds
+const DEFAULT_REPORTING_INTERVAL_SECS: u64 = 5;
+
+/// Get the server stats reporting interval from environment variable
+fn get_reporting_interval() -> Duration {
+    let interval_secs = std::env::var("SERVER_STATS_INTERVAL_SECS")
+        .unwrap_or_else(|_| DEFAULT_REPORTING_INTERVAL_SECS.to_string())
+        .parse::<u64>()
+        .unwrap_or(DEFAULT_REPORTING_INTERVAL_SECS);
+
+    Duration::from_secs(interval_secs)
+}
+
 pub struct ConnectionTracker {
-    connections: Arc<Mutex<HashMap<String, ConnectionInfo>>>,
-    customer_connections: Arc<Mutex<HashMap<String, u32>>>, // email -> connection_count
-}
-
-impl Default for ConnectionTracker {
-    fn default() -> Self {
-        Self::new()
-    }
+    connections: Mutex<HashMap<String, ConnectionInfo>>,
+    // (customer_email, meeting_id) -> reconnection_count
+    reconnections: Mutex<HashMap<(String, String), u64>>,
+    server_instance: String,
+    region: String,
+    service_type: String,
 }
 
 impl ConnectionTracker {
     pub fn new() -> Self {
-        Self {
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            customer_connections: Arc::new(Mutex::new(HashMap::new())),
+        let server_instance = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("SERVER_ID"))
+            .unwrap_or_else(|_| "server-unknown".to_string());
+        let region = std::env::var("REGION").unwrap_or_else(|_| "us-east".to_string());
+        let service_type =
+            std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
+
+        ConnectionTracker {
+            connections: Mutex::new(HashMap::new()),
+            reconnections: Mutex::new(HashMap::new()),
+            server_instance,
+            region,
+            service_type,
         }
     }
 
-    /// Track a new connection start
+    /// Initialize the global NATS client for publishing events
+    pub fn init_nats_client(client: Client) -> Result<(), Client> {
+        NATS_CLIENT.set(client)
+    }
+
+    /// Get current timestamp in milliseconds
+    fn current_timestamp_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_millis() as u64
+    }
+
+    /// Create connection metadata
+    fn create_metadata(
+        &self,
+        session_id: &str,
+        customer_email: &str,
+        meeting_id: &str,
+        protocol: &str,
+    ) -> ConnectionMetadata {
+        let mut metadata = ConnectionMetadata::new();
+        metadata.session_id = session_id.to_string();
+        metadata.customer_email = customer_email.to_string();
+        metadata.meeting_id = meeting_id.to_string();
+        metadata.protocol = protocol.to_string();
+        metadata.server_instance = self.server_instance.clone();
+        metadata.region = self.region.clone();
+        metadata
+    }
+
+    /// Publish event to NATS
+    async fn publish_event(&self, packet: ServerConnectionPacket) {
+        if let Some(client) = NATS_CLIENT.get() {
+            let topic = format!(
+                "server.connections.{}.{}.{}",
+                self.region, self.service_type, self.server_instance
+            );
+
+            match packet.write_to_bytes() {
+                Ok(payload) => {
+                    if let Err(e) = client.publish(topic.clone(), payload.into()).await {
+                        error!(
+                            "Failed to publish server event to NATS topic {}: {}",
+                            topic, e
+                        );
+                    } else {
+                        debug!("Published server event to NATS topic: {}", topic);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize server connection packet: {}", e);
+                }
+            }
+        } else {
+            warn!("NATS client not available, skipping event publication");
+        }
+    }
+
+    /// Track a new connection starting
     pub fn connection_started(
         &self,
         session_id: String,
@@ -87,97 +172,91 @@ impl ConnectionTracker {
         meeting_id: String,
         protocol: String,
     ) {
+        let mut connections = self.connections.lock().unwrap();
+        let mut reconnections = self.reconnections.lock().unwrap();
+
+        let key = (customer_email.clone(), meeting_id.clone());
+        let is_reconnection = reconnections.contains_key(&key);
+
+        if is_reconnection {
+            info!(
+                "Reconnection detected for customer: {}, meeting: {}",
+                customer_email, meeting_id
+            );
+        }
+        let count = reconnections.get(&key).unwrap_or(&0) + 1;
+        reconnections.insert(key, count);
+
+        let now = Instant::now();
         let info = ConnectionInfo {
             session_id: session_id.clone(),
             customer_email: customer_email.clone(),
             meeting_id: meeting_id.clone(),
             protocol: protocol.clone(),
-            start_time: Instant::now(),
+            start_time: now,
             bytes_sent: 0,
             bytes_received: 0,
+            last_data_report: now,
         };
+        connections.insert(session_id.clone(), info);
 
-        // Store connection info
-        {
-            let mut connections = self.connections.lock().unwrap();
-            connections.insert(session_id.clone(), info);
-        }
-
-        // Update customer connection count and check for reconnections
-        {
-            let mut customer_conns = self.customer_connections.lock().unwrap();
-            let customer_key = format!("{customer_email}:{meeting_id}");
-            let count = customer_conns.entry(customer_key.clone()).or_insert(0);
-            *count += 1;
-
-            // If this isn't the first connection, it's a reconnection
-            if *count > 1 {
-                info!(
-                    "Reconnection detected for customer {} in meeting {}",
-                    customer_email, meeting_id
-                );
-                SERVER_RECONNECTIONS_TOTAL
-                    .with_label_values(&[&protocol, &customer_email, &meeting_id])
-                    .inc();
-            }
-        }
-
-        // Update active connections metric
-        SERVER_CONNECTIONS_ACTIVE
-            .with_label_values(&[&protocol, &customer_email, &meeting_id, &session_id])
-            .set(1.0);
-
-        // Track connection event
-        SERVER_CONNECTION_EVENTS_TOTAL
-            .with_label_values(&["connected", &protocol, &customer_email, &meeting_id])
-            .inc();
-
-        info!(
+        debug!(
             "Connection started: session={}, customer={}, meeting={}, protocol={}",
             session_id, customer_email, meeting_id, protocol
         );
+
+        // Publish connection started event
+        let metadata = self.create_metadata(&session_id, &customer_email, &meeting_id, &protocol);
+        let mut packet = ServerConnectionPacket::new();
+        packet.event_type = EventType::CONNECTION_STARTED.into();
+        packet.timestamp_ms = Self::current_timestamp_ms();
+        packet.connection = Some(metadata).into();
+        packet.is_reconnection = is_reconnection;
+
+        if NATS_CLIENT.get().is_some() {
+            tokio::spawn(async move {
+                GLOBAL_TRACKER.publish_event(packet).await;
+            });
+        }
     }
 
-    /// Track connection end and record duration
+    /// Track a connection ending
     pub fn connection_ended(&self, session_id: &str) {
-        let connection_info = {
-            let mut connections = self.connections.lock().unwrap();
-            connections.remove(session_id)
-        };
+        let mut connections = self.connections.lock().unwrap();
+        if let Some(info) = connections.remove(session_id) {
+            let duration_ms = info.start_time.elapsed().as_millis() as u64;
 
-        if let Some(info) = connection_info {
-            let duration = info.start_time.elapsed().as_secs_f64();
-
-            // Record duration histogram
-            SERVER_CONNECTION_DURATION_SECONDS.observe(duration);
-
-            // Clear active connection metric
-            SERVER_CONNECTIONS_ACTIVE
-                .with_label_values(&[
-                    &info.protocol,
-                    &info.customer_email,
-                    &info.meeting_id,
-                    &info.session_id,
-                ])
-                .set(0.0);
-
-            // Track disconnection event
-            SERVER_CONNECTION_EVENTS_TOTAL
-                .with_label_values(&[
-                    "disconnected",
-                    &info.protocol,
-                    &info.customer_email,
-                    &info.meeting_id,
-                ])
-                .inc();
-
-            info!(
-                "Connection ended: session={}, customer={}, meeting={}, protocol={}, duration={}s, sent={}bytes, received={}bytes",
-                info.session_id, info.customer_email, info.meeting_id, info.protocol,
-                duration, info.bytes_sent, info.bytes_received
+            debug!(
+                "Connection ended: session={}, customer={}, meeting={}, protocol={}, duration={}ms, sent={}B, received={}B",
+                info.session_id, info.customer_email, info.meeting_id, info.protocol, duration_ms, info.bytes_sent, info.bytes_received
             );
+
+            // Publish connection ended event
+            let metadata = self.create_metadata(
+                &info.session_id,
+                &info.customer_email,
+                &info.meeting_id,
+                &info.protocol,
+            );
+            let mut packet = ServerConnectionPacket::new();
+            packet.event_type = EventType::CONNECTION_ENDED.into();
+            packet.timestamp_ms = Self::current_timestamp_ms();
+            packet.connection = Some(metadata).into();
+            packet.connection_duration_ms = duration_ms;
+
+            // Include final data transfer stats
+            let mut data_transfer = DataTransferInfo::new();
+            data_transfer.bytes_sent = info.bytes_sent;
+            data_transfer.bytes_received = info.bytes_received;
+            packet.data_transfer = Some(data_transfer).into();
+
+            if NATS_CLIENT.get().is_some() {
+                tokio::spawn(async move {
+                    GLOBAL_TRACKER.publish_event(packet).await;
+                });
+            }
         } else {
-            debug!("Connection end tracked for unknown session: {}", session_id);
+            debug!("Connection ended for unknown session_id: {}", session_id);
         }
     }
 
@@ -186,17 +265,6 @@ impl ConnectionTracker {
         let mut connections = self.connections.lock().unwrap();
         if let Some(info) = connections.get_mut(session_id) {
             info.bytes_sent += bytes;
-
-            // Update cumulative bytes metric
-            SERVER_DATA_BYTES_TOTAL
-                .with_label_values(&[
-                    "sent",
-                    &info.protocol,
-                    &info.customer_email,
-                    &info.meeting_id,
-                    &info.session_id,
-                ])
-                .add(bytes as f64);
         }
     }
 
@@ -205,23 +273,65 @@ impl ConnectionTracker {
         let mut connections = self.connections.lock().unwrap();
         if let Some(info) = connections.get_mut(session_id) {
             info.bytes_received += bytes;
-
-            // Update cumulative bytes metric
-            SERVER_DATA_BYTES_TOTAL
-                .with_label_values(&[
-                    "received",
-                    &info.protocol,
-                    &info.customer_email,
-                    &info.meeting_id,
-                    &info.session_id,
-                ])
-                .add(bytes as f64);
         }
     }
 
     /// Get current connection count for debugging
     pub fn get_connection_count(&self) -> usize {
         self.connections.lock().unwrap().len()
+    }
+
+    /// Start periodic data reporting task (configurable via SERVER_STATS_INTERVAL_SECS env var)
+    pub async fn start_periodic_reporting(&self) {
+        if NATS_CLIENT.get().is_none() {
+            warn!("NATS client not available, periodic reporting disabled");
+            return;
+        }
+
+        let reporting_interval = get_reporting_interval();
+        info!(
+            "Starting periodic server stats reporting every {:?}",
+            reporting_interval
+        );
+
+        let mut interval = interval(reporting_interval);
+        loop {
+            interval.tick().await;
+            self.report_current_data_usage().await;
+        }
+    }
+
+    /// Report current data usage for all active connections
+    async fn report_current_data_usage(&self) {
+        let connections_snapshot = {
+            let connections = self.connections.lock().unwrap();
+            connections.clone()
+        };
+
+        for (_session_id, info) in connections_snapshot {
+            // Only report if we have new data since last report
+            let should_report = info.bytes_sent > 0 || info.bytes_received > 0;
+
+            if should_report {
+                let metadata = self.create_metadata(
+                    &info.session_id,
+                    &info.customer_email,
+                    &info.meeting_id,
+                    &info.protocol,
+                );
+                let mut data_transfer = DataTransferInfo::new();
+                data_transfer.bytes_sent = info.bytes_sent;
+                data_transfer.bytes_received = info.bytes_received;
+
+                let mut packet = ServerConnectionPacket::new();
+                packet.event_type = EventType::DATA_TRANSFERRED.into();
+                packet.timestamp_ms = Self::current_timestamp_ms();
+                packet.connection = Some(metadata).into();
+                packet.data_transfer = Some(data_transfer).into();
+
+                self.publish_event(packet).await;
+            }
+        }
     }
 }
 

@@ -239,21 +239,21 @@ lazy_static! {
     )
     .expect("Failed to create client_active_server metric");
 
-    // ===== SERVER-SIDE METRICS =====
+    // ===== SERVER-SIDE METRICS (via NATS) =====
 
-    /// Active connections on this server by protocol and customer
+    /// Active connections on servers by protocol and customer
     pub static ref SERVER_CONNECTIONS_ACTIVE: GaugeVec = register_gauge_vec!(
         "videocall_server_connections_active",
-        "Number of active connections on this server",
-        &["protocol", "customer_email", "meeting_id", "session_id"]
+        "Number of active connections on servers",
+        &["protocol", "customer_email", "meeting_id", "server_instance", "region"]
     )
     .expect("Failed to create server_connections_active metric");
 
-    /// Total data bytes transferred by this server per customer
+    /// Total data bytes transferred by servers per customer
     pub static ref SERVER_DATA_BYTES_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_server_data_bytes_total",
-        "Cumulative bytes transferred by this server per customer",
-        &["direction", "protocol", "customer_email", "meeting_id", "session_id"]
+        "Cumulative bytes transferred by servers per customer",
+        &["direction", "protocol", "customer_email", "meeting_id", "server_instance", "region"]
     )
     .expect("Failed to create server_data_bytes_total metric");
 
@@ -266,10 +266,9 @@ lazy_static! {
     .expect("Failed to create server_connection_duration_seconds metric");
 
     /// Connection lifecycle events counter
-    pub static ref SERVER_CONNECTION_EVENTS_TOTAL: GaugeVec = register_gauge_vec!(
+    pub static ref SERVER_CONNECTION_EVENTS_TOTAL: Counter = register_counter!(
         "videocall_server_connection_events_total",
-        "Total connection lifecycle events on this server",
-        &["event_type", "protocol", "customer_email", "meeting_id"]
+        "Total connection lifecycle events on servers"
     )
     .expect("Failed to create server_connection_events_total metric");
 
@@ -277,7 +276,7 @@ lazy_static! {
     pub static ref SERVER_RECONNECTIONS_TOTAL: GaugeVec = register_gauge_vec!(
         "videocall_server_reconnections_total",
         "Total reconnections per customer and meeting",
-        &["protocol", "customer_email", "meeting_id"]
+        &["protocol", "customer_email", "meeting_id", "server_instance", "region"]
     )
     .expect("Failed to create server_reconnections_total metric");
 }

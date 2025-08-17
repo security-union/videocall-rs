@@ -45,13 +45,11 @@ struct ConnectionData {
 // Complete state snapshot approach
 #[derive(Debug, Clone)]
 struct ServerSnapshot {
-    server_id: String,
-    region: String,
     last_seen: Instant,
     // Raw metrics snapshot from this server with per-connection timestamps
-    connections: HashMap<String, ConnectionData>, // key: "websocket_customer@meeting_protocol"
+    connections: HashMap<String, ConnectionData>, // key: "session_id_protocol_customer_meeting_server_region"
     unique_users: HashMap<String, ConnectionData>, // key: "customer@meeting_region"
-    data_bytes: HashMap<String, ConnectionData>,  // key: "sent_protocol_customer@meeting"
+    data_bytes: HashMap<String, ConnectionData>, // key: "sent/received_session_id_protocol_customer_meeting_server_region"
 }
 
 type ServerSnapshots = Arc<Mutex<HashMap<String, ServerSnapshot>>>; // server_id -> snapshot
@@ -221,8 +219,6 @@ async fn update_connection_with_timestamp(
     let snapshot = snapshots_guard
         .entry(server_id.clone())
         .or_insert_with(|| ServerSnapshot {
-            server_id: server_id.clone(),
-            region: conn.region.clone(),
             last_seen: Instant::now(),
             connections: HashMap::new(),
             unique_users: HashMap::new(),

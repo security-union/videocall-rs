@@ -16,7 +16,7 @@ scrape_configs:
       - targets: ['metrics-api:9091']
     metrics_path: '/metrics'
     scrape_interval: 5s
-    scrape_timeout: 10s
+    scrape_timeout: 4s
 
   # Server connection tracking (with session_id, stale cleanup, etc.)
   - job_name: 'videocall-server-stats'
@@ -24,7 +24,7 @@ scrape_configs:
       - targets: ['server-stats-api:9092']
     metrics_path: '/metrics'
     scrape_interval: 5s
-    scrape_timeout: 8s
+    scrape_timeout: 4s
 
 alerting:
   alertmanagers:

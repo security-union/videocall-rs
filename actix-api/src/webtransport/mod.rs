@@ -156,7 +156,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
     // Initialize global connection tracker with NATS client
     if let Err(e) = ConnectionTracker::init_nats_client(nc.clone()) {
-        error!("Failed to initialize NATS client for connection tracker: {e}");
+        error!("Failed to initialize NATS client for connection tracker: {e:?}");
     }
 
     // Start periodic data reporting (1 Hz)

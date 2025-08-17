@@ -112,7 +112,7 @@ services:
       dockerfile: ../docker/Dockerfile.actix
       context: ../docker
     working_dir: /app/actix-api
-    command: bash -c "cargo watch -x \"run -r --bin metrics_server \""
+    command: bash -c "cargo watch -x \"run -r --bin metrics_server_snapshot \""
     environment:
       - METRICS_PORT=9091
       - NATS_URL=nats:4222
@@ -158,6 +158,7 @@ services:
       - CARGO_NET_OFFLINE=false
     ports:
       - "4433:4433/udp"
+      - "5321:5321"  # Health/metrics port
     volumes:
       - type: bind
         source: ../

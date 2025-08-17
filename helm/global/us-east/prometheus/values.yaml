@@ -77,7 +77,7 @@ prometheus:
           static_configs:
             - targets: ['metrics-api-us-east:9091']
           metrics_path: '/metrics'
-          scrape_interval: 10s
+          scrape_interval: 5s
         
         # Kubernetes API server
         - job_name: 'kubernetes-apiservers'

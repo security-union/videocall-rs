@@ -9,9 +9,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task;
 use tracing::{debug, error, info};
 use videocall_types::protos::health_packet::HealthPacket as PbHealthPacket;
-use videocall_types::protos::server_connection_packet::{
-    EventType, ServerConnectionPacket as PbServerConnectionPacket,
-};
 
 use prometheus::{Encoder, TextEncoder};
 
@@ -36,19 +33,6 @@ struct SessionInfo {
 
 type SessionTracker = Arc<Mutex<HashMap<String, SessionInfo>>>;
 
-// Server connection tracking for cleanup
-#[derive(Debug, Clone)]
-struct ServerConnectionInfo {
-    customer_email: String,
-    meeting_id: String,
-    protocol: String,
-    server_instance: String,
-    region: String,
-    last_seen: Instant,
-}
-
-type ServerConnectionTracker = Arc<Mutex<HashMap<String, ServerConnectionInfo>>>;
-
 // Prometheus metrics (same as existing diagnostics.rs)
 // Import shared Prometheus metrics
 use sec_api::metrics::{
@@ -58,21 +42,17 @@ use sec_api::metrics::{
     NETEQ_MERGE_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
     NETEQ_PACKETS_PER_SEC, NETEQ_PREEMPTIVE_EXPAND_OPS_PER_SEC, NETEQ_UNDEFINED_OPS_PER_SEC,
     PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, SERVER_CONNECTIONS_ACTIVE,
-    SERVER_CONNECTION_DURATION_SECONDS, SERVER_CONNECTION_EVENTS_TOTAL, SERVER_DATA_BYTES_TOTAL,
-    SERVER_RECONNECTIONS_TOTAL, VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
+    SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, VIDEO_FPS, VIDEO_PACKETS_BUFFERED,
 };
 
 async fn metrics_handler(
     data: web::Data<HealthDataStore>,
     session_tracker: web::Data<SessionTracker>,
-    server_tracker: web::Data<ServerConnectionTracker>,
 ) -> Result<HttpResponse> {
     drop(data.lock().unwrap());
 
-    // Clean up stale sessions and server metrics before processing metrics
+    // Clean up stale sessions before processing metrics
     cleanup_stale_sessions(&session_tracker);
-    cleanup_stale_server_metrics(&server_tracker);
 
     // Do not mutate metrics here. Metrics are updated only on fresh NATS messages.
 
@@ -641,342 +621,6 @@ async fn handle_health_message(
     Ok(())
 }
 
-/// Clean up stale server connection metrics that haven't been updated in 60 seconds
-fn cleanup_stale_server_metrics(server_tracker: &ServerConnectionTracker) {
-    use std::time::Duration;
-    let mut tracker = server_tracker.lock().unwrap();
-    let now = Instant::now();
-    let timeout = Duration::from_secs(60); // 60 second timeout
-
-    let mut to_remove = Vec::new();
-
-    for (key, connection_info) in tracker.iter() {
-        if now.duration_since(connection_info.last_seen) > timeout {
-            to_remove.push(key.clone());
-        }
-    }
-
-    for key in to_remove {
-        if let Some(connection_info) = tracker.remove(&key) {
-            info!(
-                "Cleaning up stale server metrics: {}@{} -> {}/{}",
-                connection_info.customer_email,
-                connection_info.meeting_id,
-                connection_info.protocol,
-                connection_info.server_instance
-            );
-
-            // Remove server metrics for this connection
-            remove_server_connection_metrics(&connection_info);
-        }
-    }
-}
-
-/// Remove all server metrics for a specific connection
-fn remove_server_connection_metrics(connection_info: &ServerConnectionInfo) {
-    // Remove active connection metric
-    SERVER_CONNECTIONS_ACTIVE
-        .remove_label_values(&[
-            &connection_info.protocol,
-            &connection_info.customer_email,
-            &connection_info.meeting_id,
-            &connection_info.server_instance,
-            &connection_info.region,
-        ])
-        .unwrap_or_default();
-
-    // Remove data transfer metrics
-    SERVER_DATA_BYTES_TOTAL
-        .remove_label_values(&[
-            "sent",
-            &connection_info.protocol,
-            &connection_info.customer_email,
-            &connection_info.meeting_id,
-            &connection_info.server_instance,
-            &connection_info.region,
-        ])
-        .unwrap_or_default();
-
-    SERVER_DATA_BYTES_TOTAL
-        .remove_label_values(&[
-            "received",
-            &connection_info.protocol,
-            &connection_info.customer_email,
-            &connection_info.meeting_id,
-            &connection_info.server_instance,
-            &connection_info.region,
-        ])
-        .unwrap_or_default();
-
-    // Remove reconnection metrics
-    SERVER_RECONNECTIONS_TOTAL
-        .remove_label_values(&[
-            &connection_info.protocol,
-            &connection_info.customer_email,
-            &connection_info.meeting_id,
-            &connection_info.server_instance,
-            &connection_info.region,
-        ])
-        .unwrap_or_default();
-
-    debug!(
-        "Removed server metrics for connection: {}",
-        connection_info.customer_email
-    );
-}
-
-async fn nats_server_consumer(
-    nats_client: Client,
-    server_tracker: ServerConnectionTracker,
-) -> anyhow::Result<()> {
-    // Subscribe to all server connection topics from all regions
-    let queue_group = "metrics-server-connection-events";
-    let mut subscription = nats_client
-        .queue_subscribe("server.connections.>", queue_group.to_string())
-        .await?;
-
-    info!("Subscribed to NATS topic: server.connections.>");
-
-    while let Some(message) = subscription.next().await {
-        debug!(
-            "Received server connection message from NATS: {}",
-            message.subject
-        );
-        if let Err(e) = handle_server_connection_message(message, &server_tracker).await {
-            error!("Failed to handle server connection message: {}", e);
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_server_connection_message(
-    message: Message,
-    server_tracker: &ServerConnectionTracker,
-) -> anyhow::Result<()> {
-    let topic = &message.subject;
-    debug!("Received server connection data from topic: {}", topic);
-
-    // Parse protobuf server connection packet
-    let connection_packet: PbServerConnectionPacket =
-        PbServerConnectionPacket::parse_from_bytes(&message.payload)?;
-
-    // Freshness guard: discard stale packets (30 seconds timeout)
-    let now_ms: u128 = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-    let packet_ts_ms: u128 = connection_packet.timestamp_ms as u128;
-
-    let is_fresh = now_ms.saturating_sub(packet_ts_ms) <= 30_000;
-    if !is_fresh {
-        debug!(
-            "Discarded stale server connection packet on topic {}",
-            topic
-        );
-        return Ok(());
-    }
-
-    // Process based on event type
-    let event_type = connection_packet
-        .event_type
-        .enum_value()
-        .unwrap_or(EventType::UNKNOWN);
-
-    match event_type {
-        EventType::CONNECTION_STARTED => {
-            handle_connection_started(&connection_packet, server_tracker).await?;
-        }
-        EventType::CONNECTION_ENDED => {
-            handle_connection_ended(&connection_packet, server_tracker).await?;
-        }
-        EventType::DATA_TRANSFERRED => {
-            handle_data_transferred(&connection_packet, server_tracker).await?;
-        }
-        EventType::UNKNOWN => {
-            debug!("Received unknown server connection event type");
-        }
-    }
-
-    // Increment events counter
-    SERVER_CONNECTION_EVENTS_TOTAL.inc();
-
-    debug!("Processed server connection event for topic {}", topic);
-    Ok(())
-}
-
-async fn handle_connection_started(
-    packet: &PbServerConnectionPacket,
-    server_tracker: &ServerConnectionTracker,
-) -> anyhow::Result<()> {
-    let conn = packet
-        .connection
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Missing connection metadata"))?;
-
-    // Increment active connections
-    SERVER_CONNECTIONS_ACTIVE
-        .with_label_values(&[
-            &conn.protocol,
-            &conn.customer_email,
-            &conn.meeting_id,
-            &conn.server_instance,
-            &conn.region,
-        ])
-        .inc();
-
-    // Track reconnection if it's detected
-    if packet.is_reconnection {
-        SERVER_RECONNECTIONS_TOTAL
-            .with_label_values(&[
-                &conn.protocol,
-                &conn.customer_email,
-                &conn.meeting_id,
-                &conn.server_instance,
-                &conn.region,
-            ])
-            .inc();
-    }
-
-    // Track this connection for cleanup
-    let connection_key = format!(
-        "{}_{}_{}_{}_{}",
-        conn.protocol, conn.customer_email, conn.meeting_id, conn.server_instance, conn.region
-    );
-    let connection_info = ServerConnectionInfo {
-        customer_email: conn.customer_email.clone(),
-        meeting_id: conn.meeting_id.clone(),
-        protocol: conn.protocol.clone(),
-        server_instance: conn.server_instance.clone(),
-        region: conn.region.clone(),
-        last_seen: Instant::now(),
-    };
-    server_tracker
-        .lock()
-        .unwrap()
-        .insert(connection_key, connection_info);
-
-    debug!(
-        "Connection started: {}@{} -> {}/{}",
-        conn.customer_email, conn.meeting_id, conn.protocol, conn.server_instance
-    );
-    Ok(())
-}
-
-async fn handle_connection_ended(
-    packet: &PbServerConnectionPacket,
-    server_tracker: &ServerConnectionTracker,
-) -> anyhow::Result<()> {
-    let conn = packet
-        .connection
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Missing connection metadata"))?;
-
-    // Decrement active connections
-    SERVER_CONNECTIONS_ACTIVE
-        .with_label_values(&[
-            &conn.protocol,
-            &conn.customer_email,
-            &conn.meeting_id,
-            &conn.server_instance,
-            &conn.region,
-        ])
-        .dec();
-
-    // Record connection duration
-    if packet.connection_duration_ms > 0 {
-        let duration_seconds = packet.connection_duration_ms as f64 / 1000.0;
-        SERVER_CONNECTION_DURATION_SECONDS.observe(duration_seconds);
-    }
-
-    // Clean up data transfer metrics when connection ends
-    // Reset to 0 so rates go to 0 properly in Grafana
-    SERVER_DATA_BYTES_TOTAL
-        .with_label_values(&[
-            "sent",
-            &conn.protocol,
-            &conn.customer_email,
-            &conn.meeting_id,
-            &conn.server_instance,
-            &conn.region,
-        ])
-        .set(0.0);
-
-    SERVER_DATA_BYTES_TOTAL
-        .with_label_values(&[
-            "received",
-            &conn.protocol,
-            &conn.customer_email,
-            &conn.meeting_id,
-            &conn.server_instance,
-            &conn.region,
-        ])
-        .set(0.0);
-
-    // Remove from tracking
-    let connection_key = format!(
-        "{}_{}_{}_{}_{}",
-        conn.protocol, conn.customer_email, conn.meeting_id, conn.server_instance, conn.region
-    );
-    server_tracker.lock().unwrap().remove(&connection_key);
-
-    debug!(
-        "Connection ended: {}@{} -> {}/{}",
-        conn.customer_email, conn.meeting_id, conn.protocol, conn.server_instance
-    );
-    Ok(())
-}
-
-async fn handle_data_transferred(
-    packet: &PbServerConnectionPacket,
-    server_tracker: &ServerConnectionTracker,
-) -> anyhow::Result<()> {
-    let conn = packet
-        .connection
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Missing connection metadata"))?;
-
-    let data_transfer = packet
-        .data_transfer
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Missing data transfer info"))?;
-
-    // Update cumulative data transfer metrics
-    if data_transfer.bytes_sent > 0 {
-        SERVER_DATA_BYTES_TOTAL
-            .with_label_values(&[
-                "sent",
-                &conn.protocol,
-                &conn.customer_email,
-                &conn.meeting_id,
-                &conn.server_instance,
-                &conn.region,
-            ])
-            .set(data_transfer.bytes_sent as f64);
-    }
-
-    if data_transfer.bytes_received > 0 {
-        SERVER_DATA_BYTES_TOTAL
-            .with_label_values(&[
-                "received",
-                &conn.protocol,
-                &conn.customer_email,
-                &conn.meeting_id,
-                &conn.server_instance,
-                &conn.region,
-            ])
-            .set(data_transfer.bytes_received as f64);
-    }
-
-    // Update tracking timestamp
-    let connection_key = format!(
-        "{}_{}_{}_{}_{}",
-        conn.protocol, conn.customer_email, conn.meeting_id, conn.server_instance, conn.region
-    );
-    if let Some(connection_info) = server_tracker.lock().unwrap().get_mut(&connection_key) {
-        connection_info.last_seen = Instant::now();
-    }
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -1004,25 +648,13 @@ async fn main() -> anyhow::Result<()> {
     // Create shared session tracker
     let session_tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
 
-    // Create shared server connection tracker
-    let server_tracker: ServerConnectionTracker = Arc::new(Mutex::new(HashMap::new()));
-
-    // Start NATS health consumer in background
+    // Start NATS consumer in background
     let nats_store = health_store.clone();
     let nats_client_clone = nats_client.clone();
     let nats_tracker = session_tracker.clone();
     task::spawn(async move {
         if let Err(e) = nats_health_consumer(nats_client_clone, nats_store, nats_tracker).await {
-            error!("NATS health consumer failed: {}", e);
-        }
-    });
-
-    // Start NATS server connection consumer in background
-    let nats_client_server = nats_client.clone();
-    let nats_server_tracker = server_tracker.clone();
-    task::spawn(async move {
-        if let Err(e) = nats_server_consumer(nats_client_server, nats_server_tracker).await {
-            error!("NATS server connection consumer failed: {}", e);
+            error!("NATS consumer failed: {}", e);
         }
     });
 
@@ -1032,7 +664,6 @@ async fn main() -> anyhow::Result<()> {
         App::new()
             .app_data(web::Data::new(health_store.clone()))
             .app_data(web::Data::new(session_tracker.clone()))
-            .app_data(web::Data::new(server_tracker.clone()))
             .route("/metrics", web::get().to(metrics_handler))
             .route(
                 "/health",
@@ -1421,14 +1052,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         {
             let tracker_clone = tracker.clone();
-            let server_tracker: ServerConnectionTracker = Arc::new(Mutex::new(HashMap::new()));
             rt.block_on(async move {
-                let resp = metrics_handler(
-                    web::Data::new(health_store),
-                    web::Data::new(tracker_clone),
-                    web::Data::new(server_tracker),
-                )
-                .await;
+                let resp =
+                    metrics_handler(web::Data::new(health_store), web::Data::new(tracker_clone))
+                        .await;
                 assert!(resp.is_ok());
             });
         }

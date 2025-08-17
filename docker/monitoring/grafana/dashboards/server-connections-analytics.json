@@ -7,13 +7,18 @@
     "panels": [
       {
         "id": 1,
-        "title": "Active Connections by Protocol",
+        "title": "Active Unique Users (Deduplicated)",
         "type": "stat",
         "targets": [
           {
-            "expr": "sum by (protocol, server_instance) (videocall_server_connections_active)",
+            "expr": "sum by (region) (videocall_server_unique_users_active)",
             "refId": "A",
-            "legendFormat": "{{server_instance}} - {{protocol}}"
+            "legendFormat": "{{region}} - Unique Users"
+          },
+          {
+            "expr": "sum by (protocol) (videocall_server_protocol_connections)",
+            "refId": "B",
+            "legendFormat": "{{protocol}} connections"
           }
         ],
         "fieldConfig": {
@@ -65,11 +70,11 @@
       },
       {
         "id": 2,
-        "title": "Top Customers by Connection Count",
+        "title": "Top Customers by Unique Connection Count",
         "type": "table",
         "targets": [
           {
-            "expr": "topk(10, sum by (customer_email, protocol, server_instance) (videocall_server_connections_active))",
+            "expr": "topk(10, sum by (customer_email, meeting_id, region) (videocall_server_unique_users_active))",
             "refId": "A",
             "format": "table"
           }
@@ -251,193 +256,6 @@
           "w": 12,
           "x": 0,
           "y": 16
-        }
-      },
-      {
-        "id": 5,
-        "title": "Reconnections by Protocol",
-        "type": "stat",
-        "targets": [
-          {
-            "expr": "sum by (protocol, server_instance) (rate(videocall_server_reconnections_total[1h]))",
-            "refId": "A",
-            "legendFormat": "{{server_instance}} - {{protocol}}"
-          }
-        ],
-        "fieldConfig": {
-          "defaults": {
-            "color": {
-              "mode": "thresholds"
-            },
-            "mappings": [],
-            "thresholds": {
-              "steps": [
-                {
-                  "color": "green",
-                  "value": null
-                },
-                {
-                  "color": "yellow",
-                  "value": 0.1
-                },
-                {
-                  "color": "red",
-                  "value": 0.5
-                }
-              ]
-            },
-            "unit": "reconnections/h"
-          },
-          "overrides": []
-        },
-        "options": {
-          "orientation": "auto",
-          "reduceOptions": {
-            "values": false,
-            "calcs": [
-              "lastNotNull"
-            ],
-            "fields": ""
-          },
-          "textMode": "auto",
-          "colorMode": "value",
-          "graphMode": "area",
-          "justifyMode": "auto"
-        },
-        "pluginVersion": "8.5.2",
-        "gridPos": {
-          "h": 8,
-          "w": 12,
-          "x": 12,
-          "y": 16
-        }
-      },
-      {
-        "id": 6,
-        "title": "Connection Duration Distribution",
-        "type": "histogram",
-        "targets": [
-          {
-            "expr": "rate(videocall_server_connection_duration_seconds_bucket[5m])",
-            "refId": "A",
-            "format": "heatmap",
-            "legendFormat": "{{le}}"
-          }
-        ],
-        "fieldConfig": {
-          "defaults": {
-            "custom": {
-              "hideFrom": {
-                "legend": false,
-                "tooltip": false,
-                "vis": false
-              }
-            },
-            "mappings": [],
-            "unit": "s"
-          },
-          "overrides": []
-        },
-        "options": {
-          "calculate": false,
-          "cellGap": 1,
-          "cellValues": {},
-          "color": {
-            "exponent": 0.5,
-            "fill": "dark-orange",
-            "mode": "spectrum",
-            "reverse": false,
-            "scale": "exponential",
-            "scheme": "Spectral",
-            "steps": 128
-          },
-          "exemplars": {
-            "color": "rgba(255,0,255,0.7)"
-          },
-          "filterValues": {
-            "le": 1e-9
-          },
-          "legend": {
-            "show": false
-          },
-          "rowsFrame": {
-            "layout": "auto"
-          },
-          "tooltip": {
-            "show": true,
-            "yHistogram": false
-          },
-          "yAxis": {
-            "axisPlacement": "left",
-            "reverse": false,
-            "unit": "s"
-          }
-        },
-        "gridPos": {
-          "h": 8,
-          "w": 24,
-          "x": 0,
-          "y": 24
-        }
-      },
-      {
-        "id": 7,
-        "title": "Top Data Consumers (Last Hour)",
-        "type": "table",
-        "targets": [
-          {
-            "expr": "topk(20, sum by (customer_email, protocol, server_instance) (increase(videocall_server_data_bytes_total[1h])))",
-            "refId": "A",
-            "format": "table"
-          }
-        ],
-        "fieldConfig": {
-          "defaults": {
-            "custom": {
-              "align": "auto",
-              "displayMode": "auto"
-            },
-            "mappings": [],
-            "thresholds": {
-              "steps": [
-                {
-                  "color": "green",
-                  "value": null
-                }
-              ]
-            },
-            "unit": "bytes"
-          },
-          "overrides": [
-            {
-              "matcher": {
-                "id": "byName",
-                "options": "Value"
-              },
-              "properties": [
-                {
-                  "id": "unit",
-                  "value": "decbytes"
-                }
-              ]
-            }
-          ]
-        },
-        "options": {
-          "showHeader": true,
-          "sortBy": [
-            {
-              "desc": true,
-              "displayName": "Value"
-            }
-          ]
-        },
-        "pluginVersion": "8.5.2",
-        "gridPos": {
-          "h": 8,
-          "w": 24,
-          "x": 0,
-          "y": 32
         }
       }
     ],

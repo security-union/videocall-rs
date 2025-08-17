@@ -60,7 +60,6 @@ async fn main() {
         },
     };
 
-    let listen = opt.listen;
     actix_rt::spawn(async move {
         info!("Starting health/metrics HTTP server: {:?}", health_listen);
         let server =

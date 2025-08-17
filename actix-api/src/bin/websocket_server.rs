@@ -32,7 +32,6 @@ use actix_web::{
     App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
-use prometheus::{Encoder, TextEncoder};
 use reqwest::header::LOCATION;
 use sec_api::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},

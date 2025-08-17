@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::connection_tracker::{DataTracker, GLOBAL_TRACKER};
 use crate::diagnostics::health_processor;
 use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
@@ -31,6 +32,7 @@ use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, error, info, trace, trace_span};
+
 use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -239,6 +241,17 @@ async fn handle_webtransport_session(
     lobby_id: &str,
     nc: async_nats::client::Client,
 ) -> anyhow::Result<()> {
+    // Generate unique session ID for this WebTransport connection
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    // Track connection start for metrics
+    GLOBAL_TRACKER.connection_started(
+        session_id.clone(),
+        username.to_string(),
+        lobby_id.to_string(),
+        "webtransport".to_string(),
+    );
+
     let session = Arc::new(RwLock::new(session));
     let should_run = Arc::new(AtomicBool::new(true));
 
@@ -266,6 +279,7 @@ async fn handle_webtransport_session(
     let nats_receive_task = {
         let session = session.clone();
         let should_run = should_run.clone();
+        let session_id_clone = session_id.clone();
         tokio::spawn(async move {
             while let Some(msg) = sub.next().await {
                 if !should_run.load(Ordering::SeqCst) {
@@ -276,11 +290,16 @@ async fn handle_webtransport_session(
                 }
                 let session = session.read().await;
                 let stream = session.open_uni().await;
+                let session_id_clone = session_id_clone.clone();
+                let payload_size = msg.payload.len() as u64;
                 tokio::spawn(async move {
                     match stream {
                         Ok(mut uni_stream) => {
                             if let Err(e) = uni_stream.write_all(&msg.payload).await {
                                 error!("Error writing to unidirectional stream: {}", e);
+                            } else {
+                                // Track data sent
+                                DataTracker::track_sent(&session_id_clone, payload_size);
                             }
                         }
                         Err(e) => {
@@ -296,16 +315,22 @@ async fn handle_webtransport_session(
         let session = session.clone();
         let nc = nc.clone();
         let specific_subject = specific_subject.clone();
+        let session_id_clone = session_id.clone();
         tokio::spawn(async move {
             let session = session.read().await;
             while let Ok(mut uni_stream) = session.accept_uni().await {
                 let nc = nc.clone();
                 let specific_subject = specific_subject.clone();
                 let session_clone = session.clone();
+                let session_id_clone = session_id_clone.clone();
                 tokio::spawn(async move {
                     let result = uni_stream.read_to_end(usize::MAX).await;
                     match result {
                         Ok(buf) => {
+                            let buf_size = buf.len() as u64;
+                            // Track data received
+                            DataTracker::track_received(&session_id_clone, buf_size);
+
                             // Check if this is an RTT packet that should be echoed back
                             if is_rtt_packet(&buf) {
                                 trace!("Echoing RTT packet back via WebTransport");
@@ -313,6 +338,9 @@ async fn handle_webtransport_session(
                                     Ok(mut echo_stream) => {
                                         if let Err(e) = echo_stream.write_all(&buf).await {
                                             error!("Error echoing RTT packet: {}", e);
+                                        } else {
+                                            // Track data sent for echo
+                                            DataTracker::track_sent(&session_id_clone, buf_size);
                                         }
                                     }
                                     Err(e) => {
@@ -348,14 +376,22 @@ async fn handle_webtransport_session(
 
     let _datagrams_task = {
         let session_clone = session.clone();
+        let session_id_clone = session_id.clone();
         tokio::spawn(async move {
             let session = session_clone.read().await;
             while let Ok(buf) = session.read_datagram().await {
+                let buf_size = buf.len() as u64;
+                // Track data received
+                DataTracker::track_received(&session_id_clone, buf_size);
+
                 // Check if this is an RTT packet that should be echoed back
                 if is_rtt_packet(&buf) {
                     debug!("Echoing RTT datagram back via WebTransport");
-                    if let Err(e) = session.send_datagram(buf) {
+                    if let Err(e) = session.send_datagram(buf.clone()) {
                         error!("Error echoing RTT datagram: {}", e);
+                    } else {
+                        // Track data sent for echo
+                        DataTracker::track_sent(&session_id_clone, buf_size);
                     }
                 } else if health_processor::is_health_packet_bytes(&buf) {
                     // Process health packet for diagnostics (don't relay)
@@ -373,7 +409,11 @@ async fn handle_webtransport_session(
     quic_task.await?;
     should_run.store(false, Ordering::SeqCst);
     nats_receive_task.abort();
-    info!("Finished handling session");
+
+    // Track connection end for metrics
+    GLOBAL_TRACKER.connection_ended(&session_id);
+
+    info!("Finished handling session: {}", session_id);
     Ok(())
 }
 
@@ -382,6 +422,8 @@ async fn handle_quic_connection(
     nc: async_nats::client::Client,
 ) -> Result<()> {
     let _session_id = conn.stable_id();
+    // Generate session ID for metrics tracking (will start tracking after CONNECTION packet)
+    let session_id = Arc::new(uuid::Uuid::new_v4().to_string());
     let session = Arc::new(RwLock::new(conn));
     let should_run = Arc::new(AtomicBool::new(true));
     let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<Subject>>(None);
@@ -391,6 +433,7 @@ async fn handle_quic_connection(
         let should_run = should_run.clone();
         let nc_clone = nc.clone();
         let specific_subject_rx_clone = specific_subject_rx.clone();
+        let session_id_clone = session_id.clone();
         tokio::spawn(async move {
             let mut specific_subject_rx = specific_subject_rx_clone;
             let nc = nc_clone;
@@ -421,11 +464,16 @@ async fn handle_quic_connection(
                 let session = session.read().await;
 
                 let stream = session.open_uni().await;
+                let session_id_clone = session_id_clone.clone();
+                let payload_size = msg.payload.len() as u64;
                 tokio::spawn(async move {
                     match stream {
                         Ok(mut uni_stream) => {
                             if let Err(e) = uni_stream.write_all(&msg.payload).await {
                                 error!("Error writing to unidirectional stream: {}", e);
+                            } else {
+                                // Track data sent
+                                DataTracker::track_sent(&session_id_clone, payload_size);
                             }
                         }
                         Err(e) => {
@@ -441,6 +489,7 @@ async fn handle_quic_connection(
         let specific_subject_rx_clone = specific_subject_rx.clone();
         let session = session.clone();
         let nc = nc.clone();
+        let session_id_arc = session_id.clone();
         tokio::spawn(async move {
             let session = session.read().await;
             let specific_subject_tx = Arc::new(specific_subject_tx);
@@ -449,9 +498,15 @@ async fn handle_quic_connection(
                 let specific_subject_tx_clone = specific_subject_tx.clone();
                 let specific_subject_rx = specific_subject_rx_clone.clone();
                 let session_for_echo = session.clone();
+                let session_id_inner = session_id_arc.clone();
                 tokio::spawn(async move {
                     if let Ok(d) = uni_stream.read_to_end(MAX_UNIDIRECTIONAL_STREAM_SIZE).await {
+                        let buf_size = d.len() as u64;
+
                         if specific_subject_rx.borrow().is_none() {
+                            // Track data received even during handshake
+                            DataTracker::track_received(&session_id_inner, buf_size);
+
                             if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(&d) {
                                 if packet_wrapper.packet_type == PacketType::CONNECTION.into() {
                                     info!("Got connection packet");
@@ -464,12 +519,24 @@ async fn handle_quic_connection(
                                     )
                                     .replace(' ', "_");
                                     info!("Specific subject: {}", specific_subject);
+
+                                    // Now we have customer info - start tracking the connection
+                                    GLOBAL_TRACKER.connection_started(
+                                        session_id_inner.as_ref().clone(),
+                                        packet_wrapper.email.clone(),
+                                        connection_packet.meeting_id.clone(),
+                                        "quic".to_string(),
+                                    );
+
                                     specific_subject_tx_clone
                                         .send(Some(specific_subject.into()))
                                         .unwrap();
                                 }
                             }
                         } else {
+                            // Track data received for established connections
+                            DataTracker::track_received(&session_id_inner, buf_size);
+
                             // Check if this is an RTT packet that should be echoed back
                             if is_rtt_packet(&d) {
                                 trace!("Echoing RTT packet back via QUIC");
@@ -478,6 +545,9 @@ async fn handle_quic_connection(
                                     Ok(mut echo_stream) => {
                                         if let Err(e) = echo_stream.write_all(&d).await {
                                             error!("Error echoing RTT packet via QUIC: {}", e);
+                                        } else {
+                                            // Track data sent for echo
+                                            DataTracker::track_sent(&session_id_inner, buf_size);
                                         }
                                     }
                                     Err(e) => {
@@ -510,6 +580,7 @@ async fn handle_quic_connection(
 
     let _datagrams_task = {
         let session_clone = session.clone();
+        let session_id_clone = session_id.clone();
         tokio::spawn(async move {
             let session = session_clone.read().await;
             if specific_subject_rx.borrow().is_none() {
@@ -517,11 +588,18 @@ async fn handle_quic_connection(
             }
             let specific_subject = specific_subject_rx.borrow().clone().unwrap();
             while let Ok(datagram) = session.read_datagram().await {
+                let datagram_size = datagram.len() as u64;
+                // Track data received
+                DataTracker::track_received(&session_id_clone, datagram_size);
+
                 // Check if this is an RTT packet that should be echoed back
                 if is_rtt_packet(&datagram) {
                     debug!("Echoing RTT datagram back via QUIC");
-                    if let Err(e) = session.send_datagram(datagram) {
+                    if let Err(e) = session.send_datagram(datagram.clone()) {
                         error!("Error echoing RTT datagram via QUIC: {}", e);
+                    } else {
+                        // Track data sent for echo
+                        DataTracker::track_sent(&session_id_clone, datagram_size);
                     }
                 } else {
                     // Normal datagram processing - publish to NATS
@@ -536,7 +614,11 @@ async fn handle_quic_connection(
     quic_task.await?;
     should_run.store(false, Ordering::SeqCst);
     nats_task.abort();
-    info!("Finished handling session");
+
+    // Track connection end for metrics
+    GLOBAL_TRACKER.connection_ended(&session_id);
+
+    info!("Finished handling QUIC session: {}", session_id);
     Ok(())
 }
 

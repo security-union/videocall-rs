@@ -238,4 +238,46 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id", "server_url", "server_type"]
     )
     .expect("Failed to create client_active_server metric");
+
+    // ===== SERVER-SIDE METRICS =====
+
+    /// Active connections on this server by protocol and customer
+    pub static ref SERVER_CONNECTIONS_ACTIVE: GaugeVec = register_gauge_vec!(
+        "videocall_server_connections_active",
+        "Number of active connections on this server",
+        &["protocol", "customer_email", "meeting_id", "session_id"]
+    )
+    .expect("Failed to create server_connections_active metric");
+
+    /// Total data bytes transferred by this server per customer
+    pub static ref SERVER_DATA_BYTES_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_server_data_bytes_total",
+        "Cumulative bytes transferred by this server per customer",
+        &["direction", "protocol", "customer_email", "meeting_id", "session_id"]
+    )
+    .expect("Failed to create server_data_bytes_total metric");
+
+    /// Connection duration in seconds (when connection closes)
+    pub static ref SERVER_CONNECTION_DURATION_SECONDS: Histogram = register_histogram!(
+        "videocall_server_connection_duration_seconds",
+        "Duration of server connections in seconds",
+        vec![1.0, 10.0, 30.0, 60.0, 300.0, 900.0, 1800.0, 3600.0, 7200.0] // 1s to 2h buckets
+    )
+    .expect("Failed to create server_connection_duration_seconds metric");
+
+    /// Connection lifecycle events counter
+    pub static ref SERVER_CONNECTION_EVENTS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_server_connection_events_total",
+        "Total connection lifecycle events on this server",
+        &["event_type", "protocol", "customer_email", "meeting_id"]
+    )
+    .expect("Failed to create server_connection_events_total metric");
+
+    /// Reconnection tracking per customer and meeting
+    pub static ref SERVER_RECONNECTIONS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_server_reconnections_total",
+        "Total reconnections per customer and meeting",
+        &["protocol", "customer_email", "meeting_id"]
+    )
+    .expect("Failed to create server_reconnections_total metric");
 }

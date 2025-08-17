@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::connection_tracker::GLOBAL_TRACKER;
 use crate::diagnostics::health_processor;
 use crate::messages::server::{ClientMessage, Packet};
 use crate::messages::session::Message;
@@ -109,6 +110,14 @@ impl Actor for WsChatSession {
     type Context = WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        // Track connection start for metrics
+        GLOBAL_TRACKER.connection_started(
+            self.id.clone(),
+            self.email.clone(),
+            self.room.clone(),
+            "websocket".to_string(),
+        );
+
         self.heartbeat(ctx);
         let addr = ctx.address();
         self.addr
@@ -129,6 +138,9 @@ impl Actor for WsChatSession {
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        // Track connection end for metrics
+        GLOBAL_TRACKER.connection_ended(&self.id);
+
         // notify chat server
         self.addr.do_send(Disconnect {
             session: self.id.clone(),
@@ -141,6 +153,8 @@ impl Handler<Message> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
+        // Track sent data when forwarding messages to clients
+        GLOBAL_TRACKER.track_data_sent(&self.id, msg.msg.len() as u64);
         ctx.binary(msg.msg);
     }
 }
@@ -181,9 +195,14 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             ws::Message::Binary(msg) => {
                 let msg_bytes = msg.to_vec();
 
+                // Track received data
+                GLOBAL_TRACKER.track_data_received(&self.id, msg_bytes.len() as u64);
+
                 // Check if this is an RTT packet that should be echoed back
                 if self.is_rtt_packet(&msg_bytes) {
                     trace!("Echoing RTT packet back to sender: {}", self.email);
+                    // Track sent data for echo
+                    GLOBAL_TRACKER.track_data_sent(&self.id, msg_bytes.len() as u64);
                     ctx.binary(msg_bytes);
                 } else if health_processor::is_health_packet_bytes(&msg_bytes) {
                     // Process health packet for diagnostics (don't relay to other peers)

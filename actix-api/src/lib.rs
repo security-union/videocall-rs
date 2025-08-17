@@ -18,6 +18,7 @@
 
 pub mod actors;
 pub mod auth;
+pub mod connection_tracker;
 pub mod constants;
 pub mod db;
 pub mod diagnostics;

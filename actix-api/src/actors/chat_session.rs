@@ -16,7 +16,9 @@
  * conditions.
  */
 
-use crate::connection_tracker::GLOBAL_TRACKER;
+use crate::connection_tracker::{
+    send_connection_ended, send_connection_started, DataTracker, TrackerSender,
+};
 use crate::diagnostics::health_processor;
 use crate::messages::server::{ClientMessage, Packet};
 use crate::messages::session::Message;
@@ -53,6 +55,7 @@ pub struct WsChatSession {
     pub heartbeat: Instant,
     pub email: Email,
     pub nats_client: async_nats::client::Client,
+    pub tracker_sender: TrackerSender,
 }
 
 impl WsChatSession {
@@ -61,6 +64,7 @@ impl WsChatSession {
         room: String,
         email: String,
         nats_client: async_nats::client::Client,
+        tracker_sender: TrackerSender,
     ) -> Self {
         info!("new session with room {} and email {}", room, email);
 
@@ -71,6 +75,7 @@ impl WsChatSession {
             email,
             addr,
             nats_client,
+            tracker_sender,
         }
     }
 
@@ -111,7 +116,8 @@ impl Actor for WsChatSession {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         // Track connection start for metrics
-        GLOBAL_TRACKER.connection_started(
+        send_connection_started(
+            &self.tracker_sender,
             self.id.clone(),
             self.email.clone(),
             self.room.clone(),
@@ -139,7 +145,7 @@ impl Actor for WsChatSession {
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
         // Track connection end for metrics
-        GLOBAL_TRACKER.connection_ended(&self.id);
+        send_connection_ended(&self.tracker_sender, self.id.clone());
 
         // notify chat server
         self.addr.do_send(Disconnect {
@@ -154,7 +160,8 @@ impl Handler<Message> for WsChatSession {
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         // Track sent data when forwarding messages to clients
-        GLOBAL_TRACKER.track_data_sent(&self.id, msg.msg.len() as u64);
+        let data_tracker = DataTracker::new(self.tracker_sender.clone());
+        data_tracker.track_sent(&self.id, msg.msg.len() as u64);
         ctx.binary(msg.msg);
     }
 }
@@ -196,13 +203,15 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 let msg_bytes = msg.to_vec();
 
                 // Track received data
-                GLOBAL_TRACKER.track_data_received(&self.id, msg_bytes.len() as u64);
+                let data_tracker = DataTracker::new(self.tracker_sender.clone());
+                data_tracker.track_received(&self.id, msg_bytes.len() as u64);
 
                 // Check if this is an RTT packet that should be echoed back
                 if self.is_rtt_packet(&msg_bytes) {
                     trace!("Echoing RTT packet back to sender: {}", self.email);
                     // Track sent data for echo
-                    GLOBAL_TRACKER.track_data_sent(&self.id, msg_bytes.len() as u64);
+                    let data_tracker = DataTracker::new(self.tracker_sender.clone());
+                    data_tracker.track_sent(&self.id, msg_bytes.len() as u64);
                     ctx.binary(msg_bytes);
                 } else if health_processor::is_health_packet_bytes(&msg_bytes) {
                     // Process health packet for diagnostics (don't relay to other peers)

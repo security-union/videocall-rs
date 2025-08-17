@@ -40,7 +40,7 @@ use sec_api::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
-    connection_tracker::{ConnectionTracker, GLOBAL_TRACKER},
+    connection_tracker::ConnectionTracker,
     db::{get_pool, PostgresPool},
     models::{AppConfig, AppState},
 };
@@ -200,7 +200,8 @@ pub async fn ws_connect(
     debug!("socket connected");
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
-    let actor = WsChatSession::new(chat, room, email, nats_client);
+    let tracker_sender = state.tracker_sender.clone();
+    let actor = WsChatSession::new(chat, room, email, nats_client, tracker_sender);
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)
 }
@@ -223,14 +224,15 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to connect to NATS");
     let chat = ChatServer::new(nats_client.clone()).await.start();
 
-    // Initialize global connection tracker with NATS client
-    if let Err(_) = ConnectionTracker::init_nats_client(nats_client.clone()) {
-        error!("Failed to initialize NATS client for connection tracker");
-    }
+    // Create connection tracker with message channel
+    let (connection_tracker, tracker_sender, tracker_receiver) =
+        ConnectionTracker::new_with_channel(nats_client.clone());
 
-    // Start periodic data reporting (1 Hz)
+    // Start the connection tracker message processing task
+    let connection_tracker = std::sync::Arc::new(connection_tracker);
+    let tracker_task = connection_tracker.clone();
     tokio::spawn(async move {
-        GLOBAL_TRACKER.start_periodic_reporting().await;
+        tracker_task.run_message_loop(tracker_receiver).await;
     });
     let oauth_client_id: String =
         std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
@@ -256,6 +258,7 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
+                    tracker_sender: tracker_sender.clone(),
                 }))
                 .service(ws_connect)
                 .route("/metrics", web::get().to(metrics_handler))
@@ -266,6 +269,7 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
+                    tracker_sender: tracker_sender.clone(),
                 }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),

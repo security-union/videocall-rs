@@ -21,32 +21,90 @@
 use async_nats::Client;
 use protobuf::Message;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use videocall_types::protos::server_connection_packet::{
     ConnectionMetadata, DataTransferInfo, EventType, ServerConnectionPacket,
 };
 
-/// Data tracking helper functions to keep DRY across WebTransport/QUIC
-pub struct DataTracker;
+/// Messages for the ConnectionTracker task
+#[derive(Debug, Clone)]
+pub enum TrackerMessage {
+    ConnectionStarted {
+        session_id: String,
+        customer_email: String,
+        meeting_id: String,
+        protocol: String,
+    },
+    ConnectionEnded {
+        session_id: String,
+    },
+    DataSent {
+        session_id: String,
+        bytes: u64,
+    },
+    DataReceived {
+        session_id: String,
+        bytes: u64,
+    },
+}
+
+/// Data tracking helper that uses message passing
+pub struct DataTracker {
+    sender: mpsc::UnboundedSender<TrackerMessage>,
+}
+
+/// Tracker sender for sending messages to the ConnectionTracker
+pub type TrackerSender = mpsc::UnboundedSender<TrackerMessage>;
+
+/// Convenience functions for sending tracker messages
+pub fn send_connection_started(
+    sender: &TrackerSender,
+    session_id: String,
+    customer_email: String,
+    meeting_id: String,
+    protocol: String,
+) {
+    let _ = sender.send(TrackerMessage::ConnectionStarted {
+        session_id,
+        customer_email,
+        meeting_id,
+        protocol,
+    });
+}
+
+pub fn send_connection_ended(sender: &TrackerSender, session_id: String) {
+    let _ = sender.send(TrackerMessage::ConnectionEnded { session_id });
+}
 
 impl DataTracker {
+    pub fn new(sender: mpsc::UnboundedSender<TrackerMessage>) -> Self {
+        DataTracker { sender }
+    }
+
     /// Track received data and update metrics
-    pub fn track_received(session_id: &str, bytes: u64) {
-        GLOBAL_TRACKER.track_data_received(session_id, bytes);
+    pub fn track_received(&self, session_id: &str, bytes: u64) {
+        let _ = self.sender.send(TrackerMessage::DataReceived {
+            session_id: session_id.to_string(),
+            bytes,
+        });
     }
 
     /// Track sent data and update metrics
-    pub fn track_sent(session_id: &str, bytes: u64) {
-        GLOBAL_TRACKER.track_data_sent(session_id, bytes);
+    pub fn track_sent(&self, session_id: &str, bytes: u64) {
+        let _ = self.sender.send(TrackerMessage::DataSent {
+            session_id: session_id.to_string(),
+            bytes,
+        });
     }
 
     /// Track echo (received + sent in one call)
-    pub fn track_echo(session_id: &str, bytes: u64) {
-        GLOBAL_TRACKER.track_data_received(session_id, bytes);
-        GLOBAL_TRACKER.track_data_sent(session_id, bytes);
+    pub fn track_echo(&self, session_id: &str, bytes: u64) {
+        self.track_received(session_id, bytes);
+        self.track_sent(session_id, bytes);
     }
 }
 
@@ -62,9 +120,6 @@ pub struct ConnectionInfo {
     pub last_data_report: Instant,
 }
 
-// Global NATS client for server connection events
-static NATS_CLIENT: OnceLock<Client> = OnceLock::new();
-
 /// Default server stats reporting interval in seconds
 const DEFAULT_REPORTING_INTERVAL_SECS: u64 = 5;
 
@@ -78,18 +133,19 @@ fn get_reporting_interval() -> Duration {
     Duration::from_secs(interval_secs)
 }
 
-#[derive(Default)]
+#[derive(Debug)]
 pub struct ConnectionTracker {
     connections: Mutex<HashMap<String, ConnectionInfo>>,
     // (customer_email, meeting_id) -> reconnection_count
     reconnections: Mutex<HashMap<(String, String), u64>>,
+    nats_client: Client,
     server_instance: String,
     region: String,
     service_type: String,
 }
 
 impl ConnectionTracker {
-    pub fn new() -> Self {
+    pub fn new(nats_client: Client) -> Self {
         let server_instance = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("SERVER_ID"))
             .unwrap_or_else(|_| "server-unknown".to_string());
@@ -100,15 +156,24 @@ impl ConnectionTracker {
         ConnectionTracker {
             connections: Mutex::new(HashMap::new()),
             reconnections: Mutex::new(HashMap::new()),
+            nats_client,
             server_instance,
             region,
             service_type,
         }
     }
 
-    /// Initialize the global NATS client for publishing events
-    pub fn init_nats_client(client: Client) -> Result<(), Client> {
-        NATS_CLIENT.set(client)
+    /// Create a ConnectionTracker with message channel
+    pub fn new_with_channel(
+        nats_client: Client,
+    ) -> (
+        Self,
+        mpsc::UnboundedSender<TrackerMessage>,
+        mpsc::UnboundedReceiver<TrackerMessage>,
+    ) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let tracker = Self::new(nats_client);
+        (tracker, sender, receiver)
     }
 
     /// Get current timestamp in milliseconds
@@ -139,29 +204,29 @@ impl ConnectionTracker {
 
     /// Publish event to NATS
     async fn publish_event(&self, packet: ServerConnectionPacket) {
-        if let Some(client) = NATS_CLIENT.get() {
-            let topic = format!(
-                "server.connections.{}.{}.{}",
-                self.region, self.service_type, self.server_instance
-            );
+        let topic = format!(
+            "server.connections.{}.{}.{}",
+            self.region, self.service_type, self.server_instance
+        );
 
-            match packet.write_to_bytes() {
-                Ok(payload) => {
-                    if let Err(e) = client.publish(topic.clone(), payload.into()).await {
-                        error!(
-                            "Failed to publish server event to NATS topic {}: {}",
-                            topic, e
-                        );
-                    } else {
-                        debug!("Published server event to NATS topic: {}", topic);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to serialize server connection packet: {}", e);
+        match packet.write_to_bytes() {
+            Ok(payload) => {
+                if let Err(e) = self
+                    .nats_client
+                    .publish(topic.clone(), payload.into())
+                    .await
+                {
+                    error!(
+                        "Failed to publish server event to NATS topic {}: {}",
+                        topic, e
+                    );
+                } else {
+                    debug!("Published server event to NATS topic: {}", topic);
                 }
             }
-        } else {
-            warn!("NATS client not available, skipping event publication");
+            Err(e) => {
+                error!("Failed to serialize server connection packet: {}", e);
+            }
         }
     }
 
@@ -214,11 +279,33 @@ impl ConnectionTracker {
         packet.connection = Some(metadata).into();
         packet.is_reconnection = is_reconnection;
 
-        if NATS_CLIENT.get().is_some() {
-            tokio::spawn(async move {
-                GLOBAL_TRACKER.publish_event(packet).await;
-            });
-        }
+        let nats_client = self.nats_client.clone();
+        let region = self.region.clone();
+        let service_type = self.service_type.clone();
+        let server_instance = self.server_instance.clone();
+
+        tokio::spawn(async move {
+            let topic = format!(
+                "server.connections.{}.{}.{}",
+                region, service_type, server_instance
+            );
+
+            match packet.write_to_bytes() {
+                Ok(payload) => {
+                    if let Err(e) = nats_client.publish(topic.clone(), payload.into()).await {
+                        error!(
+                            "Failed to publish server event to NATS topic {}: {}",
+                            topic, e
+                        );
+                    } else {
+                        debug!("Published server event to NATS topic: {}", topic);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize server connection packet: {}", e);
+                }
+            }
+        });
     }
 
     /// Track a connection ending
@@ -251,11 +338,33 @@ impl ConnectionTracker {
             data_transfer.bytes_received = info.bytes_received;
             packet.data_transfer = Some(data_transfer).into();
 
-            if NATS_CLIENT.get().is_some() {
-                tokio::spawn(async move {
-                    GLOBAL_TRACKER.publish_event(packet).await;
-                });
-            }
+            let nats_client = self.nats_client.clone();
+            let region = self.region.clone();
+            let service_type = self.service_type.clone();
+            let server_instance = self.server_instance.clone();
+
+            tokio::spawn(async move {
+                let topic = format!(
+                    "server.connections.{}.{}.{}",
+                    region, service_type, server_instance
+                );
+
+                match packet.write_to_bytes() {
+                    Ok(payload) => {
+                        if let Err(e) = nats_client.publish(topic.clone(), payload.into()).await {
+                            error!(
+                                "Failed to publish server event to NATS topic {}: {}",
+                                topic, e
+                            );
+                        } else {
+                            debug!("Published server event to NATS topic: {}", topic);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize server connection packet: {}", e);
+                    }
+                }
+            });
         } else {
             debug!("Connection ended for unknown session_id: {}", session_id);
         }
@@ -282,23 +391,59 @@ impl ConnectionTracker {
         self.connections.lock().unwrap().len()
     }
 
-    /// Start periodic data reporting task (configurable via SERVER_STATS_INTERVAL_SECS env var)
-    pub async fn start_periodic_reporting(&self) {
-        if NATS_CLIENT.get().is_none() {
-            warn!("NATS client not available, periodic reporting disabled");
-            return;
-        }
-
+    /// Run the connection tracker message processing loop
+    pub async fn run_message_loop(&self, mut receiver: mpsc::UnboundedReceiver<TrackerMessage>) {
+        // Start periodic reporting task
         let reporting_interval = get_reporting_interval();
         info!(
             "Starting periodic server stats reporting every {:?}",
             reporting_interval
         );
 
-        let mut interval = interval(reporting_interval);
+        let mut reporting_interval = interval(reporting_interval);
+
         loop {
-            interval.tick().await;
-            self.report_current_data_usage().await;
+            tokio::select! {
+                // Handle incoming messages
+                msg = receiver.recv() => {
+                    if let Some(msg) = msg {
+                        self.handle_message(msg).await;
+                    } else {
+                        // Channel closed, exit loop
+                        break;
+                    }
+                }
+
+                // Periodic reporting
+                _ = reporting_interval.tick() => {
+                    self.report_current_data_usage().await;
+                }
+            }
+        }
+
+        info!("Connection tracker message loop ended");
+    }
+
+    /// Handle a single tracker message
+    async fn handle_message(&self, msg: TrackerMessage) {
+        match msg {
+            TrackerMessage::ConnectionStarted {
+                session_id,
+                customer_email,
+                meeting_id,
+                protocol,
+            } => {
+                self.connection_started(session_id, customer_email, meeting_id, protocol);
+            }
+            TrackerMessage::ConnectionEnded { session_id } => {
+                self.connection_ended(&session_id);
+            }
+            TrackerMessage::DataSent { session_id, bytes } => {
+                self.track_data_sent(&session_id, bytes);
+            }
+            TrackerMessage::DataReceived { session_id, bytes } => {
+                self.track_data_received(&session_id, bytes);
+            }
         }
     }
 
@@ -334,9 +479,4 @@ impl ConnectionTracker {
             }
         }
     }
-}
-
-lazy_static::lazy_static! {
-    /// Global instance for server-wide connection tracking
-    pub static ref GLOBAL_TRACKER: ConnectionTracker = ConnectionTracker::new();
 }

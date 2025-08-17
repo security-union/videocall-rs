@@ -20,7 +20,10 @@
 
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
+use js_sys::Reflect;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "wasm")]
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{console, window, VideoFrame, Worker};
@@ -104,7 +107,9 @@ impl Decodable for WasmDecoder {
                         video_frame.close();
                     }
                     Err(_) => {
-                        log::warn!("Received unexpected message from worker: {js_val:?}");
+                        if !handle_worker_diag_message(&js_val) {
+                            log::warn!("Received unexpected message from worker: {js_val:?}");
+                        }
                     }
                 }
             }) as Box<dyn FnMut(_)>)
@@ -161,7 +166,9 @@ impl WasmDecoder {
                         callback(video_frame);
                     }
                     Err(_) => {
-                        log::warn!("Received unexpected message from worker: {js_val:?}");
+                        if !handle_worker_diag_message(&js_val) {
+                            log::warn!("Received unexpected message from worker: {js_val:?}");
+                        }
                     }
                 }
             }) as Box<dyn FnMut(_)>)
@@ -259,4 +266,46 @@ impl Drop for WasmDecoder {
         console::log_1(&"Terminating worker".into());
         self.worker.terminate();
     }
+}
+
+/// Handle diagnostics objects posted by the worker. Returns true if handled.
+fn handle_worker_diag_message(js_val: &JsValue) -> bool {
+    if !js_val.is_object() {
+        return false;
+    }
+
+    if let Ok(kind) = Reflect::get(js_val, &JsValue::from_str("kind")) {
+        if kind.as_string().as_deref() == Some("video_stats") {
+            #[cfg(feature = "wasm")]
+            {
+                let from_peer = Reflect::get(js_val, &JsValue::from_str("from_peer"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                let to_peer = Reflect::get(js_val, &JsValue::from_str("to_peer"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                let frames_buffered = Reflect::get(js_val, &JsValue::from_str("frames_buffered"))
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as u64;
+
+                let evt = DiagEvent {
+                    subsystem: "video",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        metric!("from_peer", from_peer),
+                        metric!("to_peer", to_peer),
+                        metric!("frames_buffered", frames_buffered),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(evt);
+            }
+            return true;
+        }
+    }
+
+    false
 }

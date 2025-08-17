@@ -19,7 +19,7 @@
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
-use crate::connection_tracker::TrackerSender;
+use crate::server_diagnostics::TrackerSender;
 
 pub struct AppState {
     pub chat: Addr<ChatServer>,

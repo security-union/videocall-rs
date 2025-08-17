@@ -73,11 +73,21 @@ prometheus:
           static_configs:
             - targets: ['localhost:9090']
 
-        - job_name: 'videocall-metrics-api'
+        # Client health metrics (sessions, NetEQ, video quality, etc.)
+        - job_name: 'videocall-client-metrics'
           static_configs:
-            - targets: ['metrics-api-us-east:9091']
+            - targets: ['metrics-api:9091']
           metrics_path: '/metrics'
           scrape_interval: 5s
+          scrape_timeout: 4s
+
+        # Server connection tracking (with session_id, stale cleanup, etc.)
+        - job_name: 'videocall-server-stats'
+          static_configs:
+            - targets: ['metrics-api-server-stats:9092']
+          metrics_path: '/metrics'
+          scrape_interval: 5s
+          scrape_timeout: 4s
         
         # Kubernetes API server
         - job_name: 'kubernetes-apiservers'

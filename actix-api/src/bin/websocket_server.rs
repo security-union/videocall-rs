@@ -39,9 +39,9 @@ use sec_api::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
-    connection_tracker::ConnectionTracker,
     db::{get_pool, PostgresPool},
     models::{AppConfig, AppState},
+    server_diagnostics::ServerDiagnostics,
 };
 use tracing::{debug, error, info};
 use videocall_types::truthy;
@@ -205,7 +205,7 @@ async fn main() -> std::io::Result<()> {
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
-        ConnectionTracker::new_with_channel(nats_client.clone());
+        ServerDiagnostics::new_with_channel(nats_client.clone());
 
     // Start the connection tracker message processing task
     let connection_tracker = std::sync::Arc::new(connection_tracker);

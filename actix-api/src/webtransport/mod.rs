@@ -16,10 +16,10 @@
  * conditions.
  */
 
-use crate::connection_tracker::{
-    send_connection_ended, send_connection_started, ConnectionTracker, DataTracker, TrackerSender,
+use crate::client_diagnostics::health_processor;
+use crate::server_diagnostics::{
+    send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
 };
-use crate::diagnostics::health_processor;
 use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
 use futures::StreamExt;
@@ -158,7 +158,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
-        ConnectionTracker::new_with_channel(nc.clone());
+        ServerDiagnostics::new_with_channel(nc.clone());
 
     // Start the connection tracker message processing task
     let connection_tracker = std::sync::Arc::new(connection_tracker);

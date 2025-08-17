@@ -18,11 +18,11 @@
 
 pub mod actors;
 pub mod auth;
-pub mod connection_tracker;
+pub mod client_diagnostics;
 pub mod constants;
 pub mod db;
-pub mod diagnostics;
 pub mod messages;
 pub mod metrics;
 pub mod models;
+pub mod server_diagnostics;
 pub mod webtransport;

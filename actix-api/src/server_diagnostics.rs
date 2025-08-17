@@ -30,7 +30,7 @@ use videocall_types::protos::server_connection_packet::{
     ConnectionMetadata, DataTransferInfo, EventType, ServerConnectionPacket,
 };
 
-/// Messages for the ConnectionTracker task
+/// Messages for the ServerDiagnostics task
 #[derive(Debug, Clone)]
 pub enum TrackerMessage {
     ConnectionStarted {
@@ -57,7 +57,7 @@ pub struct DataTracker {
     sender: mpsc::UnboundedSender<TrackerMessage>,
 }
 
-/// Tracker sender for sending messages to the ConnectionTracker
+/// Tracker sender for sending messages to the ServerDiagnostics
 pub type TrackerSender = mpsc::UnboundedSender<TrackerMessage>;
 
 /// Convenience functions for sending tracker messages
@@ -134,7 +134,7 @@ fn get_reporting_interval() -> Duration {
 }
 
 #[derive(Debug)]
-pub struct ConnectionTracker {
+pub struct ServerDiagnostics {
     connections: Mutex<HashMap<String, ConnectionInfo>>,
     // (customer_email, meeting_id) -> reconnection_count
     reconnections: Mutex<HashMap<(String, String), u64>>,
@@ -144,7 +144,7 @@ pub struct ConnectionTracker {
     service_type: String,
 }
 
-impl ConnectionTracker {
+impl ServerDiagnostics {
     pub fn new(nats_client: Client) -> Self {
         let server_instance = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("SERVER_ID"))
@@ -153,7 +153,7 @@ impl ConnectionTracker {
         let service_type =
             std::env::var("SERVICE_TYPE").unwrap_or_else(|_| "websocket".to_string());
 
-        ConnectionTracker {
+        ServerDiagnostics {
             connections: Mutex::new(HashMap::new()),
             reconnections: Mutex::new(HashMap::new()),
             nats_client,
@@ -163,7 +163,7 @@ impl ConnectionTracker {
         }
     }
 
-    /// Create a ConnectionTracker with message channel
+    /// Create a ServerDiagnostics with message channel
     pub fn new_with_channel(
         nats_client: Client,
     ) -> (

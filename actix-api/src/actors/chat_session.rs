@@ -16,12 +16,12 @@
  * conditions.
  */
 
-use crate::connection_tracker::{
-    send_connection_ended, send_connection_started, DataTracker, TrackerSender,
-};
-use crate::diagnostics::health_processor;
+use crate::client_diagnostics::health_processor;
 use crate::messages::server::{ClientMessage, Packet};
 use crate::messages::session::Message;
+use crate::server_diagnostics::{
+    send_connection_ended, send_connection_started, DataTracker, TrackerSender,
+};
 use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
 use std::sync::Arc;
 

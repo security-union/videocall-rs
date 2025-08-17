@@ -106,7 +106,7 @@ impl ConnectionTracker {
         // Update customer connection count and check for reconnections
         {
             let mut customer_conns = self.customer_connections.lock().unwrap();
-            let customer_key = format!("{}:{}", customer_email, meeting_id);
+            let customer_key = format!("{customer_email}:{meeting_id}");
             let count = customer_conns.entry(customer_key.clone()).or_insert(0);
             *count += 1;
 

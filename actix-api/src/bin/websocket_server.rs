@@ -169,26 +169,6 @@ where
     Ok(res.streaming(WebsocketContext::with_codec(actor, stream, codec)))
 }
 
-/// Prometheus metrics endpoint for server-side connection tracking
-async fn metrics_handler() -> actix_web::Result<HttpResponse> {
-    let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
-    let mut buffer = Vec::new();
-
-    match encoder.encode(&metric_families, &mut buffer) {
-        Ok(_) => {
-            let output = String::from_utf8_lossy(&buffer);
-            Ok(HttpResponse::Ok()
-                .content_type("text/plain; version=0.0.4")
-                .body(output.to_string()))
-        }
-        Err(e) => {
-            error!("Failed to encode metrics: {}", e);
-            Ok(HttpResponse::InternalServerError().body("Failed to encode metrics"))
-        }
-    }
-}
-
 #[get("/lobby/{email}/{room}")]
 pub async fn ws_connect(
     session: web::Path<(String, String)>,
@@ -261,7 +241,6 @@ async fn main() -> std::io::Result<()> {
                     tracker_sender: tracker_sender.clone(),
                 }))
                 .service(ws_connect)
-                .route("/metrics", web::get().to(metrics_handler))
         } else {
             let pool = if db_enabled { Some(get_pool()) } else { None };
             App::new()
@@ -283,7 +262,6 @@ async fn main() -> std::io::Result<()> {
                 .service(handle_google_oauth_callback)
                 .service(login)
                 .service(ws_connect)
-                .route("/metrics", web::get().to(metrics_handler))
         }
     })
     .bind((

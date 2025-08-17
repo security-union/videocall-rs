@@ -19,33 +19,12 @@
 use std::net::ToSocketAddrs;
 
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use prometheus::{Encoder, TextEncoder};
 use tracing::{error, info};
 
 use sec_api::webtransport::{self, Certs};
 
 async fn health_responder() -> impl Responder {
     HttpResponse::Ok().body("Ok")
-}
-
-/// Prometheus metrics endpoint
-async fn metrics_handler() -> actix_web::Result<HttpResponse> {
-    let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
-    let mut buffer = Vec::new();
-
-    match encoder.encode(&metric_families, &mut buffer) {
-        Ok(_) => {
-            let output = String::from_utf8_lossy(&buffer);
-            Ok(HttpResponse::Ok()
-                .content_type("text/plain; version=0.0.4")
-                .body(output.to_string()))
-        }
-        Err(e) => {
-            error!("Failed to encode metrics: {}", e);
-            Ok(HttpResponse::InternalServerError().body("Failed to encode metrics"))
-        }
-    }
 }
 
 #[actix_rt::main]
@@ -84,11 +63,8 @@ async fn main() {
     let listen = opt.listen;
     actix_rt::spawn(async move {
         info!("Starting health/metrics HTTP server: {:?}", health_listen);
-        let server = HttpServer::new(|| {
-            App::new()
-                .route("/healthz", web::get().to(health_responder))
-                .route("/metrics", web::get().to(metrics_handler))
-        });
+        let server =
+            HttpServer::new(|| App::new().route("/healthz", web::get().to(health_responder)));
 
         match server.bind(&health_listen) {
             Ok(server) => {

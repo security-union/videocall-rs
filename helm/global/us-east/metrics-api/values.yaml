@@ -98,7 +98,7 @@ serverStats:
     RUST_LOG: "debug,async_nats=info"
   
   # Binary to run
-  command: ["cargo", "run", "--release", "--bin", "metrics_server_snapshot"]
+  command: ["/usr/bin/metrics_server_snapshot"]
   
   # Health check configuration
   livenessProbe:

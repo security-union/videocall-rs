@@ -35,7 +35,6 @@
 
 //! Web worker decoder that handles both frame data and control messages using a JitterBuffer.
 
-use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, VideoFrame};

@@ -8,6 +8,7 @@ on:
     branches:
       - main
       - add-diagnostics
+      - add-server-stats
     paths:
       - 'actix-api/**'
       - 'types/**'

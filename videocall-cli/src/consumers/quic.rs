@@ -34,6 +34,7 @@ use videocall_types::protos::{
 };
 
 use crate::cli_args::Stream;
+use crate::fake_cert_verifier::NoVerification;
 
 use super::camera_synk::CameraSynk;
 
@@ -130,18 +131,26 @@ async fn connect_to_server(options: &Stream) -> anyhow::Result<Connection> {
             .expect("couldn't resolve the address provided");
         let remote = addrs.first().to_owned();
         let remote = remote.unwrap();
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
-        let mut client_crypto = rustls::ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let mut client_crypto = if options.insecure_skip_verify {
+            info!("WARNING: Skipping TLS certificate verification - connection is insecure!");
+            rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_custom_certificate_verifier(Arc::new(NoVerification))
+                .with_no_client_auth()
+        } else {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
+                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                    ta.subject,
+                    ta.spki,
+                    ta.name_constraints,
+                )
+            }));
+            rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
 
         let alpn = vec![b"hq-29".to_vec()];
         client_crypto.alpn_protocols = alpn;

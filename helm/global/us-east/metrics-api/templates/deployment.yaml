@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "metrics-api.fullname" . }}
+  name: client-{{ include "metrics-api.fullname" . }}
   labels:
     {{- include "metrics-api.labels" . | nindent 4 }}
 spec:
@@ -33,8 +33,14 @@ spec:
               value: {{ .Values.metricsApi.env.NATS_URL | quote }}
             - name: REGION
               value: {{ .Values.metricsApi.env.REGION | quote }}
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: SERVER_ID
-              value: {{ .Values.metricsApi.env.SERVER_ID | quote }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: SERVICE_TYPE
               value: {{ .Values.metricsApi.env.SERVICE_TYPE | quote }}
             - name: RUST_LOG

@@ -146,7 +146,7 @@ impl VideoPeerDecoder {
                         log::debug!("Rendered video frame ({width}x{height})");
                     }
                 } else {
-                    log::error!("Canvas element with id '{canvas_id}' not found");
+                    log::info!("Canvas element with id '{canvas_id}' not found");
                 }
             }
         }

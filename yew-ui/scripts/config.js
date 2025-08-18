@@ -1,10 +1,10 @@
 window.__APP_CONFIG = Object.freeze({
   apiBaseUrl: "http://localhost:8080",
-  wsUrl: "ws://localhost:8080",
-  webTransportHost: "https://webtransport-singapore.webtransport.video",
+  wsUrl: "wss://websocket-us-east.webtransport.video,wss://websocket-singapore.webtransport.video",
+  webTransportHost: "https://127.0.0.1:4433",
   oauthEnabled: "false",
   e2eeEnabled: "false",
-  webTransportEnabled: "true",
+  webTransportEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,
   audioBitrateKbps: 65,

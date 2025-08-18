@@ -178,7 +178,7 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        log::warn!("Dropping Connection to {}", self.url);
+        log::debug!("Dropping Connection to {}", self.url);
         self.stop_heartbeat();
     }
 }

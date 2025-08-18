@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.27](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.26...videocall-ui-v1.1.27) - 2025-08-18
+
+### Other
+
+- Add server stats ([#399](https://github.com/security-union/videocall-rs/pull/399))
+
+## [1.1.26](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.25...videocall-ui-v1.1.26) - 2025-08-15
+
+### Other
+
+- Disable caching and create blog post, also downgrade many messages to debug  ([#395](https://github.com/security-union/videocall-rs/pull/395))
+
+## [1.1.25](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.24...videocall-ui-v1.1.25) - 2025-08-15
+
+### Added
+
+- feature/self as attendant ([#392](https://github.com/security-union/videocall-rs/pull/392))
+
+### Other
+
+- Add low end android device profiles ([#394](https://github.com/security-union/videocall-rs/pull/394))
+- Add packets per sec, and matomo logs to debug system, handle mic errors more gracefully ([#385](https://github.com/security-union/videocall-rs/pull/385))
+
 ## [1.1.24](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.23...videocall-ui-v1.1.24) - 2025-08-10
 
 ### Other

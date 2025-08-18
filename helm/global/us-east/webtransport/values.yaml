@@ -28,17 +28,29 @@ rustlemania-webtransport:
       value: /certs/tls.key
     - name: REGION
       value: "us-east"
+    - name: HOSTNAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVER_ID
-      value: $(POD_NAME)
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVICE_TYPE
       value: webtransport
+    - name: SERVER_STATS_INTERVAL_SECS
+      value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "1"  # Conservative start for 500m CPU (WebTransport + crypto operations)
+    - name: TOKIO_BLOCKING_THREADS
+      value: "2"  # Small pool for blocking crypto operations
 
   resources:
     limits:
       cpu: "500m"
       memory: "768Mi"
     requests:
-      cpu: "250m"
+      cpu: "500m"
       memory: "384Mi"
 
   service:

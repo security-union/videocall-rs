@@ -24,6 +24,7 @@ pub mod encoder;
 pub mod frame;
 pub mod jitter_buffer;
 pub mod jitter_estimator;
+pub mod messages;
 
 // Diagnostics helper to publish video metrics via the shared event bus.
 #[cfg(feature = "wasm")]

@@ -25,17 +25,27 @@ rustlemania-websocket:
       value: abc
     - name: REGION
       value: "singapore"
+    - name: HOSTNAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVER_ID
-      value: $(POD_NAME)
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVICE_TYPE
       value: websocket
+    - name: SERVER_STATS_INTERVAL_SECS
+      value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "1"  # Critical for 200m CPU - single thread optimal for I/O bound operations
 
   resources:
     limits:
-      cpu: "200m"
+      cpu: "500m"
       memory: "256Mi"
     requests:
-      cpu: "100m"
+      cpu: "500m"
       memory: "128Mi"
 
   service:
@@ -64,7 +74,7 @@ rustlemania-websocket:
           - websocket-singapore.webtransport.video
 
   autoscaling:
-    enabled: true
+    enabled: false
     minReplicas: 2
     maxReplicas: 8
     targetCPUUtilizationPercentage: 70

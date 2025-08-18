@@ -71,3 +71,12 @@ ingress:
         - app.videocall.rs
         - transport.rustlemania.com
         # rustlemania.com cert is still referenced by redirect Ingress
+
+# Certificate configuration (alternative to ingress auto-cert)
+certificate:
+  enabled: false  # Set to true to use standalone Certificate resource instead of ingress annotations
+  name: ""  # Defaults to {fullname}-tls
+  secretName: ""  # Defaults to {fullname}-tls  
+  issuer: "letsencrypt-prod"
+  issuerKind: "Issuer"
+  dnsNames: []

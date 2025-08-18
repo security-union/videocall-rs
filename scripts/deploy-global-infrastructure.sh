@@ -62,7 +62,6 @@ declare -a CERTIFICATE_FILES=(
     "global/us-east/engineering-vlog/certificate.yaml"
     "global/us-east/matomo/certificate.yaml"
     "global/us-east/rustlemania-ui/certificate.yaml"
-    "global/us-east/rustlemania-ui-staging/certificate.yaml"
     "global/us-east/videocall-website/certificate.yaml"
     "global/us-east/grafana/certificate.yaml"
 )

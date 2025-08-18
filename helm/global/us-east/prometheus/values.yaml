@@ -76,7 +76,7 @@ prometheus:
         # Client health metrics (sessions, NetEQ, video quality, etc.)
         - job_name: 'videocall-client-metrics'
           static_configs:
-            - targets: ['metrics-api:9091']
+            - targets: ['client-metrics-api-us-east:9091']
           metrics_path: '/metrics'
           scrape_interval: 5s
           scrape_timeout: 4s
@@ -84,7 +84,7 @@ prometheus:
         # Server connection tracking (with session_id, stale cleanup, etc.)
         - job_name: 'videocall-server-stats'
           static_configs:
-            - targets: ['metrics-api-server-stats:9092']
+            - targets: ['server-metrics-api-us-east:9092']
           metrics_path: '/metrics'
           scrape_interval: 5s
           scrape_timeout: 4s

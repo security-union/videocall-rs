@@ -29,8 +29,8 @@ use yew::virtual_dom::VNode;
 use yew::{html, Html};
 
 pub fn generate(client: &VideoCallClient, peers: Vec<String>) -> Vec<VNode> {
-    // If only one peer, render it as a full-bleed tile (WhatsApp-like)
-    if peers.len() == 1 {
+    // If only one peer and not screen sharing, render it as a full-bleed tile (WhatsApp-like)
+    if peers.len() == 1 && !client.is_screen_share_enabled_for_peer(&peers[0]) {
         let key = &peers[0];
         let allowed = users_allowed_to_stream().unwrap_or_default();
         if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/security-union/videocall-rs/compare/neteq-v0.4.1...neteq-v0.5.0) - 2025-08-15
+
+### Other
+
+- Add packets per sec, and matomo logs to debug system, handle mic errors more gracefully ([#385](https://github.com/security-union/videocall-rs/pull/385))
+
 ## [0.4.1](https://github.com/security-union/videocall-rs/compare/neteq-v0.4.0...neteq-v0.4.1) - 2025-08-08
 
 ### Other

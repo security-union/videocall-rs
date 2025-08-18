@@ -41,6 +41,7 @@ use sec_api::{
     },
     db::{get_pool, PostgresPool},
     models::{AppConfig, AppState},
+    server_diagnostics::ServerDiagnostics,
 };
 use tracing::{debug, error, info};
 use videocall_types::truthy;
@@ -178,7 +179,8 @@ pub async fn ws_connect(
     debug!("socket connected");
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
-    let actor = WsChatSession::new(chat, room, email, nats_client);
+    let tracker_sender = state.tracker_sender.clone();
+    let actor = WsChatSession::new(chat, room, email, nats_client, tracker_sender);
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)
 }
@@ -200,6 +202,17 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to NATS");
     let chat = ChatServer::new(nats_client.clone()).await.start();
+
+    // Create connection tracker with message channel
+    let (connection_tracker, tracker_sender, tracker_receiver) =
+        ServerDiagnostics::new_with_channel(nats_client.clone());
+
+    // Start the connection tracker message processing task
+    let connection_tracker = std::sync::Arc::new(connection_tracker);
+    let tracker_task = connection_tracker.clone();
+    tokio::spawn(async move {
+        tracker_task.run_message_loop(tracker_receiver).await;
+    });
     let oauth_client_id: String =
         std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
     let oauth_auth_url: String =
@@ -224,6 +237,7 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
+                    tracker_sender: tracker_sender.clone(),
                 }))
                 .service(ws_connect)
         } else {
@@ -233,6 +247,7 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
+                    tracker_sender: tracker_sender.clone(),
                 }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),

@@ -888,7 +888,7 @@ checksum = "cfa8873f51c92e232f9bac4065cddef41b714152812bfc5f7672ba16d6ef8cd9"
 
 [[package]]
 name = "bot"
-version = "1.0.7"
+version = "1.0.9"
 dependencies = [
  "chrono",
  "dotenv",
@@ -3652,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "neteq"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "axum",
  "clap",
@@ -6545,7 +6545,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "1.0.37"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -6568,7 +6568,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "1.1.20"
+version = "1.1.23"
 dependencies = [
  "aes",
  "anyhow",
@@ -6713,7 +6713,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6738,7 +6738,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-types"
-version = "2.0.2"
+version = "3.0.1"
 dependencies = [
  "protobuf 3.7.1",
  "serde",
@@ -6748,7 +6748,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.1.24"
+version = "1.1.27"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

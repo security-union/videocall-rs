@@ -625,7 +625,7 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_video_enabled(enabled) {
-                    error!("Failed to set video enabled {enabled}: {e}");
+                    debug!("Failed to set video enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set video enabled: {enabled}");
                     if let Some(hr) = &inner.health_reporter {
@@ -646,7 +646,7 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_audio_enabled(enabled) {
-                    error!("Failed to set audio enabled {enabled}: {e}");
+                    debug!("Failed to set audio enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set audio enabled: {enabled}");
                     if let Some(hr) = &inner.health_reporter {
@@ -667,7 +667,7 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_screen_enabled(enabled) {
-                    error!("Failed to set screen enabled {enabled}: {e}");
+                    debug!("Failed to set screen enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set screen enabled: {enabled}");
                 }

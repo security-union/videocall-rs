@@ -23,18 +23,28 @@ rustlemania-websocket:
       value: abc
     - name: REGION
       value: "us-east"
+    - name: HOSTNAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVER_ID
-      value: $(POD_NAME)
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVICE_TYPE
       value: websocket
+    - name: SERVER_STATS_INTERVAL_SECS
+      value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "1"  # Optimal for 300m CPU (I/O bound WebSocket operations)
 
 
   resources:
     limits:
-      cpu: "300m"
+      cpu: "500m"
       memory: "384Mi"
     requests:
-      cpu: "150m"
+      cpu: "500m"
       memory: "192Mi"
 
   service:

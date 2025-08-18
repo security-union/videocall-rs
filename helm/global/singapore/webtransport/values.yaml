@@ -40,13 +40,17 @@ rustlemania-webtransport:
       value: webtransport
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "1"  # Optimal for 400m CPU (WebTransport crypto operations)
+    - name: TOKIO_BLOCKING_THREADS
+      value: "2"  # Small pool for blocking crypto operations
 
   resources:
     limits:
-      cpu: "400m"
+      cpu: "1"
       memory: "512Mi"
     requests:
-      cpu: "200m"
+      cpu: "1"
       memory: "256Mi"
 
   service:

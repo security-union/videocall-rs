@@ -35,14 +35,16 @@ rustlemania-websocket:
       value: websocket
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "1"  # Optimal for 300m CPU (I/O bound WebSocket operations)
 
 
   resources:
     limits:
-      cpu: "300m"
+      cpu: "1"
       memory: "384Mi"
     requests:
-      cpu: "150m"
+      cpu: "1"
       memory: "192Mi"
 
   service:

@@ -23,6 +23,8 @@ env:
     value: "false"
   - name: DATABASE_URL
     value: abc
+  - name: TOKIO_WORKER_THREADS
+    value: "1"  # Default for WebSocket services - adjust per region as needed
 resources:
   limits:
     cpu: "50m"

@@ -31,6 +31,7 @@ metricsApi:
     REGION: "us-east"
     SERVICE_TYPE: "metrics"
     RUST_LOG: "warn,async_nats=warn"
+    TOKIO_WORKER_THREADS: "1"  # Optimal for 50m CPU (metrics collection is I/O bound)
   
   # Health check configuration
   livenessProbe:
@@ -96,6 +97,7 @@ serverStats:
     REGION: "us-east"
     SERVICE_TYPE: "server-stats"
     RUST_LOG: "debug,async_nats=info"
+    TOKIO_WORKER_THREADS: "1"  # Optimal for 100m CPU (server stats aggregation is I/O bound)
   
   # Binary to run
   command: ["/usr/bin/metrics_server_snapshot"]

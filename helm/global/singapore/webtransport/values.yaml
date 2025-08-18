@@ -40,13 +40,17 @@ rustlemania-webtransport:
       value: webtransport
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "1"  # Optimal for 400m CPU (WebTransport crypto operations)
+    - name: TOKIO_BLOCKING_THREADS
+      value: "2"  # Small pool for blocking crypto operations
 
   resources:
     limits:
-      cpu: "400m"
+      cpu: "500m"
       memory: "512Mi"
     requests:
-      cpu: "200m"
+      cpu: "500m"
       memory: "256Mi"
 
   service:
@@ -66,9 +70,9 @@ rustlemania-webtransport:
       external-dns.alpha.kubernetes.io/hostname: "webtransport-singapore.webtransport.video"
 
   autoscaling:
-    enabled: true
-    minReplicas: 2
-    maxReplicas: 6
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
     targetCPUUtilizationPercentage: 70
 
   # Node selector for Singapore region

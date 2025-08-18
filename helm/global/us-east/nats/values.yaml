@@ -1,31 +1,30 @@
 # US East NATS configuration with Singapore gateway
 nats:
-  config:
-    nats:
-      natsbox:
+  nats:
+    natsbox:
+      enabled: true
+    cluster:
+      enabled: false
+      replicas: 3
+      noAdvertise: true
+    jetstream:
+      enabled: false
+      fileStore:
+        pvc:
+          size: 5Gi
+          storageClassName: do-block-storage
+      memStore:
         enabled: true
-      cluster:
-        enabled: true
-        replicas: 3
-        noAdvertise: true
-      jetstream:
-        enabled: true
-        fileStore:
-          pvc:
-            size: 5Gi
-            storageClassName: do-block-storage
-        memStore:
-          enabled: true
-          maxSize: 1Gi
-      auth:
-        enabled: false
-      resources:
-        limits:
-          cpu: 300m
-          memory: 384Mi
-        requests:
-          cpu: 150m
-          memory: 192Mi
+        maxSize: 1Gi
+    auth:
+      enabled: false
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 200m
+        memory: 256Mi 
   # Gateway configuration using direct DigitalOcean format
   gateway:
     enabled: true

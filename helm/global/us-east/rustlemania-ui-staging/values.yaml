@@ -29,12 +29,22 @@ rustlemania-ui:
   nodeSelector:
     topology.kubernetes.io/region: "nyc1"
 
+  # Certificate configuration using standalone Certificate resource
+  certificate:
+    enabled: true
+    name: "videocall-staging-ui-us-east-tls"
+    secretName: "videocall-staging-ui-us-east-tls"
+    issuer: "letsencrypt-prod"
+    issuerKind: "Issuer"
+    dnsNames:
+      - "staging-app.videocall.rs"
+
   ingress:
     enabled: true
     redirect: false  # Disable rustlemania.com redirect - we want website to handle it
     className: "nginx"
     annotations:
-      cert-manager.io/issuer: "letsencrypt-prod"
+      # cert-manager.io/issuer: "letsencrypt-prod"  # REMOVED - using standalone Certificate instead
       nginx.ingress.kubernetes.io/ssl-redirect: "true"
     hosts:
       - host: staging-app.videocall.rs

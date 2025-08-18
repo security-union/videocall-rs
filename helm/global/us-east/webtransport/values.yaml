@@ -47,10 +47,10 @@ rustlemania-webtransport:
 
   resources:
     limits:
-      cpu: "1"
+      cpu: "500m"
       memory: "768Mi"
     requests:
-      cpu: "1"
+      cpu: "500m"
       memory: "384Mi"
 
   service:

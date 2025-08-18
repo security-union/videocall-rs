@@ -47,10 +47,10 @@ rustlemania-webtransport:
 
   resources:
     limits:
-      cpu: "1"
+      cpu: "500m"
       memory: "512Mi"
     requests:
-      cpu: "1"
+      cpu: "500m"
       memory: "256Mi"
 
   service:
@@ -70,9 +70,9 @@ rustlemania-webtransport:
       external-dns.alpha.kubernetes.io/hostname: "webtransport-singapore.webtransport.video"
 
   autoscaling:
-    enabled: true
-    minReplicas: 2
-    maxReplicas: 6
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
     targetCPUUtilizationPercentage: 70
 
   # Node selector for Singapore region

@@ -70,24 +70,73 @@ declare -a CERTIFICATE_FILES=(
 # DigitalOcean DNS secret file
 declare -r DIGITALOCEAN_SECRET_FILE="${HELM_DIR}/digital-ocean-secret/digitalocean-dns.yaml"
 
+# Service filtering functions
+filter_charts_by_services() {
+    local -a input_charts=()
+    local services_filter="$1"
+    
+    # Read input from stdin into array
+    while IFS= read -r line; do
+        input_charts+=("$line")
+    done
+    
+    if [[ -z "$services_filter" ]]; then
+        # No filtering, return all charts
+        printf '%s\n' "${input_charts[@]}"
+        return
+    fi
+    
+    # Parse services filter
+    IFS=',' read -ra SERVICES_ARRAY <<< "$services_filter"
+    local -a filtered_charts=()
+    
+    for chart in "${input_charts[@]}"; do
+        for service in "${SERVICES_ARRAY[@]}"; do
+            service=$(echo "$service" | xargs) # trim whitespace
+            case "$chart" in
+                *"/$service")
+                    filtered_charts+=("$chart")
+                    break
+                    ;;
+            esac
+        done
+    done
+    
+    printf '%s\n' "${filtered_charts[@]}"
+}
+
 # Region filtering functions
 get_charts_for_region() {
     local region="$1"
+    local services_filter="$2"
+    
+    local -a region_charts=()
     case "$region" in
         "all")
-            printf '%s\n' "${CHARTS[@]}"
+            region_charts=("${CHARTS[@]}")
             ;;
         "us-east")
             # Include global/us-east charts and global chart deployments for US East
-            printf '%s\n' "${CHARTS[@]}" | grep "global/us-east"
+            while IFS= read -r chart; do
+                [[ -n "$chart" ]] && region_charts+=("$chart")
+            done < <(printf '%s\n' "${CHARTS[@]}" | grep "global/us-east")
             ;;
         "singapore")
-            printf '%s\n' "${CHARTS[@]}" | grep "global/singapore"
+            while IFS= read -r chart; do
+                [[ -n "$chart" ]] && region_charts+=("$chart")
+            done < <(printf '%s\n' "${CHARTS[@]}" | grep "global/singapore")
             ;;
         *)
             error_exit "Invalid region: $region"
             ;;
     esac
+    
+    # Apply service filtering
+    if [[ -n "$services_filter" ]]; then
+        printf '%s\n' "${region_charts[@]}" | filter_charts_by_services "$services_filter"
+    else
+        printf '%s\n' "${region_charts[@]}"
+    fi
 }
 
 get_contexts_for_region() {
@@ -206,6 +255,7 @@ get_release_name_for_chart() {
 DRY_RUN=false
 SKIP_DEPENDENCIES=false
 DEPLOY_REGION="all"  # Options: all, us-east, singapore
+SERVICES_FILTER=""   # Comma-separated list of services to deploy
 
 # Colors for output
 declare -r RED='\033[0;31m'
@@ -287,6 +337,14 @@ parse_args() {
                 DEPLOY_REGION="singapore"
                 shift
                 ;;
+            --services)
+                if [[ -n "$2" && "$2" != --* ]]; then
+                    SERVICES_FILTER="$2"
+                    shift 2
+                else
+                    error_exit "--services requires a value (comma-separated list of services)"
+                fi
+                ;;
             -h|--help)
                 show_help
                 exit 0
@@ -310,6 +368,10 @@ Options:
     --region REGION          Deploy to specific region (all, us-east, singapore)
     --us-east-only           Deploy only to US East region (shortcut for --region us-east)
     --singapore-only         Deploy only to Singapore region (shortcut for --region singapore)
+    --services SERVICES      Deploy only specific services (comma-separated)
+                            Available: websocket, webtransport, ingress-nginx, engineering-vlog,
+                            matomo, rustlemania-ui, rustlemania-ui-staging, videocall-website,
+                            prometheus, grafana, metrics-api
     -h, --help              Show this help message
 
 This script will:
@@ -329,10 +391,11 @@ Available charts:
 $(for chart in "${CHARTS[@]}"; do echo "- $chart"; done)
 
 Examples:
-    $0                        # Deploy to all regions
-    $0 --region us-east       # Deploy only to US East
-    $0 --singapore-only       # Deploy only to Singapore
-    $0 --dry-run --region singapore  # Show what would be deployed to Singapore
+    $0                                      # Deploy all services to all regions
+    $0 --region us-east                     # Deploy all services to US East only
+    $0 --services websocket,webtransport    # Deploy only WebSocket and WebTransport services
+    $0 --services metrics-api --region us-east  # Deploy only metrics API to US East
+    $0 --dry-run --services websocket --singapore-only  # Show what would be deployed
 EOF
 }
 
@@ -359,7 +422,7 @@ validate_prerequisites() {
     done
     
     # Check helm charts exist for selected region
-    local charts=($(get_charts_for_region "${DEPLOY_REGION}"))
+    local charts=($(get_charts_for_region "${DEPLOY_REGION}" "${SERVICES_FILTER}"))
     for chart in "${charts[@]}"; do
         local chart_path="${HELM_DIR}/${chart}"
         
@@ -423,7 +486,7 @@ update_dependencies() {
     
     log_section "Updating Helm Dependencies"
     
-    local charts=($(get_charts_for_region "${DEPLOY_REGION}"))
+    local charts=($(get_charts_for_region "${DEPLOY_REGION}" "${SERVICES_FILTER}"))
     
     # Add required helm repositories first
     local repos_added=false
@@ -666,7 +729,7 @@ deploy_certificates() {
 deploy_all_charts() {
     log_section "Deploying Selected Charts"
     
-    local charts=($(get_charts_for_region "${DEPLOY_REGION}"))
+    local charts=($(get_charts_for_region "${DEPLOY_REGION}" "${SERVICES_FILTER}"))
     
     for chart in "${charts[@]}"; do
         deploy_chart "${chart}"
@@ -819,6 +882,11 @@ main() {
     log_info "Dry run mode: ${DRY_RUN}"
     log_info "Skip dependencies: ${SKIP_DEPENDENCIES}"
     log_info "Deploy region: ${DEPLOY_REGION}"
+    if [[ -n "${SERVICES_FILTER}" ]]; then
+        log_info "Services filter: ${SERVICES_FILTER}"
+    else
+        log_info "Services filter: all"
+    fi
     
     validate_prerequisites
     deploy_digitalocean_secret

@@ -42,10 +42,10 @@ rustlemania-websocket:
 
   resources:
     limits:
-      cpu: "1"
+      cpu: "500m"
       memory: "256Mi"
     requests:
-      cpu: "1"
+      cpu: "500m"
       memory: "128Mi"
 
   service:
@@ -74,7 +74,7 @@ rustlemania-websocket:
           - websocket-singapore.webtransport.video
 
   autoscaling:
-    enabled: true
+    enabled: false
     minReplicas: 2
     maxReplicas: 8
     targetCPUUtilizationPercentage: 70

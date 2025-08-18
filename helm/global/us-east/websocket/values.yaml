@@ -41,10 +41,10 @@ rustlemania-websocket:
 
   resources:
     limits:
-      cpu: "1"
+      cpu: "500m"
       memory: "384Mi"
     requests:
-      cpu: "1"
+      cpu: "500m"
       memory: "192Mi"
 
   service:

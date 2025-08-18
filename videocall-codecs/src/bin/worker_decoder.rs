@@ -40,6 +40,7 @@ use std::cell::RefCell;
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, VideoFrame};
 use videocall_codecs::jitter_buffer::JitterBuffer;
+use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -47,19 +48,6 @@ use web_sys::{
     EncodedVideoChunkType, VideoDecoder, VideoDecoderConfig, VideoDecoderInit,
     VideoFrame as WebVideoFrame,
 };
-
-/// Messages that can be sent to the web worker
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerMessage {
-    /// Decode a frame using the jitter buffer
-    DecodeFrame(FrameBuffer),
-    /// Flush the jitter buffer and decoder
-    Flush,
-    /// Reset jitter buffer and decoder to initial state
-    Reset,
-    /// Set diagnostic context so we can attach from/to labels to diagnostics
-    SetContext { from_peer: String, to_peer: String },
-}
 
 /// WebDecoder implementation that wraps WebCodecs VideoDecoder
 struct WebDecoder {
@@ -225,14 +213,6 @@ thread_local! {
     static CONTEXT_TO: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct VideoStatsMsg {
-    kind: &'static str,
-    from_peer: String,
-    to_peer: String,
-    frames_buffered: u64,
-}
-
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
 
 #[wasm_bindgen(start)]
@@ -379,12 +359,11 @@ fn check_jitter_buffer_for_ready_frames() {
 
                             // Also post a lightweight message to the main thread so it can forward to its bus
                             if let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() {
-                                let msg = VideoStatsMsg {
-                                    kind: "video_stats",
-                                    from_peer: from_cell.borrow().clone().unwrap(),
-                                    to_peer: to_cell.borrow().clone().unwrap(),
-                                    frames_buffered: buffered,
-                                };
+                                let msg = VideoStatsMessage::new(
+                                    from_cell.borrow().clone().unwrap(),
+                                    to_cell.borrow().clone().unwrap(),
+                                    buffered,
+                                );
                                 if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                     let _ = scope.post_message(&val);
                                 }

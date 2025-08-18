@@ -20,26 +20,12 @@
 
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
-use js_sys::Reflect;
-use serde::{Deserialize, Serialize};
+use crate::messages::{VideoStatsMessage, WorkerMessage};
 #[cfg(feature = "wasm")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{console, window, VideoFrame, Worker};
-
-/// Messages that can be sent to the web worker
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerMessage {
-    /// Decode a frame
-    DecodeFrame(FrameBuffer),
-    /// Flush the decoder buffer and reset state
-    Flush,
-    /// Reset decoder to initial state (waiting for keyframe)
-    Reset,
-    /// Set diagnostic context so worker can tag events with original IDs
-    SetContext { from_peer: String, to_peer: String },
-}
 
 unsafe impl Send for WasmDecoder {}
 unsafe impl Sync for WasmDecoder {}
@@ -270,42 +256,34 @@ impl Drop for WasmDecoder {
 
 /// Handle diagnostics objects posted by the worker. Returns true if handled.
 fn handle_worker_diag_message(js_val: &JsValue) -> bool {
-    if !js_val.is_object() {
-        return false;
-    }
+    // Try to deserialize the JavaScript object using serde
+    match serde_wasm_bindgen::from_value::<VideoStatsMessage>(js_val.clone()) {
+        Ok(stats_msg) => {
+            // Only handle video_stats messages
+            if stats_msg.kind != "video_stats" {
+                return false;
+            }
 
-    if let Ok(kind) = Reflect::get(js_val, &JsValue::from_str("kind")) {
-        if kind.as_string().as_deref() == Some("video_stats") {
             #[cfg(feature = "wasm")]
             {
-                let from_peer = Reflect::get(js_val, &JsValue::from_str("from_peer"))
-                    .ok()
-                    .and_then(|v| v.as_string())
-                    .unwrap_or_default();
-                let to_peer = Reflect::get(js_val, &JsValue::from_str("to_peer"))
-                    .ok()
-                    .and_then(|v| v.as_string())
-                    .unwrap_or_default();
-                let frames_buffered = Reflect::get(js_val, &JsValue::from_str("frames_buffered"))
-                    .ok()
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as u64;
-
                 let evt = DiagEvent {
                     subsystem: "video",
                     stream_id: None,
                     ts_ms: now_ms(),
                     metrics: vec![
-                        metric!("from_peer", from_peer),
-                        metric!("to_peer", to_peer),
-                        metric!("frames_buffered", frames_buffered),
+                        metric!("from_peer", stats_msg.from_peer.unwrap_or_default()),
+                        metric!("to_peer", stats_msg.to_peer.unwrap_or_default()),
+                        metric!("frames_buffered", stats_msg.frames_buffered.unwrap_or(0)),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);
             }
-            return true;
+            true
+        }
+        Err(_) => {
+            // Not a recognized diagnostic message
+            log::debug!("Received unexpected message from worker: {js_val:?}");
+            false
         }
     }
-
-    false
 }

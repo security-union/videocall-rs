@@ -289,11 +289,8 @@ mod wasm_worker {
                         let actual_production_rate = TOTAL_FRAMES_PRODUCED as f64 / (total_elapsed_ms / 1000.0);
                         let expected_rate = 100.0; // 100 Hz target
                         let timing_error_ms = (TOTAL_FRAMES_PRODUCED as f64 * 10.0) - total_elapsed_ms;
-                                                 console::log_1(
-                             &format!(
-                                 "🎯 NetEq (5ms checks): {:.1}Hz actual, {:.1}Hz expected, {:.1}ms timing error, {} behind, muted={}",
-                                 actual_production_rate, expected_rate, timing_error_ms, frames_behind, is_muted
-                             ).into(),
+                        log::debug!(
+                            "🎯 NetEq (5ms checks): {actual_production_rate:.1}Hz actual, {expected_rate:.1}Hz expected, {timing_error_ms:.1}ms timing error, {frames_behind} behind, muted={is_muted}"
                          );
                         LAST_TIMING_LOG = now;
                     }

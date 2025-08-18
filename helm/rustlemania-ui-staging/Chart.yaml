@@ -1,9 +1,0 @@
-apiVersion: v2
-name: rustlemania-ui-staging
-description: A Helm chart for rustlemania-ui staging deployment
-type: application
-version: 0.1.0
-dependencies:
-  - name: rustlemania-ui
-    version: "0.1.0"
-    repository: "file://../rustlemania-ui" 

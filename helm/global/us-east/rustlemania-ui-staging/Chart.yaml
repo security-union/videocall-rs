@@ -4,6 +4,6 @@ version: 0.1.0
 description: Videocall staging UI for US East region
 
 dependencies:
-  - name: rustlemania-ui-staging
+  - name: rustlemania-ui
     version: 0.1.0
-    repository: file://../../../rustlemania-ui-staging 
+    repository: file://../../../rustlemania-ui

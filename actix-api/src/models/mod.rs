@@ -19,10 +19,12 @@
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
+use crate::server_diagnostics::TrackerSender;
 
 pub struct AppState {
     pub chat: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
+    pub tracker_sender: TrackerSender,
 }
 
 pub struct AppConfig {

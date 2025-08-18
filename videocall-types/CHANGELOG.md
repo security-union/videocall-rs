@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1](https://github.com/security-union/videocall-rs/compare/videocall-types-v3.0.0...videocall-types-v3.0.1) - 2025-08-18
+
+### Other
+
+- Add server stats ([#399](https://github.com/security-union/videocall-rs/pull/399))
+
 ## [3.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v2.0.2...videocall-types-v3.0.0) - 2025-08-15
 
 ### Other

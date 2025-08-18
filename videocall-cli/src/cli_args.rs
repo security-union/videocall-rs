@@ -148,6 +148,11 @@ pub struct Stream {
     /// This is for ensuring that we can open the camera and encode video
     #[clap(long = "debug-offline-streaming-test")]
     pub local_streaming_test: bool,
+
+    /// Skip TLS certificate verification for QUIC connections.
+    /// Warning: This makes connections insecure and should only be used for testing.
+    #[clap(long = "insecure-skip-verify")]
+    pub insecure_skip_verify: bool,
 }
 
 fn parse_frame_format(s: &str) -> Result<FrameFormat, String> {

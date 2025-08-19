@@ -34,6 +34,7 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 // Real VP9 encoder - exactly same approach as videocall-cli
 
 pub struct VideoProducer {
+    #[allow(dead_code)]
     user_id: String,
     quit: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,

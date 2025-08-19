@@ -13,7 +13,7 @@ authors = ["Dario Lencina Talarico"]
 
 Real-time video calling systems fail in spectacular ways when they hit their limits. Instead of waiting for your customers to discover these limits during peak usage (usually at the worst possible moment), we built synthetic client bots that hammer your system with realistic traffic patterns. This article walks through building load testing infrastructure that actually works, catches real bottlenecks, and saves your on-call rotation from 3 AM disasters.
 
-## The Problem That Haunts Every Staff Engineer
+## The Problem That Haunts Every Engineer
 
 Picture this: It's Black Friday, your video calling service is getting hammered, and suddenly users are reporting "the call quality is terrible." Your monitoring dashboard shows everything green – CPU usage normal, memory fine, all services responding. But your support queue is filling up with angry customers who sound like they're calling from the bottom of a well.
 

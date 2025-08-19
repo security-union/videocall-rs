@@ -432,7 +432,7 @@ impl PeerDecodeManager {
                     if let Some(diagnostics) = &self.diagnostics {
                         diagnostics.track_heartbeat(&email);
                     }
-                    log::info!("💓 BROWSER: Heartbeat received from peer: {}", email);
+                    log::info!("💓 BROWSER: Heartbeat received from peer: {email}");
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {

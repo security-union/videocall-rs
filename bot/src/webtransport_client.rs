@@ -142,7 +142,7 @@ impl WebTransportClient {
                         email: user_id.clone(),
                         timestamp: now_ms as f64,
                         heartbeat_metadata: Some(HeartbeatMetadata {
-                            video_enabled: true, // EXACT match with videocall-cli (always true)
+                            video_enabled,
                             ..Default::default()
                         })
                         .into(),
@@ -208,11 +208,4 @@ impl WebTransportClient {
         self.quit.store(true, Ordering::Relaxed);
         info!("Stopping WebTransport client for {}", self.config.user_id);
     }
-}
-
-fn get_timestamp_ms() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as f64
 }

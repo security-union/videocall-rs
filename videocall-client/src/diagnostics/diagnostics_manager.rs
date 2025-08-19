@@ -351,7 +351,7 @@ impl DiagnosticManager {
 
     // Track a heartbeat received from a peer
     pub fn track_heartbeat(&self, peer_id: &str) {
-        debug!("📡 Tracking heartbeat for peer: {}", peer_id);
+        debug!("📡 Tracking heartbeat for peer: {peer_id}");
 
         if let Err(e) = self
             .sender

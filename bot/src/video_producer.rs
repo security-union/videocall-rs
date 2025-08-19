@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -84,7 +84,7 @@ impl VideoProducer {
         // Load image sequence (using videocall-cli pattern)
         let mut frames = Vec::new();
         for i in 120..125 {
-            let path = format!("{image_dir}/{i}/output_{i}.jpg");
+            let path = format!("{image_dir}/output_{i}.jpg");
             match std::fs::read(&path) {
                 Ok(img_data) => {
                     let img = ImageReader::new(std::io::Cursor::new(img_data))
@@ -161,7 +161,7 @@ impl VideoProducer {
                 if let Err(e) = packet_sender.try_send(packet_data) {
                     warn!("Failed to send video packet for {}: {}", user_id, e);
                 } else {
-                    debug!(
+                    trace!(
                         "Sent VP9 frame {} ({} bytes, {}) for {}",
                         sequence,
                         frame.data.len(),

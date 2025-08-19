@@ -7,7 +7,7 @@ clients:
   # Client 0: Full audio+video in meetinga
   - user_id: "dockerbot000"
     meeting_id: "meetinga"
-    enable_audio: false
+    enable_audio: true
     enable_video: true
     
   # Client 1: Audio-only in meetingb  
@@ -19,5 +19,53 @@ clients:
   # Client 2: Video-only in meetinga (same room as client 0)
   - user_id: "dockerbot002"
     meeting_id: "meetinga"
-    enable_audio: false
-    enable_video: false
+    enable_audio: true
+    enable_video: true
+
+  # Client 3: Full audio+video in meetinga
+  - user_id: "dockerbot003"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
+
+  # Client 4: Full audio+video in meetinga
+  - user_id: "dockerbot004"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
+
+  # Client 5: Full audio+video in meetingb
+  - user_id: "dockerbot005"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
+
+  # Client 6: Full audio+video in meetingb
+  - user_id: "dockerbot006"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
+
+  # Client 7: Full audio+video in meetingb
+  - user_id: "dockerbot007"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
+
+  # Client 8: Full audio+video in meetinga
+  - user_id: "dockerbot008"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
+
+  # Client 9: Full audio+video in meetinga
+  - user_id: "dockerbot009"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
+
+  # Client 10: Full audio+video in meetinga
+  - user_id: "dockerbot010"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true

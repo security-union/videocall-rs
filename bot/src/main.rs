@@ -136,10 +136,10 @@ async fn run_client(
 
     if config.enable_video {
         info!("Starting video producer for {}", config.user_id);
-        // Use local image directory (copied from videocall-cli)
+        // Use local image directory (images are in current directory)
         match VideoProducer::from_image_sequence(
             config.user_id.clone(),
-            ".", // Images are in current directory
+            ".", // Images are in current directory (bot working dir)
             packet_tx.clone(),
         ) {
             Ok(producer) => {

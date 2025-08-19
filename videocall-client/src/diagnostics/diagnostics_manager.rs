@@ -434,8 +434,8 @@ impl DiagnosticWorker {
                 *count += 1;
 
                 debug!(
-                    "💓 DiagnosticWorker: Heartbeat #{} received from peer: {}",
-                    count, peer_id
+                    "💓 DiagnosticWorker: Heartbeat #{} received from peer: {peer_id}",
+                    count
                 );
 
                 // Send heartbeat event to UI via global diagnostics

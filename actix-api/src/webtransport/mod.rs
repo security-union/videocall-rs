@@ -276,17 +276,14 @@ async fn handle_webtransport_session(
         "webtransport".to_string(),
     );
 
-    let session = Arc::new(RwLock::new(session));
+    let session = session.clone();
     let should_run = Arc::new(AtomicBool::new(true));
 
     let subject = format!("room.{lobby_id}.*").replace(' ', "_");
     let specific_subject: Subject = format!("room.{lobby_id}.{username}")
         .replace(' ', "_")
         .into();
-    let mut sub = match nc
-        .queue_subscribe(subject.clone(), specific_subject.to_string())
-        .await
-    {
+    let mut sub = match nc.subscribe(subject.clone()).await {
         Ok(sub) => {
             info!("Subscribed to subject {subject}");
             sub
@@ -314,12 +311,12 @@ async fn handle_webtransport_session(
                 if msg.subject == specific_subject_clone {
                     continue;
                 }
-                let session = session.read().await;
-                let stream = session.open_uni().await;
+                let session = session.clone();
                 let session_id_clone = session_id_clone.clone();
                 let payload_size = msg.payload.len() as u64;
                 let tracker_sender_inner = tracker_sender_nats.clone();
                 tokio::spawn(async move {
+                    let stream = session.open_uni().await;
                     let data_tracker_inner = DataTracker::new(tracker_sender_inner);
                     match stream {
                         Ok(mut uni_stream) => {
@@ -346,7 +343,6 @@ async fn handle_webtransport_session(
         let session_id_clone = session_id.clone();
         let tracker_sender_wt = tracker_sender.clone();
         tokio::spawn(async move {
-            let session = session.read().await;
             while let Ok(mut uni_stream) = session.accept_uni().await {
                 let nc = nc.clone();
                 let specific_subject = specific_subject.clone();
@@ -406,12 +402,10 @@ async fn handle_webtransport_session(
     };
 
     let _datagrams_task = {
-        let session_clone = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_wt_datagram = tracker_sender.clone();
         tokio::spawn(async move {
             let data_tracker = DataTracker::new(tracker_sender_wt_datagram);
-            let session = session_clone.read().await;
             while let Ok(buf) = session.read_datagram().await {
                 let buf_size = buf.len() as u64;
                 // Track data received

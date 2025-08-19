@@ -139,8 +139,8 @@ impl AudioProducer {
 
             // Extract 20ms worth of samples (with looping)
             let mut packet_samples = vec![0.0f32; samples_per_packet];
-            for i in 0..samples_per_packet {
-                packet_samples[i] = audio_data[audio_position % audio_data.len()];
+            for item in packet_samples.iter_mut().take(samples_per_packet) {
+                *item = audio_data[audio_position % audio_data.len()];
                 audio_position += 1;
             }
 
@@ -148,7 +148,7 @@ impl AudioProducer {
             let mut encoded = vec![0u8; 4000];
             match opus_encoder.encode_float(&packet_samples, &mut encoded) {
                 Ok(bytes_written) => {
-                    encoded.truncate(bytes_written as usize);
+                    encoded.truncate(bytes_written);
 
                     // Create media packet
                     let media_packet = MediaPacket {

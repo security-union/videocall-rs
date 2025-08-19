@@ -48,6 +48,7 @@ pub struct VideoEncoderBuilder {
     pub bitrate_kbps: u32,
     pub fps: u32,
     pub resolution: (u32, u32),
+    #[allow(dead_code)]
     pub cpu_used: u32,
     pub profile: u32,
 }
@@ -186,6 +187,7 @@ pub struct Frame<'a> {
     pub data: &'a [u8],
     /// Whether this is a key frame.
     pub key: bool,
+    #[allow(dead_code)]
     /// Whether this frame is invisible.
     pub invisible: bool,
 }

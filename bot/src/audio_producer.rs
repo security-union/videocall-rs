@@ -20,16 +20,18 @@ use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEnco
 use protobuf::Message;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
-use tracing::{debug, error, info, warn};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, MissedTickBehavior};
+use tracing::{error, info, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket, VideoMetadata};
+use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub struct AudioProducer {
+    #[allow(dead_code)]
     user_id: String,
     quit: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -45,8 +47,10 @@ impl AudioProducer {
         let quit_clone = quit.clone();
         let user_id_clone = user_id.clone();
 
-        let handle = thread::spawn(move || {
-            if let Err(e) = Self::audio_loop(user_id_clone, audio_data, packet_sender, quit_clone) {
+        let handle = tokio::spawn(async move {
+            if let Err(e) =
+                Self::audio_loop(user_id_clone, audio_data, packet_sender, quit_clone).await
+            {
                 error!("Audio producer error: {}", e);
             }
         });
@@ -109,7 +113,7 @@ impl AudioProducer {
         Self::new(user_id, wav_samples, packet_sender)
     }
 
-    fn audio_loop(
+    async fn audio_loop(
         user_id: String,
         audio_data: Vec<f32>,
         packet_sender: Sender<Vec<u8>>,
@@ -120,6 +124,10 @@ impl AudioProducer {
         let channels = 1u8; // Mono for simplicity
         let samples_per_packet = (sample_rate as f32 * 0.02) as usize; // 20ms worth
         let packet_interval = Duration::from_millis(20);
+
+        // Create precise interval timer
+        let mut interval_timer = interval(packet_interval);
+        interval_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         // Create Opus encoder
         let mut opus_encoder = OpusEncoder::new(sample_rate, OpusChannels::Mono, OpusApp::Voip)?;
@@ -186,7 +194,7 @@ impl AudioProducer {
                 }
             }
 
-            thread::sleep(packet_interval);
+            interval_timer.tick().await;
         }
 
         Ok(())
@@ -195,7 +203,7 @@ impl AudioProducer {
     pub fn stop(&mut self) {
         self.quit.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            handle.abort();
         }
     }
 }

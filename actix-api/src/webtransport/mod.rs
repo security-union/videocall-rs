@@ -17,6 +17,7 @@
  */
 
 use crate::client_diagnostics::health_processor;
+use crate::models::build_subject_and_queue;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
 };
@@ -280,13 +281,17 @@ async fn handle_webtransport_session(
     let session = session.clone();
     let cancellation_token = CancellationToken::new();
 
-    let subject = format!("room.{lobby_id}.*").replace(' ', "_");
+    // Use the same function as WebSocket to build subject and queue names
+    let (subject, queue_name) = build_subject_and_queue(lobby_id, &session_id);
     let specific_subject: Subject = format!("room.{lobby_id}.{username}")
         .replace(' ', "_")
         .into();
-    let mut sub = match nc.subscribe(subject.clone()).await {
+    let mut sub = match nc
+        .queue_subscribe(subject.clone(), queue_name.clone())
+        .await
+    {
         Ok(sub) => {
-            info!("Subscribed to subject {subject}");
+            info!("Subscribed to subject {subject} with queue {queue_name}");
             sub
         }
         Err(e) => {

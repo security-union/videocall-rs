@@ -64,15 +64,15 @@ impl BotConfig {
         let mut clients = Vec::new();
         for i in 0..n_clients {
             // Check for per-client env vars first, then default to global/defaults
-            let client_enable_audio = std::env::var(&format!("CLIENT_{i}_ENABLE_AUDIO"))
+            let client_enable_audio = std::env::var(format!("CLIENT_{i}_ENABLE_AUDIO"))
                 .unwrap_or_else(|_| "true".to_string())
                 .parse::<bool>()
                 .unwrap_or(true);
-            let client_enable_video = std::env::var(&format!("CLIENT_{i}_ENABLE_VIDEO"))
+            let client_enable_video = std::env::var(format!("CLIENT_{i}_ENABLE_VIDEO"))
                 .unwrap_or_else(|_| "true".to_string())
                 .parse::<bool>()
                 .unwrap_or(true);
-            let client_meeting_id = std::env::var(&format!("CLIENT_{i}_MEETING_ID"))
+            let client_meeting_id = std::env::var(format!("CLIENT_{i}_MEETING_ID"))
                 .unwrap_or_else(|_| default_meeting_id.clone());
 
             clients.push(ClientConfig {

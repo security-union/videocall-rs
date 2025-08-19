@@ -1,6 +1,6 @@
 +++
 title = "The Dario Way: Know Your Limits Before Your Customers Do (And How We Caught a 50% Performance Bug)"
-date = 2025-01-27
+date = 2025-08-19
 description = "Using synthetic client bots to load test WebTransport video calls and discovering hidden bottlenecks before they hit production"
 [taxonomies]
 tags = ["rust", "load-testing", "performance", "webtransport", "synthetic-clients", "engineering"]

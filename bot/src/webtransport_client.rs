@@ -119,6 +119,7 @@ impl WebTransportClient {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
             let video_enabled = self.config.enable_video; // Get actual video config
+            let audio_enabled = self.config.enable_audio; // Get actual audio config
             let quit = self.quit.clone();
 
             tokio::spawn(async move {
@@ -143,6 +144,7 @@ impl WebTransportClient {
                         timestamp: now_ms as f64,
                         heartbeat_metadata: Some(HeartbeatMetadata {
                             video_enabled,
+                            audio_enabled,
                             ..Default::default()
                         })
                         .into(),

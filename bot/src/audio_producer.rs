@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
+use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket, VideoMetadata};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -152,13 +152,12 @@ impl AudioProducer {
 
                     // Create media packet
                     let media_packet = MediaPacket {
+                        email: user_id.clone(),
                         media_type: MediaType::AUDIO.into(),
                         data: encoded,
-                        email: user_id.clone(),
-                        frame_type: "audio".to_string(),
+                        frame_type: "key".to_string(),
                         timestamp: get_timestamp_ms(),
-                        duration: 20.0, // 20ms packet
-                        video_metadata: Some(VideoMetadata {
+                        audio_metadata: Some(AudioMetadata {
                             sequence,
                             ..Default::default()
                         })
@@ -168,9 +167,9 @@ impl AudioProducer {
 
                     // Wrap in packet wrapper
                     let packet_wrapper = PacketWrapper {
-                        packet_type: PacketType::MEDIA.into(),
-                        email: user_id.clone(),
                         data: media_packet.write_to_bytes()?,
+                        email: user_id.clone(),
+                        packet_type: PacketType::MEDIA.into(),
                         ..Default::default()
                     };
 
@@ -178,8 +177,6 @@ impl AudioProducer {
                     let packet_data = packet_wrapper.write_to_bytes()?;
                     if let Err(e) = packet_sender.try_send(packet_data) {
                         warn!("Failed to send audio packet for {}: {}", user_id, e);
-                    } else {
-                        debug!("Sent audio packet {} for {}", sequence, user_id);
                     }
 
                     sequence += 1;

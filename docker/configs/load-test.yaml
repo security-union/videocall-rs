@@ -1,0 +1,50 @@
+# Load testing configuration - 10 clients across 3 meetings
+ramp_up_delay_ms: 500  # Faster ramp-up
+server_url: "https://webtransport-api:4433"
+
+clients:
+  # Meeting room 1 - 4 clients
+  - user_id: "load-test-001"
+    meeting_id: "load-room-1"
+    enable_audio: true
+    enable_video: true
+  - user_id: "load-test-002"
+    meeting_id: "load-room-1"
+    enable_audio: true
+    enable_video: false
+  - user_id: "load-test-003"
+    meeting_id: "load-room-1"
+    enable_audio: false
+    enable_video: true
+  - user_id: "load-test-004"
+    meeting_id: "load-room-1"
+    enable_audio: true
+    enable_video: true
+    
+  # Meeting room 2 - 3 clients
+  - user_id: "load-test-005"
+    meeting_id: "load-room-2"
+    enable_audio: true
+    enable_video: true
+  - user_id: "load-test-006"
+    meeting_id: "load-room-2"
+    enable_audio: true
+    enable_video: false
+  - user_id: "load-test-007"
+    meeting_id: "load-room-2"
+    enable_audio: false
+    enable_video: true
+    
+  # Meeting room 3 - 3 clients
+  - user_id: "load-test-008"
+    meeting_id: "load-room-3"
+    enable_audio: true
+    enable_video: false
+  - user_id: "load-test-009"
+    meeting_id: "load-room-3"
+    enable_audio: false
+    enable_video: true
+  - user_id: "load-test-010"
+    meeting_id: "load-room-3"
+    enable_audio: true
+    enable_video: true

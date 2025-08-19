@@ -1,0 +1,23 @@
+# Docker synthetic clients configuration
+ramp_up_delay_ms: 1000
+server_url: "https://webtransport-api:4433"
+insecure: true  # Skip certificate verification for development
+
+clients:
+  # Client 0: Full audio+video in meetinga
+  - user_id: "dockerbot000"
+    meeting_id: "meetinga"
+    enable_audio: false
+    enable_video: false
+    
+  # Client 1: Audio-only in meetingb  
+  - user_id: "dockerbot001"
+    meeting_id: "meetingb"
+    enable_audio: false
+    enable_video: false
+    
+  # Client 2: Video-only in meetinga (same room as client 0)
+  - user_id: "dockerbot002"
+    meeting_id: "meetinga"
+    enable_audio: false
+    enable_video: false

@@ -403,7 +403,13 @@ impl PeerDecodeManager {
     }
 
     pub fn run_peer_monitor(&mut self) {
-        let pred = |peer: &mut Peer| peer.check_heartbeat();
+        let pred = |peer: &mut Peer| {
+            let has_heartbeat = peer.check_heartbeat();
+            if !has_heartbeat {
+                debug!("❌ Removing peer {} due to missing heartbeats", peer.email);
+            }
+            !has_heartbeat // Remove if NO heartbeat (inverted logic)
+        };
         self.connected_peers.remove_if(pred);
     }
 
@@ -422,6 +428,11 @@ impl PeerDecodeManager {
             match peer.decode(&packet) {
                 Ok((MediaType::HEARTBEAT, _)) => {
                     peer.on_heartbeat();
+                    // Track heartbeat in diagnostics
+                    if let Some(diagnostics) = &self.diagnostics {
+                        diagnostics.track_heartbeat(&email);
+                    }
+                    log::info!("💓 BROWSER: Heartbeat received from peer: {}", email);
                     Ok(())
                 }
                 Ok((media_type, decode_status)) => {

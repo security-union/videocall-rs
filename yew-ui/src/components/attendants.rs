@@ -83,10 +83,11 @@ pub enum Msg {
     RemoveLastFakePeer,
     #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
-    NetEqStatsUpdated(String, String), // (peer_id, stats_json)
-    NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
-    NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
-    ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
+    NetEqStatsUpdated(String, String),      // (peer_id, stats_json)
+    NetEqBufferUpdated(String, u64),        // (peer_id, buffer_value)
+    NetEqJitterUpdated(String, u64),        // (peer_id, jitter_value)
+    ConnectionManagerUpdate(String),        // connection manager diagnostics JSON
+    HeartbeatReceived(String, Option<u64>), // (peer_id, heartbeat_count)
     HangUp,
     ShowCopyToast(bool),
 }
@@ -142,6 +143,8 @@ pub struct AttendantsComponent {
     pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
     pub connection_manager_state: Option<String>, // connection manager diagnostics (serialized)
     pub connection_manager_events: Vec<SerializableDiagEvent>, // accumulate individual events
+    pub last_heartbeat_per_peer: HashMap<String, f64>, // Track last heartbeat time per peer
+    pub heartbeat_count_per_peer: HashMap<String, u64>, // Track heartbeat count per peer
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -354,6 +357,8 @@ impl Component for AttendantsComponent {
             neteq_jitter_per_peer: HashMap::new(),
             connection_manager_state: None,
             connection_manager_events: Vec::new(),
+            last_heartbeat_per_peer: HashMap::new(),
+            heartbeat_count_per_peer: HashMap::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -503,6 +508,32 @@ impl Component for AttendantsComponent {
                             link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
                                 sender_stats,
                             )));
+                        }
+                    } else if evt.subsystem == "heartbeat" {
+                        // Track heartbeat events from peers
+                        if let Some(peer_id) = &evt.stream_id {
+                            let mut heartbeat_count = None;
+                            for metric in &evt.metrics {
+                                if metric.name == "heartbeat_received" {
+                                    // Extract heartbeat count if available
+                                    for count_metric in &evt.metrics {
+                                        if count_metric.name == "heartbeat_count" {
+                                            if let MetricValue::U64(count) = &count_metric.value {
+                                                heartbeat_count = Some(*count);
+                                            }
+                                        }
+                                    }
+                                    log::debug!(
+                                        "💓 YEW-UI: Heartbeat #{:?} received from peer: {}",
+                                        heartbeat_count,
+                                        peer_id
+                                    );
+                                    link.send_message(Msg::HeartbeatReceived(
+                                        peer_id.clone(),
+                                        heartbeat_count,
+                                    ));
+                                }
+                            }
                         }
                     } else if evt.subsystem == "video" {
                         // Known subsystem used for Grafana/metrics; UI does not render it
@@ -784,6 +815,26 @@ impl Component for AttendantsComponent {
                     .forget();
                 }
                 true
+            }
+            Msg::HeartbeatReceived(peer_id, count) => {
+                // Track heartbeat reception for diagnostics
+                if let Some(count) = count {
+                    log::debug!(
+                        "💓 UI: Received heartbeat #{} from peer: {}",
+                        count,
+                        peer_id
+                    );
+                    self.heartbeat_count_per_peer.insert(peer_id.clone(), count);
+                } else {
+                    log::debug!("💓 UI: Received heartbeat from peer: {}", peer_id);
+                }
+
+                // Update last heartbeat time for this peer
+                let now = js_sys::Date::now();
+                self.last_heartbeat_per_peer.insert(peer_id.clone(), now);
+
+                // No need to re-render for heartbeats (they're frequent)
+                false
             }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
@@ -1230,6 +1281,8 @@ impl Component for AttendantsComponent {
                     mic_enabled={self.mic_enabled}
                     share_screen={self.share_screen}
                     connection_manager_state={self.connection_manager_state.clone()}
+                    heartbeat_status={self.last_heartbeat_per_peer.clone()}
+                    heartbeat_counts={self.heartbeat_count_per_peer.clone()}
                 />
             </div>
         }

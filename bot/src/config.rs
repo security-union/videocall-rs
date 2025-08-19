@@ -24,7 +24,7 @@ use url::Url;
 pub struct BotConfig {
     pub ramp_up_delay_ms: Option<u64>,
     pub server_url: String,
-    pub insecure: Option<bool>,  // Skip certificate verification
+    pub insecure: Option<bool>, // Skip certificate verification
     pub clients: Vec<ClientConfig>,
 }
 
@@ -64,19 +64,19 @@ impl BotConfig {
         let mut clients = Vec::new();
         for i in 0..n_clients {
             // Check for per-client env vars first, then default to global/defaults
-            let client_enable_audio = std::env::var(&format!("CLIENT_{}_ENABLE_AUDIO", i))
+            let client_enable_audio = std::env::var(&format!("CLIENT_{i}_ENABLE_AUDIO"))
                 .unwrap_or_else(|_| "true".to_string())
                 .parse::<bool>()
                 .unwrap_or(true);
-            let client_enable_video = std::env::var(&format!("CLIENT_{}_ENABLE_VIDEO", i))
+            let client_enable_video = std::env::var(&format!("CLIENT_{i}_ENABLE_VIDEO"))
                 .unwrap_or_else(|_| "true".to_string())
                 .parse::<bool>()
                 .unwrap_or(true);
-            let client_meeting_id = std::env::var(&format!("CLIENT_{}_MEETING_ID", i))
+            let client_meeting_id = std::env::var(&format!("CLIENT_{i}_MEETING_ID"))
                 .unwrap_or_else(|_| default_meeting_id.clone());
 
             clients.push(ClientConfig {
-                user_id: format!("bot{:03}", i), // Remove hyphen for server compatibility
+                user_id: format!("bot{i:03}"), // Remove hyphen for server compatibility
                 meeting_id: client_meeting_id,
                 enable_audio: client_enable_audio,
                 enable_video: client_enable_video,

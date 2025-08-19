@@ -81,12 +81,17 @@ impl WebTransportClient {
         );
 
         self.session = Some(session);
+        info!(
+            "WebTransport session established for {}",
+            self.config.user_id
+        );
 
         // Send connection packet
         self.send_connection_packet().await?;
 
         // Start heartbeat
         self.start_heartbeat().await;
+        info!("Heartbeat started for {}", self.config.user_id);
 
         Ok(())
     }
@@ -113,7 +118,7 @@ impl WebTransportClient {
         if let Some(session) = &self.session {
             let session = session.clone();
             let user_id = self.config.user_id.clone();
-            let video_enabled = self.config.enable_video;  // Get actual video config
+            let video_enabled = self.config.enable_video; // Get actual video config
             let quit = self.quit.clone();
 
             tokio::spawn(async move {
@@ -137,7 +142,7 @@ impl WebTransportClient {
                         email: user_id.clone(),
                         timestamp: now_ms as f64,
                         heartbeat_metadata: Some(HeartbeatMetadata {
-                            video_enabled: video_enabled,  // Use actual client config
+                            video_enabled: true, // EXACT match with videocall-cli (always true)
                             ..Default::default()
                         })
                         .into(),

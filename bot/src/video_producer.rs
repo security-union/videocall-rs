@@ -83,7 +83,7 @@ impl VideoProducer {
         // Load image sequence (using videocall-cli pattern)
         let mut frames = Vec::new();
         for i in 120..125 {
-            let path = format!("{}/output_{}.jpg", image_dir, i);
+            let path = format!("{image_dir}/{i}/output_{i}.jpg");
             match std::fs::read(&path) {
                 Ok(img_data) => {
                     let img = ImageReader::new(std::io::Cursor::new(img_data))
@@ -160,9 +160,13 @@ impl VideoProducer {
                 if let Err(e) = packet_sender.try_send(packet_data) {
                     warn!("Failed to send video packet for {}: {}", user_id, e);
                 } else {
-                    debug!("Sent VP9 frame {} ({} bytes, {}) for {}", 
-                           sequence, frame.data.len(), 
-                           if frame.key { "key" } else { "delta" }, user_id);
+                    debug!(
+                        "Sent VP9 frame {} ({} bytes, {}) for {}",
+                        sequence,
+                        frame.data.len(),
+                        if frame.key { "key" } else { "delta" },
+                        user_id
+                    );
                 }
             }
 

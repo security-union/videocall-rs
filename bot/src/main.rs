@@ -18,7 +18,7 @@
 
 mod audio_producer;
 mod config;
-mod video_encoder;  // VP9 encoder from videocall-cli
+mod video_encoder; // VP9 encoder from videocall-cli
 mod video_producer;
 mod webtransport_client;
 
@@ -93,7 +93,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_client(config: ClientConfig, server_url: url::Url, insecure: bool) -> anyhow::Result<()> {
+async fn run_client(
+    config: ClientConfig,
+    server_url: url::Url,
+    insecure: bool,
+) -> anyhow::Result<()> {
     info!("Initializing client: {}", config.user_id);
 
     // Create WebTransport client and connect

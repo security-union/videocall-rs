@@ -45,9 +45,6 @@ pub enum DiagnosticEvent {
         media_type: MediaType,
         frame_size: u64, // Size of the frame in bytes
     },
-    HeartbeatReceived {
-        peer_id: String,
-    },
     RequestStats,
     SetStatsCallback(Callback<String>),
     SetReportingInterval(u64),
@@ -216,8 +213,6 @@ struct DiagnosticWorker {
     packet_handler: Option<Callback<DiagnosticsPacket>>,
     receiver: Receiver<DiagnosticEvent>,
     userid: String,
-    last_heartbeat_per_peer: HashMap<String, f64>, // Track last heartbeat time per peer
-    heartbeat_count_per_peer: HashMap<String, u64>, // Track total heartbeat count per peer
 }
 
 impl std::fmt::Debug for DiagnosticManager {
@@ -243,8 +238,6 @@ impl DiagnosticManager {
             report_interval_ms: 500,
             receiver,
             userid,
-            last_heartbeat_per_peer: HashMap::new(),
-            heartbeat_count_per_peer: HashMap::new(),
         };
 
         wasm_bindgen_futures::spawn_local(worker.run());
@@ -276,12 +269,12 @@ impl DiagnosticManager {
             }
         }) as Box<dyn FnMut()>);
 
-        // Set up the interval to run every 2000ms (2 seconds) to avoid removing peers between heartbeats
+        // Set up the interval to run every 500ms
         let interval_id = window()
             .expect("Failed to get window")
             .set_interval_with_callback_and_timeout_and_arguments_0(
                 callback.as_ref().unchecked_ref(),
-                2000,
+                500,
             )
             .expect("Failed to set interval");
 
@@ -349,21 +342,6 @@ impl DiagnosticManager {
         0.0
     }
 
-    // Track a heartbeat received from a peer
-    pub fn track_heartbeat(&self, peer_id: &str) {
-        debug!("📡 Tracking heartbeat for peer: {peer_id}");
-
-        if let Err(e) = self
-            .sender
-            .clone()
-            .try_send(DiagnosticEvent::HeartbeatReceived {
-                peer_id: peer_id.to_string(),
-            })
-        {
-            error!("Failed to send heartbeat event: {e}");
-        }
-    }
-
     // Increment the frames dropped counter
     pub fn increment_frames_dropped(&self) {
         self.frames_dropped.fetch_add(1, Ordering::SeqCst);
@@ -420,41 +398,6 @@ impl DiagnosticWorker {
                     .or_insert_with(|| FpsTracker::new(media_type));
 
                 tracker.track_frame_with_size(frame_size);
-            }
-            DiagnosticEvent::HeartbeatReceived { peer_id } => {
-                // Update last heartbeat time for the peer
-                self.last_heartbeat_per_peer
-                    .insert(peer_id.clone(), js_sys::Date::now());
-
-                // Increment heartbeat counter for the peer
-                let count = self
-                    .heartbeat_count_per_peer
-                    .entry(peer_id.clone())
-                    .or_insert(0);
-                *count += 1;
-
-                debug!(
-                    "💓 DiagnosticWorker: Heartbeat #{} received from peer: {peer_id}",
-                    count
-                );
-
-                // Send heartbeat event to UI via global diagnostics
-                let sender = global_sender();
-                let _result = sender.try_broadcast(DiagEvent {
-                    subsystem: "heartbeat",
-                    stream_id: Some(peer_id),
-                    ts_ms: now_ms(),
-                    metrics: vec![
-                        videocall_diagnostics::Metric {
-                            name: "heartbeat_received",
-                            value: videocall_diagnostics::MetricValue::U64(1),
-                        },
-                        videocall_diagnostics::Metric {
-                            name: "heartbeat_count",
-                            value: videocall_diagnostics::MetricValue::U64(*count),
-                        },
-                    ],
-                });
             }
             DiagnosticEvent::SetStatsCallback(callback) => {
                 self.on_stats_update = Some(callback);

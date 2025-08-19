@@ -8,7 +8,7 @@ clients:
   - user_id: "dockerbot000"
     meeting_id: "meetinga"
     enable_audio: false
-    enable_video: false
+    enable_video: true
     
   # Client 1: Audio-only in meetingb  
   - user_id: "dockerbot001"

@@ -340,15 +340,6 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
 
         .connection-error { background: #2C2C2E; color: #FF453A; padding: 12px; border-radius: 8px; border-left: 4px solid #FF453A; }
         .error-reason { margin: 6px 0 0 0; font-size: 12px; font-style: italic; }
-
-        .heartbeat-status-grid { display: grid; gap: 8px; }
-        .heartbeat-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-radius: 6px; border: 1px solid #38383A; }
-        .heartbeat-alive { background: #1C2E1F; border-color: #30D158; }
-        .heartbeat-dead { background: #2E1C1C; border-color: #FF453A; }
-        .heartbeat-peer-id { font-weight: 600; font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; font-size: 12px; }
-        .heartbeat-status { font-size: 11px; font-weight: 500; }
-        .heartbeat-alive .heartbeat-status { color: #30D158; }
-        .heartbeat-dead .heartbeat-status { color: #FF453A; }
     "#;
 
     if let Some(state) = parsed_state {
@@ -606,10 +597,6 @@ pub struct DiagnosticsProps {
     pub share_screen: bool,
     /// Connection manager diagnostics state
     pub connection_manager_state: Option<String>,
-    /// Heartbeat status per peer (peer_id -> last_heartbeat_time)
-    pub heartbeat_status: HashMap<String, f64>,
-    /// Heartbeat count per peer (peer_id -> total_count)
-    pub heartbeat_counts: HashMap<String, u64>,
 }
 
 fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
@@ -749,42 +736,6 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 <div class="diagnostics-section">
                     <h3>{"Connection Manager"}</h3>
                     <ConnectionManagerDisplay connection_manager_state={props.connection_manager_state.clone()} />
-                </div>
-
-                // Heartbeat Status Display
-                <div class="diagnostics-section">
-                    <h3>{"Peer Heartbeat Status"}</h3>
-                    {
-                        if props.heartbeat_status.is_empty() {
-                            html! {
-                                <p style="color: #AEAEB2; font-style: italic;">{"No peer heartbeat data available"}</p>
-                            }
-                        } else {
-                            let now = js_sys::Date::now();
-                            html! {
-                                <div class="heartbeat-status-grid">
-                                    {for props.heartbeat_status.iter().map(|(peer_id, last_heartbeat)| {
-                                        let time_since = now - last_heartbeat;
-                                        let is_alive = time_since < 5000.0; // Consider alive if heartbeat within 5 seconds
-                                        let status_class = if is_alive { "heartbeat-alive" } else { "heartbeat-dead" };
-                                        let heartbeat_count = props.heartbeat_counts.get(peer_id).unwrap_or(&0);
-                                        let status_text = if is_alive {
-                                            format!("🟢 #{} heartbeats ({:.1}s ago)", heartbeat_count, time_since / 1000.0)
-                                        } else {
-                                            format!("🔴 #{} heartbeats ({:.1}s ago)", heartbeat_count, time_since / 1000.0)
-                                        };
-
-                                        html! {
-                                            <div class={classes!("heartbeat-item", status_class)}>
-                                                <div class="heartbeat-peer-id">{peer_id}</div>
-                                                <div class="heartbeat-status">{status_text}</div>
-                                            </div>
-                                        }
-                                    })}
-                                </div>
-                            }
-                        }
-                    }
                 </div>
 
                 // Peer Selection

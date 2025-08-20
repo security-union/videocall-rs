@@ -32,7 +32,6 @@ use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, trace_span};
 
 use videocall_types::protos::connection_packet::ConnectionPacket;
@@ -481,9 +480,6 @@ async fn handle_quic_connection(
                 }
             };
             while let Some(msg) = sub.next().await {
-                if cancellation_token.is_cancelled() {
-                    break;
-                }
                 if Some(msg.subject) == specific_subject_rx.borrow().clone() {
                     continue;
                 }

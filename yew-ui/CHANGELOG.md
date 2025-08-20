@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.28](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.27...videocall-ui-v1.1.28) - 2025-08-20
+
+### Fixed
+
+- *(codecs)* route worker diag messages to health bus; refs #397 ([#400](https://github.com/security-union/videocall-rs/pull/400))
+
+### Other
+
+- (bug) screenshare now works only if there are at least 3 peers connected: host+ two listener #398 ([#402](https://github.com/security-union/videocall-rs/pull/402))
+
 ## [1.1.27](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.26...videocall-ui-v1.1.27) - 2025-08-18
 
 ### Other

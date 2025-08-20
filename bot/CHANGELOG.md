@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.10](https://github.com/security-union/videocall-rs/compare/bot-v1.0.9...bot-v1.0.10) - 2025-08-20
+
+### Other
+
+- Superbot and get rid of the should_run cancellation token ([#407](https://github.com/security-union/videocall-rs/pull/407))
+
 ## [1.0.9](https://github.com/security-union/videocall-rs/compare/bot-v1.0.8...bot-v1.0.9) - 2025-08-18
 
 ### Other

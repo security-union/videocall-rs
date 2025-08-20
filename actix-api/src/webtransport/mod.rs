@@ -276,7 +276,7 @@ async fn handle_webtransport_session(
         "webtransport".to_string(),
     );
 
-    let cancellation_token = Arc::new(CancellationToken::new());
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     let subject = format!("room.{lobby_id}.*").replace(' ', "_");
     let specific_subject: Subject = format!("room.{lobby_id}.{username}")
@@ -299,11 +299,11 @@ async fn handle_webtransport_session(
 
     let specific_subject_clone = specific_subject.clone();
 
-    let nats_receive_task = {
+    {
         let session = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
             while let Some(msg) = sub.next().await {
                 if msg.subject == specific_subject_clone {
@@ -331,16 +331,16 @@ async fn handle_webtransport_session(
                     }
                 });
             }
-        })
-    };
+        });
+    }
 
-    let quic_task = {
+    {
         let session = session.clone();
         let nc = nc.clone();
         let specific_subject = specific_subject.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_wt = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             while let Ok(mut uni_stream) = session.accept_uni().await {
                 let nc = nc.clone();
                 let specific_subject = specific_subject.clone();
@@ -396,13 +396,13 @@ async fn handle_webtransport_session(
                     }
                 });
             }
-        })
-    };
+        });
+    }
 
-    let _datagrams_task = {
+    {
         let session_id_clone = session_id.clone();
         let tracker_sender_wt_datagram = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let data_tracker = DataTracker::new(tracker_sender_wt_datagram);
             while let Ok(buf) = session.read_datagram().await {
                 let buf_size = buf.len() as u64;
@@ -429,18 +429,11 @@ async fn handle_webtransport_session(
                     }
                 }
             }
-        })
-    };
-    tokio::select! {
-        _ = quic_task => {},
-        _ = nats_receive_task => {},
-        _ = _datagrams_task => {},
-        _ = cancellation_token.cancelled() => {
-            info!("Cancellation token cancelled");
-        }
+        });
     }
 
-    cancellation_token.cancel();
+    join_set.join_next().await;
+    join_set.shutdown().await;
 
     // Track connection end for metrics
     send_connection_ended(&tracker_sender, session_id.clone());
@@ -458,17 +451,16 @@ async fn handle_quic_connection(
     // Generate session ID for metrics tracking (will start tracking after CONNECTION packet)
     let session_id = Arc::new(uuid::Uuid::new_v4().to_string());
     let session = Arc::new(RwLock::new(conn));
-    let cancellation_token = Arc::new(CancellationToken::new());
     let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<Subject>>(None);
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-    let nats_task = {
+    {
         let session = session.clone();
-        let cancellation_token = cancellation_token.clone();
         let nc_clone = nc.clone();
         let specific_subject_rx_clone = specific_subject_rx.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let mut specific_subject_rx = specific_subject_rx_clone;
             let nc = nc_clone;
             specific_subject_rx.changed().await.unwrap();
@@ -518,16 +510,16 @@ async fn handle_quic_connection(
                     }
                 });
             }
-        })
-    };
+        });
+    }
 
-    let quic_task = {
+    {
         let specific_subject_rx_clone = specific_subject_rx.clone();
         let session = session.clone();
         let nc = nc.clone();
         let session_id_arc = session_id.clone();
         let tracker_sender_quic = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let session = session.read().await;
             let specific_subject_tx = Arc::new(specific_subject_tx);
             while let Ok(mut uni_stream) = session.accept_uni().await {
@@ -615,14 +607,14 @@ async fn handle_quic_connection(
                     };
                 });
             }
-        })
-    };
+        });
+    }
 
-    let _datagrams_task = {
+    {
         let session_clone = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_datagram = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let data_tracker = DataTracker::new(tracker_sender_datagram);
             let session = session_clone.read().await;
             if specific_subject_rx.borrow().is_none() {
@@ -651,19 +643,11 @@ async fn handle_quic_connection(
                     }
                 }
             }
-        })
-    };
-
-    tokio::select! {
-        _ = quic_task => {},
-        _ = nats_task => {},
-        _ = _datagrams_task => {},
-        _ = cancellation_token.cancelled() => {
-            info!("Cancellation token cancelled");
-        }
+        });
     }
 
-    cancellation_token.cancel();
+    join_set.join_next().await;
+    join_set.shutdown().await;
 
     // Track connection end for metrics
     send_connection_ended(&tracker_sender, session_id.as_ref().clone());

@@ -299,6 +299,7 @@ async fn handle_webtransport_session(
 
     let specific_subject_clone = specific_subject.clone();
 
+    // NATS receive task
     {
         let session = session.clone();
         let session_id_clone = session_id.clone();
@@ -353,6 +354,7 @@ async fn handle_webtransport_session(
         });
     }
 
+    // WebTransport unidirectional receive task
     {
         let session = session.clone();
         let nc = nc.clone();
@@ -418,6 +420,7 @@ async fn handle_webtransport_session(
         });
     }
 
+    // WebTransport datagram receive task
     {
         let session_id_clone = session_id.clone();
         let tracker_sender_wt_datagram = tracker_sender.clone();
@@ -473,6 +476,7 @@ async fn handle_quic_connection(
     let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<Subject>>(None);
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+    // NATS receive task
     {
         let session = session.clone();
         let nc_clone = nc.clone();
@@ -529,6 +533,7 @@ async fn handle_quic_connection(
         });
     }
 
+    // QUIC unidirectional receive task
     {
         let specific_subject_rx_clone = specific_subject_rx.clone();
         let session = session.clone();
@@ -626,6 +631,7 @@ async fn handle_quic_connection(
         });
     }
 
+    // QUIC datagram receive task
     {
         let session_clone = session.clone();
         let session_id_clone = session_id.clone();

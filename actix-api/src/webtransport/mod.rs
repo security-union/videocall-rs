@@ -39,7 +39,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use web_transport_quinn::Session;
+use web_transport_quinn::{Session, SessionError};
 
 /// Videocall WebTransport API
 ///
@@ -323,6 +323,14 @@ async fn handle_webtransport_session(
                                 // Track data sent
                                 data_tracker_inner.track_sent(&session_id_clone, payload_size);
                             }
+                        }
+                        Err(SessionError::ConnectionError(e)) => {
+                            error!("Connection error: {}", e);
+                            return;
+                        }
+                        Err(SessionError::WebTransportError(e)) => {
+                            error!("WebTransport error: {}", e);
+                            return;
                         }
                         Err(e) => {
                             error!("Error opening unidirectional stream: {}", e);

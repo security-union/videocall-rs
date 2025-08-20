@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.5...videocall-codecs-v0.1.6) - 2025-08-20
+
+### Fixed
+
+- *(codecs)* route worker diag messages to health bus; refs #397 ([#400](https://github.com/security-union/videocall-rs/pull/400))
+
 ## [0.1.5](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.4...videocall-codecs-v0.1.5) - 2025-08-08
 
 ### Other

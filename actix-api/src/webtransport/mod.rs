@@ -28,12 +28,10 @@ use quinn::crypto::rustls::HandshakeData;
 use quinn::VarInt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
-
 use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, trace_span};
 
 use videocall_types::protos::connection_packet::ConnectionPacket;
@@ -41,7 +39,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use web_transport_quinn::Session;
+use web_transport_quinn::{Session, SessionError};
 
 /// Videocall WebTransport API
 ///
@@ -277,14 +275,16 @@ async fn handle_webtransport_session(
         "webtransport".to_string(),
     );
 
-    let session = session.clone();
-    let cancellation_token = CancellationToken::new();
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     let subject = format!("room.{lobby_id}.*").replace(' ', "_");
     let specific_subject: Subject = format!("room.{lobby_id}.{username}")
         .replace(' ', "_")
         .into();
-    let mut sub = match nc.subscribe(subject.clone()).await {
+    let mut sub = match nc
+        .queue_subscribe(subject.clone(), specific_subject.to_string())
+        .await
+    {
         Ok(sub) => {
             info!("Subscribed to subject {subject}");
             sub
@@ -298,203 +298,150 @@ async fn handle_webtransport_session(
 
     let specific_subject_clone = specific_subject.clone();
 
-    let nats_receive_task = {
+    // NATS receive task
+    {
         let session = session.clone();
-        let cancellation_token = cancellation_token.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
-            loop {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        debug!("NATS receive task cancelled");
-                        break;
-                    }
-                    msg_opt = sub.next() => {
-                        match msg_opt {
-                            Some(msg) => {
-                                if msg.subject == specific_subject_clone {
-                                    continue;
-                                }
-                                let session = session.clone();
-                                let session_id_clone = session_id_clone.clone();
-                                let payload_size = msg.payload.len() as u64;
-                                let tracker_sender_inner = tracker_sender_nats.clone();
-                                tokio::spawn(async move {
-                                    let stream = session.open_uni().await;
-                                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
-                                    match stream {
-                                        Ok(mut uni_stream) => {
-                                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                                error!("Error writing to unidirectional stream: {}", e);
-                                            } else {
-                                                // Track data sent
-                                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Error opening unidirectional stream: {}", e);
-                                        }
-                                    }
-                                });
-                            }
-                            None => {
-                                debug!("NATS subscription ended");
-                                break;
+            while let Some(msg) = sub.next().await {
+                if msg.subject == specific_subject_clone {
+                    continue;
+                }
+                let session_id_clone = session_id_clone.clone();
+                let payload_size = msg.payload.len() as u64;
+                let tracker_sender_inner = tracker_sender_nats.clone();
+                let session = session.clone();
+                tokio::spawn(async move {
+                    let stream = session.open_uni().await;
+                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
+                    match stream {
+                        Ok(mut uni_stream) => {
+                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
+                                error!("Error writing to unidirectional stream: {}", e);
+                            } else {
+                                // Track data sent
+                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
                             }
                         }
+                        Err(SessionError::ConnectionError(e)) => {
+                            error!("Connection error: {}", e);
+                        }
+                        Err(SessionError::WebTransportError(e)) => {
+                            error!("WebTransport error: {}", e);
+                        }
+                        Err(e) => {
+                            error!("Error opening unidirectional stream: {}", e);
+                        }
                     }
-                }
+                });
             }
-        })
-    };
+        });
+    }
 
-    let quic_task = {
+    // WebTransport unidirectional receive task
+    {
         let session = session.clone();
         let nc = nc.clone();
         let specific_subject = specific_subject.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_wt = tracker_sender.clone();
-        let cancellation_token = cancellation_token.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        debug!("QUIC task cancelled");
-                        break;
-                    }
-                    stream_result = session.accept_uni() => {
-                        match stream_result {
-                            Ok(mut uni_stream) => {
-                                let nc = nc.clone();
-                                let specific_subject = specific_subject.clone();
-                                let session_clone = session.clone();
-                                let session_id_clone = session_id_clone.clone();
-                                let tracker_sender_inner = tracker_sender_wt.clone();
-                                tokio::spawn(async move {
-                                    let data_tracker = DataTracker::new(tracker_sender_inner);
-                                    let result = uni_stream.read_to_end(usize::MAX).await;
-                                    match result {
-                                        Ok(buf) => {
-                                            let buf_size = buf.len() as u64;
-                                            // Track data received
-                                            data_tracker.track_received(&session_id_clone, buf_size);
+        join_set.spawn(async move {
+            while let Ok(mut uni_stream) = session.accept_uni().await {
+                let nc = nc.clone();
+                let specific_subject = specific_subject.clone();
+                let session_clone = session.clone();
+                let session_id_clone = session_id_clone.clone();
+                let tracker_sender_inner = tracker_sender_wt.clone();
+                tokio::spawn(async move {
+                    let data_tracker = DataTracker::new(tracker_sender_inner);
+                    let result = uni_stream.read_to_end(usize::MAX).await;
+                    match result {
+                        Ok(buf) => {
+                            let buf_size = buf.len() as u64;
+                            // Track data received
+                            data_tracker.track_received(&session_id_clone, buf_size);
 
-                                            // Check if this is an RTT packet that should be echoed back
-                                            if is_rtt_packet(&buf) {
-                                                trace!("Echoing RTT packet back via WebTransport");
-                                                match session_clone.open_uni().await {
-                                                    Ok(mut echo_stream) => {
-                                                        if let Err(e) = echo_stream.write_all(&buf).await {
-                                                            error!("Error echoing RTT packet: {}", e);
-                                                        } else {
-                                                            // Track data sent for echo
-                                                            data_tracker.track_sent(&session_id_clone, buf_size);
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        error!("Error opening echo stream: {}", e);
-                                                    }
-                                                }
-                                            } else if health_processor::is_health_packet_bytes(&buf) {
-                                                // Process health packet for diagnostics (don't relay)
-                                                debug!("WT-SERVER: Received health packet via unidirectional stream (size: {} bytes) - processing locally", buf.len());
-                                                health_processor::process_health_packet_bytes(&buf, nc.clone());
-                                            } else {
-                                                // Normal packet processing - publish to NATS
-                                                tokio::spawn(async move {
-                                                    if let Err(e) =
-                                                        nc.publish(specific_subject.clone(), buf.into()).await
-                                                    {
-                                                        error!(
-                                                            "Error publishing to subject {}: {}",
-                                                            &specific_subject, e
-                                                        );
-                                                    }
-                                                });
-                                            }
+                            // Check if this is an RTT packet that should be echoed back
+                            if is_rtt_packet(&buf) {
+                                trace!("Echoing RTT packet back via WebTransport");
+                                match session_clone.open_uni().await {
+                                    Ok(mut echo_stream) => {
+                                        if let Err(e) = echo_stream.write_all(&buf).await {
+                                            error!("Error echoing RTT packet: {}", e);
+                                        } else {
+                                            // Track data sent for echo
+                                            data_tracker.track_sent(&session_id_clone, buf_size);
                                         }
-                                        Err(e) => {
-                                            error!("Error reading from unidirectional stream: {}", e);
-                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Error opening echo stream: {}", e);
+                                    }
+                                }
+                            } else if health_processor::is_health_packet_bytes(&buf) {
+                                // Process health packet for diagnostics (don't relay)
+                                debug!("WT-SERVER: Received health packet via unidirectional stream (size: {} bytes) - processing locally", buf.len());
+                                health_processor::process_health_packet_bytes(&buf, nc.clone());
+                            } else {
+                                // Normal packet processing - publish to NATS
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        nc.publish(specific_subject.clone(), buf.into()).await
+                                    {
+                                        error!(
+                                            "Error publishing to subject {}: {}",
+                                            &specific_subject, e
+                                        );
                                     }
                                 });
                             }
-                            Err(e) => {
-                                error!("Error accepting unidirectional stream: {}", e);
-                                break;
-                            }
+                        }
+                        Err(e) => {
+                            error!("Error reading from unidirectional stream: {}", e);
                         }
                     }
-                }
+                });
             }
-        })
-    };
+        });
+    }
 
-    let _datagrams_task = {
+    // WebTransport datagram receive task
+    {
         let session_id_clone = session_id.clone();
         let tracker_sender_wt_datagram = tracker_sender.clone();
-        let cancellation_token = cancellation_token.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let data_tracker = DataTracker::new(tracker_sender_wt_datagram);
-            loop {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        debug!("Datagrams task cancelled");
-                        break;
-                    }
-                    datagram_result = session.read_datagram() => {
-                        match datagram_result {
-                            Ok(buf) => {
-                                let buf_size = buf.len() as u64;
-                                // Track data received
-                                data_tracker.track_received(&session_id_clone, buf_size);
+            while let Ok(buf) = session.read_datagram().await {
+                let buf_size = buf.len() as u64;
+                // Track data received
+                data_tracker.track_received(&session_id_clone, buf_size);
 
-                                // Check if this is an RTT packet that should be echoed back
-                                if is_rtt_packet(&buf) {
-                                    debug!("Echoing RTT datagram back via WebTransport");
-                                    if let Err(e) = session.send_datagram(buf.clone()) {
-                                        error!("Error echoing RTT datagram: {}", e);
-                                    } else {
-                                        // Track data sent for echo
-                                        data_tracker.track_sent(&session_id_clone, buf_size);
-                                    }
-                                } else if health_processor::is_health_packet_bytes(&buf) {
-                                    // Process health packet for diagnostics (don't relay)
-                                    health_processor::process_health_packet_bytes(&buf, nc.clone());
-                                } else {
-                                    // Normal datagram processing - publish to NATS
-                                    let nc = nc.clone();
-                                    if let Err(e) = nc.publish(specific_subject.clone(), buf).await {
-                                        error!("Error publishing to subject {}: {}", specific_subject, e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error reading datagram: {}", e);
-                                break;
-                            }
-                        }
+                // Check if this is an RTT packet that should be echoed back
+                if is_rtt_packet(&buf) {
+                    debug!("Echoing RTT datagram back via WebTransport");
+                    if let Err(e) = session.send_datagram(buf.clone()) {
+                        error!("Error echoing RTT datagram: {}", e);
+                    } else {
+                        // Track data sent for echo
+                        data_tracker.track_sent(&session_id_clone, buf_size);
+                    }
+                } else if health_processor::is_health_packet_bytes(&buf) {
+                    // Process health packet for diagnostics (don't relay)
+                    health_processor::process_health_packet_bytes(&buf, nc.clone());
+                } else {
+                    // Normal datagram processing - publish to NATS
+                    let nc = nc.clone();
+                    if let Err(e) = nc.publish(specific_subject.clone(), buf).await {
+                        error!("Error publishing to subject {}: {}", specific_subject, e);
                     }
                 }
             }
-        })
-    };
+        });
+    }
 
-    tokio::select! {
-        _ = quic_task => {
-            error!("Quic task failed");
-        }
-        _ = nats_receive_task => {
-            error!("Nats receive task failed");
-        }
-        _ = _datagrams_task => {
-            error!("Datagrams task failed");
-        }
-    };
-
-    cancellation_token.cancel();
+    join_set.join_next().await;
+    join_set.shutdown().await;
 
     // Track connection end for metrics
     send_connection_ended(&tracker_sender, session_id.clone());
@@ -512,17 +459,17 @@ async fn handle_quic_connection(
     // Generate session ID for metrics tracking (will start tracking after CONNECTION packet)
     let session_id = Arc::new(uuid::Uuid::new_v4().to_string());
     let session = Arc::new(RwLock::new(conn));
-    let cancellation_token = CancellationToken::new();
     let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<Subject>>(None);
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-    let nats_task = {
+    // NATS receive task
+    {
         let session = session.clone();
-        let cancellation_token = cancellation_token.clone();
         let nc_clone = nc.clone();
         let specific_subject_rx_clone = specific_subject_rx.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let mut specific_subject_rx = specific_subject_rx_clone;
             let nc = nc_clone;
             specific_subject_rx.changed().await.unwrap();
@@ -542,59 +489,44 @@ async fn handle_quic_connection(
                     return;
                 }
             };
-            loop {
-                tokio::select! {
-                    _ = cancellation_token.cancelled() => {
-                        debug!("QUIC NATS task cancelled");
-                        break;
-                    }
-                    msg_opt = sub.next() => {
-                        match msg_opt {
-                            Some(msg) => {
-                                if Some(msg.subject) == specific_subject_rx.borrow().clone() {
-                                    continue;
-                                }
-                                let session = session.read().await;
+            while let Some(msg) = sub.next().await {
+                if Some(msg.subject) == specific_subject_rx.borrow().clone() {
+                    continue;
+                }
+                let session = session.read().await;
 
-                                let stream = session.open_uni().await;
-                                let session_id_clone = session_id_clone.clone();
-                                let payload_size = msg.payload.len() as u64;
-                                let tracker_sender_msg = tracker_sender_nats.clone();
-                                tokio::spawn(async move {
-                                    let data_tracker = DataTracker::new(tracker_sender_msg);
-                                    match stream {
-                                        Ok(mut uni_stream) => {
-                                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                                error!("Error writing to unidirectional stream: {}", e);
-                                            } else {
-                                                // Track data sent
-                                                data_tracker.track_sent(&session_id_clone, payload_size);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Error opening unidirectional stream: {}", e);
-                                        }
-                                    }
-                                });
-                            }
-                            None => {
-                                debug!("QUIC NATS subscription ended");
-                                break;
+                let stream = session.open_uni().await;
+                let session_id_clone = session_id_clone.clone();
+                let payload_size = msg.payload.len() as u64;
+                let tracker_sender_msg = tracker_sender_nats.clone();
+                tokio::spawn(async move {
+                    let data_tracker = DataTracker::new(tracker_sender_msg);
+                    match stream {
+                        Ok(mut uni_stream) => {
+                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
+                                error!("Error writing to unidirectional stream: {}", e);
+                            } else {
+                                // Track data sent
+                                data_tracker.track_sent(&session_id_clone, payload_size);
                             }
                         }
+                        Err(e) => {
+                            error!("Error opening unidirectional stream: {}", e);
+                        }
                     }
-                }
+                });
             }
-        })
-    };
+        });
+    }
 
-    let quic_task = {
+    // QUIC unidirectional receive task
+    {
         let specific_subject_rx_clone = specific_subject_rx.clone();
         let session = session.clone();
         let nc = nc.clone();
         let session_id_arc = session_id.clone();
         let tracker_sender_quic = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let session = session.read().await;
             let specific_subject_tx = Arc::new(specific_subject_tx);
             while let Ok(mut uni_stream) = session.accept_uni().await {
@@ -682,14 +614,15 @@ async fn handle_quic_connection(
                     };
                 });
             }
-        })
-    };
+        });
+    }
 
-    let _datagrams_task = {
+    // QUIC datagram receive task
+    {
         let session_clone = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_datagram = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let data_tracker = DataTracker::new(tracker_sender_datagram);
             let session = session_clone.read().await;
             if specific_subject_rx.borrow().is_none() {
@@ -697,7 +630,7 @@ async fn handle_quic_connection(
             }
             let specific_subject = specific_subject_rx.borrow().clone().unwrap();
             while let Ok(datagram) = session.read_datagram().await {
-                let datagram_size = datagram.len() as u64;
+                let datagram_size: u64 = datagram.len() as u64;
                 // Track data received
                 data_tracker.track_received(&session_id_clone, datagram_size);
 
@@ -718,11 +651,11 @@ async fn handle_quic_connection(
                     }
                 }
             }
-        })
-    };
-    quic_task.await?;
-    cancellation_token.cancel();
-    nats_task.abort();
+        });
+    }
+
+    join_set.join_next().await;
+    join_set.shutdown().await;
 
     // Track connection end for metrics
     send_connection_ended(&tracker_sender, session_id.as_ref().clone());

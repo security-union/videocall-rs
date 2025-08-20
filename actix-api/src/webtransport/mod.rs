@@ -32,7 +32,6 @@ use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, trace_span};
 
 use videocall_types::protos::connection_packet::ConnectionPacket;

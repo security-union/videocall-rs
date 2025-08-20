@@ -32,6 +32,7 @@ use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, trace_span};
 
 use videocall_types::protos::connection_packet::ConnectionPacket;
@@ -302,41 +303,52 @@ async fn handle_webtransport_session(
         let session = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
+        let cancellation_token = CancellationToken::new();
         join_set.spawn(async move {
             let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
-            while let Some(msg) = sub.next().await {
-                if msg.subject == specific_subject_clone {
-                    continue;
-                }
-                let session_id_clone = session_id_clone.clone();
-                let payload_size = msg.payload.len() as u64;
-                let tracker_sender_inner = tracker_sender_nats.clone();
-                let session = session.clone();
-                tokio::spawn(async move {
-                    let stream = session.open_uni().await;
-                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
-                    match stream {
-                        Ok(mut uni_stream) => {
-                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                error!("Error writing to unidirectional stream: {}", e);
-                            } else {
-                                // Track data sent
-                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
-                            }
-                        }
-                        Err(SessionError::ConnectionError(e)) => {
-                            error!("Connection error: {}", e);
-                            return;
-                        }
-                        Err(SessionError::WebTransportError(e)) => {
-                            error!("WebTransport error: {}", e);
-                            return;
-                        }
-                        Err(e) => {
-                            error!("Error opening unidirectional stream: {}", e);
-                        }
+            loop {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        error!("Cancellation token cancelled");
+                        return;
                     }
-                });
+                    Some(msg) = sub.next() => {
+                        if msg.subject == specific_subject_clone {
+                            continue;
+                        }
+                        let session_id_clone = session_id_clone.clone();
+                        let payload_size = msg.payload.len() as u64;
+                        let tracker_sender_inner = tracker_sender_nats.clone();
+                        let session = session.clone();
+                        let cancellation_token = cancellation_token.clone();
+                        tokio::spawn(async move {
+                            let stream = session.open_uni().await;
+                            let data_tracker_inner = DataTracker::new(tracker_sender_inner);
+                            match stream {
+                                Ok(mut uni_stream) => {
+                                    if let Err(e) = uni_stream.write_all(&msg.payload).await {
+                                        error!("Error writing to unidirectional stream: {}", e);
+                                    } else {
+                                        // Track data sent
+                                        data_tracker_inner.track_sent(&session_id_clone, payload_size);
+                                    }
+                                }
+                                Err(SessionError::ConnectionError(e)) => {
+                                    error!("Connection error: {}", e);
+                                    cancellation_token.cancel();
+                                }
+                                Err(SessionError::WebTransportError(e)) => {
+                                    error!("WebTransport error: {}", e);
+                                    cancellation_token.cancel();
+                                }
+                                Err(e) => {
+                                    error!("Error opening unidirectional stream: {}", e);
+                                    cancellation_token.cancel();
+                                }
+                            }
+                        });
+                }
+                }
             }
         });
     }

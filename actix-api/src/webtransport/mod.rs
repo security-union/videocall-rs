@@ -50,8 +50,6 @@ pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", 
 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 
-const MAX_UNIDIRECTIONAL_STREAM_SIZE: usize = 500_000;
-
 /// Check if the binary data is an RTT packet that should be echoed back
 fn is_rtt_packet(data: &[u8]) -> bool {
     if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
@@ -103,17 +101,6 @@ fn get_key_and_cert_chain<'a>(
 
     anyhow::ensure!(!chain.is_empty(), "could not find certificate");
     Ok((key, chain))
-}
-
-pub fn is_http3(conn: &quinn::Connection) -> bool {
-    if let Some(data) = conn.handshake_data() {
-        if let Some(d) = data.downcast_ref::<HandshakeData>() {
-            if let Some(alpn) = &d.protocol {
-                return WEB_TRANSPORT_ALPN.contains(&alpn.as_slice());
-            }
-        }
-    };
-    false
 }
 
 pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error>> {
@@ -488,7 +475,7 @@ async fn handle_quic_connection(
                 let tracker_sender_inner = tracker_sender_quic.clone();
                 tokio::spawn(async move {
                     let data_tracker = DataTracker::new(tracker_sender_inner.clone());
-                    if let Ok(d) = uni_stream.read_to_end(MAX_UNIDIRECTIONAL_STREAM_SIZE).await {
+                    if let Ok(d) = uni_stream.read_to_end(usize::MAX).await {
                         let buf_size = d.len() as u64;
 
                         if specific_subject_rx.borrow().is_none() {

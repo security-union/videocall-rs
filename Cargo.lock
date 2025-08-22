@@ -900,9 +900,6 @@ dependencies = [
  "image 0.25.6",
  "opus",
  "protobuf 3.7.1",
- "quinn",
- "rand 0.8.5",
- "rustls 0.23.28",
  "serde",
  "serde_yaml",
  "tokio",
@@ -6436,7 +6433,6 @@ dependencies = [
  "oauth2",
  "prometheus",
  "protobuf 3.7.1",
- "quinn",
  "r2d2",
  "r2d2_postgres",
  "regex",
@@ -6446,7 +6442,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -6467,8 +6462,6 @@ dependencies = [
  "image 0.25.6",
  "opus",
  "protobuf 3.7.1",
- "quinn",
- "rustls 0.23.28",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -6477,7 +6470,6 @@ dependencies = [
  "videocall-nokhwa",
  "videocall-types",
  "web-transport-quinn 0.7.3",
- "webpki-roots 0.25.4",
 ]
 
 [[package]]

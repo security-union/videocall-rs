@@ -16,9 +16,6 @@ categories = ["network-programming", "multimedia"]
 tokio = { version = "1.28.1", features = ["full"] }
 # Remove WebSocket, add WebTransport
 web-transport-quinn = { workspace = true }
-quinn = { workspace = true }
-rustls = { workspace = true }
-rand = "0.8.5"
 futures = "0.3.16"
 videocall-types = { path= "../videocall-types", version = "3.0.1" }
 protobuf = "3.3.0"

@@ -91,6 +91,8 @@ pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", 
 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 
+const KEEP_ALIVE_PING: &[u8] = b"ping";
+
 /// Check if the binary data is an RTT packet that should be echoed back
 fn is_rtt_packet(data: &[u8]) -> bool {
     if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
@@ -410,6 +412,8 @@ async fn handle_webtransport_session(
                 } else if health_processor::is_health_packet_bytes(&buf) {
                     // Process health packet for diagnostics (don't relay)
                     health_processor::process_health_packet_bytes(&buf, nc.clone());
+                } else if buf.as_ref() == KEEP_ALIVE_PING {
+                    // Keep-alive packet - don't relay, just ignore
                 } else {
                     // Normal datagram processing - publish to NATS
                     let nc = nc.clone();
@@ -561,7 +565,7 @@ mod tests {
 
     async fn keep_alive(session: &web_transport_quinn::Session) {
         // Send a small datagram to keep connection alive
-        let ping_data = b"ping";
+        let ping_data = KEEP_ALIVE_PING;
         if let Err(e) = session.send_datagram(ping_data.to_vec().into()) {
             debug!("Keep-alive ping failed: {}", e);
         }
@@ -781,6 +785,13 @@ mod tests {
         );
         println!("✅ Confirmed: Bob (lobby-public) isolated from Alice's packets");
 
+        // Alice should NOT receive her own packets back (no self-echo)
+        assert_eq!(
+            alice_count_after, count_a,
+            "❌ Alice received her own packets back! Self-echo should be prevented."
+        );
+        println!("✅ Confirmed: Alice does not receive her own packets back (no self-echo)");
+
         // Charlie should have received Alice's packets (same lobby)
         assert!(
             charlie_count_after >= count_c + 3,
@@ -792,7 +803,7 @@ mod tests {
         // ========== PHASE 2: BIDIRECTIONAL SAME-LOBBY TEST ==========
         println!("\n--- Phase 2: Testing Bidirectional Same-Lobby Communication ---");
 
-        let [alice_before_bidi, bob_before_bidi, _charlie_before_bidi] =
+        let [alice_before_bidi, bob_before_bidi, charlie_before_bidi] =
             get_all_user_counts(&[user_a, user_b, user_c])[..]
         else {
             panic!("Expected exactly 3 user counts");
@@ -825,6 +836,13 @@ mod tests {
         );
         println!("✅ Confirmed: Bidirectional communication within lobby-secure works");
 
+        // Charlie should NOT receive his own packets back (no self-echo)
+        assert_eq!(
+            charlie_after_bidi, charlie_before_bidi,
+            "❌ Charlie received his own packets back! Self-echo should be prevented."
+        );
+        println!("✅ Confirmed: Charlie does not receive his own packets back (no self-echo)");
+
         // Bob should still have zero new packets
         assert_eq!(
             bob_after_bidi, bob_before_bidi,
@@ -841,7 +859,7 @@ mod tests {
             panic!("Expected exactly 3 user counts");
         };
 
-        // Bob sends packet in his own lobby (should not reach Alice or Charlie)
+        // Bob sends packet in his own lobby (should not reach Alice, Charlie, or echo back to himself)
         let packet = create_test_packet(user_b, VcMediaType::AUDIO, "bob-isolated-msg".to_string());
         send_packet(&session_b, packet).await;
         println!("✓ Bob sent packet in lobby-public");
@@ -867,7 +885,15 @@ mod tests {
             charlie_after_bob, charlie_before_bob,
             "❌ Charlie received Bob's packet across lobbies!"
         );
+
+        // Bob should NOT receive his own packet back
+        assert_eq!(
+            bob_after_bob, bob_before_bob,
+            "❌ Bob received his own packet back! Self-echo should be prevented."
+        );
+
         println!("✅ Confirmed: Bob's packets isolated to lobby-public");
+        println!("✅ Confirmed: Bob does not receive his own packets back (no self-echo)");
 
         // ========== SUMMARY ==========
         println!("\n=== COMPREHENSIVE LOBBY ISOLATION TEST PASSED ===");
@@ -881,6 +907,7 @@ mod tests {
         println!("  • Bob   (lobby-public):  {}", bob_final);
         println!("  • Charlie (lobby-secure): {}", charlie_final);
         println!("✅ All lobby isolation requirements verified!");
+        println!("✅ Self-echo prevention verified for all users!");
 
         Ok(())
     }

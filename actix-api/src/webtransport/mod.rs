@@ -25,10 +25,8 @@ use async_nats::Subject;
 use futures::StreamExt;
 use protobuf::Message;
 use quinn::crypto::rustls::HandshakeData;
-use quinn::VarInt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
-use std::time::Duration;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::{watch, RwLock};
@@ -123,30 +121,10 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
     let (key, certs) = get_key_and_cert_chain(opt.certs)?;
 
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)?;
-
-    config.max_early_data_size = u32::MAX;
-    let mut alpn = vec![];
-    for proto in WEB_TRANSPORT_ALPN {
-        alpn.push(proto.to_vec());
-    }
-    alpn.push(QUIC_ALPN.to_vec());
-    config.alpn_protocols = alpn;
-
-    // 1. create quinn server endpoint and bind UDP socket
-    let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
-    // configure pings
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
-    transport_config.max_idle_timeout(Some(VarInt::from_u32(10_000).into()));
-    config.transport = Arc::new(transport_config);
-    let server = quinn::Endpoint::server(config, opt.listen)?;
+    // Use ServerBuilder for 0.7.3 API
+    let mut server = web_transport_quinn::ServerBuilder::new()
+        .with_addr(opt.listen)
+        .with_certificate(certs, key)?;
 
     info!("listening on {}", opt.listen);
 
@@ -166,54 +144,29 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
         tracker_task.run_message_loop(tracker_receiver).await;
     });
 
-    // 2. Accept new quic connections and spawn a new task to handle them
-    while let Some(new_conn) = server.accept().await {
+    // 2. Accept new WebTransport connections using 0.7.3 API
+    while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
         let nc = nc.clone();
         let tracker_sender = tracker_sender.clone();
         tokio::spawn(async move {
-            match new_conn.await {
-                Ok(conn) => {
-                    if is_http3(&conn) {
-                        info!("new http3 established");
-                        if let Err(err) =
-                            run_webtransport_connection(conn.clone(), nc, tracker_sender.clone())
-                                .await
-                        {
-                            error!("Failed to handle connection: {err:?}");
-                        }
-                    } else {
-                        info!("new quic established");
-                        let nc = nc.clone();
-                        if let Err(err) =
-                            handle_quic_connection(conn, nc, tracker_sender.clone()).await
-                        {
-                            error!("Failed to handle connection: {err:?}");
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!("accepting connection failed: {:?}", err);
-                }
+            // Handle WebTransport request directly using 0.7.3 API
+            if let Err(err) =
+                run_webtransport_connection_from_request(request, nc, tracker_sender).await
+            {
+                error!("Failed to handle WebTransport connection: {err:?}");
             }
         });
     }
 
-    // shut down gracefully
-    // wait for connections to be closed before exiting
-    server.wait_idle().await;
     Ok(())
 }
 
-async fn run_webtransport_connection(
-    conn: quinn::Connection,
+async fn run_webtransport_connection_from_request(
+    request: web_transport_quinn::Request,
     nc: async_nats::client::Client,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
-    info!("received new QUIC connection");
-
-    // Perform the WebTransport handshake.
-    let request = web_transport_quinn::accept(conn.clone()).await?;
     info!("received WebTransport request: {}", request.url());
     let url = request.url();
 
@@ -227,18 +180,15 @@ async fn run_webtransport_connection(
     let parts = parts.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
     info!("Parts {:?}", parts);
     if parts.len() != 3 {
-        conn.close(VarInt::from_u32(0x1), b"Invalid path wrong length");
         return Err(anyhow!("Invalid path wrong length"));
     } else if parts[0] != &"lobby" {
-        conn.close(VarInt::from_u32(0x1), b"Invalid path wrong prefix");
         return Err(anyhow!("Invalid path wrong prefix"));
     }
 
     let username = parts[1].replace(' ', "_");
     let lobby_id = parts[2].replace(' ', "_");
-    let re = regex::Regex::new("^[a-zA-Z0-9_]*$").unwrap();
+    let re = regex::Regex::new("^[a-zA-Z0-9_-]*$").unwrap();
     if !re.is_match(&username) && !re.is_match(&lobby_id) {
-        conn.close(VarInt::from_u32(0x1), b"Invalid path input chars");
         return Err(anyhow!("Invalid path input chars"));
     }
 
@@ -675,69 +625,13 @@ fn session_subject_to_lobby_subject(subject: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
     use rustls::crypto::CryptoProvider;
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
     use videocall_types::protos::media_packet::media_packet::MediaType as VcMediaType;
     use videocall_types::protos::media_packet::MediaPacket as VcMediaPacket;
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType as VcPacketType;
     use videocall_types::protos::packet_wrapper::PacketWrapper as VcPacketWrapper;
-
-    // Certificate verifier that skips verification for tests
-    #[derive(Debug)]
-    struct SkipServerVerification;
-
-    impl ServerCertVerifier for SkipServerVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            vec![
-                rustls::SignatureScheme::RSA_PKCS1_SHA1,
-                rustls::SignatureScheme::ECDSA_SHA1_Legacy,
-                rustls::SignatureScheme::RSA_PKCS1_SHA256,
-                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-                rustls::SignatureScheme::RSA_PKCS1_SHA384,
-                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-                rustls::SignatureScheme::RSA_PKCS1_SHA512,
-                rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-                rustls::SignatureScheme::RSA_PSS_SHA256,
-                rustls::SignatureScheme::RSA_PSS_SHA384,
-                rustls::SignatureScheme::RSA_PSS_SHA512,
-                rustls::SignatureScheme::ED25519,
-                rustls::SignatureScheme::ED448,
-            ]
-        }
-    }
 
     async fn start_webtransport_server() -> tokio::task::JoinHandle<()> {
         if let Err(e) = CryptoProvider::install_default(rustls::crypto::ring::default_provider()) {
@@ -796,25 +690,13 @@ mod tests {
         let url_str = format!("{}/lobby/{}/{}", base.trim_end_matches('/'), user, meeting);
         let url = url::Url::parse(&url_str)?;
 
-        // Create a client endpoint for insecure connections (tests only)
-        let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
+        // Create WebTransport client using 0.7.3 API (same as bot)
+        let client = unsafe {
+            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
+        };
 
-        // Configure for insecure connections (self-signed certs)
-        let rustls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_no_client_auth();
-
-        let mut client_config = quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_config))?,
-        ));
-
-        let transport_config = quinn::TransportConfig::default();
-        client_config.transport_config(Arc::new(transport_config));
-        endpoint.set_default_client_config(client_config);
-
-        // Connect using web-transport-quinn
-        Ok(web_transport_quinn::connect(&endpoint, &url).await?)
+        // Connect using modern API
+        Ok(client.connect(url).await?)
     }
 
     async fn send_packet(session: &web_transport_quinn::Session, bytes: Vec<u8>) {

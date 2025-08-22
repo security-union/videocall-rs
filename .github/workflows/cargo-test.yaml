@@ -38,5 +38,4 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - run: make check
-      - run: make test
+      - run: make tests_run

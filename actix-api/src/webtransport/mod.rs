@@ -671,3 +671,230 @@ fn session_subject_to_lobby_subject(subject: &str) -> String {
     lobby_subject.push_str(".*");
     lobby_subject
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::CryptoProvider;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
+    use videocall_types::protos::media_packet::media_packet::MediaType as VcMediaType;
+    use videocall_types::protos::media_packet::MediaPacket as VcMediaPacket;
+    use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType as VcPacketType;
+    use videocall_types::protos::packet_wrapper::PacketWrapper as VcPacketWrapper;
+
+    // Certificate verifier that skips verification for tests
+    #[derive(Debug)]
+    struct SkipServerVerification;
+
+    impl ServerCertVerifier for SkipServerVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA1,
+                rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::ED448,
+            ]
+        }
+    }
+
+    async fn start_webtransport_server() -> tokio::task::JoinHandle<()> {
+        if let Err(e) = CryptoProvider::install_default(rustls::crypto::ring::default_provider()) {
+            error!("Error installing crypto provider: {e:?}");
+        }
+        use crate::webtransport::{self, Certs};
+        use std::net::ToSocketAddrs;
+
+        // Start WebTransport server
+        let opt = webtransport::WebTransportOpt {
+            listen: std::env::var("LISTEN_URL")
+                .unwrap_or_else(|_| "0.0.0.0:4433".to_string())
+                .to_socket_addrs()
+                .expect("expected LISTEN_URL to be a valid socket address")
+                .next()
+                .expect("expected LISTEN_URL to be a valid socket address"),
+            certs: Certs {
+                key: std::env::var("KEY_PATH")
+                    .unwrap_or_else(|_| "certs/localhost.key".to_string())
+                    .into(),
+                cert: std::env::var("CERT_PATH")
+                    .unwrap_or_else(|_| "certs/localhost.pem".to_string())
+                    .into(),
+            },
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = webtransport::start(opt).await {
+                eprintln!("WebTransport server error: {}", e);
+            }
+        })
+    }
+
+    async fn wait_for_server_ready() {
+        // Wait for server to be ready by attempting connections
+        for _ in 0..50u8 {
+            match connect_client("test", "test").await {
+                Ok(_) => {
+                    info!("Server is ready!");
+                    return;
+                }
+                Err(e) => error!("Error connecting to server: {e:?}"),
+            }
+            info!("Retrying connection to server...");
+            sleep(Duration::from_millis(200)).await;
+        }
+        panic!("WebTransport server not ready after 10 seconds");
+    }
+
+    async fn connect_client(
+        user: &str,
+        meeting: &str,
+    ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let url_str = format!("{}/lobby/{}/{}", base.trim_end_matches('/'), user, meeting);
+        let url = url::Url::parse(&url_str)?;
+
+        // Create a client endpoint for insecure connections (tests only)
+        let mut endpoint = quinn::Endpoint::client("[::]:0".parse()?)?;
+
+        // Configure for insecure connections (self-signed certs)
+        let rustls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+            .with_no_client_auth();
+
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_config))?,
+        ));
+
+        let transport_config = quinn::TransportConfig::default();
+        client_config.transport_config(Arc::new(transport_config));
+        endpoint.set_default_client_config(client_config);
+
+        // Connect using web-transport-quinn
+        Ok(web_transport_quinn::connect(&endpoint, &url).await?)
+    }
+
+    async fn send_packet(session: &web_transport_quinn::Session, bytes: Vec<u8>) {
+        let mut s = session.open_uni().await.expect("open uni");
+        s.write_all(&bytes).await.expect("write packet");
+        s.finish().expect("finish uni");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_relay_packet_webtransport() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(std::io::stderr)
+            .init();
+
+        println!("=== STARTING INTEGRATION TEST ===");
+
+        println!("Starting WebTransport server...");
+        let _wt_handle = start_webtransport_server().await;
+
+        println!("Waiting for server to be ready...");
+        wait_for_server_ready().await;
+
+        let meeting = "it-meeting-1";
+        let user_a = "user-a";
+        let user_b = "user-b";
+
+        println!("Connecting client A: {}", user_a);
+        let session_a = connect_client(user_a, meeting)
+            .await
+            .expect("connect client A");
+        println!("Client A connected!");
+
+        println!("Connecting client B: {}", user_b);
+        let session_b = connect_client(user_b, meeting)
+            .await
+            .expect("connect client B");
+        println!("Client B connected!");
+
+        // Craft a MEDIA packet that is not RTT and not health
+        let media = VcMediaPacket {
+            media_type: VcMediaType::AUDIO.into(),
+            email: user_a.to_string(),
+            ..Default::default()
+        };
+        let packet = VcPacketWrapper {
+            packet_type: VcPacketType::MEDIA.into(),
+            email: user_a.to_string(),
+            data: media.write_to_bytes().expect("serialize media"),
+            ..Default::default()
+        };
+        let bytes = packet.write_to_bytes().expect("serialize wrapper");
+
+        println!("Sending packet from A to B (size: {} bytes)", bytes.len());
+        // Send from A
+        send_packet(&session_a, bytes.clone()).await;
+        println!("Packet sent from A!");
+
+        println!("Waiting for packet on B...");
+        // Receive on B
+        let received = timeout(Duration::from_secs(5), async {
+            loop {
+                match session_b.accept_uni().await {
+                    Ok(mut stream) => {
+                        if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                            if !buf.is_empty() {
+                                println!("Received packet on B (size: {} bytes)", buf.len());
+                                break buf;
+                            }
+                        }
+                    }
+                    Err(_) => sleep(Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("timely receive");
+
+        assert_eq!(bytes, received, "B must receive the exact bytes sent by A");
+        println!("=== INTEGRATION TEST PASSED ===");
+    }
+}

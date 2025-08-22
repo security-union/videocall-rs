@@ -900,7 +900,9 @@ dependencies = [
  "image 0.25.6",
  "opus",
  "protobuf 3.7.1",
+ "quinn 0.11.8",
  "rand 0.8.5",
+ "rustls 0.23.28",
  "serde",
  "serde_yaml",
  "tokio",
@@ -6528,10 +6530,11 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
  "uuid",
  "videocall-types",
- "web-transport-quinn 0.3.4",
+ "web-transport-quinn 0.7.3",
 ]
 
 [[package]]
@@ -6942,24 +6945,6 @@ dependencies = [
  "http 1.3.1",
  "thiserror 2.0.12",
  "url",
-]
-
-[[package]]
-name = "web-transport-quinn"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3020b51cda10472a365e42d9a701916d4f04d74cc743de08246ef6a421c2d137"
-dependencies = [
- "bytes",
- "futures",
- "http 1.3.1",
- "log",
- "quinn 0.11.8",
- "quinn-proto 0.11.12",
- "thiserror 1.0.69",
- "tokio",
- "url",
- "web-transport-proto",
 ]
 
 [[package]]

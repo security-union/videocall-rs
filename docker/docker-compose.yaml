@@ -283,7 +283,6 @@ services:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
-
   
 volumes:
   rustlemania-actix-web-cargo-registry-cache:

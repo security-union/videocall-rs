@@ -82,7 +82,7 @@ Enhancement suggestions are tracked as GitHub issues. Create an issue and provid
    ```
    cargo fmt
    cargo clippy -- -D warnings
-   cargo test
+   cargo tests_run
    ```
 4. Commit your changes with a descriptive commit message following the [Conventional Commits](https://www.conventionalcommits.org/) specification:
    ```

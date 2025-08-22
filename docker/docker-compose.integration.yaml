@@ -4,7 +4,6 @@ services:
     command: ["-js", "--http_port", "8222"]
 
   rust-tests:
-    platform: linux/amd64
     build:
       dockerfile: ../docker/Dockerfile.actix
       context: ../docker
@@ -32,12 +31,11 @@ services:
       - rustlemania-it-tests-cache:/app/actix-api/target
     depends_on:
       - nats
-    entrypoint: ["/bin/sh", "-lc"]
     command: >
-      exec bash -lc '
+      bash -lc '
         set -euo pipefail
         echo "=== STARTING CARGO TEST ==="
-        /usr/local/cargo/bin/cargo test -p videocall-api -- --nocapture --test-threads=1
+        cargo test -p videocall-api -- --nocapture --test-threads=1
         echo "=== CARGO TEST FINISHED WITH EXIT CODE: $? ==="
       '
 

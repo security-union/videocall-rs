@@ -722,6 +722,9 @@ mod tests {
         let user_a = "alice";
         let user_b = "bob";
         let user_c = "charlie";
+        assert_eq!(get_test_packet_counter_for_user(user_a), 0);
+        assert_eq!(get_test_packet_counter_for_user(user_b), 0);
+        assert_eq!(get_test_packet_counter_for_user(user_c), 0);
 
         println!("\n--- Establishing Connections ---");
 

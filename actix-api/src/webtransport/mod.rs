@@ -31,6 +31,49 @@ use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
 use tracing::{debug, error, info, trace, trace_span};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
+
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Mutex;
+
+#[cfg(test)]
+lazy_static::lazy_static! {
+    static ref TEST_PACKET_COUNTERS: Arc<Mutex<HashMap<String, AtomicU64>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+}
+
+#[cfg(test)]
+fn increment_test_packet_counter_for_user(username: &str) {
+    let counters = TEST_PACKET_COUNTERS.clone();
+    let mut counters_map = counters.lock().unwrap();
+    let counter = counters_map
+        .entry(username.to_string())
+        .or_insert_with(|| AtomicU64::new(0));
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn get_test_packet_counter_for_user(username: &str) -> u64 {
+    let counters = TEST_PACKET_COUNTERS.clone();
+    let counters_map = counters.lock().unwrap();
+    counters_map
+        .get(username)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn reset_test_packet_counters() {
+    let counters = TEST_PACKET_COUNTERS.clone();
+    let mut counters_map = counters.lock().unwrap();
+    counters_map.clear();
+}
+
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -236,12 +279,17 @@ async fn handle_webtransport_session(
         let session = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let username_clone = username.to_string();
         join_set.spawn(async move {
             let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
             while let Some(msg) = sub.next().await {
                 if msg.subject == specific_subject_clone {
                     continue;
                 }
+
+                #[cfg(test)]
+                increment_test_packet_counter_for_user(&username_clone);
                 let session_id_clone = session_id_clone.clone();
                 let payload_size = msg.payload.len() as u64;
                 let tracker_sender_inner = tracker_sender_nats.clone();
@@ -388,7 +436,6 @@ mod tests {
     use super::*;
     use rustls::crypto::CryptoProvider;
     use std::time::Duration;
-    use tokio::time::{sleep, timeout};
     use videocall_types::protos::media_packet::media_packet::MediaType as VcMediaType;
     use videocall_types::protos::media_packet::MediaPacket as VcMediaPacket;
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType as VcPacketType;
@@ -426,20 +473,66 @@ mod tests {
         })
     }
 
+    async fn wait_for_condition<F, Fut, T>(
+        mut condition: F,
+        timeout_duration: Duration,
+        check_interval: Duration,
+    ) -> Result<T, &'static str>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout_duration {
+            if let Some(result) = condition().await {
+                return Ok(result);
+            }
+            tokio::time::sleep(check_interval).await;
+        }
+        Err("Condition not met within timeout")
+    }
+
+    async fn wait_for_condition_bool<F, Fut>(
+        condition: F,
+        timeout_duration: Duration,
+        check_interval: Duration,
+    ) -> Result<(), &'static str>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout_duration {
+            if condition().await {
+                return Ok(());
+            }
+            tokio::time::sleep(check_interval).await;
+        }
+        Err("Condition not met within timeout")
+    }
+
     async fn wait_for_server_ready() {
-        // Wait for server to be ready by attempting connections
-        for _ in 0..50u8 {
+        let condition = || async {
             match connect_client("test", "test").await {
                 Ok(_) => {
                     info!("Server is ready!");
-                    return;
+                    true
                 }
-                Err(e) => error!("Error connecting to server: {e:?}"),
+                Err(e) => {
+                    error!("Error connecting to server: {e:?}");
+                    info!("Retrying connection to server...");
+                    false
+                }
             }
-            info!("Retrying connection to server...");
-            sleep(Duration::from_millis(200)).await;
-        }
-        panic!("WebTransport server not ready after 10 seconds");
+        };
+
+        wait_for_condition_bool(
+            condition,
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect("WebTransport server not ready after 10 seconds");
     }
 
     async fn connect_client(
@@ -463,17 +556,39 @@ mod tests {
     async fn send_packet(session: &web_transport_quinn::Session, bytes: Vec<u8>) {
         let mut s = session.open_uni().await.expect("open uni");
         s.write_all(&bytes).await.expect("write packet");
-        s.finish().expect("finish uni");
+        // Don't call finish() to avoid closing the session prematurely
+    }
+
+    async fn keep_alive(session: &web_transport_quinn::Session) {
+        // Send a small datagram to keep connection alive
+        let ping_data = b"ping";
+        if let Err(e) = session.send_datagram(ping_data.to_vec().into()) {
+            debug!("Keep-alive ping failed: {}", e);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_relay_packet_webtransport() {
-        tracing_subscriber::fmt()
+    async fn test_relay_packet_webtransport_between_two_clients() {
+        let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
             .with_writer(std::io::stderr)
-            .init();
+            .try_init();
 
+        // Wrap entire test with 15 second timeout
+        let test_result = tokio::time::timeout(Duration::from_secs(15), async {
+            test_relay_packet_impl().await
+        })
+        .await;
+
+        match test_result {
+            Ok(Ok(())) => println!("Test completed successfully"),
+            Ok(Err(e)) => panic!("Test failed: {}", e),
+            Err(_) => panic!("Test timed out after 15 seconds"),
+        }
+    }
+
+    async fn test_relay_packet_impl() -> anyhow::Result<()> {
         println!("=== STARTING INTEGRATION TEST ===");
 
         println!("Starting WebTransport server...");
@@ -498,6 +613,26 @@ mod tests {
             .expect("connect client B");
         println!("Client B connected!");
 
+        // Start keep-alive tasks that will be cancelled when test ends
+        let session_a_keep = session_a.clone();
+        let session_b_keep = session_b.clone();
+
+        let _keep_alive_a = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_a_keep).await;
+            }
+        });
+
+        let _keep_alive_b = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_b_keep).await;
+            }
+        });
+
         // Craft a MEDIA packet that is not RTT and not health
         let media = VcMediaPacket {
             media_type: VcMediaType::AUDIO.into(),
@@ -517,27 +652,291 @@ mod tests {
         send_packet(&session_a, bytes.clone()).await;
         println!("Packet sent from A!");
 
+        // Give NATS time to relay the message
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
         println!("Waiting for packet on B...");
         // Receive on B
-        let received = timeout(Duration::from_secs(5), async {
-            loop {
-                match session_b.accept_uni().await {
-                    Ok(mut stream) => {
-                        if let Ok(buf) = stream.read_to_end(usize::MAX).await {
-                            if !buf.is_empty() {
-                                println!("Received packet on B (size: {} bytes)", buf.len());
-                                break buf;
-                            }
+        let condition = || async {
+            match session_b.accept_uni().await {
+                Ok(mut stream) => {
+                    if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                        if !buf.is_empty() {
+                            println!("Received packet on B (size: {} bytes)", buf.len());
+                            return Some(buf);
                         }
                     }
-                    Err(_) => sleep(Duration::from_millis(50)).await,
                 }
+                Err(_) => {}
             }
-        })
-        .await
-        .expect("timely receive");
+            None
+        };
+
+        let received =
+            wait_for_condition(condition, Duration::from_secs(5), Duration::from_millis(50))
+                .await
+                .expect("timely receive");
 
         assert_eq!(bytes, received, "B must receive the exact bytes sent by A");
+
         println!("=== INTEGRATION TEST PASSED ===");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_lobby_isolation() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(std::io::stderr)
+            .try_init();
+
+        // Wrap entire test with 15 second timeout
+        let test_result = tokio::time::timeout(Duration::from_secs(15), async {
+            test_lobby_isolation_impl().await
+        })
+        .await;
+
+        match test_result {
+            Ok(Ok(())) => println!("Test completed successfully"),
+            Ok(Err(e)) => panic!("Test failed: {}", e),
+            Err(_) => panic!("Test timed out after 15 seconds"),
+        }
+    }
+
+    async fn test_lobby_isolation_impl() -> anyhow::Result<()> {
+        println!("=== STARTING COMPREHENSIVE LOBBY ISOLATION TEST ===");
+
+        // ========== SETUP ==========
+        reset_test_packet_counters();
+        println!("✓ Reset packet counters");
+
+        println!("Starting WebTransport server...");
+        let _wt_handle = start_webtransport_server().await;
+        wait_for_server_ready().await;
+        println!("✓ Server ready");
+
+        // ========== CLIENT CONNECTIONS ==========
+        let lobby_1 = "lobby-secure";
+        let lobby_2 = "lobby-public";
+        let user_a = "alice";
+        let user_b = "bob";
+        let user_c = "charlie";
+
+        println!("\n--- Establishing Connections ---");
+
+        let session_a = connect_client(user_a, lobby_1)
+            .await
+            .expect("connect alice");
+        println!("✓ Alice connected to lobby-secure");
+
+        let session_b = connect_client(user_b, lobby_2).await.expect("connect bob");
+        println!("✓ Bob connected to lobby-public");
+
+        let session_c = connect_client(user_c, lobby_1)
+            .await
+            .expect("connect charlie");
+        println!("✓ Charlie connected to lobby-secure");
+
+        // Keep connections alive
+        start_keep_alive_tasks(&session_a, &session_b, &session_c).await;
+
+        // ========== PHASE 1: CROSS-LOBBY ISOLATION TEST ==========
+        println!("\n--- Phase 1: Testing Cross-Lobby Isolation ---");
+
+        let [count_a, count_b, count_c] = get_all_user_counts(&[user_a, user_b, user_c])[..] else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!(
+            "Initial counts: A={}, B={}, C={}",
+            count_a, count_b, count_c
+        );
+
+        // Alice sends 3 packets to her lobby (should only reach Charlie, not Bob)
+        for i in 1..=3 {
+            let packet = create_test_packet(user_a, VcMediaType::AUDIO, format!("alice-msg-{}", i));
+            send_packet(&session_a, packet).await;
+            println!("✓ Alice sent packet #{}", i);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let [alice_count_after, bob_count_after, charlie_count_after] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!(
+            "After Alice's packets: A={}, B={}, C={}",
+            alice_count_after, bob_count_after, charlie_count_after
+        );
+
+        // Bob should have received ZERO packets (different lobby)
+        assert_eq!(
+            bob_count_after, count_b,
+            "❌ ISOLATION BREACH: Bob in lobby-public received packets from Alice in lobby-secure!"
+        );
+        println!("✅ Confirmed: Bob (lobby-public) isolated from Alice's packets");
+
+        // Charlie should have received Alice's packets (same lobby)
+        assert!(
+            charlie_count_after >= count_c + 3,
+            "❌ Charlie should have received Alice's 3 packets, but only got {} new packets",
+            charlie_count_after - count_c
+        );
+        println!("✅ Confirmed: Charlie (lobby-secure) received Alice's packets");
+
+        // ========== PHASE 2: BIDIRECTIONAL SAME-LOBBY TEST ==========
+        println!("\n--- Phase 2: Testing Bidirectional Same-Lobby Communication ---");
+
+        let [alice_before_bidi, bob_before_bidi, _charlie_before_bidi] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+
+        // Charlie responds to Alice with 2 packets
+        for i in 1..=2 {
+            let packet =
+                create_test_packet(user_c, VcMediaType::VIDEO, format!("charlie-reply-{}", i));
+            send_packet(&session_c, packet).await;
+            println!("✓ Charlie sent reply #{}", i);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let [alice_after_bidi, bob_after_bidi, charlie_after_bidi] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!(
+            "After Charlie's replies: A={}, B={}, C={}",
+            alice_after_bidi, bob_after_bidi, charlie_after_bidi
+        );
+
+        // Alice should receive Charlie's replies
+        assert!(
+            alice_after_bidi >= alice_before_bidi + 2,
+            "❌ Alice should have received Charlie's 2 replies"
+        );
+        println!("✅ Confirmed: Bidirectional communication within lobby-secure works");
+
+        // Bob should still have zero new packets
+        assert_eq!(
+            bob_after_bidi, bob_before_bidi,
+            "❌ ISOLATION BREACH: Bob received packets from Charlie!"
+        );
+        println!("✅ Confirmed: Bob remains isolated from lobby-secure traffic");
+
+        // ========== PHASE 3: ISOLATED LOBBY COMMUNICATION ==========
+        println!("\n--- Phase 3: Testing Bob's Isolated Communication ---");
+
+        let [alice_before_bob, bob_before_bob, charlie_before_bob] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+
+        // Bob sends packet in his own lobby (should not reach Alice or Charlie)
+        let packet = create_test_packet(user_b, VcMediaType::AUDIO, "bob-isolated-msg".to_string());
+        send_packet(&session_b, packet).await;
+        println!("✓ Bob sent packet in lobby-public");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let [alice_after_bob, bob_after_bob, charlie_after_bob] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!(
+            "After Bob's packet: A={}, B={}, C={}",
+            alice_after_bob, bob_after_bob, charlie_after_bob
+        );
+
+        // Alice and Charlie should not receive Bob's packet
+        assert_eq!(
+            alice_after_bob, alice_before_bob,
+            "❌ Alice received Bob's packet across lobbies!"
+        );
+        assert_eq!(
+            charlie_after_bob, charlie_before_bob,
+            "❌ Charlie received Bob's packet across lobbies!"
+        );
+        println!("✅ Confirmed: Bob's packets isolated to lobby-public");
+
+        // ========== SUMMARY ==========
+        println!("\n=== COMPREHENSIVE LOBBY ISOLATION TEST PASSED ===");
+        let [alice_final, bob_final, charlie_final] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!("Final packet counts:");
+        println!("  • Alice (lobby-secure): {}", alice_final);
+        println!("  • Bob   (lobby-public):  {}", bob_final);
+        println!("  • Charlie (lobby-secure): {}", charlie_final);
+        println!("✅ All lobby isolation requirements verified!");
+
+        Ok(())
+    }
+
+    // ========== HELPER FUNCTIONS ==========
+
+    async fn start_keep_alive_tasks(
+        session_a: &web_transport_quinn::Session,
+        session_b: &web_transport_quinn::Session,
+        session_c: &web_transport_quinn::Session,
+    ) {
+        let session_a_keep = session_a.clone();
+        let session_b_keep = session_b.clone();
+        let session_c_keep = session_c.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(8));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_a_keep).await;
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(8));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_b_keep).await;
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(8));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_c_keep).await;
+            }
+        });
+    }
+
+    fn create_test_packet(sender: &str, media_type: VcMediaType, _message: String) -> Vec<u8> {
+        let media = VcMediaPacket {
+            media_type: media_type.into(),
+            email: sender.to_string(),
+            ..Default::default()
+        };
+        let packet = VcPacketWrapper {
+            packet_type: VcPacketType::MEDIA.into(),
+            email: sender.to_string(),
+            data: media.write_to_bytes().expect("serialize media"),
+            ..Default::default()
+        };
+        packet.write_to_bytes().expect("serialize wrapper")
+    }
+
+    fn get_all_user_counts(users: &[&str]) -> Vec<u64> {
+        users
+            .iter()
+            .map(|user| get_test_packet_counter_for_user(user))
+            .collect()
     }
 }

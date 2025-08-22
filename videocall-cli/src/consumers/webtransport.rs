@@ -16,11 +16,8 @@
  * conditions.
  */
 
-use std::sync::Arc;
-
 use anyhow::Error;
 use protobuf::Message;
-use quinn::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     sync::mpsc::{self, Sender},
@@ -34,16 +31,15 @@ use videocall_types::protos::{
 };
 
 use crate::cli_args::Stream;
-use crate::fake_cert_verifier::NoVerification;
 
 use super::camera_synk::CameraSynk;
 
-pub struct QUICClient {
+pub struct WebTransportClient {
     options: Stream,
     sender: Option<Sender<Vec<u8>>>,
 }
 
-impl QUICClient {
+impl WebTransportClient {
     pub fn new(options: Stream) -> Self {
         Self {
             options,
@@ -66,10 +62,10 @@ impl QUICClient {
         Ok(())
     }
 
-    pub async fn send(conn: Connection, data: Vec<u8>) -> anyhow::Result<()> {
-        let mut stream = conn.open_uni().await?;
+    pub async fn send(session: &web_transport_quinn::Session, data: Vec<u8>) -> anyhow::Result<()> {
+        let mut stream = session.open_uni().await?;
         stream.write_all(&data).await?;
-        stream.finish().await?;
+        stream.finish()?;
         Ok(())
     }
 
@@ -84,7 +80,7 @@ impl QUICClient {
         }
     }
 
-    async fn start_heartbeat(&self, conn: Connection, options: &Stream) {
+    async fn start_heartbeat(&self, session: web_transport_quinn::Session, options: &Stream) {
         let interval = time::interval(Duration::from_secs(1));
         let email = options.user_id.clone();
         tokio::spawn(async move {
@@ -114,7 +110,7 @@ impl QUICClient {
                     ..Default::default()
                 };
                 let data = packet.write_to_bytes().unwrap();
-                if let Err(e) = Self::send(conn.clone(), data).await {
+                if let Err(e) = Self::send(&session, data).await {
                     tracing::error!("Failed to send heartbeat: {}", e);
                 }
             }
@@ -122,80 +118,54 @@ impl QUICClient {
     }
 }
 
-async fn connect_to_server(options: &Stream) -> anyhow::Result<Connection> {
+async fn connect_to_server(options: &Stream) -> anyhow::Result<web_transport_quinn::Session> {
     loop {
         info!("Attempting to connect to {}", options.url);
-        let addrs = options
-            .url
-            .socket_addrs(|| Some(443))
-            .expect("couldn't resolve the address provided");
-        let remote = addrs.first().to_owned();
-        let remote = remote.unwrap();
-        let mut client_crypto = if options.insecure_skip_verify {
+
+        // Construct WebTransport URL
+        let mut url = options.url.clone();
+        url.set_path(&format!(
+            "/lobby/{}/{}",
+            options.user_id, options.meeting_id
+        ));
+
+        // Create WebTransport client using 0.7.3 API (same pattern as bot)
+        let client = if options.insecure_skip_verify {
             info!("WARNING: Skipping TLS certificate verification - connection is insecure!");
-            rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_custom_certificate_verifier(Arc::new(NoVerification))
-                .with_no_client_auth()
+            unsafe { web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()? }
         } else {
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                    ta.subject,
-                    ta.spki,
-                    ta.name_constraints,
-                )
-            }));
-            rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
+            web_transport_quinn::ClientBuilder::new().with_system_roots()?
         };
 
-        let alpn = vec![b"hq-29".to_vec()];
-        client_crypto.alpn_protocols = alpn;
-        if options.keylog {
-            client_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
-        }
-        let client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
-        let host = options.url.host_str();
-
-        match quinn::Endpoint::client("[::]:0".parse().unwrap()) {
-            Ok(mut endpoint) => {
-                endpoint.set_default_client_config(client_config);
-                match endpoint.connect(*remote, host.unwrap()) {
-                    Ok(conn) => {
-                        let conn = conn.await?;
-                        info!("Connected successfully");
-                        return Ok(conn);
-                    }
-                    Err(e) => {
-                        tracing::error!("Connection failed: {}. Retrying in 5 seconds...", e);
-                        time::sleep(Duration::from_secs(5)).await;
-                    }
-                }
+        match client.connect(url).await {
+            Ok(session) => {
+                info!("WebTransport session established successfully");
+                return Ok(session);
             }
             Err(e) => {
-                tracing::error!("Endpoint creation failed: {}. Retrying in 5 seconds...", e);
+                tracing::error!(
+                    "WebTransport connection failed: {}. Retrying in 5 seconds...",
+                    e
+                );
                 time::sleep(Duration::from_secs(5)).await;
             }
         }
     }
 }
 
-impl CameraSynk for QUICClient {
+impl CameraSynk for WebTransportClient {
     async fn connect(&mut self) -> anyhow::Result<()> {
-        let conn = connect_to_server(&self.options).await?;
+        let session = connect_to_server(&self.options).await?;
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(100);
         self.sender = Some(tx);
 
-        // Spawn a task to handle sending messages via the connection
-        let cloned_conn = conn.clone();
+        // Spawn a task to handle sending messages via the WebTransport session
+        let session_clone = session.clone();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                let cloned_conn = cloned_conn.clone();
+                let session_clone_inner = session_clone.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = Self::send(cloned_conn.clone(), message).await {
+                    if let Err(e) = WebTransportClient::send(&session_clone_inner, message).await {
                         tracing::error!("Failed to send message: {}", e);
                     }
                 });
@@ -203,7 +173,7 @@ impl CameraSynk for QUICClient {
         });
 
         // Spawn a separate task for heartbeat
-        self.start_heartbeat(conn.clone(), &self.options).await;
+        self.start_heartbeat(session.clone(), &self.options).await;
 
         self.send_connection_packet().await?;
         Ok(())

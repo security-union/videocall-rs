@@ -20,7 +20,7 @@ use tokio::sync::mpsc::channel;
 use videocall_cli::cli_args::Stream;
 use videocall_cli::consumers::camera_synk::CameraSynk;
 use videocall_cli::consumers::dead_synk::DeadSynk;
-use videocall_cli::consumers::quic::QUICClient;
+use videocall_cli::consumers::webtransport::WebTransportClient;
 use videocall_cli::consumers::CameraSynks;
 use videocall_cli::producers::{
     camera::{CameraConfig, CameraDaemon},
@@ -60,7 +60,7 @@ pub async fn stream(opt: Stream) {
     let mut client: CameraSynks = if local_streaming {
         CameraSynks::DeadSynk(DeadSynk::new(opt))
     } else {
-        CameraSynks::CameraSynk(Box::new(QUICClient::new(opt)))
+        CameraSynks::CameraSynk(Box::new(WebTransportClient::new(opt)))
     };
     client.connect().await.expect("failed to connect");
     let camera_config = CameraConfig {
@@ -72,31 +72,34 @@ pub async fn stream(opt: Stream) {
         bitrate_kbps,
         cpu_used,
     };
-    let (quic_tx, mut quic_rx) = channel::<Vec<u8>>(10);
+    let (wt_tx, mut wt_rx) = channel::<Vec<u8>>(10);
     let mut video_producer: Box<dyn Producer> = if send_test_pattern {
         Box::new(TestPatternSender::from_config(
             camera_config,
             user_id.clone(),
-            quic_tx.clone(),
+            wt_tx.clone(),
         ))
     } else {
         Box::new(CameraDaemon::from_config(
             camera_config,
             user_id.clone(),
-            quic_tx.clone(),
+            wt_tx.clone(),
         ))
     };
     video_producer.start().expect("failed to start camera");
     let mut microphone = MicrophoneDaemon::default();
     if let Some(audio_device) = audio_device {
         microphone
-            .start(quic_tx, audio_device, user_id.clone())
+            .start(wt_tx, audio_device, user_id.clone())
             .expect("failed to start microphone");
     }
 
-    while let Some(data) = quic_rx.recv().await {
+    while let Some(data) = wt_rx.recv().await {
+        tracing::debug!("Received packet from producer: {} bytes", data.len());
         if let Err(e) = client.send_packet(data).await {
             tracing::error!("Failed to send packet: {}", e);
+        } else {
+            tracing::debug!("Packet sent successfully to WebTransport client");
         }
     }
 }

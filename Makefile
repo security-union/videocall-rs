@@ -1,5 +1,15 @@
-test:
-		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app/actix-api && cargo test"
+COMPOSE_IT := docker/docker-compose.integration.yaml
+
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean
+
+tests_run:
+	docker compose -f $(COMPOSE_IT) up -d && docker compose -f $(COMPOSE_IT) run --rm rust-tests bash -c "cargo clippy -- -D warnings && cargo fmt --check && cargo machete && cargo test -- --nocapture --test-threads=1"
+
+tests_build:
+	docker compose -f $(COMPOSE_IT) build
+
+tests_down:
+	docker compose -f $(COMPOSE_IT) down -v
 
 up:
 		docker compose -f docker/docker-compose.yaml up

@@ -17,6 +17,7 @@
  */
 
 use crate::client_diagnostics::health_processor;
+use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
 };
@@ -24,15 +25,12 @@ use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
 use futures::StreamExt;
 use protobuf::Message;
-use quinn::crypto::rustls::HandshakeData;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
 use std::{fs, io};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::sync::{watch, RwLock};
+use std::{net::SocketAddr, path::PathBuf};
 use tracing::{debug, error, info, trace, trace_span};
 
-use videocall_types::protos::connection_packet::ConnectionPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -160,8 +158,6 @@ async fn run_webtransport_connection_from_request(
     let uri = url;
     let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
-    info!("Got path : {} ", path);
-
     let parts = path.split('/').collect::<Vec<&str>>();
     // filter out the empty strings
     let parts = parts.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
@@ -174,7 +170,7 @@ async fn run_webtransport_connection_from_request(
 
     let username = parts[1].replace(' ', "_");
     let lobby_id = parts[2].replace(' ', "_");
-    let re = regex::Regex::new("^[a-zA-Z0-9_-]*$").unwrap();
+    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
     if !re.is_match(&username) && !re.is_match(&lobby_id) {
         return Err(anyhow!("Invalid path input chars"));
     }
@@ -385,228 +381,6 @@ async fn handle_webtransport_session(
 
     info!("Finished handling session: {}", session_id);
     Ok(())
-}
-
-async fn handle_quic_connection(
-    conn: quinn::Connection,
-    nc: async_nats::client::Client,
-    tracker_sender: TrackerSender,
-) -> Result<()> {
-    let _session_id = conn.stable_id();
-    // Generate session ID for metrics tracking (will start tracking after CONNECTION packet)
-    let session_id = Arc::new(uuid::Uuid::new_v4().to_string());
-    let session = Arc::new(RwLock::new(conn));
-    let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<Subject>>(None);
-    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-
-    // NATS receive task
-    {
-        let session = session.clone();
-        let nc_clone = nc.clone();
-        let specific_subject_rx_clone = specific_subject_rx.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_nats = tracker_sender.clone();
-        join_set.spawn(async move {
-            let mut specific_subject_rx = specific_subject_rx_clone;
-            let nc = nc_clone;
-            specific_subject_rx.changed().await.unwrap();
-            let specific_subject = specific_subject_rx.borrow().clone().unwrap();
-            let subject = session_subject_to_lobby_subject(&specific_subject);
-            let mut sub = match nc
-                .queue_subscribe(subject.clone(), specific_subject.to_string())
-                .await
-            {
-                Ok(sub) => {
-                    info!("Subscribed to subject {subject}");
-                    sub
-                }
-                Err(e) => {
-                    let err = format!("error subscribing to subject {subject}: {e}");
-                    error!("{err}");
-                    return;
-                }
-            };
-            while let Some(msg) = sub.next().await {
-                if Some(msg.subject) == specific_subject_rx.borrow().clone() {
-                    continue;
-                }
-                let session = session.read().await;
-
-                let stream = session.open_uni().await;
-                let session_id_clone = session_id_clone.clone();
-                let payload_size = msg.payload.len() as u64;
-                let tracker_sender_msg = tracker_sender_nats.clone();
-                tokio::spawn(async move {
-                    let data_tracker = DataTracker::new(tracker_sender_msg);
-                    match stream {
-                        Ok(mut uni_stream) => {
-                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                error!("Error writing to unidirectional stream: {}", e);
-                            } else {
-                                // Track data sent
-                                data_tracker.track_sent(&session_id_clone, payload_size);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error opening unidirectional stream: {}", e);
-                        }
-                    }
-                });
-            }
-        });
-    }
-
-    // QUIC unidirectional receive task
-    {
-        let specific_subject_rx_clone = specific_subject_rx.clone();
-        let session = session.clone();
-        let nc = nc.clone();
-        let session_id_arc = session_id.clone();
-        let tracker_sender_quic = tracker_sender.clone();
-        join_set.spawn(async move {
-            let session = session.read().await;
-            let specific_subject_tx = Arc::new(specific_subject_tx);
-            while let Ok(mut uni_stream) = session.accept_uni().await {
-                let nc = nc.clone();
-                let specific_subject_tx_clone = specific_subject_tx.clone();
-                let specific_subject_rx = specific_subject_rx_clone.clone();
-                let session_for_echo = session.clone();
-                let session_id_inner = session_id_arc.clone();
-                let tracker_sender_inner = tracker_sender_quic.clone();
-                tokio::spawn(async move {
-                    let data_tracker = DataTracker::new(tracker_sender_inner.clone());
-                    if let Ok(d) = uni_stream.read_to_end(usize::MAX).await {
-                        let buf_size = d.len() as u64;
-
-                        if specific_subject_rx.borrow().is_none() {
-                            // Track data received even during handshake
-                            data_tracker.track_received(&session_id_inner, buf_size);
-
-                            if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(&d) {
-                                if packet_wrapper.packet_type == PacketType::CONNECTION.into() {
-                                    info!("Got connection packet");
-                                    let connection_packet =
-                                        ConnectionPacket::parse_from_bytes(&packet_wrapper.data)
-                                            .unwrap();
-                                    let specific_subject = format!(
-                                        "room.{}.{}",
-                                        connection_packet.meeting_id, packet_wrapper.email
-                                    )
-                                    .replace(' ', "_");
-                                    info!("Specific subject: {}", specific_subject);
-
-                                    // Now we have customer info - start tracking the connection
-                                    send_connection_started(
-                                        &tracker_sender_inner,
-                                        session_id_inner.as_ref().clone(),
-                                        packet_wrapper.email.clone(),
-                                        connection_packet.meeting_id.clone(),
-                                        "quic".to_string(),
-                                    );
-
-                                    specific_subject_tx_clone
-                                        .send(Some(specific_subject.into()))
-                                        .unwrap();
-                                }
-                            }
-                        } else {
-                            // Track data received for established connections
-                            data_tracker.track_received(&session_id_inner, buf_size);
-
-                            // Check if this is an RTT packet that should be echoed back
-                            if is_rtt_packet(&d) {
-                                trace!("Echoing RTT packet back via QUIC");
-                                let session_read = session_for_echo.clone();
-                                match session_read.open_uni().await {
-                                    Ok(mut echo_stream) => {
-                                        if let Err(e) = echo_stream.write_all(&d).await {
-                                            error!("Error echoing RTT packet via QUIC: {}", e);
-                                        } else {
-                                            // Track data sent for echo
-                                            data_tracker.track_sent(&session_id_inner, buf_size);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Error opening QUIC echo stream: {}", e);
-                                    }
-                                }
-                            } else if health_processor::is_health_packet_bytes(&d) {
-                                // Process health packet for diagnostics (don't relay)
-                                health_processor::process_health_packet_bytes(&d, nc.clone());
-                            } else {
-                                // Normal packet processing - publish to NATS
-                                let specific_subject =
-                                    specific_subject_rx.borrow().clone().unwrap();
-                                if let Err(e) = nc.publish(specific_subject.clone(), d.into()).await
-                                {
-                                    error!(
-                                        "Error publishing to subject {}: {}",
-                                        &specific_subject, e
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        error!("Error reading from unidirectional stream");
-                    };
-                });
-            }
-        });
-    }
-
-    // QUIC datagram receive task
-    {
-        let session_clone = session.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_datagram = tracker_sender.clone();
-        join_set.spawn(async move {
-            let data_tracker = DataTracker::new(tracker_sender_datagram);
-            let session = session_clone.read().await;
-            if specific_subject_rx.borrow().is_none() {
-                specific_subject_rx.changed().await.unwrap();
-            }
-            let specific_subject = specific_subject_rx.borrow().clone().unwrap();
-            while let Ok(datagram) = session.read_datagram().await {
-                let datagram_size: u64 = datagram.len() as u64;
-                // Track data received
-                data_tracker.track_received(&session_id_clone, datagram_size);
-
-                // Check if this is an RTT packet that should be echoed back
-                if is_rtt_packet(&datagram) {
-                    debug!("Echoing RTT datagram back via QUIC");
-                    if let Err(e) = session.send_datagram(datagram.clone()) {
-                        error!("Error echoing RTT datagram via QUIC: {}", e);
-                    } else {
-                        // Track data sent for echo
-                        data_tracker.track_sent(&session_id_clone, datagram_size);
-                    }
-                } else {
-                    // Normal datagram processing - publish to NATS
-                    let nc = nc.clone();
-                    if let Err(e) = nc.publish(specific_subject.clone(), datagram).await {
-                        error!("Error publishing to subject {}: {}", specific_subject, e);
-                    }
-                }
-            }
-        });
-    }
-
-    join_set.join_next().await;
-    join_set.shutdown().await;
-
-    // Track connection end for metrics
-    send_connection_ended(&tracker_sender, session_id.as_ref().clone());
-
-    info!("Finished handling QUIC session: {}", session_id);
-    Ok(())
-}
-
-fn session_subject_to_lobby_subject(subject: &str) -> String {
-    let parts = subject.split('.').collect::<Vec<&str>>();
-    let mut lobby_subject = String::from("room.");
-    lobby_subject.push_str(parts[1]);
-    lobby_subject.push_str(".*");
-    lobby_subject
 }
 
 #[cfg(test)]

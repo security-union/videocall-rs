@@ -26,8 +26,9 @@ depends = "libvpx7 (>= 1.11.0), libvpx-dev (>= 1.11.0), libc6 (>= 2.34), libasou
 anyhow = { workspace = true }
 clap = { version = "4.0.32", features = ["derive"] }
 protobuf = "3.3.0"
-quinn = "0.10.2"
-rustls = {version = "0.21.7", features = ["dangerous_configuration"]}
+quinn = { workspace = true }
+rustls = { workspace = true }
+web-transport-quinn = { workspace = true }
 tokio = { version = "1.32.0", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter", "fmt", "ansi", "time", "local-time"] }

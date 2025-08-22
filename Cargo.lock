@@ -889,7 +889,7 @@ checksum = "cfa8873f51c92e232f9bac4065cddef41b714152812bfc5f7672ba16d6ef8cd9"
 
 [[package]]
 name = "bot"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6453,7 +6453,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "2.0.1"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "clap",

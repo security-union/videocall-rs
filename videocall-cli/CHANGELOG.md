@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0](https://github.com/security-union/videocall-rs/compare/videocall-cli-v2.0.1...videocall-cli-v3.0.0) - 2025-08-22
+
+### Other
+
+- breaking change: Axe raw QUIC api and use webtransport for videocall-cli ([#410](https://github.com/security-union/videocall-rs/pull/410))
+
 ## [2.0.1](https://github.com/security-union/videocall-rs/compare/videocall-cli-v2.0.0...videocall-cli-v2.0.1) - 2025-08-20
 
 ### Other

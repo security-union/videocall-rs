@@ -34,7 +34,7 @@ use super::camera::CameraConfig;
 
 pub fn encoder_thread(
     mut cam_rx: Receiver<Option<CameraPacket>>,
-    quic_tx: Arc<Sender<Vec<u8>>>,
+    wt_tx: Sender<Vec<u8>>,
     quit: Arc<AtomicBool>,
     camera_config: CameraConfig,
     user_id: String,
@@ -83,8 +83,17 @@ pub fn encoder_thread(
                 let frame_size = frame.data.len() as f64 / 1000f64;
                 debug!("Frame size: {:.2} kbit", frame_size);
                 let packet_wrapper = transform_video_chunk(&frame, &user_id);
-                if let Err(e) = quic_tx.try_send(packet_wrapper.write_to_bytes().unwrap()) {
-                    error!("Unable to send packet: {:?}", e);
+                let packet_bytes = packet_wrapper.write_to_bytes().unwrap();
+                debug!(
+                    "Queueing VIDEO packet: {} bytes, frame_type: {}, sequence: {}",
+                    packet_bytes.len(),
+                    if frame.key { "key" } else { "delta" },
+                    sequence - 1
+                );
+                if let Err(e) = wt_tx.try_send(packet_bytes) {
+                    error!("Unable to send video packet: {:?}", e);
+                } else {
+                    debug!("Video packet queued successfully");
                 }
             }
         }

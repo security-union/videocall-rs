@@ -18,16 +18,16 @@
 
 use camera_synk::CameraSynk;
 use dead_synk::DeadSynk;
-use quic::QUICClient;
+use webtransport::WebTransportClient;
 
 pub mod camera_synk;
 pub mod dead_synk;
 pub mod local_window_synk;
-pub mod quic;
+pub mod webtransport;
 
 pub enum CameraSynks {
     DeadSynk(DeadSynk),
-    CameraSynk(Box<QUICClient>),
+    CameraSynk(Box<WebTransportClient>),
     // LocalWindowSynk(LocalWindowSynk)
 }
 

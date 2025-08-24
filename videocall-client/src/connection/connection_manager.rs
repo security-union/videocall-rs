@@ -249,18 +249,10 @@ impl ConnectionManager {
 
         info!("Created {} connections for testing", self.connections.len());
 
-        // If only one connection was created, elect it immediately
+        // If only one connection was created, we still need to wait for it to be established
+        // Don't force immediate election - let the normal process work
         if self.connections.len() == 1 {
-            info!("Only one connection created, electing immediately");
-
-            // Set a very short election period for immediate election
-            if let ElectionState::Testing { start_time, .. } = &mut self.election_state {
-                self.election_state = ElectionState::Testing {
-                    start_time: *start_time,
-                    duration_ms: 100, // Very short - will be elected almost immediately
-                    probe_timer: None,
-                };
-            }
+            info!("Only one connection created, waiting for it to be established before election");
         }
 
         Ok(())
@@ -304,7 +296,7 @@ impl ConnectionManager {
             if packet.email != userid {
                 on_inbound_media.emit(packet);
             } else {
-                warn!("Rejecting packet from same user: {}", packet.email);
+                debug!("Rejecting packet from same user: {}", packet.email);
             }
         })
     }
@@ -644,7 +636,7 @@ impl ConnectionManager {
             debug!(
                 "ConnectionManager: Sending main connection manager diagnostics event: {event:?}"
             );
-            match global_sender().send(event) {
+            match global_sender().try_broadcast(event) {
                 Ok(_) => {
                     debug!("ConnectionManager: Successfully sent main connection manager diagnostics event");
                 }
@@ -706,7 +698,7 @@ impl ConnectionManager {
                 metrics: final_metrics,
             };
 
-            match global_sender().send(event) {
+            match global_sender().try_broadcast(event) {
                 Ok(_) => {
                     debug!(
                         "ConnectionManager: Successfully sent server diagnostics for {}",

@@ -35,11 +35,11 @@
 
 //! Web worker decoder that handles both frame data and control messages using a JitterBuffer.
 
-use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, VideoFrame};
 use videocall_codecs::jitter_buffer::JitterBuffer;
+use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -47,17 +47,6 @@ use web_sys::{
     EncodedVideoChunkType, VideoDecoder, VideoDecoderConfig, VideoDecoderInit,
     VideoFrame as WebVideoFrame,
 };
-
-/// Messages that can be sent to the web worker
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerMessage {
-    /// Decode a frame using the jitter buffer
-    DecodeFrame(FrameBuffer),
-    /// Flush the jitter buffer and decoder
-    Flush,
-    /// Reset jitter buffer and decoder to initial state
-    Reset,
-}
 
 /// WebDecoder implementation that wraps WebCodecs VideoDecoder
 struct WebDecoder {
@@ -219,6 +208,8 @@ impl Decodable for WebDecoder {
 thread_local! {
     static JITTER_BUFFER: RefCell<Option<JitterBuffer<DecodedFrame>>> = const { RefCell::new(None) };
     static INTERVAL_ID: RefCell<Option<i32>> = const { RefCell::new(None) };
+    static CONTEXT_FROM: RefCell<Option<String>> = const { RefCell::new(None) };
+    static CONTEXT_TO: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
@@ -265,6 +256,11 @@ fn handle_worker_message(message: WorkerMessage) {
         WorkerMessage::Reset => {
             console::log_1(&"[WORKER] Resetting jitter buffer and decoder state".into());
             reset_jitter_buffer();
+        }
+        WorkerMessage::SetContext { from_peer, to_peer } => {
+            CONTEXT_FROM.with(|f| *f.borrow_mut() = Some(from_peer));
+            CONTEXT_TO.with(|t| *t.borrow_mut() = Some(to_peer));
+            console::log_1(&"[WORKER] Set diagnostics context (from_peer,to_peer)".into());
         }
     }
 }
@@ -335,6 +331,48 @@ fn check_jitter_buffer_for_ready_frames() {
         if let Some(jb) = jb_opt.as_mut() {
             let current_time_ms = js_sys::Date::now() as u128;
             jb.find_and_move_continuous_frames(current_time_ms);
+
+            // Publish buffered frames metric periodically under subsystem "video" with stream_id unset.
+            // The client layer will attach original ids later in the pipeline.
+            let buffered = jb.buffered_frames_len() as u64;
+            #[cfg(feature = "wasm")]
+            {
+                use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+                // Only emit when we have context so the server can attribute correctly
+                CONTEXT_FROM.with(|from_cell| {
+                    CONTEXT_TO.with(|to_cell| {
+                        if let (Some(from_peer), Some(to_peer)) = (
+                            from_cell.borrow().clone(),
+                            to_cell.borrow().clone(),
+                        ) {
+                            console::log_1(&format!("[WORKER] Emitting video diagnostic: from={from_peer}, to={to_peer}, frames_buffered={buffered}").into());
+                            let evt = DiagEvent {
+                                subsystem: "video",
+                                stream_id: None,
+                                ts_ms: now_ms(),
+                                metrics: vec![
+                                    metric!("from_peer", from_peer),
+                                    metric!("to_peer", to_peer),
+                                    metric!("frames_buffered", buffered),
+                                ],
+                            };
+                            let _ = global_sender().try_broadcast(evt);
+
+                            // Also post a lightweight message to the main thread so it can forward to its bus
+                            if let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() {
+                                let msg = VideoStatsMessage::new(
+                                    from_cell.borrow().clone().unwrap(),
+                                    to_cell.borrow().clone().unwrap(),
+                                    buffered,
+                                );
+                                if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
+                                    let _ = scope.post_message(&val);
+                                }
+                            }
+                        }
+                    })
+                });
+            }
         }
     });
 }

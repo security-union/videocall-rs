@@ -40,6 +40,10 @@ declare -a CHARTS=(
     "global/us-east/rustlemania-ui"
     "global/us-east/rustlemania-ui-staging" 
     "global/us-east/videocall-website"
+    # Monitoring infrastructure
+    "global/us-east/prometheus"
+    "global/us-east/grafana"
+    "global/us-east/metrics-api"
 )
 
 # Infrastructure components that need to be deployed first
@@ -58,31 +62,80 @@ declare -a CERTIFICATE_FILES=(
     "global/us-east/engineering-vlog/certificate.yaml"
     "global/us-east/matomo/certificate.yaml"
     "global/us-east/rustlemania-ui/certificate.yaml"
-    "global/us-east/rustlemania-ui-staging/certificate.yaml"
     "global/us-east/videocall-website/certificate.yaml"
+    "global/us-east/grafana/certificate.yaml"
 )
 
 # DigitalOcean DNS secret file
 declare -r DIGITALOCEAN_SECRET_FILE="${HELM_DIR}/digital-ocean-secret/digitalocean-dns.yaml"
 
+# Service filtering functions
+filter_charts_by_services() {
+    local -a input_charts=()
+    local services_filter="$1"
+    
+    # Read input from stdin into array
+    while IFS= read -r line; do
+        input_charts+=("$line")
+    done
+    
+    if [[ -z "$services_filter" ]]; then
+        # No filtering, return all charts
+        printf '%s\n' "${input_charts[@]}"
+        return
+    fi
+    
+    # Parse services filter
+    IFS=',' read -ra SERVICES_ARRAY <<< "$services_filter"
+    local -a filtered_charts=()
+    
+    for chart in "${input_charts[@]}"; do
+        for service in "${SERVICES_ARRAY[@]}"; do
+            service=$(echo "$service" | xargs) # trim whitespace
+            case "$chart" in
+                *"/$service")
+                    filtered_charts+=("$chart")
+                    break
+                    ;;
+            esac
+        done
+    done
+    
+    printf '%s\n' "${filtered_charts[@]}"
+}
+
 # Region filtering functions
 get_charts_for_region() {
     local region="$1"
+    local services_filter="$2"
+    
+    local -a region_charts=()
     case "$region" in
         "all")
-            printf '%s\n' "${CHARTS[@]}"
+            region_charts=("${CHARTS[@]}")
             ;;
         "us-east")
             # Include global/us-east charts and global chart deployments for US East
-            printf '%s\n' "${CHARTS[@]}" | grep "global/us-east"
+            while IFS= read -r chart; do
+                [[ -n "$chart" ]] && region_charts+=("$chart")
+            done < <(printf '%s\n' "${CHARTS[@]}" | grep "global/us-east")
             ;;
         "singapore")
-            printf '%s\n' "${CHARTS[@]}" | grep "global/singapore"
+            while IFS= read -r chart; do
+                [[ -n "$chart" ]] && region_charts+=("$chart")
+            done < <(printf '%s\n' "${CHARTS[@]}" | grep "global/singapore")
             ;;
         *)
             error_exit "Invalid region: $region"
             ;;
     esac
+    
+    # Apply service filtering
+    if [[ -n "$services_filter" ]]; then
+        printf '%s\n' "${region_charts[@]}" | filter_charts_by_services "$services_filter"
+    else
+        printf '%s\n' "${region_charts[@]}"
+    fi
 }
 
 get_contexts_for_region() {
@@ -137,7 +190,7 @@ get_context_for_chart() {
             echo "${SINGAPORE_CONTEXT}"
             ;;
         # Additional services deployed to US East for consolidation
-        "global/us-east/engineering-vlog"|"global/us-east/matomo"|"global/us-east/rustlemania-ui"|"global/us-east/rustlemania-ui-staging"|"global/us-east/videocall-website")
+        "global/us-east/engineering-vlog"|"global/us-east/matomo"|"global/us-east/rustlemania-ui"|"global/us-east/rustlemania-ui-staging"|"global/us-east/videocall-website"|"global/us-east/prometheus"|"global/us-east/grafana"|"global/us-east/metrics-api")
             echo "${US_EAST_CONTEXT}"
             ;;
         *)
@@ -182,6 +235,15 @@ get_release_name_for_chart() {
         "global/us-east/videocall-website")
             echo "videocall-website-us-east"
             ;;
+        "global/us-east/prometheus")
+            echo "prometheus-us-east"
+            ;;
+        "global/us-east/grafana")
+            echo "grafana-us-east"
+            ;;
+        "global/us-east/metrics-api")
+            echo "metrics-api-us-east"
+            ;;
         *)
             echo "unknown"
             ;;
@@ -192,6 +254,7 @@ get_release_name_for_chart() {
 DRY_RUN=false
 SKIP_DEPENDENCIES=false
 DEPLOY_REGION="all"  # Options: all, us-east, singapore
+SERVICES_FILTER=""   # Comma-separated list of services to deploy
 
 # Colors for output
 declare -r RED='\033[0;31m'
@@ -273,6 +336,14 @@ parse_args() {
                 DEPLOY_REGION="singapore"
                 shift
                 ;;
+            --services)
+                if [[ -n "$2" && "$2" != --* ]]; then
+                    SERVICES_FILTER="$2"
+                    shift 2
+                else
+                    error_exit "--services requires a value (comma-separated list of services)"
+                fi
+                ;;
             -h|--help)
                 show_help
                 exit 0
@@ -296,6 +367,10 @@ Options:
     --region REGION          Deploy to specific region (all, us-east, singapore)
     --us-east-only           Deploy only to US East region (shortcut for --region us-east)
     --singapore-only         Deploy only to Singapore region (shortcut for --region singapore)
+    --services SERVICES      Deploy only specific services (comma-separated)
+                            Available: websocket, webtransport, ingress-nginx, engineering-vlog,
+                            matomo, rustlemania-ui, rustlemania-ui-staging, videocall-website,
+                            prometheus, grafana, metrics-api
     -h, --help              Show this help message
 
 This script will:
@@ -315,10 +390,11 @@ Available charts:
 $(for chart in "${CHARTS[@]}"; do echo "- $chart"; done)
 
 Examples:
-    $0                        # Deploy to all regions
-    $0 --region us-east       # Deploy only to US East
-    $0 --singapore-only       # Deploy only to Singapore
-    $0 --dry-run --region singapore  # Show what would be deployed to Singapore
+    $0                                      # Deploy all services to all regions
+    $0 --region us-east                     # Deploy all services to US East only
+    $0 --services websocket,webtransport    # Deploy only WebSocket and WebTransport services
+    $0 --services metrics-api --region us-east  # Deploy only metrics API to US East
+    $0 --dry-run --services websocket --singapore-only  # Show what would be deployed
 EOF
 }
 
@@ -345,7 +421,7 @@ validate_prerequisites() {
     done
     
     # Check helm charts exist for selected region
-    local charts=($(get_charts_for_region "${DEPLOY_REGION}"))
+    local charts=($(get_charts_for_region "${DEPLOY_REGION}" "${SERVICES_FILTER}"))
     for chart in "${charts[@]}"; do
         local chart_path="${HELM_DIR}/${chart}"
         
@@ -409,7 +485,7 @@ update_dependencies() {
     
     log_section "Updating Helm Dependencies"
     
-    local charts=($(get_charts_for_region "${DEPLOY_REGION}"))
+    local charts=($(get_charts_for_region "${DEPLOY_REGION}" "${SERVICES_FILTER}"))
     
     # Add required helm repositories first
     local repos_added=false
@@ -418,6 +494,22 @@ update_dependencies() {
             if ! helm repo list | grep -q bitnami; then
                 log_info "Adding bitnami helm repository for ${chart}"
                 helm repo add bitnami https://charts.bitnami.com/bitnami
+                repos_added=true
+            fi
+        fi
+        
+        if [[ "${chart}" == "global/us-east/grafana" ]] && [[ "${DRY_RUN}" == "false" ]]; then
+            if ! helm repo list | grep -q grafana; then
+                log_info "Adding grafana helm repository for ${chart}"
+                helm repo add grafana https://grafana.github.io/helm-charts
+                repos_added=true
+            fi
+        fi
+        
+        if [[ "${chart}" == "global/us-east/prometheus" ]] && [[ "${DRY_RUN}" == "false" ]]; then
+            if ! helm repo list | grep -q prometheus-community; then
+                log_info "Adding prometheus-community helm repository for ${chart}"
+                helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
                 repos_added=true
             fi
         fi
@@ -468,7 +560,7 @@ deploy_chart() {
     log_info "Switched to context: ${context}"
     
     # Standard local chart deployment for all regional charts
-    if ! (cd "${chart_path}" && helm upgrade --install "${release_name}" . -f values.yaml --timeout 300s); then
+    if ! (cd "${chart_path}" && helm upgrade --install "${release_name}" . -f values.yaml --timeout 300s --force); then
         error_exit "Failed to deploy ${chart}"
     fi
     
@@ -636,7 +728,7 @@ deploy_certificates() {
 deploy_all_charts() {
     log_section "Deploying Selected Charts"
     
-    local charts=($(get_charts_for_region "${DEPLOY_REGION}"))
+    local charts=($(get_charts_for_region "${DEPLOY_REGION}" "${SERVICES_FILTER}"))
     
     for chart in "${charts[@]}"; do
         deploy_chart "${chart}"
@@ -729,6 +821,8 @@ verify_deployments() {
             local ui_deployment=$(kubectl get deployment videocall-ui-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local staging_deployment=$(kubectl get deployment videocall-staging-ui-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             local videocall_website_deployment=$(kubectl get deployment videocall-website-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local prometheus_deployment=$(kubectl get deployment prometheus-us-east-server -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+            local grafana_deployment=$(kubectl get deployment grafana-us-east -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
             
             log_info "    Website: ${website_deployment} replicas ready"
             log_info "    Engineering Blog: ${blog_deployment} replicas ready"
@@ -736,6 +830,8 @@ verify_deployments() {
             log_info "    Videocall UI: ${ui_deployment} replicas ready"
             log_info "    Videocall Staging UI: ${staging_deployment} replicas ready"
             log_info "    Videocall Website: ${videocall_website_deployment} replicas ready"
+            log_info "    Prometheus: ${prometheus_deployment} replicas ready"
+            log_info "    Grafana: ${grafana_deployment} replicas ready"
             
             # Check ingresses for new services
             local website_ingress=$(kubectl get ingress website-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
@@ -744,6 +840,7 @@ verify_deployments() {
             local ui_ingress=$(kubectl get ingress videocall-ui-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local staging_ingress=$(kubectl get ingress videocall-staging-ui-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             local videocall_website_ingress=$(kubectl get ingress videocall-website-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
+            local grafana_ingress=$(kubectl get ingress grafana-us-east -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "not-found")
             
             echo ""
             log_info "  INGRESS IP ADDRESSES:"
@@ -753,6 +850,7 @@ verify_deployments() {
             log_info "    Videocall UI: ${ui_ingress}"
             log_info "    Videocall Staging UI: ${staging_ingress}"
             log_info "    Videocall Website: ${videocall_website_ingress}"
+            log_info "    Grafana: ${grafana_ingress}"
         fi
     
     echo ""
@@ -783,6 +881,11 @@ main() {
     log_info "Dry run mode: ${DRY_RUN}"
     log_info "Skip dependencies: ${SKIP_DEPENDENCIES}"
     log_info "Deploy region: ${DEPLOY_REGION}"
+    if [[ -n "${SERVICES_FILTER}" ]]; then
+        log_info "Services filter: ${SERVICES_FILTER}"
+    else
+        log_info "Services filter: all"
+    fi
     
     validate_prerequisites
     deploy_digitalocean_secret

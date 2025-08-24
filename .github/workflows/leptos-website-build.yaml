@@ -1,0 +1,99 @@
+name: Leptos Website Build
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'leptos-website/**'
+  pull_request:
+    paths:
+      - 'leptos-website/**'
+
+jobs:
+  leptos-build:
+    name: Leptos Website Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2024-11-01
+          target: wasm32-unknown-unknown
+          override: true
+          profile: minimal
+
+      - name: Cache cargo tools
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-cargo-tools-leptos-0.2.29-wasm-bindgen-0.2.100
+          restore-keys: |
+            ${{ runner.os }}-cargo-tools-
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-deps-${{ hashFiles('leptos-website/Cargo.lock', 'Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-deps-
+
+      - name: Cache leptos target
+        uses: actions/cache@v3
+        with:
+          path: leptos-website/target
+          key: ${{ runner.os }}-leptos-target-${{ hashFiles('leptos-website/Cargo.lock', 'leptos-website/src/**/*.rs', 'leptos-website/style/**') }}
+          restore-keys: |
+            ${{ runner.os }}-leptos-target-
+
+      - name: Install cargo-leptos
+        run: |
+          if ! command -v cargo-leptos &> /dev/null; then
+            echo "Installing cargo-leptos..."
+            cargo install --locked cargo-leptos@0.2.29
+          else
+            echo "cargo-leptos already installed"
+          fi
+
+      - name: Install wasm-bindgen-cli
+        run: |
+          if ! command -v wasm-bindgen &> /dev/null; then
+            echo "Installing wasm-bindgen-cli..."
+            cargo install wasm-bindgen-cli@0.2.100 --locked
+          else
+            echo "wasm-bindgen-cli already installed"
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: leptos-website/package-lock.json
+
+      - name: Install Node dependencies
+        run: cd leptos-website && npm install
+
+      - name: Cache Tailwind build
+        uses: actions/cache@v3
+        with:
+          path: leptos-website/style/output.css
+          key: ${{ runner.os }}-tailwind-${{ hashFiles('leptos-website/input.css', 'leptos-website/tailwind.config.js', 'leptos-website/src/**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-tailwind-
+
+      - name: Build Tailwind CSS
+        run: |
+          if [ ! -f leptos-website/style/output.css ] || [ leptos-website/input.css -nt leptos-website/style/output.css ]; then
+            echo "Building Tailwind CSS..."
+            cd leptos-website && npx tailwindcss -i input.css -o style/output.css --config tailwind.config.js --minify
+          else
+            echo "Tailwind CSS already up to date"
+          fi
+
+      - name: Build Leptos website
+        run: cd leptos-website && cargo leptos build --release

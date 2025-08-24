@@ -22,8 +22,10 @@ use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
+use crate::health_reporter::HealthReporter;
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
+use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info};
 use protobuf::Message;
@@ -35,6 +37,7 @@ use std::rc::{Rc, Weak};
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -69,6 +72,9 @@ pub struct VideoCallClientOptions {
     /// remote peers' clients.
     pub userid: String,
 
+    /// The meeting ID that this client is joining
+    pub meeting_id: String,
+
     /// The urls to which WebSocket connections should be made (comma-separated)
     pub websocket_urls: Vec<String>,
 
@@ -81,17 +87,17 @@ pub struct VideoCallClientOptions {
     /// Callback will be called as `callback(())` if a connection gets dropped
     pub on_connection_lost: Callback<JsValue>,
 
-    /// Callback will be called as `callback(stats_string)` with diagnostics information
-    pub on_diagnostics_update: Option<Callback<String>>,
-
-    /// Callback will be called as `callback(stats_string)` with sender diagnostics information
-    pub on_sender_stats_update: Option<Callback<String>>,
-
     /// `true` to enable diagnostics collection; `false` to disable
     pub enable_diagnostics: bool,
 
     /// How often to send diagnostics updates in milliseconds (default: 1000)
     pub diagnostics_update_interval_ms: Option<u64>,
+
+    /// `true` to enable health reporting to server; `false` to disable
+    pub enable_health_reporting: bool,
+
+    /// How often to send health packets in milliseconds (default: 5000)
+    pub health_reporting_interval_ms: Option<u64>,
 
     /// Callback for encoder settings
     pub on_encoder_settings_update: Option<Callback<String>>,
@@ -120,6 +126,7 @@ struct Inner {
     peer_decode_manager: PeerDecodeManager,
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
+    health_reporter: Option<Rc<RefCell<HealthReporter>>>,
 }
 
 /// The client struct for a video call connection.
@@ -154,21 +161,11 @@ impl VideoCallClient {
         let diagnostics = if options.enable_diagnostics {
             let diagnostics = Rc::new(DiagnosticManager::new(options.userid.clone()));
 
-            // Set up diagnostics callback if provided
-            if let Some(callback) = &options.on_diagnostics_update {
-                diagnostics.set_stats_callback(callback.clone());
-            }
-
             // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 let mut diag = DiagnosticManager::new(options.userid.clone());
                 diag.set_reporting_interval(interval);
                 let diagnostics = Rc::new(diag);
-
-                // Set up diagnostics callback if provided
-                if let Some(callback) = &options.on_diagnostics_update {
-                    diagnostics.set_stats_callback(callback.clone());
-                }
 
                 Some(diagnostics)
             } else {
@@ -182,17 +179,41 @@ impl VideoCallClient {
         let sender_diagnostics = if options.enable_diagnostics {
             let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.userid.clone()));
 
-            // Set up sender diagnostics callback if provided
-            if let Some(callback) = &options.on_sender_stats_update {
-                sender_diagnostics.set_stats_callback(callback.clone());
-            }
-
             // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 sender_diagnostics.set_reporting_interval(interval);
             }
 
             Some(sender_diagnostics)
+        } else {
+            None
+        };
+
+        // Create health reporter if enabled
+        let health_reporter = if options.enable_health_reporting {
+            let session_id = format!(
+                "session_{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            );
+
+            let mut reporter = HealthReporter::new(
+                session_id,
+                options.userid.clone(),
+                options.health_reporting_interval_ms.unwrap_or(5000),
+            );
+
+            // Set the meeting ID
+            reporter.set_meeting_id(options.meeting_id.clone());
+
+            // Set health reporting interval if provided
+            if let Some(interval) = options.health_reporting_interval_ms {
+                reporter.set_health_interval(interval);
+            }
+
+            Some(Rc::new(RefCell::new(reporter)))
         } else {
             None
         };
@@ -218,6 +239,7 @@ impl VideoCallClient {
                 ),
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
+                health_reporter: health_reporter.clone(),
             })),
             aes,
             _diagnostics: diagnostics.clone(),
@@ -229,6 +251,23 @@ impl VideoCallClient {
             diagnostics.set_packet_handler(Callback::from(move |packet| {
                 client_clone.send_diagnostic_packet(packet);
             }));
+        }
+
+        // Set up health reporter with packet sending callback
+        if let Some(health_reporter) = &health_reporter {
+            if let Ok(mut reporter) = health_reporter.try_borrow_mut() {
+                let client_clone = client.clone();
+                reporter.set_send_packet_callback(Callback::from(move |packet| {
+                    client_clone.send_packet(packet);
+                }));
+
+                // Start real diagnostics subscription (not mock channels)
+                reporter.start_diagnostics_subscription();
+
+                // Start health reporting
+                reporter.start_health_reporting();
+                debug!("Health reporting started with real diagnostics subscription");
+            }
         }
 
         client
@@ -263,12 +302,6 @@ impl VideoCallClient {
 
         if total_servers == 0 {
             return Err(anyhow!("No servers provided for RTT testing"));
-        }
-
-        if total_servers == 1 {
-            // Only one server available, connect directly without RTT testing
-            info!("Only one server available, skipping RTT testing and connecting directly");
-            return self.connect_direct();
         }
 
         let election_period_ms = self.options.rtt_testing_period_ms;
@@ -350,85 +383,6 @@ impl VideoCallClient {
         Ok(())
     }
 
-    /// Connect directly to a single server without RTT testing (legacy fallback)
-    fn connect_direct(&mut self) -> anyhow::Result<()> {
-        info!("Connecting directly to single server without RTT testing");
-
-        // For now, just use the ConnectionManager even for single server
-        // This ensures consistent diagnostics reporting
-        let websocket_urls = self.options.websocket_urls.clone();
-        let webtransport_urls = if self.options.enable_webtransport {
-            self.options.webtransport_urls.clone()
-        } else {
-            Vec::new()
-        };
-
-        let manager_options = ConnectionManagerOptions {
-            websocket_urls,
-            webtransport_urls,
-            userid: self.options.userid.clone(),
-            on_inbound_media: {
-                let inner = Rc::downgrade(&self.inner);
-                Callback::from(move |packet| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(mut inner) = inner.try_borrow_mut() {
-                            inner.on_inbound_media(packet);
-                        }
-                    }
-                })
-            },
-            on_state_changed: {
-                let on_connected = self.options.on_connected.clone();
-                let on_connection_lost = self.options.on_connection_lost.clone();
-                let inner = Rc::downgrade(&self.inner);
-                Callback::from(move |state: ConnectionState| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        if let Ok(mut inner) = inner.try_borrow_mut() {
-                            inner.connection_state = state.clone();
-                        }
-                    }
-
-                    match state {
-                        ConnectionState::Connected { .. } => {
-                            on_connected.emit(());
-                        }
-                        ConnectionState::Failed { error, .. } => {
-                            on_connection_lost.emit(JsValue::from_str(&error));
-                        }
-                        _ => {}
-                    }
-                })
-            },
-            peer_monitor: {
-                let inner = Rc::downgrade(&self.inner);
-                let on_connection_lost = self.options.on_connection_lost.clone();
-                Callback::from(move |_| {
-                    if let Some(inner) = Weak::upgrade(&inner) {
-                        match inner.try_borrow_mut() {
-                            Ok(mut inner) => {
-                                inner.peer_decode_manager.run_peer_monitor();
-                            }
-                            Err(_) => {
-                                on_connection_lost.emit(JsValue::from_str(
-                                    "Unable to borrow inner -- not starting peer monitor",
-                                ));
-                            }
-                        }
-                    }
-                })
-            },
-            election_period_ms: 100, // Very short election period for direct connection
-        };
-
-        let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
-
-        let mut borrowed = self.inner.try_borrow_mut()?;
-        borrowed.connection_controller = Some(connection_controller);
-
-        info!("Direct connection established with diagnostics reporting");
-        Ok(())
-    }
-
     /// Initiates a connection to a videocall server with automatic RTT-based server selection.
     ///
     /// This method automatically tests all provided servers and connects to the one with the lowest RTT.
@@ -471,18 +425,19 @@ impl VideoCallClient {
     }
 
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
+        let packet_type = media.packet_type.enum_value();
         match self.inner.try_borrow() {
             Ok(inner) => {
                 if let Some(connection_controller) = &inner.connection_controller {
                     if let Err(e) = connection_controller.send_packet(media) {
-                        error!("Failed to send packet: {e}");
+                        error!("Failed to send {packet_type:?} packet: {e}");
                     }
                 } else {
-                    error!("No connection manager available");
+                    error!("No connection manager available for {packet_type:?} packet");
                 }
             }
             Err(_) => {
-                error!("Unable to borrow inner -- dropping send packet {media:?}")
+                error!("Unable to borrow inner -- dropping {packet_type:?} packet {media:?}")
             }
         }
     }
@@ -646,13 +601,38 @@ impl VideoCallClient {
         }
     }
 
+    /// Subscribe to the global diagnostics broadcast system
+    ///
+    /// Returns a receiver that will receive all diagnostic events from across the system.
+    /// This is the new preferred way to access diagnostics data using the MPMC broadcast pattern.
+    pub fn subscribe_global_diagnostics(&self) -> async_broadcast::Receiver<DiagEvent> {
+        subscribe_global_diagnostics()
+    }
+
+    /// Remove a peer from health tracking
+    pub fn remove_peer_health(&self, peer_id: &str) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(health_reporter) = &inner.health_reporter {
+                if let Ok(reporter) = health_reporter.try_borrow() {
+                    reporter.remove_peer(peer_id);
+                    debug!("Removed peer from health tracking: {peer_id}");
+                }
+            }
+        }
+    }
+
     pub fn set_video_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_video_enabled(enabled) {
-                    error!("Failed to set video enabled {enabled}: {e}");
+                    debug!("Failed to set video enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set video enabled: {enabled}");
+                    if let Some(hr) = &inner.health_reporter {
+                        if let Ok(hrb) = hr.try_borrow() {
+                            hrb.set_reporting_video_enabled(enabled);
+                        }
+                    }
                 }
             } else {
                 debug!("No connection controller available for set_video_enabled({enabled})");
@@ -666,9 +646,14 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_audio_enabled(enabled) {
-                    error!("Failed to set audio enabled {enabled}: {e}");
+                    debug!("Failed to set audio enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set audio enabled: {enabled}");
+                    if let Some(hr) = &inner.health_reporter {
+                        if let Ok(hrb) = hr.try_borrow() {
+                            hrb.set_reporting_audio_enabled(enabled);
+                        }
+                    }
                 }
             } else {
                 debug!("No connection controller available for set_audio_enabled({enabled})");
@@ -682,7 +667,7 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_screen_enabled(enabled) {
-                    error!("Failed to set screen enabled {enabled}: {e}");
+                    debug!("Failed to set screen enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set screen enabled: {enabled}");
                 }
@@ -821,6 +806,14 @@ impl Inner {
                     error!("Failed to parse diagnostics packet");
                 }
             }
+            Ok(PacketType::HEALTH) => {
+                // Health packets are sent from client to server for monitoring
+                // Clients should not receive health packets, so we ignore them
+                debug!(
+                    "Received unexpected health packet from {}, ignoring",
+                    response.email
+                );
+            }
             Err(e) => {
                 error!("Failed to parse diagnostics packet: {e}");
             }
@@ -830,7 +823,7 @@ impl Inner {
                 self.options.on_peer_added.emit(peer_userid);
                 self.send_public_key();
             } else {
-                log::warn!("Rejecting packet from same user: {peer_userid}");
+                log::debug!("Rejecting packet from same user: {peer_userid}");
             }
         }
     }

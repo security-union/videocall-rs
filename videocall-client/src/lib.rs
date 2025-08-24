@@ -40,92 +40,121 @@
 //!
 //! ## Client creation and connection:
 //! ```no_run
-//! # use videocall_client::{VideoCallClient, VideoCallClientOptions};
-//! # use yew::Callback;
-//! # use videocall_types::protos::media_packet::media_packet::MediaType;
-//! # use wasm_bindgen::JsValue;
-//! 
-//! // Create client options with required callbacks
+//! use videocall_client::{VideoCallClient, VideoCallClientOptions};
+//! use yew::Callback;
+//!
 //! let options = VideoCallClientOptions {
-//!     // Required fields
-//!     enable_e2ee: false,  // Enable end-to-end encryption
-//!     enable_webtransport: false,  // Use WebSocket instead of WebTransport
-//!     
-//!     // Required callbacks
-//!     on_peer_added: Callback::from(|_peer_id: String| {
-//!         // Handle new peer added
-//!     }),
-//!     on_peer_first_frame: Callback::from(|(_peer_id, _media_type): (String, MediaType)| {
-//!         // Handle first frame received from peer
-//!         // media_type can be Audio, Video, or Screen
-//!     }),
-//!     
-//!     // Required function to get video canvas ID for a peer
-//!     get_peer_video_canvas_id: Callback::from(|peer_id: String| {
-//!         format!("video-{peer_id}")
-//!     }),
-//!     
-//!     // Required function to get screen canvas ID for a peer
-//!     get_peer_screen_canvas_id: Callback::from(|peer_id: String| {
-//!         format!("screen-{peer_id}")
-//!     }),
-//!     
-//!     // Required user ID
-//!     userid: "example_user".to_string(),
-//!     
-//!     // Required server URLs
-//!     websocket_urls: vec!["wss://example.com/ws".to_string()],
-//!     webtransport_urls: vec!["https://example.com/wt".to_string()],
-//!     
-//!     // Required callbacks
-//!     on_connected: Callback::from(|_| {
-//!         // Handle connection established
-//!     }),
-//!     on_connection_lost: Callback::from(|_error: JsValue| {
-//!         // Handle connection lost
-//!     }),
-//!     
-//!     // Optional callbacks
-//!     on_diagnostics_update: None,  // No diagnostics updates by default
-//!     on_sender_stats_update: None,  // No sender stats updates by default
-//!     
-//!     // Optional configuration
-//!     enable_diagnostics: false,  // Disable diagnostics by default
-//!     diagnostics_update_interval_ms: None,  // Use default interval
-//!     on_encoder_settings_update: None,  // No encoder settings updates
-//!     rtt_testing_period_ms: 3000,  // Default RTT testing period
-//!     rtt_probe_interval_ms: None,  // Use default probe interval
+//!     enable_e2ee: true,
+//!     enable_webtransport: true,
+//!     on_peer_added: Callback::noop(),
+//!     on_peer_first_frame: Callback::noop(),
+//!     get_peer_video_canvas_id: Callback::from(|_| "video-canvas".to_string()),
+//!     get_peer_screen_canvas_id: Callback::from(|_| "screen-canvas".to_string()),
+//!     userid: "user123".to_string(),
+//!     meeting_id: "room456".to_string(),
+//!     websocket_urls: vec!["ws://localhost:8080".to_string()],
+//!     webtransport_urls: vec!["https://localhost:8443".to_string()],
+//!     on_connected: Callback::noop(),
+//!     on_connection_lost: Callback::noop(),
+//!     enable_diagnostics: false,
+//!     diagnostics_update_interval_ms: None,
+//!     enable_health_reporting: false,
+//!     on_encoder_settings_update: None,
+//!     rtt_testing_period_ms: 3000,
+//!     rtt_probe_interval_ms: None,
+//!     health_reporting_interval_ms: Some(5000), // Send health every 5 seconds
 //! };
-//! 
-//! // Create a client with the specified options
 //! let mut client = VideoCallClient::new(options);
-//! 
-//! // Connect to the server
-//! client.connect();
+//!
+//! client.connect().unwrap();
 //! ```
 //!
-//! ## Requesting device access:
+//! ## Encoder creation:
 //! ```no_run
-//! # use videocall_client::MediaDeviceAccess;
-//! # use yew::Callback;
-//! 
+//! use videocall_client::{VideoCallClient, CameraEncoder, ScreenEncoder, create_microphone_encoder};
+//! use yew::Callback;
+//!
+//! # use videocall_client::VideoCallClientOptions;
+//! # let options = VideoCallClientOptions {
+//! #     enable_e2ee: false, enable_webtransport: false, on_peer_added: Callback::noop(),
+//! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
+//! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), userid: "user".to_string(),
+//! #     meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
+//! #     on_connected: Callback::noop(), on_connection_lost: Callback::noop(), enable_diagnostics: false, diagnostics_update_interval_ms: None,
+//! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
+//! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
+//! # };
+//! # let client = VideoCallClient::new(options);
+//! let mut camera = CameraEncoder::new(
+//!     client.clone(),
+//!     "video-element",
+//!     1000000, // 1 Mbps initial bitrate
+//!     Callback::noop()
+//! );
+//! let mut microphone = create_microphone_encoder(
+//!     client.clone(),
+//!     128, // 128 kbps bitrate
+//!     Callback::noop(),
+//!     Callback::noop(),
+//! );
+//! let mut screen = ScreenEncoder::new(
+//!     client,
+//!     2000, // 2 Mbps bitrate
+//!     Callback::noop()
+//! );
+//!
+//! // Select devices and start/stop encoding
+//! camera.select("camera-device-id".to_string());
+//! camera.start();
+//! camera.stop();
+//! microphone.select("microphone-device-id".to_string());
+//! microphone.start();
+//! microphone.stop();
+//! screen.set_enabled(true);
+//! screen.set_enabled(false);
+//! ```
+//!
+//! ## Device access permission:
+//!
+//! ```no_run
+//! use videocall_client::MediaDeviceAccess;
+//! use yew::Callback;
+//!
 //! let mut media_device_access = MediaDeviceAccess::new();
-//! // Request access to media devices
+//! media_device_access.on_granted = Callback::from(|_| {
+//!     web_sys::console::log_1(&"Access granted!".into());
+//! });
+//! media_device_access.on_denied = Callback::from(|error| {
+//!     web_sys::console::log_2(&"Access denied:".into(), &error);
+//! });
 //! media_device_access.request();
 //! ```
 //!
 //! ### Device query and listing:
 //! ```no_run
-//! # use videocall_client::MediaDeviceList;
-//! 
-//! // Create a new device list
-//! let media_device_list = MediaDeviceList::new();
-//! // Get available audio input devices
+//! use videocall_client::MediaDeviceList;
+//! use yew::Callback;
+//!
+//! let mut media_device_list = MediaDeviceList::new();
+//! media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
+//!     web_sys::console::log_2(&"Audio device selected:".into(), &device_id.into());
+//! });
+//! media_device_list.video_inputs.on_selected = Callback::from(|device_id: String| {
+//!     web_sys::console::log_2(&"Video device selected:".into(), &device_id.into());
+//! });
+//!
+//! media_device_list.load();
+//!
 //! let microphones = media_device_list.audio_inputs.devices();
-//! // Get available video input devices
 //! let cameras = media_device_list.video_inputs.devices();
+//! if let Some(mic) = microphones.first() {
+//!     media_device_list.audio_inputs.select(&mic.device_id());
+//! }
+//! if let Some(camera) = cameras.first() {
+//!     media_device_list.video_inputs.select(&camera.device_id());
+//! }
+//!
 //! ```
-
 
 pub mod audio_worklet_codec;
 mod client;
@@ -135,6 +164,7 @@ pub mod crypto;
 pub mod decode;
 pub mod diagnostics;
 pub mod encode;
+pub mod health_reporter;
 mod media_devices;
 pub mod utils;
 mod wrappers;

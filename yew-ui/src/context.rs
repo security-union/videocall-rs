@@ -38,11 +38,10 @@ pub fn save_username_to_storage(username: &str) {
 // Validation helpers
 // -----------------------------------------------------------------------------
 
-lazy_static::lazy_static! {
+use once_cell::sync::Lazy;
 
-    /// Regex compiled once at start-up.
-    static ref USERNAME_RE: regex::Regex = regex::Regex::new(r"^[A-Za-z0-9_]+$").unwrap();
-}
+static USERNAME_RE: Lazy<regex::Regex> =
+    Lazy::new(|| regex::Regex::new(r"^[A-Za-z0-9_]+$").unwrap());
 
 /// Returns `true` iff the supplied username is non-empty and matches the
 /// allowed pattern.

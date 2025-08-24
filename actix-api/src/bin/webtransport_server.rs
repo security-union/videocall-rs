@@ -60,15 +60,21 @@ async fn main() {
         },
     };
 
-    let listen = opt.listen;
     actix_rt::spawn(async move {
-        info!("Starting http server: {:?}", listen);
+        info!("Starting health/metrics HTTP server: {:?}", health_listen);
         let server =
-            HttpServer::new(|| App::new().route("/healthz", web::get().to(health_responder)))
-                .bind(&health_listen)
-                .unwrap();
-        if let Err(e) = server.run().await {
-            error!("http server error: {}", e);
+            HttpServer::new(|| App::new().route("/healthz", web::get().to(health_responder)));
+
+        match server.bind(&health_listen) {
+            Ok(server) => {
+                info!("Health server successfully bound to: {:?}", health_listen);
+                if let Err(e) = server.run().await {
+                    error!("Health server runtime error: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Failed to bind health server to {:?}: {}", health_listen, e);
+            }
         }
     });
 

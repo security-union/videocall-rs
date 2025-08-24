@@ -7,7 +7,8 @@ on:
   push:
     branches:
       - main
-      - high-availability #shabadoo
+      - add-diagnostics
+      - add-dynamic-ui-config
     paths:
       - 'yew-ui/**'
       - 'types/**'
@@ -16,6 +17,7 @@ on:
       - 'neteq/**'
       - Dockerfile.yew
       - nginx.conf
+      - docker/start-yew.sh
   workflow_dispatch:
 
 jobs:

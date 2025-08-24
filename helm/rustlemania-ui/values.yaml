@@ -32,6 +32,20 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+runtimeConfig:
+  # Using values aligned with docker/Dockerfile.yew
+  apiBaseUrl: "https://app.videocall.rs"
+  wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
+  webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
+  oauthEnabled: "false"
+  e2eeEnabled: "false"
+  webTransportEnabled: "true"
+  usersAllowedToStream: ""
+  serverElectionPeriodMs: 2000
+  audioBitrateKbps: 65
+  videoBitrateKbps: 1000
+  screenBitrateKbps: 1000
+
 ingress:
   enabled: true
   redirect: true

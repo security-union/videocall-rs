@@ -17,6 +17,7 @@
  */
 
 use crate::constants::*;
+use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
@@ -28,6 +29,7 @@ use yew::prelude::*;
 use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
 };
+use crate::context::{is_valid_username, load_username_from_storage, save_username_to_storage};
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -40,14 +42,19 @@ pub enum Msg {
     DisableMicrophone,
     EnableVideo(bool),
     DisableVideo,
-    AudioDeviceChanged(String),
-    VideoDeviceChanged(String),
-    SpeakerDeviceChanged(String),
+    AudioDeviceChanged(DeviceInfo),
+    VideoDeviceChanged(DeviceInfo),
+    SpeakerDeviceChanged(DeviceInfo),
     CameraEncoderSettingsUpdated(String),
     MicrophoneEncoderSettingsUpdated(String),
     ScreenEncoderSettingsUpdated(String),
     DevicesLoaded,
     DevicesChanged,
+    ToggleChangeNameModal,
+    UpdatePendingName(String),
+    SaveChangeName,
+    CancelChangeName,
+    MicrophoneError(String),
 }
 
 pub struct Host {
@@ -59,6 +66,9 @@ pub struct Host {
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub encoder_settings: EncoderSettings,
+    show_change_name: bool,
+    pending_name: String,
+    change_name_error: Option<String>,
 }
 
 pub struct EncoderSettings {
@@ -103,6 +113,11 @@ pub struct MeetingProps {
     pub device_settings_open: bool,
 
     pub on_device_settings_toggle: Callback<MouseEvent>,
+
+    /// Called when the microphone encoder reports an unrecoverable error.
+    /// The parent should disable the mic and optionally display an error.
+    #[prop_or_default]
+    pub on_microphone_error: Callback<String>,
 }
 
 impl Component for Host {
@@ -117,18 +132,26 @@ impl Component for Host {
         let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
         let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
 
+        let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
-            VIDEO_BITRATE_KBPS,
+            video_bitrate,
             camera_callback,
         );
 
         // Use the factory function to create the appropriate microphone encoder
-        let mut microphone =
-            create_microphone_encoder(client.clone(), AUDIO_BITRATE_KBPS, microphone_callback);
+        let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
+        let microphone_error_cb = ctx.link().callback(Msg::MicrophoneError);
+        let mut microphone = create_microphone_encoder(
+            client.clone(),
+            audio_bitrate,
+            microphone_callback,
+            microphone_error_cb.clone(),
+        );
 
-        let mut screen = ScreenEncoder::new(client.clone(), SCREEN_BITRATE_KBPS, screen_callback);
+        let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
+        let mut screen = ScreenEncoder::new(client.clone(), screen_bitrate, screen_callback);
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
@@ -174,6 +197,9 @@ impl Component for Host {
                 microphone: None,
                 screen: None,
             },
+            show_change_name: false,
+            pending_name: String::new(),
+            change_name_error: None,
         }
     }
 
@@ -189,6 +215,7 @@ impl Component for Host {
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::DisableScreenShare);
         }
+        // Mic enable/disable is controlled upstream; reflect props only
         if self.microphone.set_enabled(ctx.props().mic_enabled) {
             self.mic_enabled = ctx.props().mic_enabled;
             ctx.link()
@@ -248,6 +275,14 @@ impl Component for Host {
                     .emit(self.encoder_settings.to_string());
                 true
             }
+            Msg::MicrophoneError(err) => {
+                log::error!("Microphone error: {err}");
+                // Cancel encoder
+                self.microphone.stop();
+                // Propagate upstream so the parent can disable mic and show UI
+                ctx.props().on_microphone_error.emit(err);
+                true
+            }
             Msg::EnableVideo(should_enable) => {
                 if !should_enable {
                     return true;
@@ -263,11 +298,49 @@ impl Component for Host {
                     .emit(self.encoder_settings.to_string());
                 true
             }
+            Msg::ToggleChangeNameModal => {
+                if !self.show_change_name {
+                    // Opening: prefill with current username from storage
+                    self.pending_name = load_username_from_storage().unwrap_or_default();
+                    self.show_change_name = true;
+                    self.change_name_error = None;
+                } else {
+                    self.show_change_name = false;
+                    self.change_name_error = None;
+                }
+                true
+            }
+            Msg::UpdatePendingName(value) => {
+                self.pending_name = value;
+                true
+            }
+            Msg::CancelChangeName => {
+                self.show_change_name = false;
+                self.change_name_error = None;
+                false
+            }
+            Msg::SaveChangeName => {
+                let new_name = self.pending_name.trim().to_string();
+                if is_valid_username(&new_name) && !new_name.is_empty() {
+                    save_username_to_storage(&new_name);
+                    // Force a soft reload so meeting picks up new name
+                    if let Some(win) = web_sys::window() {
+                        let _ = win.location().reload();
+                    }
+                    self.show_change_name = false;
+                    self.change_name_error = None;
+                    false
+                } else {
+                    self.change_name_error =
+                        Some("Use letters, numbers, and underscore only.".to_string());
+                    true
+                }
+            }
             Msg::AudioDeviceChanged(audio) => {
                 log::info!("Audio device changed: {audio}");
                 // Update the MediaDeviceList selection
-                self.media_devices.audio_inputs.select(&audio);
-                if self.microphone.select(audio) {
+                self.media_devices.audio_inputs.select(&audio.device_id);
+                if self.microphone.select(audio.device_id.clone()) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
                         link.send_message(Msg::EnableMicrophone(true));
@@ -279,8 +352,8 @@ impl Component for Host {
             Msg::VideoDeviceChanged(video) => {
                 log::info!("Video device changed: {video}");
                 // Update the MediaDeviceList selection
-                self.media_devices.video_inputs.select(&video);
-                if self.camera.select(video) {
+                self.media_devices.video_inputs.select(&video.device_id);
+                if self.camera.select(video.device_id.clone()) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
                         link.send_message(Msg::EnableVideo(true));
@@ -291,9 +364,13 @@ impl Component for Host {
             }
             Msg::SpeakerDeviceChanged(speaker) => {
                 // Update the MediaDeviceList selection
-                self.media_devices.audio_outputs.select(&speaker);
+                self.media_devices.audio_outputs.select(&speaker.device_id);
                 // Update the speaker device for all connected peers
-                if let Err(e) = ctx.props().client.update_speaker_device(Some(speaker)) {
+                if let Err(e) = ctx
+                    .props()
+                    .client
+                    .update_speaker_device(Some(speaker.device_id.clone()))
+                {
                     log::error!("Failed to update speaker device: {e:?}");
                 }
                 true
@@ -335,26 +412,34 @@ impl Component for Host {
                 }
             }
             Msg::DevicesLoaded => {
+                let audio_device_id = self.media_devices.audio_inputs.selected();
+                let video_device_id = self.media_devices.video_inputs.selected();
+                let speaker_device_id = self.media_devices.audio_outputs.selected();
+
                 ctx.link().send_message(Msg::AudioDeviceChanged(
-                    self.media_devices.audio_inputs.selected(),
+                    self.create_device_info_from_id(&audio_device_id, "audio_input"),
                 ));
                 ctx.link().send_message(Msg::VideoDeviceChanged(
-                    self.media_devices.video_inputs.selected(),
+                    self.create_device_info_from_id(&video_device_id, "video_input"),
                 ));
                 ctx.link().send_message(Msg::SpeakerDeviceChanged(
-                    self.media_devices.audio_outputs.selected(),
+                    self.create_device_info_from_id(&speaker_device_id, "audio_output"),
                 ));
                 true
             }
             Msg::DevicesChanged => {
+                let audio_device_id = self.media_devices.audio_inputs.selected();
+                let video_device_id = self.media_devices.video_inputs.selected();
+                let speaker_device_id = self.media_devices.audio_outputs.selected();
+
                 ctx.link().send_message(Msg::AudioDeviceChanged(
-                    self.media_devices.audio_inputs.selected(),
+                    self.create_device_info_from_id(&audio_device_id, "audio_input"),
                 ));
                 ctx.link().send_message(Msg::VideoDeviceChanged(
-                    self.media_devices.video_inputs.selected(),
+                    self.create_device_info_from_id(&video_device_id, "video_input"),
                 ));
                 ctx.link().send_message(Msg::SpeakerDeviceChanged(
-                    self.media_devices.audio_outputs.selected(),
+                    self.create_device_info_from_id(&speaker_device_id, "audio_output"),
                 ));
                 true
             }
@@ -383,11 +468,17 @@ impl Component for Host {
                 {
                     if ctx.props().video_enabled {
                         html! {
-                            <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
+                            <div class="host-video-wrapper" style="position:relative;">
+                                <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
+                                <button class="change-name-fab" title="Change name"
+                                    onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                                </button>
+                            </div>
                         }
                     } else {
                         html! {
-                            <div class="video-placeholder">
+                            <div class="" style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem; position:relative;">
                                 <div class="placeholder-content">
                                     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                         <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
@@ -395,6 +486,10 @@ impl Component for Host {
                                     </svg>
                                     <span class="placeholder-text">{"Camera Off"}</span>
                                 </div>
+                                <button class="change-name-fab" title="Change name"
+                                    onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                                </button>
                             </div>
                         }
                     }
@@ -402,7 +497,7 @@ impl Component for Host {
 
                 // Device Settings Menu Button (positioned outside the host video)
                 <button
-                    class="device-settings-menu-button"
+                    class="device-settings-menu-button btn-apple btn-secondary"
                     onclick={ctx.props().on_device_settings_toggle.clone()}
                     title="Device Settings"
                 >
@@ -441,6 +536,56 @@ impl Component for Host {
                     visible={ctx.props().device_settings_open}
                     on_close={close_settings_callback}
                 />
+
+                {
+                    if self.show_change_name {
+                        html!{
+                            <div class="glass-backdrop"
+                                onkeydown={{
+                                    let link = ctx.link().clone();
+                                    Callback::from(move |e: KeyboardEvent| {
+                                        let key = e.key();
+                                        if key == "Escape" {
+                                            e.prevent_default();
+                                            link.send_message(Msg::CancelChangeName);
+                                        } else if key == "Enter" {
+                                            e.prevent_default();
+                                            link.send_message(Msg::SaveChangeName);
+                                        }
+                                    })
+                                }}
+                            >
+                                <div class="card-apple" style="width: 380px;">
+                                    <h3 style="margin-top:0;">{"Change your name"}</h3>
+                                    <p style="color:#AEAEB2; margin-top:0.25rem;">{"This name will be visible to others in the meeting."}</p>
+                                    <input class="input-apple" value={self.pending_name.clone()} oninput={ctx.link().callback(|e: InputEvent| {
+                                        let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                        Msg::UpdatePendingName(input.value())
+                                    })} placeholder="Enter new name" pattern="^[a-zA-Z0-9_]*$" autofocus=true
+                                        onkeydown={{
+                                            let link = ctx.link().clone();
+                                            Callback::from(move |e: KeyboardEvent| {
+                                                let key = e.key();
+                                                if key == "Escape" {
+                                                    e.prevent_default();
+                                                    link.send_message(Msg::CancelChangeName);
+                                                } else if key == "Enter" {
+                                                    e.prevent_default();
+                                                    link.send_message(Msg::SaveChangeName);
+                                                }
+                                            })
+                                        }}
+                                    />
+                                    { if let Some(err) = &self.change_name_error { html!{ <p style="color:#FF453A; margin-top:6px; font-size:12px;">{err}</p> } } else { html!{} } }
+                                    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
+                                        <button class="btn-apple btn-secondary btn-sm" onclick={ctx.link().callback(|_| Msg::CancelChangeName)}>{"Cancel"}</button>
+                                        <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| Msg::SaveChangeName)}>{"Save"}</button>
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                    } else { html!{} }
+                }
             </>
         }
     }
@@ -450,5 +595,40 @@ impl Component for Host {
         self.camera.stop();
         self.microphone.stop();
         self.screen.stop();
+    }
+}
+
+impl Host {
+    /// Helper method to create DeviceInfo from device ID by looking up the device name
+    fn create_device_info_from_id(&self, device_id: &str, device_type: &str) -> DeviceInfo {
+        let device_name = match device_type {
+            "audio_input" => self
+                .media_devices
+                .audio_inputs
+                .devices()
+                .iter()
+                .find(|device| device.device_id() == device_id)
+                .map(|device| device.label())
+                .unwrap_or_else(|| "Unknown Microphone".to_string()),
+            "video_input" => self
+                .media_devices
+                .video_inputs
+                .devices()
+                .iter()
+                .find(|device| device.device_id() == device_id)
+                .map(|device| device.label())
+                .unwrap_or_else(|| "Unknown Camera".to_string()),
+            "audio_output" => self
+                .media_devices
+                .audio_outputs
+                .devices()
+                .iter()
+                .find(|device| device.device_id() == device_id)
+                .map(|device| device.label())
+                .unwrap_or_else(|| "Unknown Speaker".to_string()),
+            _ => "Unknown Device".to_string(),
+        };
+
+        DeviceInfo::new(device_id.to_string(), device_name)
     }
 }

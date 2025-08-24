@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.5...videocall-codecs-v0.1.6) - 2025-08-20
+
+### Fixed
+
+- *(codecs)* route worker diag messages to health bus; refs #397 ([#400](https://github.com/security-union/videocall-rs/pull/400))
+
+## [0.1.5](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.4...videocall-codecs-v0.1.5) - 2025-08-08
+
+### Other
+
+- (feature) Add diagnostics with Prometheus and Grafana ([#365](https://github.com/security-union/videocall-rs/pull/365))
+
+## [0.1.4](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.3...videocall-codecs-v0.1.4) - 2025-07-25
+
+### Other
+
+- Fix pin icon positioning and visibility on iOS and desktop ([#324](https://github.com/security-union/videocall-rs/pull/324)) ([#338](https://github.com/security-union/videocall-rs/pull/338))
+
 ## [0.1.3](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.2...videocall-codecs-v0.1.3) - 2025-07-20
 
 ### Other

@@ -52,7 +52,22 @@ if #[cfg(feature = "ssr")] {
         // `ServeDir` implements `tower::Service` so we can call it with `tower::ServiceExt::oneshot`
         // This path is relative to the cargo root
         match ServeDir::new(root).oneshot(req).await {
-            Ok(res) => Ok(res.map(boxed)),
+            Ok(mut res) => {
+                // Add no-cache headers to disable browser caching
+                res.headers_mut().insert(
+                    "Cache-Control",
+                    axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate, max-age=0")
+                );
+                res.headers_mut().insert(
+                    "Pragma",
+                    axum::http::HeaderValue::from_static("no-cache")
+                );
+                res.headers_mut().insert(
+                    "Expires",
+                    axum::http::HeaderValue::from_static("0")
+                );
+                Ok(res.map(boxed))
+            },
             Err(err) => Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Something went wrong: {err}"),

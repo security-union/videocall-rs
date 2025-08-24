@@ -1,0 +1,36 @@
+# Sample configuration for videocall synthetic clients
+# This configuration creates multiple clients with different audio/video settings
+
+ramp_up_delay_ms: 1000  # 1 second delay between client starts
+server_url: "https://webtransport-us-east.webtransport.video"
+
+clients:
+  # Audio-only client
+  - user_id: "audio-bot-001"
+    meeting_id: "test-room-audio"
+    enable_audio: true
+    enable_video: false
+    
+  # Video-only client  
+  - user_id: "video-bot-001"
+    meeting_id: "test-room-video"
+    enable_audio: false
+    enable_video: true
+    
+  # Full audio + video client
+  - user_id: "full-bot-001"
+    meeting_id: "test-room-full"
+    enable_audio: true
+    enable_video: true
+    
+  # Another full client in same room
+  - user_id: "full-bot-002" 
+    meeting_id: "test-room-full"
+    enable_audio: true
+    enable_video: true
+
+  # Silent client (no media, just connection)
+  - user_id: "silent-bot-001"
+    meeting_id: "test-room-silent"
+    enable_audio: false
+    enable_video: false

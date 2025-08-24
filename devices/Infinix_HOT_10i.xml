@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<d:devices xmlns:d="http://schemas.android.com/sdk/devices/8" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <d:device>
+    <d:name>Infinix HOT 10i</d:name>
+    <d:id>Infinix_HOT_10i</d:id>
+    <d:manufacturer>Infinix</d:manufacturer>
+    <d:meta/>
+    <d:hardware>
+      <d:screen>
+        <d:screen-size>normal</d:screen-size>
+        <d:diagonal-length>6.50</d:diagonal-length>
+        <d:pixel-density>280dpi</d:pixel-density>
+        <d:screen-ratio>long</d:screen-ratio>
+        <d:dimensions>
+          <d:x-dimension>720</d:x-dimension>
+          <d:y-dimension>1600</d:y-dimension>
+        </d:dimensions>
+        <d:xdpi>280.0</d:xdpi>
+        <d:ydpi>280.0</d:ydpi>
+        <d:touch>
+          <d:multitouch>jazz-hands</d:multitouch>
+          <d:mechanism>finger</d:mechanism>
+          <d:screen-type>capacitive</d:screen-type>
+        </d:touch>
+      </d:screen>
+      <d:networking>Bluetooth
+Wifi</d:networking>
+      <d:sensors>Accelerometer
+Compass
+GPS
+Gyroscope
+LightSensor
+ProximitySensor</d:sensors>
+      <d:mic>true</d:mic>
+      <d:camera>
+        <d:location>back</d:location>
+        <d:autofocus>true</d:autofocus>
+        <d:flash>true</d:flash>
+      </d:camera>
+      <d:camera>
+        <d:location>front</d:location>
+        <d:autofocus>true</d:autofocus>
+        <d:flash>false</d:flash>
+      </d:camera>
+      <d:keyboard>nokeys</d:keyboard>
+      <d:nav>nonav</d:nav>
+      <d:ram unit="MiB">4096</d:ram>
+      <d:buttons>soft</d:buttons>
+      <d:internal-storage unit="GiB">128</d:internal-storage>
+      <d:removable-storage unit="GiB">0</d:removable-storage>
+      <d:cpu>MediaTek Helio P65</d:cpu>
+      <d:gpu>auto</d:gpu>
+      <d:abi>arm64-v8a</d:abi>
+      <d:abis>arm64-v8a</d:abis>
+      <d:abis>armeabi-v7a</d:abis>
+      <d:dock/>
+      <d:power-type>battery</d:power-type>
+    </d:hardware>
+    <d:software>
+      <d:api-level>30</d:api-level>
+      <d:live-wallpaper-support>true</d:live-wallpaper-support>
+      <d:bluetooth-profiles/>
+      <d:gl-version>3.0</d:gl-version>
+      <d:status-bar>true</d:status-bar>
+    </d:software>
+    <d:state default="true" name="Portrait">
+      <d:description>The device in portrait view</d:description>
+      <d:screen-orientation>port</d:screen-orientation>
+      <d:keyboard-state>keyssoft</d:keyboard-state>
+      <d:nav-state>navhidden</d:nav-state>
+    </d:state>
+    <d:state name="Landscape">
+      <d:description>The device in landscape view</d:description>
+      <d:screen-orientation>land</d:screen-orientation>
+      <d:keyboard-state>keyssoft</d:keyboard-state>
+      <d:nav-state>navhidden</d:nav-state>
+    </d:state>
+  </d:device>
+</d:devices>
+
+

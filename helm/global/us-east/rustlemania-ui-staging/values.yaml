@@ -1,54 +1,61 @@
 # US East Videocall Staging UI configuration
-rustlemania-ui-staging:
+
+# Inherit from parent rustlemania-ui chart but with staging-specific overrides
+rustlemania-ui:
   nameOverride: "videocall-staging-ui-us-east"
   fullnameOverride: "videocall-staging-ui-us-east"
 
-  # Inherit from parent rustlemania-ui chart but with staging-specific overrides
-  rustlemania-ui:
-    nameOverride: "videocall-staging-ui-us-east"
-    fullnameOverride: "videocall-staging-ui-us-east"
+  replicaCount: 1
 
-    replicaCount: 1
+  image:
+    repository: securityunion/rustlemania-ui
+    pullPolicy: Always
+    tag: latest  # Use staging tag
 
-    image:
-      repository: securityunion/rustlemania-ui
-      pullPolicy: Always
-      tag: latest  # Use staging tag
+  resources:
+    limits:
+      cpu: "50m"
+      memory: "128Mi"
+    requests:
+      cpu: "20m"
+      memory: "64Mi"
 
-    resources:
-      limits:
-        cpu: "50m"
-        memory: "128Mi"
-      requests:
-        cpu: "20m"
-        memory: "64Mi"
+  # Service configuration (uses chart's service.yaml template)
+  service:
+    type: ClusterIP
+    port: 80
 
-    # Service configuration (uses chart's service.yaml template)
-    service:
-      type: ClusterIP
-      port: 80
+  # Node selector for US East region
+  nodeSelector:
+    topology.kubernetes.io/region: "nyc1"
 
-    # Node selector for US East region
-    nodeSelector:
-      topology.kubernetes.io/region: "nyc1"
+  # Certificate configuration using standalone Certificate resource
+  certificate:
+    enabled: true
+    name: "videocall-staging-ui-us-east-tls"
+    secretName: "videocall-staging-ui-us-east-tls"
+    issuer: "letsencrypt-prod"
+    issuerKind: "Issuer"
+    dnsNames:
+      - "staging-app.videocall.rs"
 
-    ingress:
-      enabled: true
-      redirect: false  # Disable rustlemania.com redirect - we want website to handle it
-      className: "nginx"
-      annotations:
-        cert-manager.io/issuer: "letsencrypt-prod"
-        nginx.ingress.kubernetes.io/ssl-redirect: "true"
-      hosts:
-        - host: staging-app.videocall.rs
-          paths:
-            - path: /
-              pathType: Prefix
-              service:
-                name: "videocall-staging-ui-us-east"  # This matches fullnameOverride
-                port:
-                  number: 80
-      tls:
-        - secretName: videocall-staging-ui-us-east-tls
-          hosts:
-            - staging-app.videocall.rs 
+  ingress:
+    enabled: true
+    redirect: false  # Disable rustlemania.com redirect - we want website to handle it
+    className: "nginx"
+    annotations:
+      # cert-manager.io/issuer: "letsencrypt-prod"  # REMOVED - using standalone Certificate instead
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    hosts:
+      - host: staging-app.videocall.rs
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: "videocall-staging-ui-us-east"  # This matches fullnameOverride
+              port:
+                number: 80
+    tls:
+      - secretName: videocall-staging-ui-us-east-tls
+        hosts:
+          - staging-app.videocall.rs 

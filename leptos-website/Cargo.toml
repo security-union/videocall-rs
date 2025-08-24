@@ -13,20 +13,19 @@ categories = ["web-programming", "multimedia"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-cached = { version = "0.43", optional = true }
 console_error_panic_hook = "0.1.7"
 cfg-if = "1.0.0"
-leptos = { git = "https://github.com/leptos-rs/leptos", features = [
+leptos = { version = "0.5.1", features = [
 	"nightly",
 	"experimental-islands",
 ] }
-leptos_axum = { git = "https://github.com/leptos-rs/leptos", optional = true, features = [
+leptos_axum = { version = "0.5.1", optional = true, features = [
 	"experimental-islands",
 ] }
-leptos_meta = { git = "https://github.com/leptos-rs/leptos", features = [
+leptos_meta = { version = "0.5.1", features = [
 	"nightly",
 ] }
-leptos_router = { git = "https://github.com/leptos-rs/leptos", features = [
+leptos_router = { version = "0.5.1", features = [
 	"nightly",
 ] }
 log = "0.4.17"
@@ -49,14 +48,21 @@ wasm-bindgen = "=0.2.100"
 femark = { version = "=0.1.3", optional = true }
 axum-extra = { version = "0.7.4", optional = true, features = ["cookie"] }
 web-sys = { version = "0.3", optional = true, features = [
-	"HtmlDocument",
-	"MediaQueryList",
+    "HtmlDocument",
+    "MediaQueryList",
+    "Window",
+    "Element",
+    "HtmlElement",
+    "CssStyleDeclaration",
+    "Document",
+    "Node",
 ] }
 serde = "1.0.218"
 
 [features]
 default = ["csr"]
 csr = ["leptos/csr", "leptos_meta/csr", "leptos_router/csr"]
+testimonials = []
 hydrate = [
 	"leptos/hydrate",
 	"leptos_meta/hydrate",
@@ -74,7 +80,6 @@ ssr = [
 	"leptos_router/ssr",
 	"dep:leptos_axum",
 	"dep:femark",
-	"dep:cached",
 	"dep:axum-extra",
 ]
 

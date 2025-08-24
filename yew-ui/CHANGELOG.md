@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.28](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.27...videocall-ui-v1.1.28) - 2025-08-20
+
+### Fixed
+
+- *(codecs)* route worker diag messages to health bus; refs #397 ([#400](https://github.com/security-union/videocall-rs/pull/400))
+
+### Other
+
+- (bug) screenshare now works only if there are at least 3 peers connected: host+ two listener #398 ([#402](https://github.com/security-union/videocall-rs/pull/402))
+
+## [1.1.27](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.26...videocall-ui-v1.1.27) - 2025-08-18
+
+### Other
+
+- Add server stats ([#399](https://github.com/security-union/videocall-rs/pull/399))
+
+## [1.1.26](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.25...videocall-ui-v1.1.26) - 2025-08-15
+
+### Other
+
+- Disable caching and create blog post, also downgrade many messages to debug  ([#395](https://github.com/security-union/videocall-rs/pull/395))
+
+## [1.1.25](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.24...videocall-ui-v1.1.25) - 2025-08-15
+
+### Added
+
+- feature/self as attendant ([#392](https://github.com/security-union/videocall-rs/pull/392))
+
+### Other
+
+- Add low end android device profiles ([#394](https://github.com/security-union/videocall-rs/pull/394))
+- Add packets per sec, and matomo logs to debug system, handle mic errors more gracefully ([#385](https://github.com/security-union/videocall-rs/pull/385))
+
+## [1.1.24](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.23...videocall-ui-v1.1.24) - 2025-08-10
+
+### Other
+
+- Add config.js to version control along with instructions ([#381](https://github.com/security-union/videocall-rs/pull/381))
+
+## [1.0.23](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.22...videocall-ui-v1.0.23) - 2025-08-10
+
+### Other
+
+- updated the following local packages: videocall-types, videocall-client
+
+## [1.0.22](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.21...videocall-ui-v1.0.22) - 2025-08-08
+
+### Other
+
+- (feature) Add diagnostics with Prometheus and Grafana ([#365](https://github.com/security-union/videocall-rs/pull/365))
+
+## [1.0.21](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.20...videocall-ui-v1.0.21) - 2025-08-05
+
+### Other
+
+- updated the following local packages: videocall-client
+
+## [1.0.20](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.19...videocall-ui-v1.0.20) - 2025-08-02
+
+### Other
+
+- Fix crash on the yew-ui due to discrepancy in yew-ui stats data structure ([#358](https://github.com/security-union/videocall-rs/pull/358))
+
+## [1.0.19](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.18...videocall-ui-v1.0.19) - 2025-08-02
+
+### Other
+
+- rewrite filter buffer, add a ton of tests  ([#356](https://github.com/security-union/videocall-rs/pull/356))
+
+## [1.0.18](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.17...videocall-ui-v1.0.18) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq, videocall-client
+
+## [1.0.17](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.16...videocall-ui-v1.0.17) - 2025-08-02
+
+### Other
+
+- Fix neteq buffering and show app version ([#352](https://github.com/security-union/videocall-rs/pull/352))
+
+## [1.0.16](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.15...videocall-ui-v1.0.16) - 2025-07-31
+
+### Other
+
+- updated the following local packages: videocall-client
+
+## [1.0.15](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.14...videocall-ui-v1.0.15) - 2025-07-31
+
+### Other
+
+- speaker selection, neteq worker audio reproduction ([#345](https://github.com/security-union/videocall-rs/pull/345))
+
+## [1.0.14](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.13...videocall-ui-v1.0.14) - 2025-07-25
+
+### Other
+
+- release ([#337](https://github.com/security-union/videocall-rs/pull/337))
+
 ## [1.0.13](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.0.12...videocall-ui-v1.0.13) - 2025-07-10
 
 ### Other

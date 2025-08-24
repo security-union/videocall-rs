@@ -20,21 +20,12 @@
 
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
-use serde::{Deserialize, Serialize};
+use crate::messages::{VideoStatsMessage, WorkerMessage};
+#[cfg(feature = "wasm")]
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{console, window, VideoFrame, Worker};
-
-/// Messages that can be sent to the web worker
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerMessage {
-    /// Decode a frame
-    DecodeFrame(FrameBuffer),
-    /// Flush the decoder buffer and reset state
-    Flush,
-    /// Reset decoder to initial state (waiting for keyframe)
-    Reset,
-}
 
 unsafe impl Send for WasmDecoder {}
 unsafe impl Sync for WasmDecoder {}
@@ -102,7 +93,9 @@ impl Decodable for WasmDecoder {
                         video_frame.close();
                     }
                     Err(_) => {
-                        log::warn!("Received unexpected message from worker: {js_val:?}");
+                        if !handle_worker_diag_message(&js_val) {
+                            log::warn!("Received unexpected message from worker: {js_val:?}");
+                        }
                     }
                 }
             }) as Box<dyn FnMut(_)>)
@@ -159,7 +152,9 @@ impl WasmDecoder {
                         callback(video_frame);
                     }
                     Err(_) => {
-                        log::warn!("Received unexpected message from worker: {js_val:?}");
+                        if !handle_worker_diag_message(&js_val) {
+                            log::warn!("Received unexpected message from worker: {js_val:?}");
+                        }
                     }
                 }
             }) as Box<dyn FnMut(_)>)
@@ -191,6 +186,21 @@ impl WasmDecoder {
             Err(e) => {
                 log::error!("Error serializing message: {e:?}");
             }
+        }
+    }
+
+    /// Provide diagnostic context to the worker so that metrics include original peer IDs
+    pub fn set_context(&self, from_peer: String, to_peer: String) {
+        let message = WorkerMessage::SetContext { from_peer, to_peer };
+        match serde_wasm_bindgen::to_value(&message) {
+            Ok(js_message) => {
+                if let Err(e) = self.worker.post_message(&js_message) {
+                    log::error!("Error posting context message to worker: {e:?}");
+                } else {
+                    log::debug!("Sent context to worker");
+                }
+            }
+            Err(e) => log::error!("Error serializing context message: {e:?}"),
         }
     }
 
@@ -241,5 +251,39 @@ impl Drop for WasmDecoder {
     fn drop(&mut self) {
         console::log_1(&"Terminating worker".into());
         self.worker.terminate();
+    }
+}
+
+/// Handle diagnostics objects posted by the worker. Returns true if handled.
+fn handle_worker_diag_message(js_val: &JsValue) -> bool {
+    // Try to deserialize the JavaScript object using serde
+    match serde_wasm_bindgen::from_value::<VideoStatsMessage>(js_val.clone()) {
+        Ok(stats_msg) => {
+            // Only handle video_stats messages
+            if stats_msg.kind != "video_stats" {
+                return false;
+            }
+
+            #[cfg(feature = "wasm")]
+            {
+                let evt = DiagEvent {
+                    subsystem: "video",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        metric!("from_peer", stats_msg.from_peer.unwrap_or_default()),
+                        metric!("to_peer", stats_msg.to_peer.unwrap_or_default()),
+                        metric!("frames_buffered", stats_msg.frames_buffered.unwrap_or(0)),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(evt);
+            }
+            true
+        }
+        Err(_) => {
+            // Not a recognized diagnostic message
+            log::debug!("Received unexpected message from worker: {js_val:?}");
+            false
+        }
     }
 }

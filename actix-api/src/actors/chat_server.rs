@@ -20,6 +20,7 @@ use crate::messages::{
     server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
     session::Message,
 };
+use crate::models::build_subject_and_queue;
 
 use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
 use futures::StreamExt;
@@ -36,15 +37,9 @@ pub struct ChatServer {
 }
 
 impl ChatServer {
-    pub async fn new() -> Self {
-        let url = std::env::var("NATS_URL").expect("NATS_URL env var must be defined");
+    pub async fn new(nats_connection: async_nats::client::Client) -> Self {
         ChatServer {
-            nats_connection: async_nats::ConnectOptions::new()
-                .require_tls(false)
-                .ping_interval(std::time::Duration::from_secs(10))
-                .connect(&url)
-                .await
-                .unwrap(),
+            nats_connection,
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
         }
@@ -170,13 +165,6 @@ impl Handler<JoinRoom> for ChatServer {
 
         MessageResult(Ok(()))
     }
-}
-
-fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {
-    (
-        format!("room.{room}.*").replace(' ', "_"),
-        format!("{session}-{room}").replace(' ', "_"),
-    )
 }
 
 fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {

@@ -3,7 +3,7 @@ replicaCount: 1
 image:
   repository: securityunion/videocall-engineering-vlog
   pullPolicy: Always
-  tag: delta-article-21fa671f
+  tag: latest
 
 resources:
   limits:

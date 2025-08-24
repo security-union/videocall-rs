@@ -1,0 +1,33 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  
+  # Client health metrics (sessions, NetEQ, video quality, etc.)
+  - job_name: 'videocall-client-metrics'
+    static_configs:
+      - targets: ['metrics-api:9091']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 4s
+
+  # Server connection tracking (with session_id, stale cleanup, etc.)
+  - job_name: 'videocall-server-stats'
+    static_configs:
+      - targets: ['server-stats-api:9092']
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+    scrape_timeout: 4s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093

@@ -206,30 +206,35 @@ impl Clone for SelectableDevices {
 ///  Outline of usage is:
 ///
 /// ```no_run
-/// # use videocall_client::MediaDeviceList;
-/// # use yew::Callback;
-/// # use wasm_bindgen::JsValue;
-/// 
-/// // Create a new device list
+/// use videocall_client::MediaDeviceList;
+/// use yew::Callback;
+///
 /// let mut media_device_list = MediaDeviceList::new();
-/// 
-/// // Set up callbacks for device selection
 /// media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
-///     
+///     web_sys::console::log_2(&"Audio input selected:".into(), &device_id.into());
 /// });
-/// 
 /// media_device_list.video_inputs.on_selected = Callback::from(|device_id: String| {
-///     
+///     web_sys::console::log_2(&"Video input selected:".into(), &device_id.into());
 /// });
-/// 
 /// media_device_list.audio_outputs.on_selected = Callback::from(|device_id: String| {
-///     
+///     web_sys::console::log_2(&"Audio output selected:".into(), &device_id.into());
 /// });
-/// 
-/// // Load available devices
+///
 /// media_device_list.load();
-/// 
-
+///
+/// let microphones = media_device_list.audio_inputs.devices();
+/// let cameras = media_device_list.video_inputs.devices();
+/// let speakers = media_device_list.audio_outputs.devices();
+/// if let Some(mic) = microphones.first() {
+///     media_device_list.audio_inputs.select(&mic.device_id());
+/// }
+/// if let Some(camera) = cameras.first() {
+///     media_device_list.video_inputs.select(&camera.device_id());
+/// }
+/// if let Some(speaker) = speakers.first() {
+///     media_device_list.audio_outputs.select(&speaker.device_id());
+/// }
+///
 /// ```
 pub struct MediaDeviceList<P: MediaDevicesProvider + Clone = BrowserMediaDevicesProvider> {
     /// The list of audio input devices. This field is `pub` for access through it, but should be considerd "read-only".
@@ -535,26 +540,19 @@ impl MediaDeviceList {
     /// callbacks, e.g.:
     ///
     /// ```no_run
-    /// # use videocall_client::MediaDeviceList;
-    /// # use yew::Callback;
-    /// 
+    /// use videocall_client::MediaDeviceList;
+    /// use yew::Callback;
+    ///
     /// let mut media_device_list = MediaDeviceList::new();
-    /// 
-    /// // Set up callbacks for device selection
-    /// media_device_list.audio_inputs.on_selected = Callback::from(|_device_id: String| {
-    ///     
+    /// media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
+    ///     web_sys::console::log_2(&"Audio input selected:".into(), &device_id.into());
     /// });
-    /// 
-    /// media_device_list.video_inputs.on_selected = Callback::from(|_device_id: String| {
-    ///     
+    /// media_device_list.video_inputs.on_selected = Callback::from(|device_id: String| {
+    ///     web_sys::console::log_2(&"Video input selected:".into(), &device_id.into());
     /// });
-    /// 
-    /// media_device_list.audio_outputs.on_selected = Callback::from(|_device_id: String| {
-    ///     
+    /// media_device_list.audio_outputs.on_selected = Callback::from(|device_id: String| {
+    ///     web_sys::console::log_2(&"Audio output selected:".into(), &device_id.into());
     /// });
-    /// 
-    /// // Don't forget to call load() to populate the device lists
-    /// media_device_list.load();
     /// ```
     ///
     /// After constructing, [`load()`](Self::load) needs to be called to populate the lists.

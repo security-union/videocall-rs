@@ -51,13 +51,13 @@ impl MicrophoneDaemon {
 
     pub fn start(
         &mut self,
-        quic_tx: Sender<Vec<u8>>,
+        wt_tx: Sender<Vec<u8>>,
         device: String,
         email: String,
     ) -> anyhow::Result<()> {
         self.handles.push(start_microphone(
             device.clone(),
-            quic_tx.clone(),
+            wt_tx.clone(),
             email,
             self.stop.clone(),
         )?);
@@ -76,7 +76,7 @@ impl MicrophoneDaemon {
 
 fn start_microphone(
     device: String,
-    quic_tx: Sender<Vec<u8>>,
+    wt_tx: Sender<Vec<u8>>,
     email: String,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
@@ -113,7 +113,7 @@ fn start_microphone(
                 &config.into(),
                 move |data, _: &_| {
                     for chunk in data.chunks_exact(960) {
-                        match encode_and_send_i16(chunk, &mut encoder, &quic_tx, email.clone()) {
+                        match encode_and_send_i16(chunk, &mut encoder, &wt_tx, email.clone()) {
                             Ok(_) => {}
                             Err(e) => {
                                 error!("Failed to encode and send audio: {}", e);
@@ -146,13 +146,15 @@ fn start_microphone(
 fn encode_and_send_i16(
     input: &[i16],
     encoder: &mut opus::Encoder,
-    quic_tx: &Sender<Vec<u8>>,
+    wt_tx: &Sender<Vec<u8>>,
     email: String,
 ) -> anyhow::Result<()> {
     let output = encoder.encode_vec(input, 960)?;
     let output = transform_audio_chunk(output, email, 0);
-    let output = output?.write_to_bytes()?;
-    quic_tx.try_send(output)?;
+    let output_bytes = output?.write_to_bytes()?;
+    tracing::info!("Queueing AUDIO packet: {} bytes", output_bytes.len());
+    wt_tx.try_send(output_bytes)?;
+    tracing::debug!("Audio packet queued successfully");
     Ok(())
 }
 

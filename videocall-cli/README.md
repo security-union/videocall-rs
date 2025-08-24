@@ -4,7 +4,7 @@
 ## ✨ Features
 - Stream video effortlessly from the CLI on your desktop, robot, or Raspberry Pi.
 - Works seamlessly with [videocall.rs](https://videocall.rs).
-- Currently Supports Chrome, Chromium and Edge.
+- Currently Supports Chrome, Safari (both mobile and desktop), Chromium and Edge.
 - Compatible with **local servers** or **production environments**.
 
 ---
@@ -69,11 +69,11 @@ videocall-cli \
   --bitrate-kbps 500
 ```
 
-## 🌐 See Your Stream Live! using Chrome
+## 🌐 See Your Stream Live! using Chrome or Safari
 This system integrates directly with [videocall.rs](https://videocall.rs). Simply navigate to the following URL to watch your stream live:
 
 ```
-https://app.videocall.rs/meeting/<your-username>/<meeting-id>
+https://app.videocall.rs/meeting/<meeting-id>
 ```
 
 Replace `<your-username>` and `<meeting-id>` with the appropriate values.

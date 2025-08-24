@@ -43,15 +43,15 @@ But this story isn't about time management. It's about what happened when we fin
 
 Picture this: My mother-in-law needs to pay for her checked bag. Simple, right? We walk up to one of those self-service kiosks that looks like it was designed by someone who's never actually used a credit card. The interface is asking for payment, so I swipe my Amex.
 
-**"YOUR CREDIT CARD COULD'T BE READ"**
+**"YOUR CREDIT CARD COULDN'T BE READ"**
 
 Okay, weird. Maybe I swiped too fast. Let me try again.
 
-**"YOUR CREDIT CARD COULD'T BE READ"**
+**"YOUR CREDIT CARD COULDN'T BE READ"**
 
 Huh. Maybe the magnetic stripe is worn. Let me try inserting it.
 
-**"YOUR CREDIT CARD COULD'T BE READ"**
+**"YOUR CREDIT CARD COULDN'T BE READ"**
 
 Maybe this particular machine is broken? There's another kiosk right next to it. Let me try that one. Same exact thing. Card swipe, error message, repeat. Different machine, same lies.
 

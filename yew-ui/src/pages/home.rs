@@ -27,7 +27,7 @@ use crate::context::{
 use crate::Route;
 use web_time::SystemTime;
 
-const TEXT_INPUT_CLASSES: &str = "bg-background-light/20 backdrop-filter-blur text-white border border-white/10 outline-none focus:ring-2 focus:ring-primary rounded-xl p-4 w-full placeholder:text-foreground-subtle transition-all duration-300 hover:border-white/20";
+const TEXT_INPUT_CLASSES: &str = "input-apple";
 
 #[function_component(Home)]
 pub fn home() -> Html {
@@ -47,6 +47,17 @@ pub fn home() -> Html {
         load_username_from_storage().unwrap_or_default()
     };
 
+    // If we already have a stored username, set the Matomo user id early
+    use_effect_with((), {
+        let uid = existing_username.clone();
+        move |_| {
+            if !uid.is_empty() {
+                matomo_logger::set_user_id(&uid);
+            }
+            || ()
+        }
+    });
+
     let onsubmit = {
         let username_ref = username_ref.clone();
         let meeting_id_ref = meeting_id_ref.clone();
@@ -64,6 +75,10 @@ pub fn home() -> Html {
             }
             save_username_to_storage(&username);
             username_ctx.set(Some(username));
+            // Set Matomo user id for attribution
+            if let Some(name) = &*username_ctx {
+                matomo_logger::set_user_id(name);
+            }
             navigator.push(&Route::Meeting { id: meeting_id });
         })
     };
@@ -103,6 +118,10 @@ pub fn home() -> Html {
             let meeting_id = generate_meeting_id();
             save_username_to_storage(&username);
             username_ctx.set(Some(username));
+            // Set Matomo user id for attribution
+            if let Some(name) = &*username_ctx {
+                matomo_logger::set_user_id(name);
+            }
             navigator.push(&Route::Meeting { id: meeting_id });
         })
     };
@@ -137,7 +156,7 @@ pub fn home() -> Html {
                 <div class="content-separator"></div>
 
                 // Form section - moved to top for prominence
-                <form {onsubmit} class="w-full mb-8 border border-white/10 rounded-xl p-8 bg-background-light/10 backdrop-filter-blur">
+                <form {onsubmit} class="w-full mb-8 card-apple p-8">
                     <h3 class="text-center text-xl font-semibold mb-6 text-white/90">{"Start or Join a Meeting"}</h3>
                     <div class="space-y-6">
                         <div>
@@ -170,18 +189,17 @@ pub fn home() -> Html {
                         </div>
 
                         <div class="mt-8">
-                            <button type="submit" class="cta-button w-full flex items-center justify-center gap-2">
+                            <button type="submit" class="btn-apple btn-primary w-full flex items-center justify-center gap-2">
                                 <span class="text-lg">{ "Join Meeting" }</span>
                                 <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                     <path d="M5 12h14"></path>
                                     <path d="m12 5 7 7-7 7"></path>
                                 </svg>
-                                <span class="cta-glow"></span>
                             </button>
                         </div>
 
                         <div class="mt-2">
-                            <button type="button" class="secondary-button w-full flex items-center justify-center gap-2" onclick={create_meeting.clone()}>
+                            <button type="button" class="btn-apple btn-secondary w-full flex items-center justify-center gap-2" onclick={create_meeting.clone()}>
                                 <span class="text-lg">{"Create New Meeting"}</span>
                             </button>
                         </div>

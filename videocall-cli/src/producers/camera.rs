@@ -107,7 +107,7 @@ pub struct CameraDaemon {
     user_id: String,
     cam_rx: Option<mpsc::Receiver<Option<CameraPacket>>>,
     cam_tx: Arc<mpsc::Sender<Option<CameraPacket>>>,
-    quic_tx: Arc<Sender<Vec<u8>>>,
+    wt_tx: Sender<Vec<u8>>,
     quit: Arc<AtomicBool>,
     handles: Vec<JoinHandle<()>>,
 }
@@ -117,7 +117,7 @@ impl Producer for CameraDaemon {
         self.handles.push(self.camera_thread()?);
         let encoder = encoder_thread(
             self.cam_rx.take().unwrap(),
-            self.quic_tx.clone(),
+            self.wt_tx.clone(),
             self.quit.clone(),
             self.config.clone(),
             self.user_id.clone(),
@@ -139,7 +139,7 @@ impl CameraDaemon {
     pub fn from_config(
         config: CameraConfig,
         user_id: String,
-        quic_tx: Sender<Vec<u8>>,
+        wt_tx: Sender<Vec<u8>>,
     ) -> CameraDaemon {
         let (cam_tx, cam_rx) = mpsc::channel(100);
         CameraDaemon {
@@ -149,7 +149,7 @@ impl CameraDaemon {
             cam_tx: Arc::new(cam_tx),
             quit: Arc::new(AtomicBool::new(false)),
             handles: vec![],
-            quic_tx: Arc::new(quic_tx),
+            wt_tx,
         }
     }
 

@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.24](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.23...videocall-client-v1.1.24) - 2025-08-20
+
+### Fixed
+
+- *(codecs)* route worker diag messages to health bus; refs #397 ([#400](https://github.com/security-union/videocall-rs/pull/400))
+
+## [1.1.23](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.22...videocall-client-v1.1.23) - 2025-08-18
+
+### Other
+
+- updated the following local packages: videocall-types
+
+## [1.1.22](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.21...videocall-client-v1.1.22) - 2025-08-15
+
+### Other
+
+- Disable caching and create blog post, also downgrade many messages to debug  ([#395](https://github.com/security-union/videocall-rs/pull/395))
+
+## [1.1.21](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.20...videocall-client-v1.1.21) - 2025-08-15
+
+### Other
+
+- Add packets per sec, and matomo logs to debug system, handle mic errors more gracefully ([#385](https://github.com/security-union/videocall-rs/pull/385))
+
+## [1.1.20](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.19...videocall-client-v1.1.20) - 2025-08-10
+
+### Other
+
+- Reduce RTT freq, add RTT to stats,  ([#376](https://github.com/security-union/videocall-rs/pull/376))
+
+## [1.1.19](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.18...videocall-client-v1.1.19) - 2025-08-08
+
+### Other
+
+- (feature) Add diagnostics with Prometheus and Grafana ([#365](https://github.com/security-union/videocall-rs/pull/365))
+
+## [1.1.18](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.17...videocall-client-v1.1.18) - 2025-08-05
+
+### Other
+
+- Fix website hash and local yew not connecting to single server ([#366](https://github.com/security-union/videocall-rs/pull/366))
+
+## [1.1.17](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.16...videocall-client-v1.1.17) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq
+
+## [1.1.16](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.15...videocall-client-v1.1.16) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq
+
+## [1.1.15](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.14...videocall-client-v1.1.15) - 2025-08-02
+
+### Other
+
+- updated the following local packages: neteq
+
+## [1.1.14](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.13...videocall-client-v1.1.14) - 2025-07-31
+
+### Other
+
+- updated the following local packages: neteq
+
+## [1.1.13](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.12...videocall-client-v1.1.13) - 2025-07-31
+
+### Other
+
+- speaker selection, neteq worker audio reproduction ([#345](https://github.com/security-union/videocall-rs/pull/345))
+
+## [1.1.12](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.11...videocall-client-v1.1.12) - 2025-07-25
+
+### Other
+
+- Fix net eq 2 ([#340](https://github.com/security-union/videocall-rs/pull/340))
+- Fix pin icon positioning and visibility on iOS and desktop ([#324](https://github.com/security-union/videocall-rs/pull/324)) ([#338](https://github.com/security-union/videocall-rs/pull/338))
+
 ## [1.1.11](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.10...videocall-client-v1.1.11) - 2025-07-20
 
 ### Other

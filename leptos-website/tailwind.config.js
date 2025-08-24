@@ -1,8 +1,6 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
-  content: {
-    files: ["*.html", "./src/**/*.rs"],
-  },
+  content: ["*.html", "./src/**/*.rs"],
   darkMode: "class",
 
   theme: {
@@ -11,57 +9,83 @@ module.exports = {
         "4xl": "1920px",
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', 'sans-serif'],
-        mono: ['Fira Code', 'monospace'],
+        sans: ['-apple-system', 'BlinkMacSystemFont', '"SF Pro Display"', '"SF Pro Text"', 'Inter', 'system-ui', 'sans-serif'],
+        mono: ['SF Mono', '"Fira Code"', 'Menlo', 'Monaco', 'monospace'],
       },
-    },
-    colors: {
-      transparent: "transparent",
-      current: "currentColor",
-      primary: "#7928CA",    // Purple
-      secondary: "#38BDF8",  // Blue
-      accent: "#FF3366",     // Pink/Red accent
-      background: {
-        DEFAULT: "#0D131F",  // Dark background
-        light: "#1A2333",    // Lighter dark background for cards/sections
+      blur: {
+        'xs': '2px',
       },
-      foreground: {
-        DEFAULT: "#FFFFFF",  // Primary text color
-        muted: "#D1D5DB",    // Secondary text color
-        subtle: "#9CA3AF",   // Tertiary text color
+      backdropBlur: {
+        'xs': '2px',
       },
-      white: "#FFFFFF",
-      black: "#000000",
-      gray: {
-        50: "#F9FAFB",
-        100: "#F3F4F6",
-        200: "#E5E7EB",
-        300: "#D1D5DB",
-        400: "#9CA3AF",
-        500: "#6B7280",
-        600: "#4B5563",
-        700: "#374151",
-        800: "#1F2937",
-        900: "#111827",
+      colors: {
+        // Apple-inspired color palette
+        primary: {
+          DEFAULT: "#007AFF", // Apple blue
+          dark: "#0A84FF",
+        },
+        
+        // True Apple-style dark mode colors
+        background: {
+          DEFAULT: "#000000",  // Pure black like Apple
+          secondary: "#1C1C1E", // Elevated surfaces
+          tertiary: "#2C2C2E",  // Cards and modals
+        },
+        
+        foreground: {
+          DEFAULT: "#FFFFFF",  // Pure white text
+          secondary: "#AEAEB2", // Secondary text
+          tertiary: "#8E8E93",  // Tertiary text
+          quaternary: "#636366", // Disabled text
+        },
+        
+        border: {
+          DEFAULT: "#38383A", // Subtle borders
+          secondary: "#48484A", // More visible borders
+        },
+        
+        // Semantic colors - Apple style
+        success: "#30D158",    // Apple green
+        warning: "#FF9F0A",    // Apple orange
+        error: "#FF453A",      // Apple red
+        info: "#007AFF",       // Apple blue
       },
-      // Semantic colors
-      success: "#10B981",    // Green
-      warning: "#F59E0B",    // Amber
-      error: "#EF4444",      // Red
-      info: "#3B82F6",       // Blue
-    },
-    // Typography scale
-    fontSize: {
-      xs: ["0.75rem", { lineHeight: "1rem" }],
-      sm: ["0.875rem", { lineHeight: "1.25rem" }],
-      base: ["1rem", { lineHeight: "1.5rem" }],
-      lg: ["1.125rem", { lineHeight: "1.75rem" }],
-      xl: ["1.25rem", { lineHeight: "1.75rem" }],
-      "2xl": ["1.5rem", { lineHeight: "2rem" }],
-      "3xl": ["1.875rem", { lineHeight: "2.25rem" }],
-      "4xl": ["2.25rem", { lineHeight: "2.5rem" }],
-      "5xl": ["3rem", { lineHeight: "1" }],
-      "6xl": ["3.75rem", { lineHeight: "1" }],
+      
+      // Apple-inspired typography scale
+      fontSize: {
+        xs: ["0.75rem", { lineHeight: "1rem", fontWeight: "400" }],
+        sm: ["0.875rem", { lineHeight: "1.25rem", fontWeight: "400" }],
+        base: ["1rem", { lineHeight: "1.5rem", fontWeight: "400" }],
+        lg: ["1.125rem", { lineHeight: "1.75rem", fontWeight: "400" }],
+        xl: ["1.25rem", { lineHeight: "1.75rem", fontWeight: "400" }],
+        "2xl": ["1.5rem", { lineHeight: "2rem", fontWeight: "500" }],
+        "3xl": ["1.875rem", { lineHeight: "2.25rem", fontWeight: "600" }],
+        "4xl": ["2.25rem", { lineHeight: "2.5rem", fontWeight: "600" }],
+        "5xl": ["3rem", { lineHeight: "3.5rem", fontWeight: "700" }],
+        "6xl": ["3.75rem", { lineHeight: "4rem", fontWeight: "700" }],
+        "7xl": ["4.5rem", { lineHeight: "5rem", fontWeight: "700" }],
+        "8xl": ["6rem", { lineHeight: "6.5rem", fontWeight: "700" }],
+        "9xl": ["8rem", { lineHeight: "8.5rem", fontWeight: "700" }],
+      },
+      
+      spacing: {
+        '18': '4.5rem',
+        '88': '22rem',
+        '112': '28rem',
+        '128': '32rem',
+      },
+      
+      borderRadius: {
+        'none': '0',
+        'sm': '0.25rem',
+        'DEFAULT': '0.5rem',
+        'md': '0.75rem',
+        'lg': '1rem',
+        'xl': '1.5rem',
+        '2xl': '2rem',
+        '3xl': '3rem',
+        'full': '9999px',
+      },
     },
   },
   plugins: [],

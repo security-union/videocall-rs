@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.29](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.28...videocall-ui-v1.1.29) - 2025-09-01
+
+### Other
+
+- Fix #415: Failed to enqueue PCM Data ([#417](https://github.com/security-union/videocall-rs/pull/417))
+
 ## [1.1.28](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.27...videocall-ui-v1.1.28) - 2025-08-20
 
 ### Fixed

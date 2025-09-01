@@ -21,6 +21,7 @@ pub mod config;
 pub mod hash_map_with_ordered_keys;
 pub mod media_decoder_trait;
 pub mod neteq_audio_decoder;
+pub mod peer_audio_worklet_manager;
 pub mod peer_decode_manager;
 pub mod peer_decoder;
 #[cfg(not(feature = "neteq_ff"))]

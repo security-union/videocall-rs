@@ -241,6 +241,240 @@ impl ConnectionManagerState {
     }
 }
 
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct AudioWorkletState {
+    pub peer_id: String,
+    pub worklet_state: String,
+    pub sample_rate: Option<u64>,
+    pub is_terminated: bool,
+    pub uptime_ms: Option<u64>,
+    pub pending_tasks: u64,
+    pub last_health_check_ms: Option<u64>,
+    pub health_check_overdue: bool,
+    pub pcm_data_received: u64,
+    pub pcm_sent_to_worklet: u64,
+    pub pcm_send_failed: u64,
+    pub last_pcm_success_timestamp: Option<u64>,
+    pub last_error: Option<String>,
+    pub timestamp: u64,
+}
+
+impl Default for AudioWorkletState {
+    fn default() -> Self {
+        Self {
+            peer_id: "unknown".to_string(),
+            worklet_state: "unknown".to_string(),
+            sample_rate: None,
+            is_terminated: false,
+            uptime_ms: None,
+            pending_tasks: 0,
+            last_health_check_ms: None,
+            health_check_overdue: false,
+            pcm_data_received: 0,
+            pcm_sent_to_worklet: 0,
+            pcm_send_failed: 0,
+            last_pcm_success_timestamp: None,
+            last_error: None,
+            timestamp: 0,
+        }
+    }
+}
+
+impl AudioWorkletState {
+    pub fn from_diagnostic_events(peer_id: &str, events: &[SerializableDiagEvent]) -> Self {
+        let mut state = Self {
+            peer_id: peer_id.to_string(),
+            ..Self::default()
+        };
+
+        // Process events in chronological order
+        let mut sorted_events = events.to_vec();
+        sorted_events.sort_by_key(|e| e.ts_ms);
+
+        for event in sorted_events {
+            if event.subsystem != "audio_worklet" {
+                continue;
+            }
+
+            state.timestamp = event.ts_ms;
+
+            for metric in &event.metrics {
+                match metric.name.as_str() {
+                    "worklet_state" => {
+                        if let MetricValue::Text(ws) = &metric.value {
+                            state.worklet_state = ws.clone();
+                        }
+                    }
+                    "sample_rate" => {
+                        if let MetricValue::U64(sr) = &metric.value {
+                            state.sample_rate = Some(*sr);
+                        }
+                    }
+                    "is_terminated" => {
+                        if let MetricValue::U64(term) = &metric.value {
+                            state.is_terminated = *term > 0;
+                        }
+                    }
+                    "uptime_ms" => {
+                        if let MetricValue::U64(ut) = &metric.value {
+                            state.uptime_ms = Some(*ut);
+                        }
+                    }
+                    "pending_tasks" => {
+                        if let MetricValue::U64(pt) = &metric.value {
+                            state.pending_tasks = *pt;
+                        }
+                    }
+                    "last_health_check_ms" => {
+                        if let MetricValue::U64(hc) = &metric.value {
+                            state.last_health_check_ms = Some(*hc);
+                        }
+                    }
+                    "health_check_overdue" => {
+                        if let MetricValue::U64(overdue) = &metric.value {
+                            state.health_check_overdue = *overdue > 0;
+                        }
+                    }
+                    "pcm_data_received" => {
+                        if let MetricValue::U64(_) = &metric.value {
+                            state.pcm_data_received += 1;
+                        }
+                    }
+                    "pcm_sent_to_worklet" => {
+                        if let MetricValue::U64(_) = &metric.value {
+                            state.pcm_sent_to_worklet += 1;
+                        }
+                    }
+                    "pcm_send_failed" => {
+                        if let MetricValue::U64(_) = &metric.value {
+                            state.pcm_send_failed += 1;
+                        }
+                    }
+                    "last_pcm_success_timestamp" => {
+                        if let MetricValue::U64(ts) = &metric.value {
+                            state.last_pcm_success_timestamp = Some(*ts);
+                        }
+                    }
+                    "pcm_error" => {
+                        if let MetricValue::Text(error) = &metric.value {
+                            state.last_error = Some(error.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        state
+    }
+}
+
+#[derive(Properties, PartialEq)]
+pub struct AudioWorkletDisplayProps {
+    pub audio_worklet_states: HashMap<String, AudioWorkletState>,
+}
+
+#[function_component(AudioWorkletDisplay)]
+pub fn audio_worklet_display(props: &AudioWorkletDisplayProps) -> Html {
+    if props.audio_worklet_states.is_empty() {
+        return html! {
+            <div class="audio-worklet-display">
+                <p class="no-data">{"No audio worklet data available"}</p>
+            </div>
+        };
+    }
+
+    html! {
+        <div class="audio-worklet-display">
+            {for props.audio_worklet_states.iter().map(|(peer_id, state)| {
+                let worklet_status_class = match state.worklet_state.as_str() {
+                    "ready" => "status-healthy",
+                    "initializing" => "status-initializing",
+                    "uninitialized" => "status-warning",
+                    "terminated" | "terminating" => "status-terminated",
+                    _ => "status-unknown"
+                };
+
+                let pcm_flow_healthy = state.pcm_sent_to_worklet > 0 &&
+                    state.last_pcm_success_timestamp.is_some() &&
+                    !state.health_check_overdue;
+
+                html! {
+                    <div class="worklet-peer-card">
+                        <div class="peer-header">
+                            <span class="peer-id">{peer_id}</span>
+                            <span class={classes!("worklet-status", worklet_status_class)}>
+                                {state.worklet_state.to_uppercase()}
+                            </span>
+                        </div>
+
+                        <div class="worklet-metrics">
+                            {
+                                if let Some(sample_rate) = state.sample_rate {
+                                    html! {
+                                        <div class="metric-row">
+                                            <span class="metric-label">{"Sample Rate:"}</span>
+                                            <span class="metric-value">{format!("{}Hz", sample_rate)}</span>
+                                        </div>
+                                    }
+                                } else {
+                                    html! {}
+                                }
+                            }
+
+                            <div class="metric-row">
+                                <span class="metric-label">{"PCM Flow:"}</span>
+                                <span class={classes!("metric-value", if pcm_flow_healthy { "flow-healthy" } else { "flow-unhealthy" })}>
+                                    {format!("↓{} ↑{} ✗{}", state.pcm_data_received, state.pcm_sent_to_worklet, state.pcm_send_failed)}
+                                </span>
+                            </div>
+
+                            {
+                                if state.pending_tasks > 0 {
+                                    html! {
+                                        <div class="metric-row">
+                                            <span class="metric-label">{"Pending Tasks:"}</span>
+                                            <span class="metric-value">{state.pending_tasks}</span>
+                                        </div>
+                                    }
+                                } else {
+                                    html! {}
+                                }
+                            }
+
+                            {
+                                if let Some(uptime) = state.uptime_ms {
+                                    html! {
+                                        <div class="metric-row">
+                                            <span class="metric-label">{"Uptime:"}</span>
+                                            <span class="metric-value">{format!("{:.1}s", uptime as f64 / 1000.0)}</span>
+                                        </div>
+                                    }
+                                } else {
+                                    html! {}
+                                }
+                            }
+
+                            {
+                                if let Some(error) = &state.last_error {
+                                    html! {
+                                        <div class="metric-row error-row">
+                                            <span class="metric-label">{"Last Error:"}</span>
+                                            <span class="metric-value error-text">{error}</span>
+                                        </div>
+                                    }
+                                } else {
+                                    html! {}
+                                }
+                            }
+                        </div>
+                    </div>
+                }
+            })}
+        </div>
+    }
+}
+
 #[derive(Properties, PartialEq)]
 pub struct ConnectionManagerDisplayProps {
     pub connection_manager_state: Option<String>,
@@ -340,6 +574,26 @@ pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html
 
         .connection-error { background: #2C2C2E; color: #FF453A; padding: 12px; border-radius: 8px; border-left: 4px solid #FF453A; }
         .error-reason { margin: 6px 0 0 0; font-size: 12px; font-style: italic; }
+
+        /* Audio Worklet Display Styles */
+        .audio-worklet-display { margin: 8px 0; }
+        .worklet-peer-card { background: #1C1C1E; border: 1px solid #38383A; border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+        .peer-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #38383A; padding-bottom: 6px; }
+        .peer-id { font-weight: 600; font-size: 12px; color: #FFFFFF; font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; background: #2C2C2E; padding: 2px 6px; border-radius: 3px; }
+        .worklet-status { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+        .status-healthy { background: #1C1C1E; color: #30D158; border: 1px solid #38383A; }
+        .status-initializing { background: #1C1C1E; color: #FF9F0A; border: 1px solid #38383A; }
+        .status-warning { background: #1C1C1E; color: #FF9F0A; border: 1px solid #38383A; }
+        .status-terminated { background: #1C1C1E; color: #FF453A; border: 1px solid #38383A; }
+        .status-unknown { background: #1C1C1E; color: #8E8E93; border: 1px solid #38383A; }
+        .worklet-metrics { display: grid; gap: 6px; }
+        .metric-row { display: flex; justify-content: space-between; align-items: center; font-size: 11px; }
+        .metric-label { color: #AEAEB2; font-weight: 500; }
+        .metric-value { color: #FFFFFF; font-weight: 600; font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; }
+        .flow-healthy { color: #30D158; }
+        .flow-unhealthy { color: #FF453A; }
+        .error-row { border: 1px solid #FF453A; border-radius: 4px; padding: 4px; background: rgba(255, 69, 58, 0.1); }
+        .error-text { color: #FF453A; font-size: 10px; word-break: break-all; }
     "#;
 
     if let Some(state) = parsed_state {
@@ -597,6 +851,8 @@ pub struct DiagnosticsProps {
     pub share_screen: bool,
     /// Connection manager diagnostics state
     pub connection_manager_state: Option<String>,
+    /// Audio worklet diagnostics data (JSON string) - per peer
+    pub audio_worklet_diagnostics: HashMap<String, Vec<String>>,
 }
 
 fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
@@ -665,6 +921,20 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         peers.extend(peer_keys);
         peers
     };
+
+    // Process audio worklet diagnostics
+    let audio_worklet_states: HashMap<String, AudioWorkletState> = props
+        .audio_worklet_diagnostics
+        .iter()
+        .map(|(peer_id, events)| {
+            let events_vec: Vec<SerializableDiagEvent> = events
+                .iter()
+                .filter_map(|event_str| serde_json::from_str(event_str).ok())
+                .collect();
+            let state = AudioWorkletState::from_diagnostic_events(peer_id, &events_vec);
+            (peer_id.clone(), state)
+        })
+        .collect();
 
     // Parse NetEQ stats based on selected peer
     let neteq_stats_history = if *selected_peer == "All Peers" {
@@ -738,6 +1008,20 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                     <ConnectionManagerDisplay connection_manager_state={props.connection_manager_state.clone()} />
                 </div>
 
+                // Audio Worklet Status - Critical for debugging audio issues
+                {
+                    if !audio_worklet_states.is_empty() {
+                        html! {
+                            <div class="diagnostics-section">
+                                <h3>{"Worklet Status"}</h3>
+                                <AudioWorkletDisplay audio_worklet_states={audio_worklet_states.clone()} />
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+
                 // Peer Selection
                 if available_peers.len() > 1 {
                     <div class="diagnostics-section">
@@ -763,7 +1047,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
 
                 // NetEQ Status Display
                 <div class="diagnostics-section">
-                    <h3>{"Current Status"}</h3>
+                    <h3>{"Audio Status"}</h3>
                     <NetEqStatusDisplay latest_stats={latest_neteq_stats} />
                 </div>
 

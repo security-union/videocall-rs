@@ -1,4 +1,5 @@
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
+use crate::decode::peer_audio_worklet_manager::PeerAudioWorkletManager;
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
 use js_sys::Float32Array;
 use serde::{Deserialize, Serialize};
@@ -12,8 +13,7 @@ use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{AudioContext, AudioContextOptions, AudioWorkletNode, MessageEvent, Worker};
+use web_sys::{AudioContext, AudioContextOptions, MessageEvent, Worker};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
@@ -53,13 +53,12 @@ enum WorkerResponse {
 }
 
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
-#[derive(Debug)]
 pub struct NetEqAudioPeerDecoder {
     worker: Worker,
     audio_context: AudioContext,
     decoded: bool,
-    peer_id: String, // Track which peer this decoder belongs to
-    _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
+    peer_id: String,
+    worklet_manager: Rc<PeerAudioWorkletManager>,
 
     // Message queueing system
     pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
@@ -106,96 +105,11 @@ impl NetEqAudioPeerDecoder {
         Worker::new(&worker_url)
     }
 
-    /// Send PCM data to Safari AudioWorklet (simple and efficient)
-    fn send_pcm_to_safari_worklet(pcm_player: &AudioWorkletNode, pcm: &Float32Array) {
-        // Create message object for the worklet
-        let message = js_sys::Object::new();
-        js_sys::Reflect::set(&message, &"command".into(), &"play".into()).unwrap();
-        js_sys::Reflect::set(&message, &"pcm".into(), pcm).unwrap();
-
-        // Send PCM data to the worklet - it handles all timing internally
-        if let Err(e) = pcm_player.port().unwrap().post_message(&message) {
-            web_sys::console::warn_1(
-                &format!("Safari: Failed to send PCM to worklet: {e:?}").into(),
-            );
-        }
-    }
-
-    /// Create Safari-optimized AudioContext with PCM player worklet
-    async fn create_safari_audio_context(
-        speaker_device_id: Option<String>,
-    ) -> Result<(AudioContext, AudioWorkletNode), JsValue> {
-        // Create AudioContext with ENFORCED 48kHz for Safari (critical!)
-        let options = AudioContextOptions::new();
-        options.set_sample_rate(48000.0); // Explicitly force 48kHz
-        let audio_context = AudioContext::new_with_context_options(&options)?;
-
-        // CRITICAL: Verify actual sample rate Safari is using
-        let actual_sample_rate = audio_context.sample_rate();
-        log::info!("Safari AudioContext sample rate: {actual_sample_rate}");
-
-        if (actual_sample_rate - 48000.0).abs() > 1.0 {
-            log::warn!(
-                "⚠️ Safari AudioContext sample rate mismatch! Expected 48000, got: {actual_sample_rate}"
-            );
-        }
-
-        // Load the PCM player worklet
-        JsFuture::from(
-            audio_context
-                .audio_worklet()?
-                .add_module("/pcmPlayerWorker.js")?,
-        )
-        .await?;
-
-        // Create the PCM player worklet node
-        let pcm_player = AudioWorkletNode::new(&audio_context, "pcm-player")?;
-
-        // Connect worklet to destination
-        pcm_player.connect_with_audio_node(&audio_context.destination())?;
-
-        // Configure the worklet with explicit 48kHz
-        let config_message = js_sys::Object::new();
-        js_sys::Reflect::set(&config_message, &"command".into(), &"configure".into())?;
-        js_sys::Reflect::set(
-            &config_message,
-            &"sampleRate".into(),
-            &JsValue::from(48000.0),
-        )?; // Force 48kHz
-        js_sys::Reflect::set(
-            &config_message,
-            &"channels".into(),
-            &JsValue::from(AUDIO_CHANNELS as f32),
-        )?;
-        pcm_player.port()?.post_message(&config_message)?;
-
-        log::info!("Safari: Configured PCM worklet for 48kHz playback");
-
-        // Set sink device if specified (Safari supports setSinkId)
-        if let Some(device_id) = speaker_device_id {
-            if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
-                .unwrap_or(false)
-            {
-                let promise = audio_context.set_sink_id_with_str(&device_id);
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) = JsFuture::from(promise).await {
-                        log::warn!("Safari: Failed to set audio output device: {e:?}");
-                    } else {
-                        log::info!("Safari: Successfully set audio output device");
-                    }
-                });
-            }
-        }
-
-        Ok((audio_context, pcm_player))
-    }
-
-    /// Handle PCM audio data from NetEq worker
+    /// Handle PCM audio data from NetEq worker using the new worklet manager
     fn handle_pcm_data(
         pcm: Float32Array,
-        pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
+        worklet_manager: Rc<PeerAudioWorkletManager>,
         audio_context: &AudioContext,
-        speaker_device_id: Option<String>,
     ) {
         // Ensure AudioContext is running
         if let Err(e) = audio_context.resume() {
@@ -204,34 +118,16 @@ impl NetEqAudioPeerDecoder {
             );
         }
 
-        let pcm_player_clone = pcm_player.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            Self::ensure_worklet_initialized(&pcm_player_clone, speaker_device_id).await;
-
-            if let Some(ref worklet) = *pcm_player_clone.borrow() {
-                Self::send_pcm_to_safari_worklet(worklet, &pcm);
-            }
-        });
-    }
-
-    /// Ensure AudioWorklet is initialized (lazy initialization)
-    async fn ensure_worklet_initialized(
-        pcm_player: &Rc<RefCell<Option<AudioWorkletNode>>>,
-        speaker_device_id: Option<String>,
-    ) {
-        if pcm_player.borrow().is_some() {
-            return;
-        }
-
-        log::info!("Initializing AudioWorklet for PCM playback");
-
-        match Self::create_safari_audio_context(speaker_device_id).await {
-            Ok((_, worklet)) => {
-                *pcm_player.borrow_mut() = Some(worklet);
-                log::info!("AudioWorklet initialized successfully");
-            }
-            Err(e) => {
-                web_sys::console::error_2(&"Failed to initialize worklet:".into(), &e);
+        // Use the worklet manager to process PCM data safely
+        if let Err(e) = worklet_manager.process_pcm_data(pcm) {
+            // Only log errors that are not expected during shutdown
+            match e {
+                crate::decode::peer_audio_worklet_manager::PCMError::PeerDisconnected => {
+                    // Expected during cleanup - no logging needed
+                }
+                _ => {
+                    log::debug!("PCM processing failed: {e:?}");
+                }
             }
         }
     }
@@ -383,10 +279,9 @@ impl NetEqAudioPeerDecoder {
 
     /// Create message handler for NetEq worker
     fn create_message_handler(
-        pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
+        worklet_manager: Rc<PeerAudioWorkletManager>,
         audio_context: AudioContext,
         peer_id: String,
-        speaker_device_id: Option<String>,
         worker_ready: Rc<RefCell<bool>>,
         pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
         worker: Worker,
@@ -395,14 +290,9 @@ impl NetEqAudioPeerDecoder {
             let data = event.data();
 
             if data.is_instance_of::<Float32Array>() {
-                // High-performance PCM path (unchanged)
+                // High-performance PCM path using the new worklet manager
                 let pcm = Float32Array::from(data);
-                Self::handle_pcm_data(
-                    pcm,
-                    pcm_player.clone(),
-                    &audio_context,
-                    speaker_device_id.clone(),
-                );
+                Self::handle_pcm_data(pcm, worklet_manager.clone(), &audio_context);
             } else if data.is_object() {
                 // Try to parse as WorkerResponse first
                 if let Ok(response) = serde_wasm_bindgen::from_value::<WorkerResponse>(data.clone())
@@ -471,28 +361,56 @@ impl NetEqAudioPeerDecoder {
         let options = AudioContextOptions::new();
         options.set_sample_rate(48000.0);
         let audio_context = AudioContext::new_with_context_options(&options)?;
+        log::info!(
+            "[audio] Created AudioContext for peer {} at {:.0} Hz",
+            peer_id,
+            audio_context.sample_rate()
+        );
 
         // Set sink device if specified
         if let Some(device_id) = &speaker_device_id {
+            log::info!("[audio] Requesting sink change via setSinkId to device: {device_id}");
             if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
                 .unwrap_or(false)
             {
                 let promise = audio_context.set_sink_id_with_str(device_id);
+                let device_id_clone = device_id.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let _ = JsFuture::from(promise).await;
+                    match wasm_bindgen_futures::JsFuture::from(promise).await {
+                        Ok(_) => {
+                            log::info!(
+                                "[audio] AudioContext.setSinkId() applied: {device_id_clone}"
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "[audio] AudioContext.setSinkId() failed for {device_id_clone}: {e:?}",
+                            );
+                        }
+                    }
                 });
+            } else {
+                log::warn!(
+                    "[audio] setSinkId not supported on AudioContext in this browser; using default output"
+                );
             }
+        } else {
+            log::info!("[audio] Using default output device (no sinkId provided)");
         }
 
-        let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
+        // Create the dedicated worklet manager for this peer
+        let worklet_manager = Rc::new(PeerAudioWorkletManager::new(
+            peer_id.clone(),
+            audio_context.clone(),
+        ));
 
-        // Create decoder with explicit mute state first
+        // Create decoder with the new worklet manager
         let mut decoder = Self {
             worker: worker.clone(),
             audio_context: audio_context.clone(),
             decoded: false,
             peer_id: peer_id.clone(),
-            _pcm_player: pcm_player_ref.clone(),
+            worklet_manager: worklet_manager.clone(),
 
             // Message queueing system
             pending_messages: Rc::new(RefCell::new(VecDeque::new())),
@@ -501,10 +419,9 @@ impl NetEqAudioPeerDecoder {
 
         // Set up worker message handling with decoder's queue references
         let on_message_closure = Self::create_message_handler(
-            pcm_player_ref.clone(),
+            worklet_manager.clone(),
             audio_context.clone(),
             peer_id.clone(),
-            speaker_device_id.clone(),
             decoder.worker_ready.clone(),
             decoder.pending_messages.clone(),
             worker.clone(),
@@ -545,6 +462,13 @@ impl NetEqAudioPeerDecoder {
             initial_muted
         );
 
+        // Attempt to resume audio context immediately to satisfy autoplay policies
+        if let Err(e) = decoder.audio_context.resume() {
+            log::warn!("[audio] AudioContext.resume() returned error (may be fine until user gesture): {e:?}");
+        } else {
+            log::info!("[audio] AudioContext resume requested");
+        }
+
         // Enable diagnostics in the NetEQ worker
         decoder.send_worker_message(WorkerMsg::SetDiagnostics { enabled: true });
         log::info!(
@@ -558,8 +482,22 @@ impl NetEqAudioPeerDecoder {
 
 impl Drop for NetEqAudioPeerDecoder {
     fn drop(&mut self) {
-        let _ = self.audio_context.close();
+        log::info!(
+            "Cleaning up NetEqAudioPeerDecoder for peer {}",
+            self.peer_id
+        );
+
+        // Initiate graceful shutdown of the worklet manager
+        let worklet_manager = Rc::clone(&self.worklet_manager);
+        wasm_bindgen_futures::spawn_local(async move {
+            worklet_manager.graceful_shutdown().await;
+        });
+
+        // Clean up worker
         self.worker.terminate();
+
+        // Close audio context
+        let _ = self.audio_context.close();
     }
 }
 

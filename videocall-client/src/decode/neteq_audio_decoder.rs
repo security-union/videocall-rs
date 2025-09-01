@@ -140,13 +140,25 @@ impl NetEqAudioPeerDecoder {
             );
         }
 
-        // Load the PCM player worklet
-        JsFuture::from(
-            audio_context
-                .audio_worklet()?
-                .add_module("/pcmPlayerWorker.js")?,
-        )
-        .await?;
+        // Preload/register PCM player worklet from embedded source (no network fetch)
+        let worklet_code = include_str!("../../../neteq/src/scripts/pcmPlayerWorker.js");
+
+        // Create a Blob with explicit JS MIME type for Safari
+        let blob_parts = js_sys::Array::new();
+        blob_parts.push(&JsValue::from_str(worklet_code));
+
+        let blob_property_bag = web_sys::BlobPropertyBag::new();
+        blob_property_bag.set_type("application/javascript");
+
+        let blob =
+            web_sys::Blob::new_with_str_sequence_and_options(&blob_parts, &blob_property_bag)?;
+
+        // Create an object URL and register the module with this AudioContext
+        let worklet_url = web_sys::Url::create_object_url_with_blob(&blob)?;
+        let audio_worklet = audio_context.audio_worklet()?;
+        let module_promise = audio_worklet.add_module(&worklet_url)?;
+        JsFuture::from(module_promise).await?;
+        web_sys::Url::revoke_object_url(&worklet_url)?;
 
         // Create the PCM player worklet node
         let pcm_player = AudioWorkletNode::new(&audio_context, "pcm-player")?;

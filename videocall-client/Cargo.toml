@@ -54,6 +54,8 @@ version = "0.3"
 features = [
     "AudioTrack",
     "AudioData",
+    "Blob",
+    "BlobPropertyBag",
     "AudioParam",
     "AudioEncoder",
     "AudioEncoderInit",
@@ -131,6 +133,7 @@ features = [
     "MessageEvent",
     "MediaSource",
     "DomException",
+    "Url",
 ]
 
 [dependencies.pidgeon]

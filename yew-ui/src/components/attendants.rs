@@ -83,10 +83,11 @@ pub enum Msg {
     RemoveLastFakePeer,
     #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
-    NetEqStatsUpdated(String, String), // (peer_id, stats_json)
-    NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
-    NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
-    ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
+    NetEqStatsUpdated(String, String),  // (peer_id, stats_json)
+    NetEqBufferUpdated(String, u64),    // (peer_id, buffer_value)
+    NetEqJitterUpdated(String, u64),    // (peer_id, jitter_value)
+    ConnectionManagerUpdate(String),    // connection manager diagnostics JSON
+    AudioWorkletUpdate(String, String), // (peer_id, audio worklet diagnostics JSON)
     HangUp,
     ShowCopyToast(bool),
 }
@@ -142,6 +143,7 @@ pub struct AttendantsComponent {
     pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
     pub connection_manager_state: Option<String>, // connection manager diagnostics (serialized)
     pub connection_manager_events: Vec<SerializableDiagEvent>, // accumulate individual events
+    pub audio_worklet_diagnostics: HashMap<String, Vec<String>>, // peer_id -> audio worklet events
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -354,6 +356,7 @@ impl Component for AttendantsComponent {
             neteq_jitter_per_peer: HashMap::new(),
             connection_manager_state: None,
             connection_manager_events: Vec::new(),
+            audio_worklet_diagnostics: HashMap::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -504,6 +507,16 @@ impl Component for AttendantsComponent {
                                 sender_stats,
                             )));
                         }
+                    } else if evt.subsystem == "audio_worklet" {
+                        // Audio worklet diagnostics - collect per peer
+                        let peer_id = evt
+                            .stream_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let serializable_evt = SerializableDiagEvent::from(evt);
+                        let serialized =
+                            serde_json::to_string(&serializable_evt).unwrap_or_default();
+                        link.send_message(Msg::AudioWorkletUpdate(peer_id, serialized));
                     } else if evt.subsystem == "video" {
                         // Known subsystem used for Grafana/metrics; UI does not render it
                         log::debug!(
@@ -771,6 +784,20 @@ impl Component for AttendantsComponent {
                     }
                 } else {
                     log::error!("AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {event_json}");
+                }
+                true
+            }
+            Msg::AudioWorkletUpdate(peer_id, event_json) => {
+                // Store audio worklet diagnostic events per peer
+                let peer_events = self
+                    .audio_worklet_diagnostics
+                    .entry(peer_id)
+                    .or_insert_with(Vec::new);
+                peer_events.push(event_json);
+
+                // Keep only the last 50 events per peer to avoid memory bloat
+                if peer_events.len() > 50 {
+                    peer_events.remove(0);
                 }
                 true
             }
@@ -1230,6 +1257,7 @@ impl Component for AttendantsComponent {
                     mic_enabled={self.mic_enabled}
                     share_screen={self.share_screen}
                     connection_manager_state={self.connection_manager_state.clone()}
+                    audio_worklet_diagnostics={self.audio_worklet_diagnostics.clone()}
                 />
             </div>
         }

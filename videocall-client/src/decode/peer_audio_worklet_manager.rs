@@ -6,15 +6,16 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use videocall_diagnostics::{global_sender, DiagEvent, Metric, MetricValue};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{window, AudioContext, AudioWorkletNode};
+#[allow(unused_imports)] // Blob APIs only used in runtime, not in unit tests
+use web_sys::{window, AudioContext, AudioWorkletNode, Blob, BlobPropertyBag, Url};
 
 const HEALTH_CHECK_INTERVAL_MS: u64 = 5000; // 5 seconds
 const INITIALIZATION_TIMEOUT_MS: u64 = 10000; // 10 seconds
 const CLEANUP_TIMEOUT_MS: u64 = 2000; // 2 seconds
-const TASK_TIMEOUT_MS: u64 = 1000; // 1 second for individual tasks
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkletState {
@@ -36,21 +37,12 @@ pub enum WorkletState {
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 struct TaskId(u64);
 
-#[derive(Debug)]
-enum TaskType {
-    PCMProcessing,
-    WorkletInitialization,
-    HealthCheck,
-    Cleanup,
-}
-
 #[derive(Clone)]
 pub struct PeerAudioWorkletManager {
     state: Rc<RefCell<WorkletState>>,
     audio_context: AudioContext,
     peer_id: String,
     pending_tasks: Rc<RefCell<HashSet<TaskId>>>,
-    speaker_device_id: Option<String>,
     health_check_interval: Rc<RefCell<Option<i32>>>,
     next_task_id: Arc<AtomicU64>,
     is_terminated: Rc<RefCell<bool>>,
@@ -70,10 +62,10 @@ impl std::fmt::Display for WorkletError {
         match self {
             WorkletError::PeerDisconnected => write!(f, "Peer has disconnected"),
             WorkletError::InitializationFailed(msg) => {
-                write!(f, "Worklet initialization failed: {}", msg)
+                write!(f, "Worklet initialization failed: {msg}")
             }
             WorkletError::NotResponsive => write!(f, "Worklet not responsive"),
-            WorkletError::AudioContextError(msg) => write!(f, "Audio context error: {}", msg),
+            WorkletError::AudioContextError(msg) => write!(f, "Audio context error: {msg}"),
             WorkletError::TaskTimeout => write!(f, "Task timeout"),
         }
     }
@@ -122,19 +114,14 @@ impl Drop for TaskGuard {
 }
 
 impl PeerAudioWorkletManager {
-    pub fn new(
-        peer_id: String,
-        audio_context: AudioContext,
-        speaker_device_id: Option<String>,
-    ) -> Self {
-        info!("Creating PeerAudioWorkletManager for peer {}", peer_id);
+    pub fn new(peer_id: String, audio_context: AudioContext) -> Self {
+        info!("Creating PeerAudioWorkletManager for peer {peer_id}");
 
         Self {
             state: Rc::new(RefCell::new(WorkletState::Uninitialized)),
             audio_context,
             peer_id,
             pending_tasks: Rc::new(RefCell::new(HashSet::new())),
-            speaker_device_id,
             health_check_interval: Rc::new(RefCell::new(None)),
             next_task_id: Arc::new(AtomicU64::new(1)),
             is_terminated: Rc::new(RefCell::new(false)),
@@ -151,6 +138,107 @@ impl PeerAudioWorkletManager {
 
     fn now_ms() -> u64 {
         js_sys::Date::now() as u64
+    }
+
+    /// Emit diagnostic events for audio worklet status
+    fn emit_worklet_diagnostics(&self) {
+        let state = self.state.borrow().clone();
+        let sample_rate = self.audio_context.sample_rate();
+
+        let mut metrics = vec![
+            Metric {
+                name: "sample_rate",
+                value: MetricValue::U64(sample_rate as u64),
+            },
+            Metric {
+                name: "is_terminated",
+                value: MetricValue::U64(if self.is_terminated() { 1u64 } else { 0u64 }),
+            },
+        ];
+
+        match state {
+            WorkletState::Uninitialized => {
+                metrics.push(Metric {
+                    name: "worklet_state",
+                    value: MetricValue::Text("uninitialized".to_string()),
+                });
+            }
+            WorkletState::Initializing { start_time } => {
+                metrics.push(Metric {
+                    name: "worklet_state",
+                    value: MetricValue::Text("initializing".to_string()),
+                });
+                metrics.push(Metric {
+                    name: "initialization_time_ms",
+                    value: MetricValue::U64(Self::now_ms() - start_time),
+                });
+            }
+            WorkletState::Ready {
+                initialized_at,
+                last_health_check,
+                ..
+            } => {
+                metrics.push(Metric {
+                    name: "worklet_state",
+                    value: MetricValue::Text("ready".to_string()),
+                });
+                metrics.push(Metric {
+                    name: "uptime_ms",
+                    value: MetricValue::U64(Self::now_ms() - initialized_at),
+                });
+                metrics.push(Metric {
+                    name: "last_health_check_ms",
+                    value: MetricValue::U64(Self::now_ms() - last_health_check),
+                });
+                metrics.push(Metric {
+                    name: "health_check_overdue",
+                    value: MetricValue::U64(
+                        if Self::now_ms() - last_health_check > HEALTH_CHECK_INTERVAL_MS {
+                            1u64
+                        } else {
+                            0u64
+                        },
+                    ),
+                });
+            }
+            WorkletState::Terminating { start_time } => {
+                metrics.push(Metric {
+                    name: "worklet_state",
+                    value: MetricValue::Text("terminating".to_string()),
+                });
+                metrics.push(Metric {
+                    name: "termination_time_ms",
+                    value: MetricValue::U64(Self::now_ms() - start_time),
+                });
+            }
+            WorkletState::Terminated => {
+                metrics.push(Metric {
+                    name: "worklet_state",
+                    value: MetricValue::Text("terminated".to_string()),
+                });
+            }
+        }
+
+        // Add task count
+        metrics.push(Metric {
+            name: "pending_tasks",
+            value: MetricValue::U64(self.pending_tasks.borrow().len() as u64),
+        });
+
+        // Emit the diagnostic event
+        let event = DiagEvent {
+            subsystem: "audio_worklet",
+            stream_id: Some(self.peer_id.clone()),
+            ts_ms: Self::now_ms(),
+            metrics,
+        };
+
+        if let Err(e) = global_sender().try_broadcast(event) {
+            debug!(
+                "Failed to emit worklet diagnostics for peer {}: {:?}",
+                self.peer_id, e
+            );
+        }
     }
 
     pub async fn ensure_worklet_ready(&self) -> Result<(), WorkletError> {
@@ -170,12 +258,14 @@ impl PeerAudioWorkletManager {
                     debug!("Health check needed for peer {}", self.peer_id);
                     if self.is_worklet_healthy(worklet).await {
                         self.update_health_check_time();
+                        self.emit_worklet_diagnostics(); // Emit periodic health status
                         Ok(())
                     } else {
                         warn!(
                             "Worklet unhealthy for peer {}, reinitializing",
                             self.peer_id
                         );
+                        self.emit_worklet_diagnostics(); // Emit unhealthy status before reinit
                         self.reinitialize_worklet().await
                     }
                 } else {
@@ -215,6 +305,7 @@ impl PeerAudioWorkletManager {
                     last_health_check: Self::now_ms(),
                 };
                 self.start_health_monitoring();
+                self.emit_worklet_diagnostics(); // Emit success diagnostics
                 Ok(())
             }
             Err(e) => {
@@ -223,18 +314,34 @@ impl PeerAudioWorkletManager {
                     self.peer_id, e
                 );
                 *self.state.borrow_mut() = WorkletState::Uninitialized;
-                Err(WorkletError::InitializationFailed(format!(
-                    "JS Error during worklet initialization"
-                )))
+                self.emit_worklet_diagnostics(); // Emit failure diagnostics
+                Err(WorkletError::InitializationFailed(
+                    "JS Error during worklet initialization".to_string(),
+                ))
             }
         }
     }
 
     async fn create_safari_audio_worklet(&self) -> Result<AudioWorkletNode, JsValue> {
-        // Load the PCM player worklet
-        let audio_worklet = self.audio_context.audio_worklet()?;
+        // Embed the PCM player worklet code directly
+        let worklet_code = include_str!("../../../yew-ui/scripts/pcmPlayerWorker.js");
 
-        let module_promise = audio_worklet.add_module("/pcmPlayerWorker.js")?;
+        // Create a Blob from the embedded worklet code
+        let blob_parts = js_sys::Array::new();
+        blob_parts.push(&JsValue::from_str(worklet_code));
+
+        let blob_property_bag = web_sys::BlobPropertyBag::new();
+        blob_property_bag.set_type("application/javascript");
+
+        let blob =
+            web_sys::Blob::new_with_str_sequence_and_options(&blob_parts, &blob_property_bag)?;
+
+        // Create URL from the blob
+        let worklet_url = web_sys::Url::create_object_url_with_blob(&blob)?;
+
+        // Load the worklet using the blob URL
+        let audio_worklet = self.audio_context.audio_worklet()?;
+        let module_promise = audio_worklet.add_module(&worklet_url)?;
         wasm_bindgen_futures::JsFuture::from(module_promise).await?;
 
         // Create the PCM player worklet node
@@ -301,6 +408,8 @@ impl PeerAudioWorkletManager {
                         }
                     } else {
                         manager_clone.update_health_check_time();
+                        // Emit periodic uptime/health metrics so UI shows increasing uptime
+                        manager_clone.emit_worklet_diagnostics();
                     }
                 }
             });
@@ -429,6 +538,29 @@ impl PeerAudioWorkletManager {
 
         let manager = self.clone();
         let task_id = self.generate_task_id();
+        let pcm_length = pcm_data.length();
+
+        // Emit PCM data received diagnostic
+        let event = DiagEvent {
+            subsystem: "audio_worklet",
+            stream_id: Some(self.peer_id.clone()),
+            ts_ms: Self::now_ms(),
+            metrics: vec![
+                Metric {
+                    name: "pcm_data_received",
+                    value: MetricValue::U64(1),
+                },
+                Metric {
+                    name: "pcm_data_length",
+                    value: MetricValue::U64(pcm_length as u64),
+                },
+                Metric {
+                    name: "pcm_receive_timestamp",
+                    value: MetricValue::U64(Self::now_ms()),
+                },
+            ],
+        };
+        let _ = global_sender().try_broadcast(event);
 
         // Create task with automatic cleanup
         spawn_local(async move {
@@ -441,16 +573,55 @@ impl PeerAudioWorkletManager {
 
             match manager.ensure_worklet_ready().await {
                 Ok(()) => {
-                    if let Err(e) = manager.send_pcm_to_worklet(&pcm_data).await {
-                        match e {
-                            PCMError::PeerDisconnected => {
-                                // Expected during cleanup
-                            }
-                            _ => {
-                                debug!(
-                                    "PCM processing failed for peer {}: {:?}",
-                                    manager.peer_id, e
-                                );
+                    match manager.send_pcm_to_worklet(&pcm_data).await {
+                        Ok(()) => {
+                            // Emit successful PCM send
+                            let event = DiagEvent {
+                                subsystem: "audio_worklet",
+                                stream_id: Some(manager.peer_id.clone()),
+                                ts_ms: Self::now_ms(),
+                                metrics: vec![
+                                    Metric {
+                                        name: "pcm_sent_to_worklet",
+                                        value: MetricValue::U64(1),
+                                    },
+                                    Metric {
+                                        name: "last_pcm_success_timestamp",
+                                        value: MetricValue::U64(Self::now_ms()),
+                                    },
+                                ],
+                            };
+                            let _ = global_sender().try_broadcast(event);
+                        }
+                        Err(e) => {
+                            match e {
+                                PCMError::PeerDisconnected => {
+                                    // Expected during cleanup
+                                }
+                                _ => {
+                                    // Emit PCM send failure
+                                    let event = DiagEvent {
+                                        subsystem: "audio_worklet",
+                                        stream_id: Some(manager.peer_id.clone()),
+                                        ts_ms: Self::now_ms(),
+                                        metrics: vec![
+                                            Metric {
+                                                name: "pcm_send_failed",
+                                                value: MetricValue::U64(1),
+                                            },
+                                            Metric {
+                                                name: "pcm_error",
+                                                value: MetricValue::Text(format!("{:?}", e)),
+                                            },
+                                        ],
+                                    };
+                                    let _ = global_sender().try_broadcast(event);
+
+                                    debug!(
+                                        "PCM processing failed for peer {}: {:?}",
+                                        manager.peer_id, e
+                                    );
+                                }
                             }
                         }
                     }
@@ -568,26 +739,8 @@ impl PeerAudioWorkletManager {
     }
 }
 
-impl Drop for PeerAudioWorkletManager {
-    fn drop(&mut self) {
-        info!("Dropping PeerAudioWorkletManager for peer {}", self.peer_id);
-
-        // Mark as terminated
-        *self.is_terminated.borrow_mut() = true;
-
-        // Clean up health check interval
-        if let Some(interval_id) = *self.health_check_interval.borrow() {
-            if interval_id >= 0 {
-                if let Some(window) = window() {
-                    window.clear_interval_with_handle(interval_id);
-                }
-            }
-        }
-
-        // Set state to terminated
-        *self.state.borrow_mut() = WorkletState::Terminated;
-    }
-}
+// Intentionally no Drop implementation.
+// Cleanup is handled explicitly by NetEqAudioPeerDecoder::drop() via graceful_shutdown().
 
 #[cfg(test)]
 mod tests {

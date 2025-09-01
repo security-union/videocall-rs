@@ -13,7 +13,6 @@ use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
 use web_sys::{AudioContext, AudioContextOptions, MessageEvent, Worker};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,7 +58,7 @@ pub struct NetEqAudioPeerDecoder {
     audio_context: AudioContext,
     decoded: bool,
     peer_id: String,
-    worklet_manager: Arc<PeerAudioWorkletManager>,
+    worklet_manager: Rc<PeerAudioWorkletManager>,
 
     // Message queueing system
     pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
@@ -109,7 +108,7 @@ impl NetEqAudioPeerDecoder {
     /// Handle PCM audio data from NetEq worker using the new worklet manager
     fn handle_pcm_data(
         pcm: Float32Array,
-        worklet_manager: Arc<PeerAudioWorkletManager>,
+        worklet_manager: Rc<PeerAudioWorkletManager>,
         audio_context: &AudioContext,
     ) {
         // Ensure AudioContext is running
@@ -127,7 +126,7 @@ impl NetEqAudioPeerDecoder {
                     // Expected during cleanup - no logging needed
                 }
                 _ => {
-                    log::debug!("PCM processing failed: {:?}", e);
+                    log::debug!("PCM processing failed: {e:?}");
                 }
             }
         }
@@ -280,7 +279,7 @@ impl NetEqAudioPeerDecoder {
 
     /// Create message handler for NetEq worker
     fn create_message_handler(
-        worklet_manager: Arc<PeerAudioWorkletManager>,
+        worklet_manager: Rc<PeerAudioWorkletManager>,
         audio_context: AudioContext,
         peer_id: String,
         worker_ready: Rc<RefCell<bool>>,
@@ -362,24 +361,53 @@ impl NetEqAudioPeerDecoder {
         let options = AudioContextOptions::new();
         options.set_sample_rate(48000.0);
         let audio_context = AudioContext::new_with_context_options(&options)?;
+        log::info!(
+            "[audio] Created AudioContext for peer {} at {:.0} Hz",
+            peer_id,
+            audio_context.sample_rate()
+        );
 
         // Set sink device if specified
         if let Some(device_id) = &speaker_device_id {
+            log::info!(
+                "[audio] Requesting sink change via setSinkId to device: {}",
+                device_id
+            );
             if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
                 .unwrap_or(false)
             {
                 let promise = audio_context.set_sink_id_with_str(device_id);
+                let device_id_clone = device_id.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let _ = JsFuture::from(promise).await;
+                    match wasm_bindgen_futures::JsFuture::from(promise).await {
+                        Ok(_) => {
+                            log::info!(
+                                "[audio] AudioContext.setSinkId() applied: {}",
+                                device_id_clone
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "[audio] AudioContext.setSinkId() failed for {}: {:?}",
+                                device_id_clone,
+                                e
+                            );
+                        }
+                    }
                 });
+            } else {
+                log::warn!(
+                    "[audio] setSinkId not supported on AudioContext in this browser; using default output"
+                );
             }
+        } else {
+            log::info!("[audio] Using default output device (no sinkId provided)");
         }
 
         // Create the dedicated worklet manager for this peer
-        let worklet_manager = Arc::new(PeerAudioWorkletManager::new(
+        let worklet_manager = Rc::new(PeerAudioWorkletManager::new(
             peer_id.clone(),
             audio_context.clone(),
-            speaker_device_id,
         ));
 
         // Create decoder with the new worklet manager
@@ -440,6 +468,13 @@ impl NetEqAudioPeerDecoder {
             initial_muted
         );
 
+        // Attempt to resume audio context immediately to satisfy autoplay policies
+        if let Err(e) = decoder.audio_context.resume() {
+            log::warn!("[audio] AudioContext.resume() returned error (may be fine until user gesture): {:?}", e);
+        } else {
+            log::info!("[audio] AudioContext resume requested");
+        }
+
         // Enable diagnostics in the NetEQ worker
         decoder.send_worker_message(WorkerMsg::SetDiagnostics { enabled: true });
         log::info!(
@@ -459,7 +494,7 @@ impl Drop for NetEqAudioPeerDecoder {
         );
 
         // Initiate graceful shutdown of the worklet manager
-        let worklet_manager = Arc::clone(&self.worklet_manager);
+        let worklet_manager = Rc::clone(&self.worklet_manager);
         wasm_bindgen_futures::spawn_local(async move {
             worklet_manager.graceful_shutdown().await;
         });

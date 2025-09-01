@@ -789,10 +789,7 @@ impl Component for AttendantsComponent {
             }
             Msg::AudioWorkletUpdate(peer_id, event_json) => {
                 // Store audio worklet diagnostic events per peer
-                let peer_events = self
-                    .audio_worklet_diagnostics
-                    .entry(peer_id)
-                    .or_insert_with(Vec::new);
+                let peer_events = self.audio_worklet_diagnostics.entry(peer_id).or_default();
                 peer_events.push(event_json);
 
                 // Keep only the last 50 events per peer to avoid memory bloat

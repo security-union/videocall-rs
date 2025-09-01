@@ -153,6 +153,11 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
             case 'flush':
                 this.buffer.reset();
                 break;
+                
+            case 'ping':
+                // Health check - respond that we're alive
+                this.port.postMessage({ command: 'pong' });
+                break;
         }
     }
     

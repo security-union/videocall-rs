@@ -611,7 +611,7 @@ impl PeerAudioWorkletManager {
                                             },
                                             Metric {
                                                 name: "pcm_error",
-                                                value: MetricValue::Text(format!("{:?}", e)),
+                                                value: MetricValue::Text(format!("{e:?}")),
                                             },
                                         ],
                                     };

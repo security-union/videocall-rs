@@ -382,15 +382,12 @@ impl NetEqAudioPeerDecoder {
                     match wasm_bindgen_futures::JsFuture::from(promise).await {
                         Ok(_) => {
                             log::info!(
-                                "[audio] AudioContext.setSinkId() applied: {}",
-                                device_id_clone
+                                "[audio] AudioContext.setSinkId() applied: {device_id_clone}"
                             );
                         }
                         Err(e) => {
                             log::error!(
-                                "[audio] AudioContext.setSinkId() failed for {}: {:?}",
-                                device_id_clone,
-                                e
+                                "[audio] AudioContext.setSinkId() failed for {device_id_clone}: {e:?}",
                             );
                         }
                     }

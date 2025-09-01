@@ -369,10 +369,7 @@ impl NetEqAudioPeerDecoder {
 
         // Set sink device if specified
         if let Some(device_id) = &speaker_device_id {
-            log::info!(
-                "[audio] Requesting sink change via setSinkId to device: {}",
-                device_id
-            );
+            log::info!("[audio] Requesting sink change via setSinkId to device: {device_id}");
             if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
                 .unwrap_or(false)
             {
@@ -467,7 +464,7 @@ impl NetEqAudioPeerDecoder {
 
         // Attempt to resume audio context immediately to satisfy autoplay policies
         if let Err(e) = decoder.audio_context.resume() {
-            log::warn!("[audio] AudioContext.resume() returned error (may be fine until user gesture): {:?}", e);
+            log::warn!("[audio] AudioContext.resume() returned error (may be fine until user gesture): {e:?}");
         } else {
             log::info!("[audio] AudioContext resume requested");
         }

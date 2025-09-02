@@ -736,7 +736,7 @@ impl Component for AttendantsComponent {
                 if peer_stats.len() > 60 {
                     peer_stats.remove(0);
                 } // keep last 60 entries (60 seconds of data)
-                true
+                false
             }
             Msg::NetEqBufferUpdated(peer_id, buffer_value) => {
                 let peer_buffer = self.neteq_buffer_per_peer.entry(peer_id).or_default();
@@ -772,7 +772,7 @@ impl Component for AttendantsComponent {
                 } else {
                     log::error!("AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {event_json}");
                 }
-                true
+                false
             }
             Msg::ShowCopyToast(show) => {
                 self.show_copy_toast = show;
@@ -799,7 +799,7 @@ impl Component for AttendantsComponent {
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
         let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
-        let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
+        // let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
         let mut display_peers_vec = real_peers_vec.clone();
@@ -1197,40 +1197,40 @@ impl Component for AttendantsComponent {
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
-                <Diagnostics
-                    is_open={self.diagnostics_open}
-                    on_close={close_diagnostics}
-                    diagnostics_data={self.diagnostics_data.clone()}
-                    sender_stats={self.sender_stats.clone()}
-                    encoder_settings={self.encoder_settings.clone()}
-                    neteq_stats={
-                        let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
-                        if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
-                    }
-                    neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
-                    neteq_buffer_history={
-                        // Aggregate all peers' buffer history, taking the most recent from each
-                        let mut aggregated_buffer = Vec::new();
-                        for peer_buffer in self.neteq_buffer_per_peer.values() {
-                            aggregated_buffer.extend(peer_buffer.iter().cloned());
-                        }
-                        aggregated_buffer
-                    }
-                    neteq_jitter_history={
-                        // Aggregate all peers' jitter history, taking the most recent from each
-                        let mut aggregated_jitter = Vec::new();
-                        for peer_jitter in self.neteq_jitter_per_peer.values() {
-                            aggregated_jitter.extend(peer_jitter.iter().cloned());
-                        }
-                        aggregated_jitter
-                    }
-                    neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
-                    neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
-                    video_enabled={self.video_enabled}
-                    mic_enabled={self.mic_enabled}
-                    share_screen={self.share_screen}
-                    connection_manager_state={self.connection_manager_state.clone()}
-                />
+                // <Diagnostics
+                //     is_open={self.diagnostics_open}
+                //     on_close={close_diagnostics}
+                //     diagnostics_data={self.diagnostics_data.clone()}
+                //     sender_stats={self.sender_stats.clone()}
+                //     encoder_settings={self.encoder_settings.clone()}
+                //     neteq_stats={
+                //         let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
+                //         if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
+                //     }
+                //     neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
+                //     neteq_buffer_history={
+                //         // Aggregate all peers' buffer history, taking the most recent from each
+                //         let mut aggregated_buffer = Vec::new();
+                //         for peer_buffer in self.neteq_buffer_per_peer.values() {
+                //             aggregated_buffer.extend(peer_buffer.iter().cloned());
+                //         }
+                //         aggregated_buffer
+                //     }
+                //     neteq_jitter_history={
+                //         // Aggregate all peers' jitter history, taking the most recent from each
+                //         let mut aggregated_jitter = Vec::new();
+                //         for peer_jitter in self.neteq_jitter_per_peer.values() {
+                //             aggregated_jitter.extend(peer_jitter.iter().cloned());
+                //         }
+                //         aggregated_jitter
+                //     }
+                //     neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
+                //     neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
+                //     video_enabled={self.video_enabled}
+                //     mic_enabled={self.mic_enabled}
+                //     share_screen={self.share_screen}
+                //     connection_manager_state={self.connection_manager_state.clone()}
+                // />
             </div>
         }
     }

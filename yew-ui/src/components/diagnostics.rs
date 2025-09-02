@@ -648,12 +648,6 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
 
 #[function_component(Diagnostics)]
 pub fn diagnostics(props: &DiagnosticsProps) -> Html {
-    return html! {
-        <div>
-            <p>{"Diagnostics"}</p>
-        </div>
-    };
-
     let selected_peer = use_state(|| "All Peers".to_string());
 
     let close_handler = {

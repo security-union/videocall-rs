@@ -156,6 +156,8 @@
 //!
 //! ```
 
+#[cfg(feature = "neteq_ff")]
+pub mod audio;
 pub mod audio_worklet_codec;
 mod client;
 mod connection;

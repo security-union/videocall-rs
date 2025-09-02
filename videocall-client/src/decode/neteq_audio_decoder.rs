@@ -634,6 +634,158 @@ impl NetEqAudioPeerDecoder {
 
         Ok(Box::new(decoder))
     }
+
+    /// Create audio decoder with shared audio context
+    #[cfg(feature = "neteq_ff")]
+    pub fn new_with_shared_audio(
+        peer_id: String,
+        shared_audio_manager: Rc<RefCell<crate::audio::SharedNetEqAudioManager>>,
+    ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
+        // Create worker
+        let worker = Self::create_neteq_worker()?;
+
+        // Use placeholder for PCM player - will be set up asynchronously via shared manager
+        let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
+
+        // Create decoder structure
+        let mut decoder = Self {
+            worker: worker.clone(),
+            audio_context: shared_audio_manager.borrow().audio_context().clone(),
+            decoded: false,
+            peer_id: peer_id.clone(),
+            _pcm_player: pcm_player_ref.clone(),
+
+            // Message queueing system
+            pending_messages: Rc::new(RefCell::new(VecDeque::new())),
+            worker_ready: Rc::new(RefCell::new(false)),
+
+            // AudioWorklet guards
+            worklet_ready: Arc::new(AtomicBool::new(false)),
+            worklet_inflight: Arc::new(AtomicBool::new(false)),
+            retry_scheduled: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Set up worker message handling for shared audio
+        let on_message_closure = Self::create_shared_audio_message_handler(
+            peer_id.clone(),
+            shared_audio_manager.clone(),
+            pcm_player_ref.clone(),
+            decoder.worker_ready.clone(),
+            decoder.pending_messages.clone(),
+            worker.clone(),
+        );
+
+        worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
+        on_message_closure.forget();
+
+        // Initialize worker
+        let init_msg = WorkerMsg::Init {
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: AUDIO_CHANNELS as u8,
+        };
+
+        let init_js = serde_wasm_bindgen::to_value(&init_msg)?;
+        let worker_clone = worker.clone();
+        let send_cb = Closure::wrap(Box::new(move || {
+            if let Err(e) = worker_clone.post_message(&init_js) {
+                web_sys::console::error_2(&"[neteq-audio-decoder] failed to post Init:".into(), &e);
+            }
+        }) as Box<dyn FnMut()>);
+
+        web_sys::window()
+            .expect("no window")
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                send_cb.as_ref().unchecked_ref(),
+                10,
+            )?;
+        send_cb.forget();
+
+        log::info!("NetEq audio decoder initialized for peer {peer_id} with shared audio context");
+
+        // Set the initial mute state explicitly (peers start muted)
+        decoder.set_muted(true);
+
+        // Enable diagnostics in the NetEQ worker
+        decoder.send_worker_message(WorkerMsg::SetDiagnostics { enabled: true });
+
+        // Set up peer in shared audio manager asynchronously
+        let peer_id_clone = peer_id.clone();
+        let shared_audio_clone = shared_audio_manager.clone();
+
+        #[allow(clippy::await_holding_refcell_ref)]
+        wasm_bindgen_futures::spawn_local(async move {
+            match shared_audio_clone
+                .borrow_mut()
+                .add_peer(peer_id_clone.clone())
+                .await
+            {
+                Ok(_peer_sink) => {
+                    log::info!("Successfully added peer to shared audio manager: {peer_id_clone}");
+                }
+                Err(e) => {
+                    log::error!("Failed to add peer to shared audio manager: {e:?}");
+                }
+            }
+        });
+
+        Ok(Box::new(decoder))
+    }
+
+    /// Create message handler for shared audio architecture
+    #[cfg(feature = "neteq_ff")]
+    fn create_shared_audio_message_handler(
+        peer_id: String,
+        shared_audio_manager: Rc<RefCell<crate::audio::SharedNetEqAudioManager>>,
+        _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
+        worker_ready: Rc<RefCell<bool>>,
+        pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
+        worker: Worker,
+    ) -> Closure<dyn FnMut(MessageEvent)> {
+        Closure::wrap(Box::new(move |event: MessageEvent| {
+            let data = event.data();
+
+            if data.is_instance_of::<Float32Array>() {
+                // PCM data from NetEq worker - send to shared audio manager
+                let pcm = Float32Array::from(data);
+
+                if let Err(e) = shared_audio_manager.borrow().send_peer_pcm(&peer_id, pcm) {
+                    log::warn!(
+                        "Failed to send PCM to shared audio manager for peer {peer_id}: {e:?}"
+                    );
+                }
+            } else if data.is_object() {
+                // Try to parse as WorkerResponse first
+                if let Ok(response) = serde_wasm_bindgen::from_value::<WorkerResponse>(data.clone())
+                {
+                    match response {
+                        WorkerResponse::WorkerReady { mute_state } => {
+                            log::info!(
+                                "🎵 NetEq worker ready for peer {peer_id} (muted: {mute_state})"
+                            );
+                            *worker_ready.borrow_mut() = true;
+
+                            // Send all pending messages
+                            let mut pending = pending_messages.borrow_mut();
+                            while let Some(msg) = pending.pop_front() {
+                                if let Err(e) = serde_wasm_bindgen::to_value(&msg)
+                                    .map(|js_msg| worker.post_message(&js_msg))
+                                {
+                                    log::error!("Failed to send queued worker message: {e:?}");
+                                }
+                            }
+                        }
+                        WorkerResponse::Stats { .. } => {
+                            // Handle stats if needed
+                        }
+                    }
+                } else {
+                    log::debug!(
+                        "Unknown message type received from NetEq worker for peer {peer_id}"
+                    );
+                }
+            }
+        }) as Box<dyn FnMut(MessageEvent)>)
+    }
 }
 
 impl Drop for NetEqAudioPeerDecoder {

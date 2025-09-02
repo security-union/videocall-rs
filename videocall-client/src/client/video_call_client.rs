@@ -18,6 +18,8 @@
 
 use super::super::connection::{ConnectionController, ConnectionManagerOptions, ConnectionState};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
+#[cfg(feature = "neteq_ff")]
+use crate::audio::SharedNetEqAudioManager;
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
@@ -127,6 +129,8 @@ struct Inner {
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
+    #[cfg(feature = "neteq_ff")]
+    shared_neteq_audio: Option<Rc<RefCell<SharedNetEqAudioManager>>>,
 }
 
 /// The client struct for a video call connection.
@@ -218,6 +222,13 @@ impl VideoCallClient {
             None
         };
 
+        // Create shared NetEq audio manager if neteq_ff feature is enabled
+        #[cfg(feature = "neteq_ff")]
+        let shared_neteq_audio = Some(Rc::new(RefCell::new(
+            SharedNetEqAudioManager::new(None)
+                .expect("Failed to create shared NetEq audio manager"),
+        )));
+
         let client = Self {
             options: options.clone(),
             inner: Rc::new(RefCell::new(Inner {
@@ -236,10 +247,14 @@ impl VideoCallClient {
                 peer_decode_manager: Self::create_peer_decoder_manager(
                     &options,
                     diagnostics.clone(),
+                    #[cfg(feature = "neteq_ff")]
+                    shared_neteq_audio.clone(),
                 ),
                 _diagnostics: diagnostics.clone(),
                 sender_diagnostics: sender_diagnostics.clone(),
                 health_reporter: health_reporter.clone(),
+                #[cfg(feature = "neteq_ff")]
+                shared_neteq_audio: shared_neteq_audio.clone(),
             })),
             aes,
             _diagnostics: diagnostics.clone(),
@@ -405,7 +420,22 @@ impl VideoCallClient {
     fn create_peer_decoder_manager(
         opts: &VideoCallClientOptions,
         diagnostics: Option<Rc<DiagnosticManager>>,
+        #[cfg(feature = "neteq_ff")] shared_neteq_audio: Option<
+            Rc<RefCell<SharedNetEqAudioManager>>,
+        >,
     ) -> PeerDecodeManager {
+        #[cfg(feature = "neteq_ff")]
+        if let Some(shared_audio) = shared_neteq_audio {
+            // Use shared NetEq audio manager
+            let mut peer_decode_manager =
+                PeerDecodeManager::new_with_shared_neteq_audio(diagnostics, shared_audio);
+            peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
+            peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
+            peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
+            return peer_decode_manager;
+        }
+
+        // Fallback to existing implementation
         match diagnostics {
             Some(diagnostics) => {
                 let mut peer_decode_manager = PeerDecodeManager::new_with_diagnostics(diagnostics);
@@ -685,9 +715,20 @@ impl VideoCallClient {
     /// Pass None to use the default system speaker.
     pub fn update_speaker_device(&self, speaker_device_id: Option<String>) -> Result<(), JsValue> {
         match self.inner.try_borrow_mut() {
-            Ok(mut inner) => inner
-                .peer_decode_manager
-                .update_speaker_device(speaker_device_id),
+            Ok(mut inner) => {
+                #[cfg(feature = "neteq_ff")]
+                if let Some(ref shared_audio) = inner.shared_neteq_audio {
+                    // For NetEq: use shared manager
+                    return shared_audio
+                        .borrow_mut()
+                        .update_speaker_device(speaker_device_id);
+                }
+
+                // Fallback: existing implementation for Safari/Standard decoders
+                inner
+                    .peer_decode_manager
+                    .update_speaker_device(speaker_device_id)
+            }
             Err(_) => {
                 error!("Failed to borrow inner for updating speaker device");
                 Err(JsValue::from_str(

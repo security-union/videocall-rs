@@ -16,9 +16,13 @@
  * conditions.
  */
 
+#[cfg(feature = "neteq_ff")]
+use super::create_audio_peer_decoder_with_shared_context;
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
+#[cfg(feature = "neteq_ff")]
+use crate::audio::SharedNetEqAudioManager;
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
@@ -130,6 +134,41 @@ impl Peer {
         })
     }
 
+    #[cfg(feature = "neteq_ff")]
+    fn new_with_shared_audio(
+        video_canvas_id: String,
+        screen_canvas_id: String,
+        email: String,
+        aes: Option<Aes128State>,
+        shared_audio_manager: Rc<std::cell::RefCell<SharedNetEqAudioManager>>,
+    ) -> Result<Self, JsValue> {
+        let (mut audio, video, screen) = Self::new_decoders_with_shared_audio(
+            &video_canvas_id,
+            &screen_canvas_id,
+            &email,
+            shared_audio_manager,
+        )?;
+
+        // Initialize with explicit mute state (audio_enabled starts as false, so muted=true)
+        audio.set_muted(true);
+        debug!("Initialized peer {email} with shared audio context (muted)");
+
+        Ok(Self {
+            audio,
+            video,
+            screen,
+            email,
+            video_canvas_id,
+            screen_canvas_id,
+            aes,
+            heartbeat_count: 0,
+            video_enabled: false,
+            audio_enabled: false,
+            screen_enabled: false,
+            context_initialized: false,
+        })
+    }
+
     fn new_decoders(
         video_canvas_id: &str,
         screen_canvas_id: &str,
@@ -144,6 +183,30 @@ impl Peer {
     > {
         Ok((
             create_audio_peer_decoder(None, peer_id.to_string())?,
+            VideoPeerDecoder::new(video_canvas_id)?,
+            VideoPeerDecoder::new(screen_canvas_id)?,
+        ))
+    }
+
+    #[cfg(feature = "neteq_ff")]
+    fn new_decoders_with_shared_audio(
+        video_canvas_id: &str,
+        screen_canvas_id: &str,
+        peer_id: &str,
+        shared_audio_manager: Rc<std::cell::RefCell<SharedNetEqAudioManager>>,
+    ) -> Result<
+        (
+            Box<dyn AudioPeerDecoderTrait>,
+            VideoPeerDecoder,
+            VideoPeerDecoder,
+        ),
+        JsValue,
+    > {
+        Ok((
+            create_audio_peer_decoder_with_shared_context(
+                peer_id.to_string(),
+                shared_audio_manager,
+            )?,
             VideoPeerDecoder::new(video_canvas_id)?,
             VideoPeerDecoder::new(screen_canvas_id)?,
         ))
@@ -365,6 +428,8 @@ pub struct PeerDecodeManager {
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
+    #[cfg(feature = "neteq_ff")]
+    shared_neteq_audio: Option<Rc<std::cell::RefCell<SharedNetEqAudioManager>>>,
 }
 
 impl Default for PeerDecodeManager {
@@ -381,6 +446,8 @@ impl PeerDecodeManager {
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
+            #[cfg(feature = "neteq_ff")]
+            shared_neteq_audio: None,
         }
     }
 
@@ -391,6 +458,23 @@ impl PeerDecodeManager {
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
+            #[cfg(feature = "neteq_ff")]
+            shared_neteq_audio: None,
+        }
+    }
+
+    #[cfg(feature = "neteq_ff")]
+    pub fn new_with_shared_neteq_audio(
+        diagnostics: Option<Rc<DiagnosticManager>>,
+        shared_audio_manager: Rc<std::cell::RefCell<SharedNetEqAudioManager>>,
+    ) -> Self {
+        Self {
+            connected_peers: HashMapWithOrderedKeys::new(),
+            on_first_frame: Callback::noop(),
+            get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
+            get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
+            diagnostics,
+            shared_neteq_audio: Some(shared_audio_manager),
         }
     }
 
@@ -447,20 +531,52 @@ impl PeerDecodeManager {
 
     fn add_peer(&mut self, email: &str, aes: Option<Aes128State>) -> Result<(), JsValue> {
         debug!("Adding peer {email}");
-        self.connected_peers.insert(
-            email.to_owned(),
+
+        #[cfg(feature = "neteq_ff")]
+        let peer = if let Some(ref shared_audio) = self.shared_neteq_audio {
+            // Use shared audio manager
+            Peer::new_with_shared_audio(
+                self.get_video_canvas_id.emit(email.to_owned()),
+                self.get_screen_canvas_id.emit(email.to_owned()),
+                email.to_owned(),
+                aes,
+                shared_audio.clone(),
+            )?
+        } else {
+            // Fallback to individual audio contexts
             Peer::new(
                 self.get_video_canvas_id.emit(email.to_owned()),
                 self.get_screen_canvas_id.emit(email.to_owned()),
                 email.to_owned(),
                 aes,
-            )?,
-        );
+            )?
+        };
+
+        #[cfg(not(feature = "neteq_ff"))]
+        let peer = Peer::new(
+            self.get_video_canvas_id.emit(email.to_owned()),
+            self.get_screen_canvas_id.emit(email.to_owned()),
+            email.to_owned(),
+            aes,
+        )?;
+
+        self.connected_peers.insert(email.to_owned(), peer);
         Ok(())
     }
 
     pub fn delete_peer(&mut self, email: &String) {
-        self.connected_peers.remove(email);
+        // Remove from connected peers
+        if self.connected_peers.remove(email).is_some() {
+            // Remove from shared audio manager if using it
+            #[cfg(feature = "neteq_ff")]
+            if let Some(ref shared_audio) = self.shared_neteq_audio {
+                if let Err(e) = shared_audio.borrow_mut().remove_peer(email) {
+                    log::warn!("Failed to remove peer from shared audio manager: {e:?}");
+                }
+            }
+
+            log::info!("Deleted peer: {email}");
+        }
     }
 
     pub fn ensure_peer(&mut self, email: &String) -> PeerStatus {

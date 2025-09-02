@@ -16,10 +16,12 @@
  * conditions.
  */
 
+#[cfg(feature = "diagnostics")]
+use crate::components::diagnostics::Diagnostics;
+#[cfg(feature = "diagnostics")]
 use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
-    host::Host, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility, canvas_generator, host::Host, peer_list::PeerList,
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
@@ -28,10 +30,13 @@ use crate::constants::{
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
+#[cfg(feature = "diagnostics")]
 use serde_json;
+#[cfg(feature = "diagnostics")]
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+#[cfg(feature = "diagnostics")]
 use videocall_diagnostics::{subscribe, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
@@ -48,8 +53,11 @@ pub enum WsAction {
     MediaPermissionsGranted,
     MediaPermissionsError(String),
     Log(String),
+    #[cfg(feature = "diagnostics")]
     DiagnosticsUpdated(String),
+    #[cfg(feature = "diagnostics")]
     SenderStatsUpdated(String),
+    #[cfg(feature = "diagnostics")]
     EncoderSettingsUpdated(String),
 }
 
@@ -64,6 +72,7 @@ pub enum MeetingAction {
 #[derive(Debug)]
 pub enum UserScreenToggleAction {
     PeerList,
+    #[cfg(feature = "diagnostics")]
     Diagnostics,
     DeviceSettings,
 }
@@ -83,12 +92,18 @@ pub enum Msg {
     RemoveLastFakePeer,
     #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
+    #[cfg(feature = "diagnostics")]
     NetEqStatsUpdated(String, String), // (peer_id, stats_json)
-    NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
-    NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
-    ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
+    #[cfg(feature = "diagnostics")]
+    NetEqBufferUpdated(String, u64), // (peer_id, buffer_value)
+    #[cfg(feature = "diagnostics")]
+    NetEqJitterUpdated(String, u64), // (peer_id, jitter_value)
+    #[cfg(feature = "diagnostics")]
+    ConnectionManagerUpdate(String), // connection manager diagnostics JSON
     HangUp,
     ShowCopyToast(bool),
+    #[cfg(not(feature = "diagnostics"))]
+    NoOp, // No-operation message for when features are disabled
 }
 
 impl From<WsAction> for Msg {
@@ -129,18 +144,28 @@ pub struct AttendantsComponent {
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub peer_list_open: bool,
+    #[cfg(feature = "diagnostics")]
     pub diagnostics_open: bool,
     pub device_settings_open: bool,
     pub error: Option<String>,
+    #[cfg(feature = "diagnostics")]
     pub diagnostics_data: Option<String>,
+    #[cfg(feature = "diagnostics")]
     pub sender_stats: Option<String>,
+    #[cfg(feature = "diagnostics")]
     pub encoder_settings: Option<String>,
     pub mic_error: Option<String>,
+    #[cfg(feature = "diagnostics")]
     pub neteq_stats: Option<String>,
+    #[cfg(feature = "diagnostics")]
     pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
-    pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
-    pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
+    #[cfg(feature = "diagnostics")]
+    pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>, // peer_id -> buffer history
+    #[cfg(feature = "diagnostics")]
+    pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>, // peer_id -> jitter history
+    #[cfg(feature = "diagnostics")]
     pub connection_manager_state: Option<String>, // connection manager diagnostics (serialized)
+    #[cfg(feature = "diagnostics")]
     pub connection_manager_events: Vec<SerializableDiagEvent>, // accumulate individual events
     pending_mic_enable: bool,
     pending_video_enable: bool,
@@ -224,12 +249,15 @@ impl AttendantsComponent {
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
             health_reporting_interval_ms: Some(5000),
+            #[cfg(feature = "diagnostics")]
             on_encoder_settings_update: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |settings| {
                     link.send_message(Msg::from(WsAction::EncoderSettingsUpdated(settings)))
                 })
             }),
+            #[cfg(not(feature = "diagnostics"))]
+            on_encoder_settings_update: None,
             rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
             rtt_probe_interval_ms: Some(200),
         };
@@ -313,6 +341,90 @@ impl AttendantsComponent {
         html! {} // Empty html when feature is not enabled
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn view_diagnostics_button(&self, ctx: &Context<Self>) -> Html {
+        let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
+        html! {
+            <button
+                class={classes!("video-control-button", self.diagnostics_open.then_some("active"))}
+                onclick={toggle_diagnostics}>
+                {
+                    if self.diagnostics_open {
+                        html! {
+                            <>
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
+                                    <line x1="3" y1="3" x2="21" y2="21"></line>
+                                </svg>
+                                <span class="tooltip">{ "Close Diagnostics" }</span>
+                            </>
+                        }
+                    } else {
+                        html! {
+                            <>
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
+                                </svg>
+                                <span class="tooltip">{ "Open Diagnostics" }</span>
+                            </>
+                        }
+                    }
+                }
+            </button>
+        }
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    fn view_diagnostics_button(&self, _ctx: &Context<Self>) -> Html {
+        html! {} // Empty html when feature is not enabled
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn view_diagnostics_component(&self, ctx: &Context<Self>) -> Html {
+        let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
+        html! {
+            <Diagnostics
+                is_open={self.diagnostics_open}
+                on_close={close_diagnostics}
+                diagnostics_data={self.diagnostics_data.clone()}
+                sender_stats={self.sender_stats.clone()}
+                encoder_settings={self.encoder_settings.clone()}
+                neteq_stats={
+                    let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
+                    if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
+                }
+                neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
+                neteq_buffer_history={
+                    // Aggregate all peers' buffer history, taking the most recent from each
+                    let mut aggregated_buffer = Vec::new();
+                    for peer_buffer in self.neteq_buffer_per_peer.values() {
+                        aggregated_buffer.extend(peer_buffer.iter().cloned());
+                    }
+                    aggregated_buffer
+                }
+                neteq_jitter_history={
+                    // Aggregate all peers' jitter history, taking the most recent from each
+                    let mut aggregated_jitter = Vec::new();
+                    for peer_jitter in self.neteq_jitter_per_peer.values() {
+                        aggregated_jitter.extend(peer_jitter.iter().cloned());
+                    }
+                    aggregated_jitter
+                }
+                neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
+                neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
+                video_enabled={self.video_enabled}
+                mic_enabled={self.mic_enabled}
+                share_screen={self.share_screen}
+                connection_manager_state={self.connection_manager_state.clone()}
+            />
+        }
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    fn view_diagnostics_component(&self, _ctx: &Context<Self>) -> Html {
+        html! {} // Empty html when feature is not enabled
+    }
+
     fn play_user_joined() {
         if let Some(_window) = web_sys::window() {
             if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
@@ -341,18 +453,28 @@ impl Component for AttendantsComponent {
             mic_enabled: false,
             video_enabled: false,
             peer_list_open: false,
+            #[cfg(feature = "diagnostics")]
             diagnostics_open: false,
             device_settings_open: false,
             error: None,
+            #[cfg(feature = "diagnostics")]
             diagnostics_data: None,
+            #[cfg(feature = "diagnostics")]
             sender_stats: None,
+            #[cfg(feature = "diagnostics")]
             encoder_settings: None,
             mic_error: None,
+            #[cfg(feature = "diagnostics")]
             neteq_stats: None,
+            #[cfg(feature = "diagnostics")]
             neteq_stats_per_peer: HashMap::new(),
+            #[cfg(feature = "diagnostics")]
             neteq_buffer_per_peer: HashMap::new(),
+            #[cfg(feature = "diagnostics")]
             neteq_jitter_per_peer: HashMap::new(),
+            #[cfg(feature = "diagnostics")]
             connection_manager_state: None,
+            #[cfg(feature = "diagnostics")]
             connection_manager_events: Vec::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
@@ -369,6 +491,7 @@ impl Component for AttendantsComponent {
             log::error!("{e:?}");
             self_.error = Some(e);
         }
+        #[cfg(feature = "diagnostics")]
         {
             let link = ctx.link().clone();
             wasm_bindgen_futures::spawn_local(async move {
@@ -594,15 +717,18 @@ impl Component for AttendantsComponent {
                     self.meeting_joined = false; // Stay on join screen if permissions denied
                     true
                 }
+                #[cfg(feature = "diagnostics")]
                 WsAction::DiagnosticsUpdated(stats) => {
                     log::debug!("YEW-UI: Diagnostics UI updated: {stats}");
                     self.diagnostics_data = Some(stats);
                     true
                 }
+                #[cfg(feature = "diagnostics")]
                 WsAction::SenderStatsUpdated(stats) => {
                     self.sender_stats = Some(stats);
                     true
                 }
+                #[cfg(feature = "diagnostics")]
                 WsAction::EncoderSettingsUpdated(settings) => {
                     self.encoder_settings = Some(settings);
                     true
@@ -671,10 +797,12 @@ impl Component for AttendantsComponent {
                 match action {
                     UserScreenToggleAction::PeerList => {
                         self.peer_list_open = !self.peer_list_open;
+                        #[cfg(feature = "diagnostics")]
                         if self.peer_list_open {
                             self.diagnostics_open = false;
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
                     UserScreenToggleAction::Diagnostics => {
                         self.diagnostics_open = !self.diagnostics_open;
                         if self.diagnostics_open {
@@ -685,7 +813,10 @@ impl Component for AttendantsComponent {
                         self.device_settings_open = !self.device_settings_open;
                         if self.device_settings_open {
                             self.peer_list_open = false;
-                            self.diagnostics_open = false;
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                self.diagnostics_open = false;
+                            }
                         }
                     }
                 }
@@ -724,6 +855,7 @@ impl Component for AttendantsComponent {
                 self.simulation_info_message = None;
                 true
             }
+            #[cfg(feature = "diagnostics")]
             Msg::NetEqStatsUpdated(peer_id, stats_json) => {
                 self.neteq_stats = Some(stats_json.clone());
 
@@ -738,6 +870,7 @@ impl Component for AttendantsComponent {
                 } // keep last 60 entries (60 seconds of data)
                 false
             }
+            #[cfg(feature = "diagnostics")]
             Msg::NetEqBufferUpdated(peer_id, buffer_value) => {
                 let peer_buffer = self.neteq_buffer_per_peer.entry(peer_id).or_default();
                 peer_buffer.push(buffer_value);
@@ -746,6 +879,7 @@ impl Component for AttendantsComponent {
                 } // keep last 50
                 false
             }
+            #[cfg(feature = "diagnostics")]
             Msg::NetEqJitterUpdated(peer_id, jitter_value) => {
                 let peer_jitter = self.neteq_jitter_per_peer.entry(peer_id).or_default();
                 peer_jitter.push(jitter_value);
@@ -754,6 +888,7 @@ impl Component for AttendantsComponent {
                 }
                 false
             }
+            #[cfg(feature = "diagnostics")]
             Msg::ConnectionManagerUpdate(event_json) => {
                 // Parse the SerializableDiagEvent from JSON
                 if let Ok(event) = serde_json::from_str::<SerializableDiagEvent>(&event_json) {
@@ -790,6 +925,11 @@ impl Component for AttendantsComponent {
                 let _ = window().location().reload(); // Refresh page for clean state
                 true
             }
+            #[cfg(not(feature = "diagnostics"))]
+            Msg::NoOp => {
+                // No operation - used for disabled features
+                false
+            }
         }
     }
 
@@ -798,8 +938,6 @@ impl Component for AttendantsComponent {
         let media_access_granted = self.media_device_access.is_granted();
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
-        let toggle_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
-        // let close_diagnostics = ctx.link().callback(|_| UserScreenToggleAction::Diagnostics);
 
         let real_peers_vec = self.client.sorted_peer_keys();
         let mut display_peers_vec = real_peers_vec.clone();
@@ -827,7 +965,10 @@ impl Component for AttendantsComponent {
             num_peers_for_styling.max(1)
         );
 
+        #[cfg(feature = "diagnostics")]
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
+        #[cfg(not(feature = "diagnostics"))]
+        let on_encoder_settings_update = ctx.link().callback(|_: String| Msg::NoOp);
 
         // Compute meeting link for invitation overlay
         let meeting_link = {
@@ -1072,32 +1213,7 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
-                                            <button
-                                                class={classes!("video-control-button", self.diagnostics_open.then_some("active"))}
-                                                onclick={toggle_diagnostics.clone()}>
-                                                {
-                                                    if self.diagnostics_open {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
-                                                                    <line x1="3" y1="3" x2="21" y2="21"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Close Diagnostics" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Open Diagnostics" }</span>
-                                                            </>
-                                                        }
-                                                    }
-                                                }
-                                            </button>
+                                            { self.view_diagnostics_button(ctx) }
                                             <button
                                                 class={classes!("video-control-button", "mobile-only-device-settings", self.device_settings_open.then_some("active"))}
                                                 onclick={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}>
@@ -1197,40 +1313,7 @@ impl Component for AttendantsComponent {
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
-                // <Diagnostics
-                //     is_open={self.diagnostics_open}
-                //     on_close={close_diagnostics}
-                //     diagnostics_data={self.diagnostics_data.clone()}
-                //     sender_stats={self.sender_stats.clone()}
-                //     encoder_settings={self.encoder_settings.clone()}
-                //     neteq_stats={
-                //         let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
-                //         if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
-                //     }
-                //     neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
-                //     neteq_buffer_history={
-                //         // Aggregate all peers' buffer history, taking the most recent from each
-                //         let mut aggregated_buffer = Vec::new();
-                //         for peer_buffer in self.neteq_buffer_per_peer.values() {
-                //             aggregated_buffer.extend(peer_buffer.iter().cloned());
-                //         }
-                //         aggregated_buffer
-                //     }
-                //     neteq_jitter_history={
-                //         // Aggregate all peers' jitter history, taking the most recent from each
-                //         let mut aggregated_jitter = Vec::new();
-                //         for peer_jitter in self.neteq_jitter_per_peer.values() {
-                //             aggregated_jitter.extend(peer_jitter.iter().cloned());
-                //         }
-                //         aggregated_jitter
-                //     }
-                //     neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
-                //     neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
-                //     video_enabled={self.video_enabled}
-                //     mic_enabled={self.mic_enabled}
-                //     share_screen={self.share_screen}
-                //     connection_manager_state={self.connection_manager_state.clone()}
-                // />
+                { self.view_diagnostics_component(ctx) }
             </div>
         }
     }

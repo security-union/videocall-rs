@@ -15,7 +15,8 @@ window.__APP_CONFIG = Object.freeze({
   serverElectionPeriodMs: ${SERVER_ELECTION_PERIOD_MS:-2000},
   audioBitrateKbps: ${AUDIO_BITRATE_KBPS:-65},
   videoBitrateKbps: ${VIDEO_BITRATE_KBPS:-1000},
-  screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-1000}
+  screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-1000},
+  diagnosticsEnabled: "${DIAGNOSTICS_ENABLED:-true}"
 });
 EOF
 

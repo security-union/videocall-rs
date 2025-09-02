@@ -1,5 +1,5 @@
 use crate::components::attendants::AttendantsComponent;
-use crate::constants::{e2ee_enabled, webtransport_enabled};
+use crate::constants::{diagnostics_enabled, e2ee_enabled, webtransport_enabled};
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
 };
@@ -141,6 +141,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                             id={props.id.clone()}
                             webtransport_enabled={webtransport_enabled().unwrap_or(false)}
                             e2ee_enabled={e2ee_enabled().unwrap_or(false)}
+                            enable_diagnostics={diagnostics_enabled().unwrap_or(true)}
                         />
                     }
                 } else {

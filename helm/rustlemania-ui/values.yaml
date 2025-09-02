@@ -43,8 +43,9 @@ runtimeConfig:
   usersAllowedToStream: ""
   serverElectionPeriodMs: 2000
   audioBitrateKbps: 65
-  videoBitrateKbps: 1000
-  screenBitrateKbps: 1000
+  videoBitrateKbps: 200
+  screenBitrateKbps: 500
+  diagnosticsEnabled: "false"
 
 ingress:
   enabled: true

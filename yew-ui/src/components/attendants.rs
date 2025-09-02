@@ -120,6 +120,8 @@ pub struct AttendantsComponentProps {
     pub e2ee_enabled: bool,
 
     pub webtransport_enabled: bool,
+
+    pub enable_diagnostics: bool,
 }
 
 pub struct AttendantsComponent {
@@ -371,159 +373,163 @@ impl Component for AttendantsComponent {
         }
         {
             let link = ctx.link().clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let mut rx = subscribe();
-                while let Ok(evt) = rx.recv().await {
-                    if evt.subsystem == "neteq" {
-                        for m in &evt.metrics {
-                            if m.name == "stats_json" {
-                                if let MetricValue::Text(json) = &m.value {
-                                    // Parse the new format: "reporting_peer->target_peer"
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
+            if ctx.props().enable_diagnostics {
+                wasm_bindgen_futures::spawn_local(async move {
+                    let mut rx = subscribe();
+                    while let Ok(evt) = rx.recv().await {
+                        if evt.subsystem == "neteq" {
+                            for m in &evt.metrics {
+                                if m.name == "stats_json" {
+                                    if let MetricValue::Text(json) = &m.value {
+                                        // Parse the new format: "reporting_peer->target_peer"
+                                        let stream_id = evt
+                                            .stream_id
+                                            .clone()
+                                            .unwrap_or_else(|| "unknown->unknown".to_string());
+                                        let parts: Vec<&str> = stream_id.split("->").collect();
+                                        let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                            (parts[0], parts[1])
+                                        } else {
+                                            ("unknown", "unknown")
+                                        };
 
-                                    link.send_message(Msg::NetEqStatsUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        json.clone(),
-                                    ));
-                                }
-                            } else if m.name == "audio_buffer_ms" {
-                                if let MetricValue::U64(v) = &m.value {
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
+                                        link.send_message(Msg::NetEqStatsUpdated(
+                                            format!("{reporting_peer}->{target_peer}"),
+                                            json.clone(),
+                                        ));
+                                    }
+                                } else if m.name == "audio_buffer_ms" {
+                                    if let MetricValue::U64(v) = &m.value {
+                                        let stream_id = evt
+                                            .stream_id
+                                            .clone()
+                                            .unwrap_or_else(|| "unknown->unknown".to_string());
+                                        let parts: Vec<&str> = stream_id.split("->").collect();
+                                        let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                            (parts[0], parts[1])
+                                        } else {
+                                            ("unknown", "unknown")
+                                        };
 
-                                    link.send_message(Msg::NetEqBufferUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        *v,
-                                    ));
-                                }
-                            } else if m.name == "jitter_buffer_delay_ms" {
-                                if let MetricValue::U64(v) = &m.value {
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
+                                        link.send_message(Msg::NetEqBufferUpdated(
+                                            format!("{reporting_peer}->{target_peer}"),
+                                            *v,
+                                        ));
+                                    }
+                                } else if m.name == "jitter_buffer_delay_ms" {
+                                    if let MetricValue::U64(v) = &m.value {
+                                        let stream_id = evt
+                                            .stream_id
+                                            .clone()
+                                            .unwrap_or_else(|| "unknown->unknown".to_string());
+                                        let parts: Vec<&str> = stream_id.split("->").collect();
+                                        let (reporting_peer, target_peer) = if parts.len() == 2 {
+                                            (parts[0], parts[1])
+                                        } else {
+                                            ("unknown", "unknown")
+                                        };
 
-                                    link.send_message(Msg::NetEqJitterUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        *v,
-                                    ));
+                                        link.send_message(Msg::NetEqJitterUpdated(
+                                            format!("{reporting_peer}->{target_peer}"),
+                                            *v,
+                                        ));
+                                    }
                                 }
                             }
-                        }
-                    } else if evt.subsystem == "connection_manager" {
-                        let serializable_evt = SerializableDiagEvent::from(evt);
-                        link.send_message(Msg::ConnectionManagerUpdate(
-                            serde_json::to_string(&serializable_evt).unwrap_or_default(),
-                        ));
-                    } else if evt.subsystem == "decoder" {
-                        let mut decoder_stats = String::new();
-                        for metric in &evt.metrics {
-                            match metric.name {
-                                "fps" => {
-                                    if let MetricValue::F64(fps) = &metric.value {
-                                        decoder_stats.push_str(&format!("FPS: {fps:.2}\n"));
-                                    }
-                                }
-                                "bitrate_kbps" => {
-                                    if let MetricValue::F64(bitrate) = &metric.value {
-                                        decoder_stats
-                                            .push_str(&format!("Bitrate: {bitrate:.1} kbps\n"));
-                                    }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(media_type) = &metric.value {
-                                        decoder_stats
-                                            .push_str(&format!("Media Type: {media_type}\n"));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !decoder_stats.is_empty() {
-                            let peer_id = evt
-                                .stream_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            decoder_stats.push_str(&format!(
-                                "Peer: {}\nTimestamp: {}\n",
-                                peer_id, evt.ts_ms
+                        } else if evt.subsystem == "connection_manager" {
+                            let serializable_evt = SerializableDiagEvent::from(evt);
+                            link.send_message(Msg::ConnectionManagerUpdate(
+                                serde_json::to_string(&serializable_evt).unwrap_or_default(),
                             ));
-                            link.send_message(Msg::WsAction(WsAction::DiagnosticsUpdated(
-                                decoder_stats,
-                            )));
-                        }
-                    } else if evt.subsystem == "sender" {
-                        let mut sender_stats = String::new();
-                        for metric in &evt.metrics {
-                            match metric.name {
-                                "sender_id" => {
-                                    if let MetricValue::Text(sender_id) = &metric.value {
-                                        sender_stats.push_str(&format!("Sender: {sender_id}\n"));
+                        } else if evt.subsystem == "decoder" {
+                            let mut decoder_stats = String::new();
+                            for metric in &evt.metrics {
+                                match metric.name {
+                                    "fps" => {
+                                        if let MetricValue::F64(fps) = &metric.value {
+                                            decoder_stats.push_str(&format!("FPS: {fps:.2}\n"));
+                                        }
                                     }
-                                }
-                                "target_id" => {
-                                    if let MetricValue::Text(target_id) = &metric.value {
-                                        sender_stats.push_str(&format!("Target: {target_id}\n"));
+                                    "bitrate_kbps" => {
+                                        if let MetricValue::F64(bitrate) = &metric.value {
+                                            decoder_stats
+                                                .push_str(&format!("Bitrate: {bitrate:.1} kbps\n"));
+                                        }
                                     }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(media_type) = &metric.value {
-                                        sender_stats
-                                            .push_str(&format!("Media Type: {media_type}\n"));
+                                    "media_type" => {
+                                        if let MetricValue::Text(media_type) = &metric.value {
+                                            decoder_stats
+                                                .push_str(&format!("Media Type: {media_type}\n"));
+                                        }
                                     }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
+                            if !decoder_stats.is_empty() {
+                                let peer_id = evt
+                                    .stream_id
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                decoder_stats.push_str(&format!(
+                                    "Peer: {}\nTimestamp: {}\n",
+                                    peer_id, evt.ts_ms
+                                ));
+                                link.send_message(Msg::WsAction(WsAction::DiagnosticsUpdated(
+                                    decoder_stats,
+                                )));
+                            }
+                        } else if evt.subsystem == "sender" {
+                            let mut sender_stats = String::new();
+                            for metric in &evt.metrics {
+                                match metric.name {
+                                    "sender_id" => {
+                                        if let MetricValue::Text(sender_id) = &metric.value {
+                                            sender_stats
+                                                .push_str(&format!("Sender: {sender_id}\n"));
+                                        }
+                                    }
+                                    "target_id" => {
+                                        if let MetricValue::Text(target_id) = &metric.value {
+                                            sender_stats
+                                                .push_str(&format!("Target: {target_id}\n"));
+                                        }
+                                    }
+                                    "media_type" => {
+                                        if let MetricValue::Text(media_type) = &metric.value {
+                                            sender_stats
+                                                .push_str(&format!("Media Type: {media_type}\n"));
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if !sender_stats.is_empty() {
+                                sender_stats.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
+                                link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
+                                    sender_stats,
+                                )));
+                            }
+                        } else if evt.subsystem == "video" {
+                            // Known subsystem used for Grafana/metrics; UI does not render it
+                            log::debug!(
+                                "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
+                                evt.ts_ms
+                            );
+                        } else if evt.subsystem == "peer_status" {
+                            // Known subsystem for mute/camera state; UI does not render it
+                            log::debug!(
+                                "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
+                                evt.ts_ms
+                            );
+                        } else {
+                            let subsystem = evt.subsystem;
+                            log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 
+                                    subsystem, evt.stream_id, evt.ts_ms);
                         }
-                        if !sender_stats.is_empty() {
-                            sender_stats.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
-                            link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
-                                sender_stats,
-                            )));
-                        }
-                    } else if evt.subsystem == "video" {
-                        // Known subsystem used for Grafana/metrics; UI does not render it
-                        log::debug!(
-                            "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
-                            evt.ts_ms
-                        );
-                    } else if evt.subsystem == "peer_status" {
-                        // Known subsystem for mute/camera state; UI does not render it
-                        log::debug!(
-                            "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
-                            evt.ts_ms
-                        );
-                    } else {
-                        let subsystem = evt.subsystem;
-                        log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 
-                                   subsystem, evt.stream_id, evt.ts_ms);
                     }
-                }
-                log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
-            });
+                    log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
+                });
+            }
         }
         self_
     }
@@ -1072,32 +1078,40 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
-                                            <button
-                                                class={classes!("video-control-button", self.diagnostics_open.then_some("active"))}
-                                                onclick={toggle_diagnostics.clone()}>
-                                                {
-                                                    if self.diagnostics_open {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
-                                                                    <line x1="3" y1="3" x2="21" y2="21"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Close Diagnostics" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Open Diagnostics" }</span>
-                                                            </>
-                                                        }
+                                            {
+                                                if ctx.props().enable_diagnostics {
+                                                    html! {
+                                                        <button
+                                                            class={classes!("video-control-button", self.diagnostics_open.then_some("active"))}
+                                                            onclick={toggle_diagnostics.clone()}>
+                                                            {
+                                                                if self.diagnostics_open {
+                                                                    html! {
+                                                                        <>
+                                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                                <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
+                                                                                <line x1="3" y1="3" x2="21" y2="21"></line>
+                                                                            </svg>
+                                                                            <span class="tooltip">{ "Close Diagnostics" }</span>
+                                                                        </>
+                                                                    }
+                                                                } else {
+                                                                    html! {
+                                                                        <>
+                                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                                                <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
+                                                                            </svg>
+                                                                            <span class="tooltip">{ "Open Diagnostics" }</span>
+                                                                        </>
+                                                                    }
+                                                                }
+                                                            }
+                                                        </button>
                                                     }
+                                                } else {
+                                                    html! {}
                                                 }
-                                            </button>
+                                            }
                                             <button
                                                 class={classes!("video-control-button", "mobile-only-device-settings", self.device_settings_open.then_some("active"))}
                                                 onclick={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}>
@@ -1197,40 +1211,48 @@ impl Component for AttendantsComponent {
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
-                <Diagnostics
-                    is_open={self.diagnostics_open}
-                    on_close={close_diagnostics}
-                    diagnostics_data={self.diagnostics_data.clone()}
-                    sender_stats={self.sender_stats.clone()}
-                    encoder_settings={self.encoder_settings.clone()}
-                    neteq_stats={
-                        let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
-                        if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
-                    }
-                    neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
-                    neteq_buffer_history={
-                        // Aggregate all peers' buffer history, taking the most recent from each
-                        let mut aggregated_buffer = Vec::new();
-                        for peer_buffer in self.neteq_buffer_per_peer.values() {
-                            aggregated_buffer.extend(peer_buffer.iter().cloned());
+                {
+                    if ctx.props().enable_diagnostics {
+                        html! {
+                            <Diagnostics
+                                is_open={self.diagnostics_open}
+                                on_close={close_diagnostics}
+                                diagnostics_data={self.diagnostics_data.clone()}
+                                sender_stats={self.sender_stats.clone()}
+                                encoder_settings={self.encoder_settings.clone()}
+                                neteq_stats={
+                                    let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
+                                    if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
+                                }
+                                neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
+                                neteq_buffer_history={
+                                    // Aggregate all peers' buffer history, taking the most recent from each
+                                    let mut aggregated_buffer = Vec::new();
+                                    for peer_buffer in self.neteq_buffer_per_peer.values() {
+                                        aggregated_buffer.extend(peer_buffer.iter().cloned());
+                                    }
+                                    aggregated_buffer
+                                }
+                                neteq_jitter_history={
+                                    // Aggregate all peers' jitter history, taking the most recent from each
+                                    let mut aggregated_jitter = Vec::new();
+                                    for peer_jitter in self.neteq_jitter_per_peer.values() {
+                                        aggregated_jitter.extend(peer_jitter.iter().cloned());
+                                    }
+                                    aggregated_jitter
+                                }
+                                neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
+                                neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
+                                video_enabled={self.video_enabled}
+                                mic_enabled={self.mic_enabled}
+                                share_screen={self.share_screen}
+                                connection_manager_state={self.connection_manager_state.clone()}
+                            />
                         }
-                        aggregated_buffer
+                    } else {
+                        html! {}
                     }
-                    neteq_jitter_history={
-                        // Aggregate all peers' jitter history, taking the most recent from each
-                        let mut aggregated_jitter = Vec::new();
-                        for peer_jitter in self.neteq_jitter_per_peer.values() {
-                            aggregated_jitter.extend(peer_jitter.iter().cloned());
-                        }
-                        aggregated_jitter
-                    }
-                    neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
-                    neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
-                    video_enabled={self.video_enabled}
-                    mic_enabled={self.mic_enabled}
-                    share_screen={self.share_screen}
-                    connection_manager_state={self.connection_manager_state.clone()}
-                />
+                }
             </div>
         }
     }

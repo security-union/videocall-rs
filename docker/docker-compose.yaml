@@ -28,6 +28,7 @@ services:
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
       - UI_URL=${UI_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
+      - DIAGNOSTICS_ENABLED=${DIAGNOSTICS_ENABLED:-true}
     ports:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
     depends_on:

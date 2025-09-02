@@ -147,7 +147,7 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         super();
         
         // Initialize with optimized settings for low-end devices
-        this.buffer = new UltraFastPCMBuffer(4096 * 3, 1); // 85ms at 48kHz
+        this.buffer = new UltraFastPCMBuffer(6144 * 6, 1); // 85ms at 48kHz
         this.sampleRate = 48000;
         this.channels = 1;
         // Burst-drop policy configuration
@@ -170,7 +170,7 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
                 this.sampleRate = sampleRate || 48000;
                 this.channels = channels || 2;
                 // Recreate buffer with new configuration
-                this.buffer = new UltraFastPCMBuffer(4096 * 2, this.channels);
+                this.buffer = new UltraFastPCMBuffer(6144 * 4, this.channels);
                 break;
                 
             case 'play':

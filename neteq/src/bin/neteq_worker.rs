@@ -312,11 +312,9 @@ mod wasm_worker {
                                     // Track timing adjustments for debugging
                                     if frames_behind > 1 {
                                         TIMING_ADJUSTMENTS += 1;
-                                        console::log_1(
-                                            &format!(
-                                                "⚡ Timing adjustment: {} frames behind, interval was {:.1}ms",
-                                                frames_behind, interval_since_last
-                                            ).into(),
+                                        log::debug!(
+                                            "⚡ Timing adjustment: {} frames behind, interval was {:.1}ms",
+                                            frames_behind, interval_since_last
                                         );
                                     }
                                 } else {

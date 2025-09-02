@@ -18,6 +18,7 @@ rustlemania-ui:
     audioBitrateKbps: 16
     videoBitrateKbps: 160
     screenBitrateKbps: 160
+    diagnosticsEnabled: "false"
 
 
   image:

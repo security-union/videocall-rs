@@ -535,12 +535,6 @@ impl Component for AttendantsComponent {
         self_
     }
 
-    fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            // Don't auto-connect anymore
-        }
-    }
-
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {

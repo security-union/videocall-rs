@@ -23,10 +23,8 @@ pub mod media_decoder_trait;
 pub mod neteq_audio_decoder;
 pub mod peer_decode_manager;
 pub mod peer_decoder;
-#[cfg(not(feature = "neteq_ff"))]
 pub mod safari;
 pub mod video_decoder_wrapper;
-#[cfg(not(feature = "neteq_ff"))]
 use safari::audio_decoder::{
     AudioPeerDecoder as SafariAudioPeerDecoder, PeerDecode as SafariPeerDecodeTrait,
 };
@@ -86,7 +84,6 @@ impl AudioPeerDecoderTrait for StandardAudioPeerDecoder {
     }
 }
 
-#[cfg(not(feature = "neteq_ff"))]
 impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         let decode_status = SafariPeerDecodeTrait::decode(self, packet)?;
@@ -109,16 +106,14 @@ impl AudioPeerDecoderTrait for SafariAudioPeerDecoder {
 }
 
 #[cfg(feature = "neteq_ff")]
-/// Factory function to create the appropriate audio peer decoder based on platform detection
-pub fn create_audio_peer_decoder(
-    speaker_device_id: Option<String>,
+/// Factory function to create NetEq audio decoder with shared audio context
+pub fn create_audio_peer_decoder_with_shared_context(
     peer_id: String,
+    shared_audio_manager: std::rc::Rc<std::cell::RefCell<crate::audio::SharedNetEqAudioManager>>,
 ) -> Result<Box<dyn AudioPeerDecoderTrait>, JsValue> {
-    // NetEq decoders should start muted by default (peers start with audio_enabled=false)
-    NetEqAudioPeerDecoder::new_with_mute_state(speaker_device_id, peer_id, true)
+    NetEqAudioPeerDecoder::new_with_shared_audio(peer_id, shared_audio_manager)
 }
 
-#[cfg(not(feature = "neteq_ff"))]
 pub fn create_audio_peer_decoder(
     speaker_device_id: Option<String>,
     _peer_id: String, // peer_id not used by Safari/Standard decoders yet

@@ -7,6 +7,7 @@ use serde_wasm_bindgen;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
@@ -64,6 +65,11 @@ pub struct NetEqAudioPeerDecoder {
     // Message queueing system
     pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
     worker_ready: Rc<RefCell<bool>>,
+
+    // AudioWorklet initialization guards (atomics only)
+    worklet_ready: Arc<AtomicBool>,
+    worklet_inflight: Arc<AtomicBool>,
+    retry_scheduled: Arc<AtomicBool>,
 }
 
 impl NetEqAudioPeerDecoder {
@@ -121,59 +127,47 @@ impl NetEqAudioPeerDecoder {
         }
     }
 
-    /// Create Safari-optimized AudioContext with PCM player worklet
+    /// Create Safari-optimized AudioContext with PCM player worklet (original path)
     async fn create_safari_audio_context(
         speaker_device_id: Option<String>,
     ) -> Result<(AudioContext, AudioWorkletNode), JsValue> {
-        // Create AudioContext with ENFORCED 48kHz for Safari (critical!)
+        // Create AudioContext with ENFORCED 48kHz
         let options = AudioContextOptions::new();
-        options.set_sample_rate(48000.0); // Explicitly force 48kHz
+        options.set_sample_rate(48000.0);
         let audio_context = AudioContext::new_with_context_options(&options)?;
 
-        // CRITICAL: Verify actual sample rate Safari is using
         let actual_sample_rate = audio_context.sample_rate();
         log::info!("Safari AudioContext sample rate: {actual_sample_rate}");
-
         if (actual_sample_rate - 48000.0).abs() > 1.0 {
-            log::warn!(
-                "⚠️ Safari AudioContext sample rate mismatch! Expected 48000, got: {actual_sample_rate}"
-            );
+            log::warn!("⚠️ Safari AudioContext sample rate mismatch! Expected 48000, got: {actual_sample_rate}");
         }
 
-        // Preload/register PCM player worklet from embedded source (no network fetch)
+        // Register PCM player worklet
         let worklet_code = include_str!("../../../neteq/src/scripts/pcmPlayerWorker.js");
-
-        // Create a Blob with explicit JS MIME type for Safari
         let blob_parts = js_sys::Array::new();
         blob_parts.push(&JsValue::from_str(worklet_code));
-
         let blob_property_bag = web_sys::BlobPropertyBag::new();
         blob_property_bag.set_type("application/javascript");
-
         let blob =
             web_sys::Blob::new_with_str_sequence_and_options(&blob_parts, &blob_property_bag)?;
-
-        // Create an object URL and register the module with this AudioContext
         let worklet_url = web_sys::Url::create_object_url_with_blob(&blob)?;
         let audio_worklet = audio_context.audio_worklet()?;
         let module_promise = audio_worklet.add_module(&worklet_url)?;
         JsFuture::from(module_promise).await?;
         web_sys::Url::revoke_object_url(&worklet_url)?;
 
-        // Create the PCM player worklet node
+        // Create node and connect
         let pcm_player = AudioWorkletNode::new(&audio_context, "pcm-player")?;
-
-        // Connect worklet to destination
         pcm_player.connect_with_audio_node(&audio_context.destination())?;
 
-        // Configure the worklet with explicit 48kHz
+        // Configure 48kHz + channels
         let config_message = js_sys::Object::new();
         js_sys::Reflect::set(&config_message, &"command".into(), &"configure".into())?;
         js_sys::Reflect::set(
             &config_message,
             &"sampleRate".into(),
             &JsValue::from(48000.0),
-        )?; // Force 48kHz
+        )?;
         js_sys::Reflect::set(
             &config_message,
             &"channels".into(),
@@ -181,20 +175,14 @@ impl NetEqAudioPeerDecoder {
         )?;
         pcm_player.port()?.post_message(&config_message)?;
 
-        log::info!("Safari: Configured PCM worklet for 48kHz playback");
-
-        // Set sink device if specified (Safari supports setSinkId)
+        // Optional sink device
         if let Some(device_id) = speaker_device_id {
             if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
                 .unwrap_or(false)
             {
                 let promise = audio_context.set_sink_id_with_str(&device_id);
                 wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) = JsFuture::from(promise).await {
-                        log::warn!("Safari: Failed to set audio output device: {e:?}");
-                    } else {
-                        log::info!("Safari: Successfully set audio output device");
-                    }
+                    let _ = JsFuture::from(promise).await;
                 });
             }
         }
@@ -202,12 +190,17 @@ impl NetEqAudioPeerDecoder {
         Ok((audio_context, pcm_player))
     }
 
+    // request_worklet_init removed in favor of minimal guard inside ensure_worklet_initialized
+
     /// Handle PCM audio data from NetEq worker
     fn handle_pcm_data(
         pcm: Float32Array,
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
         audio_context: &AudioContext,
         speaker_device_id: Option<String>,
+        worklet_ready: Arc<AtomicBool>,
+        worklet_inflight: Arc<AtomicBool>,
+        retry_scheduled: Arc<AtomicBool>,
     ) {
         // Ensure AudioContext is running
         if let Err(e) = audio_context.resume() {
@@ -217,33 +210,91 @@ impl NetEqAudioPeerDecoder {
         }
 
         let pcm_player_clone = pcm_player.clone();
+        let worklet_ready_c = worklet_ready.clone();
+        let worklet_inflight_c = worklet_inflight.clone();
+        let retry_scheduled_c = retry_scheduled.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            Self::ensure_worklet_initialized(&pcm_player_clone, speaker_device_id).await;
-
+            NetEqAudioPeerDecoder::ensure_worklet_initialized(
+                &pcm_player_clone,
+                speaker_device_id,
+                worklet_ready_c,
+                worklet_inflight_c,
+                retry_scheduled_c,
+            )
+            .await;
             if let Some(ref worklet) = *pcm_player_clone.borrow() {
-                Self::send_pcm_to_safari_worklet(worklet, &pcm);
+                NetEqAudioPeerDecoder::send_pcm_to_safari_worklet(worklet, &pcm);
             }
         });
     }
 
-    /// Ensure AudioWorklet is initialized (lazy initialization)
+    /// Ensure AudioWorklet is initialized (lazy) with single-flight guard and fixed retry
     async fn ensure_worklet_initialized(
         pcm_player: &Rc<RefCell<Option<AudioWorkletNode>>>,
         speaker_device_id: Option<String>,
+        worklet_ready: Arc<AtomicBool>,
+        worklet_inflight: Arc<AtomicBool>,
+        retry_scheduled: Arc<AtomicBool>,
     ) {
-        if pcm_player.borrow().is_some() {
+        // Already present
+        if pcm_player.borrow().is_some() || worklet_ready.load(Ordering::Relaxed) {
+            return;
+        }
+
+        // Single-flight guard
+        if worklet_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return;
         }
 
         log::info!("Initializing AudioWorklet for PCM playback");
-
-        match Self::create_safari_audio_context(speaker_device_id).await {
+        match Self::create_safari_audio_context(speaker_device_id.clone()).await {
             Ok((_, worklet)) => {
                 *pcm_player.borrow_mut() = Some(worklet);
+                worklet_ready.store(true, Ordering::SeqCst);
+                worklet_inflight.store(false, Ordering::SeqCst);
                 log::info!("AudioWorklet initialized successfully");
             }
             Err(e) => {
                 web_sys::console::error_2(&"Failed to initialize worklet:".into(), &e);
+                worklet_inflight.store(false, Ordering::SeqCst);
+
+                // Schedule one fixed-delay retry if not already scheduled
+                if !retry_scheduled.load(Ordering::SeqCst) {
+                    retry_scheduled.store(true, Ordering::SeqCst);
+                    let pcm_player_r = pcm_player.clone();
+                    let retry_scheduled_c = retry_scheduled.clone();
+                    let worklet_ready_c = worklet_ready.clone();
+                    let worklet_inflight_c = worklet_inflight.clone();
+                    let speaker_retry = speaker_device_id.clone();
+                    let cb = Closure::wrap(Box::new(move || {
+                        retry_scheduled_c.store(false, Ordering::SeqCst);
+                        let pcm_player_rr = pcm_player_r.clone();
+                        let speaker_retry2 = speaker_retry.clone();
+                        let worklet_ready_c = worklet_ready_c.clone();
+                        let worklet_inflight_c = worklet_inflight_c.clone();
+                        let retry_scheduled_c = retry_scheduled_c.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            NetEqAudioPeerDecoder::ensure_worklet_initialized(
+                                &pcm_player_rr,
+                                speaker_retry2,
+                                worklet_ready_c,
+                                worklet_inflight_c,
+                                retry_scheduled_c,
+                            )
+                            .await;
+                        });
+                    }) as Box<dyn FnMut()>);
+                    let _ = web_sys::window()
+                        .unwrap()
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            cb.as_ref().unchecked_ref(),
+                            1500,
+                        );
+                    cb.forget();
+                }
             }
         }
     }
@@ -394,6 +445,7 @@ impl NetEqAudioPeerDecoder {
     }
 
     /// Create message handler for NetEq worker
+    #[allow(clippy::too_many_arguments)]
     fn create_message_handler(
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
         audio_context: AudioContext,
@@ -402,6 +454,9 @@ impl NetEqAudioPeerDecoder {
         worker_ready: Rc<RefCell<bool>>,
         pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
         worker: Worker,
+        worklet_ready: Arc<AtomicBool>,
+        worklet_inflight: Arc<AtomicBool>,
+        retry_scheduled: Arc<AtomicBool>,
     ) -> Closure<dyn FnMut(MessageEvent)> {
         Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
@@ -414,6 +469,9 @@ impl NetEqAudioPeerDecoder {
                     pcm_player.clone(),
                     &audio_context,
                     speaker_device_id.clone(),
+                    worklet_ready.clone(),
+                    worklet_inflight.clone(),
+                    retry_scheduled.clone(),
                 );
             } else if data.is_object() {
                 // Try to parse as WorkerResponse first
@@ -448,6 +506,8 @@ impl NetEqAudioPeerDecoder {
                                     }
                                 }
                             }
+
+                            // Keep original behavior: worklet will lazily init on first PCM
                         }
                         WorkerResponse::Stats { .. } => {
                             // Handle stats message (fallback to old method for now)
@@ -509,6 +569,11 @@ impl NetEqAudioPeerDecoder {
             // Message queueing system
             pending_messages: Rc::new(RefCell::new(VecDeque::new())),
             worker_ready: Rc::new(RefCell::new(false)),
+
+            // AudioWorklet guards (minimized)
+            worklet_ready: Arc::new(AtomicBool::new(false)),
+            worklet_inflight: Arc::new(AtomicBool::new(false)),
+            retry_scheduled: Arc::new(AtomicBool::new(false)),
         };
 
         // Set up worker message handling with decoder's queue references
@@ -520,6 +585,9 @@ impl NetEqAudioPeerDecoder {
             decoder.worker_ready.clone(),
             decoder.pending_messages.clone(),
             worker.clone(),
+            decoder.worklet_ready.clone(),
+            decoder.worklet_inflight.clone(),
+            decoder.retry_scheduled.clone(),
         );
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
@@ -655,5 +723,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
             muted,
             now
         );
+
+        // If unmuting, worklet will be lazily initialized on first PCM path
     }
 }

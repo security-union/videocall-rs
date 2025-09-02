@@ -373,6 +373,7 @@ impl Component for AttendantsComponent {
         }
         {
             let link = ctx.link().clone();
+            // TOFIX: if we disable diagnostics, other things break.
             if ctx.props().enable_diagnostics {
                 wasm_bindgen_futures::spawn_local(async move {
                     let mut rx = subscribe();

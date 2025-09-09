@@ -20,6 +20,7 @@ use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
 use crate::crypto::aes::Aes128State;
+use crate::diagnostics::diagnostics_manager::VIDEO_CALL_PEER_STATUS_SUBSYSTEM;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
 use log::debug;
@@ -292,7 +293,7 @@ impl Peer {
                     // Broadcast peer status to diagnostics with original IDs
                     // We don't have local userid here; use reporting peer context via diagnostics elsewhere.
                     let evt = DiagEvent {
-                        subsystem: "peer_status",
+                        subsystem: VIDEO_CALL_PEER_STATUS_SUBSYSTEM,
                         stream_id: None,
                         ts_ms: now_ms(),
                         metrics: vec![

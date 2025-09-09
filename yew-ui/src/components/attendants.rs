@@ -30,6 +30,9 @@ use gloo_utils::window;
 use log::{error, warn};
 use serde_json;
 use std::collections::HashMap;
+use videocall_client::diagnostics::diagnostics_manager::{
+    VIDEO_CALL_DIAGNOSTICS_SUBSYSTEM, VIDEO_CALL_PEER_STATUS_SUBSYSTEM,
+};
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_diagnostics::{subscribe, MetricValue};
@@ -374,8 +377,7 @@ impl Component for AttendantsComponent {
         {
             let link = ctx.link().clone();
             // TOFIX: if we disable diagnostics, other things break.
-            if true {
-                // ctx.props().enable_diagnostics {
+            if ctx.props().enable_diagnostics {
                 wasm_bindgen_futures::spawn_local(async move {
                     let mut rx = subscribe();
                     while let Ok(evt) = rx.recv().await {
@@ -480,7 +482,7 @@ impl Component for AttendantsComponent {
                                     decoder_stats,
                                 )));
                             }
-                        } else if evt.subsystem == "sender" {
+                        } else if evt.subsystem == VIDEO_CALL_DIAGNOSTICS_SUBSYSTEM {
                             let mut sender_stats = String::new();
                             for metric in &evt.metrics {
                                 match metric.name {
@@ -513,16 +515,8 @@ impl Component for AttendantsComponent {
                             }
                         } else if evt.subsystem == "video" {
                             // Known subsystem used for Grafana/metrics; UI does not render it
-                            log::debug!(
-                                "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
-                                evt.ts_ms
-                            );
-                        } else if evt.subsystem == "peer_status" {
+                        } else if evt.subsystem == VIDEO_CALL_PEER_STATUS_SUBSYSTEM {
                             // Known subsystem for mute/camera state; UI does not render it
-                            log::debug!(
-                                "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
-                                evt.ts_ms
-                            );
                         } else {
                             let subsystem = evt.subsystem;
                             log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 

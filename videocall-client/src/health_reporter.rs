@@ -34,6 +34,9 @@ use wasm_bindgen_futures::spawn_local;
 use web_time::{SystemTime, UNIX_EPOCH};
 use yew::prelude::Callback;
 
+use crate::diagnostics::diagnostics_manager::VIDEO_CALL_DIAGNOSTICS_SUBSYSTEM;
+use crate::diagnostics::diagnostics_manager::VIDEO_CALL_PEER_STATUS_SUBSYSTEM;
+
 /// Health data cached for a specific peer
 #[derive(Debug, Clone)]
 pub struct PeerHealthData {
@@ -165,7 +168,7 @@ impl HealthReporter {
             while let Ok(event) = receiver.recv().await {
                 if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
                     // Capture self-state from sender diagnostics events
-                    if event.subsystem == "sender" {
+                    if event.subsystem == VIDEO_CALL_DIAGNOSTICS_SUBSYSTEM {
                         if let (Some(ae), Some(ve)) =
                             (Weak::upgrade(&audio_enabled), Weak::upgrade(&video_enabled))
                         {
@@ -341,7 +344,7 @@ impl HealthReporter {
             }
         }
         // Handle sender events (from local SenderDiagnosticManager)
-        else if event.subsystem == "sender" {
+        else if event.subsystem == VIDEO_CALL_DIAGNOSTICS_SUBSYSTEM {
             debug!(
                 "Received sender event for peer: {} at {}",
                 target_peer, event.ts_ms
@@ -349,7 +352,7 @@ impl HealthReporter {
             // Sender events are mainly for server reporting, less impact on health status
         }
         // Handle peer status events (mute/camera on/off)
-        else if event.subsystem == "peer_status" {
+        else if event.subsystem == VIDEO_CALL_PEER_STATUS_SUBSYSTEM {
             if let Ok(mut health_map) = peer_health_data.try_borrow_mut() {
                 let peer_data = health_map
                     .entry(target_peer.to_string())

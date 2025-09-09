@@ -140,3 +140,18 @@ features = ["wasm"]
 [dev-dependencies]
 wasm-bindgen-test = "0.3.20"
 
+# Debug profile with symbols for WASM debugging
+[profile.dev]
+debug = true              # Enable debug info
+debug-assertions = true   # Keep debug assertions
+opt-level = 1            # Light optimization for faster builds
+lto = false              # Disable LTO for faster builds
+panic = "abort"          # Reduce binary size
+
+# Release profile with symbols
+[profile.release]
+debug = true             # Keep debug symbols in release
+opt-level = "s"          # Optimize for size
+lto = true
+panic = "abort"
+

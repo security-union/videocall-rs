@@ -37,6 +37,9 @@ use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacke
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
+pub const VIDEO_CALL_DIAGNOSTICS_SUBSYSTEM: &str = "videocall-client-diag";
+pub const VIDEO_CALL_PEER_STATUS_SUBSYSTEM: &str = "peer-status";
+
 // Basic structure for diagnostics events
 #[derive(Debug, Clone)]
 pub enum DiagnosticEvent {
@@ -776,7 +779,7 @@ impl SenderDiagnosticWorker {
 
                 // Publish to global diagnostics broadcast system
                 let event = DiagEvent {
-                    subsystem: "sender",
+                    subsystem: VIDEO_CALL_DIAGNOSTICS_SUBSYSTEM,
                     stream_id: Some(target_id.clone()),
                     ts_ms: now_ms(),
                     metrics: vec![

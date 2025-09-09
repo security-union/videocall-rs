@@ -83,7 +83,7 @@ impl Vp9Encoder {
         }
     }
 
-    pub fn encode(&mut self, frame_count: i64, yuv_data: Option<&[u8]>) -> Result<Frames> {
+    pub fn encode(&mut self, frame_count: i64, yuv_data: Option<&[u8]>) -> Result<Frames<'_>> {
         unsafe {
             let image_ptr = if let Some(data) = yuv_data {
                 let mut image: vpx_image_t = MaybeUninit::zeroed().assume_init();

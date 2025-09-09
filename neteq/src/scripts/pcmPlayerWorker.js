@@ -32,12 +32,40 @@ class UltraFastPCMBuffer {
         console.log(`Ultra-fast PCM buffer: ${maxSamples} samples (~${(maxSamples/48000*1000).toFixed(1)}ms), ${channels} channels`);
     }
     
+    // Drop the oldest samples to make room (advance read pointer)
+    dropOldestSamples(samplesToDrop) {
+        if (samplesToDrop <= 0) return 0;
+        const drop = Math.min(samplesToDrop, this.availableSamples);
+        this.readPos = (this.readPos + drop) % this.maxSamples;
+        this.availableSamples -= drop;
+        return drop;
+    }
+
+    // Ensure capacity for a frame by applying a burst-drop policy (drop oldest)
+    // Returns number of samples dropped
+    ensureCapacityFor(frameLength, highWatermark, lowWatermark) {
+        // If we're above the high watermark, proactively reduce to low watermark
+        let dropped = 0;
+        if (this.availableSamples >= highWatermark) {
+            const target = Math.max(0, Math.min(lowWatermark, this.maxSamples));
+            const toDrop = this.availableSamples - target;
+            dropped += this.dropOldestSamples(toDrop);
+        }
+
+        // If still not enough room for the incoming frame, drop just enough
+        const overflow = (this.availableSamples + frameLength) - this.maxSamples;
+        if (overflow > 0) {
+            dropped += this.dropOldestSamples(overflow);
+        }
+        return dropped;
+    }
+
     // Optimized push with minimal branching
     pushInterleaved(data) {
         const frameLength = data.length / this.channels;
         
         if (this.availableSamples + frameLength > this.maxSamples) {
-            return false; // Buffer full
+            return false; // Caller should ensure capacity first
         }
         
         if (this.channels === 1) {
@@ -119,9 +147,14 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
         super();
         
         // Initialize with optimized settings for low-end devices
-        this.buffer = new UltraFastPCMBuffer(4096 * 2, 2); // 85ms at 48kHz
+        this.buffer = new UltraFastPCMBuffer(4096 * 3, 1); // 85ms at 48kHz
         this.sampleRate = 48000;
-        this.channels = 2;
+        this.channels = 1;
+        // Burst-drop policy configuration
+        this.highWatermarkRatio = 0.80; // start dropping when >= 80% full
+        this.lowWatermarkRatio = 0.50;  // drop down to 20%
+        this.lastDropWarnTime = 0;
+        this.dropWarnCooldownMs = 1000; // rate-limit warnings
         
         console.log('Ultra-Fast PCM Player Worklet initialized - JavaScript optimized for maximum performance');
         
@@ -142,10 +175,29 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
                 
             case 'play':
                 if (pcm && pcm instanceof Float32Array) {
+                    // Apply burst-drop policy before enqueuing
+                    const frameLength = pcm.length / this.channels;
+                    const highWM = Math.floor(this.buffer.maxSamples * this.highWatermarkRatio);
+                    const lowWM = Math.floor(this.buffer.maxSamples * this.lowWatermarkRatio);
+                    const dropped = this.buffer.ensureCapacityFor(frameLength, highWM, lowWM);
+
+                    if (dropped > 0) {
+                        const now = Date.now();
+                        if (now - this.lastDropWarnTime >= this.dropWarnCooldownMs) {
+                            console.warn(`PCM buffer high-watermark: dropped ${dropped} samples to cap latency (avail=${this.buffer.availableSamples}/${this.buffer.maxSamples})`);
+                            this.lastDropWarnTime = now;
+                        }
+                    }
+
+                    // Enqueue after ensuring capacity. If this still fails, frame is too large.
                     const success = this.buffer.pushInterleaved(pcm);
-                    // Silent failure handling - no console spam on low-end devices
                     if (!success) {
-                        console.warn('Failed to enqueue PCM data');
+                        // Extremely rare: frame larger than buffer capacity
+                        const now = Date.now();
+                        if (now - this.lastDropWarnTime >= this.dropWarnCooldownMs) {
+                            console.warn('Failed to enqueue PCM data: frame larger than buffer capacity');
+                            this.lastDropWarnTime = now;
+                        }
                     }
                 }
                 break;

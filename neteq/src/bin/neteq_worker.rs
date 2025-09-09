@@ -120,6 +120,9 @@ mod wasm_worker {
             }
         }
 
+        // Note: PCM AudioWorklet is registered against the main thread AudioContext.
+        // We embed/register it there instead of evaluating it inside this worker.
+
         let self_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
         let self_scope_clone = self_scope.clone();
         let self_scope_clone_2 = self_scope.clone();

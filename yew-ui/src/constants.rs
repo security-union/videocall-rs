@@ -44,6 +44,8 @@ pub struct RuntimeConfig {
     pub video_bitrate_kbps: u32,
     #[serde(rename = "screenBitrateKbps")]
     pub screen_bitrate_kbps: u32,
+    #[serde(rename = "diagnosticsEnabled")]
+    pub diagnostics_enabled: String,
     // ui_url intentionally omitted; unused by the UI
 }
 
@@ -104,6 +106,10 @@ pub fn webtransport_enabled() -> Result<bool, String> {
 }
 pub fn e2ee_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.e2ee_enabled.as_str())))
+}
+
+pub fn diagnostics_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.diagnostics_enabled.as_str())))
 }
 
 pub fn users_allowed_to_stream() -> Result<Vec<String>, String> {

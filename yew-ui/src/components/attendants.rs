@@ -152,6 +152,7 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    pub call_start_time: Option<web_sys::Performance>, // Track when the call started
 }
 
 impl AttendantsComponent {
@@ -325,6 +326,22 @@ impl AttendantsComponent {
             }
         }
     }
+    // Format the call duration as HH:MM:SS
+    fn format_call_duration(&self) -> String {
+        let now = web_sys::window().and_then(|w| w.performance()).map(|p| p.now() as u64).unwrap_or(0);
+        let start = self.call_start_time.as_ref().map(|p| p.now() as u64).unwrap_or(0);
+        let elapsed_secs = (now - start) / 1000; // Convert from ms to seconds
+
+        let hours = elapsed_secs / 3600;
+        let minutes = (elapsed_secs % 3600) / 60;
+        let seconds = elapsed_secs % 60;
+
+        if hours > 0 {
+            format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+        } else {
+            format!("{:02}:{:02}", minutes, seconds)
+        }
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -364,6 +381,7 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            call_start_time: None, // Will be set when the meeting starts
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -572,14 +590,17 @@ impl Component for AttendantsComponent {
                     self.error = None;
 
                     if self.pending_mic_enable {
-                        self.mic_enabled = true;
-                        self.pending_mic_enable = false;
+                        self.mic_enabled = true; 
+                        self.pending_mic_enable = false; 
                     }
 
                     if self.pending_video_enable {
                         self.video_enabled = true;
                         self.pending_video_enable = false;
                     }
+
+                    // Set call start time when media permissions are granted
+                    self.call_start_time = web_sys::window().and_then(|w| w.performance());
 
                     if self.pending_screen_share {
                         self.share_screen = true;
@@ -880,14 +901,43 @@ impl Component for AttendantsComponent {
             };
         }
 
+        // Create the call timer HTML if the call has started
+        let call_timer = if self.call_start_time.is_some() {
+            html! {
+                <div class="call-timer">
+                    { self.format_call_duration() }
+                </div>
+            }
+        } else {
+            html! {} // TODO: show a loading spinner
+        };
+
+        // Create the top-right controls
+        let top_right_controls = html! {
+            <div class="top-right-controls">
+                {call_timer}
+                <button
+                    class={classes!("control-button", self.diagnostics_open.then_some("active"))}
+                    onclick={toggle_diagnostics.clone()}
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="12" y1="8" x2="12" y2="12"></line>
+                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                </button>
+            </div>
+        };
+
         html! {
             <div id="main-container" class="meeting-page">
                 <BrowserCompatibility/>
+                {top_right_controls}
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}
                     style={container_style}>
-                    { rows }
+                    {rows}
 
                     { // Invitation overlay when there are no connected peers
                         if num_display_peers == 0 {

@@ -1156,6 +1156,59 @@ select {
   font-size: 0.9em;
 }
 
+/* Top right controls for the timer duration */
+.top-right-controls {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  z-index: 10;
+}
+
+.call-timer {
+  background-color: rgba(0, 0, 0, 0.5);
+  color: white;
+  font-family: monospace;
+  font-size: 16px;
+  padding: 6px 12px;
+  border-radius: 16px;
+  font-weight: 500;
+  backdrop-filter: blur(4px);
+  user-select: none;
+  min-width: 60px;
+  text-align: center;
+}
+
+.control-button {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background-color: rgba(0, 0, 0, 0.5);
+  border: none;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.control-button:hover {
+  background-color: rgba(0, 0, 0, 0.7);
+  transform: scale(1.05);
+}
+
+/* Responsive adjustments for the timer */
+@media (max-width: 600px) {
+  .call-timer {
+    font-size: 14px;
+    padding: 4px 10px;
+    min-width: 50px;
+  }
+}
+
 /* Device Settings Menu Button */
 .device-settings-menu-button {
   visibility: hidden;

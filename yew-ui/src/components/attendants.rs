@@ -15,7 +15,7 @@
  * license, shall be dual licensed as above, without any additional terms or
  * conditions.
  */
-
+ 
 use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
@@ -25,7 +25,7 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use gloo_timers::callback::Timeout;
+use gloo_timers::callback::{Interval, Timeout};
 use gloo_utils::window;
 use log::{error, warn};
 use serde_json;
@@ -35,6 +35,7 @@ use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOption
 use videocall_diagnostics::{subscribe, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
+use wasm_bindgen_futures;
 use web_sys::*;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
@@ -51,6 +52,7 @@ pub enum WsAction {
     DiagnosticsUpdated(String),
     SenderStatsUpdated(String),
     EncoderSettingsUpdated(String),
+    TimerTick,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -152,6 +154,8 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    pub call_start_time: Option<f64>, // Track when the call started
+    _timer: Option<Interval>,
 }
 
 impl AttendantsComponent {
@@ -325,6 +329,34 @@ impl AttendantsComponent {
             }
         }
     }
+    // Format the call duration as HH:MM:SS
+    fn format_call_duration(&self) -> String {
+        // Use a fixed reference time if call_start_time is not set
+        let start_time = match &self.call_start_time {
+            Some(start) => start,
+            None => return "00:00".to_string(),
+        };
+        
+        let now = web_sys::window()
+            .and_then(|w| w.performance())
+            .map(|p| p.now())
+            .unwrap_or_else(|| {
+                web_sys::console::warn_1(&"Failed to get performance.now()".into());
+                start_time + 1.0
+            });
+            
+        let elapsed_secs = ((now - start_time) / 1000.0) as u64;
+
+        let hours = elapsed_secs / 3600;
+        let minutes = (elapsed_secs % 3600) / 60;
+        let seconds = elapsed_secs % 60;
+
+        if hours > 0 {
+            format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+        } else {
+            format!("{:02}:{:02}", minutes, seconds)
+        }
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -364,6 +396,8 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            call_start_time: None, // Will be set when the meeting starts
+            _timer: None,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -553,6 +587,19 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
+                    // Start the timer when connection is established
+                    self.call_start_time = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
+
+                    if self.call_start_time.is_some() {
+                        let link = ctx.link().clone();
+                        // Clear any existing timer
+                        // self._timer = None;
+                        // Create a new interval that triggers an update every second
+                        let interval = Interval::new(1000, move || {
+                            link.send_message(WsAction::TimerTick);
+                        });
+                        self._timer = Some(interval);
+                    }
                     true
                 }
                 WsAction::Log(msg) => {
@@ -581,12 +628,20 @@ impl Component for AttendantsComponent {
                         self.pending_video_enable = false;
                     }
 
+                    // Set call start time when media permissions are granted
+                    // self.call_start_time = web_sys::window().and_then(|w| w.performance());
+
                     if self.pending_screen_share {
                         self.share_screen = true;
                         self.pending_screen_share = false;
                     }
 
                     ctx.link().send_message(WsAction::Connect);
+                    true
+                }
+
+                WsAction::TimerTick => {
+                    // This will trigger a re-render, which will update the timer display
                     true
                 }
                 WsAction::MediaPermissionsError(error) => {
@@ -612,6 +667,21 @@ impl Component for AttendantsComponent {
                 log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
+
+                // Make sure timer is running when someone joins
+                if self.call_start_time.is_none() {
+                    self.call_start_time = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
+                    if self.call_start_time.is_some() {
+                        let link = ctx.link().clone();
+                        // Clear any existing timer
+                        self._timer = None;
+                        // Create a new interval that triggers an update every second
+                        let interval = Interval::new(1000, move || {
+                            link.send_message(WsAction::TimerTick);
+                        });
+                        self._timer = Some(interval);
+                    }
+                }
                 true
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
@@ -880,14 +950,43 @@ impl Component for AttendantsComponent {
             };
         }
 
+        // Create the call timer HTML if the call has started
+        let call_timer = if self.call_start_time.is_some() {
+            html! {
+                <div class="call-timer">
+                    { self.format_call_duration() }
+                </div>
+            }
+        } else {
+            html! {} // TODO: show a loading spinner
+        };
+
+        // Create the top-right controls
+        let top_right_controls = html! {
+            <div class="top-right-controls">
+                {call_timer}
+                <button
+                    class={classes!("control-button", self.diagnostics_open.then_some("active"))}
+                    onclick={toggle_diagnostics.clone()}
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="12" y1="8" x2="12" y2="12"></line>
+                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                </button>
+            </div>
+        };
+
         html! {
             <div id="main-container" class="meeting-page">
                 <BrowserCompatibility/>
+                {top_right_controls}
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}
                     style={container_style}>
-                    { rows }
+                    {rows}
 
                     { // Invitation overlay when there are no connected peers
                         if num_display_peers == 0 {
@@ -937,6 +1036,15 @@ impl Component for AttendantsComponent {
                         } else { html!{} }
                     }
 
+                    {
+                        if let Some(message) = &self.simulation_info_message {
+                            html!{
+                                <p class="simulation-info-message">{ message }</p>
+                            }
+                        } else {
+                            html!{}
+                        }
+                    }
                     {
                         if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
                             html! {
@@ -991,7 +1099,7 @@ impl Component for AttendantsComponent {
                                                         html! {
                                                             <>
                                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
+                                                                    <path d="M16 16v1a4 4 0 0 1-4 4H3a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
                                                                     <line x1="1" y1="1" x2="23" y2="23"></line>
                                                                 </svg>
                                                                 <span class="tooltip">{ "Start Video" }</span>

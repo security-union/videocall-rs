@@ -16,8 +16,10 @@
  * conditions.
  */
 
-use crate::components::neteq_chart::{
-    AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
+use crate::components::{
+    neteq_chart::{
+        AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

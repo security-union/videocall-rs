@@ -45,10 +45,6 @@ impl WebNetEq {
     /// This must be called after construction and is async.
     #[wasm_bindgen]
     pub async fn init(&self) -> Result<(), JsValue> {
-        self.init_internal().await
-    }
-
-    async fn init_internal(&self) -> Result<(), JsValue> {
         let cfg = NetEqConfig {
             sample_rate: self.sample_rate,
             channels: self.channels,

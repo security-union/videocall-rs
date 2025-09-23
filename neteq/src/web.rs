@@ -48,16 +48,6 @@ impl WebNetEq {
         self.init_internal(None).await
     }
 
-    /// Initialize the NetEq with audio playback enabled (Safari only).
-    /// Pass an AudioContext to enable audio output in Safari.
-    #[wasm_bindgen(js_name = initWithAudioContext)]
-    pub async fn init_with_audio_context(
-        &self,
-        audio_context: &web_sys::AudioContext,
-    ) -> Result<(), JsValue> {
-        self.init_internal(Some(audio_context)).await
-    }
-
     async fn init_internal(
         &self,
         audio_context: Option<&web_sys::AudioContext>,

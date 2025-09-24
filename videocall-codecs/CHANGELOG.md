@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.6...videocall-codecs-v0.1.7) - 2025-09-24
+
+### Other
+
+- Eliminate mismatched_lifetime_syntaxes compiler warning by eliding return type lifetime to Result<Frames<'_>> ([#413](https://github.com/security-union/videocall-rs/pull/413))
+
 ## [0.1.6](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.5...videocall-codecs-v0.1.6) - 2025-08-20
 
 ### Fixed

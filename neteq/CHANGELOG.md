@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/security-union/videocall-rs/compare/neteq-v0.5.1...neteq-v0.6.0) - 2025-09-24
+
+### Other
+
+- refactor to use a single context ([#428](https://github.com/security-union/videocall-rs/pull/428))
+- Fix #415: Failed to enqueue PCM Data ([#417](https://github.com/security-union/videocall-rs/pull/417))
+
 ## [0.5.1](https://github.com/security-union/videocall-rs/compare/neteq-v0.5.0...neteq-v0.5.1) - 2025-08-20
 
 ### Fixed

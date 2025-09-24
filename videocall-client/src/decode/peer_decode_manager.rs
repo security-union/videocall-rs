@@ -370,6 +370,7 @@ pub struct PeerDecodeManager {
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
+    pub on_peer_removed: Callback<String>,
 }
 
 impl Default for PeerDecodeManager {
@@ -386,6 +387,7 @@ impl PeerDecodeManager {
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
+            on_peer_removed: Callback::noop(),
         }
     }
 
@@ -396,6 +398,7 @@ impl PeerDecodeManager {
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
+            on_peer_removed: Callback::noop(),
         }
     }
 
@@ -408,8 +411,12 @@ impl PeerDecodeManager {
     }
 
     pub fn run_peer_monitor(&mut self) {
-        let pred = |peer: &mut Peer| peer.check_heartbeat();
-        self.connected_peers.remove_if(pred);
+        let removed = self
+            .connected_peers
+            .remove_if_and_return_keys(|peer| peer.check_heartbeat());
+        for k in removed {
+            self.on_peer_removed.emit(k);
+        }
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
@@ -466,6 +473,7 @@ impl PeerDecodeManager {
 
     pub fn delete_peer(&mut self, email: &String) {
         self.connected_peers.remove(email);
+        self.on_peer_removed.emit(email.clone());
     }
 
     pub fn ensure_peer(&mut self, email: &String) -> PeerStatus {

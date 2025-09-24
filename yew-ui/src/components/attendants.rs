@@ -18,8 +18,8 @@
 
 use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
-    host::Host, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics, host::Host,
+    peer_list::PeerList, peer_tile::PeerTile,
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
@@ -73,6 +73,7 @@ pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
+    OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
     OnMicrophoneError(String),
     DismissMicError,
@@ -218,6 +219,13 @@ impl AttendantsComponent {
                     link.send_message(Msg::OnFirstFrame((email, media_type)))
                 })
             },
+            on_peer_removed: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |peer_id: String| {
+                    log::info!("Peer removed: {}", peer_id);
+                    link.send_message(Msg::OnPeerRemoved(peer_id));
+                })
+            }),
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
             enable_diagnostics: true,
@@ -370,160 +378,160 @@ impl Component for AttendantsComponent {
             self_.error = Some(e);
         }
         {
-            let link = ctx.link().clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let mut rx = subscribe();
-                while let Ok(evt) = rx.recv().await {
-                    if evt.subsystem == "neteq" {
-                        for m in &evt.metrics {
-                            if m.name == "stats_json" {
-                                if let MetricValue::Text(json) = &m.value {
-                                    // Parse the new format: "reporting_peer->target_peer"
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
+            // let link = ctx.link().clone();
+            // wasm_bindgen_futures::spawn_local(async move {
+            //     let mut rx = subscribe();
+            //     while let Ok(evt) = rx.recv().await {
+            //         if evt.subsystem == "neteq" {
+            //             for m in &evt.metrics {
+            //                 if m.name == "stats_json" {
+            //                     if let MetricValue::Text(json) = &m.value {
+            //                         // Parse the new format: "reporting_peer->target_peer"
+            //                         let stream_id = evt
+            //                             .stream_id
+            //                             .clone()
+            //                             .unwrap_or_else(|| "unknown->unknown".to_string());
+            //                         let parts: Vec<&str> = stream_id.split("->").collect();
+            //                         let (reporting_peer, target_peer) = if parts.len() == 2 {
+            //                             (parts[0], parts[1])
+            //                         } else {
+            //                             ("unknown", "unknown")
+            //                         };
 
-                                    link.send_message(Msg::NetEqStatsUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        json.clone(),
-                                    ));
-                                }
-                            } else if m.name == "audio_buffer_ms" {
-                                if let MetricValue::U64(v) = &m.value {
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
+            //                         link.send_message(Msg::NetEqStatsUpdated(
+            //                             format!("{reporting_peer}->{target_peer}"),
+            //                             json.clone(),
+            //                         ));
+            //                     }
+            //                 } else if m.name == "audio_buffer_ms" {
+            //                     if let MetricValue::U64(v) = &m.value {
+            //                         let stream_id = evt
+            //                             .stream_id
+            //                             .clone()
+            //                             .unwrap_or_else(|| "unknown->unknown".to_string());
+            //                         let parts: Vec<&str> = stream_id.split("->").collect();
+            //                         let (reporting_peer, target_peer) = if parts.len() == 2 {
+            //                             (parts[0], parts[1])
+            //                         } else {
+            //                             ("unknown", "unknown")
+            //                         };
 
-                                    link.send_message(Msg::NetEqBufferUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        *v,
-                                    ));
-                                }
-                            } else if m.name == "jitter_buffer_delay_ms" {
-                                if let MetricValue::U64(v) = &m.value {
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
+            //                         link.send_message(Msg::NetEqBufferUpdated(
+            //                             format!("{reporting_peer}->{target_peer}"),
+            //                             *v,
+            //                         ));
+            //                     }
+            //                 } else if m.name == "jitter_buffer_delay_ms" {
+            //                     if let MetricValue::U64(v) = &m.value {
+            //                         let stream_id = evt
+            //                             .stream_id
+            //                             .clone()
+            //                             .unwrap_or_else(|| "unknown->unknown".to_string());
+            //                         let parts: Vec<&str> = stream_id.split("->").collect();
+            //                         let (reporting_peer, target_peer) = if parts.len() == 2 {
+            //                             (parts[0], parts[1])
+            //                         } else {
+            //                             ("unknown", "unknown")
+            //                         };
 
-                                    link.send_message(Msg::NetEqJitterUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        *v,
-                                    ));
-                                }
-                            }
-                        }
-                    } else if evt.subsystem == "connection_manager" {
-                        let serializable_evt = SerializableDiagEvent::from(evt);
-                        link.send_message(Msg::ConnectionManagerUpdate(
-                            serde_json::to_string(&serializable_evt).unwrap_or_default(),
-                        ));
-                    } else if evt.subsystem == "decoder" {
-                        let mut decoder_stats = String::new();
-                        for metric in &evt.metrics {
-                            match metric.name {
-                                "fps" => {
-                                    if let MetricValue::F64(fps) = &metric.value {
-                                        decoder_stats.push_str(&format!("FPS: {fps:.2}\n"));
-                                    }
-                                }
-                                "bitrate_kbps" => {
-                                    if let MetricValue::F64(bitrate) = &metric.value {
-                                        decoder_stats
-                                            .push_str(&format!("Bitrate: {bitrate:.1} kbps\n"));
-                                    }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(media_type) = &metric.value {
-                                        decoder_stats
-                                            .push_str(&format!("Media Type: {media_type}\n"));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !decoder_stats.is_empty() {
-                            let peer_id = evt
-                                .stream_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            decoder_stats.push_str(&format!(
-                                "Peer: {}\nTimestamp: {}\n",
-                                peer_id, evt.ts_ms
-                            ));
-                            link.send_message(Msg::WsAction(WsAction::DiagnosticsUpdated(
-                                decoder_stats,
-                            )));
-                        }
-                    } else if evt.subsystem == "sender" {
-                        let mut sender_stats = String::new();
-                        for metric in &evt.metrics {
-                            match metric.name {
-                                "sender_id" => {
-                                    if let MetricValue::Text(sender_id) = &metric.value {
-                                        sender_stats.push_str(&format!("Sender: {sender_id}\n"));
-                                    }
-                                }
-                                "target_id" => {
-                                    if let MetricValue::Text(target_id) = &metric.value {
-                                        sender_stats.push_str(&format!("Target: {target_id}\n"));
-                                    }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(media_type) = &metric.value {
-                                        sender_stats
-                                            .push_str(&format!("Media Type: {media_type}\n"));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !sender_stats.is_empty() {
-                            sender_stats.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
-                            link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
-                                sender_stats,
-                            )));
-                        }
-                    } else if evt.subsystem == "video" {
-                        // Known subsystem used for Grafana/metrics; UI does not render it
-                        log::debug!(
-                            "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
-                            evt.ts_ms
-                        );
-                    } else if evt.subsystem == "peer_status" {
-                        // Known subsystem for mute/camera state; UI does not render it
-                        log::debug!(
-                            "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
-                            evt.ts_ms
-                        );
-                    } else {
-                        let subsystem = evt.subsystem;
-                        log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 
-                                   subsystem, evt.stream_id, evt.ts_ms);
-                    }
-                }
-                log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
-            });
+            //                         link.send_message(Msg::NetEqJitterUpdated(
+            //                             format!("{reporting_peer}->{target_peer}"),
+            //                             *v,
+            //                         ));
+            //                     }
+            //                 }
+            //             }
+            //         } else if evt.subsystem == "connection_manager" {
+            //             let serializable_evt = SerializableDiagEvent::from(evt);
+            //             link.send_message(Msg::ConnectionManagerUpdate(
+            //                 serde_json::to_string(&serializable_evt).unwrap_or_default(),
+            //             ));
+            //         } else if evt.subsystem == "decoder" {
+            //             let mut decoder_stats = String::new();
+            //             for metric in &evt.metrics {
+            //                 match metric.name {
+            //                     "fps" => {
+            //                         if let MetricValue::F64(fps) = &metric.value {
+            //                             decoder_stats.push_str(&format!("FPS: {fps:.2}\n"));
+            //                         }
+            //                     }
+            //                     "bitrate_kbps" => {
+            //                         if let MetricValue::F64(bitrate) = &metric.value {
+            //                             decoder_stats
+            //                                 .push_str(&format!("Bitrate: {bitrate:.1} kbps\n"));
+            //                         }
+            //                     }
+            //                     "media_type" => {
+            //                         if let MetricValue::Text(media_type) = &metric.value {
+            //                             decoder_stats
+            //                                 .push_str(&format!("Media Type: {media_type}\n"));
+            //                         }
+            //                     }
+            //                     _ => {}
+            //                 }
+            //             }
+            //             if !decoder_stats.is_empty() {
+            //                 let peer_id = evt
+            //                     .stream_id
+            //                     .clone()
+            //                     .unwrap_or_else(|| "unknown".to_string());
+            //                 decoder_stats.push_str(&format!(
+            //                     "Peer: {}\nTimestamp: {}\n",
+            //                     peer_id, evt.ts_ms
+            //                 ));
+            //                 link.send_message(Msg::WsAction(WsAction::DiagnosticsUpdated(
+            //                     decoder_stats,
+            //                 )));
+            //             }
+            //         } else if evt.subsystem == "sender" {
+            //             let mut sender_stats = String::new();
+            //             for metric in &evt.metrics {
+            //                 match metric.name {
+            //                     "sender_id" => {
+            //                         if let MetricValue::Text(sender_id) = &metric.value {
+            //                             sender_stats.push_str(&format!("Sender: {sender_id}\n"));
+            //                         }
+            //                     }
+            //                     "target_id" => {
+            //                         if let MetricValue::Text(target_id) = &metric.value {
+            //                             sender_stats.push_str(&format!("Target: {target_id}\n"));
+            //                         }
+            //                     }
+            //                     "media_type" => {
+            //                         if let MetricValue::Text(media_type) = &metric.value {
+            //                             sender_stats
+            //                                 .push_str(&format!("Media Type: {media_type}\n"));
+            //                         }
+            //                     }
+            //                     _ => {}
+            //                 }
+            //             }
+            //             if !sender_stats.is_empty() {
+            //                 sender_stats.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
+            //                 link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
+            //                     sender_stats,
+            //                 )));
+            //             }
+            //         } else if evt.subsystem == "video" {
+            //             // Known subsystem used for Grafana/metrics; UI does not render it
+            //             log::debug!(
+            //                 "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
+            //                 evt.ts_ms
+            //             );
+            //         } else if evt.subsystem == "peer_status" {
+            //             // Known subsystem for mute/camera state; UI does not render it
+            //             log::debug!(
+            //                 "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
+            //                 evt.ts_ms
+            //             );
+            //         } else {
+            //             let subsystem = evt.subsystem;
+            //             log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}",
+            //                        subsystem, evt.stream_id, evt.ts_ms);
+            //         }
+            //     }
+            //     log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
+            // });
         }
         self_
     }
@@ -612,6 +620,10 @@ impl Component for AttendantsComponent {
                 log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
+                true
+            }
+            Msg::OnPeerRemoved(peer_id) => {
+                // Trigger a re-render; tiles are rebuilt from current client peer list
                 true
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
@@ -812,14 +824,16 @@ impl Component for AttendantsComponent {
         // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
-        let rows = canvas_generator::generate(
-            &self.client, // canvas_generator is client-aware for real peers' media status
-            display_peers_vec
-                .iter()
-                .take(CANVAS_LIMIT)
-                .cloned()
-                .collect(),
-        );
+        let rows: Vec<Html> = display_peers_vec
+            .iter()
+            .take(CANVAS_LIMIT)
+            .enumerate()
+            .map(|(i, peer_id)| {
+                let full_bleed = display_peers_vec.len() == 1
+                    && !self.client.is_screen_share_enabled_for_peer(peer_id);
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} client={self.client.clone()} full_bleed={full_bleed} /> }
+            })
+            .collect();
 
         // Always let the grid take the whole stage; overlays should not shrink the grid
         let container_style = format!(

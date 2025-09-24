@@ -21,7 +21,7 @@ use crate::components::neteq_chart::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use videocall_diagnostics::{DiagEvent, MetricValue};
+use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use yew::prelude::*;
 
 // Serializable versions of DiagEvent structures (with owned strings instead of &'static str)
@@ -571,32 +571,12 @@ pub struct DiagnosticsProps {
     pub is_open: bool,
     /// Callback to close the diagnostics sidebar
     pub on_close: Callback<()>,
-    /// Reception diagnostics data
-    pub diagnostics_data: Option<String>,
-    /// Sending statistics data
-    pub sender_stats: Option<String>,
-    /// Encoder settings data
-    pub encoder_settings: Option<String>,
-    /// NetEQ statistics data (JSON string) - aggregated from all peers
-    pub neteq_stats: Option<String>,
-    /// NetEQ stats per peer
-    pub neteq_stats_per_peer: HashMap<String, Vec<String>>,
-    /// NetEQ buffer history for charting (legacy, aggregated)
-    pub neteq_buffer_history: Vec<u64>,
-    /// NetEQ jitter history for charting (legacy, aggregated)
-    pub neteq_jitter_history: Vec<u64>,
-    /// NetEQ buffer history per peer
-    pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,
-    /// NetEQ jitter history per peer
-    pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,
-    /// Current video enabled state
+    /// Current video enabled state (lightweight, not diagnostics-driven)
     pub video_enabled: bool,
-    /// Current microphone enabled state
+    /// Current microphone enabled state (lightweight, not diagnostics-driven)
     pub mic_enabled: bool,
-    /// Current screen share state
+    /// Current screen share state (lightweight, not diagnostics-driven)
     pub share_screen: bool,
-    /// Connection manager diagnostics state
-    pub connection_manager_state: Option<String>,
 }
 
 fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
@@ -650,6 +630,212 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
 pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     let selected_peer = use_state(|| "All Peers".to_string());
 
+    // Local diagnostics state
+    let diagnostics_data = use_state(|| None::<String>);
+    let sender_stats = use_state(|| None::<String>);
+    let encoder_settings = use_state(|| None::<String>);
+    let connection_manager_events = use_state(|| Vec::<SerializableDiagEvent>::new());
+    let connection_manager_state = use_state(|| None::<String>);
+    let neteq_stats_per_peer = use_state(|| HashMap::<String, Vec<String>>::new());
+    let neteq_buffer_per_peer = use_state(|| HashMap::<String, Vec<u64>>::new());
+    let neteq_jitter_per_peer = use_state(|| HashMap::<String, Vec<u64>>::new());
+
+    // Subscribe/unsubscribe on open/close
+    {
+        let is_open = props.is_open;
+        let diagnostics_data = diagnostics_data.clone();
+        let sender_stats = sender_stats.clone();
+        let connection_manager_events = connection_manager_events.clone();
+        let connection_manager_state = connection_manager_state.clone();
+        let neteq_stats_per_peer = neteq_stats_per_peer.clone();
+        let neteq_buffer_per_peer = neteq_buffer_per_peer.clone();
+        let neteq_jitter_per_peer = neteq_jitter_per_peer.clone();
+        use_effect_with(is_open, move |open| {
+            // Always create an abort flag so cleanup closure type is consistent
+            let abort = std::rc::Rc::new(std::cell::Cell::new(false));
+            let abort_c = abort.clone();
+            if *open {
+                let diagnostics_data = diagnostics_data.clone();
+                let sender_stats = sender_stats.clone();
+                let connection_manager_events = connection_manager_events.clone();
+                let connection_manager_state = connection_manager_state.clone();
+                let neteq_stats_per_peer = neteq_stats_per_peer.clone();
+                let neteq_buffer_per_peer = neteq_buffer_per_peer.clone();
+                let neteq_jitter_per_peer = neteq_jitter_per_peer.clone();
+
+                wasm_bindgen_futures::spawn_local(async move {
+                    let mut rx = subscribe();
+                    while let Ok(evt) = rx.recv().await {
+                        if abort_c.get() {
+                            break;
+                        }
+
+                        match evt.subsystem {
+                            // Decoder diagnostics text
+                            s if s == "decoder" => {
+                                let mut text = String::new();
+                                for m in &evt.metrics {
+                                    match m.name {
+                                        "fps" => {
+                                            if let MetricValue::F64(v) = &m.value {
+                                                text.push_str(&format!("FPS: {:.2}\n", v));
+                                            }
+                                        }
+                                        "bitrate_kbps" => {
+                                            if let MetricValue::F64(v) = &m.value {
+                                                text.push_str(&format!("Bitrate: {:.1} kbps\n", v));
+                                            }
+                                        }
+                                        "media_type" => {
+                                            if let MetricValue::Text(t) = &m.value {
+                                                text.push_str(&format!("Media Type: {}\n", t));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if !text.is_empty() {
+                                    if let Some(peer_id) = evt.stream_id.clone() {
+                                        text.push_str(&format!(
+                                            "Peer: {}\nTimestamp: {}\n",
+                                            peer_id, evt.ts_ms
+                                        ));
+                                    }
+                                    diagnostics_data.set(Some(text));
+                                }
+                            }
+                            // Sender diagnostics text
+                            s if s == "sender" => {
+                                let mut text = String::new();
+                                for m in &evt.metrics {
+                                    match m.name {
+                                        "sender_id" => {
+                                            if let MetricValue::Text(v) = &m.value {
+                                                text.push_str(&format!("Sender: {}\n", v));
+                                            }
+                                        }
+                                        "target_id" => {
+                                            if let MetricValue::Text(v) = &m.value {
+                                                text.push_str(&format!("Target: {}\n", v));
+                                            }
+                                        }
+                                        "media_type" => {
+                                            if let MetricValue::Text(v) = &m.value {
+                                                text.push_str(&format!("Media Type: {}\n", v));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if !text.is_empty() {
+                                    text.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
+                                    sender_stats.set(Some(text));
+                                }
+                            }
+                            // NetEq metrics
+                            s if s == "neteq" => {
+                                for m in &evt.metrics {
+                                    match m.name {
+                                        "stats_json" => {
+                                            if let MetricValue::Text(json) = &m.value {
+                                                let stream_id =
+                                                    evt.stream_id.clone().unwrap_or_else(|| {
+                                                        "unknown->unknown".to_string()
+                                                    });
+                                                let parts: Vec<&str> =
+                                                    stream_id.split("->").collect();
+                                                let (_reporting_peer, target_peer) =
+                                                    if parts.len() == 2 {
+                                                        (parts[0], parts[1])
+                                                    } else {
+                                                        ("unknown", "unknown")
+                                                    };
+                                                let mut map = (*neteq_stats_per_peer).clone();
+                                                let entry =
+                                                    map.entry(target_peer.to_string()).or_default();
+                                                entry.push(json.clone());
+                                                if entry.len() > 60 {
+                                                    entry.remove(0);
+                                                }
+                                                neteq_stats_per_peer.set(map);
+                                            }
+                                        }
+                                        "audio_buffer_ms" => {
+                                            if let MetricValue::U64(v) = &m.value {
+                                                let stream_id =
+                                                    evt.stream_id.clone().unwrap_or_else(|| {
+                                                        "unknown->unknown".to_string()
+                                                    });
+                                                let parts: Vec<&str> =
+                                                    stream_id.split("->").collect();
+                                                let (_reporting_peer, target_peer) =
+                                                    if parts.len() == 2 {
+                                                        (parts[0], parts[1])
+                                                    } else {
+                                                        ("unknown", "unknown")
+                                                    };
+                                                let mut map = (*neteq_buffer_per_peer).clone();
+                                                let entry =
+                                                    map.entry(target_peer.to_string()).or_default();
+                                                entry.push(*v);
+                                                if entry.len() > 50 {
+                                                    entry.remove(0);
+                                                }
+                                                neteq_buffer_per_peer.set(map);
+                                            }
+                                        }
+                                        "jitter_buffer_delay_ms" => {
+                                            if let MetricValue::U64(v) = &m.value {
+                                                let stream_id =
+                                                    evt.stream_id.clone().unwrap_or_else(|| {
+                                                        "unknown->unknown".to_string()
+                                                    });
+                                                let parts: Vec<&str> =
+                                                    stream_id.split("->").collect();
+                                                let (_reporting_peer, target_peer) =
+                                                    if parts.len() == 2 {
+                                                        (parts[0], parts[1])
+                                                    } else {
+                                                        ("unknown", "unknown")
+                                                    };
+                                                let mut map = (*neteq_jitter_per_peer).clone();
+                                                let entry =
+                                                    map.entry(target_peer.to_string()).or_default();
+                                                entry.push(*v);
+                                                if entry.len() > 50 {
+                                                    entry.remove(0);
+                                                }
+                                                neteq_jitter_per_peer.set(map);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            // Connection manager state accumulation
+                            s if s == "connection_manager" => {
+                                let mut vec = (*connection_manager_events).clone();
+                                vec.push(SerializableDiagEvent::from(evt));
+                                if vec.len() > 20 {
+                                    vec.remove(0);
+                                }
+                                let serialized = serde_json::to_string(&vec).unwrap_or_default();
+                                connection_manager_events.set(vec);
+                                connection_manager_state.set(Some(serialized));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
+            // Cleanup: signal abort; if we didn't start, this is harmless
+            move || {
+                abort.set(true);
+            }
+        });
+    }
+
     let close_handler = {
         let on_close = props.on_close.clone();
         Callback::from(move |_| {
@@ -657,10 +843,10 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         })
     };
 
-    // Get list of available peers
+    // Get list of available peers (from local state)
     let available_peers: Vec<String> = {
         let mut peers = vec!["All Peers".to_string()];
-        let mut peer_keys: Vec<String> = props.neteq_stats_per_peer.keys().cloned().collect();
+        let mut peer_keys: Vec<String> = neteq_stats_per_peer.keys().cloned().collect();
         peer_keys.sort();
         peers.extend(peer_keys);
         peers
@@ -668,41 +854,43 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
 
     // Parse NetEQ stats based on selected peer
     let neteq_stats_history = if *selected_peer == "All Peers" {
-        let result = props
-            .neteq_stats
-            .as_ref()
-            .map(|stats_str| parse_neteq_stats_history(stats_str))
-            .unwrap_or_default();
-        result
+        // Aggregate all peers' NetEq stats
+        let mut all = Vec::new();
+        for (_peer, stats) in neteq_stats_per_peer.iter() {
+            all.extend(stats.clone());
+        }
+        if all.is_empty() {
+            Vec::new()
+        } else {
+            parse_neteq_stats_history(&all.join("\n"))
+        }
     } else {
-        let result = props
-            .neteq_stats_per_peer
+        neteq_stats_per_peer
             .get(&*selected_peer)
-            .map(|peer_stats| {
-                let joined = peer_stats.join("\n");
-                parse_neteq_stats_history(&joined)
-            })
-            .unwrap_or_default();
-        result
+            .map(|peer_stats| parse_neteq_stats_history(&peer_stats.join("\n")))
+            .unwrap_or_default()
     };
 
     let latest_neteq_stats = neteq_stats_history.last().cloned();
 
     // Get buffer and jitter history for selected peer
     let (buffer_history, jitter_history) = if *selected_peer == "All Peers" {
-        (
-            props.neteq_buffer_history.clone(),
-            props.neteq_jitter_history.clone(),
-        )
+        let mut aggregated_buffer = Vec::new();
+        for buf in neteq_buffer_per_peer.values() {
+            aggregated_buffer.extend(buf.iter().cloned());
+        }
+        let mut aggregated_jitter = Vec::new();
+        for jit in neteq_jitter_per_peer.values() {
+            aggregated_jitter.extend(jit.iter().cloned());
+        }
+        (aggregated_buffer, aggregated_jitter)
     } else {
         (
-            props
-                .neteq_buffer_per_peer
+            neteq_buffer_per_peer
                 .get(&*selected_peer)
                 .cloned()
                 .unwrap_or_default(),
-            props
-                .neteq_jitter_per_peer
+            neteq_jitter_per_peer
                 .get(&*selected_peer)
                 .cloned()
                 .unwrap_or_default(),
@@ -735,7 +923,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 // Connection Manager Status - Now at the top for visibility
                 <div class="diagnostics-section">
                     <h3>{"Connection Manager"}</h3>
-                    <ConnectionManagerDisplay connection_manager_state={props.connection_manager_state.clone()} />
+                    <ConnectionManagerDisplay connection_manager_state={(*connection_manager_state).clone()} />
                 </div>
 
                 // Peer Selection
@@ -845,10 +1033,10 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                     <div class="diagnostics-section">
                         <h3>{"Per-Peer Summary"}</h3>
                         <div class="peer-summary">
-                            {for props.neteq_stats_per_peer.keys().map(|peer_id| {
-                                let peer_buffer = props.neteq_buffer_per_peer.get(peer_id);
+                            {for neteq_stats_per_peer.keys().map(|peer_id| {
+                                let peer_buffer = neteq_buffer_per_peer.get(peer_id);
                                 let latest_buffer = peer_buffer.and_then(|b| b.last()).unwrap_or(&0);
-                                let peer_jitter = props.neteq_jitter_per_peer.get(peer_id);
+                                let peer_jitter = neteq_jitter_per_peer.get(peer_id);
                                 let latest_jitter = peer_jitter.and_then(|j| j.last()).unwrap_or(&0);
 
                                 html! {
@@ -867,7 +1055,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                     <div class="diagnostics-section">
                         <h3>{"Reception Stats"}</h3>
                         {
-                            if let Some(data) = &props.diagnostics_data {
+                            if let Some(data) = &*diagnostics_data {
                                 html! { <pre>{ data }</pre> }
                             } else {
                                 html! { <p>{"No reception data available."}</p> }
@@ -877,7 +1065,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                     <div class="diagnostics-section">
                         <h3>{"Sending Stats"}</h3>
                         {
-                            if let Some(data) = &props.sender_stats {
+                            if let Some(data) = &*sender_stats {
                                 html! { <pre>{ data }</pre> }
                             } else {
                                 html! { <p>{"No sending data available."}</p> }
@@ -887,7 +1075,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                     <div class="diagnostics-section">
                         <h3>{"Encoder Settings"}</h3>
                         {
-                            if let Some(data) = &props.encoder_settings {
+                            if let Some(data) = &*encoder_settings {
                                 html! { <pre>{ data }</pre> }
                             } else {
                                 html! { <p>{"No encoder settings available."}</p> }

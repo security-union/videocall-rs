@@ -32,7 +32,7 @@ use serde_json;
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
-use videocall_diagnostics::{subscribe, MetricValue};
+// Diagnostics subscription moved to Diagnostics component; no imports needed here
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -84,10 +84,6 @@ pub enum Msg {
     RemoveLastFakePeer,
     #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
-    NetEqStatsUpdated(String, String), // (peer_id, stats_json)
-    NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
-    NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
-    ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
     HangUp,
     ShowCopyToast(bool),
 }
@@ -736,56 +732,6 @@ impl Component for AttendantsComponent {
                 self.simulation_info_message = None;
                 true
             }
-            Msg::NetEqStatsUpdated(peer_id, stats_json) => {
-                self.neteq_stats = Some(stats_json.clone());
-
-                // Accumulate stats history per peer for dashboard charts
-                let peer_stats = self
-                    .neteq_stats_per_peer
-                    .entry(peer_id.clone())
-                    .or_default();
-                peer_stats.push(stats_json);
-                if peer_stats.len() > 60 {
-                    peer_stats.remove(0);
-                } // keep last 60 entries (60 seconds of data)
-                true
-            }
-            Msg::NetEqBufferUpdated(peer_id, buffer_value) => {
-                let peer_buffer = self.neteq_buffer_per_peer.entry(peer_id).or_default();
-                peer_buffer.push(buffer_value);
-                if peer_buffer.len() > 50 {
-                    peer_buffer.remove(0);
-                } // keep last 50
-                false
-            }
-            Msg::NetEqJitterUpdated(peer_id, jitter_value) => {
-                let peer_jitter = self.neteq_jitter_per_peer.entry(peer_id).or_default();
-                peer_jitter.push(jitter_value);
-                if peer_jitter.len() > 50 {
-                    peer_jitter.remove(0);
-                }
-                false
-            }
-            Msg::ConnectionManagerUpdate(event_json) => {
-                // Parse the SerializableDiagEvent from JSON
-                if let Ok(event) = serde_json::from_str::<SerializableDiagEvent>(&event_json) {
-                    // Accumulate connection manager events
-                    self.connection_manager_events.push(event);
-
-                    // Keep only the last 20 events to avoid memory bloat
-                    if self.connection_manager_events.len() > 20 {
-                        self.connection_manager_events.remove(0);
-                    }
-
-                    // Serialize the accumulated events for the diagnostics component
-                    if let Ok(serialized) = serde_json::to_string(&self.connection_manager_events) {
-                        self.connection_manager_state = Some(serialized);
-                    }
-                } else {
-                    log::error!("AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {event_json}");
-                }
-                true
-            }
             Msg::ShowCopyToast(show) => {
                 self.show_copy_toast = show;
                 if show {
@@ -1211,40 +1157,19 @@ impl Component for AttendantsComponent {
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
-                <Diagnostics
-                    is_open={self.diagnostics_open}
-                    on_close={close_diagnostics}
-                    diagnostics_data={self.diagnostics_data.clone()}
-                    sender_stats={self.sender_stats.clone()}
-                    encoder_settings={self.encoder_settings.clone()}
-                    neteq_stats={
-                        let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
-                        if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
-                    }
-                    neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
-                    neteq_buffer_history={
-                        // Aggregate all peers' buffer history, taking the most recent from each
-                        let mut aggregated_buffer = Vec::new();
-                        for peer_buffer in self.neteq_buffer_per_peer.values() {
-                            aggregated_buffer.extend(peer_buffer.iter().cloned());
+                {
+                    if self.diagnostics_open {
+                        html!{
+                            <Diagnostics
+                                is_open={true}
+                                on_close={close_diagnostics}
+                                video_enabled={self.video_enabled}
+                                mic_enabled={self.mic_enabled}
+                                share_screen={self.share_screen}
+                            />
                         }
-                        aggregated_buffer
-                    }
-                    neteq_jitter_history={
-                        // Aggregate all peers' jitter history, taking the most recent from each
-                        let mut aggregated_jitter = Vec::new();
-                        for peer_jitter in self.neteq_jitter_per_peer.values() {
-                            aggregated_jitter.extend(peer_jitter.iter().cloned());
-                        }
-                        aggregated_jitter
-                    }
-                    neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
-                    neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
-                    video_enabled={self.video_enabled}
-                    mic_enabled={self.mic_enabled}
-                    share_screen={self.share_screen}
-                    connection_manager_state={self.connection_manager_state.clone()}
-                />
+                    } else { html!{} }
+                }
             </div>
         }
     }

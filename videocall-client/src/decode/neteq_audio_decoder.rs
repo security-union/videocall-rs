@@ -13,7 +13,6 @@ use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture as _; // used in async closures
 use web_sys::{AudioContext, AudioWorkletNode, MessageEvent, Worker};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,7 +56,7 @@ enum WorkerResponse {
 #[derive(Debug)]
 pub struct NetEqAudioPeerDecoder {
     worker: Worker,
-    audio_context: AudioContext,
+    _audio_context: AudioContext,
     decoded: bool,
     peer_id: String, // Track which peer this decoder belongs to
     _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
@@ -132,8 +131,8 @@ impl NetEqAudioPeerDecoder {
         SharedAudioContext::ensure_pcm_worklet(worklet_code);
 
         // Create per-peer nodes
-        let (pcm_player, _peer_gain) = SharedAudioContext::create_peer_playback_nodes(&"safari")
-            .map_err(|e| JsValue::from(e))?;
+        let (pcm_player, _peer_gain) =
+            SharedAudioContext::create_peer_playback_nodes("safari").map_err(JsValue::from)?;
 
         Ok((audio_context, pcm_player))
     }
@@ -425,7 +424,7 @@ impl NetEqAudioPeerDecoder {
         // Create decoder with explicit mute state first
         let mut decoder = Self {
             worker: worker.clone(),
-            audio_context: audio_context.clone(),
+            _audio_context: audio_context.clone(),
             decoded: false,
             peer_id: peer_id.clone(),
             _pcm_player: pcm_player_ref.clone(),

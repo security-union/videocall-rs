@@ -645,6 +645,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         let is_open = props.is_open;
         let diagnostics_data = diagnostics_data.clone();
         let sender_stats = sender_stats.clone();
+        let encoder_settings = encoder_settings.clone();
         let connection_manager_events = connection_manager_events.clone();
         let connection_manager_state = connection_manager_state.clone();
         let neteq_stats_per_peer = neteq_stats_per_peer.clone();

@@ -222,7 +222,7 @@ impl AttendantsComponent {
             on_peer_removed: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |peer_id: String| {
-                    log::info!("Peer removed: {}", peer_id);
+                    log::info!("Peer removed: {peer_id}");
                     link.send_message(Msg::OnPeerRemoved(peer_id));
                 })
             }),

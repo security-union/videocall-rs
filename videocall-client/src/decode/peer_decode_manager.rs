@@ -19,6 +19,7 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
+use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
@@ -498,37 +499,16 @@ impl PeerDecodeManager {
         None
     }
 
-    /// Updates the speaker device for all connected peers by rebuilding their audio decoders
+    /// Updates the speaker device by switching the sink on the shared AudioContext
     pub fn update_speaker_device(
         &mut self,
         speaker_device_id: Option<String>,
     ) -> Result<(), JsValue> {
-        let keys: Vec<String> = self.connected_peers.ordered_keys().clone();
-
-        for key in keys {
-            if let Some(peer) = self.connected_peers.get_mut(&key) {
-                // Preserve current mute state
-                let current_muted = !peer.audio_enabled;
-
-                // Create a new audio decoder with the new speaker device
-                match create_audio_peer_decoder(speaker_device_id.clone(), key.clone()) {
-                    Ok(mut new_audio_decoder) => {
-                        // Restore the mute state to the new decoder
-                        new_audio_decoder.set_muted(current_muted);
-
-                        // Replace the old decoder with the new one
-                        peer.audio = new_audio_decoder;
-                        log::info!("Successfully rebuilt audio decoder for peer: {key} with speaker device (muted: {current_muted})");
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to rebuild audio decoder for peer: {key}, error: {e:?}"
-                        );
-                        // Keep the old decoder rather than breaking audio completely
-                    }
-                }
-            }
-        }
+        log::info!(
+            "Updating shared AudioContext sink to {:?} (no decoder rebuild)",
+            speaker_device_id
+        );
+        SharedAudioContext::update_speaker_device(speaker_device_id)?;
         Ok(())
     }
 }

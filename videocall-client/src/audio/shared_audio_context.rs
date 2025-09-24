@@ -1,7 +1,5 @@
 use std::cell::RefCell;
-use std::rc::Rc;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{AudioContext, AudioContextOptions, AudioWorkletNode, GainNode};
 
@@ -13,6 +11,7 @@ struct Shared {
     context: AudioContext,
     master_gain: GainNode,
     worklet_registered: bool,
+    current_device_id: Option<String>,
 }
 
 pub struct SharedAudioContext;
@@ -36,6 +35,11 @@ impl SharedAudioContext {
 
             let ctx = AudioContext::new_with_context_options(&options)?;
 
+            let master_gain = ctx.create_gain()?;
+            master_gain.gain().set_value(1.0);
+            master_gain.connect_with_audio_node(&ctx.destination())?;
+
+            // Apply sink id on the AudioContext if supported
             if let Some(id) = device_id.as_ref() {
                 if js_sys::Reflect::has(&ctx, &JsValue::from_str("setSinkId")).unwrap_or(false) {
                     let p = ctx.set_sink_id_with_str(id);
@@ -45,36 +49,55 @@ impl SharedAudioContext {
                 }
             }
 
-            let master_gain = ctx.create_gain()?;
-            master_gain.gain().set_value(1.0);
-            master_gain.connect_with_audio_node(&ctx.destination())?;
-
             SHARED.with(|cell| {
                 *cell.borrow_mut() = Some(Shared {
                     context: ctx.clone(),
                     master_gain,
                     worklet_registered: false,
+                    current_device_id: device_id.clone(),
                 });
             });
 
             return Ok(ctx);
         }
 
+        // Existing context: if a new device id is provided and differs, update sink on AudioContext
+        if let Some(new_id) = device_id.as_ref() {
+            SHARED.with(|cell| {
+                if let Some(shared) = cell.borrow_mut().as_mut() {
+                    if shared.current_device_id.as_ref() != Some(new_id) {
+                        if js_sys::Reflect::has(&shared.context, &JsValue::from_str("setSinkId"))
+                            .unwrap_or(false)
+                        {
+                            let p = shared.context.set_sink_id_with_str(new_id);
+                            wasm_bindgen_futures::spawn_local(async move {
+                                let _ = JsFuture::from(p).await;
+                            });
+                        }
+                        shared.current_device_id = Some(new_id.clone());
+                    }
+                }
+            });
+        }
+
         Ok(current.expect("shared audio context should be initialized"))
     }
 
-    pub async fn update_speaker_device(device_id: Option<String>) -> Result<(), JsValue> {
+    pub fn update_speaker_device(device_id: Option<String>) -> Result<(), JsValue> {
         SHARED.with(|cell| {
-            if let Some(shared) = cell.borrow().as_ref() {
-                if let Some(id) = device_id.as_ref() {
-                    if js_sys::Reflect::has(&shared.context, &JsValue::from_str("setSinkId"))
-                        .unwrap_or(false)
-                    {
-                        let p = shared.context.set_sink_id_with_str(id);
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let _ = JsFuture::from(p).await;
-                        });
+            if let Some(shared) = cell.borrow_mut().as_mut() {
+                if shared.current_device_id != device_id {
+                    if let Some(id) = device_id.as_ref() {
+                        if js_sys::Reflect::has(&shared.context, &JsValue::from_str("setSinkId"))
+                            .unwrap_or(false)
+                        {
+                            let p = shared.context.set_sink_id_with_str(id);
+                            wasm_bindgen_futures::spawn_local(async move {
+                                let _ = JsFuture::from(p).await;
+                            });
+                        }
                     }
+                    shared.current_device_id = device_id.clone();
                 }
             }
         });

@@ -125,12 +125,12 @@ impl NetEqAudioPeerDecoder {
     async fn create_safari_audio_context(
         speaker_device_id: Option<String>,
     ) -> Result<(AudioContext, AudioWorkletNode), JsValue> {
-        // Use shared context and register worklet once
+        // Use shared context and ensure worklet is registered before creating node
         let audio_context = SharedAudioContext::get_or_init(speaker_device_id.clone())?;
         let worklet_code = include_str!("../../../neteq/src/scripts/pcmPlayerWorker.js");
-        SharedAudioContext::ensure_pcm_worklet(worklet_code);
+        SharedAudioContext::ensure_pcm_worklet_ready(worklet_code).await?;
 
-        // Create per-peer nodes
+        // Create per-peer nodes after registration completes
         let (pcm_player, _peer_gain) = SharedAudioContext::create_peer_playback_nodes("safari")?;
 
         Ok((audio_context, pcm_player))

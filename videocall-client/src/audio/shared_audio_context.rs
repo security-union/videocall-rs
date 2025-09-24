@@ -1,3 +1,4 @@
+use js_sys::Promise;
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -12,6 +13,7 @@ struct Shared {
     master_gain: GainNode,
     worklet_registered: bool,
     current_device_id: Option<String>,
+    register_promise: Option<Promise>,
 }
 
 pub struct SharedAudioContext;
@@ -55,6 +57,7 @@ impl SharedAudioContext {
                     master_gain,
                     worklet_registered: false,
                     current_device_id: device_id.clone(),
+                    register_promise: None,
                 });
             });
 
@@ -105,50 +108,70 @@ impl SharedAudioContext {
     }
 
     pub fn ensure_pcm_worklet(worklet_js: &str) {
-        let mut needs_registration = false;
-        let ctx = match Self::require_context() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        SHARED.with(|cell| {
-            if let Some(shared) = cell.borrow().as_ref() {
-                if !shared.worklet_registered {
-                    needs_registration = true;
-                }
+        wasm_bindgen_futures::spawn_local({
+            let js = worklet_js.to_string();
+            async move {
+                let _ = Self::ensure_pcm_worklet_ready(&js).await;
             }
         });
-        if !needs_registration {
-            return;
+    }
+
+    pub async fn ensure_pcm_worklet_ready(worklet_js: &str) -> Result<(), JsValue> {
+        // Fast path: already registered
+        let already_registered = SHARED.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|s| s.worklet_registered)
+                .unwrap_or(false)
+        });
+        if already_registered {
+            return Ok(());
         }
-        let js = worklet_js.to_string();
-        wasm_bindgen_futures::spawn_local(async move {
-            let blob_parts = js_sys::Array::new();
-            blob_parts.push(&JsValue::from_str(&js));
-            let blob_opts = web_sys::BlobPropertyBag::new();
-            blob_opts.set_type("application/javascript");
-            let blob =
-                match web_sys::Blob::new_with_str_sequence_and_options(&blob_parts, &blob_opts) {
-                    Ok(b) => b,
-                    Err(_) => return,
-                };
-            let url = match web_sys::Url::create_object_url_with_blob(&blob) {
-                Ok(u) => u,
-                Err(_) => return,
-            };
-            let _ = async {
-                let worklet = ctx.audio_worklet()?;
-                let p = worklet.add_module(&url)?;
-                JsFuture::from(p).await?;
-                web_sys::Url::revoke_object_url(&url)?;
-                Result::<(), JsValue>::Ok(())
+
+        // If a registration is already in-flight, await it
+        if let Some(existing_promise) = SHARED.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|s| s.register_promise.as_ref().cloned())
+        }) {
+            JsFuture::from(existing_promise).await?;
+            return Ok(());
+        }
+
+        // Start a new registration
+        let ctx = Self::require_context()?;
+
+        let blob_parts = js_sys::Array::new();
+        blob_parts.push(&JsValue::from_str(worklet_js));
+        let blob_opts = web_sys::BlobPropertyBag::new();
+        blob_opts.set_type("application/javascript");
+        let blob = web_sys::Blob::new_with_str_sequence_and_options(&blob_parts, &blob_opts)?;
+
+        let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+        let worklet = ctx.audio_worklet()?;
+        let promise = worklet.add_module(&url)?;
+
+        // Record the in-flight promise so concurrent callers can await it
+        SHARED.with(|cell| {
+            if let Some(shared) = cell.borrow_mut().as_mut() {
+                shared.register_promise = Some(promise.clone());
             }
-            .await;
-            SHARED.with(|cell| {
-                if let Some(shared) = cell.borrow_mut().as_mut() {
-                    shared.worklet_registered = true;
-                }
-            });
         });
+
+        // Await registration, then clean up and mark as registered
+        let result = JsFuture::from(promise).await;
+        // Always try to revoke the URL
+        let _ = web_sys::Url::revoke_object_url(&url);
+        result?;
+
+        SHARED.with(|cell| {
+            if let Some(shared) = cell.borrow_mut().as_mut() {
+                shared.worklet_registered = true;
+                shared.register_promise = None;
+            }
+        });
+
+        Ok(())
     }
 
     pub fn create_peer_playback_nodes(

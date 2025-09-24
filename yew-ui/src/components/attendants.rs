@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
     browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics, host::Host,
     peer_list::PeerList, peer_tile::PeerTile,
@@ -28,8 +27,7 @@ use crate::constants::{
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
-use serde_json;
-use std::collections::HashMap;
+// serde_json and HashMap no longer needed here
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 // Diagnostics subscription moved to Diagnostics component; no imports needed here
@@ -48,8 +46,6 @@ pub enum WsAction {
     MediaPermissionsGranted,
     MediaPermissionsError(String),
     Log(String),
-    DiagnosticsUpdated(String),
-    SenderStatsUpdated(String),
     EncoderSettingsUpdated(String),
 }
 
@@ -129,16 +125,8 @@ pub struct AttendantsComponent {
     pub diagnostics_open: bool,
     pub device_settings_open: bool,
     pub error: Option<String>,
-    pub diagnostics_data: Option<String>,
-    pub sender_stats: Option<String>,
     pub encoder_settings: Option<String>,
     pub mic_error: Option<String>,
-    pub neteq_stats: Option<String>,
-    pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
-    pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
-    pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
-    pub connection_manager_state: Option<String>, // connection manager diagnostics (serialized)
-    pub connection_manager_events: Vec<SerializableDiagEvent>, // accumulate individual events
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -348,16 +336,8 @@ impl Component for AttendantsComponent {
             diagnostics_open: false,
             device_settings_open: false,
             error: None,
-            diagnostics_data: None,
-            sender_stats: None,
             encoder_settings: None,
             mic_error: None,
-            neteq_stats: None,
-            neteq_stats_per_peer: HashMap::new(),
-            neteq_buffer_per_peer: HashMap::new(),
-            neteq_jitter_per_peer: HashMap::new(),
-            connection_manager_state: None,
-            connection_manager_events: Vec::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -598,15 +578,6 @@ impl Component for AttendantsComponent {
                     self.meeting_joined = false; // Stay on join screen if permissions denied
                     true
                 }
-                WsAction::DiagnosticsUpdated(stats) => {
-                    log::debug!("YEW-UI: Diagnostics UI updated: {stats}");
-                    self.diagnostics_data = Some(stats);
-                    true
-                }
-                WsAction::SenderStatsUpdated(stats) => {
-                    self.sender_stats = Some(stats);
-                    true
-                }
                 WsAction::EncoderSettingsUpdated(settings) => {
                     self.encoder_settings = Some(settings);
                     true
@@ -618,7 +589,7 @@ impl Component for AttendantsComponent {
                 Self::play_user_joined();
                 true
             }
-            Msg::OnPeerRemoved(peer_id) => {
+            Msg::OnPeerRemoved(_peer_id) => {
                 // Trigger a re-render; tiles are rebuilt from current client peer list
                 true
             }

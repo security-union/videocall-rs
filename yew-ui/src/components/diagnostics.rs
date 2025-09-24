@@ -634,11 +634,11 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     let diagnostics_data = use_state(|| None::<String>);
     let sender_stats = use_state(|| None::<String>);
     let encoder_settings = use_state(|| None::<String>);
-    let connection_manager_events = use_state(|| Vec::<SerializableDiagEvent>::new());
+    let connection_manager_events = use_state(Vec::<SerializableDiagEvent>::new);
     let connection_manager_state = use_state(|| None::<String>);
-    let neteq_stats_per_peer = use_state(|| HashMap::<String, Vec<String>>::new());
-    let neteq_buffer_per_peer = use_state(|| HashMap::<String, Vec<u64>>::new());
-    let neteq_jitter_per_peer = use_state(|| HashMap::<String, Vec<u64>>::new());
+    let neteq_stats_per_peer = use_state(HashMap::<String, Vec<String>>::new);
+    let neteq_buffer_per_peer = use_state(HashMap::<String, Vec<u64>>::new);
+    let neteq_jitter_per_peer = use_state(HashMap::<String, Vec<u64>>::new);
 
     // Subscribe/unsubscribe on open/close
     {
@@ -672,23 +672,23 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
 
                         match evt.subsystem {
                             // Decoder diagnostics text
-                            s if s == "decoder" => {
+                            "decoder" => {
                                 let mut text = String::new();
                                 for m in &evt.metrics {
                                     match m.name {
                                         "fps" => {
                                             if let MetricValue::F64(v) = &m.value {
-                                                text.push_str(&format!("FPS: {:.2}\n", v));
+                                                text.push_str(&format!("FPS: {v:.2}\n"));
                                             }
                                         }
                                         "bitrate_kbps" => {
                                             if let MetricValue::F64(v) = &m.value {
-                                                text.push_str(&format!("Bitrate: {:.1} kbps\n", v));
+                                                text.push_str(&format!("Bitrate: {v:.1} kbps\n"));
                                             }
                                         }
                                         "media_type" => {
                                             if let MetricValue::Text(t) = &m.value {
-                                                text.push_str(&format!("Media Type: {}\n", t));
+                                                text.push_str(&format!("Media Type: {t}\n"));
                                             }
                                         }
                                         _ => {}
@@ -705,23 +705,23 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                 }
                             }
                             // Sender diagnostics text
-                            s if s == "sender" => {
+                            "sender" => {
                                 let mut text = String::new();
                                 for m in &evt.metrics {
                                     match m.name {
                                         "sender_id" => {
                                             if let MetricValue::Text(v) = &m.value {
-                                                text.push_str(&format!("Sender: {}\n", v));
+                                                text.push_str(&format!("Sender: {v}\n"));
                                             }
                                         }
                                         "target_id" => {
                                             if let MetricValue::Text(v) = &m.value {
-                                                text.push_str(&format!("Target: {}\n", v));
+                                                text.push_str(&format!("Target: {v}\n"));
                                             }
                                         }
                                         "media_type" => {
                                             if let MetricValue::Text(v) = &m.value {
-                                                text.push_str(&format!("Media Type: {}\n", v));
+                                                text.push_str(&format!("Media Type: {v}\n"));
                                             }
                                         }
                                         _ => {}
@@ -733,7 +733,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                 }
                             }
                             // NetEq metrics
-                            s if s == "neteq" => {
+                            "neteq" => {
                                 for m in &evt.metrics {
                                     match m.name {
                                         "stats_json" => {
@@ -813,7 +813,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                 }
                             }
                             // Connection manager state accumulation
-                            s if s == "connection_manager" => {
+                            "connection_manager" => {
                                 let mut vec = (*connection_manager_events).clone();
                                 vec.push(SerializableDiagEvent::from(evt));
                                 if vec.len() > 20 {

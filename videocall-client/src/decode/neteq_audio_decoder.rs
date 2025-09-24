@@ -131,8 +131,7 @@ impl NetEqAudioPeerDecoder {
         SharedAudioContext::ensure_pcm_worklet(worklet_code);
 
         // Create per-peer nodes
-        let (pcm_player, _peer_gain) =
-            SharedAudioContext::create_peer_playback_nodes("safari").map_err(JsValue::from)?;
+        let (pcm_player, _peer_gain) = SharedAudioContext::create_peer_playback_nodes("safari")?;
 
         Ok((audio_context, pcm_player))
     }

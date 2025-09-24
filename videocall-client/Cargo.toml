@@ -46,7 +46,6 @@ serde_json = { version = "1.0" }
 async-broadcast = "0.7.2"
 
 [features]
-neteq_ff = ["neteq"]
 default = []
 
 [dependencies.web-sys]

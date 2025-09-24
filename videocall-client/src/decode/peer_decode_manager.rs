@@ -307,6 +307,10 @@ impl Peer {
                                 "video_enabled",
                                 if metadata.video_enabled { 1u64 } else { 0u64 }
                             ),
+                            metric!(
+                                "screen_enabled",
+                                if metadata.screen_enabled { 1u64 } else { 0u64 }
+                            ),
                         ],
                     };
                     let _ = global_sender().try_broadcast(evt);

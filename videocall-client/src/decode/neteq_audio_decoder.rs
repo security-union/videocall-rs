@@ -15,6 +15,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{AudioContext, AudioWorkletNode, MessageEvent, Worker};
 
+const WORKLET_CODE: &str = include_str!("../scripts/pcmPlayerWorker.js");
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 enum WorkerMsg {
@@ -127,8 +129,7 @@ impl NetEqAudioPeerDecoder {
     ) -> Result<(AudioContext, AudioWorkletNode), JsValue> {
         // Use shared context and ensure worklet is registered before creating node
         let audio_context = SharedAudioContext::get_or_init(speaker_device_id.clone())?;
-        let worklet_code = include_str!("../../../neteq/src/scripts/pcmPlayerWorker.js");
-        SharedAudioContext::ensure_pcm_worklet_ready(worklet_code).await?;
+        SharedAudioContext::ensure_pcm_worklet_ready(WORKLET_CODE).await?;
 
         // Create per-peer nodes after registration completes
         let (pcm_player, _peer_gain) = SharedAudioContext::create_peer_playback_nodes("safari")?;
@@ -415,8 +416,7 @@ impl NetEqAudioPeerDecoder {
 
         // Use shared AudioContext and ensure worklet registered once
         let audio_context = SharedAudioContext::get_or_init(speaker_device_id.clone())?;
-        let worklet_code = include_str!("../../../neteq/src/scripts/pcmPlayerWorker.js");
-        SharedAudioContext::ensure_pcm_worklet(worklet_code);
+        SharedAudioContext::ensure_pcm_worklet(WORKLET_CODE);
 
         let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
 

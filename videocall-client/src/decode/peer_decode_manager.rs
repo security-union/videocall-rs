@@ -505,8 +505,7 @@ impl PeerDecodeManager {
         speaker_device_id: Option<String>,
     ) -> Result<(), JsValue> {
         log::info!(
-            "Updating shared AudioContext sink to {:?} (no decoder rebuild)",
-            speaker_device_id
+            "Updating shared AudioContext sink to {speaker_device_id:?} (no decoder rebuild)",
         );
         SharedAudioContext::update_speaker_device(speaker_device_id)?;
         Ok(())

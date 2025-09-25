@@ -18,6 +18,7 @@
  */
 
 use crate::components::canvas_generator::generate_for_peer;
+use futures::future::{AbortHandle, Abortable};
 use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use yew::prelude::*;
@@ -39,6 +40,7 @@ pub struct PeerTile {
     audio_enabled: bool,
     video_enabled: bool,
     screen_enabled: bool,
+    abort_handle: Option<AbortHandle>,
 }
 
 impl Component for PeerTile {
@@ -50,6 +52,7 @@ impl Component for PeerTile {
             audio_enabled: false,
             video_enabled: false,
             screen_enabled: false,
+            abort_handle: None,
         }
     }
 
@@ -71,11 +74,17 @@ impl Component for PeerTile {
 
             // Subscribe to global diagnostics for peer_status updates
             let link = ctx.link().clone();
-            wasm_bindgen_futures::spawn_local(async move {
+            let (abort_handle, abort_reg) = AbortHandle::new_pair();
+            let fut = async move {
                 let mut rx = subscribe();
                 while let Ok(evt) = rx.recv().await {
                     link.send_message(Msg::Diagnostics(evt));
                 }
+            };
+            let abortable = Abortable::new(fut, abort_reg);
+            self.abort_handle = Some(abort_handle);
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = abortable.await;
             });
         }
     }
@@ -136,5 +145,11 @@ impl Component for PeerTile {
             &ctx.props().peer_id,
             ctx.props().full_bleed,
         )
+    }
+
+    fn destroy(&mut self, _ctx: &Context<Self>) {
+        if let Some(handle) = self.abort_handle.take() {
+            handle.abort();
+        }
     }
 }

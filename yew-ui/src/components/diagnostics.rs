@@ -19,6 +19,7 @@
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
+use futures::future::{AbortHandle, Abortable};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
@@ -652,14 +653,10 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         let neteq_buffer_per_peer = neteq_buffer_per_peer.clone();
         let neteq_jitter_per_peer = neteq_jitter_per_peer.clone();
         use_effect_with(is_open, move |open| {
-            // Always create an abort flag so cleanup closure type is consistent
-            let abort = std::rc::Rc::new(std::cell::Cell::new(false));
-            let abort_c = abort.clone();
-            let cleanup = {
-                let abort = abort.clone();
-                move || {
-                    abort.set(true);
-                }
+            // Abortable subscription so we can stop immediately when closing
+            let (abort_handle, abort_reg) = AbortHandle::new_pair();
+            let cleanup = move || {
+                abort_handle.abort();
             };
 
             if !*open {
@@ -683,13 +680,9 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
             let neteq_buffer_per_peer = neteq_buffer_per_peer.clone();
             let neteq_jitter_per_peer = neteq_jitter_per_peer.clone();
 
-            wasm_bindgen_futures::spawn_local(async move {
+            let fut = async move {
                 let mut rx = subscribe();
                 while let Ok(evt) = rx.recv().await {
-                    if abort_c.get() {
-                        break;
-                    }
-
                     match evt.subsystem {
                         // Decoder diagnostics text
                         "decoder" => {
@@ -843,6 +836,10 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                         _ => {}
                     }
                 }
+            };
+            let abortable = Abortable::new(fut, abort_reg);
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = abortable.await;
             });
 
             // Cleanup: signal abort; if we didn't start, this is harmless

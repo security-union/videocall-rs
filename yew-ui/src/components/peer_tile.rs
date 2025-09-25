@@ -7,7 +7,6 @@
  *   (http://www.apache.org/licenses/LICENSE-2.0)
  * * MIT license
  *   (http://opensource.org/licenses/MIT)
- *   (http://opensource.org/licenses/MIT)
  *
  * at your option.
  *

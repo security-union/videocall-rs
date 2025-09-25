@@ -27,7 +27,6 @@ use crate::constants::{
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
-// serde_json and HashMap no longer needed here
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 // Diagnostics subscription moved to Diagnostics component; no imports needed here

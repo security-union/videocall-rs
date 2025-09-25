@@ -29,7 +29,6 @@ use gloo_utils::window;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
-// Diagnostics subscription moved to Diagnostics component; no imports needed here
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;

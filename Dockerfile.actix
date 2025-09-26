@@ -5,14 +5,19 @@ COPY . /app
 WORKDIR /app/actix-api
 RUN cargo build --release
 
+# Create a directory with all binary executables for easier copying
+RUN mkdir -p /app/binaries && \
+    find /app/actix-api/target/release -maxdepth 1 -type f -executable \
+    -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
+    -exec cp {} /app/binaries/ \;
+
 FROM debian:bookworm-slim as production
 
 RUN apt-get --yes update && apt-get --yes install libssl-dev
 
 COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
-COPY --from=build /app/actix-api/target/release/websocket_server /usr/bin/websocket_server
-COPY --from=build /app/actix-api/target/release/webtransport_server /usr/bin/webtransport_server
-COPY --from=build /app/actix-api/target/release/metrics_server /usr/bin/metrics_server
+# Copy all binary executables from actix-api
+COPY --from=build /app/binaries/* /usr/bin/
 COPY --from=build /app/actix-api/startup.sh /usr/bin/startup.sh
 COPY --from=build /app/dbmate /app/dbmate
 

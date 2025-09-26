@@ -29,7 +29,7 @@ use actix_web::{
     },
     error, get,
     web::{self, Bytes},
-    App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
+    App, Error, HttpRequest, HttpResponse, HttpServer,
 };
 use actix_web_actors::ws::{handshake, WebsocketContext};
 use reqwest::header::LOCATION;
@@ -39,8 +39,10 @@ use sec_api::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
+    constants::VALID_ID_PATTERN,
     db::{get_pool, PostgresPool},
     models::{AppConfig, AppState},
+    server_diagnostics::ServerDiagnostics,
 };
 use tracing::{debug, error, info};
 use videocall_types::truthy;
@@ -173,12 +175,29 @@ pub async fn ws_connect(
     req: HttpRequest,
     stream: web::Payload,
     state: web::Data<AppState>,
-) -> impl Responder {
+) -> Result<HttpResponse, Error> {
     let (email, room) = session.into_inner();
-    debug!("socket connected");
+
+    // Validate email and room using the same pattern as WebTransport
+    let email_clean = email.replace(' ', "_");
+    let room_clean = room.replace(' ', "_");
+    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
+    if !re.is_match(&email_clean) || !re.is_match(&room_clean) {
+        error!(
+            "Invalid email or room format: email={}, room={}",
+            email, room
+        );
+        return Ok(HttpResponse::BadRequest().body("Invalid email or room format"));
+    }
+
+    debug!(
+        "socket connected for email={}, room={}",
+        email_clean, room_clean
+    );
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
-    let actor = WsChatSession::new(chat, room, email, nats_client);
+    let tracker_sender = state.tracker_sender.clone();
+    let actor = WsChatSession::new(chat, room_clean, email_clean, nats_client, tracker_sender);
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)
 }
@@ -200,6 +219,17 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to NATS");
     let chat = ChatServer::new(nats_client.clone()).await.start();
+
+    // Create connection tracker with message channel
+    let (connection_tracker, tracker_sender, tracker_receiver) =
+        ServerDiagnostics::new_with_channel(nats_client.clone());
+
+    // Start the connection tracker message processing task
+    let connection_tracker = std::sync::Arc::new(connection_tracker);
+    let tracker_task = connection_tracker.clone();
+    tokio::spawn(async move {
+        tracker_task.run_message_loop(tracker_receiver).await;
+    });
     let oauth_client_id: String =
         std::env::var("OAUTH_CLIENT_ID").unwrap_or_else(|_| String::from(""));
     let oauth_auth_url: String =
@@ -224,6 +254,7 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
+                    tracker_sender: tracker_sender.clone(),
                 }))
                 .service(ws_connect)
         } else {
@@ -233,6 +264,7 @@ async fn main() -> std::io::Result<()> {
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
+                    tracker_sender: tracker_sender.clone(),
                 }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),

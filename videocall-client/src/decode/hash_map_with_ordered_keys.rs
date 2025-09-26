@@ -118,4 +118,27 @@ impl<K: Ord + Hash + Clone, V> HashMapWithOrderedKeys<K, V> {
             self.keys.retain(|k| k != key);
         }
     }
+
+    /// Same as `remove_if`, but returns the list of removed keys.
+    pub fn remove_if_and_return_keys<F>(&mut self, predicate: F) -> Vec<K>
+    where
+        F: Fn(&mut V) -> bool,
+    {
+        let mut keys_to_remove = Vec::new();
+
+        for key in &self.keys {
+            if let Some(value) = self.map.get_mut(key) {
+                if !predicate(value) {
+                    keys_to_remove.push(key.clone());
+                }
+            }
+        }
+
+        for key in &keys_to_remove {
+            self.map.remove(key);
+            self.keys.retain(|k| k != key);
+        }
+
+        keys_to_remove
+    }
 }

@@ -115,15 +115,6 @@ impl UnifiedOpusDecoder {
         })
     }
 
-    /// Creates a new unified decoder (audio context parameter kept for compatibility)
-    pub async fn new_with_playback(
-        sample_rate: u32,
-        channels: u8,
-        _audio_context: Option<&web_sys::AudioContext>,
-    ) -> Result<Self> {
-        Self::new(sample_rate, channels).await
-    }
-
     /// Get the decoder type for debugging
     pub fn decoder_type(&self) -> &'static str {
         self.decoder.get_decoder_type()

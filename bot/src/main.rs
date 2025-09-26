@@ -16,105 +16,167 @@
  * conditions.
  */
 
-use chrono::Utc;
-use futures::stream::FuturesUnordered;
-use futures::SinkExt;
-use futures::StreamExt;
-use protobuf::Message as ProtoMessage;
-use rand::Rng;
-use std::env;
-use tokio::task::JoinHandle;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use url::Url;
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
+mod audio_producer;
+mod config;
+mod video_encoder; // VP9 encoder from videocall-cli
+mod video_producer;
+mod webtransport_client;
+
+use audio_producer::AudioProducer;
+use config::{BotConfig, ClientConfig};
+// Removed unused Arc import
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time;
+use tracing::{error, info, warn};
+use video_producer::VideoProducer;
+use webtransport_client::WebTransportClient;
 
 #[tokio::main]
-async fn main() {
-    dotenv::dotenv().ok();
+async fn main() -> anyhow::Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
-    let n_clients = env::var("N_CLIENTS").unwrap().parse::<usize>().unwrap();
-    let endpoint = env::var("ENDPOINT").unwrap();
-    let room = env::var("ROOM").unwrap();
-    let echo_user = env::var("ECHO_USER").unwrap();
-    let email_prefix = env::var("EMAIL_PREFIX").unwrap_or_else(|_| "".to_string());
+    info!("Starting videocall synthetic client bot");
 
-    (0..n_clients)
-        .map(|_| async {
-            let handle = create_client(&endpoint, &room, &echo_user, &email_prefix).await;
-            let _ = handle.await;
-        })
-        .collect::<FuturesUnordered<_>>()
-        .collect::<Vec<_>>()
-        .await;
+    // Load configuration
+    let config = BotConfig::from_env_or_default()?;
+    info!("Loaded configuration for {} clients", config.clients.len());
+
+    let server_url = config.server_url()?;
+    let ramp_up_delay = Duration::from_millis(config.ramp_up_delay_ms.unwrap_or(1000));
+    let insecure = config.insecure.unwrap_or(false);
+
+    if insecure {
+        warn!("WARNING: Certificate verification disabled - connection is insecure!");
+    }
+
+    // Start clients with linear ramp-up
+    let mut client_handles = Vec::new();
+    let total_clients = config.clients.len();
+
+    for (index, client_config) in config.clients.into_iter().enumerate() {
+        info!(
+            "Starting client {} ({}) - audio: {}, video: {}",
+            index, client_config.user_id, client_config.enable_audio, client_config.enable_video
+        );
+
+        let server_url_clone = server_url.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = run_client(client_config, server_url_clone, insecure).await {
+                error!("Client failed: {}", e);
+            }
+        });
+
+        client_handles.push(handle);
+
+        // Linear ramp-up delay between client starts
+        if index < total_clients - 1 {
+            info!(
+                "Waiting {}ms before starting next client",
+                ramp_up_delay.as_millis()
+            );
+            time::sleep(ramp_up_delay).await;
+        }
+    }
+
+    info!("All clients started, waiting for completion");
+
+    // Wait for all clients to complete
+    for handle in client_handles {
+        let _ = handle.await;
+    }
+
+    info!("All clients finished");
+    Ok(())
 }
 
-async fn create_client(
-    endpoint: &str,
-    room: &str,
-    echo_user: &str,
-    email_prefix: &str,
-) -> JoinHandle<()> {
-    let email = generate_email(email_prefix);
-    let url = format!("{endpoint}/lobby/{email}/{room}");
-    let parsed_url = Url::parse(&url).unwrap();
-    let (mut ws_stream, _) = connect_async(parsed_url).await.unwrap();
-    println!("Connected to {url}");
-    let echo_user = echo_user.to_string();
-    // Send a single heartbeat just so that we show up on the ui
-    let media_packet = MediaPacket {
-        media_type: MediaType::HEARTBEAT.into(),
-        email: email.clone(),
-        timestamp: Utc::now().timestamp_millis() as f64,
-        ..Default::default()
-    };
-    let mut buf = Vec::new();
-    media_packet.write_to_vec(&mut buf).unwrap();
-    ws_stream.send(Message::Binary(buf)).await.unwrap();
-    tokio::spawn(async move {
-        let mut ws_stream = ws_stream;
-        while let Some(msg) = ws_stream.next().await {
-            let msg = msg.unwrap();
-            match msg {
-                Message::Text(text) => {
-                    if text == "Hello" {
-                        ws_stream.send("Hello".into()).await.unwrap();
-                    }
-                }
-                Message::Binary(bin) => {
-                    // decode bin as protobuf
-                    let mut media_packet =
-                        MediaPacket::parse_from_bytes(&bin.into_boxed_slice()).unwrap();
+async fn run_client(
+    config: ClientConfig,
+    server_url: url::Url,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    info!("Initializing client: {}", config.user_id);
 
-                    // rewrite whatever is in the protobuf so that it seems like it is coming from this bot
-                    if media_packet.email == echo_user {
-                        media_packet.email.clone_from(&email);
+    // Create WebTransport client and connect
+    let mut client = WebTransportClient::new(config.clone());
+    client.connect(&server_url, insecure).await?;
 
-                        // send the protobuf back to the server
-                        let mut buf = Vec::new();
-                        media_packet.write_to_vec(&mut buf).unwrap();
-                        ws_stream.send(Message::Binary(buf)).await.unwrap();
-                    }
-                }
-                Message::Ping(data) => {
-                    ws_stream.send(Message::Pong(data)).await.unwrap();
-                }
-                _ => {}
+    // Create packet channel for media producers
+    let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(100);
+
+    // Start packet sender task
+    client.start_packet_sender(packet_rx).await;
+
+    // Start media producers based on configuration
+    let mut audio_producer: Option<AudioProducer> = None;
+    let mut video_producer: Option<VideoProducer> = None;
+
+    if config.enable_audio {
+        info!("Starting audio producer for {}", config.user_id);
+        match AudioProducer::from_wav_file(
+            config.user_id.clone(),
+            "BundyBests2.wav",
+            packet_tx.clone(),
+        ) {
+            Ok(producer) => {
+                audio_producer = Some(producer);
+                info!("Audio producer started for {}", config.user_id);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to start audio producer for {}: {}",
+                    config.user_id, e
+                );
             }
         }
-    })
-}
+    }
 
-fn generate_email(email_prefix: &str) -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    if config.enable_video {
+        info!("Starting video producer for {}", config.user_id);
+        // Use local image directory (images are in current directory)
+        match VideoProducer::from_image_sequence(
+            config.user_id.clone(),
+            ".", // Images are in current directory (bot working dir)
+            packet_tx.clone(),
+        ) {
+            Ok(producer) => {
+                video_producer = Some(producer);
+                info!("Video producer started for {}", config.user_id);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to start video producer for {}: {}",
+                    config.user_id, e
+                );
+            }
+        }
+    }
 
-    let mut rng = rand::thread_rng();
-    let email: String = (0..10)
-        .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
+    info!(
+        "Client {} running with audio: {}, video: {}",
+        config.user_id,
+        audio_producer.is_some(),
+        video_producer.is_some()
+    );
 
-    format!("{email_prefix}{email}@example.com")
+    // Keep the client running
+    // In a real scenario, you might want to run for a specific duration or until a signal
+    tokio::signal::ctrl_c().await?;
+
+    info!("Shutting down client: {}", config.user_id);
+
+    // Clean shutdown
+    client.stop();
+    if let Some(mut audio) = audio_producer {
+        audio.stop();
+    }
+    if let Some(mut video) = video_producer {
+        video.stop();
+    }
+
+    info!("Client {} shut down cleanly", config.user_id);
+    Ok(())
 }

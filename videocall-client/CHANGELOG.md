@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.25](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.24...videocall-client-v1.1.25) - 2025-09-24
+
+### Other
+
+- refactor to use a single context ([#428](https://github.com/security-union/videocall-rs/pull/428))
+- Fix #415: Failed to enqueue PCM Data ([#417](https://github.com/security-union/videocall-rs/pull/417))
+
+## [1.1.24](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.23...videocall-client-v1.1.24) - 2025-08-20
+
+### Fixed
+
+- *(codecs)* route worker diag messages to health bus; refs #397 ([#400](https://github.com/security-union/videocall-rs/pull/400))
+
+## [1.1.23](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.22...videocall-client-v1.1.23) - 2025-08-18
+
+### Other
+
+- updated the following local packages: videocall-types
+
+## [1.1.22](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.21...videocall-client-v1.1.22) - 2025-08-15
+
+### Other
+
+- Disable caching and create blog post, also downgrade many messages to debug  ([#395](https://github.com/security-union/videocall-rs/pull/395))
+
+## [1.1.21](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.20...videocall-client-v1.1.21) - 2025-08-15
+
+### Other
+
+- Add packets per sec, and matomo logs to debug system, handle mic errors more gracefully ([#385](https://github.com/security-union/videocall-rs/pull/385))
+
 ## [1.1.20](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.19...videocall-client-v1.1.20) - 2025-08-10
 
 ### Other

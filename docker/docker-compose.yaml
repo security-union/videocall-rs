@@ -119,7 +119,7 @@ services:
       - NATS_URL=nats:4222
       - REGION=${REGION:-us-east}
       - SERVER_ID=${SERVER_ID:-server-1}
-      - SERVICE_TYPE=metrics
+      - SERVICE_TYPE=client-metrics
       - RUST_LOG=debug,async_nats=info
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - CARGO_TARGET_DIR=/app/actix-api/target
@@ -127,6 +127,35 @@ services:
       - CARGO_NET_OFFLINE=false
     ports:
       - "9091:9091"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-actix-web-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-actix-web-cargo-target-cache:/usr/local/cargo/target
+      - rustlemania-actix-web-target-cache:/app/actix-api/target
+    depends_on:
+      - nats
+
+  server-stats-api:
+    build:
+      dockerfile: ../docker/Dockerfile.actix
+      context: ../docker
+    working_dir: /app/actix-api
+    command: bash -c "cargo watch -x \"run -r --bin metrics_server_snapshot \""
+    environment:
+      - METRICS_PORT=9092
+      - NATS_URL=nats:4222
+      - REGION=${REGION:-us-east}
+      - SERVER_ID=${SERVER_ID:-server-1}
+      - SERVICE_TYPE=server-stats
+      - RUST_LOG=debug,async_nats=info
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+    ports:
+      - "9092:9092"
     volumes:
       - type: bind
         source: ../
@@ -169,6 +198,35 @@ services:
       - rustlemania-actix-webtransport-cache:/app/actix-api/target
     depends_on:
       - nats
+
+  synthetic-clients:
+    build:
+      dockerfile: ../docker/Dockerfile.actix
+      context: ../docker
+    working_dir: /app/bot
+    command: bash -c "cargo run --release"
+    environment:
+      - RUST_LOG=debug  # Enable debug logging to see VP9 frame details
+      - BOT_CONFIG_PATH=/config/bot-config.yaml  # Use YAML config
+      - INSECURE=true  # Skip certificate verification for development
+      - CARGO_TARGET_DIR=/app/bot/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      # Mount the YAML config file
+      - type: bind
+        source: ./bot-config.yaml
+        target: /config/bot-config.yaml
+        read_only: true
+      - rustlemania-bot-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-bot-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-bot-cargo-target-cache:/usr/local/cargo/target
+      - rustlemania-bot-cache:/app/bot/target
+    depends_on:
+      - webtransport-api
 
   nats:
     image: nats
@@ -226,7 +284,6 @@ services:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
-
   
 volumes:
   rustlemania-actix-web-cargo-registry-cache:
@@ -245,5 +302,9 @@ volumes:
   rustlemania-leptos-ui-cargo-git-cache:
   rustlemania-leptos-ui-cargo-target-cache:
   rustlemania-leptos-ui-cache:
+  rustlemania-bot-cargo-registry-cache:
+  rustlemania-bot-cargo-git-cache:
+  rustlemania-bot-cargo-target-cache:
+  rustlemania-bot-cache:
   prometheus_data:
   grafana_data:

@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package server_connection_packet;
+
+// Server connection event types
+enum EventType {
+  UNKNOWN = 0;
+  CONNECTION_STARTED = 1;
+  CONNECTION_ENDED = 2;
+  DATA_TRANSFERRED = 3;
+}
+
+// Data transfer information
+message DataTransferInfo {
+  uint64 bytes_sent = 1;
+  uint64 bytes_received = 2;
+}
+
+// Connection metadata
+message ConnectionMetadata {
+  string session_id = 1;
+  string customer_email = 2;
+  string meeting_id = 3;
+  string protocol = 4;  // "websocket", "webtransport", "quic"
+  string server_instance = 5;  // K8s pod name or server identifier
+  string region = 6;
+}
+
+// Main server connection event packet
+message ServerConnectionPacket {
+  EventType event_type = 1;
+  uint64 timestamp_ms = 2;
+  ConnectionMetadata connection = 3;
+  
+  // Optional fields based on event type
+  DataTransferInfo data_transfer = 4;  // For DATA_TRANSFERRED events
+  uint64 connection_duration_ms = 5;   // For CONNECTION_ENDED events
+  
+  // Additional context
+  bool is_reconnection = 6;  // True if this is a detected reconnection
+}

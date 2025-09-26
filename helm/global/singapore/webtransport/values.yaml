@@ -28,18 +28,30 @@ rustlemania-webtransport:
       value: /certs/tls.key
     - name: REGION
       value: "singapore"
+    - name: HOSTNAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVER_ID
-      value: $(POD_NAME)
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
     - name: SERVICE_TYPE
       value: webtransport
+    - name: SERVER_STATS_INTERVAL_SECS
+      value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "1"  # Optimal for 300m CPU (WebTransport crypto operations)
+    - name: TOKIO_BLOCKING_THREADS
+      value: "2"  # Small pool for blocking crypto operations
 
   resources:
     limits:
-      cpu: "400m"
-      memory: "512Mi"
+      cpu: "300m"
+      memory: "384Mi"
     requests:
-      cpu: "200m"
-      memory: "256Mi"
+      cpu: "300m"
+      memory: "192Mi"
 
   service:
     type: LoadBalancer  # LoadBalancer for UDP traffic
@@ -58,9 +70,9 @@ rustlemania-webtransport:
       external-dns.alpha.kubernetes.io/hostname: "webtransport-singapore.webtransport.video"
 
   autoscaling:
-    enabled: true
-    minReplicas: 2
-    maxReplicas: 6
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
     targetCPUUtilizationPercentage: 70
 
   # Node selector for Singapore region

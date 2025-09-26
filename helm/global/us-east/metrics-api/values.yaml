@@ -29,9 +29,9 @@ metricsApi:
     METRICS_PORT: "9091"
     NATS_URL: "nats://nats-us-east:4222"
     REGION: "us-east"
-    SERVER_ID: "metrics-server-1"
     SERVICE_TYPE: "metrics"
     RUST_LOG: "warn,async_nats=warn"
+    TOKIO_WORKER_THREADS: "1"  # Optimal for 50m CPU (metrics collection is I/O bound)
   
   # Health check configuration
   livenessProbe:
@@ -47,6 +47,75 @@ metricsApi:
     httpGet:
       path: /health
       port: 9091
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  
+  # Security context
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+  
+  # Pod security context
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+# Separate Server Stats pod for connection tracking (stateless snapshot approach)
+serverStats:
+  # Image configuration (same as metrics-api but different binary)
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: latest
+  
+  # Minimal resources for server connection tracking
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+  
+  # Single replica
+  replicas: 1
+  
+  # Service configuration - different port from client metrics
+  service:
+    type: ClusterIP
+    port: 9092
+    targetPort: 9092
+  
+  # Environment variables for server stats
+  env:
+    METRICS_PORT: "9092"
+    NATS_URL: "nats://nats-us-east:4222"
+    REGION: "us-east"
+    SERVICE_TYPE: "server-stats"
+    RUST_LOG: "debug,async_nats=info"
+    TOKIO_WORKER_THREADS: "1"  # Optimal for 100m CPU (server stats aggregation is I/O bound)
+  
+  # Binary to run
+  command: ["/usr/bin/metrics_server_snapshot"]
+  
+  # Health check configuration
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 9092
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 9092
     initialDelaySeconds: 5
     periodSeconds: 5
     timeoutSeconds: 3

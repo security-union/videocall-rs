@@ -20,23 +20,12 @@
 
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
-use serde::{Deserialize, Serialize};
+use crate::messages::{VideoStatsMessage, WorkerMessage};
+#[cfg(feature = "wasm")]
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{console, window, VideoFrame, Worker};
-
-/// Messages that can be sent to the web worker
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorkerMessage {
-    /// Decode a frame
-    DecodeFrame(FrameBuffer),
-    /// Flush the decoder buffer and reset state
-    Flush,
-    /// Reset decoder to initial state (waiting for keyframe)
-    Reset,
-    /// Set diagnostic context so worker can tag events with original IDs
-    SetContext { from_peer: String, to_peer: String },
-}
 
 unsafe impl Send for WasmDecoder {}
 unsafe impl Sync for WasmDecoder {}
@@ -104,7 +93,9 @@ impl Decodable for WasmDecoder {
                         video_frame.close();
                     }
                     Err(_) => {
-                        log::warn!("Received unexpected message from worker: {js_val:?}");
+                        if !handle_worker_diag_message(&js_val) {
+                            log::warn!("Received unexpected message from worker: {js_val:?}");
+                        }
                     }
                 }
             }) as Box<dyn FnMut(_)>)
@@ -161,7 +152,9 @@ impl WasmDecoder {
                         callback(video_frame);
                     }
                     Err(_) => {
-                        log::warn!("Received unexpected message from worker: {js_val:?}");
+                        if !handle_worker_diag_message(&js_val) {
+                            log::warn!("Received unexpected message from worker: {js_val:?}");
+                        }
                     }
                 }
             }) as Box<dyn FnMut(_)>)
@@ -258,5 +251,39 @@ impl Drop for WasmDecoder {
     fn drop(&mut self) {
         console::log_1(&"Terminating worker".into());
         self.worker.terminate();
+    }
+}
+
+/// Handle diagnostics objects posted by the worker. Returns true if handled.
+fn handle_worker_diag_message(js_val: &JsValue) -> bool {
+    // Try to deserialize the JavaScript object using serde
+    match serde_wasm_bindgen::from_value::<VideoStatsMessage>(js_val.clone()) {
+        Ok(stats_msg) => {
+            // Only handle video_stats messages
+            if stats_msg.kind != "video_stats" {
+                return false;
+            }
+
+            #[cfg(feature = "wasm")]
+            {
+                let evt = DiagEvent {
+                    subsystem: "video",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        metric!("from_peer", stats_msg.from_peer.unwrap_or_default()),
+                        metric!("to_peer", stats_msg.to_peer.unwrap_or_default()),
+                        metric!("frames_buffered", stats_msg.frames_buffered.unwrap_or(0)),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(evt);
+            }
+            true
+        }
+        Err(_) => {
+            // Not a recognized diagnostic message
+            log::debug!("Received unexpected message from worker: {js_val:?}");
+            false
+        }
     }
 }

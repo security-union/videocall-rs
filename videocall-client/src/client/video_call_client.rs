@@ -60,6 +60,9 @@ pub struct VideoCallClientOptions {
     /// Callback will be called as `callback(peer_userid, media_type)` immediately after the first frame of a given peer & media type is decoded
     pub on_peer_first_frame: Callback<(String, MediaType)>,
 
+    /// Optional callback called as `callback(peer_userid)` when a peer is removed (e.g., heartbeat lost)
+    pub on_peer_removed: Option<Callback<String>>,
+
     /// Callback will be called as `callback(peer_userid)` and must return the DOM id of the
     /// `HtmlCanvasElement` into which the peer video should be rendered
     pub get_peer_video_canvas_id: Callback<String, String>,
@@ -412,6 +415,9 @@ impl VideoCallClient {
                 peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
                 peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
+                if let Some(cb) = &opts.on_peer_removed {
+                    peer_decode_manager.on_peer_removed = cb.clone();
+                }
                 peer_decode_manager
             }
             None => {
@@ -419,6 +425,9 @@ impl VideoCallClient {
                 peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
                 peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
+                if let Some(cb) = &opts.on_peer_removed {
+                    peer_decode_manager.on_peer_removed = cb.clone();
+                }
                 peer_decode_manager
             }
         }
@@ -625,7 +634,7 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_video_enabled(enabled) {
-                    error!("Failed to set video enabled {enabled}: {e}");
+                    debug!("Failed to set video enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set video enabled: {enabled}");
                     if let Some(hr) = &inner.health_reporter {
@@ -646,7 +655,7 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_audio_enabled(enabled) {
-                    error!("Failed to set audio enabled {enabled}: {e}");
+                    debug!("Failed to set audio enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set audio enabled: {enabled}");
                     if let Some(hr) = &inner.health_reporter {
@@ -667,7 +676,7 @@ impl VideoCallClient {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
                 if let Err(e) = connection_controller.set_screen_enabled(enabled) {
-                    error!("Failed to set screen enabled {enabled}: {e}");
+                    debug!("Failed to set screen enabled {enabled}: {e}");
                 } else {
                     debug!("Successfully set screen enabled: {enabled}");
                 }

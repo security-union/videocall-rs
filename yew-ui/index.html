@@ -14,9 +14,9 @@
         <link data-trunk rel="css" href="./static/global.css" />
         <link data-trunk rel="copy-dir" href="./static" />
         <link data-trunk rel="copy-file" href="./scripts/config.js" />
+        <!-- TOFIX: these files are not being hashed correctly, so they are not being cached -->
         <link data-trunk rel="copy-file" href="./scripts/encoderWorker.min.js" />
         <link data-trunk rel="copy-file" href="./scripts/decoderWorker.min.js" />
-        <link data-trunk rel="copy-file" href="./scripts/pcmPlayerWorker.js" />
         <script src="/config.js"></script>
 
         <!-- Compile videocall-codecs's `worker.rs` as a separate WASM module for WebCodecs -->
@@ -44,6 +44,7 @@
         data-loader-shim
         />
         <link id="neteq-worker" href="/neteq_worker_loader.js" />
+
         <!-- Load wasm worker scripts from the videocall-codecs crate -->
         <script>	
             if (!self.MediaStreamTrackProcessor) {	

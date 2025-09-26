@@ -19,10 +19,12 @@
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
+use crate::server_diagnostics::TrackerSender;
 
 pub struct AppState {
     pub chat: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
+    pub tracker_sender: TrackerSender,
 }
 
 pub struct AppConfig {
@@ -32,4 +34,13 @@ pub struct AppConfig {
     pub oauth_auth_url: String,
     pub oauth_token_url: String,
     pub after_login_url: String,
+}
+
+/// Build NATS subject and queue name for room subscriptions
+/// Used by both WebSocket and WebTransport implementations
+pub fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {
+    (
+        format!("room.{room}.*").replace(' ', "_"),
+        format!("{session}-{room}").replace(' ', "_"),
+    )
 }

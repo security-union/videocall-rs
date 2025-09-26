@@ -138,8 +138,6 @@ pub fn home() -> Html {
             <div class="hero-content">
                 <h1 class="hero-title text-center">{ "Concept Car POC" }</h1>
 
-                <div class="content-separator"></div>
-
                 // Form section - moved to top for prominence
                 <form {onsubmit} class="w-full mb-8 card-apple p-8">
                     <h3 class="text-center text-xl font-semibold mb-6 text-white/90">{"Start or Join a Meeting"}</h3>
@@ -190,6 +188,10 @@ pub fn home() -> Html {
                         </div>
                     </div>
                 </form>
+
+                <div class="diagnostics-section">
+                    <h4>{format!("{}: {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))}</h4>
+                </div>
             </div>
         </div>
     }

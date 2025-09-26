@@ -230,8 +230,8 @@ mod tests {
     // Helper to create test options
     fn create_test_options(state_capture: &StateCapture) -> ConnectionManagerOptions {
         ConnectionManagerOptions {
-            websocket_urls: vec!["ws://localhost:8080".to_string()],
-            webtransport_urls: vec!["https://localhost:8443".to_string()],
+            websocket_urls: vec!["ws://tonys-mac-lp3.local:8080".to_string()],
+            webtransport_urls: vec!["https://tonys-mac-lp3.local:8443".to_string()],
             userid: "test_user".to_string(),
             on_inbound_media: Callback::from(|_| {}),
             on_state_changed: state_capture.callback(),

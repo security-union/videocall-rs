@@ -60,6 +60,9 @@ pub struct VideoCallClientOptions {
     /// Callback will be called as `callback(peer_userid, media_type)` immediately after the first frame of a given peer & media type is decoded
     pub on_peer_first_frame: Callback<(String, MediaType)>,
 
+    /// Optional callback called as `callback(peer_userid)` when a peer is removed (e.g., heartbeat lost)
+    pub on_peer_removed: Option<Callback<String>>,
+
     /// Callback will be called as `callback(peer_userid)` and must return the DOM id of the
     /// `HtmlCanvasElement` into which the peer video should be rendered
     pub get_peer_video_canvas_id: Callback<String, String>,
@@ -412,6 +415,9 @@ impl VideoCallClient {
                 peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
                 peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
+                if let Some(cb) = &opts.on_peer_removed {
+                    peer_decode_manager.on_peer_removed = cb.clone();
+                }
                 peer_decode_manager
             }
             None => {
@@ -419,6 +425,9 @@ impl VideoCallClient {
                 peer_decode_manager.on_first_frame = opts.on_peer_first_frame.clone();
                 peer_decode_manager.get_video_canvas_id = opts.get_peer_video_canvas_id.clone();
                 peer_decode_manager.get_screen_canvas_id = opts.get_peer_screen_canvas_id.clone();
+                if let Some(cb) = &opts.on_peer_removed {
+                    peer_decode_manager.on_peer_removed = cb.clone();
+                }
                 peer_decode_manager
             }
         }

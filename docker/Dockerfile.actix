@@ -5,3 +5,4 @@ RUN apt-get update && apt-get install -y pkg-config libclang-dev \
 
 RUN rustup component add clippy
 RUN rustup component add rustfmt
+RUN cargo install cargo-machete@0.8.0 --locked

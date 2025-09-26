@@ -20,6 +20,7 @@ use crate::messages::{
     server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
     session::Message,
 };
+use crate::models::build_subject_and_queue;
 
 use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
 use futures::StreamExt;
@@ -164,13 +165,6 @@ impl Handler<JoinRoom> for ChatServer {
 
         MessageResult(Ok(()))
     }
-}
-
-fn build_subject_and_queue(room: &str, session: &str) -> (String, String) {
-    (
-        format!("room.{room}.*").replace(' ', "_"),
-        format!("{session}-{room}").replace(' ', "_"),
-    )
 }
 
 fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {

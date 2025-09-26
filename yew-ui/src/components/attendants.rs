@@ -16,10 +16,9 @@
  * conditions.
  */
 
-use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
-    host::Host, peer_list::PeerList,
+    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics, host::Host,
+    peer_list::PeerList, peer_tile::PeerTile,
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
@@ -28,11 +27,8 @@ use crate::constants::{
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
-use serde_json;
-use std::collections::HashMap;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
-use videocall_diagnostics::{subscribe, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -48,8 +44,6 @@ pub enum WsAction {
     MediaPermissionsGranted,
     MediaPermissionsError(String),
     Log(String),
-    DiagnosticsUpdated(String),
-    SenderStatsUpdated(String),
     EncoderSettingsUpdated(String),
 }
 
@@ -73,6 +67,7 @@ pub enum Msg {
     WsAction(WsAction),
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
+    OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
     OnMicrophoneError(String),
     DismissMicError,
@@ -83,10 +78,6 @@ pub enum Msg {
     RemoveLastFakePeer,
     #[cfg(feature = "fake-peers")]
     ToggleForceDesktopGrid,
-    NetEqStatsUpdated(String, String), // (peer_id, stats_json)
-    NetEqBufferUpdated(String, u64),   // (peer_id, buffer_value)
-    NetEqJitterUpdated(String, u64),   // (peer_id, jitter_value)
-    ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
     HangUp,
     ShowCopyToast(bool),
 }
@@ -132,16 +123,8 @@ pub struct AttendantsComponent {
     pub diagnostics_open: bool,
     pub device_settings_open: bool,
     pub error: Option<String>,
-    pub diagnostics_data: Option<String>,
-    pub sender_stats: Option<String>,
     pub encoder_settings: Option<String>,
     pub mic_error: Option<String>,
-    pub neteq_stats: Option<String>,
-    pub neteq_stats_per_peer: HashMap<String, Vec<String>>, // peer_id -> stats history
-    pub neteq_buffer_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> buffer history
-    pub neteq_jitter_per_peer: HashMap<String, Vec<u64>>,   // peer_id -> jitter history
-    pub connection_manager_state: Option<String>, // connection manager diagnostics (serialized)
-    pub connection_manager_events: Vec<SerializableDiagEvent>, // accumulate individual events
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -218,6 +201,13 @@ impl AttendantsComponent {
                     link.send_message(Msg::OnFirstFrame((email, media_type)))
                 })
             },
+            on_peer_removed: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |peer_id: String| {
+                    log::info!("Peer removed: {peer_id}");
+                    link.send_message(Msg::OnPeerRemoved(peer_id));
+                })
+            }),
             get_peer_video_canvas_id: Callback::from(|email| email),
             get_peer_screen_canvas_id: Callback::from(|email| format!("screen-share-{}", &email)),
             enable_diagnostics: true,
@@ -344,16 +334,8 @@ impl Component for AttendantsComponent {
             diagnostics_open: false,
             device_settings_open: false,
             error: None,
-            diagnostics_data: None,
-            sender_stats: None,
             encoder_settings: None,
             mic_error: None,
-            neteq_stats: None,
-            neteq_stats_per_peer: HashMap::new(),
-            neteq_buffer_per_peer: HashMap::new(),
-            neteq_jitter_per_peer: HashMap::new(),
-            connection_manager_state: None,
-            connection_manager_events: Vec::new(),
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -369,162 +351,7 @@ impl Component for AttendantsComponent {
             log::error!("{e:?}");
             self_.error = Some(e);
         }
-        {
-            let link = ctx.link().clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let mut rx = subscribe();
-                while let Ok(evt) = rx.recv().await {
-                    if evt.subsystem == "neteq" {
-                        for m in &evt.metrics {
-                            if m.name == "stats_json" {
-                                if let MetricValue::Text(json) = &m.value {
-                                    // Parse the new format: "reporting_peer->target_peer"
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
 
-                                    link.send_message(Msg::NetEqStatsUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        json.clone(),
-                                    ));
-                                }
-                            } else if m.name == "audio_buffer_ms" {
-                                if let MetricValue::U64(v) = &m.value {
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
-
-                                    link.send_message(Msg::NetEqBufferUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        *v,
-                                    ));
-                                }
-                            } else if m.name == "jitter_buffer_delay_ms" {
-                                if let MetricValue::U64(v) = &m.value {
-                                    let stream_id = evt
-                                        .stream_id
-                                        .clone()
-                                        .unwrap_or_else(|| "unknown->unknown".to_string());
-                                    let parts: Vec<&str> = stream_id.split("->").collect();
-                                    let (reporting_peer, target_peer) = if parts.len() == 2 {
-                                        (parts[0], parts[1])
-                                    } else {
-                                        ("unknown", "unknown")
-                                    };
-
-                                    link.send_message(Msg::NetEqJitterUpdated(
-                                        format!("{reporting_peer}->{target_peer}"),
-                                        *v,
-                                    ));
-                                }
-                            }
-                        }
-                    } else if evt.subsystem == "connection_manager" {
-                        let serializable_evt = SerializableDiagEvent::from(evt);
-                        link.send_message(Msg::ConnectionManagerUpdate(
-                            serde_json::to_string(&serializable_evt).unwrap_or_default(),
-                        ));
-                    } else if evt.subsystem == "decoder" {
-                        let mut decoder_stats = String::new();
-                        for metric in &evt.metrics {
-                            match metric.name {
-                                "fps" => {
-                                    if let MetricValue::F64(fps) = &metric.value {
-                                        decoder_stats.push_str(&format!("FPS: {fps:.2}\n"));
-                                    }
-                                }
-                                "bitrate_kbps" => {
-                                    if let MetricValue::F64(bitrate) = &metric.value {
-                                        decoder_stats
-                                            .push_str(&format!("Bitrate: {bitrate:.1} kbps\n"));
-                                    }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(media_type) = &metric.value {
-                                        decoder_stats
-                                            .push_str(&format!("Media Type: {media_type}\n"));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !decoder_stats.is_empty() {
-                            let peer_id = evt
-                                .stream_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            decoder_stats.push_str(&format!(
-                                "Peer: {}\nTimestamp: {}\n",
-                                peer_id, evt.ts_ms
-                            ));
-                            link.send_message(Msg::WsAction(WsAction::DiagnosticsUpdated(
-                                decoder_stats,
-                            )));
-                        }
-                    } else if evt.subsystem == "sender" {
-                        let mut sender_stats = String::new();
-                        for metric in &evt.metrics {
-                            match metric.name {
-                                "sender_id" => {
-                                    if let MetricValue::Text(sender_id) = &metric.value {
-                                        sender_stats.push_str(&format!("Sender: {sender_id}\n"));
-                                    }
-                                }
-                                "target_id" => {
-                                    if let MetricValue::Text(target_id) = &metric.value {
-                                        sender_stats.push_str(&format!("Target: {target_id}\n"));
-                                    }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(media_type) = &metric.value {
-                                        sender_stats
-                                            .push_str(&format!("Media Type: {media_type}\n"));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !sender_stats.is_empty() {
-                            sender_stats.push_str(&format!("Timestamp: {}\n", evt.ts_ms));
-                            link.send_message(Msg::WsAction(WsAction::SenderStatsUpdated(
-                                sender_stats,
-                            )));
-                        }
-                    } else if evt.subsystem == "video" {
-                        // Known subsystem used for Grafana/metrics; UI does not render it
-                        log::debug!(
-                            "YEW-UI: Received 'video' diagnostics (handled by server/Grafana), ts={}",
-                            evt.ts_ms
-                        );
-                    } else if evt.subsystem == "peer_status" {
-                        // Known subsystem for mute/camera state; UI does not render it
-                        log::debug!(
-                            "YEW-UI: Received 'peer_status' diagnostics (handled by server/Grafana), ts={}",
-                            evt.ts_ms
-                        );
-                    } else {
-                        let subsystem = evt.subsystem;
-                        log::warn!("YEW-UI: Received diagnostic event for unknown subsystem '{}' from peer {:?} at timestamp {}", 
-                                   subsystem, evt.stream_id, evt.ts_ms);
-                    }
-                }
-                log::warn!("AttendantsComponent: Diagnostics subscription loop ended");
-            });
-        }
         self_
     }
 
@@ -594,15 +421,6 @@ impl Component for AttendantsComponent {
                     self.meeting_joined = false; // Stay on join screen if permissions denied
                     true
                 }
-                WsAction::DiagnosticsUpdated(stats) => {
-                    log::debug!("YEW-UI: Diagnostics UI updated: {stats}");
-                    self.diagnostics_data = Some(stats);
-                    true
-                }
-                WsAction::SenderStatsUpdated(stats) => {
-                    self.sender_stats = Some(stats);
-                    true
-                }
                 WsAction::EncoderSettingsUpdated(settings) => {
                     self.encoder_settings = Some(settings);
                     true
@@ -612,6 +430,10 @@ impl Component for AttendantsComponent {
                 log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
+                true
+            }
+            Msg::OnPeerRemoved(_peer_id) => {
+                // Trigger a re-render; tiles are rebuilt from current client peer list
                 true
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
@@ -724,56 +546,6 @@ impl Component for AttendantsComponent {
                 self.simulation_info_message = None;
                 true
             }
-            Msg::NetEqStatsUpdated(peer_id, stats_json) => {
-                self.neteq_stats = Some(stats_json.clone());
-
-                // Accumulate stats history per peer for dashboard charts
-                let peer_stats = self
-                    .neteq_stats_per_peer
-                    .entry(peer_id.clone())
-                    .or_default();
-                peer_stats.push(stats_json);
-                if peer_stats.len() > 60 {
-                    peer_stats.remove(0);
-                } // keep last 60 entries (60 seconds of data)
-                true
-            }
-            Msg::NetEqBufferUpdated(peer_id, buffer_value) => {
-                let peer_buffer = self.neteq_buffer_per_peer.entry(peer_id).or_default();
-                peer_buffer.push(buffer_value);
-                if peer_buffer.len() > 50 {
-                    peer_buffer.remove(0);
-                } // keep last 50
-                false
-            }
-            Msg::NetEqJitterUpdated(peer_id, jitter_value) => {
-                let peer_jitter = self.neteq_jitter_per_peer.entry(peer_id).or_default();
-                peer_jitter.push(jitter_value);
-                if peer_jitter.len() > 50 {
-                    peer_jitter.remove(0);
-                }
-                false
-            }
-            Msg::ConnectionManagerUpdate(event_json) => {
-                // Parse the SerializableDiagEvent from JSON
-                if let Ok(event) = serde_json::from_str::<SerializableDiagEvent>(&event_json) {
-                    // Accumulate connection manager events
-                    self.connection_manager_events.push(event);
-
-                    // Keep only the last 20 events to avoid memory bloat
-                    if self.connection_manager_events.len() > 20 {
-                        self.connection_manager_events.remove(0);
-                    }
-
-                    // Serialize the accumulated events for the diagnostics component
-                    if let Ok(serialized) = serde_json::to_string(&self.connection_manager_events) {
-                        self.connection_manager_state = Some(serialized);
-                    }
-                } else {
-                    log::error!("AttendantsComponent: Failed to parse SerializableDiagEvent from JSON: {event_json}");
-                }
-                true
-            }
             Msg::ShowCopyToast(show) => {
                 self.show_copy_toast = show;
                 if show {
@@ -812,14 +584,16 @@ impl Component for AttendantsComponent {
         // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
-        let rows = canvas_generator::generate(
-            &self.client, // canvas_generator is client-aware for real peers' media status
-            display_peers_vec
-                .iter()
-                .take(CANVAS_LIMIT)
-                .cloned()
-                .collect(),
-        );
+        let rows: Vec<Html> = display_peers_vec
+            .iter()
+            .take(CANVAS_LIMIT)
+            .enumerate()
+            .map(|(i, peer_id)| {
+                let full_bleed = display_peers_vec.len() == 1
+                    && !self.client.is_screen_share_enabled_for_peer(peer_id);
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} client={self.client.clone()} full_bleed={full_bleed} /> }
+            })
+            .collect();
 
         // Always let the grid take the whole stage; overlays should not shrink the grid
         let container_style = format!(
@@ -1197,40 +971,19 @@ impl Component for AttendantsComponent {
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
-                <Diagnostics
-                    is_open={self.diagnostics_open}
-                    on_close={close_diagnostics}
-                    diagnostics_data={self.diagnostics_data.clone()}
-                    sender_stats={self.sender_stats.clone()}
-                    encoder_settings={self.encoder_settings.clone()}
-                    neteq_stats={
-                        let all_stats: Vec<String> = self.neteq_stats_per_peer.values().flatten().cloned().collect();
-                        if all_stats.is_empty() { None } else { Some(all_stats.join("\n")) }
-                    }
-                    neteq_stats_per_peer={self.neteq_stats_per_peer.clone()}
-                    neteq_buffer_history={
-                        // Aggregate all peers' buffer history, taking the most recent from each
-                        let mut aggregated_buffer = Vec::new();
-                        for peer_buffer in self.neteq_buffer_per_peer.values() {
-                            aggregated_buffer.extend(peer_buffer.iter().cloned());
+                {
+                    if self.diagnostics_open {
+                        html!{
+                            <Diagnostics
+                                is_open={true}
+                                on_close={close_diagnostics}
+                                video_enabled={self.video_enabled}
+                                mic_enabled={self.mic_enabled}
+                                share_screen={self.share_screen}
+                            />
                         }
-                        aggregated_buffer
-                    }
-                    neteq_jitter_history={
-                        // Aggregate all peers' jitter history, taking the most recent from each
-                        let mut aggregated_jitter = Vec::new();
-                        for peer_jitter in self.neteq_jitter_per_peer.values() {
-                            aggregated_jitter.extend(peer_jitter.iter().cloned());
-                        }
-                        aggregated_jitter
-                    }
-                    neteq_buffer_per_peer={self.neteq_buffer_per_peer.clone()}
-                    neteq_jitter_per_peer={self.neteq_jitter_per_peer.clone()}
-                    video_enabled={self.video_enabled}
-                    mic_enabled={self.mic_enabled}
-                    share_screen={self.share_screen}
-                    connection_manager_state={self.connection_manager_state.clone()}
-                />
+                    } else { html!{} }
+                }
             </div>
         }
     }

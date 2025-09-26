@@ -17,6 +17,7 @@
  */
 
 use crate::client_diagnostics::health_processor;
+use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
 };
@@ -24,23 +25,60 @@ use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
 use futures::StreamExt;
 use protobuf::Message;
-use quinn::crypto::rustls::HandshakeData;
-use quinn::VarInt;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use std::{fs, io};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::sync::{watch, RwLock};
+use std::{net::SocketAddr, path::PathBuf};
 use tracing::{debug, error, info, trace, trace_span};
 
-use videocall_types::protos::connection_packet::ConnectionPacket;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Arc;
+
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Mutex;
+
+#[cfg(test)]
+lazy_static::lazy_static! {
+    static ref TEST_PACKET_COUNTERS: Arc<Mutex<HashMap<String, AtomicU64>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+}
+
+#[cfg(test)]
+fn increment_test_packet_counter_for_user(username: &str) {
+    let counters = TEST_PACKET_COUNTERS.clone();
+    let mut counters_map = counters.lock().unwrap();
+    let counter = counters_map
+        .entry(username.to_string())
+        .or_insert_with(|| AtomicU64::new(0));
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn get_test_packet_counter_for_user(username: &str) -> u64 {
+    let counters = TEST_PACKET_COUNTERS.clone();
+    let counters_map = counters.lock().unwrap();
+    counters_map
+        .get(username)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn reset_test_packet_counters() {
+    let counters = TEST_PACKET_COUNTERS.clone();
+    let mut counters_map = counters.lock().unwrap();
+    counters_map.clear();
+}
+
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use web_transport_quinn::Session;
+use web_transport_quinn::{Session, SessionError};
 
 /// Videocall WebTransport API
 ///
@@ -53,7 +91,7 @@ pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", 
 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 
-const MAX_UNIDIRECTIONAL_STREAM_SIZE: usize = 500_000;
+const KEEP_ALIVE_PING: &[u8] = b"ping";
 
 /// Check if the binary data is an RTT packet that should be echoed back
 fn is_rtt_packet(data: &[u8]) -> bool {
@@ -108,46 +146,15 @@ fn get_key_and_cert_chain<'a>(
     Ok((key, chain))
 }
 
-pub fn is_http3(conn: &quinn::Connection) -> bool {
-    if let Some(data) = conn.handshake_data() {
-        if let Some(d) = data.downcast_ref::<HandshakeData>() {
-            if let Some(alpn) = &d.protocol {
-                return WEB_TRANSPORT_ALPN.contains(&alpn.as_slice());
-            }
-        }
-    };
-    false
-}
-
 pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
     let (key, certs) = get_key_and_cert_chain(opt.certs)?;
 
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)?;
-
-    config.max_early_data_size = u32::MAX;
-    let mut alpn = vec![];
-    for proto in WEB_TRANSPORT_ALPN {
-        alpn.push(proto.to_vec());
-    }
-    alpn.push(QUIC_ALPN.to_vec());
-    config.alpn_protocols = alpn;
-
-    // 1. create quinn server endpoint and bind UDP socket
-    let config: quinn::crypto::rustls::QuicServerConfig = config.try_into()?;
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
-    // configure pings
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.keep_alive_interval(Some(Duration::from_secs(2)));
-    transport_config.max_idle_timeout(Some(VarInt::from_u32(10_000).into()));
-    config.transport = Arc::new(transport_config);
-    let server = quinn::Endpoint::server(config, opt.listen)?;
+    // Use ServerBuilder for 0.7.3 API
+    let mut server = web_transport_quinn::ServerBuilder::new()
+        .with_addr(opt.listen)
+        .with_certificate(certs, key)?;
 
     info!("listening on {}", opt.listen);
 
@@ -167,79 +174,49 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
         tracker_task.run_message_loop(tracker_receiver).await;
     });
 
-    // 2. Accept new quic connections and spawn a new task to handle them
-    while let Some(new_conn) = server.accept().await {
+    // 2. Accept new WebTransport connections using 0.7.3 API
+    while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
         let nc = nc.clone();
         let tracker_sender = tracker_sender.clone();
         tokio::spawn(async move {
-            match new_conn.await {
-                Ok(conn) => {
-                    if is_http3(&conn) {
-                        info!("new http3 established");
-                        if let Err(err) =
-                            run_webtransport_connection(conn.clone(), nc, tracker_sender.clone())
-                                .await
-                        {
-                            error!("Failed to handle connection: {err:?}");
-                        }
-                    } else {
-                        info!("new quic established");
-                        let nc = nc.clone();
-                        if let Err(err) =
-                            handle_quic_connection(conn, nc, tracker_sender.clone()).await
-                        {
-                            error!("Failed to handle connection: {err:?}");
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!("accepting connection failed: {:?}", err);
-                }
+            // Handle WebTransport request directly using 0.7.3 API
+            if let Err(err) =
+                run_webtransport_connection_from_request(request, nc, tracker_sender).await
+            {
+                error!("Failed to handle WebTransport connection: {err:?}");
             }
         });
     }
 
-    // shut down gracefully
-    // wait for connections to be closed before exiting
-    server.wait_idle().await;
     Ok(())
 }
 
-async fn run_webtransport_connection(
-    conn: quinn::Connection,
+async fn run_webtransport_connection_from_request(
+    request: web_transport_quinn::Request,
     nc: async_nats::client::Client,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
-    info!("received new QUIC connection");
-
-    // Perform the WebTransport handshake.
-    let request = web_transport_quinn::accept(conn.clone()).await?;
     info!("received WebTransport request: {}", request.url());
     let url = request.url();
 
     let uri = url;
     let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
-    info!("Got path : {} ", path);
-
     let parts = path.split('/').collect::<Vec<&str>>();
     // filter out the empty strings
     let parts = parts.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
     info!("Parts {:?}", parts);
     if parts.len() != 3 {
-        conn.close(VarInt::from_u32(0x1), b"Invalid path wrong length");
         return Err(anyhow!("Invalid path wrong length"));
     } else if parts[0] != &"lobby" {
-        conn.close(VarInt::from_u32(0x1), b"Invalid path wrong prefix");
         return Err(anyhow!("Invalid path wrong prefix"));
     }
 
     let username = parts[1].replace(' ', "_");
     let lobby_id = parts[2].replace(' ', "_");
-    let re = regex::Regex::new("^[a-zA-Z0-9_]*$").unwrap();
+    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
     if !re.is_match(&username) && !re.is_match(&lobby_id) {
-        conn.close(VarInt::from_u32(0x1), b"Invalid path input chars");
         return Err(anyhow!("Invalid path input chars"));
     }
 
@@ -276,8 +253,7 @@ async fn handle_webtransport_session(
         "webtransport".to_string(),
     );
 
-    let session = Arc::new(RwLock::new(session));
-    let should_run = Arc::new(AtomicBool::new(true));
+    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     let subject = format!("room.{lobby_id}.*").replace(' ', "_");
     let specific_subject: Subject = format!("room.{lobby_id}.{username}")
@@ -300,26 +276,28 @@ async fn handle_webtransport_session(
 
     let specific_subject_clone = specific_subject.clone();
 
-    let nats_receive_task = {
+    // NATS receive task
+    {
         let session = session.clone();
-        let should_run = should_run.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
-        tokio::spawn(async move {
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let username_clone = username.to_string();
+        join_set.spawn(async move {
             let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
             while let Some(msg) = sub.next().await {
-                if !should_run.load(Ordering::SeqCst) {
-                    break;
-                }
                 if msg.subject == specific_subject_clone {
                     continue;
                 }
-                let session = session.read().await;
-                let stream = session.open_uni().await;
+
+                #[cfg(test)]
+                increment_test_packet_counter_for_user(&username_clone);
                 let session_id_clone = session_id_clone.clone();
                 let payload_size = msg.payload.len() as u64;
                 let tracker_sender_inner = tracker_sender_nats.clone();
+                let session = session.clone();
                 tokio::spawn(async move {
+                    let stream = session.open_uni().await;
                     let data_tracker_inner = DataTracker::new(tracker_sender_inner);
                     match stream {
                         Ok(mut uni_stream) => {
@@ -330,23 +308,29 @@ async fn handle_webtransport_session(
                                 data_tracker_inner.track_sent(&session_id_clone, payload_size);
                             }
                         }
+                        Err(SessionError::ConnectionError(e)) => {
+                            error!("Connection error: {}", e);
+                        }
+                        Err(SessionError::WebTransportError(e)) => {
+                            error!("WebTransport error: {}", e);
+                        }
                         Err(e) => {
                             error!("Error opening unidirectional stream: {}", e);
                         }
                     }
                 });
             }
-        })
-    };
+        });
+    }
 
-    let quic_task = {
+    // WebTransport unidirectional receive task
+    {
         let session = session.clone();
         let nc = nc.clone();
         let specific_subject = specific_subject.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_wt = tracker_sender.clone();
-        tokio::spawn(async move {
-            let session = session.read().await;
+        join_set.spawn(async move {
             while let Ok(mut uni_stream) = session.accept_uni().await {
                 let nc = nc.clone();
                 let specific_subject = specific_subject.clone();
@@ -402,16 +386,15 @@ async fn handle_webtransport_session(
                     }
                 });
             }
-        })
-    };
+        });
+    }
 
-    let _datagrams_task = {
-        let session_clone = session.clone();
+    // WebTransport datagram receive task
+    {
         let session_id_clone = session_id.clone();
         let tracker_sender_wt_datagram = tracker_sender.clone();
-        tokio::spawn(async move {
+        join_set.spawn(async move {
             let data_tracker = DataTracker::new(tracker_sender_wt_datagram);
-            let session = session_clone.read().await;
             while let Ok(buf) = session.read_datagram().await {
                 let buf_size = buf.len() as u64;
                 // Track data received
@@ -429,6 +412,8 @@ async fn handle_webtransport_session(
                 } else if health_processor::is_health_packet_bytes(&buf) {
                     // Process health packet for diagnostics (don't relay)
                     health_processor::process_health_packet_bytes(&buf, nc.clone());
+                } else if buf.as_ref() == KEEP_ALIVE_PING {
+                    // Keep-alive packet - don't relay, just ignore
                 } else {
                     // Normal datagram processing - publish to NATS
                     let nc = nc.clone();
@@ -437,11 +422,11 @@ async fn handle_webtransport_session(
                     }
                 }
             }
-        })
-    };
-    quic_task.await?;
-    should_run.store(false, Ordering::SeqCst);
-    nats_receive_task.abort();
+        });
+    }
+
+    join_set.join_next().await;
+    join_set.shutdown().await;
 
     // Track connection end for metrics
     send_connection_ended(&tracker_sender, session_id.clone());
@@ -450,225 +435,538 @@ async fn handle_webtransport_session(
     Ok(())
 }
 
-async fn handle_quic_connection(
-    conn: quinn::Connection,
-    nc: async_nats::client::Client,
-    tracker_sender: TrackerSender,
-) -> Result<()> {
-    let _session_id = conn.stable_id();
-    // Generate session ID for metrics tracking (will start tracking after CONNECTION packet)
-    let session_id = Arc::new(uuid::Uuid::new_v4().to_string());
-    let session = Arc::new(RwLock::new(conn));
-    let should_run = Arc::new(AtomicBool::new(true));
-    let (specific_subject_tx, mut specific_subject_rx) = watch::channel::<Option<Subject>>(None);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::crypto::CryptoProvider;
+    use std::time::Duration;
+    use videocall_types::protos::media_packet::media_packet::MediaType as VcMediaType;
+    use videocall_types::protos::media_packet::MediaPacket as VcMediaPacket;
+    use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType as VcPacketType;
+    use videocall_types::protos::packet_wrapper::PacketWrapper as VcPacketWrapper;
 
-    let nats_task = {
-        let session = session.clone();
-        let should_run = should_run.clone();
-        let nc_clone = nc.clone();
-        let specific_subject_rx_clone = specific_subject_rx.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_nats = tracker_sender.clone();
+    async fn start_webtransport_server() -> tokio::task::JoinHandle<()> {
+        if let Err(e) = CryptoProvider::install_default(rustls::crypto::ring::default_provider()) {
+            error!("Error installing crypto provider: {e:?}");
+        }
+        use crate::webtransport::{self, Certs};
+        use std::net::ToSocketAddrs;
+
+        // Start WebTransport server
+        let opt = webtransport::WebTransportOpt {
+            listen: std::env::var("LISTEN_URL")
+                .unwrap_or_else(|_| "0.0.0.0:4433".to_string())
+                .to_socket_addrs()
+                .expect("expected LISTEN_URL to be a valid socket address")
+                .next()
+                .expect("expected LISTEN_URL to be a valid socket address"),
+            certs: Certs {
+                key: std::env::var("KEY_PATH")
+                    .unwrap_or_else(|_| "certs/localhost.key".to_string())
+                    .into(),
+                cert: std::env::var("CERT_PATH")
+                    .unwrap_or_else(|_| "certs/localhost.pem".to_string())
+                    .into(),
+            },
+        };
+
         tokio::spawn(async move {
-            let mut specific_subject_rx = specific_subject_rx_clone;
-            let nc = nc_clone;
-            specific_subject_rx.changed().await.unwrap();
-            let specific_subject = specific_subject_rx.borrow().clone().unwrap();
-            let subject = session_subject_to_lobby_subject(&specific_subject);
-            let mut sub = match nc
-                .queue_subscribe(subject.clone(), specific_subject.to_string())
-                .await
-            {
-                Ok(sub) => {
-                    info!("Subscribed to subject {subject}");
-                    sub
+            if let Err(e) = webtransport::start(opt).await {
+                eprintln!("WebTransport server error: {}", e);
+            }
+        })
+    }
+
+    async fn wait_for_condition<F, Fut, T>(
+        mut condition: F,
+        timeout_duration: Duration,
+        check_interval: Duration,
+    ) -> Result<T, &'static str>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Option<T>>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout_duration {
+            if let Some(result) = condition().await {
+                return Ok(result);
+            }
+            tokio::time::sleep(check_interval).await;
+        }
+        Err("Condition not met within timeout")
+    }
+
+    async fn wait_for_condition_bool<F, Fut>(
+        condition: F,
+        timeout_duration: Duration,
+        check_interval: Duration,
+    ) -> Result<(), &'static str>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout_duration {
+            if condition().await {
+                return Ok(());
+            }
+            tokio::time::sleep(check_interval).await;
+        }
+        Err("Condition not met within timeout")
+    }
+
+    async fn wait_for_server_ready() {
+        let condition = || async {
+            match connect_client("test", "test").await {
+                Ok(_) => {
+                    info!("Server is ready!");
+                    true
                 }
                 Err(e) => {
-                    let err = format!("error subscribing to subject {subject}: {e}");
-                    error!("{err}");
-                    return;
+                    error!("Error connecting to server: {e:?}");
+                    info!("Retrying connection to server...");
+                    false
                 }
-            };
-            while let Some(msg) = sub.next().await {
-                if !should_run.load(Ordering::SeqCst) {
-                    break;
-                }
-                if Some(msg.subject) == specific_subject_rx.borrow().clone() {
-                    continue;
-                }
-                let session = session.read().await;
+            }
+        };
 
-                let stream = session.open_uni().await;
-                let session_id_clone = session_id_clone.clone();
-                let payload_size = msg.payload.len() as u64;
-                let tracker_sender_msg = tracker_sender_nats.clone();
-                tokio::spawn(async move {
-                    let data_tracker = DataTracker::new(tracker_sender_msg);
-                    match stream {
-                        Ok(mut uni_stream) => {
-                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                error!("Error writing to unidirectional stream: {}", e);
-                            } else {
-                                // Track data sent
-                                data_tracker.track_sent(&session_id_clone, payload_size);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error opening unidirectional stream: {}", e);
+        wait_for_condition_bool(
+            condition,
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect("WebTransport server not ready after 10 seconds");
+    }
+
+    async fn connect_client(
+        user: &str,
+        meeting: &str,
+    ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let url_str = format!("{}/lobby/{}/{}", base.trim_end_matches('/'), user, meeting);
+        let url = url::Url::parse(&url_str)?;
+
+        // Create WebTransport client using 0.7.3 API (same as bot)
+        let client = unsafe {
+            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
+        };
+
+        // Connect using modern API
+        Ok(client.connect(url).await?)
+    }
+
+    async fn send_packet(session: &web_transport_quinn::Session, bytes: Vec<u8>) {
+        let mut s = session.open_uni().await.expect("open uni");
+        s.write_all(&bytes).await.expect("write packet");
+        // Don't call finish() to avoid closing the session prematurely
+    }
+
+    async fn keep_alive(session: &web_transport_quinn::Session) {
+        // Send a small datagram to keep connection alive
+        let ping_data = KEEP_ALIVE_PING;
+        if let Err(e) = session.send_datagram(ping_data.to_vec().into()) {
+            debug!("Keep-alive ping failed: {}", e);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_relay_packet_webtransport_between_two_clients() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(std::io::stderr)
+            .try_init();
+
+        // Wrap entire test with 15 second timeout
+        let test_result = tokio::time::timeout(Duration::from_secs(15), async {
+            test_relay_packet_impl().await
+        })
+        .await;
+
+        match test_result {
+            Ok(Ok(())) => println!("Test completed successfully"),
+            Ok(Err(e)) => panic!("Test failed: {}", e),
+            Err(_) => panic!("Test timed out after 15 seconds"),
+        }
+    }
+
+    async fn test_relay_packet_impl() -> anyhow::Result<()> {
+        println!("=== STARTING INTEGRATION TEST ===");
+
+        println!("Starting WebTransport server...");
+        let _wt_handle = start_webtransport_server().await;
+
+        println!("Waiting for server to be ready...");
+        wait_for_server_ready().await;
+
+        let meeting = "it-meeting-1";
+        let user_a = "user-a";
+        let user_b = "user-b";
+
+        println!("Connecting client A: {}", user_a);
+        let session_a = connect_client(user_a, meeting)
+            .await
+            .expect("connect client A");
+        println!("Client A connected!");
+
+        println!("Connecting client B: {}", user_b);
+        let session_b = connect_client(user_b, meeting)
+            .await
+            .expect("connect client B");
+        println!("Client B connected!");
+
+        // Start keep-alive tasks that will be cancelled when test ends
+        let session_a_keep = session_a.clone();
+        let session_b_keep = session_b.clone();
+
+        let _keep_alive_a = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_a_keep).await;
+            }
+        });
+
+        let _keep_alive_b = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_b_keep).await;
+            }
+        });
+
+        // Craft a MEDIA packet that is not RTT and not health
+        let media = VcMediaPacket {
+            media_type: VcMediaType::AUDIO.into(),
+            email: user_a.to_string(),
+            ..Default::default()
+        };
+        let packet = VcPacketWrapper {
+            packet_type: VcPacketType::MEDIA.into(),
+            email: user_a.to_string(),
+            data: media.write_to_bytes().expect("serialize media"),
+            ..Default::default()
+        };
+        let bytes = packet.write_to_bytes().expect("serialize wrapper");
+
+        println!("Sending packet from A to B (size: {} bytes)", bytes.len());
+        // Send from A
+        send_packet(&session_a, bytes.clone()).await;
+        println!("Packet sent from A!");
+
+        // Give NATS time to relay the message
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        println!("Waiting for packet on B...");
+        // Receive on B
+        let condition = || async {
+            match session_b.accept_uni().await {
+                Ok(mut stream) => {
+                    if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                        if !buf.is_empty() {
+                            println!("Received packet on B (size: {} bytes)", buf.len());
+                            return Some(buf);
                         }
                     }
-                });
+                }
+                Err(_) => {}
             }
-        })
-    };
+            None
+        };
 
-    let quic_task = {
-        let specific_subject_rx_clone = specific_subject_rx.clone();
-        let session = session.clone();
-        let nc = nc.clone();
-        let session_id_arc = session_id.clone();
-        let tracker_sender_quic = tracker_sender.clone();
+        let received =
+            wait_for_condition(condition, Duration::from_secs(5), Duration::from_millis(50))
+                .await
+                .expect("timely receive");
+
+        assert_eq!(bytes, received, "B must receive the exact bytes sent by A");
+
+        println!("=== INTEGRATION TEST PASSED ===");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_lobby_isolation() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(std::io::stderr)
+            .try_init();
+
+        // Wrap entire test with 15 second timeout
+        let test_result = tokio::time::timeout(Duration::from_secs(15), async {
+            test_lobby_isolation_impl().await
+        })
+        .await;
+
+        match test_result {
+            Ok(Ok(())) => println!("Test completed successfully"),
+            Ok(Err(e)) => panic!("Test failed: {}", e),
+            Err(_) => panic!("Test timed out after 15 seconds"),
+        }
+    }
+
+    async fn test_lobby_isolation_impl() -> anyhow::Result<()> {
+        println!("=== STARTING COMPREHENSIVE LOBBY ISOLATION TEST ===");
+
+        // ========== SETUP ==========
+        reset_test_packet_counters();
+        println!("✓ Reset packet counters");
+
+        println!("Starting WebTransport server...");
+        let _wt_handle = start_webtransport_server().await;
+        wait_for_server_ready().await;
+        println!("✓ Server ready");
+
+        // ========== CLIENT CONNECTIONS ==========
+        let lobby_1 = "lobby-secure";
+        let lobby_2 = "lobby-public";
+        let user_a = "alice";
+        let user_b = "bob";
+        let user_c = "charlie";
+        assert_eq!(get_test_packet_counter_for_user(user_a), 0);
+        assert_eq!(get_test_packet_counter_for_user(user_b), 0);
+        assert_eq!(get_test_packet_counter_for_user(user_c), 0);
+
+        println!("\n--- Establishing Connections ---");
+
+        let session_a = connect_client(user_a, lobby_1)
+            .await
+            .expect("connect alice");
+        println!("✓ Alice connected to lobby-secure");
+
+        let session_b = connect_client(user_b, lobby_2).await.expect("connect bob");
+        println!("✓ Bob connected to lobby-public");
+
+        let session_c = connect_client(user_c, lobby_1)
+            .await
+            .expect("connect charlie");
+        println!("✓ Charlie connected to lobby-secure");
+
+        // Keep connections alive
+        start_keep_alive_tasks(&session_a, &session_b, &session_c).await;
+
+        // ========== PHASE 1: CROSS-LOBBY ISOLATION TEST ==========
+        println!("\n--- Phase 1: Testing Cross-Lobby Isolation ---");
+
+        let [count_a, count_b, count_c] = get_all_user_counts(&[user_a, user_b, user_c])[..] else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!(
+            "Initial counts: A={}, B={}, C={}",
+            count_a, count_b, count_c
+        );
+
+        // Alice sends 3 packets to her lobby (should only reach Charlie, not Bob)
+        for i in 1..=3 {
+            let packet = create_test_packet(user_a, VcMediaType::AUDIO, format!("alice-msg-{}", i));
+            send_packet(&session_a, packet).await;
+            println!("✓ Alice sent packet #{}", i);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let [alice_count_after, bob_count_after, charlie_count_after] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!(
+            "After Alice's packets: A={}, B={}, C={}",
+            alice_count_after, bob_count_after, charlie_count_after
+        );
+
+        // Bob should have received ZERO packets (different lobby)
+        assert_eq!(
+            bob_count_after, count_b,
+            "❌ ISOLATION BREACH: Bob in lobby-public received packets from Alice in lobby-secure!"
+        );
+        println!("✅ Confirmed: Bob (lobby-public) isolated from Alice's packets");
+
+        // Alice should NOT receive her own packets back (no self-echo)
+        assert_eq!(
+            alice_count_after, count_a,
+            "❌ Alice received her own packets back! Self-echo should be prevented."
+        );
+        println!("✅ Confirmed: Alice does not receive her own packets back (no self-echo)");
+
+        // Charlie should have received Alice's packets (same lobby)
+        assert!(
+            charlie_count_after >= count_c + 3,
+            "❌ Charlie should have received Alice's 3 packets, but only got {} new packets",
+            charlie_count_after - count_c
+        );
+        println!("✅ Confirmed: Charlie (lobby-secure) received Alice's packets");
+
+        // ========== PHASE 2: BIDIRECTIONAL SAME-LOBBY TEST ==========
+        println!("\n--- Phase 2: Testing Bidirectional Same-Lobby Communication ---");
+
+        let [alice_before_bidi, bob_before_bidi, charlie_before_bidi] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+
+        // Charlie responds to Alice with 2 packets
+        for i in 1..=2 {
+            let packet =
+                create_test_packet(user_c, VcMediaType::VIDEO, format!("charlie-reply-{}", i));
+            send_packet(&session_c, packet).await;
+            println!("✓ Charlie sent reply #{}", i);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let [alice_after_bidi, bob_after_bidi, charlie_after_bidi] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!(
+            "After Charlie's replies: A={}, B={}, C={}",
+            alice_after_bidi, bob_after_bidi, charlie_after_bidi
+        );
+
+        // Alice should receive Charlie's replies
+        assert!(
+            alice_after_bidi >= alice_before_bidi + 2,
+            "❌ Alice should have received Charlie's 2 replies"
+        );
+        println!("✅ Confirmed: Bidirectional communication within lobby-secure works");
+
+        // Charlie should NOT receive his own packets back (no self-echo)
+        assert_eq!(
+            charlie_after_bidi, charlie_before_bidi,
+            "❌ Charlie received his own packets back! Self-echo should be prevented."
+        );
+        println!("✅ Confirmed: Charlie does not receive his own packets back (no self-echo)");
+
+        // Bob should still have zero new packets
+        assert_eq!(
+            bob_after_bidi, bob_before_bidi,
+            "❌ ISOLATION BREACH: Bob received packets from Charlie!"
+        );
+        println!("✅ Confirmed: Bob remains isolated from lobby-secure traffic");
+
+        // ========== PHASE 3: ISOLATED LOBBY COMMUNICATION ==========
+        println!("\n--- Phase 3: Testing Bob's Isolated Communication ---");
+
+        let [alice_before_bob, bob_before_bob, charlie_before_bob] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+
+        // Bob sends packet in his own lobby (should not reach Alice, Charlie, or echo back to himself)
+        let packet = create_test_packet(user_b, VcMediaType::AUDIO, "bob-isolated-msg".to_string());
+        send_packet(&session_b, packet).await;
+        println!("✓ Bob sent packet in lobby-public");
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let [alice_after_bob, bob_after_bob, charlie_after_bob] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!(
+            "After Bob's packet: A={}, B={}, C={}",
+            alice_after_bob, bob_after_bob, charlie_after_bob
+        );
+
+        // Alice and Charlie should not receive Bob's packet
+        assert_eq!(
+            alice_after_bob, alice_before_bob,
+            "❌ Alice received Bob's packet across lobbies!"
+        );
+        assert_eq!(
+            charlie_after_bob, charlie_before_bob,
+            "❌ Charlie received Bob's packet across lobbies!"
+        );
+
+        // Bob should NOT receive his own packet back
+        assert_eq!(
+            bob_after_bob, bob_before_bob,
+            "❌ Bob received his own packet back! Self-echo should be prevented."
+        );
+
+        println!("✅ Confirmed: Bob's packets isolated to lobby-public");
+        println!("✅ Confirmed: Bob does not receive his own packets back (no self-echo)");
+
+        // ========== SUMMARY ==========
+        println!("\n=== COMPREHENSIVE LOBBY ISOLATION TEST PASSED ===");
+        let [alice_final, bob_final, charlie_final] =
+            get_all_user_counts(&[user_a, user_b, user_c])[..]
+        else {
+            panic!("Expected exactly 3 user counts");
+        };
+        println!("Final packet counts:");
+        println!("  • Alice (lobby-secure): {}", alice_final);
+        println!("  • Bob   (lobby-public):  {}", bob_final);
+        println!("  • Charlie (lobby-secure): {}", charlie_final);
+        println!("✅ All lobby isolation requirements verified!");
+        println!("✅ Self-echo prevention verified for all users!");
+
+        Ok(())
+    }
+
+    // ========== HELPER FUNCTIONS ==========
+
+    async fn start_keep_alive_tasks(
+        session_a: &web_transport_quinn::Session,
+        session_b: &web_transport_quinn::Session,
+        session_c: &web_transport_quinn::Session,
+    ) {
+        let session_a_keep = session_a.clone();
+        let session_b_keep = session_b.clone();
+        let session_c_keep = session_c.clone();
+
         tokio::spawn(async move {
-            let session = session.read().await;
-            let specific_subject_tx = Arc::new(specific_subject_tx);
-            while let Ok(mut uni_stream) = session.accept_uni().await {
-                let nc = nc.clone();
-                let specific_subject_tx_clone = specific_subject_tx.clone();
-                let specific_subject_rx = specific_subject_rx_clone.clone();
-                let session_for_echo = session.clone();
-                let session_id_inner = session_id_arc.clone();
-                let tracker_sender_inner = tracker_sender_quic.clone();
-                tokio::spawn(async move {
-                    let data_tracker = DataTracker::new(tracker_sender_inner.clone());
-                    if let Ok(d) = uni_stream.read_to_end(MAX_UNIDIRECTIONAL_STREAM_SIZE).await {
-                        let buf_size = d.len() as u64;
-
-                        if specific_subject_rx.borrow().is_none() {
-                            // Track data received even during handshake
-                            data_tracker.track_received(&session_id_inner, buf_size);
-
-                            if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(&d) {
-                                if packet_wrapper.packet_type == PacketType::CONNECTION.into() {
-                                    info!("Got connection packet");
-                                    let connection_packet =
-                                        ConnectionPacket::parse_from_bytes(&packet_wrapper.data)
-                                            .unwrap();
-                                    let specific_subject = format!(
-                                        "room.{}.{}",
-                                        connection_packet.meeting_id, packet_wrapper.email
-                                    )
-                                    .replace(' ', "_");
-                                    info!("Specific subject: {}", specific_subject);
-
-                                    // Now we have customer info - start tracking the connection
-                                    send_connection_started(
-                                        &tracker_sender_inner,
-                                        session_id_inner.as_ref().clone(),
-                                        packet_wrapper.email.clone(),
-                                        connection_packet.meeting_id.clone(),
-                                        "quic".to_string(),
-                                    );
-
-                                    specific_subject_tx_clone
-                                        .send(Some(specific_subject.into()))
-                                        .unwrap();
-                                }
-                            }
-                        } else {
-                            // Track data received for established connections
-                            data_tracker.track_received(&session_id_inner, buf_size);
-
-                            // Check if this is an RTT packet that should be echoed back
-                            if is_rtt_packet(&d) {
-                                trace!("Echoing RTT packet back via QUIC");
-                                let session_read = session_for_echo.clone();
-                                match session_read.open_uni().await {
-                                    Ok(mut echo_stream) => {
-                                        if let Err(e) = echo_stream.write_all(&d).await {
-                                            error!("Error echoing RTT packet via QUIC: {}", e);
-                                        } else {
-                                            // Track data sent for echo
-                                            data_tracker.track_sent(&session_id_inner, buf_size);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Error opening QUIC echo stream: {}", e);
-                                    }
-                                }
-                            } else if health_processor::is_health_packet_bytes(&d) {
-                                // Process health packet for diagnostics (don't relay)
-                                health_processor::process_health_packet_bytes(&d, nc.clone());
-                            } else {
-                                // Normal packet processing - publish to NATS
-                                let specific_subject =
-                                    specific_subject_rx.borrow().clone().unwrap();
-                                if let Err(e) = nc.publish(specific_subject.clone(), d.into()).await
-                                {
-                                    error!(
-                                        "Error publishing to subject {}: {}",
-                                        &specific_subject, e
-                                    );
-                                }
-                            }
-                        }
-                    } else {
-                        error!("Error reading from unidirectional stream");
-                    };
-                });
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(8));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_a_keep).await;
             }
-        })
-    };
+        });
 
-    let _datagrams_task = {
-        let session_clone = session.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_datagram = tracker_sender.clone();
         tokio::spawn(async move {
-            let data_tracker = DataTracker::new(tracker_sender_datagram);
-            let session = session_clone.read().await;
-            if specific_subject_rx.borrow().is_none() {
-                specific_subject_rx.changed().await.unwrap();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(8));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_b_keep).await;
             }
-            let specific_subject = specific_subject_rx.borrow().clone().unwrap();
-            while let Ok(datagram) = session.read_datagram().await {
-                let datagram_size = datagram.len() as u64;
-                // Track data received
-                data_tracker.track_received(&session_id_clone, datagram_size);
+        });
 
-                // Check if this is an RTT packet that should be echoed back
-                if is_rtt_packet(&datagram) {
-                    debug!("Echoing RTT datagram back via QUIC");
-                    if let Err(e) = session.send_datagram(datagram.clone()) {
-                        error!("Error echoing RTT datagram via QUIC: {}", e);
-                    } else {
-                        // Track data sent for echo
-                        data_tracker.track_sent(&session_id_clone, datagram_size);
-                    }
-                } else {
-                    // Normal datagram processing - publish to NATS
-                    let nc = nc.clone();
-                    if let Err(e) = nc.publish(specific_subject.clone(), datagram).await {
-                        error!("Error publishing to subject {}: {}", specific_subject, e);
-                    }
-                }
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(8));
+            loop {
+                interval.tick().await;
+                keep_alive(&session_c_keep).await;
             }
-        })
-    };
-    quic_task.await?;
-    should_run.store(false, Ordering::SeqCst);
-    nats_task.abort();
+        });
+    }
 
-    // Track connection end for metrics
-    send_connection_ended(&tracker_sender, session_id.as_ref().clone());
+    fn create_test_packet(sender: &str, media_type: VcMediaType, _message: String) -> Vec<u8> {
+        let media = VcMediaPacket {
+            media_type: media_type.into(),
+            email: sender.to_string(),
+            ..Default::default()
+        };
+        let packet = VcPacketWrapper {
+            packet_type: VcPacketType::MEDIA.into(),
+            email: sender.to_string(),
+            data: media.write_to_bytes().expect("serialize media"),
+            ..Default::default()
+        };
+        packet.write_to_bytes().expect("serialize wrapper")
+    }
 
-    info!("Finished handling QUIC session: {}", session_id);
-    Ok(())
-}
-
-fn session_subject_to_lobby_subject(subject: &str) -> String {
-    let parts = subject.split('.').collect::<Vec<&str>>();
-    let mut lobby_subject = String::from("room.");
-    lobby_subject.push_str(parts[1]);
-    lobby_subject.push_str(".*");
-    lobby_subject
+    fn get_all_user_counts(users: &[&str]) -> Vec<u64> {
+        users
+            .iter()
+            .map(|user| get_test_packet_counter_for_user(user))
+            .collect()
+    }
 }

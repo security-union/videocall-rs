@@ -12,34 +12,27 @@ tests_down:
 	docker compose -f $(COMPOSE_IT) down -v
 
 up:
-	$(COMPOSE) up
-
+		docker compose -f docker/docker-compose.yaml up
 down:
-	$(COMPOSE) down
-
+		docker compose -f docker/docker-compose.yaml down
 build:
-	$(COMPOSE) build
+		docker compose -f docker/docker-compose.yaml build
 
 connect_to_db:
-	$(COMPOSE) run postgres bash -c "psql -h postgres -d actix-api-db -U postgres"
+		docker compose -f docker/docker-compose.yaml run postgres bash -c "psql -h postgres -d actix-api-db -U postgres"
 
 connect_to_nats:
 	docker compose -f docker/docker-compose.yaml exec nats-box sh
 
 clippy-fix:
-	$(COMPOSE) run yew-ui bash -c "cd /app && cargo clippy --fix"
+		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app && cargo clippy --fix"
 
 fmt:
-	$(COMPOSE) run yew-ui bash -c "cd /app && cargo fmt"
+		docker compose -f docker/docker-compose.yaml run yew-ui bash -c "cd /app && cargo fmt"
 
-check:
-	$(COMPOSE) run websocket-api bash -c "cd /app && cargo clippy --all -- --deny warnings && cargo fmt --check"
+check: 
+		docker compose -f docker/docker-compose.yaml run websocket-api bash -c "cd /app && cargo clippy --all  -- --deny warnings && cargo fmt --check"
 
 clean:
-	$(COMPOSE) down --remove-orphans --volumes --rmi all
-
-help:
-	@echo "Available targets:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
-
-
+		docker compose -f docker/docker-compose.yaml down --remove-orphans \
+			--volumes --rmi all

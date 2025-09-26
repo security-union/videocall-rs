@@ -15,7 +15,7 @@
  * license, shall be dual licensed as above, without any additional terms or
  * conditions.
  */
- 
+
 use crate::components::diagnostics::SerializableDiagEvent;
 use crate::components::{
     browser_compatibility::BrowserCompatibility, canvas_generator, diagnostics::Diagnostics,
@@ -31,7 +31,7 @@ use log::{error, warn};
 use serde_json;
 use std::collections::HashMap;
 use videocall_client::utils::is_ios;
-use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_client::{MediaDeviceAccess, MeetingInfo, VideoCallClient, VideoCallClientOptions};
 use videocall_diagnostics::{subscribe, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
@@ -53,6 +53,7 @@ pub enum WsAction {
     SenderStatsUpdated(String),
     EncoderSettingsUpdated(String),
     TimerTick,
+    MeetingInfoReceived(MeetingInfo),
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -91,6 +92,7 @@ pub enum Msg {
     ConnectionManagerUpdate(String),   // connection manager diagnostics JSON
     HangUp,
     ShowCopyToast(bool),
+   // MeetingStartTimesReceived(f64),
 }
 
 impl From<WsAction> for Msg {
@@ -154,6 +156,7 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp
     pub call_start_time: Option<f64>, // Track when the call started
     _timer: Option<Interval>,
 }
@@ -236,6 +239,12 @@ impl AttendantsComponent {
             }),
             rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
             rtt_probe_interval_ms: Some(200),
+            on_meeting_info_received: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |meeting_info| {
+                    link.send_message(Msg::from(WsAction::MeetingInfoReceived(meeting_info)))
+                })
+            }),
         };
 
         VideoCallClient::new(opts)
@@ -332,20 +341,29 @@ impl AttendantsComponent {
     // Format the call duration as HH:MM:SS
     fn format_call_duration(&self) -> String {
         // Use a fixed reference time if call_start_time is not set
-        let start_time = match &self.call_start_time {
-            Some(start) => start,
-            None => return "00:00".to_string(),
+        let start_time = match &self.meeting_start_time_server {
+            Some(server_start) => server_start,
+            None => &match self.call_start_time {
+                Some(local_start) => local_start,
+                None => return "00:00".to_string(),
+            }
         };
-        
+
         let now = web_sys::window()
             .and_then(|w| w.performance())
             .map(|p| p.now())
             .unwrap_or_else(|| {
                 web_sys::console::warn_1(&"Failed to get performance.now()".into());
-                start_time + 1.0
+                start_time + 1000.0
             });
-            
-        let elapsed_secs = ((now - start_time) / 1000.0) as u64;
+
+        let elapsed_ms = if self.meeting_start_time_server.is_some() {
+            now - (start_time * 1000.0)
+        } else {
+            now - start_time
+        };
+
+        let elapsed_secs = (elapsed_ms / 1000.0).max(0.0) as u64;
 
         let hours = elapsed_secs / 3600;
         let minutes = (elapsed_secs % 3600) / 60;
@@ -396,6 +414,7 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            meeting_start_time_server: None,
             call_start_time: None, // Will be set when the meeting starts
             _timer: None,
         };
@@ -588,17 +607,35 @@ impl Component for AttendantsComponent {
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
                     // Start the timer when connection is established
-                    self.call_start_time = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
+                    // self.call_start_time = web_sys::window()
+                    //     .and_then(|w| w.performance())
+                    //     .map(|p| p.now());
 
-                    if self.call_start_time.is_some() {
+                    // if self.call_start_time.is_some() {
+                    //     let link = ctx.link().clone();
+                    //     // Create a new interval that triggers an update every second
+                    //     let interval = Interval::new(1000, move || {
+                    //         link.send_message(WsAction::TimerTick);
+                    //     });
+                    //     self._timer = Some(interval);
+                    // }
+
+                    if self.meeting_start_time_server.is_none() {
+                        self.call_start_time = web_sys::window()
+                            .and_then(|w| w.performance())
+                            .map(|p| p.now());
+                    }
+                    else {
+                        log::info!("YEW-UI: Using server-synchronized timer, not overriding");
+                    }
+
+                    if self._timer.is_none() {
                         let link = ctx.link().clone();
-                        // Clear any existing timer
-                        // self._timer = None;
-                        // Create a new interval that triggers an update every second
                         let interval = Interval::new(1000, move || {
                             link.send_message(WsAction::TimerTick);
                         });
                         self._timer = Some(interval);
+
                     }
                     true
                 }
@@ -639,7 +676,6 @@ impl Component for AttendantsComponent {
                     ctx.link().send_message(WsAction::Connect);
                     true
                 }
-
                 WsAction::TimerTick => {
                     // This will trigger a re-render, which will update the timer display
                     true
@@ -662,6 +698,35 @@ impl Component for AttendantsComponent {
                     self.encoder_settings = Some(settings);
                     true
                 }
+                WsAction::MeetingInfoReceived(meeting_info) => {
+                    log::info!("YEW-UI: Received meeting info - start_timestamp_ms: {}", meeting_info.start_timestamp_ms);
+                    let client_time_now = web_sys::window()
+                        .and_then(|w| w.performance())
+                        .map(|p| p.now())
+                        .unwrap_or(0.0);
+                    let server_start_time_seconds = meeting_info.start_timestamp_ms as f64 / 1000.0;
+
+                    let server_current_time_seconds = meeting_info.current_server_time_ms as f64 / 1000.0;
+                    let meeting_elapsed_on_server = server_current_time_seconds - server_start_time_seconds;
+
+                    let local_meeting_start = client_time_now - (meeting_elapsed_on_server * 1000.0);
+                    self.meeting_start_time_server = Some(server_start_time_seconds);
+
+                    log::info!("YEW-UI: Server start time: {} seconds", server_start_time_seconds);
+                    log::info!("YEW-UI: Server current time: {} seconds", server_current_time_seconds);
+                    log::info!("YEW-UI: Meeting elapsed on server: {} seconds", meeting_elapsed_on_server);
+                    log::info!("YEW-UI: Local meeting start adjusted to: {} seconds", local_meeting_start / 1000.0);
+
+                    if self._timer.is_none() {
+                        let link = ctx.link().clone();
+                        let interval = Interval::new(1000, move || {
+                            link.send_message(WsAction::TimerTick);
+                        });
+                        self._timer = Some(interval)
+                    }
+
+                    true
+                }
             },
             Msg::OnPeerAdded(email) => {
                 log::info!("New user joined: {email}");
@@ -669,12 +734,14 @@ impl Component for AttendantsComponent {
                 Self::play_user_joined();
 
                 // Make sure timer is running when someone joins
-                if self.call_start_time.is_none() {
-                    self.call_start_time = web_sys::window().and_then(|w| w.performance()).map(|p| p.now());
-                    if self.call_start_time.is_some() {
+                if self.meeting_start_time_server.is_none() && self.call_start_time.is_none() {
+                    self.call_start_time = web_sys::window()
+                        .and_then(|w| w.performance())
+                        .map(|p| p.now());
+                    if self.call_start_time.is_some() && self._timer.is_none() {
                         let link = ctx.link().clone();
                         // Clear any existing timer
-                        self._timer = None;
+                        //  self._timer = None;
                         // Create a new interval that triggers an update every second
                         let interval = Interval::new(1000, move || {
                             link.send_message(WsAction::TimerTick);
@@ -860,6 +927,7 @@ impl Component for AttendantsComponent {
                 let _ = window().location().reload(); // Refresh page for clean state
                 true
             }
+           // Msg::MeetingStartTimesReceived(_) => todo!(),
         }
     }
 
@@ -951,7 +1019,7 @@ impl Component for AttendantsComponent {
         }
 
         // Create the call timer HTML if the call has started
-        let call_timer = if self.call_start_time.is_some() {
+        let call_timer = if self.meeting_start_time_server.is_some() || self.call_start_time.is_some() {
             html! {
                 <div class="call-timer">
                     { self.format_call_duration() }
@@ -969,7 +1037,7 @@ impl Component for AttendantsComponent {
                     class={classes!("control-button", self.diagnostics_open.then_some("active"))}
                     onclick={toggle_diagnostics.clone()}
                 >
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <circle cx="12" cy="12" r="10"></circle>
                         <line x1="12" y1="8" x2="12" y2="12"></line>
                         <line x1="12" y1="16" x2="12.01" y2="16"></line>

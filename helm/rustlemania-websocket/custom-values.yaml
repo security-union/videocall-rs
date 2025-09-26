@@ -1,0 +1,70 @@
+fullnameOverride: "rustlemania-websocket"
+
+image:
+  repository: securityunion/rustlemania-api
+  pullPolicy: Always
+  tag: latest
+
+env:
+  - name: RUST_LOG
+    value: info
+  - name: ACTIX_PORT
+    value: "8080"
+  - name: NATS_URL
+    value: "nats://nats:4222"  # Full NATS URL with protocol prefix
+  - name: UI_ENDPOINT
+    value: https://rustlemania.com
+  - name: DATABASE_ENABLED
+    value: "false"
+  - name: DATABASE_URL
+    value: "false"
+  - name: TOKIO_WORKER_THREADS
+    value: "1"
+  - name: REGION
+    value: "us-east"
+  - name: HOSTNAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: SERVER_ID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: SERVICE_TYPE
+    value: websocket
+  - name: SERVER_STATS_INTERVAL_SECS
+    value: "5"
+
+resources:
+  limits:
+    cpu: "500m"
+    memory: "384Mi"
+  requests:
+    cpu: "500m"
+    memory: "192Mi"
+
+ingress:
+  annotations:
+    # Certificate management annotations (from default values)
+    cert-manager.io/issuer: letsencrypt-prod
+    kubernetes.io/tls-acme: "true"
+
+    # WebSocket specific annotations
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/use-proxy-protocol: "false"
+  hosts:
+    - host: websocket.YOUR_DOMAIN_NAME
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: websocket-rustlemania-websocket
+            port:
+              number: 8080
+  tls:
+    - secretName: websocket-tls
+      hosts:
+        - websocket.YOUR_DOMAIN_NAME

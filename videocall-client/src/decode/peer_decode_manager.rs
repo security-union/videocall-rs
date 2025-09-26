@@ -19,6 +19,7 @@
 use super::hash_map_with_ordered_keys::HashMapWithOrderedKeys;
 use super::peer_decoder::{PeerDecode, VideoPeerDecoder};
 use super::{create_audio_peer_decoder, AudioPeerDecoderTrait, DecodeStatus};
+use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::crypto::aes::Aes128State;
 use crate::diagnostics::DiagnosticManager;
 use anyhow::Result;
@@ -306,6 +307,10 @@ impl Peer {
                                 "video_enabled",
                                 if metadata.video_enabled { 1u64 } else { 0u64 }
                             ),
+                            metric!(
+                                "screen_enabled",
+                                if metadata.screen_enabled { 1u64 } else { 0u64 }
+                            ),
                         ],
                     };
                     let _ = global_sender().try_broadcast(evt);
@@ -365,6 +370,7 @@ pub struct PeerDecodeManager {
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
     diagnostics: Option<Rc<DiagnosticManager>>,
+    pub on_peer_removed: Callback<String>,
 }
 
 impl Default for PeerDecodeManager {
@@ -381,6 +387,7 @@ impl PeerDecodeManager {
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
+            on_peer_removed: Callback::noop(),
         }
     }
 
@@ -391,6 +398,7 @@ impl PeerDecodeManager {
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: Some(diagnostics),
+            on_peer_removed: Callback::noop(),
         }
     }
 
@@ -403,8 +411,12 @@ impl PeerDecodeManager {
     }
 
     pub fn run_peer_monitor(&mut self) {
-        let pred = |peer: &mut Peer| peer.check_heartbeat();
-        self.connected_peers.remove_if(pred);
+        let removed = self
+            .connected_peers
+            .remove_if_and_return_keys(|peer| peer.check_heartbeat());
+        for k in removed {
+            self.on_peer_removed.emit(k);
+        }
     }
 
     pub fn decode(&mut self, response: PacketWrapper, userid: &str) -> Result<(), PeerDecodeError> {
@@ -461,6 +473,7 @@ impl PeerDecodeManager {
 
     pub fn delete_peer(&mut self, email: &String) {
         self.connected_peers.remove(email);
+        self.on_peer_removed.emit(email.clone());
     }
 
     pub fn ensure_peer(&mut self, email: &String) -> PeerStatus {
@@ -498,37 +511,15 @@ impl PeerDecodeManager {
         None
     }
 
-    /// Updates the speaker device for all connected peers by rebuilding their audio decoders
+    /// Updates the speaker device by switching the sink on the shared AudioContext
     pub fn update_speaker_device(
         &mut self,
         speaker_device_id: Option<String>,
     ) -> Result<(), JsValue> {
-        let keys: Vec<String> = self.connected_peers.ordered_keys().clone();
-
-        for key in keys {
-            if let Some(peer) = self.connected_peers.get_mut(&key) {
-                // Preserve current mute state
-                let current_muted = !peer.audio_enabled;
-
-                // Create a new audio decoder with the new speaker device
-                match create_audio_peer_decoder(speaker_device_id.clone(), key.clone()) {
-                    Ok(mut new_audio_decoder) => {
-                        // Restore the mute state to the new decoder
-                        new_audio_decoder.set_muted(current_muted);
-
-                        // Replace the old decoder with the new one
-                        peer.audio = new_audio_decoder;
-                        log::info!("Successfully rebuilt audio decoder for peer: {key} with speaker device (muted: {current_muted})");
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to rebuild audio decoder for peer: {key}, error: {e:?}"
-                        );
-                        // Keep the old decoder rather than breaking audio completely
-                    }
-                }
-            }
-        }
+        log::info!(
+            "Updating shared AudioContext sink to {speaker_device_id:?} (no decoder rebuild)",
+        );
+        SharedAudioContext::update_speaker_device(speaker_device_id)?;
         Ok(())
     }
 }

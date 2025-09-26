@@ -1,3 +1,4 @@
+use crate::audio::shared_audio_context::SharedAudioContext;
 use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
 use js_sys::Float32Array;
@@ -12,8 +13,9 @@ use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::{AudioContext, AudioContextOptions, AudioWorkletNode, MessageEvent, Worker};
+use web_sys::{AudioContext, AudioWorkletNode, MessageEvent, Worker};
+
+const WORKLET_CODE: &str = include_str!("../scripts/pcmPlayerWorker.js");
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
@@ -56,7 +58,7 @@ enum WorkerResponse {
 #[derive(Debug)]
 pub struct NetEqAudioPeerDecoder {
     worker: Worker,
-    audio_context: AudioContext,
+    _audio_context: AudioContext,
     decoded: bool,
     peer_id: String, // Track which peer this decoder belongs to
     _pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>, // AudioWorklet PCM player
@@ -125,67 +127,12 @@ impl NetEqAudioPeerDecoder {
     async fn create_safari_audio_context(
         speaker_device_id: Option<String>,
     ) -> Result<(AudioContext, AudioWorkletNode), JsValue> {
-        // Create AudioContext with ENFORCED 48kHz for Safari (critical!)
-        let options = AudioContextOptions::new();
-        options.set_sample_rate(48000.0); // Explicitly force 48kHz
-        let audio_context = AudioContext::new_with_context_options(&options)?;
+        // Use shared context and ensure worklet is registered before creating node
+        let audio_context = SharedAudioContext::get_or_init(speaker_device_id.clone())?;
+        SharedAudioContext::ensure_pcm_worklet_ready(WORKLET_CODE).await?;
 
-        // CRITICAL: Verify actual sample rate Safari is using
-        let actual_sample_rate = audio_context.sample_rate();
-        log::info!("Safari AudioContext sample rate: {actual_sample_rate}");
-
-        if (actual_sample_rate - 48000.0).abs() > 1.0 {
-            log::warn!(
-                "⚠️ Safari AudioContext sample rate mismatch! Expected 48000, got: {actual_sample_rate}"
-            );
-        }
-
-        // Load the PCM player worklet
-        JsFuture::from(
-            audio_context
-                .audio_worklet()?
-                .add_module("/pcmPlayerWorker.js")?,
-        )
-        .await?;
-
-        // Create the PCM player worklet node
-        let pcm_player = AudioWorkletNode::new(&audio_context, "pcm-player")?;
-
-        // Connect worklet to destination
-        pcm_player.connect_with_audio_node(&audio_context.destination())?;
-
-        // Configure the worklet with explicit 48kHz
-        let config_message = js_sys::Object::new();
-        js_sys::Reflect::set(&config_message, &"command".into(), &"configure".into())?;
-        js_sys::Reflect::set(
-            &config_message,
-            &"sampleRate".into(),
-            &JsValue::from(48000.0),
-        )?; // Force 48kHz
-        js_sys::Reflect::set(
-            &config_message,
-            &"channels".into(),
-            &JsValue::from(AUDIO_CHANNELS as f32),
-        )?;
-        pcm_player.port()?.post_message(&config_message)?;
-
-        log::info!("Safari: Configured PCM worklet for 48kHz playback");
-
-        // Set sink device if specified (Safari supports setSinkId)
-        if let Some(device_id) = speaker_device_id {
-            if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
-                .unwrap_or(false)
-            {
-                let promise = audio_context.set_sink_id_with_str(&device_id);
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(e) = JsFuture::from(promise).await {
-                        log::warn!("Safari: Failed to set audio output device: {e:?}");
-                    } else {
-                        log::info!("Safari: Successfully set audio output device");
-                    }
-                });
-            }
-        }
+        // Create per-peer nodes after registration completes
+        let (pcm_player, _peer_gain) = SharedAudioContext::create_peer_playback_nodes("safari")?;
 
         Ok((audio_context, pcm_player))
     }
@@ -467,29 +414,16 @@ impl NetEqAudioPeerDecoder {
         // Create worker
         let worker = Self::create_neteq_worker()?;
 
-        // Create AudioContext with enforced 48kHz for all browsers
-        let options = AudioContextOptions::new();
-        options.set_sample_rate(48000.0);
-        let audio_context = AudioContext::new_with_context_options(&options)?;
-
-        // Set sink device if specified
-        if let Some(device_id) = &speaker_device_id {
-            if js_sys::Reflect::has(&audio_context, &JsValue::from_str("setSinkId"))
-                .unwrap_or(false)
-            {
-                let promise = audio_context.set_sink_id_with_str(device_id);
-                wasm_bindgen_futures::spawn_local(async move {
-                    let _ = JsFuture::from(promise).await;
-                });
-            }
-        }
+        // Use shared AudioContext and ensure worklet registered once
+        let audio_context = SharedAudioContext::get_or_init(speaker_device_id.clone())?;
+        SharedAudioContext::ensure_pcm_worklet(WORKLET_CODE);
 
         let pcm_player_ref = Rc::new(RefCell::new(None::<AudioWorkletNode>));
 
         // Create decoder with explicit mute state first
         let mut decoder = Self {
             worker: worker.clone(),
-            audio_context: audio_context.clone(),
+            _audio_context: audio_context.clone(),
             decoded: false,
             peer_id: peer_id.clone(),
             _pcm_player: pcm_player_ref.clone(),
@@ -558,7 +492,6 @@ impl NetEqAudioPeerDecoder {
 
 impl Drop for NetEqAudioPeerDecoder {
     fn drop(&mut self) {
-        let _ = self.audio_context.close();
         self.worker.terminate();
     }
 }

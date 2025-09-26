@@ -22,3 +22,7 @@ use std::time::Duration;
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long before lack of client response causes a timeout
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Regex pattern for validating usernames and room IDs
+/// Allows alphanumeric characters, underscores, and hyphens
+pub const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";

@@ -1,0 +1,48 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "--http_port", "8222"]
+
+  rust-tests:
+    build:
+      dockerfile: ../docker/Dockerfile.actix
+      context: ../docker
+    working_dir: /app/actix-api
+    environment:
+      - RUST_LOG=info
+      - WEBTRANSPORT_URL=https://127.0.0.1:4433
+      - HEALTH_URL=http://127.0.0.1:5321/healthz
+      - NATS_URL=nats:4222
+      - INSECURE=true
+      - LISTEN_URL=0.0.0.0:4433
+      - HEALTH_LISTEN_URL=0.0.0.0:5321
+      - CERT_PATH=certs/localhost.pem
+      - KEY_PATH=certs/localhost.key
+      - CARGO_TARGET_DIR=/app/actix-api/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - rustlemania-it-tests-registry:/usr/local/cargo/registry
+      - rustlemania-it-tests-git:/usr/local/cargo/git
+      - rustlemania-it-tests-target:/usr/local/cargo/target
+      - rustlemania-it-tests-cache:/app/actix-api/target
+    depends_on:
+      - nats
+    command: >
+      bash -lc '
+        set -euo pipefail
+        echo "=== STARTING CARGO TEST ==="
+        cargo test -p videocall-api -- --nocapture --test-threads=1
+        echo "=== CARGO TEST FINISHED WITH EXIT CODE: $? ==="
+      '
+
+volumes:
+  rustlemania-it-tests-registry:
+  rustlemania-it-tests-git:
+  rustlemania-it-tests-target:
+  rustlemania-it-tests-cache:
+
+

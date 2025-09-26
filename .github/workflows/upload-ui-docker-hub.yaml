@@ -7,8 +7,7 @@ on:
   push:
     branches:
       - main
-      - add-diagnostics
-      - add-dynamic-ui-config
+      - disable-diagnostics
     paths:
       - 'yew-ui/**'
       - 'types/**'

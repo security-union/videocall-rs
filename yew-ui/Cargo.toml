@@ -24,6 +24,7 @@ once_cell = "1.19"
 log = "0.4.19"
 gloo-timers = "0.2.6"
 gloo-utils = "0.1"
+gloo-storage = "0.3"
 yew-router = "0.18"
 neteq = { path = "../neteq", version = "0.6.1", features = ["web"], default-features = false }
 wasm-bindgen-futures = { workspace = true }
@@ -47,6 +48,9 @@ features = [
     "Document",
     "Clipboard",
     "HtmlAudioElement",
+    "TouchEvent",
+    "TouchList",
+    "Touch",
 ]
 
 [dev-dependencies]

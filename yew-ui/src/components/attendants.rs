@@ -17,8 +17,8 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics, host::Host,
-    peer_list::PeerList, peer_tile::PeerTile,
+    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics,
+    draggable_host::DraggableHost, peer_list::PeerList, peer_tile::PeerTile,
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
@@ -942,7 +942,7 @@ impl Component for AttendantsComponent {
                                     }
                                     {
                                          if media_access_granted {
-                                             html! {<Host
+                                             html! {<DraggableHost
                                                  client={self.client.clone()}
                                                  share_screen={self.share_screen}
                                                  mic_enabled={self.mic_enabled}

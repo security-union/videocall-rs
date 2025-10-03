@@ -17,8 +17,8 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics,
-    draggable_host::DraggableHost, peer_list::PeerList, peer_tile::PeerTile,
+    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics, host::Host,
+    peer_list::PeerList, peer_tile::PeerTile,
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
@@ -80,6 +80,10 @@ pub enum Msg {
     ToggleForceDesktopGrid,
     HangUp,
     ShowCopyToast(bool),
+    // Host drag events (desktop only for now)
+    StartDragHost(MouseEvent),
+    DragHost(MouseEvent),
+    EndDragHost,
 }
 
 impl From<WsAction> for Msg {
@@ -135,6 +139,10 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    // Host drag state (simple, minimal): position in pixels relative to #main-container
+    host_pos: Option<(f64, f64)>,
+    host_dragging: bool,
+    host_drag_offset: Option<(f64, f64)>,
 }
 
 impl AttendantsComponent {
@@ -346,6 +354,9 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            host_pos: None,
+            host_dragging: false,
+            host_drag_offset: None,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -557,6 +568,45 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            // Host drag logic
+            Msg::StartDragHost(e) => {
+                self.host_dragging = true;
+                let (cx, cy) = (e.client_x() as f64, e.client_y() as f64);
+                let current = self.host_pos.unwrap_or_else(|| {
+                    // default bottom-right: rely on CSS; set zero so movement is relative
+                    (0.0, 0.0)
+                });
+                self.host_drag_offset = Some((cx - current.0, cy - current.1));
+                true
+            }
+            Msg::DragHost(e) => {
+                if self.host_dragging {
+                    if let Some((ox, oy)) = self.host_drag_offset {
+                        let (cx, cy) = (e.client_x() as f64, e.client_y() as f64);
+                        let mut x = cx - ox;
+                        let mut y = cy - oy;
+                        // Clamp to viewport
+                        if let Some(win) = web_sys::window() {
+                            if let (Ok(w), Ok(h)) = (win.inner_width(), win.inner_height()) {
+                                if let (Some(vw), Some(vh)) = (w.as_f64(), h.as_f64()) {
+                                    // Use a conservative host size for clamping
+                                    let (hw, hh) = (240.0, 180.0);
+                                    x = x.max(0.0).min(vw - hw);
+                                    y = y.max(0.0).min(vh - hh);
+                                }
+                            }
+                        }
+                        self.host_pos = Some((x, y));
+                        return true;
+                    }
+                }
+                false
+            }
+            Msg::EndDragHost => {
+                self.host_dragging = false;
+                self.host_drag_offset = None;
+                true
+            }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
                 let _ = window().location().reload(); // Refresh page for clean state
@@ -655,7 +705,7 @@ impl Component for AttendantsComponent {
         }
 
         html! {
-            <div id="main-container" class="meeting-page">
+            <div id="main-container" class="meeting-page" onmousemove={ctx.link().callback(Msg::DragHost)} onmouseup={ctx.link().callback(|_| Msg::EndDragHost)}>
                 <BrowserCompatibility/>
                 <div id="grid-container"
                     class={grid_container_classes}
@@ -942,16 +992,31 @@ impl Component for AttendantsComponent {
                                     }
                                     {
                                          if media_access_granted {
-                                             html! {<DraggableHost
-                                                 client={self.client.clone()}
-                                                 share_screen={self.share_screen}
-                                                 mic_enabled={self.mic_enabled}
-                                                 video_enabled={self.video_enabled}
-                                                 on_encoder_settings_update={on_encoder_settings_update}
-                                                 device_settings_open={self.device_settings_open}
-                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
-                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
-                                             />}
+                                             // Inline style for position based on drag state
+                                             {
+                                                 let style = if let Some((x, y)) = self.host_pos {
+                                                     format!("position:absolute; left: {}px; top: {}px; z-index: 10;", x, y)
+                                                 } else {
+                                                     // Let CSS default bottom-right apply until user drags
+                                                     "position:absolute; z-index:10;".to_string()
+                                                 };
+                                                 html! {<div
+                                                     id="host-draggable-wrapper"
+                                                     style={style}
+                                                     onmousedown={ctx.link().callback(Msg::StartDragHost)}
+                                                 >
+                    <Host
+                                                     client={self.client.clone()}
+                                                     share_screen={self.share_screen}
+                                                     mic_enabled={self.mic_enabled}
+                                                     video_enabled={self.video_enabled}
+                                                     on_encoder_settings_update={on_encoder_settings_update}
+                                                     device_settings_open={self.device_settings_open}
+                                                     on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                                     on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                                 />
+                                                 </div>}
+                                             }
                                          } else {
                                              html! {<></>}
                                          }

@@ -24,6 +24,14 @@ use wasm_bindgen::JsCast;
 use web_sys::MouseEvent;
 use yew::prelude::*;
 
+#[derive(Clone, Copy)]
+struct ContainerBox {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HostPosition {
     x: f64,
@@ -48,6 +56,7 @@ pub struct DraggableHost {
     is_dragging: bool,
     drag_offset: Option<(f64, f64)>,
     element_size: Option<(f64, f64)>,
+    node_ref: NodeRef,
 }
 
 #[derive(Properties, Debug, PartialEq)]
@@ -78,27 +87,34 @@ impl Component for DraggableHost {
             is_dragging: false,
             drag_offset: None,
             element_size: None,
+            node_ref: NodeRef::default(),
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::StartDrag(event) => {
-                if let Some(window) = web_sys::window() {
+                // Get actual element position relative to its positioned container
+                if let Some(element) = self.node_ref.cast::<web_sys::HtmlElement>() {
+                    let rect = element.get_bounding_client_rect();
+                    let container = Self::container_box(&element);
+                    let current_x = rect.left() - container.left;
+                    let current_y = rect.top() - container.top;
+
                     let client_x = event.client_x() as f64;
                     let client_y = event.client_y() as f64;
 
-                    // Get current position or calculate default
-                    let (current_x, current_y) = self.position.unwrap_or_else(|| {
-                        Self::calculate_default_position(&window, self.element_size)
-                    });
-
                     // Calculate offset from click point to element origin
-                    self.drag_offset = Some((client_x - current_x, client_y - current_y));
+                    self.drag_offset = Some((client_x - (current_x + container.left), client_y - (current_y + container.top)));
                     self.is_dragging = true;
 
-                    // Add global event listeners
-                    Self::add_global_listeners(ctx);
+                    // Store element size for constraints
+                    self.element_size = Some((rect.width(), rect.height()));
+
+                    // If we don't have a position yet, set it to current position
+                    if self.position.is_none() {
+                        self.position = Some((current_x, current_y));
+                    }
                 }
                 true
             }
@@ -106,18 +122,27 @@ impl Component for DraggableHost {
                 let touches = event.touches();
                 if touches.length() == 1 {
                     if let Some(touch) = touches.get(0) {
-                        if let Some(window) = web_sys::window() {
+                        // Get actual element position relative to its positioned container
+                        if let Some(element) = self.node_ref.cast::<web_sys::HtmlElement>() {
+                            let rect = element.get_bounding_client_rect();
+                            let container = Self::container_box(&element);
+                            let current_x = rect.left() - container.left;
+                            let current_y = rect.top() - container.top;
+
                             let client_x = touch.client_x() as f64;
                             let client_y = touch.client_y() as f64;
 
-                            let (current_x, current_y) = self.position.unwrap_or_else(|| {
-                                Self::calculate_default_position(&window, self.element_size)
-                            });
-
-                            self.drag_offset = Some((client_x - current_x, client_y - current_y));
+                            // Calculate offset from touch point to element origin (viewport coords)
+                            self.drag_offset = Some((client_x - (current_x + container.left), client_y - (current_y + container.top)));
                             self.is_dragging = true;
 
-                            Self::add_global_listeners(ctx);
+                            // Store element size for constraints
+                            self.element_size = Some((rect.width(), rect.height()));
+
+                            // If we don't have a position yet, set it to current position
+                            if self.position.is_none() {
+                                self.position = Some((current_x, current_y));
+                            }
                         }
                     }
                 }
@@ -126,18 +151,20 @@ impl Component for DraggableHost {
             Msg::Drag(event) => {
                 if self.is_dragging {
                     if let Some((offset_x, offset_y)) = self.drag_offset {
-                        if let Some(window) = web_sys::window() {
+                        if let Some(element) = self.node_ref.cast::<web_sys::HtmlElement>() {
+                            let container = Self::container_box(&element);
                             let client_x = event.client_x() as f64;
                             let client_y = event.client_y() as f64;
 
-                            let new_x = client_x - offset_x;
-                            let new_y = client_y - offset_y;
+                            let new_x = client_x - offset_x - container.left;
+                            let new_y = client_y - offset_y - container.top;
 
-                            // Constrain to viewport bounds
+                            // Constrain to container bounds
                             self.position = Some(Self::constrain_position(
                                 new_x,
                                 new_y,
-                                &window,
+                                container.width,
+                                container.height,
                                 self.element_size,
                             ));
                         }
@@ -152,18 +179,20 @@ impl Component for DraggableHost {
                     let touches = event.touches();
                     if let Some(touch) = touches.get(0) {
                         if let Some((offset_x, offset_y)) = self.drag_offset {
-                            if let Some(window) = web_sys::window() {
+                            if let Some(element) = self.node_ref.cast::<web_sys::HtmlElement>() {
                                 event.prevent_default();
+                                let container = Self::container_box(&element);
                                 let client_x = touch.client_x() as f64;
                                 let client_y = touch.client_y() as f64;
 
-                                let new_x = client_x - offset_x;
-                                let new_y = client_y - offset_y;
+                                let new_x = client_x - offset_x - container.left;
+                                let new_y = client_y - offset_y - container.top;
 
                                 self.position = Some(Self::constrain_position(
                                     new_x,
                                     new_y,
-                                    &window,
+                                    container.width,
+                                    container.height,
                                     self.element_size,
                                 ));
                             }
@@ -247,8 +276,9 @@ impl Component for DraggableHost {
         let wrapper_style = format!("{position_style} {cursor_style}");
 
         html! {
-            <nav
-                class="host"
+            <nav 
+                ref={self.node_ref.clone()}
+                class="host" 
                 style={wrapper_style}
                 onmousemove={onmousemove}
                 onmouseup={onmouseup}
@@ -292,8 +322,14 @@ impl DraggableHost {
                     (current_height - stored.viewport_height).abs() / stored.viewport_height;
 
                 if width_ratio < 0.2 && height_ratio < 0.2 {
-                    // Validate position is still within bounds
-                    let constrained = Self::constrain_position(stored.x, stored.y, &window, None);
+                    // Validate position against current viewport as container
+                    let constrained = Self::constrain_position(
+                        stored.x,
+                        stored.y,
+                        current_width,
+                        current_height,
+                        None,
+                    );
                     return Some(constrained);
                 }
             }
@@ -317,61 +353,72 @@ impl DraggableHost {
         }
     }
 
-    fn calculate_default_position(
-        window: &web_sys::Window,
-        element_size: Option<(f64, f64)>,
-    ) -> (f64, f64) {
-        if let (Ok(width), Ok(height)) = (window.inner_width(), window.inner_height()) {
-            if let (Some(w), Some(h)) = (width.as_f64(), height.as_f64()) {
-                let (elem_width, elem_height) = element_size.unwrap_or((240.0, 180.0));
-
-                // Check if mobile (viewport width < 768px)
-                let is_mobile = w < 768.0;
-
-                if is_mobile {
-                    // Mobile: bottom-right with mobile spacing
-                    let x = w - elem_width - 8.0;
-                    let y = h - elem_height - 78.0; // Account for controls
-                    return (x.max(0.0), y.max(0.0));
-                } else {
-                    // Desktop: bottom-right with desktop spacing
-                    let x = w - elem_width - 16.0;
-                    let y = h - elem_height - 16.0;
-                    return (x.max(0.0), y.max(0.0));
-                }
-            }
-        }
-        (16.0, 16.0) // Fallback position
-    }
-
     fn constrain_position(
         x: f64,
         y: f64,
-        window: &web_sys::Window,
+        container_width: f64,
+        container_height: f64,
         element_size: Option<(f64, f64)>,
     ) -> (f64, f64) {
-        if let (Ok(width), Ok(height)) = (window.inner_width(), window.inner_height()) {
-            if let (Some(w), Some(h)) = (width.as_f64(), height.as_f64()) {
-                let (elem_width, elem_height) = element_size.unwrap_or((240.0, 180.0));
+        let (elem_width, elem_height) = element_size.unwrap_or((240.0, 180.0));
 
-                let max_x = w - elem_width;
-                let max_y = h - elem_height;
+        let max_x = (container_width - elem_width).max(0.0);
+        let max_y = (container_height - elem_height).max(0.0);
 
-                let constrained_x = x.max(0.0).min(max_x);
-                let constrained_y = y.max(0.0).min(max_y);
+        let constrained_x = x.max(0.0).min(max_x);
+        let constrained_y = y.max(0.0).min(max_y);
 
-                return (constrained_x, constrained_y);
-            }
-        }
-        (x.max(0.0), y.max(0.0))
-    }
-
-    fn add_global_listeners(_ctx: &Context<Self>) {
-        // In a real implementation, add global mousemove/touchmove/mouseup/touchend listeners
-        // For now, rely on event bubbling
+        (constrained_x, constrained_y)
     }
 
     fn remove_global_listeners(_ctx: &Context<Self>) {
         // Remove global listeners when drag ends
+        // Currently not needed as we use element-level listeners
+    }
+
+    fn container_box(element: &web_sys::HtmlElement) -> ContainerBox {
+        // Prefer the absolute positioned meeting container (#main-container)
+        if let Some(doc) = element.owner_document() {
+            if let Some(el) = doc.get_element_by_id("main-container") {
+                if let Ok(container) = el.dyn_into::<web_sys::HtmlElement>() {
+                    let rect = container.get_bounding_client_rect();
+                    return ContainerBox {
+                        left: rect.left(),
+                        top: rect.top(),
+                        width: rect.width(),
+                        height: rect.height(),
+                    };
+                }
+            }
+        }
+        // Else, use the offsetParent box
+        if let Some(parent) = element.offset_parent() {
+            let rect = parent.get_bounding_client_rect();
+            return ContainerBox {
+                left: rect.left(),
+                top: rect.top(),
+                width: rect.width(),
+                height: rect.height(),
+            };
+        }
+        // Fallback to viewport bounds
+        if let Some(win) = element.owner_document().and_then(|d| d.default_view()) {
+            if let (Ok(w), Ok(h)) = (win.inner_width(), win.inner_height()) {
+                if let (Some(width), Some(height)) = (w.as_f64(), h.as_f64()) {
+                    return ContainerBox {
+                        left: 0.0,
+                        top: 0.0,
+                        width,
+                        height,
+                    };
+                }
+            }
+        }
+        ContainerBox {
+            left: 0.0,
+            top: 0.0,
+            width: 0.0,
+            height: 0.0,
+        }
     }
 }

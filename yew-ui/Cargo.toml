@@ -51,6 +51,9 @@ features = [
     "TouchEvent",
     "TouchList",
     "Touch",
+    "Element",
+    "DomRect",
+    "HtmlElement",
 ]
 
 [dev-dependencies]

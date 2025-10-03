@@ -572,10 +572,27 @@ impl Component for AttendantsComponent {
             Msg::StartDragHost(e) => {
                 self.host_dragging = true;
                 let (cx, cy) = (e.client_x() as f64, e.client_y() as f64);
-                let current = self.host_pos.unwrap_or_else(|| {
-                    // default bottom-right: rely on CSS; set zero so movement is relative
-                    (0.0, 0.0)
-                });
+                // If user hasn't dragged before, compute current position from default CSS bottom/right
+                let current = if let Some(pos) = self.host_pos {
+                    pos
+                } else {
+                    // Estimate current position using viewport and default CSS offsets
+                    if let Some(win) = web_sys::window() {
+                        if let (Ok(w), Ok(h)) = (win.inner_width(), win.inner_height()) {
+                            if let (Some(vw), Some(vh)) = (w.as_f64(), h.as_f64()) {
+                                // Use the same default offsets as style.css: bottom:16px; right:16px; max-width 240 (take 240x180 as conservative)
+                                let (hw, hh) = (240.0, 180.0);
+                                (vw - hw - 16.0, vh - hh - 16.0)
+                            } else {
+                                (0.0, 0.0)
+                            }
+                        } else {
+                            (0.0, 0.0)
+                        }
+                    } else {
+                        (0.0, 0.0)
+                    }
+                };
                 self.host_drag_offset = Some((cx - current.0, cy - current.1));
                 true
             }
@@ -704,6 +721,14 @@ impl Component for AttendantsComponent {
             };
         }
 
+        // Inline style for the outer `.host` container (camera box). When not dragged, CSS defaults apply.
+        let host_style = if let Some((x, y)) = self.host_pos {
+            // Override bottom/right so height doesn't stretch, and anchor with left/top
+            format!("position:absolute; left: {x}px; top: {y}px; bottom:auto; right:auto;")
+        } else {
+            String::new()
+        };
+
         html! {
             <div id="main-container" class="meeting-page" onmousemove={ctx.link().callback(Msg::DragHost)} onmouseup={ctx.link().callback(|_| Msg::EndDragHost)}>
                 <BrowserCompatibility/>
@@ -764,7 +789,7 @@ impl Component for AttendantsComponent {
                     {
                         if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
                             html! {
-                                <nav class="host">
+                                <nav id={"host-container"} class={"host"} style={host_style} onmousedown={ctx.link().callback(Msg::StartDragHost)}>
                                     <div class="controls">
                                         <nav class="video-controls-container">
                                             <button
@@ -992,31 +1017,16 @@ impl Component for AttendantsComponent {
                                     }
                                     {
                                          if media_access_granted {
-                                             // Inline style for position based on drag state
-                                             {
-                                                 let style = if let Some((x, y)) = self.host_pos {
-                                                     format!("position:absolute; left: {}px; top: {}px; z-index: 10;", x, y)
-                                                 } else {
-                                                     // Let CSS default bottom-right apply until user drags
-                                                     "position:absolute; z-index:10;".to_string()
-                                                 };
-                                                 html! {<div
-                                                     id="host-draggable-wrapper"
-                                                     style={style}
-                                                     onmousedown={ctx.link().callback(Msg::StartDragHost)}
-                                                 >
-                    <Host
-                                                     client={self.client.clone()}
-                                                     share_screen={self.share_screen}
-                                                     mic_enabled={self.mic_enabled}
-                                                     video_enabled={self.video_enabled}
-                                                     on_encoder_settings_update={on_encoder_settings_update}
-                                                     device_settings_open={self.device_settings_open}
-                                                     on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
-                                                     on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
-                                                 />
-                                                 </div>}
-                                             }
+                                             html! {<Host
+                                                 client={self.client.clone()}
+                                                 share_screen={self.share_screen}
+                                                 mic_enabled={self.mic_enabled}
+                                                 video_enabled={self.video_enabled}
+                                                 on_encoder_settings_update={on_encoder_settings_update}
+                                                 device_settings_open={self.device_settings_open}
+                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                             />}
                                          } else {
                                              html! {<></>}
                                          }

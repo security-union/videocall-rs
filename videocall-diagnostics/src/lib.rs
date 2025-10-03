@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures;
+use wasm_bindgen_futures::spawn_local;
 
 // === Diagnostic data structures ===
 
@@ -67,10 +67,10 @@ static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
     #[cfg(target_arch = "wasm32")]
     {
         let mut receiver = r;
-        wasm_bindgen_futures::spawn_local(async move {
+        spawn_local(async move {
             // Keep the receiver alive to prevent channel closure
             // This receiver will consume messages but not process them
-            while let Ok(_) = receiver.recv().await {
+            while receiver.recv().await.is_ok() {
                 // Intentionally discard messages in the background receiver
                 // This keeps the channel open for other receivers
             }

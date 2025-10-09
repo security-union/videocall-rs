@@ -16,16 +16,47 @@
  * conditions.
  */
 
+//! # Diagnostics Module
+//!
+//! This module provides components for displaying real-time diagnostics information
+//! about WebRTC connections, media streams, and the connection manager's state.
+//!
+//! ## Components
+//!
+//! - `Diagnostics`: The main diagnostics sidebar component that collects and displays all metrics
+//! - `ConnectionManagerDisplay`: Shows connection status, server selection, and election process
+//! - `NetEqStatusDisplay`: Shows network jitter buffer statistics for audio processing
+//!
+//! ## Key Features
+//!
+//! - Real-time connection manager state monitoring
+//! - Server election process visualization
+//! - Audio buffer and jitter metrics with visual charts
+//! - Per-peer diagnostics with filtering
+//! - Media state reporting (video, audio, screen sharing)
+//!
+//! The diagnostics system uses a global state mechanism to persist connection manager events
+//! across asynchronous callbacks, ensuring consistent state tracking even when components
+//! are unmounted and remounted during React/Yew component lifecycle events.
+
 use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
 use futures::future::{AbortHandle, Abortable};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use once_cell::sync::Lazy;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use yew::prelude::*;
+use log::debug;
 
-// Serializable versions of DiagEvent structures (with owned strings instead of &'static str)
+// Global storage for connection manager events to persist across async callbacks
+// This is needed because Yew's state hooks don't preserve state across async callbacks
+static CONNECTION_MANAGER_EVENTS: Lazy<Arc<RwLock<Vec<SerializableDiagEvent>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(Vec::new())));
+static GLOBAL_STATE_INITIALIZED: AtomicBool = AtomicBool::new(false);// Serializable versions of DiagEvent structures
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SerializableDiagEvent {
     pub subsystem: String,
@@ -102,6 +133,8 @@ impl Default for ConnectionManagerState {
 impl ConnectionManagerState {
     pub fn from_serializable_events(events: &[SerializableDiagEvent]) -> Self {
         let mut state = Self::default();
+
+        // First pass: Process all main events (with stream_id = None) to ensure we have the global state
         for event in events {
             if event.subsystem != "connection_manager" {
                 continue;
@@ -110,7 +143,16 @@ impl ConnectionManagerState {
             if event.stream_id.is_none() {
                 // Main connection manager event
                 Self::process_main_event(event, &mut state);
-            } else if let Some(connection_id) = &event.stream_id {
+            }
+        }
+
+        // Second pass: Process server-specific events
+        for event in events {
+            if event.subsystem != "connection_manager" {
+                continue;
+            }
+
+            if let Some(connection_id) = &event.stream_id {
                 // Individual server event
                 if let Some(server) = Self::process_server_event(event, connection_id) {
                     // Update existing server or add new one
@@ -250,7 +292,16 @@ pub struct ConnectionManagerDisplayProps {
 #[function_component(ConnectionManagerDisplay)]
 pub fn connection_manager_display(props: &ConnectionManagerDisplayProps) -> Html {
     let parsed_state = props.connection_manager_state.as_ref().map(|json| {
-        let events: Vec<SerializableDiagEvent> = serde_json::from_str(json).unwrap_or_default();
+        let events: Vec<SerializableDiagEvent> = match serde_json::from_str::<Vec<SerializableDiagEvent>>(json) {
+            Ok(events) => {
+                log::debug!("ConnectionManagerDisplay: Successfully parsed {} events", events.len());
+                events
+            },
+            Err(e) => {
+                log::error!("ConnectionManagerDisplay: Failed to parse JSON: {}", e);
+                Vec::new()
+            }
+        };
         ConnectionManagerState::from_serializable_events(&events)
     });
 
@@ -635,9 +686,65 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     let diagnostics_data = use_state(|| None::<String>);
     let sender_stats = use_state(|| None::<String>);
     let encoder_settings = use_state(|| None::<String>);
-    let connection_manager_events = use_state(Vec::<SerializableDiagEvent>::new);
-    let connection_manager_state = use_state(|| None::<String>);
-    let neteq_stats_per_peer = use_state(HashMap::<String, Vec<String>>::new);
+
+    // Initialize from global state if available
+    let initial_events = {
+        if GLOBAL_STATE_INITIALIZED.load(Ordering::SeqCst) {
+            match CONNECTION_MANAGER_EVENTS.read() {
+                Ok(guard) => guard.clone(),
+                Err(e) => {
+                    log::error!("Failed to acquire read lock for global events: {:?}", e);
+                    Vec::<SerializableDiagEvent>::new()
+                }
+            }
+        } else {
+            Vec::<SerializableDiagEvent>::new()
+        }
+    };
+
+    // Component local state that syncs with global state
+    let connection_manager_events = use_state(|| initial_events);
+    let connection_manager_state = use_state(|| {
+        if GLOBAL_STATE_INITIALIZED.load(Ordering::SeqCst) {
+            match CONNECTION_MANAGER_EVENTS.read() {
+                Ok(events) => Some(serde_json::to_string(&*events).unwrap_or_default()),
+                Err(_) => None
+            }
+        } else {
+            None::<String>
+        }
+    });
+
+    // Add a use_effect hook to sync component state with global state
+    {
+        let connection_manager_events = connection_manager_events.clone();
+        let connection_manager_state = connection_manager_state.clone();
+
+        // Create an interval check to sync with global state
+        // This ensures all component instances stay in sync even without new events
+        use_effect_with(
+            (),
+            move |_| {
+                if GLOBAL_STATE_INITIALIZED.load(Ordering::SeqCst) {
+                    match CONNECTION_MANAGER_EVENTS.read() {
+                        Ok(guard) => {
+                            let global_events = guard.clone();
+
+                            // Always sync with global state to ensure consistency
+                            connection_manager_events.set(global_events.clone());
+                            connection_manager_state.set(Some(serde_json::to_string(&global_events).unwrap_or_default()));
+
+                            if !global_events.is_empty() {
+                                log::info!("Initial sync from global store: events={}", global_events.len());
+                            }
+                        },
+                        Err(e) => log::error!("Failed to read global state: {:?}", e)
+                    }
+                }
+                || ()
+            },
+        );
+    }    let neteq_stats_per_peer = use_state(HashMap::<String, Vec<String>>::new);
     let neteq_buffer_per_peer = use_state(HashMap::<String, Vec<u64>>::new);
     let neteq_jitter_per_peer = use_state(HashMap::<String, Vec<u64>>::new);
 
@@ -671,14 +778,6 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 neteq_jitter_per_peer.set(HashMap::new());
                 return cleanup;
             }
-
-            let diagnostics_data = diagnostics_data.clone();
-            let sender_stats = sender_stats.clone();
-            let connection_manager_events = connection_manager_events.clone();
-            let connection_manager_state = connection_manager_state.clone();
-            let neteq_stats_per_peer = neteq_stats_per_peer.clone();
-            let neteq_buffer_per_peer = neteq_buffer_per_peer.clone();
-            let neteq_jitter_per_peer = neteq_jitter_per_peer.clone();
 
             let fut = async move {
                 let mut rx = subscribe();
@@ -824,14 +923,37 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                         }
                         // Connection manager state accumulation
                         "connection_manager" => {
-                            let mut vec = (*connection_manager_events).clone();
-                            vec.push(SerializableDiagEvent::from(evt));
-                            if vec.len() > 20 {
-                                vec.remove(0);
+                            // Update global state first
+                            {
+                                let mut events_write = match CONNECTION_MANAGER_EVENTS.write() {
+                                    Ok(guard) => guard,
+                                    Err(e) => {
+                                        log::error!("Failed to acquire write lock: {:?}", e);
+                                        // Fall back to local state update
+                                        let mut local_events = (*connection_manager_events).clone();
+                                        local_events.push(SerializableDiagEvent::from(evt.clone()));
+                                        connection_manager_events.set(local_events);
+                                        return;
+                                    }
+                                };
+
+                                events_write.push(SerializableDiagEvent::from(evt.clone()));
+
+                                if events_write.len() > 20 {
+                                    events_write.remove(0);
+                                }
+
+                                GLOBAL_STATE_INITIALIZED.store(true, Ordering::SeqCst);
                             }
-                            let serialized = serde_json::to_string(&vec).unwrap_or_default();
-                            connection_manager_events.set(vec);
-                            connection_manager_state.set(Some(serialized));
+
+                            if let Ok(events_read) = CONNECTION_MANAGER_EVENTS.read() {
+                                let global_events = events_read.clone();
+                                connection_manager_events.set(global_events.clone());
+                                connection_manager_state.set(Some(serde_json::to_string(&global_events).unwrap_or_default()));
+
+                                debug!("State updated. Events vector len: {}, Recent event stream_id: {:?}",
+                                     global_events.len(), evt.stream_id);
+                            }
                         }
                         _ => {}
                     }

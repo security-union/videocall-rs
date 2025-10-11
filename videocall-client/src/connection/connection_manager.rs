@@ -16,6 +16,29 @@
  * conditions.
  */
 
+//! # Connection Management System
+//!
+//! This module implements a connection management system that:
+//! - Establishes and maintains connections to multiple servers (WebSocket and WebTransport)
+//! - Uses an "election" process to select the best connection based on RTT measurements
+//! - Provides real-time diagnostics for monitoring connection quality
+//! - Handles automatic failover when connections are lost
+//!
+//! ## Design
+//! The system follows these key principles:
+//!
+//! 1. **Connection Election**: All available servers are tested simultaneously, and the
+//!    connection with the lowest RTT is elected as the active connection
+//!
+//! 2. **Transport Preference**: WebTransport connections are preferred over WebSocket
+//!    when available due to their better performance characteristics
+//!
+//! 3. **Diagnostics**: Comprehensive metrics are collected about connection quality
+//!    and reported through the diagnostics system
+//!
+//! 4. **Resilience**: The system handles connection loss and can perform reconnection
+//!    when needed
+
 use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::crypto::aes::Aes128State;
@@ -111,7 +134,12 @@ pub struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    /// Create a new ConnectionManager and immediately start testing all connections
+    /// Creates a new ConnectionManager and immediately starts testing all available connections.
+    ///
+    /// This constructor initializes the connection manager and begins the "election" process
+    /// to determine the best server connection based on Round Trip Time (RTT) measurements.
+    /// It creates connections to all provided WebSocket and WebTransport URLs and starts
+    /// measuring their performance.
     pub fn new(options: ConnectionManagerOptions, aes: Rc<Aes128State>) -> Result<Self> {
         let total_servers = options.websocket_urls.len() + options.webtransport_urls.len();
 
@@ -145,7 +173,16 @@ impl ConnectionManager {
         Ok(manager)
     }
 
-    /// Start the election process by creating all connections upfront
+    /// Starts the election process to determine the best server connection.
+    ///
+    /// This method initiates the connection "election" process by:
+    /// 1. Creating connections to all configured WebSocket and WebTransport servers
+    /// 2. Setting up a testing period (specified by election_period_ms)
+    /// 3. Starting RTT (Round Trip Time) measurements to all servers
+    /// 4. Reporting the initial connection state
+    ///
+    /// During the election period, RTT measurements are collected from all servers.
+    /// After the period ends, the server with the lowest average RTT is selected.
     fn start_election(&mut self) -> Result<()> {
         let election_duration = self.options.election_period_ms;
         let start_time = js_sys::Date::now();
@@ -521,11 +558,15 @@ impl ConnectionManager {
 
         for connection_id in to_remove {
             self.connections.remove(&connection_id);
-            info!("Closed unused connection: {connection_id}");
+            let rtt = self.rtt_measurements
+                .get(&connection_id)
+                .and_then(|m| m.average_rtt)
+                .unwrap_or(-1.0);
+            info!("Closed unused connection: {} which had RTT of {}ms", connection_id, rtt);
         }
     }
 
-    /// Start 1Hz diagnostics reporting  
+    /// Start 1Hz diagnostics reporting
     fn start_diagnostics_reporting(&mut self) {
         // Note: Due to borrow checker constraints, diagnostics reporting
         // will be triggered externally through trigger_diagnostics_report()

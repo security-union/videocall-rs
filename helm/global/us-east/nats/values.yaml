@@ -20,11 +20,11 @@ nats:
       enabled: false
     resources:
       limits:
-        cpu: 600m
-        memory: 1000Mi
+        cpu: 400m
+        memory: 600Mi
       requests:
-        cpu: 600m
-        memory: 1000Mi 
+        cpu: 400m
+        memory: 600Mi 
   # Gateway configuration using direct DigitalOcean format
   gateway:
     enabled: true

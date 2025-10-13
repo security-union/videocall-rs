@@ -867,7 +867,7 @@ checksum = "cfa8873f51c92e232f9bac4065cddef41b714152812bfc5f7672ba16d6ef8cd9"
 
 [[package]]
 name = "bot"
-version = "1.0.11"
+version = "1.0.12"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3707,7 +3707,7 @@ dependencies = [
 
 [[package]]
 name = "neteq"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "axum",
  "clap",
@@ -6554,7 +6554,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "3.0.1"
+version = "3.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -6575,7 +6575,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "1.1.25"
+version = "1.1.26"
 dependencies = [
  "aes",
  "anyhow",
@@ -6612,7 +6612,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-codecs"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "approx",
@@ -6682,7 +6682,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-bindings-macos"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "block",
  "cocoa-foundation",
@@ -6720,7 +6720,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6755,7 +6755,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.1.29"
+version = "1.1.30"
 dependencies = [
  "console_error_panic_hook",
  "console_log",

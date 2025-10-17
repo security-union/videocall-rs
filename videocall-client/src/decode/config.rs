@@ -79,10 +79,10 @@ pub fn configure_audio_context(
     // Connect nodes: source -> gain -> destination
     source
         .connect_with_audio_node(&gain_node)
-        .map_err(|e| anyhow::anyhow!("Failed to connect source to gain node: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to connect source to gain node: {e:?}"))?;
     gain_node
         .connect_with_audio_node(&audio_context.destination())
-        .map_err(|e| anyhow::anyhow!("Failed to connect gain node to destination: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to connect gain node to destination: {e:?}"))?;
     info!("Connected audio nodes: source -> gain -> destination");
 
     Ok(audio_context)

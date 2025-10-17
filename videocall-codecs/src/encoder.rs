@@ -111,7 +111,7 @@ impl Vp9Encoder {
             );
             if ret != VPX_CODEC_OK {
                 let err_msg = c_str_to_rust_str(vpx_codec_error(&mut self.ctx as *mut _));
-                anyhow::bail!("Failed to encode frame: {}", err_msg);
+                anyhow::bail!("Failed to encode frame: {err_msg:?}");
             }
 
             Ok(Frames {

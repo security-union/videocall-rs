@@ -76,7 +76,7 @@ impl Vp9Encoder {
             );
             if ret != VPX_CODEC_OK {
                 let err_msg = c_str_to_rust_str(vpx_codec_err_to_string(ret));
-                anyhow::bail!("Failed to initialize VP9 encoder: {}", err_msg);
+                anyhow::bail!("Failed to initialize VP9 encoder: {err_msg:?}");
             }
 
             Ok(Vp9Encoder { ctx, width, height })

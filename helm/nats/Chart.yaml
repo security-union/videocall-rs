@@ -1,8 +1,0 @@
-apiVersion: v2
-name: rustlemania-nats
-version: 0.1.0
-
-dependencies:
-  - name: nats
-    version: 0.19.15
-    repository: https://nats-io.github.io/k8s/helm/charts/

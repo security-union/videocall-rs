@@ -7,12 +7,13 @@ on:
   push:
     branches:
       - main
-      - add-diagnostics
-      - fix-topics
+      - fix-disconnects
     paths:
       - 'actix-api/**'
       - 'types/**'
       - Dockerfile.actix
+      - Cargo.lock
+      - Cargo.toml
 
 jobs:
   push_to_registry:

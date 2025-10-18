@@ -45,6 +45,9 @@ use crate::{NetEqError, Result};
 /// - WebRTC tuned this value across diverse network conditions
 const K_DECELERATION_TARGET_LEVEL_OFFSET_MS: u32 = 85;
 
+/// Hardcoded minimum delay.
+const K_BASE_MIN_DELAY_MS: u32 = 20;
+
 /// NetEQ configuration
 #[derive(Debug, Clone)]
 pub struct NetEqConfig {
@@ -58,6 +61,8 @@ pub struct NetEqConfig {
     pub max_delay_ms: u32,
     /// Minimum delay in milliseconds
     pub min_delay_ms: u32,
+    // Fixed additional delay
+    pub additional_delay_ms: u32,
     /// Disable time stretching (for testing)
     pub for_test_no_time_stretching: bool,
     /// Bypass NetEQ processing and decode packets directly (for A/B testing)
@@ -76,6 +81,7 @@ impl Default for NetEqConfig {
             max_packets_in_buffer: 200,
             max_delay_ms: 0,
             min_delay_ms: 0,
+            additional_delay_ms: 0,
             for_test_no_time_stretching: false,
             bypass_mode: false,
             delay_config: DelayConfig::default(),
@@ -93,12 +99,18 @@ pub enum Operation {
     Merge,
     /// Expand operation (concealment)
     Expand,
+    /// First expand in a row
+    ExpandStart,
+    /// Last expand in a row
+    ExpandEnd,
     /// Accelerate operation (time compression)
     Accelerate,
     /// Fast accelerate operation
     FastAccelerate,
     /// Preemptive expand operation (time expansion)
     PreemptiveExpand,
+    /// Time strech operations return multiple frames at once, return the consecutive frames
+    TimeStretchBuffer,
     /// Comfort noise generation
     ComfortNoise,
     /// DTMF tone generation
@@ -184,14 +196,16 @@ pub struct NetEq {
     decoders: HashMap<u8, Box<dyn crate::codec::AudioDecoder + Send>>,
     /// Audio queue for bypass mode (direct decoding without jitter buffer)
     bypass_audio_queue: VecDeque<f32>,
-    /// Sample memory for time-stretching operations (matches WebRTC sample_memory_)
-    sample_memory: i32,
-    /// Flag indicating if time-scale operation was performed in previous call
-    prev_time_scale: bool,
     /// Rolling counters for packets-per-second measurement
     packets_received_this_second: u32,
     last_packets_second_instant: Instant,
     packets_per_sec_snapshot: u32,
+    // A buffer for already time streched samples. Separate from leftover_samples to avoid
+    // double time-streching.
+    leftover_time_stretched_samples: Vec<f32>,
+    /// Number of samples added by time-stretching operations (matches WebRTC sample_memory_,
+    /// but with clearer meaning for positive/negative values).
+    timestretch_added_samples: i32,
 }
 
 impl NetEq {
@@ -216,14 +230,17 @@ impl NetEq {
         );
 
         let mut delay_config = config.delay_config.clone();
-        delay_config.max_packets_in_buffer = config.max_packets_in_buffer;
-        delay_config.base_minimum_delay_ms = config.min_delay_ms;
+        delay_config.base_minimum_delay_ms = K_BASE_MIN_DELAY_MS;
+        delay_config.base_maximum_delay_ms = (config.max_packets_in_buffer * 20 * 3 / 4) as u32;
+        delay_config.additional_delay_ms = config.additional_delay_ms;
 
         let mut delay_manager = DelayManager::new(delay_config);
-        if config.max_delay_ms > 0 {
-            delay_manager.set_maximum_delay(config.max_delay_ms)?;
+        if config.min_delay_ms > 0 {
+            delay_manager.set_minimum_delay(config.min_delay_ms);
         }
-        delay_manager.set_minimum_delay(config.min_delay_ms)?;
+        if config.max_delay_ms > 0 {
+            delay_manager.set_maximum_delay(config.max_delay_ms);
+        }
 
         let statistics = StatisticsCalculator::new();
         let buffer_level_filter = BufferLevelFilter::new(config.sample_rate);
@@ -251,11 +268,11 @@ impl NetEq {
             leftover_samples: Vec::new(),
             decoders: HashMap::new(),
             bypass_audio_queue: VecDeque::new(),
-            sample_memory: 0,
-            prev_time_scale: false,
             packets_received_this_second: 0,
             last_packets_second_instant: Instant::now(),
             packets_per_sec_snapshot: 0,
+            leftover_time_stretched_samples: Vec::new(),
+            timestretch_added_samples: 0,
         })
     }
 
@@ -375,12 +392,26 @@ impl NetEq {
         let operation = self.get_decision()?;
         self.last_operation = operation;
 
+        // TODO: remove debug code
+        if operation != Operation::Normal {
+            log::info!(
+                "operation {:?} buffer: {} filtered: {} target: {}",
+                operation,
+                self.current_buffer_size_ms(),
+                self.buffer_level_filter.filtered_current_level_ms(),
+                self.delay_manager.target_delay_ms(),
+            );
+        }
+
         match operation {
             Operation::Normal => self.decode_normal(&mut frame)?,
-            Operation::Accelerate => self.decode_accelerate(&mut frame)?,
-            Operation::FastAccelerate => self.decode_fast_accelerate(&mut frame)?,
+            Operation::Accelerate => self.decode_accelerate(&mut frame, false)?,
+            Operation::FastAccelerate => self.decode_accelerate(&mut frame, true)?,
             Operation::PreemptiveExpand => self.decode_preemptive_expand(&mut frame)?,
-            Operation::Expand => self.decode_expand(&mut frame)?,
+            Operation::TimeStretchBuffer => self.return_time_stretch_buffer(&mut frame)?,
+            Operation::Expand => self.decode_expand(&mut frame, false, false)?,
+            Operation::ExpandStart => self.decode_expand(&mut frame, true, false)?,
+            Operation::ExpandEnd => self.decode_expand(&mut frame, false, true)?,
             Operation::Merge => self.decode_merge(&mut frame)?,
             Operation::ComfortNoise => self.generate_comfort_noise(&mut frame)?,
             _ => {
@@ -446,13 +477,13 @@ impl NetEq {
         self.delay_manager.target_delay_ms()
     }
 
-    /// Set minimum delay
-    pub fn set_minimum_delay(&mut self, delay_ms: u32) -> Result<bool> {
+    /// Set minimum delay, return the effective minimum delay
+    pub fn set_minimum_delay(&mut self, delay_ms: u32) -> u32 {
         self.delay_manager.set_minimum_delay(delay_ms)
     }
 
-    /// Set maximum delay
-    pub fn set_maximum_delay(&mut self, delay_ms: u32) -> Result<bool> {
+    /// Set maximum delay, return the effective maximum delay
+    pub fn set_maximum_delay(&mut self, delay_ms: u32) -> u32 {
         self.delay_manager.set_maximum_delay(delay_ms)
     }
 
@@ -464,11 +495,11 @@ impl NetEq {
         self.last_decode_timestamp = None;
         self.consecutive_expands = 0;
         self.leftover_samples.clear();
-        self.sample_memory = 0;
-        self.prev_time_scale = false;
         self.packets_received_this_second = 0;
         self.packets_per_sec_snapshot = 0;
         self.last_packets_second_instant = Instant::now();
+        self.leftover_time_stretched_samples.clear();
+        self.timestretch_added_samples = 0;
     }
 
     fn get_decision(&mut self) -> Result<Operation> {
@@ -480,21 +511,33 @@ impl NetEq {
         self.buffer_level_filter
             .set_target_buffer_level(target_delay_ms);
 
-        // Calculate time-stretched samples (matches WebRTC decision_logic.cc:233-237)
-        let mut time_stretched_samples = 0i32; // time_stretched_cn_samples in WebRTC
-        if self.prev_time_scale {
-            time_stretched_samples += self.sample_memory;
-        }
         self.buffer_level_filter
-            .update(current_buffer_samples, time_stretched_samples);
+            .update(current_buffer_samples, -self.timestretch_added_samples);
 
         // Reset for next frame (matches WebRTC decision_logic.cc:245-246)
-        self.prev_time_scale = false;
+        self.timestretch_added_samples = 0;
+
+        if !self.leftover_time_stretched_samples.is_empty() {
+            return Ok(Operation::TimeStretchBuffer);
+        }
+
+        if current_buffer_samples < self.output_frame_size_samples * 3 / 2
+            && current_buffer_samples >= self.output_frame_size_samples / 2
+            && self.consecutive_expands == 0
+        {
+            self.consecutive_expands = self.consecutive_expands.saturating_add(1);
+            return Ok(Operation::ExpandStart);
+        }
 
         // Check if we have packets
-        if self.packet_buffer.is_empty() {
+        if current_buffer_samples < self.output_frame_size_samples {
             self.consecutive_expands = self.consecutive_expands.saturating_add(1);
             return Ok(Operation::Expand);
+        }
+
+        if self.consecutive_expands > 0 {
+            self.consecutive_expands = 0;
+            return Ok(Operation::ExpandEnd);
         }
 
         // Use WebRTC-style threshold calculations
@@ -523,8 +566,10 @@ impl NetEq {
             return Ok(Operation::Accelerate);
         }
 
-        // Preemptive expand: below low limit
-        if buffer_level_samples < low_limit as usize && !self.packet_buffer.is_empty() {
+        // Preemptive expand: below low limit (requires ~30ms of audio)
+        if buffer_level_samples < low_limit as usize
+            && current_buffer_samples >= self.output_frame_size_samples * 3
+        {
             self.consecutive_expands = 0;
             return Ok(Operation::PreemptiveExpand);
         }
@@ -534,6 +579,19 @@ impl NetEq {
             // ~6 seconds at 10ms frames
             self.flush();
             return Ok(Operation::Normal);
+        }
+
+        // TODO: remove debug codes
+        // if simple_random() < 0.2 {
+        //     self.consecutive_expands = 0;
+        //     return Ok(Operation::PreemptiveExpand);
+        // }
+        if simple_random() < 0.001 {
+            if self.delay_manager.get_base_minimum_delay() == 30 {
+                self.delay_manager.set_base_minimum_delay(330);
+            } else {
+                self.delay_manager.set_base_minimum_delay(30);
+            }
         }
 
         // Normal operation
@@ -631,80 +689,69 @@ impl NetEq {
         Ok(())
     }
 
-    fn decode_accelerate(&mut self, frame: &mut AudioFrame) -> Result<()> {
+    fn decode_accelerate(&mut self, frame: &mut AudioFrame, fast_mode: bool) -> Result<()> {
         if !self.config.for_test_no_time_stretching {
+            let available_samples = self.current_buffer_size_samples();
+            let mut output_len: usize = 0;
+            let mut required_samples: usize = 0;
+            for i in (1..=3).rev() {
+                // Use 30ms if available
+                output_len = self.output_frame_size_samples * i;
+                if fast_mode {
+                    required_samples = (output_len as f32 * 2.0).ceil() as usize
+                } else {
+                    required_samples = (output_len as f32 * 1.5).ceil() as usize
+                }
+                if required_samples <= available_samples {
+                    break;
+                }
+            }
+            log::info!("accelerate {} {}", output_len, required_samples);
+
             // Get more data than we need
             let mut extended_frame = AudioFrame::new(
                 self.config.sample_rate,
                 self.config.channels,
-                (frame.samples_per_channel as f32 * 1.5) as usize,
+                required_samples,
             );
 
             self.decode_normal(&mut extended_frame)?;
+
+            // Will output up to 30ms output
+            let mut output =
+                AudioFrame::new(self.config.sample_rate, self.config.channels, output_len);
 
             // Apply accelerate algorithm
-            let mut output = Vec::new();
-            let _result = self
-                .accelerate
-                .process(&extended_frame.samples, &mut output, false);
+            let _result =
+                self.accelerate
+                    .process(&extended_frame.samples, &mut output.samples, fast_mode);
 
-            // Copy processed samples to frame
-            let copy_len = output.len().min(frame.samples.len());
-            frame.samples[..copy_len].copy_from_slice(&output[..copy_len]);
+            // Put back unused samples
+            let used_input_samples = self.accelerate.get_used_input_samples();
+            if extended_frame.samples.len() > used_input_samples {
+                self.leftover_samples.splice(
+                    0..0,
+                    extended_frame.samples[used_input_samples..].iter().cloned(),
+                );
+            }
+
+            // Fill frame with as much data as it fits
+            let frame_len = frame.samples.len();
+            frame.samples.clone_from_slice(&output.samples[..frame_len]);
+
+            // Store the remaining data to be returned as later frames
+            self.leftover_time_stretched_samples
+                .extend_from_slice(&output.samples[frame_len..]);
+
+            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
+            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
+            // extended_frame has more samples than we need, representing available data
+            let samples_removed = used_input_samples as i32 - output.samples.len() as i32;
+            self.timestretch_added_samples -= samples_removed / self.config.channels as i32;
 
             // Update statistics
-            let samples_removed = self.accelerate.get_length_change_samples();
             self.statistics
                 .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
-
-            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
-            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
-            // extended_frame has more samples than we need, representing available data
-            let available_samples = extended_frame.samples.len() / self.config.channels as usize;
-            self.sample_memory = available_samples as i32;
-            self.prev_time_scale = true;
-
-            frame.speech_type = SpeechType::Normal;
-            frame.vad_activity = extended_frame.vad_activity; // Preserve VAD from decoded audio
-        } else {
-            self.decode_normal(frame)?;
-        }
-
-        Ok(())
-    }
-
-    fn decode_fast_accelerate(&mut self, frame: &mut AudioFrame) -> Result<()> {
-        if !self.config.for_test_no_time_stretching {
-            // Get more data for aggressive acceleration
-            let mut extended_frame = AudioFrame::new(
-                self.config.sample_rate,
-                self.config.channels,
-                (frame.samples_per_channel as f32 * 2.0) as usize,
-            );
-
-            self.decode_normal(&mut extended_frame)?;
-
-            // Apply fast accelerate
-            let mut output = Vec::new();
-            let _result = self.accelerate.process(
-                &extended_frame.samples,
-                &mut output,
-                true, // Fast mode
-            );
-
-            let copy_len = output.len().min(frame.samples.len());
-            frame.samples[..copy_len].copy_from_slice(&output[..copy_len]);
-
-            let samples_removed = self.accelerate.get_length_change_samples();
-            self.statistics
-                .time_stretch_operation(TimeStretchOperation::Accelerate, samples_removed as u64);
-
-            // Track time-stretching for buffer level filtering (matches WebRTC pattern)
-            // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
-            // extended_frame has more samples than we need, representing available data
-            let available_samples = extended_frame.samples.len() / self.config.channels as usize;
-            self.sample_memory = available_samples as i32;
-            self.prev_time_scale = true;
 
             frame.speech_type = SpeechType::Normal;
             frame.vad_activity = extended_frame.vad_activity; // Preserve VAD from decoded audio
@@ -717,31 +764,55 @@ impl NetEq {
 
     fn decode_preemptive_expand(&mut self, frame: &mut AudioFrame) -> Result<()> {
         if !self.config.for_test_no_time_stretching {
-            // Get normal amount of data
-            self.decode_normal(frame)?;
+            // Preemtive expand requires more data (30ms)
+            let mut extended_frame = AudioFrame::new(
+                self.config.sample_rate,
+                self.config.channels,
+                (frame.samples_per_channel as f32 * 3.0) as usize,
+            );
+
+            self.decode_normal(&mut extended_frame)?;
+
+            // get output of same size as input
+            let mut output = AudioFrame::new(
+                self.config.sample_rate,
+                self.config.channels,
+                (frame.samples_per_channel as f32 * 3.0) as usize,
+            );
 
             // Apply preemptive expand
-            let input = frame.samples.clone();
-            let mut output = Vec::new();
+            let _result =
+                self.preemptive_expand
+                    .process(&extended_frame.samples, &mut output.samples, false);
 
-            let _result = self.preemptive_expand.process(&input, &mut output, false);
+            // Put back unused samples
+            let used_input_samples = self.preemptive_expand.get_used_input_samples();
+            if extended_frame.samples.len() > used_input_samples {
+                self.leftover_samples.splice(
+                    0..0,
+                    extended_frame.samples[used_input_samples..].iter().cloned(),
+                );
+            }
 
-            // Update frame with expanded audio
-            let copy_len = output.len().min(frame.samples.len());
-            frame.samples[..copy_len].copy_from_slice(&output[..copy_len]);
+            // fill frame with first half of data
+            let frame_len = frame.samples.len();
+            frame.samples.clone_from_slice(&output.samples[..frame_len]);
 
-            let samples_added = self.preemptive_expand.get_length_change_samples();
-            self.statistics.time_stretch_operation(
-                TimeStretchOperation::PreemptiveExpand,
-                samples_added as u64,
-            );
+            // store the other half for the next frame
+            self.leftover_time_stretched_samples
+                .extend_from_slice(&output.samples[frame_len..]);
 
             // Track time-stretching for buffer level filtering (matches WebRTC pattern)
             // WebRTC sets sample_memory to available samples for time-stretching (line 1304)
             // For preemptive expand, we had normal frame samples available
-            let available_samples = frame.samples.len() / self.config.channels as usize;
-            self.sample_memory = available_samples as i32;
-            self.prev_time_scale = true;
+            let samples_added = output.samples.len() as i32 - used_input_samples as i32;
+            self.timestretch_added_samples += samples_added / self.config.channels as i32;
+
+            // Update statistics
+            self.statistics.time_stretch_operation(
+                TimeStretchOperation::PreemptiveExpand,
+                samples_added as u64,
+            );
 
             frame.speech_type = SpeechType::Normal;
             // VAD activity already preserved from decode_normal call
@@ -752,7 +823,19 @@ impl NetEq {
         Ok(())
     }
 
-    fn decode_expand(&mut self, frame: &mut AudioFrame) -> Result<()> {
+    fn return_time_stretch_buffer(&mut self, frame: &mut AudioFrame) -> Result<()> {
+        if !self.leftover_time_stretched_samples.is_empty() {
+            let to_copy = frame.samples.len();
+            frame
+                .samples
+                .copy_from_slice(&self.leftover_time_stretched_samples[..to_copy]);
+            self.leftover_time_stretched_samples.drain(..to_copy);
+        }
+
+        Ok(())
+    }
+
+    fn decode_expand(&mut self, frame: &mut AudioFrame, start: bool, end: bool) -> Result<()> {
         log::trace!(
             "decode_expand: buffer before expand={}ms, packets={} (consecutive_expands={})",
             self.current_buffer_size_ms(),
@@ -761,7 +844,50 @@ impl NetEq {
         );
         // Generate concealment audio (simple noise for now)
         for sample in &mut frame.samples {
-            *sample = (simple_random() - 0.5) * 0.01; // Very quiet noise
+            *sample = (simple_random() - 0.5) * 0.0001; // Very quiet noise
+        }
+
+        if start {
+            let mut end_of_audio = AudioFrame::new(
+                self.config.sample_rate,
+                self.config.channels,
+                (frame.samples_per_channel as f32 * 0.5) as usize,
+            );
+
+            self.decode_normal(&mut end_of_audio)?;
+
+            let fade_len = end_of_audio.samples.len();
+            let start_of_frame = frame.samples[..fade_len].to_vec();
+
+            // Crossfade with end of audio
+            crate::signal::crossfade(
+                &end_of_audio.samples,
+                &start_of_frame,
+                fade_len,
+                &mut frame.samples[..fade_len],
+            );
+        }
+
+        if end {
+            let mut start_of_audio = AudioFrame::new(
+                self.config.sample_rate,
+                self.config.channels,
+                (frame.samples_per_channel as f32 * 0.5) as usize,
+            );
+
+            self.decode_normal(&mut start_of_audio)?;
+
+            let fade_len = start_of_audio.samples.len();
+            let end_of_frame_start = frame.samples.len() - fade_len;
+            let end_of_frame = frame.samples[end_of_frame_start..].to_vec();
+
+            // Crossfade with end of audio
+            crate::signal::crossfade(
+                &end_of_frame,
+                &start_of_audio.samples,
+                fade_len,
+                &mut frame.samples[end_of_frame_start..],
+            );
         }
 
         frame.speech_type = SpeechType::Expand;
@@ -805,16 +931,14 @@ impl NetEq {
     pub fn current_buffer_size_ms(&self) -> u32 {
         // Use total content duration instead of timestamp span
         // This handles cases where packets have close/identical timestamps
-        self.packet_buffer.get_total_content_duration_ms()
+        self.current_buffer_size_samples() as u32 * 1000 / self.config.sample_rate
     }
 
     /// Get current buffer size in samples
     pub fn current_buffer_size_samples(&self) -> usize {
-        // Convert milliseconds to samples for the buffer duration
-        let buffer_duration_ms = self.current_buffer_size_ms(); // Use the fixed calculation
-        let buffer_samples =
-            (buffer_duration_ms as u64 * self.config.sample_rate as u64 / 1000) as usize;
-        buffer_samples + self.leftover_samples.len()
+        self.packet_buffer.num_samples_in_buffer()
+            + self.leftover_samples.len()
+            + self.leftover_time_stretched_samples.len()
     }
 
     /// Register a decoder for a given RTP payload type.

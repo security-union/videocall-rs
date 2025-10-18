@@ -419,12 +419,15 @@ impl StatisticsCalculator {
             Operation::Normal => 0,
             Operation::Merge => 1,
             Operation::Expand => 2,
-            Operation::Accelerate => 3,
-            Operation::FastAccelerate => 4,
-            Operation::PreemptiveExpand => 5,
-            Operation::ComfortNoise => 6,
-            Operation::Dtmf => 7,
-            Operation::Undefined => 8,
+            Operation::ExpandStart => 3,
+            Operation::ExpandEnd => 4,
+            Operation::Accelerate => 5,
+            Operation::FastAccelerate => 6,
+            Operation::PreemptiveExpand => 7,
+            Operation::TimeStretchBuffer => 8,
+            Operation::ComfortNoise => 9,
+            Operation::Dtmf => 10,
+            Operation::Undefined => 11,
         };
 
         // Increment counter

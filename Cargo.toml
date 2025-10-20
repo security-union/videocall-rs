@@ -17,10 +17,10 @@ members = [
 exclude = [
     "src-tauri",
     "leptos-website",
-    "videocall-cli/nokhwa", 
-    "videocall-cli/nokhwa/nokhwa-bindings-macos", 
-    "videocall-cli/nokhwa/nokhwa-bindings-windows", 
-    "videocall-cli/nokhwa/nokhwa-bindings-linux", 
+    "videocall-cli/nokhwa",
+    "videocall-cli/nokhwa/nokhwa-bindings-macos",
+    "videocall-cli/nokhwa/nokhwa-bindings-windows",
+    "videocall-cli/nokhwa/nokhwa-bindings-linux",
     "videocall-cli/nokhwa/nokhwa-core"
 ]
 
@@ -29,4 +29,6 @@ env-libvpx-sys = { version = "5.1.3", features = ["generate"] }
 anyhow = "1.0.75"
 wasm-bindgen-futures = { version = "0.4.30" }
 wasm-bindgen = "0.2.95"
-web-transport-quinn = "0.7.3"
+web-transport-quinn = "0.8.1"
+
+web-transport-proto = "0.2.7"

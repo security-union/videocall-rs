@@ -38,15 +38,15 @@ rustlemania-websocket:
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
     - name: TOKIO_WORKER_THREADS
-      value: "1"  # Optimal for 250m CPU - single thread for I/O bound operations
+      value: "1"  # Optimal for 700m CPU (I/O bound WebSocket operations)
 
   resources:
     limits:
-      cpu: "250m"
-      memory: "192Mi"
+      cpu: "700m"
+      memory: "1000Mi"
     requests:
-      cpu: "250m"
-      memory: "96Mi"
+      cpu: "700m"
+      memory: "1000Mi"
 
   service:
     type: ClusterIP  # Changed to ClusterIP for ingress

@@ -350,7 +350,7 @@ impl ConnectionManager {
         let connection = self
             .connections
             .get(connection_id)
-            .ok_or_else(|| anyhow!("Connection {} not found", connection_id))?;
+            .ok_or_else(|| anyhow!("Connection {connection_id} not found"))?;
 
         if !connection.is_connected() {
             return Ok(()); // Skip non-connected connections

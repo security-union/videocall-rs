@@ -105,7 +105,7 @@ impl VideoProducer {
         }
 
         if frames.is_empty() {
-            return Err(anyhow::anyhow!("No frames loaded from {}", image_dir));
+            return Err(anyhow::anyhow!("No frames loaded from {image_dir}"));
         }
 
         info!("Loaded {} frames for {}", frames.len(), user_id);

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.26](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.25...videocall-client-v1.1.26) - 2025-10-13
+
+### Other
+
+- Optimize diagnostics, get them out of attendants ([#432](https://github.com/security-union/videocall-rs/pull/432))
+- *(neteq)* release v0.6.1 ([#430](https://github.com/security-union/videocall-rs/pull/430))
+
 ## [1.1.25](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.24...videocall-client-v1.1.25) - 2025-09-24
 
 ### Other

@@ -74,8 +74,8 @@ impl Aes128State {
             // XXX: Don't make a new copy of data.
             return Ok(data.to_vec());
         }
-        let cipher = Aes128CbcEnc::new_from_slices(&self.key, &self.iv)
-            .map_err(|e| anyhow!("{}", e.to_string()))?;
+        let cipher =
+            Aes128CbcEnc::new_from_slices(&self.key, &self.iv).map_err(|e| anyhow!("{e}"))?;
         Ok(cipher.encrypt_padded_vec_mut::<Pkcs7>(data))
     }
 
@@ -85,10 +85,10 @@ impl Aes128State {
             return Ok(data.to_vec());
         }
         let decipher = Aes128CbcDec::new_from_slices(&self.key, &self.iv)
-            .map_err(|e| anyhow!("Decryptor Initialization error! {}", e.to_string()))?;
+            .map_err(|e| anyhow!("Decryptor Initialization error! {e}"))?;
         decipher
             .decrypt_padded_vec_mut::<Pkcs7>(data)
-            .map_err(|e| anyhow!("Decrypt error! {}", e.to_string()))
+            .map_err(|e| anyhow!("Decrypt error! {e}"))
     }
 }
 

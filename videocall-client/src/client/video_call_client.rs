@@ -888,22 +888,22 @@ impl Inner {
             ..Default::default()
         }
         .write_to_bytes()
-        .map_err(|e| anyhow!("Failed to serialize aes packet: {}", e.to_string()))
+        .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
     }
 
     fn encrypt_aes_packet(&self, aes_packet: &[u8], pub_key: &RsaPublicKey) -> Result<Vec<u8>> {
         self.rsa
             .encrypt_with_key(aes_packet, pub_key)
-            .map_err(|e| anyhow!("Failed to encrypt aes packet: {}", e.to_string()))
+            .map_err(|e| anyhow!("Failed to encrypt aes packet: {e}"))
     }
 }
 
 fn parse_rsa_packet(response_data: &[u8]) -> Result<RsaPacket> {
     RsaPacket::parse_from_bytes(response_data)
-        .map_err(|e| anyhow!("Failed to parse rsa packet: {}", e.to_string()))
+        .map_err(|e| anyhow!("Failed to parse rsa packet: {e}"))
 }
 
 fn parse_public_key(rsa_packet: RsaPacket) -> Result<RsaPublicKey> {
     RsaPublicKey::from_public_key_der(&rsa_packet.public_key_der)
-        .map_err(|e| anyhow!("Failed to parse rsa public key: {}", e.to_string()))
+        .map_err(|e| anyhow!("Failed to parse rsa public key: {e}"))
 }

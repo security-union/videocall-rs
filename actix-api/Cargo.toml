@@ -1,6 +1,6 @@
 [package]
 name = "videocall-api"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A secure API for the videocall project"

@@ -31,6 +31,18 @@ use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
 use tracing::{debug, error, info, trace, trace_span};
 
+lazy_static::lazy_static! {
+    static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = std::env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+
+    static ref QUIC_KEEP_ALIVE_INTERVAL_SECS: u64 = std::env::var("QUIC_KEEP_ALIVE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+}
+
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -168,11 +180,15 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
     // Configure transport with aggressive timeouts for fast disconnect detection
     let mut transport_config = quinn::TransportConfig::default();
 
-    // Detect disconnection after 5 seconds of inactivity
-    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(5).try_into()?));
+    // Detect disconnection after inactivity (configurable via QUIC_MAX_IDLE_TIMEOUT_SECS)
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(*QUIC_MAX_IDLE_TIMEOUT_SECS).try_into()?,
+    ));
 
-    // Send keep-alive pings every 2 seconds to maintain connection
-    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+    // Send keep-alive pings to maintain connection (configurable via QUIC_KEEP_ALIVE_INTERVAL_SECS)
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
+        *QUIC_KEEP_ALIVE_INTERVAL_SECS,
+    )));
 
     server_config.transport_config(std::sync::Arc::new(transport_config));
 
@@ -182,8 +198,8 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
     let mut server = web_transport_quinn::Server::new(endpoint);
 
     info!(
-        "listening on {} with 5s idle timeout and 2s keep-alive",
-        opt.listen
+        "listening on {} with {}s idle timeout and {}s keep-alive",
+        opt.listen, *QUIC_MAX_IDLE_TIMEOUT_SECS, *QUIC_KEEP_ALIVE_INTERVAL_SECS
     );
 
     let nc =
@@ -475,15 +491,6 @@ async fn handle_webtransport_session(
                 }
             }
             info!("WebTransport datagram receive task ended");
-        });
-    }
-
-    // WebTransport monitor connection state
-    {
-        let session = session.clone();
-        join_set.spawn(async move {
-            let session_error = session.closed().await;
-            error!("WebTransport connection error: {}", session_error);
         });
     }
 

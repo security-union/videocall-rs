@@ -15,7 +15,7 @@ rustlemania-webtransport:
 
   env:
     - name: RUST_LOG
-      value: warn,quinn=warn,async_nats=warn
+      value: warn,quinn=warn,web-transport-quinn=warn,async_nats=warn
     - name: NATS_URL
       value: nats-us-east:4222  # Connect to US East NATS cluster
     - name: LISTEN_URL
@@ -41,17 +41,17 @@ rustlemania-webtransport:
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
     - name: TOKIO_WORKER_THREADS
-      value: "1"  # Conservative start for 500m CPU (WebTransport + crypto operations)
+      value: "1"  # Optimal for 1000m CPU (WebTransport + crypto operations)
     - name: TOKIO_BLOCKING_THREADS
       value: "2"  # Small pool for blocking crypto operations
 
   resources:
     limits:
-      cpu: "500m"
-      memory: "768Mi"
+      cpu: "1000m"
+      memory: "1400Mi"
     requests:
-      cpu: "500m"
-      memory: "384Mi"
+      cpu: "1000m"
+      memory: "1400Mi"
 
   service:
     type: LoadBalancer  # LoadBalancer for UDP traffic

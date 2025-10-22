@@ -1,6 +1,19 @@
 # US East Matomo configuration using Bitnami chart
   # Regional deployment configuration for matomo.videocall.rs
+
+# Global security override to allow AWS ECR images
+global:
+  security:
+    allowInsecureImages: true
+
 matomo:
+  # Override image to use AWS ECR public registry with Bitnami images
+  image:
+    registry: public.ecr.aws
+    repository: bitnami/matomo
+    tag: 5.3.2-debian-12-r12
+    pullPolicy: IfNotPresent
+
   # Service configuration - ensure ClusterIP only (not LoadBalancer)
   service:
     type: ClusterIP
@@ -27,6 +40,10 @@ matomo:
   # MariaDB configuration - auto-generate passwords
   mariadb:
     enabled: true
+    image:
+      registry: public.ecr.aws
+      repository: bitnami/mariadb
+      tag: 11.4.4-debian-12-r3
     auth:
       # Leave passwords empty to auto-generate secure random passwords
       rootPassword: ""
@@ -47,3 +64,19 @@ matomo:
   persistence:
     enabled: true
     size: 10Gi
+
+  # Init container to fix volume permissions for Bitnami image
+  initContainers:
+    - name: fix-permissions
+      image: busybox:latest
+      command:
+        - sh
+        - -c
+        - |
+          chown -R 1001:1001 /bitnami/matomo || true
+          chmod -R 755 /bitnami/matomo || true
+      volumeMounts:
+        - name: matomo-data
+          mountPath: /bitnami/matomo
+      securityContext:
+        runAsUser: 0

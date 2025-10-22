@@ -34,7 +34,7 @@ pub fn configure_audio_context(
     let js_tracks = Array::new();
     js_tracks.push(audio_stream_generator);
     let media_stream = MediaStream::new_with_tracks(&js_tracks)
-        .map_err(|e| anyhow::anyhow!("Failed to create media stream: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create media stream: {e:?}"))?;
     info!("Created media stream with audio track");
 
     let audio_context_options = AudioContextOptions::new();
@@ -65,7 +65,7 @@ pub fn configure_audio_context(
     // Create gain node for volume control
     let gain_node = audio_context
         .create_gain()
-        .map_err(|e| anyhow::anyhow!("Failed to create gain node: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create gain node: {e:?}"))?;
     gain_node.gain().set_value(1.0);
     gain_node.set_channel_count(AUDIO_CHANNELS);
     info!("Created gain node with {AUDIO_CHANNELS} channels");
@@ -73,16 +73,16 @@ pub fn configure_audio_context(
     // Create media stream source
     let source = audio_context
         .create_media_stream_source(&media_stream)
-        .map_err(|e| anyhow::anyhow!("Failed to create media stream source: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to create media stream source: {e:?}"))?;
     info!("Created media stream source");
 
     // Connect nodes: source -> gain -> destination
     source
         .connect_with_audio_node(&gain_node)
-        .map_err(|e| anyhow::anyhow!("Failed to connect source to gain node: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to connect source to gain node: {e:?}"))?;
     gain_node
         .connect_with_audio_node(&audio_context.destination())
-        .map_err(|e| anyhow::anyhow!("Failed to connect gain node to destination: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to connect gain node to destination: {e:?}"))?;
     info!("Connected audio nodes: source -> gain -> destination");
 
     Ok(audio_context)

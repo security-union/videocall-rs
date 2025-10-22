@@ -78,7 +78,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use web_transport_quinn::{Session, SessionError};
+use web_transport_quinn::{quinn, Session, SessionError};
 
 /// Videocall WebTransport API
 ///
@@ -151,12 +151,40 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
     let (key, certs) = get_key_and_cert_chain(opt.certs)?;
 
-    // Use ServerBuilder for 0.7.3 API
-    let mut server = web_transport_quinn::ServerBuilder::new()
-        .with_addr(opt.listen)
-        .with_certificate(certs, key)?;
+    // Manually configure Quinn with custom transport settings for fast disconnect detection
+    let provider = rustls::crypto::ring::default_provider();
 
-    info!("listening on {}", opt.listen);
+    let mut server_crypto_config = rustls::ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    server_crypto_config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+
+    let mut server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto_config)?,
+    ));
+
+    // Configure transport with aggressive timeouts for fast disconnect detection
+    let mut transport_config = quinn::TransportConfig::default();
+
+    // Detect disconnection after 5 seconds of inactivity
+    transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(5).try_into()?));
+
+    // Send keep-alive pings every 2 seconds to maintain connection
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(1)));
+
+    server_config.transport_config(std::sync::Arc::new(transport_config));
+
+    // Create Quinn endpoint with our custom config
+    let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
+
+    let mut server = web_transport_quinn::Server::new(endpoint);
+
+    info!(
+        "listening on {} with 5s idle timeout and 2s keep-alive",
+        opt.listen
+    );
 
     let nc =
         async_nats::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))

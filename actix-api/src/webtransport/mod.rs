@@ -241,7 +241,7 @@ async fn run_webtransport_connection_from_request(
     nc: async_nats::client::Client,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
-    info!("received WebTransport request: {}", request.url());
+    warn!("received WebTransport request: {}", request.url());
     let url = request.url();
 
     let uri = url;
@@ -266,7 +266,7 @@ async fn run_webtransport_connection_from_request(
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
-    info!("accepted session");
+    debug!("accepted session");
 
     // Run the session
     if let Err(err) =
@@ -311,7 +311,7 @@ async fn handle_webtransport_session(
         .await
     {
         Ok(sub) => {
-            info!("Subscribed to subject {subject}");
+            debug!("Subscribed to subject {subject}");
             sub
         }
         Err(e) => {

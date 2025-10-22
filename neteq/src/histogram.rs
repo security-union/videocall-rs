@@ -119,7 +119,7 @@ impl Histogram {
         } else {
             // forget_factor_ += (base_forget_factor_ - forget_factor_ + 3) >> 2;
             let diff = (self.base_forget_factor - self.forget_factor + 3) >> 2;
-            self.forget_factor = self.forget_factor + diff;
+            self.forget_factor += diff;
         }
     }
 

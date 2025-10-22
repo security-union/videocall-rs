@@ -306,9 +306,8 @@ impl NetEq {
 
         // Normal NetEQ processing
         // Update delay manager
-        let _relative_delay =
-            self.delay_manager
-                .update(packet.header.timestamp, packet.sample_rate, false)?;
+        self.delay_manager
+            .update(packet.header.timestamp, packet.sample_rate, false)?;
 
         // Insert packet into buffer
         let target_delay = self.delay_manager.target_delay_ms();
@@ -706,7 +705,7 @@ impl NetEq {
                     break;
                 }
             }
-            log::info!("accelerate {} {}", output_len, required_samples);
+            log::info!("accelerate {output_len} {required_samples}");
 
             // Get more data than we need
             let mut extended_frame = AudioFrame::new(

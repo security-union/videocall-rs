@@ -165,9 +165,7 @@ impl Accelerate {
         let max_remove = (output.len() as f32 * acceleration_factor) as usize;
         let max_remove = max_remove.min(output.len() / 2); // Don't remove more than 1/3 of input (= 1/2 of output)
         let max_remove = max_remove.min(input.len() - output.len());
-        let max_remove = max_remove.max(self.overlap_length);
-
-        max_remove
+        max_remove.max(self.overlap_length)
     }
 
     fn find_low_energy_to_remove(
@@ -257,10 +255,10 @@ impl Accelerate {
         let mut best_i = 0;
 
         for j in (0..energy_deviation_rolling_sum.len()).rev() {
-            while stack.len() > 0 && stack[stack.len() - 1] >= j {
+            while !stack.is_empty() && stack[stack.len() - 1] >= j {
                 stack.pop();
             }
-            if stack.len() == 0 {
+            if stack.is_empty() {
                 break;
             }
             let mut si = stack.len();
@@ -464,7 +462,7 @@ mod tests {
     fn test_accelerate_processing() {
         let mut accelerate = Accelerate::new(16000, 1);
         let input = generate_test_signal(1600, 440.0, 16000); // 100ms of 440Hz tone
-        let mut output = vec![0.0; 800 as usize];
+        let mut output = vec![0.0; 800];
 
         let result = accelerate.process(&input, &mut output, true);
 
@@ -490,7 +488,7 @@ mod tests {
     fn test_preemptive_expand_processing() {
         let mut expand = PreemptiveExpand::new(16000, 1);
         let input = generate_test_signal(1600, 440.0, 16000); // 100ms of 440Hz tone
-        let mut output = vec![0.0; 800 as usize];
+        let mut output = vec![0.0; 800];
 
         let result = expand.process(&input, &mut output, false);
 
@@ -533,7 +531,7 @@ mod tests {
     fn test_reset_functionality() {
         let mut accelerate = Accelerate::new(16000, 1);
         let input = generate_test_signal(1600, 440.0, 16000);
-        let mut output = vec![0.0; 800 as usize];
+        let mut output = vec![0.0; 800];
 
         // Process to change state
         accelerate.process(&input, &mut output, false);

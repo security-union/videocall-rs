@@ -121,14 +121,14 @@ impl RelativeArrivalDelayTracker {
         };
 
         // Calculate actual time since last packet
-        let iat_ms = if let Some(last_time) = self.last_packet_time {
+        let actual_iat_ms = if let Some(last_time) = self.last_packet_time {
             arrival_time.duration_since(last_time).as_millis() as i32
         } else {
             0
         };
 
-        // Calculate delay, positive means packet is late, negative means packet is early
-        let iat_delay_ms = iat_ms - expected_iat_ms as i32;
+        // Calculate jitter: positive means packet is late, negative means packet is early
+        let iat_delay_ms = actual_iat_ms - expected_iat_ms as i32;
 
         self.last_packet_time = Some(arrival_time);
 
@@ -171,32 +171,30 @@ impl RelativeArrivalDelayTracker {
 
     /// Calculates the relative arrival delay of packets in the history.
     ///
-    /// This effectively computes the accumulated delay of packets relative
-    /// to the packet preceding the history window. If the running sum ever
-    /// goes below zero, it is reset, meaning the reference packet is moved.
-    ///
-    /// Note on behavior:
-    /// - This function is **sensitive to positive tail jitter**:
-    ///     * Positive delays near the end of the history accumulate.
-    ///     * Positive delays near the beginning may be partially cancelled by
-    ///       subsequent negative delays.
-    /// - Negative delays are mostly ignored because the running sum resets
-    ///   to zero whenever it becomes negative.
+    /// Returns the 97th percentile of positive jitter values in the recent history.
+    /// Negative jitter (early arrivals) is clamped to 0 since we only care about
+    /// buffering for late packets.
     pub fn calculate_relative_packet_arrival_delay(&self) -> i32 {
-        if self.delay_history.len() < 2 {
+        if self.delay_history.is_empty() {
             return 0;
         }
 
-        let mut relative_delay: i32 = 0;
+        // Collect positive jitter values (late arrivals)
+        let mut positive_delays: Vec<i32> = self
+            .delay_history
+            .iter()
+            .map(|d| d.iat_delay_ms.max(0))
+            .collect();
 
-        for delay in &self.delay_history {
-            relative_delay += delay.iat_delay_ms;
-            if relative_delay < 0 {
-                relative_delay = 0; // reset if sum goes below zero
-            }
+        if positive_delays.is_empty() {
+            return 0;
         }
 
-        relative_delay
+        positive_delays.sort_unstable();
+
+        // Return 97th percentile
+        let index = ((positive_delays.len() - 1) as f64 * self.config.quantile) as usize;
+        positive_delays[index]
     }
 }
 
@@ -300,14 +298,14 @@ impl DelayManager {
     pub fn set_minimum_delay(&mut self, delay_ms: u32) -> u32 {
         self.minimum_delay_ms = delay_ms;
         self.update_effective_delay_bounds();
-        return self.effective_minimum_delay_ms;
+        self.effective_minimum_delay_ms
     }
 
     /// Set maximum delay constraint
     pub fn set_maximum_delay(&mut self, delay_ms: u32) -> u32 {
         self.maximum_delay_ms = delay_ms;
         self.update_effective_delay_bounds();
-        return self.effective_maximum_delay_ms;
+        self.effective_maximum_delay_ms
     }
 
     /// Set base minimum delay
@@ -423,9 +421,11 @@ mod tests {
 
     #[test]
     fn test_minimum_delay_constraints() {
-        let mut config = DelayConfig::default();
-        config.base_minimum_delay_ms = 20;
-        config.base_maximum_delay_ms = 200;
+        let config = DelayConfig {
+            base_minimum_delay_ms: 20,
+            base_maximum_delay_ms: 200,
+            ..Default::default()
+        };
         let mut delay_manager = DelayManager::new(config);
 
         assert_eq!(delay_manager.effective_minimum_delay_ms, 20);

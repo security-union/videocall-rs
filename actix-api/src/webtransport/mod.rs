@@ -408,11 +408,13 @@ async fn handle_webtransport_session(
                     }
                 });
             }
+            info!("WebTransport unidirectional receive task ended");
         });
     }
 
     // WebTransport datagram receive task
     {
+        let session = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_wt_datagram = tracker_sender.clone();
         join_set.spawn(async move {
@@ -444,6 +446,16 @@ async fn handle_webtransport_session(
                     }
                 }
             }
+            info!("WebTransport datagram receive task ended");
+        });
+    }
+
+    // WebTransport monitor connection state
+    {
+        let session = session.clone();
+        join_set.spawn(async move {
+            let session_error = session.closed().await;
+            error!("WebTransport connection error: {}", session_error);
         });
     }
 

@@ -98,6 +98,6 @@ impl BotConfig {
     }
 
     pub fn server_url(&self) -> anyhow::Result<Url> {
-        Url::parse(&self.server_url).map_err(|e| anyhow::anyhow!("Invalid server URL: {}", e))
+        Url::parse(&self.server_url).map_err(|e| anyhow::anyhow!("Invalid server URL: {e}"))
     }
 }

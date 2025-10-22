@@ -29,7 +29,19 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
-use tracing::{debug, error, info, trace, trace_span};
+use tracing::{debug, error, info, trace, trace_span, warn};
+
+lazy_static::lazy_static! {
+    static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = std::env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+
+    static ref QUIC_KEEP_ALIVE_INTERVAL_SECS: u64 = std::env::var("QUIC_KEEP_ALIVE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+}
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,7 +90,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use web_transport_quinn::{Session, SessionError};
+use web_transport_quinn::{quinn, Session, SessionError};
 
 /// Videocall WebTransport API
 ///
@@ -151,12 +163,44 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
     let (key, certs) = get_key_and_cert_chain(opt.certs)?;
 
-    // Use ServerBuilder for 0.7.3 API
-    let mut server = web_transport_quinn::ServerBuilder::new()
-        .with_addr(opt.listen)
-        .with_certificate(certs, key)?;
+    // Manually configure Quinn with custom transport settings for fast disconnect detection
+    let provider = rustls::crypto::ring::default_provider();
 
-    info!("listening on {}", opt.listen);
+    let mut server_crypto_config = rustls::ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    server_crypto_config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+
+    let mut server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto_config)?,
+    ));
+
+    // Configure transport with aggressive timeouts for fast disconnect detection
+    let mut transport_config = quinn::TransportConfig::default();
+
+    // Detect disconnection after inactivity (configurable via QUIC_MAX_IDLE_TIMEOUT_SECS)
+    transport_config.max_idle_timeout(Some(
+        std::time::Duration::from_secs(*QUIC_MAX_IDLE_TIMEOUT_SECS).try_into()?,
+    ));
+
+    // Send keep-alive pings to maintain connection (configurable via QUIC_KEEP_ALIVE_INTERVAL_SECS)
+    transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(
+        *QUIC_KEEP_ALIVE_INTERVAL_SECS,
+    )));
+
+    server_config.transport_config(std::sync::Arc::new(transport_config));
+
+    // Create Quinn endpoint with our custom config
+    let endpoint = quinn::Endpoint::server(server_config, opt.listen)?;
+
+    let mut server = web_transport_quinn::Server::new(endpoint);
+
+    info!(
+        "listening on {} with {}s idle timeout and {}s keep-alive",
+        opt.listen, *QUIC_MAX_IDLE_TIMEOUT_SECS, *QUIC_KEEP_ALIVE_INTERVAL_SECS
+    );
 
     let nc =
         async_nats::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
@@ -197,7 +241,7 @@ async fn run_webtransport_connection_from_request(
     nc: async_nats::client::Client,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
-    info!("received WebTransport request: {}", request.url());
+    warn!("received WebTransport request: {}", request.url());
     let url = request.url();
 
     let uri = url;
@@ -222,7 +266,7 @@ async fn run_webtransport_connection_from_request(
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
-    info!("accepted session");
+    debug!("accepted session");
 
     // Run the session
     if let Err(err) =
@@ -255,6 +299,9 @@ async fn handle_webtransport_session(
 
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+    // Create shutdown channel to signal connection errors
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     let subject = format!("room.{lobby_id}.*").replace(' ', "_");
     let specific_subject: Subject = format!("room.{lobby_id}.{username}")
         .replace(' ', "_")
@@ -264,7 +311,7 @@ async fn handle_webtransport_session(
         .await
     {
         Ok(sub) => {
-            info!("Subscribed to subject {subject}");
+            debug!("Subscribed to subject {subject}");
             sub
         }
         Err(e) => {
@@ -281,44 +328,63 @@ async fn handle_webtransport_session(
         let session = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
+        let shutdown_tx_nats = shutdown_tx.clone();
         #[cfg_attr(not(test), allow(unused_variables))]
         let username_clone = username.to_string();
         join_set.spawn(async move {
             let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
-            while let Some(msg) = sub.next().await {
-                if msg.subject == specific_subject_clone {
-                    continue;
-                }
+            loop {
+                tokio::select! {
+                    msg = sub.next() => {
+                        match msg {
+                            Some(msg) => {
+                                if msg.subject == specific_subject_clone {
+                                    continue;
+                                }
 
-                #[cfg(test)]
-                increment_test_packet_counter_for_user(&username_clone);
-                let session_id_clone = session_id_clone.clone();
-                let payload_size = msg.payload.len() as u64;
-                let tracker_sender_inner = tracker_sender_nats.clone();
-                let session = session.clone();
-                tokio::spawn(async move {
-                    let stream = session.open_uni().await;
-                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
-                    match stream {
-                        Ok(mut uni_stream) => {
-                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                error!("Error writing to unidirectional stream: {}", e);
-                            } else {
-                                // Track data sent
-                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
+                                #[cfg(test)]
+                                increment_test_packet_counter_for_user(&username_clone);
+                                let session_id_clone = session_id_clone.clone();
+                                let payload_size = msg.payload.len() as u64;
+                                let tracker_sender_inner = tracker_sender_nats.clone();
+                                let session = session.clone();
+                                let shutdown_tx_inner = shutdown_tx_nats.clone();
+                                tokio::spawn(async move {
+                                    let stream = session.open_uni().await;
+                                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
+                                    match stream {
+                                        Ok(mut uni_stream) => {
+                                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
+                                                error!("Error writing to unidirectional stream: {}", e);
+                                            } else {
+                                                // Track data sent
+                                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
+                                            }
+                                        }
+                                        Err(SessionError::ConnectionError(e)) => {
+                                            error!("Connection error: {}", e);
+                                            let _ = shutdown_tx_inner.send(()).await;
+                                        }
+                                        Err(SessionError::WebTransportError(e)) => {
+                                            error!("WebTransport error: {}", e);
+                                        }
+                                        Err(e) => {
+                                            error!("Error opening unidirectional stream: {}", e);
+                                        }
+                                    }
+                                });
+                            }
+                            None => {
+                                info!("NATS subscription ended");
+                                break;
                             }
                         }
-                        Err(SessionError::ConnectionError(e)) => {
-                            error!("Connection error: {}", e);
-                        }
-                        Err(SessionError::WebTransportError(e)) => {
-                            error!("WebTransport error: {}", e);
-                        }
-                        Err(e) => {
-                            error!("Error opening unidirectional stream: {}", e);
-                        }
                     }
-                });
+                    _ = shutdown_rx.recv() => {
+                        info!("Received shutdown signal, stopping NATS receive task");
+                        break;
+                    }
+                }
             }
         });
     }
@@ -386,11 +452,13 @@ async fn handle_webtransport_session(
                     }
                 });
             }
+            info!("WebTransport unidirectional receive task ended");
         });
     }
 
     // WebTransport datagram receive task
     {
+        let session = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_wt_datagram = tracker_sender.clone();
         join_set.spawn(async move {
@@ -422,6 +490,7 @@ async fn handle_webtransport_session(
                     }
                 }
             }
+            info!("WebTransport datagram receive task ended");
         });
     }
 
@@ -431,7 +500,7 @@ async fn handle_webtransport_session(
     // Track connection end for metrics
     send_connection_ended(&tracker_sender, session_id.clone());
 
-    info!("Finished handling session: {}", session_id);
+    warn!("Finished handling session: {session_id} (username: {username}, lobby: {lobby_id})");
     Ok(())
 }
 

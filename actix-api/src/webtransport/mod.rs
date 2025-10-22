@@ -255,6 +255,9 @@ async fn handle_webtransport_session(
 
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+    // Create shutdown channel to signal connection errors
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     let subject = format!("room.{lobby_id}.*").replace(' ', "_");
     let specific_subject: Subject = format!("room.{lobby_id}.{username}")
         .replace(' ', "_")
@@ -281,44 +284,63 @@ async fn handle_webtransport_session(
         let session = session.clone();
         let session_id_clone = session_id.clone();
         let tracker_sender_nats = tracker_sender.clone();
+        let shutdown_tx_nats = shutdown_tx.clone();
         #[cfg_attr(not(test), allow(unused_variables))]
         let username_clone = username.to_string();
         join_set.spawn(async move {
             let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
-            while let Some(msg) = sub.next().await {
-                if msg.subject == specific_subject_clone {
-                    continue;
-                }
+            loop {
+                tokio::select! {
+                    msg = sub.next() => {
+                        match msg {
+                            Some(msg) => {
+                                if msg.subject == specific_subject_clone {
+                                    continue;
+                                }
 
-                #[cfg(test)]
-                increment_test_packet_counter_for_user(&username_clone);
-                let session_id_clone = session_id_clone.clone();
-                let payload_size = msg.payload.len() as u64;
-                let tracker_sender_inner = tracker_sender_nats.clone();
-                let session = session.clone();
-                tokio::spawn(async move {
-                    let stream = session.open_uni().await;
-                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
-                    match stream {
-                        Ok(mut uni_stream) => {
-                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                error!("Error writing to unidirectional stream: {}", e);
-                            } else {
-                                // Track data sent
-                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
+                                #[cfg(test)]
+                                increment_test_packet_counter_for_user(&username_clone);
+                                let session_id_clone = session_id_clone.clone();
+                                let payload_size = msg.payload.len() as u64;
+                                let tracker_sender_inner = tracker_sender_nats.clone();
+                                let session = session.clone();
+                                let shutdown_tx_inner = shutdown_tx_nats.clone();
+                                tokio::spawn(async move {
+                                    let stream = session.open_uni().await;
+                                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
+                                    match stream {
+                                        Ok(mut uni_stream) => {
+                                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
+                                                error!("Error writing to unidirectional stream: {}", e);
+                                            } else {
+                                                // Track data sent
+                                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
+                                            }
+                                        }
+                                        Err(SessionError::ConnectionError(e)) => {
+                                            error!("Connection error: {}", e);
+                                            let _ = shutdown_tx_inner.send(()).await;
+                                        }
+                                        Err(SessionError::WebTransportError(e)) => {
+                                            error!("WebTransport error: {}", e);
+                                        }
+                                        Err(e) => {
+                                            error!("Error opening unidirectional stream: {}", e);
+                                        }
+                                    }
+                                });
+                            }
+                            None => {
+                                info!("NATS subscription ended");
+                                break;
                             }
                         }
-                        Err(SessionError::ConnectionError(e)) => {
-                            error!("Connection error: {}", e);
-                        }
-                        Err(SessionError::WebTransportError(e)) => {
-                            error!("WebTransport error: {}", e);
-                        }
-                        Err(e) => {
-                            error!("Error opening unidirectional stream: {}", e);
-                        }
                     }
-                });
+                    _ = shutdown_rx.recv() => {
+                        info!("Received shutdown signal, stopping NATS receive task");
+                        break;
+                    }
+                }
             }
         });
     }

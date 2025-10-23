@@ -35,6 +35,7 @@ use web_sys::*;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
 
+
 #[derive(Debug)]
 pub enum WsAction {
     Connect,
@@ -577,6 +578,13 @@ impl Component for AttendantsComponent {
         let mut display_peers_vec = real_peers_vec.clone();
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
 
+        // // ✅ Ensure host (the current user) appears in the peers list
+        let my_email = ctx.props().email.clone();
+        if !display_peers_vec.contains(&my_email) {
+            // Insert host at the beginning so they appear first in the grid
+            display_peers_vec.insert(0, my_email.clone() + " (You)");
+        }
+
         let num_display_peers = display_peers_vec.len();
         // Cap the number of peers used for styling at CANVAS_LIMIT
         let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
@@ -584,14 +592,19 @@ impl Component for AttendantsComponent {
         // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
+        let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
+
+
         let rows: Vec<Html> = display_peers_vec
             .iter()
             .take(CANVAS_LIMIT)
             .enumerate()
             .map(|(i, peer_id)| {
-                let full_bleed = display_peers_vec.len() == 1
-                    && !self.client.is_screen_share_enabled_for_peer(peer_id);
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} client={self.client.clone()} full_bleed={full_bleed} /> }
+                let is_host = peer_id == &(email.clone() + " (You)");
+                let full_bleed = (display_peers_vec.len() == 1 && !self.client.is_screen_share_enabled_for_peer(peer_id)) || num_display_peers == 1;
+                html! {
+                    <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} client={self.client.clone()} full_bleed={full_bleed} is_host={is_host} /> 
+                }
             })
             .collect();
 
@@ -600,8 +613,6 @@ impl Component for AttendantsComponent {
             "position: absolute; inset: 0; width: 100%; height: 100%; --num-peers: {};",
             num_peers_for_styling.max(1)
         );
-
-        let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
         // Compute meeting link for invitation overlay
         let meeting_link = {
@@ -717,6 +728,7 @@ impl Component for AttendantsComponent {
                                 <nav class="host">
                                     <div class="controls">
                                         <nav class="video-controls-container">
+                                            // Mic mute/unmute button
                                             <button
                                                 class={classes!("video-control-button", self.mic_enabled.then_some("active"))}
                                                 onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
@@ -747,6 +759,7 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            // Video on/off button
                                             <button
                                                 class={classes!("video-control-button", self.video_enabled.then_some("active"))}
                                                 onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
@@ -774,8 +787,7 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
-
-                                            // Hide screen share button on Safari/iOS devices
+                                            // Screen share button (hide on Safari/iOS devices)
                                             {
                                                 if !is_ios() {
                                                     html! {
@@ -814,6 +826,7 @@ impl Component for AttendantsComponent {
                                                     html! {}
                                                 }
                                             }
+                                            // peer list button
                                             <button
                                                 class={classes!("video-control-button", self.peer_list_open.then_some("active"))}
                                                 onclick={toggle_peer_list.clone()}>
@@ -846,6 +859,7 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            // diagnostics button
                                             <button
                                                 class={classes!("video-control-button", self.diagnostics_open.then_some("active"))}
                                                 onclick={toggle_diagnostics.clone()}>
@@ -872,6 +886,7 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            // device settings button (mobile only)
                                             <button
                                                 class={classes!("video-control-button", "mobile-only-device-settings", self.device_settings_open.then_some("active"))}
                                                 onclick={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}>
@@ -899,6 +914,7 @@ impl Component for AttendantsComponent {
                                                     }
                                                 }
                                             </button>
+                                            // hang up button
                                             <button
                                                 class="video-control-button danger"
                                                 onclick={ctx.link().callback(|_| Msg::HangUp)}>
@@ -909,18 +925,17 @@ impl Component for AttendantsComponent {
                                             </button>
                                             { self.view_grid_toggle(ctx) }
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
-
                                         </nav>
                                         { html!{} }
-                                                                {
-                            if let Some(message) = &self.simulation_info_message {
-                                html!{
-                                    <p class="simulation-info-message">{ message }</p>
-                                }
-                            } else {
-                                html!{}
-                            }
-                        }
+                                        {
+                                            if let Some(message) = &self.simulation_info_message {
+                                                html!{
+                                                    <p class="simulation-info-message">{ message }</p>
+                                                }
+                                            } else {
+                                                html!{}
+                                            }
+                                        }
                                     </div>
                                     {
                                         if let Some(err) = &self.mic_error {
@@ -941,23 +956,24 @@ impl Component for AttendantsComponent {
                                         } else { html!{} }
                                     }
                                     {
-                                         if media_access_granted {
-                                             html! {<Host
-                                                 client={self.client.clone()}
-                                                 share_screen={self.share_screen}
-                                                 mic_enabled={self.mic_enabled}
-                                                 video_enabled={self.video_enabled}
-                                                 on_encoder_settings_update={on_encoder_settings_update}
-                                                 device_settings_open={self.device_settings_open}
-                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
-                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
-                                             />}
-                                         } else {
-                                             html! {<></>}
-                                         }
+                                        if media_access_granted {
+                                            html! {
+                                                <Host
+                                                    client={self.client.clone()}
+                                                    share_screen={self.share_screen}
+                                                    mic_enabled={self.mic_enabled}
+                                                    video_enabled={self.video_enabled}
+                                                    on_encoder_settings_update={on_encoder_settings_update}
+                                                    device_settings_open={self.device_settings_open}
+                                                    on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                                    on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                                />
+                                            }
+                                        } else {
+                                            html! {<></>}
+                                        }
                                     }
                                     <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
-
                                 </nav>
                             }
                         } else {

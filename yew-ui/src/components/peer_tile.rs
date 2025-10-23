@@ -17,6 +17,7 @@
  */
 
 use crate::components::canvas_generator::generate_for_peer;
+use crate::components::canvas_generator::generate_for_host;
 use futures::future::{AbortHandle, Abortable};
 use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
@@ -29,6 +30,7 @@ pub struct PeerTileProps {
     /// True when layout has only this peer and no screen share; affects styling
     #[prop_or(false)]
     pub full_bleed: bool,
+    pub is_host: bool,
 }
 
 pub enum Msg {
@@ -138,12 +140,22 @@ impl Component for PeerTile {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        log::info!("YEW-UI: ******* Rendering PeerTile: id: {}   is host: {}", &ctx.props().peer_id, ctx.props().is_host);
+
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
-        generate_for_peer(
-            &ctx.props().client,
-            &ctx.props().peer_id,
-            ctx.props().full_bleed,
-        )
+        if ctx.props().is_host {
+            generate_for_host(
+                &ctx.props().client,
+                &ctx.props().peer_id,
+                ctx.props().full_bleed,
+            )
+        } else {
+            generate_for_peer(
+                &ctx.props().client,
+                &ctx.props().peer_id,
+                ctx.props().full_bleed,
+            )
+        }
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {

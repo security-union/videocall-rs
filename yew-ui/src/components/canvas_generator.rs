@@ -115,6 +115,111 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
     }
 }
 
+pub fn generate_for_host(client: &VideoCallClient, key: &String, full_bleed: bool) -> Html {
+    let allowed = users_allowed_to_stream().unwrap_or_default();
+    if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
+        return html! {};
+    }
+
+    const VIDEO_ELEMENT_ID: &str = "webcam";
+
+    let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key) || true; // Host always shows video
+    let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
+    let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
+
+    // Full-bleed single peer (no screen share)
+    if full_bleed && !is_screen_share_enabled_for_peer {
+        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+        return html! {
+            <div class="grid-item full-bleed" id={(*peer_video_div_id).clone()}>
+                <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
+                    onclick={Callback::from({
+                        let div_id = (*peer_video_div_id).clone();
+                        move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
+                    })}
+                >
+                    { 
+                        if is_video_enabled_for_peer { 
+                            html!{
+                                <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
+                            } 
+                        } else { 
+                            html!{ 
+                                <div class="">
+                                    <div class="placeholder-content">
+                                        <PeerIcon/>
+                                        <span class="placeholder-text">{"Camera Off"}</span>
+                                    </div>
+                                </div> 
+                            } 
+                        }
+                    }
+                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                    <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
+                    <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
+                </div>
+            </div>
+        };
+    }
+
+    // Regular grid tile, optionally with screen share tile
+    let screen_share_css = if client.is_awaiting_peer_screen_frame(key) {
+        "grid-item hidden"
+    } else {
+        "grid-item"
+    };
+    let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
+    let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+
+    html! {
+        <>
+            // Canvas for Screen share.
+            if is_screen_share_enabled_for_peer {
+                <div class={screen_share_css} id={(*screen_share_div_id).clone()}>
+                    <div class={classes!("canvas-container", "video-on")} onclick={Callback::from({
+                        let div_id = (*screen_share_div_id).clone();
+                        move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
+                    })}>
+                        <canvas id={format!("screen-share-{}", &key)}></canvas>
+                        <h4 class="floating-name" title={format!("{}-screen", &key)} dir={"auto"}>{format!("{}-screen", &key)}</h4>
+                        <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*screen_share_div_id).clone()); })} class="pin-icon">
+                            <PushPinIcon/>
+                        </button>
+                    </div>
+                </div>
+            } else {
+                <></>
+            }
+            <div class="grid-item" id={(*peer_video_div_id).clone()}>
+                // One canvas for the User Video
+                <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
+                    onclick={Callback::from({
+                        let div_id = (*peer_video_div_id).clone();
+                        move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
+                    })}
+                >
+                    if is_video_enabled_for_peer {
+                        <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
+                    } else {
+                        <div class="placeholder-content">
+                            <PeerIcon/>
+                            <span class="placeholder-text">{"Video Disabled"}</span>
+                        </div>
+                    }
+                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                    <div class="audio-indicator">
+                        <MicIcon muted={!is_audio_enabled_for_peer}/>
+                    </div>
+                    <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon">
+                        <PushPinIcon/>
+                    </button>
+                </div>
+            </div>
+        </>
+    }
+}
+
+
 // props for the video component
 #[derive(Properties, Debug, PartialEq)]
 struct UserVideoProps {

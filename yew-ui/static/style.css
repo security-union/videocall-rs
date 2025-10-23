@@ -490,7 +490,7 @@ canvas {
   min-width: 150px; /* Min width to ensure it's usable, increased to accommodate selectors */
   /* height: auto; */ /* Let content dictate height with flex */
   /* aspect-ratio: 16/9; */ /* Aspect ratio might be tricky with added selectors, manage via video element */
-  border: 2px solid #444;
+  /* border: 2px solid #444; */
   border-radius: 8px;
   /* overflow: hidden; */ /* Remove to prevent clipping, flexbox will manage layout */
   z-index: 10; /* Make sure it's above the grid items if any overlap occurs */

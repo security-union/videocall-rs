@@ -21,7 +21,9 @@ use crate::components::neteq_chart::{
 };
 use futures::future::{AbortHandle, Abortable};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use yew::prelude::*;
 
@@ -631,15 +633,22 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
 pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     let selected_peer = use_state(|| "All Peers".to_string());
 
-    // Local diagnostics state
+    // Use Rc<RefCell<>> for async-safe state management - this fixes the state capture issue
     let diagnostics_data = use_state(|| None::<String>);
     let sender_stats = use_state(|| None::<String>);
-    let encoder_settings = use_state(|| None::<String>);
     let connection_manager_events = use_state(Vec::<SerializableDiagEvent>::new);
     let connection_manager_state = use_state(|| None::<String>);
     let neteq_stats_per_peer = use_state(HashMap::<String, Vec<String>>::new);
     let neteq_buffer_per_peer = use_state(HashMap::<String, Vec<u64>>::new);
     let neteq_jitter_per_peer = use_state(HashMap::<String, Vec<u64>>::new);
+
+    // Create shared state containers for async operations
+    let connection_events_async = Rc::new(RefCell::new(Vec::<SerializableDiagEvent>::new()));
+    let neteq_stats_async = Rc::new(RefCell::new(HashMap::<String, Vec<String>>::new()));
+    let neteq_buffer_async = Rc::new(RefCell::new(HashMap::<String, Vec<u64>>::new()));
+    let neteq_jitter_async = Rc::new(RefCell::new(HashMap::<String, Vec<u64>>::new()));
+
+    let encoder_settings = use_state(|| None::<String>);
 
     // Subscribe/unsubscribe on open/close
     {
@@ -652,6 +661,13 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         let neteq_stats_per_peer = neteq_stats_per_peer.clone();
         let neteq_buffer_per_peer = neteq_buffer_per_peer.clone();
         let neteq_jitter_per_peer = neteq_jitter_per_peer.clone();
+
+        // Clone async-safe shared containers
+        let connection_events_async = connection_events_async.clone();
+        let neteq_stats_async = neteq_stats_async.clone();
+        let neteq_buffer_async = neteq_buffer_async.clone();
+        let neteq_jitter_async = neteq_jitter_async.clone();
+
         use_effect_with(is_open, move |open| {
             // Abortable subscription so we can stop immediately when closing
             let (abort_handle, abort_reg) = AbortHandle::new_pair();
@@ -660,7 +676,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
             };
 
             if !*open {
-                // Clear state when panel is closed so we start fresh next time
+                // Clear state when panel is closed
                 diagnostics_data.set(None);
                 sender_stats.set(None);
                 encoder_settings.set(None);
@@ -669,16 +685,15 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 neteq_stats_per_peer.set(HashMap::new());
                 neteq_buffer_per_peer.set(HashMap::new());
                 neteq_jitter_per_peer.set(HashMap::new());
+
+                // Clear async containers too
+                connection_events_async.borrow_mut().clear();
+                neteq_stats_async.borrow_mut().clear();
+                neteq_buffer_async.borrow_mut().clear();
+                neteq_jitter_async.borrow_mut().clear();
+
                 return cleanup;
             }
-
-            let diagnostics_data = diagnostics_data.clone();
-            let sender_stats = sender_stats.clone();
-            let connection_manager_events = connection_manager_events.clone();
-            let connection_manager_state = connection_manager_state.clone();
-            let neteq_stats_per_peer = neteq_stats_per_peer.clone();
-            let neteq_buffer_per_peer = neteq_buffer_per_peer.clone();
-            let neteq_jitter_per_peer = neteq_jitter_per_peer.clone();
 
             let fut = async move {
                 let mut rx = subscribe();
@@ -708,12 +723,14 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                 }
                             }
                             if !text.is_empty() {
-                                if let Some(peer_id) = evt.stream_id.clone() {
-                                    text.push_str(&format!(
-                                        "Peer: {}\nTimestamp: {}\n",
-                                        peer_id, evt.ts_ms
-                                    ));
-                                }
+                                let peer_id = evt
+                                    .stream_id
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                text.push_str(&format!(
+                                    "Peer: {}\nTimestamp: {}\n",
+                                    peer_id, evt.ts_ms
+                                ));
                                 diagnostics_data.set(Some(text));
                             }
                         }
@@ -762,14 +779,21 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                             } else {
                                                 ("unknown", "unknown")
                                             };
-                                            let mut map = (*neteq_stats_per_peer).clone();
-                                            let entry =
-                                                map.entry(target_peer.to_string()).or_default();
-                                            entry.push(json.clone());
-                                            if entry.len() > 60 {
-                                                entry.remove(0);
+                                            // Update async-safe container first
+                                            {
+                                                let mut stats = neteq_stats_async.borrow_mut();
+                                                let entry = stats
+                                                    .entry(target_peer.to_string())
+                                                    .or_default();
+                                                entry.push(json.clone());
+                                                if entry.len() > 60 {
+                                                    entry.remove(0);
+                                                }
                                             }
-                                            neteq_stats_per_peer.set(map);
+
+                                            // Then update UI state
+                                            neteq_stats_per_peer
+                                                .set(neteq_stats_async.borrow().clone());
                                         }
                                     }
                                     "audio_buffer_ms" => {
@@ -785,14 +809,21 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                             } else {
                                                 ("unknown", "unknown")
                                             };
-                                            let mut map = (*neteq_buffer_per_peer).clone();
-                                            let entry =
-                                                map.entry(target_peer.to_string()).or_default();
-                                            entry.push(*v);
-                                            if entry.len() > 50 {
-                                                entry.remove(0);
+                                            // Update async-safe container first
+                                            {
+                                                let mut buffer = neteq_buffer_async.borrow_mut();
+                                                let entry = buffer
+                                                    .entry(target_peer.to_string())
+                                                    .or_default();
+                                                entry.push(*v);
+                                                if entry.len() > 50 {
+                                                    entry.remove(0);
+                                                }
                                             }
-                                            neteq_buffer_per_peer.set(map);
+
+                                            // Then update UI state
+                                            neteq_buffer_per_peer
+                                                .set(neteq_buffer_async.borrow().clone());
                                         }
                                     }
                                     "jitter_buffer_delay_ms" => {
@@ -808,29 +839,42 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                             } else {
                                                 ("unknown", "unknown")
                                             };
-                                            let mut map = (*neteq_jitter_per_peer).clone();
-                                            let entry =
-                                                map.entry(target_peer.to_string()).or_default();
-                                            entry.push(*v);
-                                            if entry.len() > 50 {
-                                                entry.remove(0);
+                                            // Update async-safe container first
+                                            {
+                                                let mut jitter = neteq_jitter_async.borrow_mut();
+                                                let entry = jitter
+                                                    .entry(target_peer.to_string())
+                                                    .or_default();
+                                                entry.push(*v);
+                                                if entry.len() > 50 {
+                                                    entry.remove(0);
+                                                }
                                             }
-                                            neteq_jitter_per_peer.set(map);
+
+                                            // Then update UI state
+                                            neteq_jitter_per_peer
+                                                .set(neteq_jitter_async.borrow().clone());
                                         }
                                     }
                                     _ => {}
                                 }
                             }
                         }
-                        // Connection manager state accumulation
+                        // Connection manager state accumulation - this is the key fix!
                         "connection_manager" => {
-                            let mut vec = (*connection_manager_events).clone();
-                            vec.push(SerializableDiagEvent::from(evt));
-                            if vec.len() > 20 {
-                                vec.remove(0);
+                            // Update async-safe container first
+                            {
+                                let mut events = connection_events_async.borrow_mut();
+                                events.push(SerializableDiagEvent::from(evt.clone()));
+                                if events.len() > 20 {
+                                    events.remove(0);
+                                }
                             }
-                            let serialized = serde_json::to_string(&vec).unwrap_or_default();
-                            connection_manager_events.set(vec);
+
+                            // Then update UI state
+                            let events = connection_events_async.borrow().clone();
+                            let serialized = serde_json::to_string(&events).unwrap_or_default();
+                            connection_manager_events.set(events);
                             connection_manager_state.set(Some(serialized));
                         }
                         _ => {}

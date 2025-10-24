@@ -15,7 +15,7 @@ rustlemania-webtransport:
 
   env:
     - name: RUST_LOG
-      value: warn,quinn=warn,async_nats=warn
+      value: warn,quinn=warn,web-transport-quinn=warn,async_nats=warn
     - name: NATS_URL
       value: nats-us-east:4222  # Connect to US East NATS cluster
     - name: LISTEN_URL

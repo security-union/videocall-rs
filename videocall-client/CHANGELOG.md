@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.27](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.26...videocall-client-v1.1.27) - 2025-10-24
+
+### Other
+
+- Fix matomo ([#454](https://github.com/security-union/videocall-rs/pull/454))
+
 ## [1.1.26](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.25...videocall-client-v1.1.26) - 2025-10-13
 
 ### Other

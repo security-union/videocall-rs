@@ -20,6 +20,7 @@ use crate::components::neteq_chart::{
     AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
 };
 use futures::future::{AbortHandle, Abortable};
+use gloo_timers::callback::Timeout;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -648,6 +649,11 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     let neteq_buffer_async = Rc::new(RefCell::new(HashMap::<String, Vec<u64>>::new()));
     let neteq_jitter_async = Rc::new(RefCell::new(HashMap::<String, Vec<u64>>::new()));
 
+    // Debounce handles to batch UI updates
+    let stats_flush_timeout = use_mut_ref(|| Option::<Timeout>::None);
+    let buffer_flush_timeout = use_mut_ref(|| Option::<Timeout>::None);
+    let jitter_flush_timeout = use_mut_ref(|| Option::<Timeout>::None);
+
     let encoder_settings = use_state(|| None::<String>);
 
     // Subscribe/unsubscribe on open/close
@@ -667,6 +673,9 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         let neteq_stats_async = neteq_stats_async.clone();
         let neteq_buffer_async = neteq_buffer_async.clone();
         let neteq_jitter_async = neteq_jitter_async.clone();
+        let stats_flush_timeout = stats_flush_timeout.clone();
+        let buffer_flush_timeout = buffer_flush_timeout.clone();
+        let jitter_flush_timeout = jitter_flush_timeout.clone();
 
         use_effect_with(is_open, move |open| {
             // Abortable subscription so we can stop immediately when closing
@@ -691,6 +700,17 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 neteq_stats_async.borrow_mut().clear();
                 neteq_buffer_async.borrow_mut().clear();
                 neteq_jitter_async.borrow_mut().clear();
+
+                // Cancel any pending flush timers
+                if let Some(t) = stats_flush_timeout.borrow_mut().take() {
+                    t.cancel();
+                }
+                if let Some(t) = buffer_flush_timeout.borrow_mut().take() {
+                    t.cancel();
+                }
+                if let Some(t) = jitter_flush_timeout.borrow_mut().take() {
+                    t.cancel();
+                }
 
                 return cleanup;
             }
@@ -791,9 +811,21 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                                 }
                                             }
 
-                                            // Then update UI state
-                                            neteq_stats_per_peer
-                                                .set(neteq_stats_async.borrow().clone());
+                                            // Debounced flush to UI state
+                                            if let Some(t) = stats_flush_timeout.borrow_mut().take()
+                                            {
+                                                t.cancel();
+                                            }
+                                            {
+                                                let neteq_stats_async = neteq_stats_async.clone();
+                                                let neteq_stats_per_peer =
+                                                    neteq_stats_per_peer.clone();
+                                                let handle = Timeout::new(180, move || {
+                                                    neteq_stats_per_peer
+                                                        .set(neteq_stats_async.borrow().clone());
+                                                });
+                                                *stats_flush_timeout.borrow_mut() = Some(handle);
+                                            }
                                         }
                                     }
                                     "audio_buffer_ms" => {
@@ -821,9 +853,22 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                                 }
                                             }
 
-                                            // Then update UI state
-                                            neteq_buffer_per_peer
-                                                .set(neteq_buffer_async.borrow().clone());
+                                            // Debounced flush to UI state
+                                            if let Some(t) =
+                                                buffer_flush_timeout.borrow_mut().take()
+                                            {
+                                                t.cancel();
+                                            }
+                                            {
+                                                let neteq_buffer_async = neteq_buffer_async.clone();
+                                                let neteq_buffer_per_peer =
+                                                    neteq_buffer_per_peer.clone();
+                                                let handle = Timeout::new(180, move || {
+                                                    neteq_buffer_per_peer
+                                                        .set(neteq_buffer_async.borrow().clone());
+                                                });
+                                                *buffer_flush_timeout.borrow_mut() = Some(handle);
+                                            }
                                         }
                                     }
                                     "jitter_buffer_delay_ms" => {
@@ -851,9 +896,22 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                                 }
                                             }
 
-                                            // Then update UI state
-                                            neteq_jitter_per_peer
-                                                .set(neteq_jitter_async.borrow().clone());
+                                            // Debounced flush to UI state
+                                            if let Some(t) =
+                                                jitter_flush_timeout.borrow_mut().take()
+                                            {
+                                                t.cancel();
+                                            }
+                                            {
+                                                let neteq_jitter_async = neteq_jitter_async.clone();
+                                                let neteq_jitter_per_peer =
+                                                    neteq_jitter_per_peer.clone();
+                                                let handle = Timeout::new(180, move || {
+                                                    neteq_jitter_per_peer
+                                                        .set(neteq_jitter_async.borrow().clone());
+                                                });
+                                                *jitter_flush_timeout.borrow_mut() = Some(handle);
+                                            }
                                         }
                                     }
                                     _ => {}
@@ -865,7 +923,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                             // Update async-safe container first
                             {
                                 let mut events = connection_events_async.borrow_mut();
-                                events.push(SerializableDiagEvent::from(evt.clone()));
+                                events.push(SerializableDiagEvent::from(evt));
                                 if events.len() > 20 {
                                     events.remove(0);
                                 }

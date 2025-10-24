@@ -19,7 +19,7 @@
 use std::collections::VecDeque;
 use web_time::{Duration, Instant};
 
-use crate::{NetEqError, Result};
+use crate::{histogram::Histogram, Result};
 
 /// Initial target delay when NetEQ starts operation.
 ///
@@ -35,6 +35,9 @@ use crate::{NetEqError, Result};
 /// - Provides safety margin during cold start before statistics stabilize
 const K_START_DELAY_MS: u32 = 80;
 
+const K_DELAY_BUCKETS: usize = 100;
+const K_BUCKET_SIZE_MS: i32 = 20;
+
 /// Configuration for the delay manager
 #[derive(Debug, Clone)]
 pub struct DelayConfig {
@@ -48,10 +51,12 @@ pub struct DelayConfig {
     pub resample_interval_ms: Option<u32>,
     /// Maximum history length in milliseconds
     pub max_history_ms: u32,
-    /// Maximum number of packets in buffer
-    pub max_packets_in_buffer: usize,
     /// Base minimum delay in milliseconds
     pub base_minimum_delay_ms: u32,
+    // Maximum delay in milliseconds
+    pub base_maximum_delay_ms: u32,
+    // Contant additional delay in milliseconds
+    pub additional_delay_ms: u32,
     /// Whether to use reorder optimizer
     pub use_reorder_optimizer: bool,
     /// Forget factor for reorder detection
@@ -63,13 +68,14 @@ pub struct DelayConfig {
 impl Default for DelayConfig {
     fn default() -> Self {
         Self {
-            quantile: 0.95,
-            forget_factor: 0.983,
+            quantile: 0.97,
+            forget_factor: 0.9993,
             start_forget_weight: Some(2.0),
             resample_interval_ms: Some(500),
             max_history_ms: 2000,
-            max_packets_in_buffer: 200,
             base_minimum_delay_ms: 0,
+            base_maximum_delay_ms: 2000,
+            additional_delay_ms: 0,
             use_reorder_optimizer: true,
             reorder_forget_factor: 0.9993,
             ms_per_loss_percent: 20,
@@ -106,15 +112,23 @@ impl RelativeArrivalDelayTracker {
     }
 
     /// Update with a new packet arrival
-    pub fn update(&mut self, timestamp: u32, sample_rate: u32) -> Option<i32> {
-        let arrival_time = Instant::now();
+    pub fn update(&mut self, timestamp: u32, sample_rate: u32, arrival_time: Instant) -> i32 {
+        // Calculate expected time since last packet
+        let expected_iat_ms = if let Some(last_timestamp) = self.last_timestamp {
+            timestamp.saturating_sub(last_timestamp) * 1000 / sample_rate
+        } else {
+            0
+        };
 
-        // Calculate inter-arrival time delay
-        let iat_delay_ms = if let Some(last_time) = self.last_packet_time {
+        // Calculate actual time since last packet
+        let iat_ms = if let Some(last_time) = self.last_packet_time {
             arrival_time.duration_since(last_time).as_millis() as i32
         } else {
             0
         };
+
+        // Calculate delay, positive means packet is late, negative means packet is early
+        let iat_delay_ms = iat_ms - expected_iat_ms as i32;
 
         self.last_packet_time = Some(arrival_time);
 
@@ -155,24 +169,34 @@ impl RelativeArrivalDelayTracker {
             .retain(|delay| now.duration_since(delay.arrival_time) <= max_age);
     }
 
-    fn calculate_relative_packet_arrival_delay(&self) -> Option<i32> {
+    /// Calculates the relative arrival delay of packets in the history.
+    ///
+    /// This effectively computes the accumulated delay of packets relative
+    /// to the packet preceding the history window. If the running sum ever
+    /// goes below zero, it is reset, meaning the reference packet is moved.
+    ///
+    /// Note on behavior:
+    /// - This function is **sensitive to positive tail jitter**:
+    ///     * Positive delays near the end of the history accumulate.
+    ///     * Positive delays near the beginning may be partially cancelled by
+    ///       subsequent negative delays.
+    /// - Negative delays are mostly ignored because the running sum resets
+    ///   to zero whenever it becomes negative.
+    pub fn calculate_relative_packet_arrival_delay(&self) -> i32 {
         if self.delay_history.len() < 2 {
-            return None;
+            return 0;
         }
 
-        // Calculate mean inter-arrival time
-        let total_iat: i32 = self.delay_history.iter().map(|d| d.iat_delay_ms).sum();
-        let mean_iat = total_iat as f64 / self.delay_history.len() as f64;
+        let mut relative_delay: i32 = 0;
 
-        // Calculate relative delay using quantile estimation
-        let mut delays: Vec<i32> = self.delay_history.iter().map(|d| d.iat_delay_ms).collect();
-        delays.sort_unstable();
+        for delay in &self.delay_history {
+            relative_delay += delay.iat_delay_ms;
+            if relative_delay < 0 {
+                relative_delay = 0; // reset if sum goes below zero
+            }
+        }
 
-        let quantile_index = ((delays.len() - 1) as f64 * self.config.quantile) as usize;
-        let quantile_delay = delays[quantile_index] as f64;
-
-        // Return the difference from expected inter-arrival time
-        Some((quantile_delay - mean_iat) as i32)
+        relative_delay
     }
 }
 
@@ -182,13 +206,13 @@ pub struct DelayManager {
     config: DelayConfig,
     arrival_delay_tracker: RelativeArrivalDelayTracker,
     target_level_ms: u32,
-    effective_minimum_delay_ms: u32,
     minimum_delay_ms: u32,
+    effective_minimum_delay_ms: u32,
     maximum_delay_ms: u32,
-    packet_len_ms: u32,
-    filtered_delay: f64,
-    initialized: bool,
-    last_update_time: Instant,
+    effective_maximum_delay_ms: u32,
+    resampled_relative_delay: i32,
+    last_resample_time: Option<Instant>,
+    histogram: Histogram,
 }
 
 impl DelayManager {
@@ -198,94 +222,98 @@ impl DelayManager {
 
         Self {
             target_level_ms: K_START_DELAY_MS.max(config.base_minimum_delay_ms), // Start with 80ms or minimum delay
+            minimum_delay_ms: 0,
             effective_minimum_delay_ms: config.base_minimum_delay_ms,
-            minimum_delay_ms: config.base_minimum_delay_ms,
-            maximum_delay_ms: 0, // No maximum by default
-            packet_len_ms: 20,   // Default 20ms packets
-            filtered_delay: 0.0,
-            initialized: false,
-            last_update_time: Instant::now(),
+            maximum_delay_ms: 0,
+            effective_maximum_delay_ms: config.base_maximum_delay_ms,
+            resampled_relative_delay: 0,
+            last_resample_time: None,
             arrival_delay_tracker,
+            histogram: Histogram::new(
+                K_DELAY_BUCKETS,
+                config.forget_factor,
+                config.start_forget_weight,
+            ),
             config,
         }
     }
 
     /// Update the delay manager with a new packet
-    pub fn update(&mut self, timestamp: u32, sample_rate: u32, reset: bool) -> Result<Option<i32>> {
+    pub fn update(&mut self, timestamp: u32, sample_rate: u32, reset: bool) -> Result<()> {
         if reset {
             self.reset();
         }
 
-        // Update arrival delay tracking
-        let relative_delay = self.arrival_delay_tracker.update(timestamp, sample_rate);
+        let arrival_time = Instant::now();
 
-        if let Some(delay) = relative_delay {
-            self.update_target_delay(delay);
+        // Update arrival delay tracking
+        let relative_delay =
+            self.arrival_delay_tracker
+                .update(timestamp, sample_rate, arrival_time);
+
+        // When jitter is high, relative_delay fluctuates between high and near 0 values.
+        // resampling helps by calculating the max over some time period.
+        if let Some(resample_interval_ms) = self.config.resample_interval_ms {
+            if let Some(last_resample_time) = self.last_resample_time {
+                let elapsed_ms = arrival_time.duration_since(last_resample_time).as_millis() as u32;
+                if elapsed_ms >= resample_interval_ms {
+                    self.register_relative_delay(self.resampled_relative_delay);
+                    self.resampled_relative_delay = 0;
+
+                    // Round down to nearest multiples, so the interval doesn't drift.
+                    let elapsed_multiples =
+                        (elapsed_ms / resample_interval_ms) * resample_interval_ms;
+                    self.last_resample_time = last_resample_time
+                        .checked_add(Duration::from_millis(elapsed_multiples as u64))
+                }
+            } else {
+                self.last_resample_time = Some(arrival_time);
+            }
+
+            self.resampled_relative_delay = self.resampled_relative_delay.max(relative_delay);
+        } else {
+            self.register_relative_delay(relative_delay);
         }
 
-        self.last_update_time = Instant::now();
+        self.update_target_delay();
 
-        Ok(relative_delay)
+        Ok(())
     }
 
     /// Reset the delay manager
     pub fn reset(&mut self) {
         self.arrival_delay_tracker.reset();
-        self.filtered_delay = 0.0;
-        self.initialized = false;
         self.target_level_ms = K_START_DELAY_MS.max(self.config.base_minimum_delay_ms);
+        self.resampled_relative_delay = 0;
+        self.last_resample_time = None;
         // Reset to 80ms like WebRTC
     }
 
     /// Get the current target delay in milliseconds
     pub fn target_delay_ms(&self) -> u32 {
-        self.target_level_ms.max(self.effective_minimum_delay_ms)
-    }
-
-    /// Set the packet audio length in milliseconds
-    pub fn set_packet_audio_length(&mut self, length_ms: u32) -> Result<()> {
-        if length_ms == 0 {
-            return Err(NetEqError::InvalidConfig(
-                "Packet length cannot be zero".to_string(),
-            ));
-        }
-
-        self.packet_len_ms = length_ms;
-        Ok(())
+        (self.target_level_ms + self.config.additional_delay_ms)
+            .max(self.effective_minimum_delay_ms)
+            .min(self.effective_maximum_delay_ms)
     }
 
     /// Set minimum delay constraint
-    pub fn set_minimum_delay(&mut self, delay_ms: u32) -> Result<bool> {
-        if self.is_valid_minimum_delay(delay_ms) {
-            self.minimum_delay_ms = delay_ms;
-            self.update_effective_minimum_delay();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+    pub fn set_minimum_delay(&mut self, delay_ms: u32) -> u32 {
+        self.minimum_delay_ms = delay_ms;
+        self.update_effective_delay_bounds();
+        return self.effective_minimum_delay_ms;
     }
 
     /// Set maximum delay constraint
-    pub fn set_maximum_delay(&mut self, delay_ms: u32) -> Result<bool> {
-        // Validate maximum delay
-        if delay_ms > 0 && delay_ms < self.minimum_delay_ms {
-            return Ok(false);
-        }
-
+    pub fn set_maximum_delay(&mut self, delay_ms: u32) -> u32 {
         self.maximum_delay_ms = delay_ms;
-        self.update_effective_minimum_delay();
-        Ok(true)
+        self.update_effective_delay_bounds();
+        return self.effective_maximum_delay_ms;
     }
 
     /// Set base minimum delay
-    pub fn set_base_minimum_delay(&mut self, delay_ms: u32) -> Result<bool> {
-        if self.is_valid_base_minimum_delay(delay_ms) {
-            self.config.base_minimum_delay_ms = delay_ms;
-            self.update_effective_minimum_delay();
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+    pub fn set_base_minimum_delay(&mut self, delay_ms: u32) {
+        self.config.base_minimum_delay_ms = delay_ms;
+        self.update_effective_delay_bounds();
     }
 
     /// Get base minimum delay
@@ -293,76 +321,65 @@ impl DelayManager {
         self.config.base_minimum_delay_ms
     }
 
-    fn update_target_delay(&mut self, relative_delay: i32) {
-        if !self.initialized {
-            // Initialize the filtered delay
-            self.filtered_delay = relative_delay as f64;
-            self.initialized = true;
-        } else {
-            // Apply exponential smoothing
-            let forget_factor = if let Some(start_weight) = self.config.start_forget_weight {
-                // Use stronger initial adaptation
-                let adaptation_factor = (start_weight - 1.0)
-                    * (-self.last_update_time.elapsed().as_secs_f64() / 10.0).exp()
-                    + 1.0;
-                self.config.forget_factor * adaptation_factor
-            } else {
-                self.config.forget_factor
-            };
+    /// Set base maximum delay
+    pub fn set_base_maximum_delay(&mut self, delay_ms: u32) {
+        self.config.base_maximum_delay_ms = delay_ms;
+        self.update_effective_delay_bounds();
+    }
 
-            // Clamp to [0.0, 1.0] to ensure filter stability
-            let forget_factor = forget_factor.clamp(0.0, 1.0);
+    /// Get base maximum delay
+    pub fn get_base_maximum_delay(&self) -> u32 {
+        self.config.base_maximum_delay_ms
+    }
 
-            self.filtered_delay = self.filtered_delay * forget_factor
-                + (relative_delay as f64) * (1.0 - forget_factor);
+    fn register_relative_delay(&mut self, relative_delay: i32) {
+        let index = (relative_delay / K_BUCKET_SIZE_MS) as usize;
+        if index < self.histogram.num_buckets() {
+            // Maximum delay to register is 2000 ms.
+            self.histogram.add(index);
         }
+    }
+
+    fn update_target_delay(&mut self) {
+        let bucket_index = self.histogram.quantile(self.config.quantile);
 
         // Update target level based on filtered delay
-        let quantile_delay = self.filtered_delay * self.config.quantile;
-        self.target_level_ms = (quantile_delay as u32)
-            .max(self.config.base_minimum_delay_ms)
-            .max(self.packet_len_ms); // At least one packet duration
+        self.target_level_ms = (1 + bucket_index as u32) * K_BUCKET_SIZE_MS as u32;
 
         // Apply constraints
-        if self.maximum_delay_ms > 0 {
-            self.target_level_ms = self.target_level_ms.min(self.maximum_delay_ms);
-        }
+        self.target_level_ms = self
+            .target_level_ms
+            .max(self.effective_minimum_delay_ms)
+            .min(self.effective_maximum_delay_ms);
 
         log::debug!(
-            "Target delay updated: {}ms (relative_delay: {}ms, filtered: {:.2}ms)",
+            "Target delay updated: {}ms max {}ms min {}ms",
             self.target_level_ms,
-            relative_delay,
-            self.filtered_delay
+            self.effective_minimum_delay_ms,
+            self.effective_maximum_delay_ms
         );
     }
 
-    fn update_effective_minimum_delay(&mut self) {
-        let upper_bound = self.minimum_delay_upper_bound();
+    fn update_effective_delay_bounds(&mut self) {
+        // base maximum is based on the buffer size, so this is the strongest
+        let upper_bound = self.config.base_maximum_delay_ms;
+        let lower_bound = self.config.base_minimum_delay_ms.min(upper_bound);
 
-        self.effective_minimum_delay_ms = self
-            .minimum_delay_ms
-            .max(self.config.base_minimum_delay_ms)
-            .min(upper_bound);
-    }
-
-    fn minimum_delay_upper_bound(&self) -> u32 {
-        // Calculate upper bound based on buffer size and maximum delay
-        let buffer_based_limit =
-            (self.config.max_packets_in_buffer as u32 * self.packet_len_ms * 3) / 4;
+        if self.minimum_delay_ms > 0 {
+            self.effective_minimum_delay_ms =
+                self.minimum_delay_ms.max(lower_bound).min(upper_bound);
+        } else {
+            self.effective_minimum_delay_ms = lower_bound;
+        }
 
         if self.maximum_delay_ms > 0 {
-            buffer_based_limit.min(self.maximum_delay_ms)
+            self.effective_maximum_delay_ms = self
+                .maximum_delay_ms
+                .max(self.effective_minimum_delay_ms)
+                .min(upper_bound);
         } else {
-            buffer_based_limit
+            self.effective_maximum_delay_ms = upper_bound;
         }
-    }
-
-    fn is_valid_minimum_delay(&self, delay_ms: u32) -> bool {
-        delay_ms <= self.minimum_delay_upper_bound()
-    }
-
-    fn is_valid_base_minimum_delay(&self, delay_ms: u32) -> bool {
-        delay_ms <= self.minimum_delay_upper_bound()
     }
 }
 
@@ -406,27 +423,49 @@ mod tests {
 
     #[test]
     fn test_minimum_delay_constraints() {
-        let config = DelayConfig::default();
+        let mut config = DelayConfig::default();
+        config.base_minimum_delay_ms = 20;
+        config.base_maximum_delay_ms = 200;
         let mut delay_manager = DelayManager::new(config);
+
+        assert_eq!(delay_manager.effective_minimum_delay_ms, 20);
+        assert_eq!(delay_manager.effective_maximum_delay_ms, 200);
 
         // Set minimum delay
-        assert!(delay_manager.set_minimum_delay(50).unwrap());
+        assert_eq!(delay_manager.set_minimum_delay(50), 50);
         assert_eq!(delay_manager.target_delay_ms(), 80); // max(80, 50) = 80
+        assert_eq!(delay_manager.effective_minimum_delay_ms, 50);
+        assert_eq!(delay_manager.effective_maximum_delay_ms, 200);
 
         // Set maximum delay
-        assert!(delay_manager.set_maximum_delay(200).unwrap());
+        assert_eq!(delay_manager.set_maximum_delay(150), 150);
+        assert_eq!(delay_manager.effective_minimum_delay_ms, 50);
+        assert_eq!(delay_manager.effective_maximum_delay_ms, 150);
 
-        // Try to set minimum delay higher than maximum
-        assert!(!delay_manager.set_maximum_delay(30).unwrap());
-    }
+        // Set maximum below minimum
+        assert_eq!(delay_manager.set_maximum_delay(40), 50);
+        assert_eq!(delay_manager.effective_minimum_delay_ms, 50);
+        assert_eq!(delay_manager.effective_maximum_delay_ms, 50);
 
-    #[test]
-    fn test_packet_length_setting() {
-        let config = DelayConfig::default();
-        let mut delay_manager = DelayManager::new(config);
+        // Lower minumum
+        assert_eq!(delay_manager.set_minimum_delay(30), 30);
+        assert_eq!(delay_manager.effective_minimum_delay_ms, 30);
+        assert_eq!(delay_manager.effective_maximum_delay_ms, 40);
 
-        assert!(delay_manager.set_packet_audio_length(10).is_ok());
-        assert!(delay_manager.set_packet_audio_length(0).is_err());
+        // Set minumum lower than base max
+        assert_eq!(delay_manager.set_minimum_delay(300), 200);
+        assert_eq!(delay_manager.effective_minimum_delay_ms, 200);
+        assert_eq!(delay_manager.effective_maximum_delay_ms, 200);
+
+        // Reset max
+        assert_eq!(delay_manager.set_maximum_delay(0), 200);
+        assert_eq!(delay_manager.effective_minimum_delay_ms, 200);
+        assert_eq!(delay_manager.effective_maximum_delay_ms, 200);
+
+        // Reset min
+        assert_eq!(delay_manager.set_minimum_delay(0), 20);
+        assert_eq!(delay_manager.effective_minimum_delay_ms, 20);
+        assert_eq!(delay_manager.effective_maximum_delay_ms, 200);
     }
 
     #[test]

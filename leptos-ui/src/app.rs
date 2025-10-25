@@ -1,9 +1,6 @@
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
-use leptos_router::{
-    components::{Route, Router, Routes},
-    StaticSegment,
-};
+use leptos_router::{components::*, *};
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -32,30 +29,23 @@ pub fn App() -> impl IntoView {
         // injects a stylesheet into the document <head>
         // id=leptos means cargo-leptos will hot-reload this stylesheet
         <Stylesheet id="leptos" href="/pkg/leptos-ui.css"/>
+        <Stylesheet id="yew-compat-1" href="/static/style.css"/>
+        <Stylesheet id="yew-compat-2" href="/static/global.css"/>
 
         // sets the document title
-        <Title text="Welcome to Leptos"/>
+        <Title text="videocall.rs"/>
 
         // content for this welcome page
         <Router>
             <main>
                 <Routes fallback=|| "Page not found.".into_view()>
-                    <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=StaticSegment("") view=crate::pages::home::HomePage/>
+                    <Route path=StaticSegment("login") view=crate::pages::home::LoginPage/>
+                    <Route path=("meeting", ParamSegment("id")) view=crate::pages::meeting::MeetingRoute/>
+                    <Route path=("meeting", ParamSegment("id"), ParamSegment("webtransport_enabled")) view=crate::pages::meeting::MeetingRoute/>
                 </Routes>
             </main>
         </Router>
     }
 }
 
-/// Renders the home page of your application.
-#[component]
-fn HomePage() -> impl IntoView {
-    // Creates a reactive value to update the button
-    let count = RwSignal::new(0);
-    let on_click = move |_| *count.write() += 1;
-
-    view! {
-        <h1>"Welcome to Leptos!"</h1>
-        <button on:click=on_click>"Click Me: " {count}</button>
-    }
-}

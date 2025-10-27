@@ -16,8 +16,7 @@
  * conditions.
  */
 
-use crate::components::canvas_generator::generate_for_peer;
-use crate::components::canvas_generator::generate_for_host;
+use crate::components::canvas_generator::generate_canvas_tile;
 use futures::future::{AbortHandle, Abortable};
 use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
@@ -143,19 +142,12 @@ impl Component for PeerTile {
         log::info!("YEW-UI: ******* Rendering PeerTile: id: {}   is host: {}", &ctx.props().peer_id, ctx.props().is_host);
 
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
-        if ctx.props().is_host {
-            generate_for_host(
-                &ctx.props().client,
-                &ctx.props().peer_id,
-                ctx.props().full_bleed,
-            )
-        } else {
-            generate_for_peer(
-                &ctx.props().client,
-                &ctx.props().peer_id,
-                ctx.props().full_bleed,
-            )
-        }
+        generate_canvas_tile(
+            &ctx.props().client,
+            &ctx.props().peer_id,
+            ctx.props().full_bleed,
+            ctx.props().is_host,
+        )
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {

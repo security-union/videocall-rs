@@ -17,7 +17,6 @@
  */
 
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::UsernameCtx;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew::{html, Component, Context};

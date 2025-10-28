@@ -27,7 +27,13 @@ use web_sys::{window, CanvasRenderingContext2d, HtmlCanvasElement};
 use yew::prelude::*;
 use yew::{html, Html};
 
-pub fn generate_canvas_tile(client: &VideoCallClient, key: &String, full_bleed: bool, is_host: bool) -> Html {
+pub fn generate_canvas_tile(
+    client: &VideoCallClient,
+    key: &String,
+    full_bleed: bool,
+    is_host: bool,
+    on_toggle_change_name: Option<Callback<MouseEvent>>,
+) -> Html {
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
         return html! {};
@@ -59,7 +65,24 @@ pub fn generate_canvas_tile(client: &VideoCallClient, key: &String, full_bleed: 
                             html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> }
                         }
                     }
-                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                    {
+                        if is_host {
+                            if let Some(cb) = on_toggle_change_name.clone() {
+                                html! {
+                                    <div class="host-floating-header">
+                                        <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                                        <button class="change-name-fab" title="Change name" onclick={cb}>
+                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                                        </button>
+                                    </div>
+                                }
+                            } else {
+                                html! { <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4> }
+                            }
+                        } else {
+                            html! { <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4> }
+                        }
+                    }
                     <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
                 </div>
@@ -114,7 +137,24 @@ pub fn generate_canvas_tile(client: &VideoCallClient, key: &String, full_bleed: 
                             <span class="placeholder-text">{"Video Disabled"}</span>
                         </div>
                     }
-                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                    {
+                        if is_host {
+                            if let Some(cb) = on_toggle_change_name.clone() {
+                                html! {
+                                    <div class="host-floating-header">
+                                        <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                                        <button class="change-name-fab" title="Change name" onclick={cb}>
+                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                                        </button>
+                                    </div>
+                                }
+                            } else {
+                                html! { <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4> }
+                            }
+                        } else {
+                            html! { <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4> }
+                        }
+                    }
                     <div class="audio-indicator">
                         <MicIcon muted={!is_audio_enabled_for_peer}/>
                     </div>

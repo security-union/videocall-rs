@@ -552,6 +552,37 @@ canvas {
   background-color: rgba(0, 0, 0, 0.44);
 }
 
+.host-floating-header {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 24px);
+  z-index: 2;
+}
+
+.host-floating-header .floating-name {
+  position: static;
+  top: auto;
+  left: auto;
+  margin: 0;
+  flex: 0 0 auto;
+  min-width: auto;
+  max-width: none;
+  overflow: visible;
+  text-overflow: initial;
+}
+
+.host-floating-header .change-name-fab {
+  position: static;
+  top: auto;
+  left: auto;
+  flex: 0 0 auto;
+}
+
 /* Speaker/full-bleed view: already top-left */
 .grid-item.full-bleed .floating-name { top: 12px; }
 
@@ -1408,4 +1439,3 @@ select {
     right: 6px;
   }
 }
-

@@ -81,6 +81,7 @@ pub enum Msg {
     ToggleForceDesktopGrid,
     HangUp,
     ShowCopyToast(bool),
+    RegisterHostToggleName(Callback<MouseEvent>),
 }
 
 impl From<WsAction> for Msg {
@@ -136,6 +137,7 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    host_toggle_change_name: Option<Callback<MouseEvent>>,
 }
 
 impl AttendantsComponent {
@@ -347,6 +349,7 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            host_toggle_change_name: None,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -563,6 +566,10 @@ impl Component for AttendantsComponent {
                 let _ = window().location().reload(); // Refresh page for clean state
                 true
             }
+            Msg::RegisterHostToggleName(callback) => {
+                self.host_toggle_change_name = Some(callback);
+                true
+            }
         }
     }
 
@@ -602,8 +609,20 @@ impl Component for AttendantsComponent {
             .map(|(i, peer_id)| {
                 let is_host = peer_id == &(email.clone() + " (You)");
                 let full_bleed = (display_peers_vec.len() == 1 && !self.client.is_screen_share_enabled_for_peer(peer_id)) || num_display_peers == 1;
+                let on_toggle_change_name = if is_host {
+                    self.host_toggle_change_name.clone()
+                } else {
+                    None
+                };
                 html! {
-                    <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} client={self.client.clone()} full_bleed={full_bleed} is_host={is_host} /> 
+                    <PeerTile
+                        key={format!("tile-{}-{}", i, peer_id)}
+                        peer_id={peer_id.clone()}
+                        client={self.client.clone()}
+                        full_bleed={full_bleed}
+                        is_host={is_host}
+                        on_toggle_change_name={on_toggle_change_name}
+                    />
                 }
             })
             .collect();
@@ -967,6 +986,7 @@ impl Component for AttendantsComponent {
                                                     device_settings_open={self.device_settings_open}
                                                     on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
                                                     on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                                    register_toggle_change_name={ctx.link().callback(Msg::RegisterHostToggleName)}
                                                 />
                                             }
                                         } else {

@@ -30,6 +30,8 @@ pub struct PeerTileProps {
     #[prop_or(false)]
     pub full_bleed: bool,
     pub is_host: bool,
+    #[prop_or_default]
+    pub on_toggle_change_name: Option<Callback<MouseEvent>>,
 }
 
 pub enum Msg {
@@ -147,6 +149,7 @@ impl Component for PeerTile {
             &ctx.props().peer_id,
             ctx.props().full_bleed,
             ctx.props().is_host,
+            ctx.props().on_toggle_change_name.clone(),
         )
     }
 

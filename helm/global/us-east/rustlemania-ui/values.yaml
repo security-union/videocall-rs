@@ -27,11 +27,11 @@ rustlemania-ui:
 
   resources:
     limits:
-      cpu: "50m"
-      memory: "10Mi"
+      cpu: "100m"
+      memory: "128Mi"
     requests:
-      cpu: "20m"
-      memory: "10Mi"
+      cpu: "50m"
+      memory: "64Mi"
 
   # Service configuration (uses chart's service.yaml template)
   service:

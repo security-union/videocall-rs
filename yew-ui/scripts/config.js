@@ -8,6 +8,6 @@ window.__APP_CONFIG = Object.freeze({
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,
   audioBitrateKbps: 65,
-  videoBitrateKbps: 1000,
-  screenBitrateKbps: 1000
+  videoBitrateKbps: 100,
+  screenBitrateKbps: 100
 });

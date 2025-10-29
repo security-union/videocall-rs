@@ -33,15 +33,21 @@ pub trait AudioDecoder {
 }
 
 // Platform-specific codec implementations
+#[cfg(feature = "web")]
+mod browser_detect;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 mod native_opus;
 #[cfg(feature = "web")]
 mod safari_decoder;
 #[cfg(not(feature = "web"))]
 mod wasm_stub;
+#[cfg(feature = "web")]
+mod webcodecs_decoder;
 
 #[cfg(feature = "web")]
 pub use safari_decoder::SafariOpusDecoder;
+#[cfg(feature = "web")]
+pub use webcodecs_decoder::WebCodecsAudioDecoder;
 
 // Always export NativeOpusDecoder for native targets
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -91,23 +97,42 @@ impl AudioDecoder for StubOpusDecoder {
 // -----------------------------------------------------------------------------
 
 #[cfg(feature = "web")]
-/// Unified Opus decoder using opus-decoder library for Safari compatibility
+enum DecoderBackend {
+    WebCodecs(webcodecs_decoder::WebCodecsAudioDecoder),
+    JsLibrary(safari_decoder::SafariOpusDecoder),
+}
+
+#[cfg(feature = "web")]
+/// Unified Opus decoder with automatic backend selection
+/// - iOS/Safari: Uses opus-decoder JS library
+/// - Chrome/Android: Uses WebCodecs hardware acceleration
 pub struct UnifiedOpusDecoder {
-    /// SafariOpusDecoder using opus-decoder library
-    decoder: safari_decoder::SafariOpusDecoder,
-    /// Cached sample rate (48kHz for Opus)
+    decoder: DecoderBackend,
     sample_rate: u32,
-    /// Cached channel count (mono for now)
     channels: u8,
 }
 
 #[cfg(feature = "web")]
 impl UnifiedOpusDecoder {
-    /// Creates a new unified decoder using opus-decoder library
+    /// Creates a new unified decoder with automatic backend selection
     pub async fn new(sample_rate: u32, channels: u8) -> Result<Self> {
-        let mut decoder = safari_decoder::SafariOpusDecoder::new(sample_rate, channels);
-        // Initialize the decoder during construction
-        decoder.init_decoder().await?;
+        let backend = browser_detect::detect_audio_backend();
+
+        let decoder = match backend {
+            browser_detect::AudioBackend::WebCodecs => {
+                log::info!("Initializing WebCodecs AudioDecoder (hardware-accelerated)");
+                let dec =
+                    webcodecs_decoder::WebCodecsAudioDecoder::new(sample_rate, channels).await?;
+                DecoderBackend::WebCodecs(dec)
+            }
+            browser_detect::AudioBackend::JsLibrary => {
+                log::info!("Initializing opus-decoder JS library (Safari/iOS)");
+                let mut dec = safari_decoder::SafariOpusDecoder::new(sample_rate, channels);
+                dec.init_decoder().await?;
+                DecoderBackend::JsLibrary(dec)
+            }
+        };
+
         Ok(Self {
             decoder,
             sample_rate,
@@ -117,7 +142,10 @@ impl UnifiedOpusDecoder {
 
     /// Get the decoder type for debugging
     pub fn decoder_type(&self) -> &'static str {
-        self.decoder.get_decoder_type()
+        match &self.decoder {
+            DecoderBackend::WebCodecs(d) => d.get_decoder_type(),
+            DecoderBackend::JsLibrary(d) => d.get_decoder_type(),
+        }
     }
 
     /// Enable audio playback (kept for compatibility, now a no-op)
@@ -135,7 +163,10 @@ impl UnifiedOpusDecoder {
 
     /// Async decode method for internal use
     pub async fn decode_async(&mut self, encoded: &[u8]) -> Vec<f32> {
-        self.decoder.decode_sync(encoded)
+        match &mut self.decoder {
+            DecoderBackend::WebCodecs(d) => d.decode(encoded).unwrap_or_default(),
+            DecoderBackend::JsLibrary(d) => d.decode_sync(encoded),
+        }
     }
 }
 
@@ -150,9 +181,10 @@ impl AudioDecoder for UnifiedOpusDecoder {
     }
 
     fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>> {
-        // Use the synchronous decode method (decoder is already initialized)
-        let samples = self.decoder.decode_sync(encoded);
-        Ok(samples)
+        match &mut self.decoder {
+            DecoderBackend::WebCodecs(d) => d.decode(encoded),
+            DecoderBackend::JsLibrary(d) => Ok(d.decode_sync(encoded)),
+        }
     }
 }
 

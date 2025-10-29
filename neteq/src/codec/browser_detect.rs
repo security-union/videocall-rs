@@ -52,15 +52,14 @@ pub fn supports_webcodecs_audio() -> bool {
             let global = JsValue::from(window);
 
             // Check if AudioDecoder exists
-            match Reflect::has(&global, &JsValue::from_str("AudioDecoder")) {
-                Ok(true) => match Reflect::get(&global, &JsValue::from_str("AudioDecoder")) {
+            if let Ok(true) = Reflect::has(&global, &JsValue::from_str("AudioDecoder")) {
+                match Reflect::get(&global, &JsValue::from_str("AudioDecoder")) {
                     Ok(constructor) if !constructor.is_undefined() && !constructor.is_null() => {
                         log::info!("WebCodecs AudioDecoder available");
                         return true;
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
         log::info!("WebCodecs AudioDecoder not available");

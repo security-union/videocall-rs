@@ -4,22 +4,20 @@ use leptos::prelude::*;
 use leptos::web_sys;
 use leptos_router::components::A;
 
+use crate::constants::login_url;
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, use_username_context,
 };
-use crate::constants::login_url;
 
 #[component]
 pub fn LoginPage() -> impl IntoView {
-    let onclick = move |_| {
-        match login_url() {
-            Ok(url) => {
-                if let Some(win) = web_sys::window() {
-                    let _ = win.location().set_href(&url);
-                }
+    let onclick = move |_| match login_url() {
+        Ok(url) => {
+            if let Some(win) = web_sys::window() {
+                let _ = win.location().set_href(&url);
             }
-            Err(e) => log::error!("{e:?}"),
         }
+        Err(e) => log::error!("{e:?}"),
     };
 
     view! {
@@ -44,49 +42,58 @@ pub fn HomePage() -> impl IntoView {
         .unwrap_or_else(|| load_username_from_storage().unwrap_or_default());
 
     // If we already have a stored username, set the Matomo user id early
-    leptos::prelude::Effect::new(move |_| {
-        if !existing_username.is_empty() {
-            matomo_logger::set_user_id(&existing_username);
-        }
-    });
+    {
+        let username_clone = existing_username.clone();
+        Effect::new(move |_| {
+            if !username_clone.is_empty() {
+                matomo_logger::set_user_id(&username_clone);
+            }
+        });
+    }
 
-    let onsubmit = move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        let user = username.get_untracked();
-        let meet = meeting_id.get_untracked();
-        if !is_valid_username(&user) || meet.is_empty() {
-            let _ = web_sys::window().unwrap().alert_with_message(
-                "Please provide a valid username and meeting id (a-z, A-Z, 0-9, _).",
-            );
-            return;
+    let onsubmit = {
+        let navigator = navigator.clone();
+        move |ev: leptos::ev::SubmitEvent| {
+            ev.prevent_default();
+            let user = username.get_untracked();
+            let meet = meeting_id.get_untracked();
+            if !is_valid_username(&user) || meet.is_empty() {
+                let _ = web_sys::window().unwrap().alert_with_message(
+                    "Please provide a valid username and meeting id (a-z, A-Z, 0-9, _).",
+                );
+                return;
+            }
+            save_username_to_storage(&user);
+            username_ctx.set(Some(user.clone()));
+            if let Some(name) = username_ctx.get() {
+                matomo_logger::set_user_id(&name);
+            }
+            navigator(&format!("/meeting/{meet}"), Default::default());
         }
-        save_username_to_storage(&user);
-        username_ctx.set(Some(user.clone()));
-        if let Some(name) = username_ctx.get() {
-            matomo_logger::set_user_id(&name);
-        }
-        navigator(&format!("/meeting/{meet}"), Default::default());
     };
 
-    let create_meeting = move |_| {
-        let user = username.get_untracked();
-        if !is_valid_username(&user) {
-            let _ = web_sys::window().unwrap().alert_with_message(
-                "Please enter a valid username before creating a meeting.",
-            );
-            return;
+    let create_meeting = {
+        let navigator = navigator.clone();
+        move |_| {
+            let user = username.get_untracked();
+            if !is_valid_username(&user) {
+                let _ = web_sys::window()
+                    .unwrap()
+                    .alert_with_message("Please enter a valid username before creating a meeting.");
+                return;
+            }
+            let millis = web_time::SystemTime::now()
+                .duration_since(web_time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let meet = format!("{millis:x}");
+            save_username_to_storage(&user);
+            username_ctx.set(Some(user.clone()));
+            if let Some(name) = username_ctx.get() {
+                matomo_logger::set_user_id(&name);
+            }
+            navigator(&format!("/meeting/{meet}"), Default::default());
         }
-        let millis = web_time::SystemTime::now()
-            .duration_since(web_time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let meet = format!("{millis:x}");
-        save_username_to_storage(&user);
-        username_ctx.set(Some(user.clone()));
-        if let Some(name) = username_ctx.get() {
-            matomo_logger::set_user_id(&name);
-        }
-        navigator(&format!("/meeting/{meet}"), Default::default());
     };
 
     // Initialize input values
@@ -190,16 +197,16 @@ pub fn HomePage() -> impl IntoView {
                                     0 => view!{
                                         <h3 class="feature-title">{"Simple"}</h3>
                                         <p class="feature-description">{"No SFU's, no NAT traversal, no complicated setup. Just a simple, secure, and fast video calls via WebTransport."}</p>
-                                    }.into_view(),
+                                    }.into_any(),
                                     1 => view!{
                                         <h3 class="feature-title">{"High Performance"}</h3>
                                         <p class="feature-description">{"Leveraging Rust's zero-cost abstractions and WebAssembly for maximum efficiency. Optimized WebTransport implementation with low latency for smooth video calls."}</p>
-                                    }.into_view(),
+                                    }.into_any(),
                                     2 => view!{
                                         <h3 class="feature-title">{"100% Open Source"}</h3>
                                         <p class="feature-description">{"Fully transparent codebase under permissive licensing. Audit the code yourself - no black boxes or proprietary elements."}</p>
-                                    }.into_view(),
-                                    _ => ().into_view(),
+                                    }.into_any(),
+                                    _ => ().into_any(),
                                 }}
                             </div>
                         </div>

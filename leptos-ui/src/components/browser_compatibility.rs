@@ -9,12 +9,16 @@ pub fn BrowserCompatibility() -> impl IntoView {
     let error = create_memo(|_| check_browser_compatibility());
 
     view! {
-        {move || if let Some(err) = error.get() { View::new_boxed(view! {
+        {move || if let Some(err) = error.get() {
+            view! {
                 <div class="error-container">
                     <p class="error-message">{err}</p>
                     <img src="/assets/street_fighter.gif" alt="Permission instructions" class="instructions-gif" />
                 </div>
-            }.into_view()) } else { View::empty() }}
+            }.into_any()
+        } else {
+            ().into_any()
+        }}
     }
 }
 

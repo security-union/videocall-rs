@@ -152,6 +152,11 @@ impl PartialEq for VideoCallClient {
     }
 }
 
+// SAFETY: VideoCallClient is only used in WASM, which is single-threaded.
+// These trait implementations allow it to be used with Leptos signals.
+unsafe impl Send for VideoCallClient {}
+unsafe impl Sync for VideoCallClient {}
+
 impl VideoCallClient {
     /// Constructor for the client struct.
     ///

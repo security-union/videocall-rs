@@ -39,13 +39,11 @@ pub fn App() -> impl IntoView {
         <Router>
             <main>
                 <Routes fallback=|| "Page not found.".into_view()>
-                    <Route path=StaticSegment("") view=crate::pages::home::HomePage/>
-                    <Route path=StaticSegment("login") view=crate::pages::home::LoginPage/>
-                    <Route path=("meeting", ParamSegment("id")) view=crate::pages::meeting::MeetingRoute/>
-                    <Route path=("meeting", ParamSegment("id"), ParamSegment("webtransport_enabled")) view=crate::pages::meeting::MeetingRoute/>
+                    <Route path="/" view=|| view! { <crate::pages::home::HomePage/> }/>
+                    <Route path="/login" view=|| view! { <crate::pages::home::LoginPage/> }/>
+                    <Route path="/meeting/:id" view=|| view! { <crate::pages::meeting::MeetingRoute/> }/>
                 </Routes>
             </main>
         </Router>
     }
 }
-

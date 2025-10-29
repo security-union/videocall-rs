@@ -2,6 +2,7 @@
 
 //! Runtime configuration accessors and constants for the Leptos UI.
 
+use js_sys;
 use leptos::web_sys;
 use serde::Deserialize;
 use serde_wasm_bindgen::from_value as from_js_value;
@@ -60,7 +61,11 @@ pub fn split_users(s: Option<&str>) -> Vec<String> {
         s.split(',')
             .filter_map(|s| {
                 let s = s.trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             })
             .collect::<Vec<String>>()
     } else {

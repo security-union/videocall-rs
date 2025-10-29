@@ -36,6 +36,11 @@ pub struct MediaDeviceAccess {
     pub on_denied: Callback<JsValue>,
 }
 
+// SAFETY: MediaDeviceAccess is only used in WASM, which is single-threaded.
+// These trait implementations allow it to be used with Leptos signals.
+unsafe impl Send for MediaDeviceAccess {}
+unsafe impl Sync for MediaDeviceAccess {}
+
 #[allow(clippy::new_without_default)]
 impl MediaDeviceAccess {
     /// Constructor for the device access struct.

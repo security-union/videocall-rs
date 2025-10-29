@@ -391,17 +391,6 @@ impl NetEq {
         let operation = self.get_decision()?;
         self.last_operation = operation;
 
-        // TODO: remove debug code
-        if operation != Operation::Normal {
-            log::info!(
-                "operation {:?} buffer: {} filtered: {} target: {}",
-                operation,
-                self.current_buffer_size_ms(),
-                self.buffer_level_filter.filtered_current_level_ms(),
-                self.delay_manager.target_delay_ms(),
-            );
-        }
-
         match operation {
             Operation::Normal => self.decode_normal(&mut frame)?,
             Operation::Accelerate => self.decode_accelerate(&mut frame, false)?,
@@ -580,11 +569,6 @@ impl NetEq {
             return Ok(Operation::Normal);
         }
 
-        // TODO: remove debug codes
-        // if simple_random() < 0.2 {
-        //     self.consecutive_expands = 0;
-        //     return Ok(Operation::PreemptiveExpand);
-        // }
         if simple_random() < 0.001 {
             if self.delay_manager.get_base_minimum_delay() == 30 {
                 self.delay_manager.set_base_minimum_delay(330);
@@ -705,7 +689,6 @@ impl NetEq {
                     break;
                 }
             }
-            log::info!("accelerate {output_len} {required_samples}");
 
             // Get more data than we need
             let mut extended_frame = AudioFrame::new(

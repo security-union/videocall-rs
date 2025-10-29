@@ -24,6 +24,8 @@
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_worker {
+    const AUDIO_PRODUCTION_INTERVAL_MS: i32 = 5;
+
     use log::LevelFilter;
     #[cfg(feature = "matomo-logger")]
     use matomo_logger::worker as matomo_worker;
@@ -133,8 +135,6 @@ mod wasm_worker {
                 Err(e) => console::error_1(&format!("[neteq-worker] bad msg: {:?}", e).into()),
             }
         }) as Box<dyn FnMut(_)>);
-        console::log_1(&"[neteq-worker] onmessage".into());
-
         self_scope.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
         // Eagerly create a default NetEq (48 kHz / mono). If the main thread later sends an
@@ -202,7 +202,6 @@ mod wasm_worker {
         });
 
         // === Stats interval (1 Hz) ===
-        console::log_1(&"[neteq-worker] stats interval".into());
         let stats_cb = Closure::wrap(Box::new(move || {
             DIAGNOSTICS_ENABLED.with(|enabled_cell| {
                 let is_enabled = *enabled_cell.borrow();
@@ -236,7 +235,7 @@ mod wasm_worker {
         );
         stats_cb.forget();
 
-        // High-frequency timer (5ms) for precise audio timing decisions (2x rate approach)
+        // Audio production timer (AUDIO_PRODUCTION_INTERVAL_MS) for 100Hz frame rate
         let cb = Closure::wrap(Box::new(move || {
             IS_MUTED.with(|muted_cell| {
                 let is_muted = *muted_cell.borrow();
@@ -254,7 +253,7 @@ mod wasm_worker {
                     if START_TIME == 0.0 {
                         START_TIME = now;
                         LAST_PRODUCTION_TIME = now;
-                        console::log_1(&"🎵 NetEq: Starting high-frequency timing checks (5ms rate)".into());
+                        console::log_1(&format!("🎵 NetEq: Starting audio production timer ({}ms interval)", AUDIO_PRODUCTION_INTERVAL_MS).into());
                         // Produce first frame immediately
                         if !is_muted {
                             NETEQ.with(|cell| {
@@ -293,7 +292,8 @@ mod wasm_worker {
                         let expected_rate = 100.0; // 100 Hz target
                         let timing_error_ms = (TOTAL_FRAMES_PRODUCED as f64 * 10.0) - total_elapsed_ms;
                         log::debug!(
-                            "🎯 NetEq (5ms checks): {actual_production_rate:.1}Hz actual, {expected_rate:.1}Hz expected, {timing_error_ms:.1}ms timing error, {frames_behind} behind, muted={is_muted}"
+                            "🎯 NetEq ({}ms timer): {actual_production_rate:.1}Hz actual, {expected_rate:.1}Hz expected, {timing_error_ms:.1}ms timing error, {frames_behind} behind, muted={is_muted}",
+                            AUDIO_PRODUCTION_INTERVAL_MS
                          );
                         LAST_TIMING_LOG = now;
                     }
@@ -312,12 +312,12 @@ mod wasm_worker {
                                     // Track timing adjustments for debugging
                                     if frames_behind > 1 {
                                         TIMING_ADJUSTMENTS += 1;
-                                        console::log_1(
-                                            &format!(
-                                                "⚡ Timing adjustment: {} frames behind, interval was {:.1}ms",
-                                                frames_behind, interval_since_last
-                                            ).into(),
-                                        );
+                                        // console::log_1(
+                                        //     &format!(
+                                        //         "⚡ Timing adjustment: {} frames behind, interval was {:.1}ms",
+                                        //         frames_behind, interval_since_last
+                                        //     ).into(),
+                                        // );
                                     }
                                 } else {
                                     // NetEq couldn't provide audio - this is expected sometimes
@@ -329,8 +329,10 @@ mod wasm_worker {
                 }
             });
         }) as Box<dyn FnMut()>);
-        let _ = self_scope_clone_3
-            .set_interval_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 5);
+        let _ = self_scope_clone_3.set_interval_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            AUDIO_PRODUCTION_INTERVAL_MS,
+        );
         cb.forget();
 
         on_message.forget();
@@ -343,11 +345,6 @@ mod wasm_worker {
                 sample_rate,
                 channels: _,
             } => {
-                console::log_2(
-                    &"[neteq-worker] Init received, sr=".into(),
-                    &JsValue::from_f64(sample_rate as f64),
-                );
-
                 // NOTE: We don't set up a second timer here! The main timer in start() already handles audio production
                 // with time-based logic to handle Safari's irregular intervals, and respects the mute state.
             }

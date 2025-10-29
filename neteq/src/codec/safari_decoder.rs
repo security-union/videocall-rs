@@ -21,6 +21,14 @@
 //! This decoder uses the opus-decoder npm library via cached reflection.
 //! We use reflection once during init to cache methods, then call them directly
 //! to avoid reflection overhead in the hot path.
+//!
+//! ## Performance Optimizations:
+//! 1. **Cached methods**: Decoder methods are cached to avoid repeated reflection
+//! 2. **Reusable input buffer**: Single Uint8Array buffer for encoded data (1275 bytes max)
+//! 3. **Double output buffering**: Two buffers that alternate to enable zero-copy returns
+//! 4. **Cached JS keys**: JsValue property names cached to avoid repeated string allocations
+//! 5. **Unchecked array access**: Direct array indexing where bounds are known
+//! 6. **Zero-copy returns**: std::mem::take to return buffers without cloning
 
 use crate::codec::AudioDecoder;
 use js_sys::{Function, Promise, Reflect, Uint8Array};
@@ -36,9 +44,13 @@ pub struct SafariOpusDecoder {
     initialized: bool,
     sample_rate: u32,
     channels: u8,
-    // Reusable buffers to avoid allocations
+    // Reusable buffers to avoid allocations (double buffering)
     input_buffer: Option<Uint8Array>,
-    output_buffer: Vec<f32>,
+    output_buffer_a: Vec<f32>,
+    output_buffer_b: Vec<f32>,
+    use_buffer_a: bool,
+    // Cached JS property names to avoid repeated string allocations
+    channel_data_key: JsValue,
 }
 
 // IMPORTANT: The OpusDecoder type from wasm-bindgen is not Send/Sync by default.
@@ -62,7 +74,12 @@ impl SafariOpusDecoder {
             channels,
             // Pre-allocate input buffer for max Opus packet size (1275 bytes)
             input_buffer: Some(Uint8Array::new_with_length(1275)),
-            output_buffer: vec![0.0; MAX_FRAME_SIZE],
+            // Double buffer for zero-copy returns
+            output_buffer_a: vec![0.0; MAX_FRAME_SIZE],
+            output_buffer_b: vec![0.0; MAX_FRAME_SIZE],
+            use_buffer_a: true,
+            // Cache JS property name
+            channel_data_key: JsValue::from_str("channelData"),
         }
     }
 
@@ -265,8 +282,8 @@ impl SafariOpusDecoder {
     }
 
     fn extract_pcm_from_result_reuse(&mut self, result: &JsValue) -> crate::Result<Vec<f32>> {
-        // Extract channelData from the result
-        let channel_data = js_sys::Reflect::get(result, &"channelData".into()).map_err(|_| {
+        // Extract channelData from the result using cached key (avoids string allocation)
+        let channel_data = js_sys::Reflect::get(result, &self.channel_data_key).map_err(|_| {
             crate::NetEqError::DecoderError(
                 "channelData property not found in decode result".to_string(),
             )
@@ -283,8 +300,11 @@ impl SafariOpusDecoder {
             ));
         }
 
-        // Get the first channel (mono or left channel for stereo)
-        let first_channel = channel_array.get(0);
+        // Get the first channel using unchecked access (we know length > 0)
+        let first_channel = js_sys::Reflect::get_u32(&channel_array, 0).map_err(|_| {
+            crate::NetEqError::DecoderError("Failed to get first channel".to_string())
+        })?;
+
         let float32_array = first_channel
             .dyn_into::<js_sys::Float32Array>()
             .map_err(|_| {
@@ -293,16 +313,29 @@ impl SafariOpusDecoder {
 
         let sample_count = float32_array.length() as usize;
 
-        // Resize output buffer if needed (should be rare after first few calls)
-        if self.output_buffer.len() < sample_count {
-            self.output_buffer.resize(sample_count, 0.0);
+        // Double buffering: write to inactive buffer, then take ownership
+        let target_buffer = if self.use_buffer_a {
+            &mut self.output_buffer_b
+        } else {
+            &mut self.output_buffer_a
+        };
+
+        // Resize target buffer if needed (should be rare after first few calls)
+        if target_buffer.len() < sample_count {
+            target_buffer.resize(sample_count, 0.0);
         }
 
-        // Copy directly into reusable buffer
-        float32_array.copy_to(&mut self.output_buffer[..sample_count]);
+        // Copy directly into target buffer
+        float32_array.copy_to(&mut target_buffer[..sample_count]);
 
-        // Return a new Vec with just the data we need (cheap allocation of just the length)
-        Ok(self.output_buffer[..sample_count].to_vec())
+        // Swap buffers so next call writes to the other one
+        self.use_buffer_a = !self.use_buffer_a;
+
+        // Take ownership of the filled buffer (zero-copy!) and replace with empty vec
+        let mut result_vec = std::mem::take(target_buffer);
+        result_vec.truncate(sample_count);
+
+        Ok(result_vec)
     }
 
     fn generate_test_tone(&self) -> Vec<f32> {

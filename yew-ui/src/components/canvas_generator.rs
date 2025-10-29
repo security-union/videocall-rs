@@ -62,7 +62,7 @@ pub fn generate_canvas_tile(
                                 html!{ <UserVideo id={key.clone()} hidden={false}/> }
                             }
                         } else {
-                            html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> }
+                            html!{ <></> }
                         }
                     }
                     {

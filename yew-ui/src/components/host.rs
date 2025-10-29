@@ -472,36 +472,6 @@ impl Component for Host {
 
         html! {
             <>
-                {
-                    if ctx.props().video_enabled {
-                        html! {
-                            <div class="host-video-wrapper" style="position:relative;">
-                                // <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
-                                // <button class="change-name-fab" title="Change name"
-                                //     onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
-                                //     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-                                // </button>
-                            </div>
-                        }
-                    } else {
-                        html! {
-                            <div class="" style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem; position:relative;">
-                                <div class="placeholder-content">
-                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                        <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
-                                        <line x1="1" y1="1" x2="23" y2="23"></line>
-                                    </svg>
-                                    <span class="placeholder-text">{"Camera Off"}</span>
-                                </div>
-                                <button class="change-name-fab" title="Change name"
-                                    onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
-                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-                                </button>
-                            </div>
-                        }
-                    }
-                }
-
                 // Device Settings Menu Button (positioned outside the host video)
                 <button
                     class="device-settings-menu-button btn-apple btn-secondary"

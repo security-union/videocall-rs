@@ -1,0 +1,60 @@
+namespace videocall.protocol;
+
+table NetEqOperationCounters {
+  normal_per_sec: double;
+  expand_per_sec: double;
+  accelerate_per_sec: double;
+  fast_accelerate_per_sec: double;
+  preemptive_expand_per_sec: double;
+  merge_per_sec: double;
+  comfort_noise_per_sec: double;
+  dtmf_per_sec: double;
+  undefined_per_sec: double;
+}
+
+table NetEqNetwork {
+  operation_counters: NetEqOperationCounters;
+}
+
+table NetEqStats {
+  current_buffer_size_ms: double;
+  packets_awaiting_decode: double;
+  network: NetEqNetwork;
+  packets_per_sec: double;
+}
+
+table VideoStats {
+  fps_received: double;
+  frames_buffered: double;
+  frames_decoded: uint64;
+  bitrate_kbps: uint64;
+}
+
+table PeerStats {
+  can_listen: bool;
+  can_see: bool;
+  audio_enabled: bool;
+  video_enabled: bool;
+  neteq_stats: NetEqStats;
+  video_stats: VideoStats;
+}
+
+table PeerStatsEntry {
+  peer_id: string;
+  stats: PeerStats;
+}
+
+table HealthPacket {
+  session_id: string;
+  meeting_id: string;
+  reporting_peer: string;
+  timestamp_ms: uint64;
+  reporting_audio_enabled: bool;
+  reporting_video_enabled: bool;
+  peer_stats: [PeerStatsEntry];
+  active_server_url: string;
+  active_server_type: string;
+  active_server_rtt_ms: double;
+}
+
+root_type HealthPacket;

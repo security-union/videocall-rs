@@ -1,0 +1,8 @@
+namespace videocall.protocol;
+
+table RsaPacket {
+  public_key_der: [ubyte];
+  username: string;
+}
+
+root_type RsaPacket;

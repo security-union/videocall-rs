@@ -9,6 +9,7 @@ members = [
     "yew-ui",
     "videocall-sdk",
     "videocall-codecs",
+    "videocall-flatbuffers",
     "neteq",
     "videocall-diagnostics",
     "matomo-logger"

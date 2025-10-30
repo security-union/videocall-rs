@@ -1,0 +1,31 @@
+namespace videocall.protocol;
+
+enum MediaType : byte {
+  VIDEO = 0,
+  AUDIO = 1,
+  SCREEN = 2,
+  HEARTBEAT = 3,
+  RTT = 4
+}
+
+table VideoMetrics {
+  fps_received: float;
+  bitrate_kbps: uint32;
+}
+
+table AudioMetrics {
+  fps_received: float;
+  bitrate_kbps: uint32;
+}
+
+table DiagnosticsPacket {
+  stream_id: string;
+  sender_id: string;
+  target_id: string;
+  timestamp_ms: uint64;
+  media_type: MediaType;
+  video_metrics: VideoMetrics;
+  audio_metrics: AudioMetrics;
+}
+
+root_type DiagnosticsPacket;

@@ -1,0 +1,33 @@
+namespace videocall.protocol;
+
+enum EventType : byte {
+  UNKNOWN = 0,
+  CONNECTION_STARTED = 1,
+  CONNECTION_ENDED = 2,
+  DATA_TRANSFERRED = 3
+}
+
+table DataTransferInfo {
+  bytes_sent: uint64;
+  bytes_received: uint64;
+}
+
+table ConnectionMetadata {
+  session_id: string;
+  customer_email: string;
+  meeting_id: string;
+  protocol: string;
+  server_instance: string;
+  region: string;
+}
+
+table ServerConnectionPacket {
+  event_type: EventType;
+  timestamp_ms: uint64;
+  connection: ConnectionMetadata;
+  data_transfer: DataTransferInfo;
+  connection_duration_ms: uint64;
+  is_reconnection: bool;
+}
+
+root_type ServerConnectionPacket;

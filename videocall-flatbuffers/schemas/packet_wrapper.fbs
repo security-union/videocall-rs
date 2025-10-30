@@ -1,0 +1,18 @@
+namespace videocall.protocol;
+
+enum PacketType : byte {
+  RSA_PUB_KEY = 0,
+  AES_KEY = 1,
+  MEDIA = 2,
+  CONNECTION = 3,
+  DIAGNOSTICS = 4,
+  HEALTH = 5
+}
+
+table PacketWrapper {
+  packet_type: PacketType;
+  email: string;
+  data: [ubyte];
+}
+
+root_type PacketWrapper;

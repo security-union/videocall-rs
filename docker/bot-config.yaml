@@ -1,6 +1,6 @@
 # Docker synthetic clients configuration
 ramp_up_delay_ms: 1000
-server_url: "https://webtransport-us-east.webtransport.video"
+server_url: "https://webtransport-api:4433"
 insecure: true  # Skip certificate verification for development
 
 clients:
@@ -10,11 +10,11 @@ clients:
     enable_audio: true
     enable_video: true
     
-  # Client 1: Audio-only in meetinga
+  # Client 1: Audio-only in meetingb  
   - user_id: "dockerbot001"
-    meeting_id: "meetinga"
-    enable_audio: true
-    enable_video: true
+    meeting_id: "meetingb"
+    enable_audio: false
+    enable_video: false
     
   # Client 2: Video-only in meetinga (same room as client 0)
   - user_id: "dockerbot002"
@@ -22,13 +22,13 @@ clients:
     enable_audio: true
     enable_video: true
 
-  # # Client 3: Full audio+video in meetinga
+  # Client 3: Full audio+video in meetinga
   - user_id: "dockerbot003"
     meeting_id: "meetinga"
-    enable_audio: false
+    enable_audio: true
     enable_video: true
 
-  # Client 4: Ful[l audio+video in meetinga
+  # Client 4: Full audio+video in meetinga
   - user_id: "dockerbot004"
     meeting_id: "meetinga"
     enable_audio: true
@@ -40,32 +40,32 @@ clients:
     enable_audio: true
     enable_video: true
 
-  # # Client 6: Full audio+video in meetingb
-  # - user_id: "dockerbot006"
-  #   meeting_id: "meetinga"
-  #   enable_audio: true
-  #   enable_video: true
+  # Client 6: Full audio+video in meetingb
+  - user_id: "dockerbot006"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
 
-  # # Client 7: Full audio+video in meetingb
-  # - user_id: "dockerbot007"
-  #   meeting_id: "meetinga"
-  #   enable_audio: true
-  #   enable_video: true
+  # Client 7: Full audio+video in meetingb
+  - user_id: "dockerbot007"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
 
-  # # Client 8: Full audio+video in meetinga
-  # - user_id: "dockerbot008"
-  #   meeting_id: "meetinga"
-  #   enable_audio: true
-  #   enable_video: true
+  # Client 8: Full audio+video in meetinga
+  - user_id: "dockerbot008"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
 
-  # # Client 9: Full audio+video in meetinga
-  # - user_id: "dockerbot009"
-  #   meeting_id: "meetinga"
-  #   enable_audio: true
-  #   enable_video: true
+  # Client 9: Full audio+video in meetinga
+  - user_id: "dockerbot009"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true
 
-  # # Client 10: Full audio+video in meetinga
-  # - user_id: "dockerbot010"
-  #   meeting_id: "meetinga"
-  #   enable_audio: true
-  #   enable_video: true
+  # Client 10: Full audio+video in meetinga
+  - user_id: "dockerbot010"
+    meeting_id: "meetinga"
+    enable_audio: true
+    enable_video: true

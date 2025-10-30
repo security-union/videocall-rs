@@ -33,7 +33,7 @@ pub const AUDIO_SAMPLE_RATE: u32 = 48000u32;
 
 pub const RSA_BITS: usize = 1024;
 
-use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_flatbuffers::MediaType;
 
 pub static SUPPORTED_MEDIA_TYPES: &[MediaType] = &[
     MediaType::AUDIO,

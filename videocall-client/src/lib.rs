@@ -167,6 +167,7 @@ pub mod crypto;
 pub mod decode;
 pub mod diagnostics;
 pub mod encode;
+pub mod flatbuffer_helpers;
 pub mod health_reporter;
 mod media_devices;
 pub mod utils;

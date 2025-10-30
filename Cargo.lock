@@ -3180,15 +3180,6 @@ checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
 name = "itertools"
-version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
@@ -4487,29 +4478,6 @@ dependencies = [
  "parking_lot",
  "protobuf 2.28.0",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "prost"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b82eaa1d779e9a4bc1c3217db8ffbeabaae1dca241bf70183242128d48681cd"
-dependencies = [
- "bytes",
- "prost-derive",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5d2d8d10f3c6ded6da8b05b5fb3b8a5082514344d56c9f871412d29b4e075b4"
-dependencies = [
- "anyhow",
- "itertools 0.10.5",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -6601,6 +6569,7 @@ dependencies = [
  "anyhow",
  "async-broadcast",
  "cbc",
+ "flatbuffers",
  "futures",
  "gloo 0.8.1",
  "gloo-timers 0.3.0",
@@ -6609,8 +6578,6 @@ dependencies = [
  "log",
  "neteq",
  "pidgeon",
- "prost",
- "protobuf 3.7.1",
  "rand 0.8.5",
  "rsa",
  "serde",
@@ -6619,7 +6586,7 @@ dependencies = [
  "serde_json",
  "videocall-codecs",
  "videocall-diagnostics",
- "videocall-types",
+ "videocall-flatbuffers",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",

@@ -37,7 +37,7 @@
 
 use std::cell::RefCell;
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
-use videocall_codecs::frame::{FrameBuffer, VideoFrame};
+use videocall_codecs::frame::FrameBuffer;
 use videocall_codecs::jitter_buffer::JitterBuffer;
 use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
 use wasm_bindgen::prelude::*;
@@ -213,7 +213,7 @@ thread_local! {
     static LAST_DIAGNOSTIC_EMIT_MS: RefCell<f64> = const { RefCell::new(0.0) };
 }
 
-const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
+const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 33; // Check every 33ms (~30Hz) to match video framerate - reduces CPU usage
 const DIAGNOSTIC_EMIT_INTERVAL_MS: f64 = 1000.0; // Emit diagnostics at 1 Hz (once per second)
 
 #[wasm_bindgen(start)]
@@ -282,13 +282,8 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
         }
 
         if let Some(jb) = jb_opt.as_mut() {
-            // Convert FrameBuffer to VideoFrame
-            let video_frame = VideoFrame {
-                sequence_number: frame.sequence_number(),
-                frame_type: frame.frame.frame_type,
-                data: frame.frame.data.clone(),
-                timestamp: frame.frame.timestamp,
-            };
+            // Move the VideoFrame from FrameBuffer instead of cloning (avoid expensive data copy)
+            let video_frame = frame.frame;
 
             // Get current time in milliseconds
             let current_time_ms = js_sys::Date::now() as u128;

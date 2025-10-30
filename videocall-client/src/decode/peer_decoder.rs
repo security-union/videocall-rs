@@ -34,6 +34,8 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_CODEC;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use log::error;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use videocall_codecs::decoder::WasmDecoder;
 use videocall_codecs::frame::{FrameBuffer, FrameType, VideoFrame as CodecVideoFrame};
@@ -55,6 +57,15 @@ pub struct DecodeStatus {
 
 pub trait PeerDecode {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus>;
+}
+
+/// Cached canvas rendering context to avoid repeated DOM lookups
+struct CanvasCache {
+    canvas: HtmlCanvasElement,
+    ctx: CanvasRenderingContext2d,
+    /// Track current dimensions to avoid expensive resize operations
+    current_width: u32,
+    current_height: u32,
 }
 
 ///
@@ -101,9 +112,11 @@ impl VideoFrameDecoder for WasmVideoFrameDecoder {
 impl VideoPeerDecoder {
     pub fn new(canvas_id: &str) -> Result<Self, JsValue> {
         let canvas_id = canvas_id.to_owned();
+        // Use Option<CanvasCache> for lazy initialization on first frame
+        let canvas_cache: Rc<RefCell<Option<CanvasCache>>> = Rc::new(RefCell::new(None));
 
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
-            Self::render_to_canvas(&canvas_id, video_frame);
+            Self::render_to_canvas_cached(&canvas_id, &canvas_cache, video_frame);
         };
 
         let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
@@ -117,39 +130,110 @@ impl VideoPeerDecoder {
         Ok(Self { decoder })
     }
 
+    /// Create and cache canvas and context references once at initialization
+    fn create_canvas_cache(canvas_id: &str) -> Result<CanvasCache, JsValue> {
+        let window = web_sys::window().ok_or("No window found")?;
+        let document = window.document().ok_or("No document found")?;
+        let canvas_element = document
+            .get_element_by_id(canvas_id)
+            .ok_or_else(|| format!("Canvas element with id '{canvas_id}' not found"))?;
+
+        let canvas = canvas_element
+            .dyn_into::<HtmlCanvasElement>()
+            .map_err(|_| "Element is not a canvas")?;
+
+        let ctx = canvas
+            .get_context("2d")?
+            .ok_or("Failed to get 2d context")?
+            .dyn_into::<CanvasRenderingContext2d>()?;
+
+        // Initialize with current canvas dimensions
+        let current_width = canvas.width();
+        let current_height = canvas.height();
+
+        Ok(CanvasCache {
+            canvas,
+            ctx,
+            current_width,
+            current_height,
+        })
+    }
+
     /// Provide original peer IDs to the underlying decoder so worker can tag diagnostics
     pub fn set_stream_context(&self, from_peer: String, to_peer: String) {
         self.decoder.set_stream_context(from_peer, to_peer);
     }
 
-    fn render_to_canvas(canvas_id: &str, video_frame: web_sys::VideoFrame) {
-        if let Some(window) = web_sys::window() {
-            if let Some(document) = window.document() {
-                if let Some(canvas_element) = document.get_element_by_id(canvas_id) {
-                    let canvas = canvas_element.dyn_into::<HtmlCanvasElement>().unwrap();
-                    let ctx = canvas
-                        .get_context("2d")
-                        .unwrap()
-                        .unwrap()
-                        .dyn_into::<CanvasRenderingContext2d>()
-                        .unwrap();
+    /// Check if cached canvas is still valid (connected to DOM)
+    fn is_canvas_valid(cache: &CanvasCache) -> bool {
+        // Check if canvas is still connected to the document
+        cache.canvas.is_connected()
+    }
 
-                    let width = video_frame.display_width();
-                    let height = video_frame.display_height();
-                    canvas.set_width(width);
-                    canvas.set_height(height);
-                    ctx.clear_rect(0.0, 0.0, width as f64, height as f64);
+    /// Render video frame using cached canvas/context (Steps 1 & 2: optimized DOM + conditional resize)
+    /// Lazily initializes canvas cache on first frame to avoid race conditions
+    /// Automatically invalidates and reinitializes cache when canvas is recreated (peer join/leave)
+    fn render_to_canvas_cached(
+        canvas_id: &str,
+        canvas_cache: &Rc<RefCell<Option<CanvasCache>>>,
+        video_frame: web_sys::VideoFrame,
+    ) {
+        let mut cache_option = canvas_cache.borrow_mut();
 
-                    if let Err(e) = ctx.draw_image_with_video_frame(&video_frame, 0.0, 0.0) {
-                        log::error!("Error drawing video frame: {e:?}");
+        // Check if we need to initialize or reinitialize the cache
+        let needs_init = match cache_option.as_ref() {
+            None => true,                                 // Never initialized
+            Some(cache) => !Self::is_canvas_valid(cache), // Canvas was recreated (peer join/leave)
+        };
+
+        if needs_init {
+            match Self::create_canvas_cache(canvas_id) {
+                Ok(cache) => {
+                    if cache_option.is_some() {
+                        log::info!(
+                            "Canvas cache reinitialized for '{canvas_id}' (canvas was recreated)"
+                        );
                     } else {
-                        log::debug!("Rendered video frame ({width}x{height})");
+                        log::info!("Canvas cache initialized for '{canvas_id}'");
                     }
-                } else {
-                    log::info!("Canvas element with id '{canvas_id}' not found");
+                    *cache_option = Some(cache);
+                }
+                Err(e) => {
+                    // Canvas not ready yet - this is normal on first few frames
+                    log::debug!("Canvas '{canvas_id}' not ready yet: {e:?}");
+                    video_frame.close();
+                    return;
                 }
             }
         }
+
+        // At this point we have a valid cache
+        let cache = cache_option.as_mut().unwrap();
+        let width = video_frame.display_width();
+        let height = video_frame.display_height();
+
+        // Step 2: Only resize canvas when dimensions actually change
+        // This is a HUGE performance win - set_width/set_height are very expensive!
+        let needs_resize = cache.current_width != width || cache.current_height != height;
+
+        if needs_resize {
+            cache.canvas.set_width(width);
+            cache.canvas.set_height(height);
+            cache.current_width = width;
+            cache.current_height = height;
+            log::debug!("Canvas resized to {width}x{height}");
+            // Note: set_width/set_height automatically clears the canvas, so no need for clear_rect
+        }
+
+        if let Err(e) = cache
+            .ctx
+            .draw_image_with_video_frame(&video_frame, 0.0, 0.0)
+        {
+            log::error!("Error drawing video frame: {e:?}");
+        } else {
+            log::debug!("Rendered video frame ({width}x{height})");
+        }
+
         video_frame.close();
     }
 

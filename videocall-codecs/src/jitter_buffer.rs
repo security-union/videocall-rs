@@ -89,7 +89,8 @@ impl<T> JitterBuffer<T> {
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
-        println!("[JITTER_BUFFER] Inserting frame: {seq}");
+        // Commented out for performance - fires 30-60 times/sec
+        // println!("[JITTER_BUFFER] Inserting frame: {seq}");
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
@@ -106,7 +107,8 @@ impl<T> JitterBuffer<T> {
                     );
                     self.flush();
                 } else {
-                    println!("[JITTER_BUFFER] Ignoring old frame: {seq}");
+                    // Commented out for performance - can fire frequently
+                    // println!("[JITTER_BUFFER] Ignoring old frame: {seq}");
                     self.num_consecutive_old_frames += 1;
                     if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
                         println!(
@@ -130,12 +132,14 @@ impl<T> JitterBuffer<T> {
                 println!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
                 self.drop_all_frames();
             } else {
-                println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
+                // Commented out for performance
+                // println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
                 return; // Reject the frame.
             }
         }
 
-        println!("[JITTER_BUFFER] Received frame: {seq}");
+        // Commented out for performance - fires 30-60 times/sec
+        // println!("[JITTER_BUFFER] Received frame: {seq}");
 
         self.jitter_estimator.update_estimate(seq, arrival_time_ms);
         self.update_target_playout_delay();
@@ -264,8 +268,9 @@ impl<T> JitterBuffer<T> {
 
     /// Pushes a single frame to the shared decodable queue.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
-        let seq = frame.sequence_number();
-        println!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
+        let _seq = frame.sequence_number();
+        // Commented out for performance - fires 30-60 times/sec
+        // println!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
     }
 

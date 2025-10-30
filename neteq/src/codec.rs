@@ -116,7 +116,7 @@ pub struct UnifiedOpusDecoder {
 impl UnifiedOpusDecoder {
     /// Creates a new unified decoder with automatic backend selection
     pub async fn new(sample_rate: u32, channels: u8) -> Result<Self> {
-        let backend = browser_detect::detect_audio_backend();
+        let backend = browser_detect::detect_audio_backend().await;
 
         let decoder = match backend {
             browser_detect::AudioBackend::WebCodecs => {

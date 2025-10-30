@@ -1,5 +1,4 @@
 use crate::audio::shared_audio_context::SharedAudioContext;
-use crate::constants::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use crate::decode::{AudioPeerDecoderTrait, DecodeStatus};
 use js_sys::Float32Array;
 use serde::{Deserialize, Serialize};
@@ -20,10 +19,6 @@ const WORKLET_CODE: &str = include_str!("../scripts/pcmPlayerWorker.js");
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 enum WorkerMsg {
-    Init {
-        sample_rate: u32,
-        channels: u8,
-    },
     Insert {
         seq: u16,
         timestamp: u32,
@@ -447,29 +442,9 @@ impl NetEqAudioPeerDecoder {
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));
         on_message_closure.forget();
 
-        // Initialize worker
-        let init_msg = WorkerMsg::Init {
-            sample_rate: AUDIO_SAMPLE_RATE,
-            channels: AUDIO_CHANNELS as u8,
-        };
-
-        let init_js = serde_wasm_bindgen::to_value(&init_msg)?;
-        let worker_clone = worker.clone();
-        let send_cb = Closure::wrap(Box::new(move || {
-            if let Err(e) = worker_clone.post_message(&init_js) {
-                web_sys::console::error_2(&"[neteq-audio-decoder] failed to post Init:".into(), &e);
-            }
-        }) as Box<dyn FnMut()>);
-
-        web_sys::window()
-            .expect("no window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                send_cb.as_ref().unchecked_ref(),
-                10,
-            )?;
-        send_cb.forget();
-
-        log::info!("NetEq audio decoder initialized for peer {peer_id} (muted: {initial_muted})");
+        log::info!(
+            "NetEq audio decoder initialized for peer {peer_id} (muted: {initial_muted}). Worker auto-initializes on startup."
+        );
 
         // Set the initial mute state explicitly
         decoder.set_muted(initial_muted);

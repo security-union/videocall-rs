@@ -180,10 +180,10 @@ impl WasmDecoder {
         // Manual JS object construction + transferable ArrayBuffer
         // This eliminates the postMessage copy by transferring ownership
         let obj = js_sys::Object::new();
-        
+
         // Set message type
         js_sys::Reflect::set(&obj, &"cmd".into(), &"DecodeFrame".into()).unwrap();
-        
+
         // Set frame metadata (small, fast to serialize)
         // Convert u64 to f64 explicitly to avoid BigInt conversion issues
         js_sys::Reflect::set(
@@ -210,26 +210,29 @@ impl WasmDecoder {
         // KEY OPTIMIZATION: Create transferable ArrayBuffer
         // Step 1: Create ArrayBuffer in JS heap (so it can be transferred)
         let array_buffer = js_sys::ArrayBuffer::new(frame.frame.data.len() as u32);
-        
+
         // Step 2: Create view into the ArrayBuffer
         let uint8_array = js_sys::Uint8Array::new(&array_buffer);
-        
+
         // Step 3: Copy from Bytes to ArrayBuffer (unavoidable WASM→JS boundary copy)
         uint8_array.copy_from(frame.frame.data.as_ref());
-        
+
         // Step 4: Attach to message
         js_sys::Reflect::set(&obj, &"data".into(), &uint8_array).unwrap();
-        
+
         // Step 5: Transfer ArrayBuffer ownership (ZERO-COPY!)
         let transfer_array = js_sys::Array::new();
         transfer_array.push(&array_buffer);
-        
+
         // postMessage with transfer - worker gets ownership, no copy!
         // This eliminates the structured clone copy (33% improvement)
-        if let Err(e) = self.worker.post_message_with_transfer(&obj, &transfer_array) {
+        if let Err(e) = self
+            .worker
+            .post_message_with_transfer(&obj, &transfer_array)
+        {
             log::error!("Error posting message to worker: {e:?}");
         }
-        
+
         // Note: array_buffer is now "detached" on main thread
         // Worker has exclusive ownership of the memory
     }

@@ -18,6 +18,7 @@ categories = ["network-programming", "multimedia"]
 [dependencies]
 aes = "0.8.3"
 anyhow = { workspace = true }
+bytes = "1.5"
 cbc = { version = "0.1.2", features = ["alloc"] }
 futures = "0.3"
 gloo = "0.8.0"

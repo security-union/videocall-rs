@@ -50,6 +50,7 @@ wasm = [
 [dependencies]
 rand = "0.8.5"
 serde = { version = "1.0", features = ["derive"] }
+bytes = "1.5"
 wasm-bindgen = { workspace = true, optional = true }
 console_error_panic_hook = { version = "0.1.7", optional = true }
 serde-wasm-bindgen = { version = "0.6.5", optional = true }

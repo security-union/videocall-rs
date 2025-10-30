@@ -403,7 +403,7 @@ mod tests {
         VideoFrame {
             sequence_number: seq,
             frame_type,
-            data: vec![0; 10],
+            data: bytes::Bytes::from(vec![0; 10]),
             timestamp: 0.0,
         }
     }

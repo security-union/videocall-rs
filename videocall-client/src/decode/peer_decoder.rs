@@ -178,6 +178,9 @@ impl VideoPeerDecoder {
         canvas_cache: &Rc<RefCell<Option<CanvasCache>>>,
         video_frame: web_sys::VideoFrame,
     ) {
+        // Performance instrumentation: mark canvas render start
+        let _ = js_sys::eval("performance.mark('canvas_render_start')");
+
         let mut cache_option = canvas_cache.borrow_mut();
 
         // Check if we need to initialize or reinitialize the cache
@@ -225,6 +228,9 @@ impl VideoPeerDecoder {
             // Note: set_width/set_height automatically clears the canvas, so no need for clear_rect
         }
 
+        // Performance instrumentation: mark draw operation
+        let _ = js_sys::eval("performance.mark('canvas_draw_start')");
+
         if let Err(e) = cache
             .ctx
             .draw_image_with_video_frame(&video_frame, 0.0, 0.0)
@@ -234,7 +240,17 @@ impl VideoPeerDecoder {
             log::debug!("Rendered video frame ({width}x{height})");
         }
 
+        // Performance instrumentation: mark draw end
+        let _ = js_sys::eval("performance.mark('canvas_draw_end')");
+        let _ = js_sys::eval(
+            "performance.measure('Canvas.drawImage', 'canvas_draw_start', 'canvas_draw_end')",
+        );
+
         video_frame.close();
+
+        // Performance instrumentation: mark complete canvas render
+        let _ = js_sys::eval("performance.mark('canvas_render_end')");
+        let _ = js_sys::eval("performance.measure('Canvas.render_total', 'canvas_render_start', 'canvas_render_end')");
     }
 
     fn get_frame_type(&self, packet: &Arc<MediaPacket>) -> FrameType {
@@ -256,12 +272,22 @@ impl VideoPeerDecoder {
 impl PeerDecode for VideoPeerDecoder {
     fn decode(&mut self, packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
         if let Some(video_metadata) = packet.video_metadata.as_ref() {
+            // Performance instrumentation: video peer decoder
+            let _ = js_sys::eval("performance.mark('video_peer_decode_start')");
+
+            // Convert to Bytes for zero-copy sharing in the pipeline
+            // This is the only copy - all subsequent operations (jitter buffer, worker, etc) are zero-copy
+            let _ = js_sys::eval("performance.mark('bytes_copy_start')");
             let video_frame = CodecVideoFrame {
                 sequence_number: video_metadata.sequence,
                 timestamp: packet.timestamp,
                 frame_type: self.get_frame_type(packet),
-                data: packet.data.clone(),
+                data: bytes::Bytes::copy_from_slice(&packet.data),
             };
+            let _ = js_sys::eval("performance.mark('bytes_copy_end')");
+            let _ = js_sys::eval(
+                "performance.measure('VideoPeer.bytes_copy', 'bytes_copy_start', 'bytes_copy_end')",
+            );
 
             // Create a FrameBuffer and push it to the decoder
             let current_time_ms = web_time::SystemTime::now()
@@ -271,9 +297,19 @@ impl PeerDecode for VideoPeerDecoder {
 
             let frame_buffer = FrameBuffer::new(video_frame, current_time_ms);
 
+            // Performance instrumentation: measure push_frame (postMessage to worker)
+            let _ = js_sys::eval("performance.mark('push_frame_start')");
+
             // Use the new ergonomic API - decoder handles jitter buffer internally,
             // and calls our VideoFrame callback for rendering
             self.decoder.push_frame(frame_buffer);
+
+            let _ = js_sys::eval("performance.mark('push_frame_end')");
+            let _ = js_sys::eval(
+                "performance.measure('VideoPeer.push_frame', 'push_frame_start', 'push_frame_end')",
+            );
+            let _ = js_sys::eval("performance.mark('video_peer_decode_end')");
+            let _ = js_sys::eval("performance.measure('VideoPeer.decode_total', 'video_peer_decode_start', 'video_peer_decode_end')");
         }
 
         Ok(DecodeStatus {

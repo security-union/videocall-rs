@@ -203,7 +203,7 @@ fn main() -> Result<()> {
                 } else {
                     FrameType::DeltaFrame
                 },
-                data: frame.data.to_vec(),
+                data: bytes::Bytes::from(frame.data.to_vec()),
                 timestamp: current_time_ms as f64,
             };
             jitter_buffer.insert_frame(video_frame, current_time_ms);
@@ -227,7 +227,7 @@ fn main() -> Result<()> {
             } else {
                 FrameType::DeltaFrame
             },
-            data: frame.data.to_vec(),
+            data: bytes::Bytes::from(frame.data.to_vec()),
             timestamp: current_time_ms as f64,
         };
         jitter_buffer.insert_frame(video_frame, current_time_ms);

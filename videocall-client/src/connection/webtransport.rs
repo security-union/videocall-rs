@@ -194,8 +194,19 @@ fn handle_bidirectional_stream(
 }
 
 fn emit_packet(bytes: Vec<u8>, message_type: MessageType, callback: Callback<PacketWrapper>) {
+    // Performance instrumentation: network packet reception
+    let _ = js_sys::eval("performance.mark('network_packet_start')");
+
     match PacketWrapper::parse_from_bytes(&bytes) {
-        Ok(media_packet) => callback.emit(media_packet),
+        Ok(media_packet) => {
+            let _ = js_sys::eval("performance.mark('network_packet_parsed')");
+            let _ = js_sys::eval("performance.measure('Network.parse_wrapper', 'network_packet_start', 'network_packet_parsed')");
+
+            callback.emit(media_packet);
+
+            let _ = js_sys::eval("performance.mark('network_packet_end')");
+            let _ = js_sys::eval("performance.measure('Network.emit_total', 'network_packet_start', 'network_packet_end')");
+        }
         Err(_) => {
             let message_type = format!("{message_type:?}");
             error!("failed to parse media packet {message_type:?}");

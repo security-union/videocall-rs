@@ -180,11 +180,14 @@ impl Decodable for WebDecoder {
                 videocall_codecs::frame::FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
             };
 
-            let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
+            let data = js_sys::Uint8Array::from(frame.frame.data.as_ref());
             let init = EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
 
             match EncodedVideoChunk::new(&init) {
                 Ok(chunk) => {
+                    // Performance instrumentation: measure WebCodecs decode
+                    let _ = js_sys::eval("performance.mark('webcodecs_decode_start')");
+                    
                     if let Err(e) = decoder.decode(&chunk) {
                         console::error_1(&format!("[WORKER] Decoder error: {e:?}").into());
 
@@ -195,6 +198,10 @@ impl Decodable for WebDecoder {
                         // Completely reset decoder + jitter buffer in a single abstraction.
                         self.reset_pipeline();
                     }
+                    
+                    // Performance instrumentation: end WebCodecs decode measurement
+                    let _ = js_sys::eval("performance.mark('webcodecs_decode_end')");
+                    let _ = js_sys::eval("performance.measure('WebCodecs.decode', 'webcodecs_decode_start', 'webcodecs_decode_end')");
                 }
                 Err(e) => {
                     console::error_1(&format!("[WORKER] Failed to create chunk: {e:?}").into());
@@ -309,17 +316,20 @@ fn parse_decode_frame_message(data: &wasm_bindgen::JsValue) -> Result<FrameBuffe
         _ => return Err("Invalid frame_type".to_string()),
     };
 
-    // Extract data as Uint8Array and convert to Vec<u8>
+    // Extract data as Uint8Array and convert to Bytes (zero-copy on subsequent operations)
     let data_array = js_sys::Reflect::get(data, &"data".into()).map_err(|_| "Missing data")?;
     let uint8_array = js_sys::Uint8Array::from(data_array);
     let mut data_vec = vec![0u8; uint8_array.length() as usize];
     uint8_array.copy_to(&mut data_vec);
-
+    
+    // Convert Vec to Bytes (takes ownership, no copy)
+    let data_bytes = bytes::Bytes::from(data_vec);
+    
     Ok(FrameBuffer {
         frame: VideoFrame {
             sequence_number: seq,
             frame_type,
-            data: data_vec,
+            data: data_bytes,
             timestamp,
         },
         arrival_time_ms,
@@ -348,6 +358,9 @@ fn handle_worker_message(message: WorkerMessage) {
 }
 
 fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
+    // Performance instrumentation: mark the start
+    let _ = js_sys::eval("performance.mark('jb_insert_start')");
+    
     JITTER_BUFFER.with(|jb_cell| {
         let mut jb_opt = jb_cell.borrow_mut();
 
@@ -372,6 +385,10 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
             jb.insert_frame(video_frame, current_time_ms);
         }
     });
+    
+    // Performance instrumentation: mark the end and measure
+    let _ = js_sys::eval("performance.mark('jb_insert_end')");
+    let _ = js_sys::eval("performance.measure('JitterBuffer.insert', 'jb_insert_start', 'jb_insert_end')");
 }
 
 fn start_jitter_buffer_interval() {
@@ -403,6 +420,9 @@ fn start_jitter_buffer_interval() {
 }
 
 fn check_jitter_buffer_for_ready_frames() {
+    // Performance instrumentation: mark jitter buffer poll
+    let _ = js_sys::eval("performance.mark('jb_poll_start')");
+    
     JITTER_BUFFER.with(|jb_cell| {
         let mut jb_opt = jb_cell.borrow_mut();
         if let Some(jb) = jb_opt.as_mut() {
@@ -460,6 +480,10 @@ fn check_jitter_buffer_for_ready_frames() {
             }
         }
     });
+    
+    // Performance instrumentation: end jitter buffer poll
+    let _ = js_sys::eval("performance.mark('jb_poll_end')");
+    let _ = js_sys::eval("performance.measure('JitterBuffer.poll', 'jb_poll_start', 'jb_poll_end')");
 }
 
 fn initialize_jitter_buffer() -> Result<JitterBuffer<DecodedFrame>, String> {

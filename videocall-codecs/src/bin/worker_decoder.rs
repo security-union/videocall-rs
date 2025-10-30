@@ -434,10 +434,10 @@ fn check_jitter_buffer_for_ready_frames() {
             // Publish buffered frames metric periodically under subsystem "video" with stream_id unset.
             // Rate limited to 1 Hz to avoid flooding diagnostics.
             // The client layer will attach original ids later in the pipeline.
-            let buffered = jb.buffered_frames_len() as u64;
-            #[cfg(feature = "wasm")]
+            #[cfg(feature = "diagnostics")]
             {
                 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+                let buffered = jb.buffered_frames_len() as u64;
                 // Only emit when we have context so the server can attribute correctly
                 CONTEXT_FROM.with(|from_cell| {
                     CONTEXT_TO.with(|to_cell| {

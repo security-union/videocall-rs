@@ -27,6 +27,7 @@ use log::debug;
 use protobuf::Message;
 use std::rc::Rc;
 use std::{fmt::Display, sync::Arc};
+#[cfg(feature = "diagnostics")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -292,28 +293,31 @@ impl Peer {
 
                     // Broadcast peer status to diagnostics with original IDs
                     // We don't have local userid here; use reporting peer context via diagnostics elsewhere.
-                    let evt = DiagEvent {
-                        subsystem: "peer_status",
-                        stream_id: None,
-                        ts_ms: now_ms(),
-                        metrics: vec![
-                            // from_peer will be attached by higher layer that knows the local user id
-                            metric!("to_peer", self.email.clone()),
-                            metric!(
-                                "audio_enabled",
-                                if metadata.audio_enabled { 1u64 } else { 0u64 }
-                            ),
-                            metric!(
-                                "video_enabled",
-                                if metadata.video_enabled { 1u64 } else { 0u64 }
-                            ),
-                            metric!(
-                                "screen_enabled",
-                                if metadata.screen_enabled { 1u64 } else { 0u64 }
-                            ),
-                        ],
-                    };
-                    let _ = global_sender().try_broadcast(evt);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let evt = DiagEvent {
+                            subsystem: "peer_status",
+                            stream_id: None,
+                            ts_ms: now_ms(),
+                            metrics: vec![
+                                // from_peer will be attached by higher layer that knows the local user id
+                                metric!("to_peer", self.email.clone()),
+                                metric!(
+                                    "audio_enabled",
+                                    if metadata.audio_enabled { 1u64 } else { 0u64 }
+                                ),
+                                metric!(
+                                    "video_enabled",
+                                    if metadata.video_enabled { 1u64 } else { 0u64 }
+                                ),
+                                metric!(
+                                    "screen_enabled",
+                                    if metadata.screen_enabled { 1u64 } else { 0u64 }
+                                ),
+                            ],
+                        };
+                        let _ = global_sender().try_broadcast(evt);
+                    }
                 }
                 Ok((
                     media_type,

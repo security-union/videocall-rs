@@ -23,7 +23,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "diagnostics"))]
 use wasm_bindgen_futures::spawn_local;
 
 // === Diagnostic data structures ===
@@ -59,6 +59,7 @@ pub enum MetricValue {
 
 use async_broadcast::{broadcast, Receiver, Sender};
 
+#[cfg(feature = "diagnostics")]
 static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
     let (s, r) = broadcast(256); // Capacity of 256 messages.
 
@@ -87,12 +88,24 @@ static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
     s
 });
 
+#[cfg(not(feature = "diagnostics"))]
+static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
+    // Create a dummy channel that will be dropped immediately
+    // The sender will never successfully send
+    let (s, _r) = broadcast(1);
+    s
+});
+
 /// Obtain a sender that can publish diagnostics events.
+/// 
+/// When the "diagnostics" feature is disabled, this returns a sender that will fail to send (low overhead).
 pub fn global_sender() -> Sender<DiagEvent> {
     SENDER.deref().clone()
 }
 
 /// Subscribe to the diagnostics stream. Each subscriber receives **all** future events.
+/// 
+/// When the "diagnostics" feature is disabled, this returns a receiver that will never receive events.
 pub fn subscribe() -> Receiver<DiagEvent> {
     SENDER.deref().new_receiver()
 }
@@ -117,6 +130,9 @@ pub fn now_ms() -> u64 {
 // === metric! helper macro ===
 
 /// Shorthand for constructing a [`Metric`].
+/// 
+/// When the "diagnostics" feature is disabled, this becomes a no-op for zero overhead.
+#[cfg(feature = "diagnostics")]
 #[macro_export]
 macro_rules! metric {
     ($name:expr, $value:expr) => {
@@ -124,6 +140,16 @@ macro_rules! metric {
             name: $name,
             value: $crate::MetricValue::from($value),
         }
+    };
+}
+
+/// No-op version of metric! when diagnostics are disabled
+#[cfg(not(feature = "diagnostics"))]
+#[macro_export]
+macro_rules! metric {
+    ($name:expr, $value:expr) => {
+        // Evaluates to nothing - completely removed by compiler
+        ()
     };
 }
 

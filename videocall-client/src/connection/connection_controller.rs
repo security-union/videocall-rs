@@ -218,10 +218,12 @@ mod tests {
             })
         }
 
+        #[allow(dead_code)]
         fn get_states(&self) -> Vec<ConnectionState> {
             self.states.lock().unwrap().clone()
         }
 
+        #[allow(dead_code)]
         fn last_state(&self) -> Option<ConnectionState> {
             self.states.lock().unwrap().last().cloned()
         }
@@ -229,11 +231,12 @@ mod tests {
 
     // Helper to create test options
     fn create_test_options(state_capture: &StateCapture) -> ConnectionManagerOptions {
+        let (packet_sender, _) = async_broadcast::broadcast::<PacketWrapper>(100);
         ConnectionManagerOptions {
             websocket_urls: vec!["ws://localhost:8080".to_string()],
             webtransport_urls: vec!["https://localhost:8443".to_string()],
             userid: "test_user".to_string(),
-            on_inbound_media: Callback::from(|_| {}),
+            packet_sender,
             on_state_changed: state_capture.callback(),
             peer_monitor: Callback::from(|_| {}),
             election_period_ms: 1000,

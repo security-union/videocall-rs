@@ -34,6 +34,7 @@ use yew::Callback;
 
 use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacket, VideoMetrics};
 
+#[cfg(feature = "diagnostics")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -431,37 +432,40 @@ impl DiagnosticWorker {
         for (peer_id, peer_trackers) in &self.fps_trackers {
             for (media_type, tracker) in peer_trackers {
                 // Always publish to global diagnostics broadcast system (independent of packet handler)
-                let event = DiagEvent {
-                    subsystem: "decoder",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
-                        metric!("fps", tracker.fps),
-                        metric!("bitrate_kbps", tracker.current_bitrate),
-                        metric!("media_type", format!("{:?}", media_type)),
-                        metric!("from_peer", self.userid.clone()),
-                        metric!("to_peer", peer_id.clone()),
-                    ],
-                };
-                debug!(
-                    "Broadcasting decoder event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps",
-                    peer_id, media_type, tracker.fps, tracker.current_bitrate
-                );
-                let _ = global_sender().try_broadcast(event);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let event = DiagEvent {
+                        subsystem: "decoder",
+                        stream_id: None,
+                        ts_ms: now_ms(),
+                        metrics: vec![
+                            metric!("fps", tracker.fps),
+                            metric!("bitrate_kbps", tracker.current_bitrate),
+                            metric!("media_type", format!("{:?}", media_type)),
+                            metric!("from_peer", self.userid.clone()),
+                            metric!("to_peer", peer_id.clone()),
+                        ],
+                    };
+                    debug!(
+                        "Broadcasting decoder event for peer {} ({:?}): FPS={:.2}, Bitrate={:.1}kbps",
+                        peer_id, media_type, tracker.fps, tracker.current_bitrate
+                    );
+                    let _ = global_sender().try_broadcast(event);
 
-                // Also publish a normalized video event that the health reporter uses for UI + server
-                let video_event = DiagEvent {
-                    subsystem: "video",
-                    stream_id: None,
-                    ts_ms: now_ms(),
-                    metrics: vec![
-                        metric!("fps_received", tracker.fps),
-                        metric!("bitrate_kbps", tracker.current_bitrate),
-                        metric!("from_peer", self.userid.clone()),
-                        metric!("to_peer", peer_id.clone()),
-                    ],
-                };
-                let _ = global_sender().try_broadcast(video_event);
+                    // Also publish a normalized video event that the health reporter uses for UI + server
+                    let video_event = DiagEvent {
+                        subsystem: "video",
+                        stream_id: None,
+                        ts_ms: now_ms(),
+                        metrics: vec![
+                            metric!("fps_received", tracker.fps),
+                            metric!("bitrate_kbps", tracker.current_bitrate),
+                            metric!("from_peer", self.userid.clone()),
+                            metric!("to_peer", peer_id.clone()),
+                        ],
+                    };
+                    let _ = global_sender().try_broadcast(video_event);
+                }
 
                 // Only create and send protobuf packets if packet handler is set (legacy system)
                 if let Some(handler) = &self.packet_handler {
@@ -775,21 +779,24 @@ impl SenderDiagnosticWorker {
                 let media_type: MediaType = packet.media_type.enum_value_or_default();
 
                 // Publish to global diagnostics broadcast system
-                let event = DiagEvent {
-                    subsystem: "sender",
-                    stream_id: Some(target_id.clone()),
-                    ts_ms: now_ms(),
-                    metrics: vec![
-                        metric!("sender_id", sender_id.clone()),
-                        metric!("target_id", target_id.clone()),
-                        metric!("media_type", format!("{:?}", media_type)),
-                        metric!("packet_timestamp", packet.timestamp_ms),
-                    ],
-                };
-                debug!(
-                    "Broadcasting sender event for target {target_id}: sender={sender_id}, media_type={media_type:?}"
-                );
-                let _ = global_sender().try_broadcast(event);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let event = DiagEvent {
+                        subsystem: "sender",
+                        stream_id: Some(target_id.clone()),
+                        ts_ms: now_ms(),
+                        metrics: vec![
+                            metric!("sender_id", sender_id.clone()),
+                            metric!("target_id", target_id.clone()),
+                            metric!("media_type", format!("{:?}", media_type)),
+                            metric!("packet_timestamp", packet.timestamp_ms),
+                        ],
+                    };
+                    debug!(
+                        "Broadcasting sender event for target {target_id}: sender={sender_id}, media_type={media_type:?}"
+                    );
+                    let _ = global_sender().try_broadcast(event);
+                }
 
                 if sender_id == self.userid {
                     let peer_stats = self.stream_stats.entry(target_id.clone()).or_default();

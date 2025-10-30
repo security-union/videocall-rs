@@ -27,6 +27,7 @@ use protobuf::Message;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+#[cfg(feature = "diagnostics")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
@@ -587,155 +588,164 @@ impl ConnectionManager {
 
     /// Report RTT metrics to diagnostics system
     fn report_diagnostics(&self) {
-        debug!(
-            "ConnectionManager::report_diagnostics - Active: {:?}, Election State: {:?}",
-            self.active_connection_id.borrow(),
-            self.election_state
-        );
-
-        let mut metrics = Vec::new();
-
-        // Report current election state
-        match &self.election_state {
-            ElectionState::Testing {
-                start_time,
-                duration_ms,
-                ..
-            } => {
-                let elapsed = js_sys::Date::now() - start_time;
-                let progress = (elapsed / *duration_ms as f64).min(1.0) as f32;
-                metrics.push(metric!("election_state", "testing"));
-                metrics.push(metric!("election_progress", progress as f64));
-                metrics.push(metric!("servers_total", self.connections.len() as u64));
-
-                // Send individual server events separately during testing
-                // (Individual server metrics are sent as separate events below)
-            }
-            ElectionState::Elected {
-                connection_id,
-                elected_at,
-            } => {
-                metrics.push(metric!("election_state", "elected"));
-                metrics.push(metric!("active_connection_id", connection_id.as_str()));
-                metrics.push(metric!("elected_at", *elected_at));
-
-                // Report active connection RTT
-                if let Some(measurement) = self.rtt_measurements.get(connection_id) {
-                    if let Some(avg_rtt) = measurement.average_rtt {
-                        metrics.push(metric!("active_server_rtt", avg_rtt));
-                        metrics.push(metric!("active_server_url", measurement.url.as_str()));
-                        metrics.push(metric!(
-                            "active_server_type",
-                            if measurement.is_webtransport {
-                                "webtransport"
-                            } else {
-                                "websocket"
-                            }
-                        ));
-                    }
-                }
-            }
-            ElectionState::Failed { reason, failed_at } => {
-                metrics.push(metric!("election_state", "failed"));
-                metrics.push(metric!("failure_reason", reason.as_str()));
-                metrics.push(metric!("failed_at", *failed_at));
-            }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            // Diagnostics disabled - no-op
+            return;
         }
 
-        // Send overall connection manager state
-        debug!(
-            "ConnectionManager: Prepared {} metrics for main event: {:?}",
-            metrics.len(),
-            metrics
-        );
-        if !metrics.is_empty() {
-            let event = DiagEvent {
-                subsystem: "connection_manager",
-                stream_id: None,
-                ts_ms: now_ms(),
-                metrics,
-            };
-
+        #[cfg(feature = "diagnostics")]
+        {
             debug!(
+                "ConnectionManager::report_diagnostics - Active: {:?}, Election State: {:?}",
+                self.active_connection_id.borrow(),
+                self.election_state
+            );
+
+            let mut metrics = Vec::new();
+
+            // Report current election state
+            match &self.election_state {
+                ElectionState::Testing {
+                    start_time,
+                    duration_ms,
+                    ..
+                } => {
+                    let elapsed = js_sys::Date::now() - start_time;
+                    let progress = (elapsed / *duration_ms as f64).min(1.0) as f32;
+                    metrics.push(metric!("election_state", "testing"));
+                    metrics.push(metric!("election_progress", progress as f64));
+                    metrics.push(metric!("servers_total", self.connections.len() as u64));
+
+                    // Send individual server events separately during testing
+                    // (Individual server metrics are sent as separate events below)
+                }
+                ElectionState::Elected {
+                    connection_id,
+                    elected_at,
+                } => {
+                    metrics.push(metric!("election_state", "elected"));
+                    metrics.push(metric!("active_connection_id", connection_id.as_str()));
+                    metrics.push(metric!("elected_at", *elected_at));
+
+                    // Report active connection RTT
+                    if let Some(measurement) = self.rtt_measurements.get(connection_id) {
+                        if let Some(avg_rtt) = measurement.average_rtt {
+                            metrics.push(metric!("active_server_rtt", avg_rtt));
+                            metrics.push(metric!("active_server_url", measurement.url.as_str()));
+                            metrics.push(metric!(
+                                "active_server_type",
+                                if measurement.is_webtransport {
+                                    "webtransport"
+                                } else {
+                                    "websocket"
+                                }
+                            ));
+                        }
+                    }
+                }
+                ElectionState::Failed { reason, failed_at } => {
+                    metrics.push(metric!("election_state", "failed"));
+                    metrics.push(metric!("failure_reason", reason.as_str()));
+                    metrics.push(metric!("failed_at", *failed_at));
+                }
+            }
+
+            // Send overall connection manager state
+            debug!(
+                "ConnectionManager: Prepared {} metrics for main event: {:?}",
+                metrics.len(),
+                metrics
+            );
+            if !metrics.is_empty() {
+                let event = DiagEvent {
+                    subsystem: "connection_manager",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics,
+                };
+
+                debug!(
                 "ConnectionManager: Sending main connection manager diagnostics event: {event:?}"
             );
-            match global_sender().try_broadcast(event) {
-                Ok(_) => {
-                    debug!("ConnectionManager: Successfully sent main connection manager diagnostics event");
-                }
-                Err(e) => {
-                    error!(
+                match global_sender().try_broadcast(event) {
+                    Ok(_) => {
+                        debug!("ConnectionManager: Successfully sent main connection manager diagnostics event");
+                    }
+                    Err(e) => {
+                        error!(
                         "ConnectionManager: Failed to send main connection manager diagnostics: {e}"
                     );
-                }
-            }
-        } else {
-            warn!("ConnectionManager: No metrics to send for main connection manager event - this might be why UI shows 'unknown'");
-        }
-
-        // Send individual server metrics as separate events
-        for (connection_id, measurement) in &self.rtt_measurements {
-            let connected = self
-                .connections
-                .get(connection_id)
-                .map(|c| c.is_connected())
-                .unwrap_or(false);
-
-            let status = if measurement.active {
-                "active"
-            } else if connected {
-                if measurement.average_rtt.is_some() {
-                    "testing"
-                } else {
-                    "connected"
+                    }
                 }
             } else {
-                "connecting"
-            };
+                warn!("ConnectionManager: No metrics to send for main connection manager event - this might be why UI shows 'unknown'");
+            }
 
-            let server_metrics = vec![
-                metric!("server_url", measurement.url.as_str()),
-                metric!(
-                    "server_type",
-                    if measurement.is_webtransport {
-                        "webtransport"
+            // Send individual server metrics as separate events
+            for (connection_id, measurement) in &self.rtt_measurements {
+                let connected = self
+                    .connections
+                    .get(connection_id)
+                    .map(|c| c.is_connected())
+                    .unwrap_or(false);
+
+                let status = if measurement.active {
+                    "active"
+                } else if connected {
+                    if measurement.average_rtt.is_some() {
+                        "testing"
                     } else {
-                        "websocket"
+                        "connected"
                     }
-                ),
-                metric!("server_status", status),
-                metric!("server_active", measurement.active as u64),
-                metric!("server_connected", connected as u64),
-                metric!("measurement_count", measurement.measurements.len() as u64),
-            ];
+                } else {
+                    "connecting"
+                };
 
-            let mut final_metrics = server_metrics;
-            if let Some(avg_rtt) = measurement.average_rtt {
-                final_metrics.push(metric!("server_rtt", avg_rtt));
-            }
+                let server_metrics = vec![
+                    metric!("server_url", measurement.url.as_str()),
+                    metric!(
+                        "server_type",
+                        if measurement.is_webtransport {
+                            "webtransport"
+                        } else {
+                            "websocket"
+                        }
+                    ),
+                    metric!("server_status", status),
+                    metric!("server_active", measurement.active as u64),
+                    metric!("server_connected", connected as u64),
+                    metric!("measurement_count", measurement.measurements.len() as u64),
+                ];
 
-            let event = DiagEvent {
-                subsystem: "connection_manager",
-                stream_id: Some(measurement.connection_id.clone()),
-                ts_ms: now_ms(),
-                metrics: final_metrics,
-            };
-
-            match global_sender().try_broadcast(event) {
-                Ok(_) => {
-                    debug!(
-                        "ConnectionManager: Successfully sent server diagnostics for {}",
-                        measurement.connection_id
-                    );
+                let mut final_metrics = server_metrics;
+                if let Some(avg_rtt) = measurement.average_rtt {
+                    final_metrics.push(metric!("server_rtt", avg_rtt));
                 }
-                Err(e) => {
-                    error!(
-                        "ConnectionManager: Failed to send server diagnostics for {}: {}",
-                        measurement.connection_id, e
-                    );
+
+                let event = DiagEvent {
+                    subsystem: "connection_manager",
+                    stream_id: Some(measurement.connection_id.clone()),
+                    ts_ms: now_ms(),
+                    metrics: final_metrics,
+                };
+
+                match global_sender().try_broadcast(event) {
+                    Ok(_) => {
+                        debug!(
+                            "ConnectionManager: Successfully sent server diagnostics for {}",
+                            measurement.connection_id
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "ConnectionManager: Failed to send server diagnostics for {}: {}",
+                            measurement.connection_id, e
+                        );
+                    }
                 }
             }
-        }
+        } // end cfg(feature = "diagnostics")
     }
 
     /// Report current state to callback

@@ -21,7 +21,7 @@
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use crate::messages::{VideoStatsMessage, WorkerMessage};
-#[cfg(feature = "wasm")]
+#[cfg(all(feature = "wasm", feature = "diagnostics"))]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -312,7 +312,7 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                 return false;
             }
 
-            #[cfg(feature = "wasm")]
+            #[cfg(all(feature = "wasm", feature = "diagnostics"))]
             {
                 let evt = DiagEvent {
                     subsystem: "video",

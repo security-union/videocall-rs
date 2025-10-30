@@ -68,6 +68,12 @@ struct CanvasCache {
     current_height: u32,
 }
 
+/// Pending VideoFrame to be rendered on next RAF cycle
+struct PendingFrame {
+    frame: Option<web_sys::VideoFrame>,
+    raf_scheduled: bool,
+}
+
 ///
 /// VideoPeerDecoder
 ///
@@ -115,8 +121,55 @@ impl VideoPeerDecoder {
         // Use Option<CanvasCache> for lazy initialization on first frame
         let canvas_cache: Rc<RefCell<Option<CanvasCache>>> = Rc::new(RefCell::new(None));
 
-        let on_video_frame = move |video_frame: web_sys::VideoFrame| {
-            Self::render_to_canvas_cached(&canvas_id, &canvas_cache, video_frame);
+        // Store pending frame and RAF state to batch renders
+        let pending_frame: Rc<RefCell<PendingFrame>> = Rc::new(RefCell::new(PendingFrame {
+            frame: None,
+            raf_scheduled: false,
+        }));
+
+        let on_video_frame = {
+            let pending = pending_frame.clone();
+            let raf_canvas_id = canvas_id.clone();
+            let raf_canvas_cache = canvas_cache.clone();
+
+            move |video_frame: web_sys::VideoFrame| {
+                let mut pending_ref = pending.borrow_mut();
+
+                // Close old frame if exists to prevent memory leak
+                if let Some(old_frame) = pending_ref.frame.take() {
+                    old_frame.close();
+                }
+
+                // Store new frame
+                pending_ref.frame = Some(video_frame);
+
+                // Schedule RAF if not already scheduled - this batches multiple frames
+                if !pending_ref.raf_scheduled {
+                    pending_ref.raf_scheduled = true;
+
+                    let raf_pending = pending.clone();
+                    let canvas_id_clone = raf_canvas_id.clone();
+                    let cache_clone = raf_canvas_cache.clone();
+
+                    let closure = Closure::once(move || {
+                        let mut pending = raf_pending.borrow_mut();
+                        if let Some(frame) = pending.frame.take() {
+                            Self::render_to_canvas_cached(&canvas_id_clone, &cache_clone, frame);
+                        }
+                        pending.raf_scheduled = false;
+                    });
+
+                    if let Some(window) = web_sys::window() {
+                        if let Err(e) =
+                            window.request_animation_frame(closure.as_ref().unchecked_ref())
+                        {
+                            log::error!("Failed to schedule RAF: {e:?}");
+                            pending_ref.raf_scheduled = false;
+                        }
+                    }
+                    closure.forget();
+                }
+            }
         };
 
         let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(

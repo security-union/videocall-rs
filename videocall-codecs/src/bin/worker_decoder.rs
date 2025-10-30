@@ -37,7 +37,7 @@
 
 use std::cell::RefCell;
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
-use videocall_codecs::frame::{FrameBuffer, VideoFrame};
+use videocall_codecs::frame::FrameBuffer;
 use videocall_codecs::jitter_buffer::JitterBuffer;
 use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
 use wasm_bindgen::prelude::*;
@@ -180,11 +180,14 @@ impl Decodable for WebDecoder {
                 videocall_codecs::frame::FrameType::DeltaFrame => EncodedVideoChunkType::Delta,
             };
 
-            let data = js_sys::Uint8Array::from(frame.frame.data.as_slice());
+            let data = js_sys::Uint8Array::from(frame.frame.data.as_ref());
             let init = EncodedVideoChunkInit::new(&data.into(), frame.frame.timestamp, chunk_type);
 
             match EncodedVideoChunk::new(&init) {
                 Ok(chunk) => {
+                    // Performance instrumentation: measure WebCodecs decode
+                    let _ = js_sys::eval("performance.mark('webcodecs_decode_start')");
+
                     if let Err(e) = decoder.decode(&chunk) {
                         console::error_1(&format!("[WORKER] Decoder error: {e:?}").into());
 
@@ -195,6 +198,10 @@ impl Decodable for WebDecoder {
                         // Completely reset decoder + jitter buffer in a single abstraction.
                         self.reset_pipeline();
                     }
+
+                    // Performance instrumentation: end WebCodecs decode measurement
+                    let _ = js_sys::eval("performance.mark('webcodecs_decode_end')");
+                    let _ = js_sys::eval("performance.measure('WebCodecs.decode', 'webcodecs_decode_start', 'webcodecs_decode_end')");
                 }
                 Err(e) => {
                     console::error_1(&format!("[WORKER] Failed to create chunk: {e:?}").into());
@@ -213,7 +220,7 @@ thread_local! {
     static LAST_DIAGNOSTIC_EMIT_MS: RefCell<f64> = const { RefCell::new(0.0) };
 }
 
-const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
+const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 33; // Check every 33ms (~30Hz) to match video framerate - reduces CPU usage
 const DIAGNOSTIC_EMIT_INTERVAL_MS: f64 = 1000.0; // Emit diagnostics at 1 Hz (once per second)
 
 #[wasm_bindgen(start)]
@@ -229,10 +236,40 @@ pub fn main() {
         .unwrap();
 
     let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-        match serde_wasm_bindgen::from_value::<WorkerMessage>(event.data()) {
+        let data = event.data();
+
+        // Try optimized path first (DecodeFrame with manual JS object)
+        if let Ok(cmd) = js_sys::Reflect::get(&data, &"cmd".into()) {
+            if let Some(cmd_str) = cmd.as_string() {
+                if cmd_str == "DecodeFrame" {
+                    // Fast path: manually parse DecodeFrame to avoid serde overhead
+                    match parse_decode_frame_message(&data) {
+                        Ok(frame) => {
+                            insert_frame_to_jitter_buffer(frame);
+                        }
+                        Err(e) => {
+                            console::error_1(
+                                &format!("[WORKER] Failed to parse optimized DecodeFrame: {e}")
+                                    .into(),
+                            );
+                        }
+                    }
+                    return; // Don't fall through to serde
+                }
+                // Other cmd types could be handled here if needed
+                console::error_1(&format!("[WORKER] Unknown cmd type: {cmd_str}").into());
+                return;
+            }
+        }
+
+        // Fallback: try serde for control messages (Flush, Reset, SetContext)
+        // Only reaches here if message doesn't have a "cmd" field
+        match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
             Ok(message) => handle_worker_message(message),
             Err(e) => {
-                console::error_1(&format!("[WORKER] Failed to deserialize message: {e:?}").into());
+                console::error_1(
+                    &format!("[WORKER] Failed to deserialize control message: {e:?}").into(),
+                );
             }
         }
     }) as Box<dyn FnMut(_)>);
@@ -242,6 +279,61 @@ pub fn main() {
 
     // Start the jitter buffer check interval
     start_jitter_buffer_interval();
+}
+
+/// Fast path: manually parse DecodeFrame message to avoid serde serialization overhead
+/// This is called 30-60 times per second, so performance is critical
+fn parse_decode_frame_message(data: &wasm_bindgen::JsValue) -> Result<FrameBuffer, String> {
+    use videocall_codecs::frame::{FrameType, VideoFrame};
+
+    // Extract sequence number
+    let seq = js_sys::Reflect::get(data, &"seq".into())
+        .map_err(|_| "Missing seq")?
+        .as_f64()
+        .ok_or("seq not a number")? as u64;
+
+    // Extract timestamp
+    let timestamp = js_sys::Reflect::get(data, &"timestamp".into())
+        .map_err(|_| "Missing timestamp")?
+        .as_f64()
+        .ok_or("timestamp not a number")?;
+
+    // Extract arrival_time_ms
+    let arrival_time_ms = js_sys::Reflect::get(data, &"arrival_time_ms".into())
+        .map_err(|_| "Missing arrival_time_ms")?
+        .as_f64()
+        .ok_or("arrival_time_ms not a number")? as u128;
+
+    // Extract frame type
+    let frame_type_str = js_sys::Reflect::get(data, &"frame_type".into())
+        .map_err(|_| "Missing frame_type")?
+        .as_string()
+        .ok_or("frame_type not a string")?;
+
+    let frame_type = match frame_type_str.as_str() {
+        "key" => FrameType::KeyFrame,
+        "delta" => FrameType::DeltaFrame,
+        _ => return Err("Invalid frame_type".to_string()),
+    };
+
+    // Extract data as Uint8Array and convert to Bytes (zero-copy on subsequent operations)
+    let data_array = js_sys::Reflect::get(data, &"data".into()).map_err(|_| "Missing data")?;
+    let uint8_array = js_sys::Uint8Array::from(data_array);
+    let mut data_vec = vec![0u8; uint8_array.length() as usize];
+    uint8_array.copy_to(&mut data_vec);
+
+    // Convert Vec to Bytes (takes ownership, no copy)
+    let data_bytes = bytes::Bytes::from(data_vec);
+
+    Ok(FrameBuffer {
+        frame: VideoFrame {
+            sequence_number: seq,
+            frame_type,
+            data: data_bytes,
+            timestamp,
+        },
+        arrival_time_ms,
+    })
 }
 
 fn handle_worker_message(message: WorkerMessage) {
@@ -266,6 +358,9 @@ fn handle_worker_message(message: WorkerMessage) {
 }
 
 fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
+    // Performance instrumentation: mark the start
+    let _ = js_sys::eval("performance.mark('jb_insert_start')");
+
     JITTER_BUFFER.with(|jb_cell| {
         let mut jb_opt = jb_cell.borrow_mut();
 
@@ -282,19 +377,20 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
         }
 
         if let Some(jb) = jb_opt.as_mut() {
-            // Convert FrameBuffer to VideoFrame
-            let video_frame = VideoFrame {
-                sequence_number: frame.sequence_number(),
-                frame_type: frame.frame.frame_type,
-                data: frame.frame.data.clone(),
-                timestamp: frame.frame.timestamp,
-            };
+            // Move the VideoFrame from FrameBuffer instead of cloning (avoid expensive data copy)
+            let video_frame = frame.frame;
 
             // Get current time in milliseconds
             let current_time_ms = js_sys::Date::now() as u128;
             jb.insert_frame(video_frame, current_time_ms);
         }
     });
+
+    // Performance instrumentation: mark the end and measure
+    let _ = js_sys::eval("performance.mark('jb_insert_end')");
+    let _ = js_sys::eval(
+        "performance.measure('JitterBuffer.insert', 'jb_insert_start', 'jb_insert_end')",
+    );
 }
 
 fn start_jitter_buffer_interval() {
@@ -326,6 +422,9 @@ fn start_jitter_buffer_interval() {
 }
 
 fn check_jitter_buffer_for_ready_frames() {
+    // Performance instrumentation: mark jitter buffer poll
+    let _ = js_sys::eval("performance.mark('jb_poll_start')");
+
     JITTER_BUFFER.with(|jb_cell| {
         let mut jb_opt = jb_cell.borrow_mut();
         if let Some(jb) = jb_opt.as_mut() {
@@ -335,10 +434,10 @@ fn check_jitter_buffer_for_ready_frames() {
             // Publish buffered frames metric periodically under subsystem "video" with stream_id unset.
             // Rate limited to 1 Hz to avoid flooding diagnostics.
             // The client layer will attach original ids later in the pipeline.
-            let buffered = jb.buffered_frames_len() as u64;
-            #[cfg(feature = "wasm")]
+            #[cfg(feature = "diagnostics")]
             {
                 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+                let buffered = jb.buffered_frames_len() as u64;
                 // Only emit when we have context so the server can attribute correctly
                 CONTEXT_FROM.with(|from_cell| {
                     CONTEXT_TO.with(|to_cell| {
@@ -383,6 +482,11 @@ fn check_jitter_buffer_for_ready_frames() {
             }
         }
     });
+
+    // Performance instrumentation: end jitter buffer poll
+    let _ = js_sys::eval("performance.mark('jb_poll_end')");
+    let _ =
+        js_sys::eval("performance.measure('JitterBuffer.poll', 'jb_poll_start', 'jb_poll_end')");
 }
 
 fn initialize_jitter_buffer() -> Result<JitterBuffer<DecodedFrame>, String> {

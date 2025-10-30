@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(feature = "diagnostics")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
@@ -217,36 +218,43 @@ impl NetEqAudioPeerDecoder {
     }
 
     /// Emit raw stats JSON for debugging
-    fn emit_stats_diagnostics(json_str: &str, peer_id: &str) {
-        // peer_id here is the target peer (whose audio we're decoding)
-        // We need to get the current user's ID for the reporting peer
-        // For now, we'll use a placeholder and enhance this later
-        let current_user = "current_user"; // TODO: Get from VideoCallClient
+    fn emit_stats_diagnostics(_json_str: &str, _peer_id: &str) {
+        #[cfg(feature = "diagnostics")]
+        {
+            // peer_id here is the target peer (whose audio we're decoding)
+            // We need to get the current user's ID for the reporting peer
+            // For now, we'll use a placeholder and enhance this later
+            let current_user = "current_user"; // TODO: Get from VideoCallClient
 
-        let _ = global_sender().try_broadcast(DiagEvent {
-            subsystem: "neteq",
-            stream_id: Some(format!("{current_user}->{peer_id}")), // reporting_peer->target_peer
-            ts_ms: now_ms(),
-            metrics: vec![
-                metric!("stats_json", json_str.to_string()),
-                metric!("reporting_peer", current_user),
-                metric!("target_peer", peer_id.to_string()),
-            ],
-        });
+            let _ = global_sender().try_broadcast(DiagEvent {
+                subsystem: "neteq",
+                stream_id: Some(format!("{current_user}->{_peer_id}")), // reporting_peer->target_peer
+                ts_ms: now_ms(),
+                metrics: vec![
+                    metric!("stats_json", _json_str.to_string()),
+                    metric!("reporting_peer", current_user),
+                    metric!("target_peer", _peer_id.to_string()),
+                ],
+            });
+        }
     }
 
     /// Parse and emit specific metrics
-    fn emit_parsed_metrics(json_str: &str, peer_id: &str) {
-        let parsed: Value = match serde_json::from_str(json_str) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
+    fn emit_parsed_metrics(_json_str: &str, _peer_id: &str) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let parsed: Value = match serde_json::from_str(_json_str) {
+                Ok(p) => p,
+                Err(_) => return,
+            };
 
-        Self::emit_jitter_metrics(&parsed, peer_id);
-        Self::emit_buffer_metrics(&parsed, peer_id);
+            Self::emit_jitter_metrics(&parsed, _peer_id);
+            Self::emit_buffer_metrics(&parsed, _peer_id);
+        }
     }
 
     /// Emit jitter buffer metrics
+    #[cfg(feature = "diagnostics")]
     fn emit_jitter_metrics(parsed: &Value, peer_id: &str) {
         let lifetime = match parsed.get("lifetime") {
             Some(l) => l,
@@ -287,6 +295,7 @@ impl NetEqAudioPeerDecoder {
     }
 
     /// Emit buffer size metrics
+    #[cfg(feature = "diagnostics")]
     fn emit_buffer_metrics(parsed: &Value, peer_id: &str) {
         let network = match parsed.get("network") {
             Some(n) => n,

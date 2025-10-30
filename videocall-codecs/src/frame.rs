@@ -18,6 +18,7 @@
 
 //! Contains the fundamental data structures for video frames.
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 /// The type of a video frame, indicating its dependency on other frames.
@@ -30,17 +31,39 @@ pub enum FrameType {
 }
 
 /// Represents a raw, encoded video frame as it arrives from the network.
-/// In our simulation, this is the unit that comes from a QUIC stream.
+/// Uses `Bytes` for zero-copy sharing of frame data across threads/tasks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoFrame {
     /// The sequence number of the frame. Must be contiguous.
     pub sequence_number: u64,
     /// The type of the frame (KeyFrame or DeltaFrame).
     pub frame_type: FrameType,
-    /// The encoded video data.
-    pub data: Vec<u8>,
+    /// The encoded video data (reference-counted, zero-copy on clone).
+    #[serde(with = "bytes_serde")]
+    pub data: Bytes,
     /// The timestamp of the frame.
     pub timestamp: f64,
+}
+
+// Custom serde for Bytes
+mod bytes_serde {
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(bytes: &Bytes, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        bytes.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Bytes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec = Vec::<u8>::deserialize(deserializer)?;
+        Ok(Bytes::from(vec))
+    }
 }
 
 /// A wrapper for a `VideoFrame` that includes metadata used by the jitter buffer.

@@ -229,10 +229,40 @@ pub fn main() {
         .unwrap();
 
     let on_message = Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
-        match serde_wasm_bindgen::from_value::<WorkerMessage>(event.data()) {
+        let data = event.data();
+
+        // Try optimized path first (DecodeFrame with manual JS object)
+        if let Ok(cmd) = js_sys::Reflect::get(&data, &"cmd".into()) {
+            if let Some(cmd_str) = cmd.as_string() {
+                if cmd_str == "DecodeFrame" {
+                    // Fast path: manually parse DecodeFrame to avoid serde overhead
+                    match parse_decode_frame_message(&data) {
+                        Ok(frame) => {
+                            insert_frame_to_jitter_buffer(frame);
+                        }
+                        Err(e) => {
+                            console::error_1(
+                                &format!("[WORKER] Failed to parse optimized DecodeFrame: {e}")
+                                    .into(),
+                            );
+                        }
+                    }
+                    return; // Don't fall through to serde
+                }
+                // Other cmd types could be handled here if needed
+                console::error_1(&format!("[WORKER] Unknown cmd type: {cmd_str}").into());
+                return;
+            }
+        }
+
+        // Fallback: try serde for control messages (Flush, Reset, SetContext)
+        // Only reaches here if message doesn't have a "cmd" field
+        match serde_wasm_bindgen::from_value::<WorkerMessage>(data) {
             Ok(message) => handle_worker_message(message),
             Err(e) => {
-                console::error_1(&format!("[WORKER] Failed to deserialize message: {e:?}").into());
+                console::error_1(
+                    &format!("[WORKER] Failed to deserialize control message: {e:?}").into(),
+                );
             }
         }
     }) as Box<dyn FnMut(_)>);
@@ -242,6 +272,58 @@ pub fn main() {
 
     // Start the jitter buffer check interval
     start_jitter_buffer_interval();
+}
+
+/// Fast path: manually parse DecodeFrame message to avoid serde serialization overhead
+/// This is called 30-60 times per second, so performance is critical
+fn parse_decode_frame_message(data: &wasm_bindgen::JsValue) -> Result<FrameBuffer, String> {
+    use videocall_codecs::frame::{FrameType, VideoFrame};
+
+    // Extract sequence number
+    let seq = js_sys::Reflect::get(data, &"seq".into())
+        .map_err(|_| "Missing seq")?
+        .as_f64()
+        .ok_or("seq not a number")? as u64;
+
+    // Extract timestamp
+    let timestamp = js_sys::Reflect::get(data, &"timestamp".into())
+        .map_err(|_| "Missing timestamp")?
+        .as_f64()
+        .ok_or("timestamp not a number")?;
+
+    // Extract arrival_time_ms
+    let arrival_time_ms = js_sys::Reflect::get(data, &"arrival_time_ms".into())
+        .map_err(|_| "Missing arrival_time_ms")?
+        .as_f64()
+        .ok_or("arrival_time_ms not a number")? as u128;
+
+    // Extract frame type
+    let frame_type_str = js_sys::Reflect::get(data, &"frame_type".into())
+        .map_err(|_| "Missing frame_type")?
+        .as_string()
+        .ok_or("frame_type not a string")?;
+
+    let frame_type = match frame_type_str.as_str() {
+        "key" => FrameType::KeyFrame,
+        "delta" => FrameType::DeltaFrame,
+        _ => return Err("Invalid frame_type".to_string()),
+    };
+
+    // Extract data as Uint8Array and convert to Vec<u8>
+    let data_array = js_sys::Reflect::get(data, &"data".into()).map_err(|_| "Missing data")?;
+    let uint8_array = js_sys::Uint8Array::from(data_array);
+    let mut data_vec = vec![0u8; uint8_array.length() as usize];
+    uint8_array.copy_to(&mut data_vec);
+
+    Ok(FrameBuffer {
+        frame: VideoFrame {
+            sequence_number: seq,
+            frame_type,
+            data: data_vec,
+            timestamp,
+        },
+        arrival_time_ms,
+    })
 }
 
 fn handle_worker_message(message: WorkerMessage) {

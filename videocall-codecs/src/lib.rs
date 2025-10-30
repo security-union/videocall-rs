@@ -34,7 +34,11 @@ pub mod video_diagnostics {
 
     /// Publish video stats to the global diagnostics stream. `stream_id` should be
     /// in the format "from_peer->to_peer" to align with health reporting expectations.
-    pub fn report_video_stats(_stream_id: String, _fps: Option<f64>, _frames_buffered: Option<u64>) {
+    pub fn report_video_stats(
+        _stream_id: String,
+        _fps: Option<f64>,
+        _frames_buffered: Option<u64>,
+    ) {
         #[cfg(feature = "diagnostics")]
         {
             let mut metrics = Vec::new();

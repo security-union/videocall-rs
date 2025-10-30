@@ -97,14 +97,14 @@ static SENDER: Lazy<Sender<DiagEvent>> = Lazy::new(|| {
 });
 
 /// Obtain a sender that can publish diagnostics events.
-/// 
+///
 /// When the "diagnostics" feature is disabled, this returns a sender that will fail to send (low overhead).
 pub fn global_sender() -> Sender<DiagEvent> {
     SENDER.deref().clone()
 }
 
 /// Subscribe to the diagnostics stream. Each subscriber receives **all** future events.
-/// 
+///
 /// When the "diagnostics" feature is disabled, this returns a receiver that will never receive events.
 pub fn subscribe() -> Receiver<DiagEvent> {
     SENDER.deref().new_receiver()
@@ -130,7 +130,7 @@ pub fn now_ms() -> u64 {
 // === metric! helper macro ===
 
 /// Shorthand for constructing a [`Metric`].
-/// 
+///
 /// When the "diagnostics" feature is disabled, this becomes a no-op for zero overhead.
 #[cfg(feature = "diagnostics")]
 #[macro_export]

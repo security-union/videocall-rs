@@ -360,10 +360,21 @@ mod stub_impl {
         }
 
         fn decode(&mut self, _encoded: &[u8]) -> Result<Vec<f32>> {
-            // Return silence for 20ms frame
+            // Return a test tone (440 Hz sine wave) for 20ms frame
+            // This ensures VAD activity detection works in tests
             let samples_per_channel = (self.sample_rate as f32 * 0.02) as usize;
             let total_samples = samples_per_channel * self.channels as usize;
-            Ok(vec![0.0; total_samples])
+            let mut samples = Vec::with_capacity(total_samples);
+
+            for i in 0..samples_per_channel {
+                let t = i as f32 / self.sample_rate as f32;
+                let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.1;
+                for _ in 0..self.channels {
+                    samples.push(sample);
+                }
+            }
+
+            Ok(samples)
         }
     }
 

@@ -569,14 +569,6 @@ impl NetEq {
             return Ok(Operation::Normal);
         }
 
-        if simple_random() < 0.001 {
-            if self.delay_manager.get_base_minimum_delay() == 30 {
-                self.delay_manager.set_base_minimum_delay(330);
-            } else {
-                self.delay_manager.set_base_minimum_delay(30);
-            }
-        }
-
         // Normal operation
         self.consecutive_expands = 0;
         Ok(Operation::Normal)

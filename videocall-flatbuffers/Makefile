@@ -1,11 +1,23 @@
 SHELL := /bin/bash
+UID := $(shell id -u)
+USER := $(shell id -un)
+
+ifeq ($(UID), 0)
+$(error Do not run as root)
+endif
 
 # Directories
 SCHEMA_DIR := schemas
 OUTPUT_DIR := src/generated
+SRC_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+IMAGE := videocall-flatbuffers-build-env
+DOCKER_NETWORK ?= bridge
+DOCKER_RUN_CMD := docker run -it -v $(SRC_DIR):$(SRC_DIR) -w $(SRC_DIR) -u $(USER):$(USER) --network $(DOCKER_NETWORK) $(IMAGE)
 
 # Find all .fbs files
 SCHEMAS := $(wildcard $(SCHEMA_DIR)/*.fbs)
+
+export DOCKER_BUILDKIT = 1
 
 .PHONY: all
 all: generate
@@ -49,3 +61,16 @@ clean:
 
 .PHONY: rebuild
 rebuild: clean generate
+
+.PHONY: build-env
+build-env:
+	docker build -t $(IMAGE) --build-arg USER=$(USER) --build-arg UID=$(UID) -f Dockerfile .
+
+.PHONY: build-env-generate
+build-env-generate:
+	$(DOCKER_RUN_CMD) make generate
+
+.PHONY: docker-build
+docker-build:
+	make build-env
+	make build-env-generate

@@ -191,3 +191,21 @@ impl MediaPacketBuilder {
 pub fn deserialize_media_packet(bytes: &[u8]) -> Result<MediaPacket, String> {
     flatbuffers::root::<MediaPacket>(bytes).map_err(|e| format!("Failed to parse MediaPacket: {}", e))
 }
+
+/// Helper to create and serialize a heartbeat MediaPacket
+pub fn serialize_heartbeat_packet(
+    email: &str,
+    video_enabled: bool,
+    audio_enabled: bool,
+    screen_enabled: bool,
+) -> Vec<u8> {
+    let builder = MediaPacketBuilder::new(MediaType::HEARTBEAT)
+        .email(email.to_string())
+        .timestamp(js_sys::Date::now())
+        .heartbeat_metadata(HeartbeatMetadataBuilder {
+            video_enabled,
+            audio_enabled,
+            screen_enabled,
+        });
+    builder.build()
+}

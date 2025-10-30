@@ -22,7 +22,7 @@
 // Handles rollover of connection from WebTransport to WebSocket
 //
 use log::{debug, error};
-use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_flatbuffers::PacketWrapper;
 use yew_websocket::websocket::WebSocketTask;
 use yew_webtransport::webtransport::WebTransportTask;
 
@@ -52,6 +52,13 @@ impl Task {
         match self {
             Task::WebSocket(ws) => ws.send_packet(packet),
             Task::WebTransport(wt) => wt.send_packet(packet),
+        }
+    }
+
+    pub fn send_raw_bytes(&self, bytes: Vec<u8>) {
+        match self {
+            Task::WebSocket(ws) => ws.send_raw_bytes(bytes),
+            Task::WebTransport(wt) => wt.send_raw_bytes(bytes),
         }
     }
 }

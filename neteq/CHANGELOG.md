@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/security-union/videocall-rs/compare/neteq-v0.6.2...neteq-v0.7.0) - 2025-10-30
+
+### Other
+
+- NetEQ Overhaul: WebCodecs Support, Critical Bug Fixes, and CI Improvements ([#466](https://github.com/security-union/videocall-rs/pull/466))
+
 ## [0.6.2](https://github.com/security-union/videocall-rs/compare/neteq-v0.6.1...neteq-v0.6.2) - 2025-10-13
 
 ### Other

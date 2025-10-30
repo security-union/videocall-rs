@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-bindings-macos-v0.2.3...videocall-nokhwa-bindings-macos-v0.2.4) - 2025-10-30
+
+### Other
+
+- release ([#431](https://github.com/security-union/videocall-rs/pull/431))
+- Add new decoder and Add MIT - Apache 2 license to all files ([#285](https://github.com/security-union/videocall-rs/pull/285))
+- Bump all crates to 1.0.0 ([#222](https://github.com/security-union/videocall-rs/pull/222))
+- Rename to videocall cli ([#185](https://github.com/security-union/videocall-rs/pull/185))
+
 ## [0.2.3](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-bindings-macos-v0.2.2...videocall-nokhwa-bindings-macos-v0.2.3) - 2025-10-13
 
 ### Other

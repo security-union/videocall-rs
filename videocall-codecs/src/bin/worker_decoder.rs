@@ -210,9 +210,11 @@ thread_local! {
     static INTERVAL_ID: RefCell<Option<i32>> = const { RefCell::new(None) };
     static CONTEXT_FROM: RefCell<Option<String>> = const { RefCell::new(None) };
     static CONTEXT_TO: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LAST_DIAGNOSTIC_EMIT_MS: RefCell<f64> = const { RefCell::new(0.0) };
 }
 
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
+const DIAGNOSTIC_EMIT_INTERVAL_MS: f64 = 1000.0; // Emit diagnostics at 1 Hz (once per second)
 
 #[wasm_bindgen(start)]
 pub fn main() {
@@ -331,6 +333,7 @@ fn check_jitter_buffer_for_ready_frames() {
             jb.find_and_move_continuous_frames(current_time_ms);
 
             // Publish buffered frames metric periodically under subsystem "video" with stream_id unset.
+            // Rate limited to 1 Hz to avoid flooding diagnostics.
             // The client layer will attach original ids later in the pipeline.
             let buffered = jb.buffered_frames_len() as u64;
             #[cfg(feature = "wasm")]
@@ -339,35 +342,42 @@ fn check_jitter_buffer_for_ready_frames() {
                 // Only emit when we have context so the server can attribute correctly
                 CONTEXT_FROM.with(|from_cell| {
                     CONTEXT_TO.with(|to_cell| {
-                        if let (Some(from_peer), Some(to_peer)) = (
-                            from_cell.borrow().clone(),
-                            to_cell.borrow().clone(),
-                        ) {
-                            console::log_1(&format!("[WORKER] Emitting video diagnostic: from={from_peer}, to={to_peer}, frames_buffered={buffered}").into());
-                            let evt = DiagEvent {
-                                subsystem: "video",
-                                stream_id: None,
-                                ts_ms: now_ms(),
-                                metrics: vec![
-                                    metric!("from_peer", from_peer),
-                                    metric!("to_peer", to_peer),
-                                    metric!("frames_buffered", buffered),
-                                ],
-                            };
-                            let _ = global_sender().try_broadcast(evt);
+                        LAST_DIAGNOSTIC_EMIT_MS.with(|last_emit_cell| {
+                            if let (Some(from_peer), Some(to_peer)) =
+                                (from_cell.borrow().clone(), to_cell.borrow().clone())
+                            {
+                                let now = js_sys::Date::now();
+                                let last_emit = *last_emit_cell.borrow();
 
-                            // Also post a lightweight message to the main thread so it can forward to its bus
-                            if let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() {
-                                let msg = VideoStatsMessage::new(
-                                    from_cell.borrow().clone().unwrap(),
-                                    to_cell.borrow().clone().unwrap(),
-                                    buffered,
-                                );
-                                if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
-                                    let _ = scope.post_message(&val);
+                                // Only emit if at least DIAGNOSTIC_EMIT_INTERVAL_MS has passed
+                                if now - last_emit >= DIAGNOSTIC_EMIT_INTERVAL_MS {
+                                    *last_emit_cell.borrow_mut() = now;
+
+                                    let evt = DiagEvent {
+                                        subsystem: "video",
+                                        stream_id: None,
+                                        ts_ms: now_ms(),
+                                        metrics: vec![
+                                            metric!("from_peer", from_peer.clone()),
+                                            metric!("to_peer", to_peer.clone()),
+                                            metric!("frames_buffered", buffered),
+                                        ],
+                                    };
+                                    let _ = global_sender().try_broadcast(evt);
+
+                                    // Also post a lightweight message to the main thread so it can forward to its bus
+                                    if let Ok(scope) =
+                                        js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>()
+                                    {
+                                        let msg =
+                                            VideoStatsMessage::new(from_peer, to_peer, buffered);
+                                        if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
+                                            let _ = scope.post_message(&val);
+                                        }
+                                    }
                                 }
                             }
-                        }
+                        })
                     })
                 });
             }

@@ -541,7 +541,7 @@ mod tests {
 
         tokio::spawn(async move {
             if let Err(e) = webtransport::start(opt).await {
-                eprintln!("WebTransport server error: {}", e);
+                eprintln!("WebTransport server error: {e}");
             }
         })
     }
@@ -656,7 +656,7 @@ mod tests {
 
         match test_result {
             Ok(Ok(())) => println!("Test completed successfully"),
-            Ok(Err(e)) => panic!("Test failed: {}", e),
+            Ok(Err(e)) => panic!("Test failed: {e}"),
             Err(_) => panic!("Test timed out after 15 seconds"),
         }
     }
@@ -674,13 +674,13 @@ mod tests {
         let user_a = "user-a";
         let user_b = "user-b";
 
-        println!("Connecting client A: {}", user_a);
+        println!("Connecting client A: {user_a}");
         let session_a = connect_client(user_a, meeting)
             .await
             .expect("connect client A");
         println!("Client A connected!");
 
-        println!("Connecting client B: {}", user_b);
+        println!("Connecting client B: {user_b}");
         let session_b = connect_client(user_b, meeting)
             .await
             .expect("connect client B");
@@ -731,16 +731,13 @@ mod tests {
         println!("Waiting for packet on B...");
         // Receive on B
         let condition = || async {
-            match session_b.accept_uni().await {
-                Ok(mut stream) => {
-                    if let Ok(buf) = stream.read_to_end(usize::MAX).await {
-                        if !buf.is_empty() {
-                            println!("Received packet on B (size: {} bytes)", buf.len());
-                            return Some(buf);
-                        }
+            if let Ok(mut stream) = session_b.accept_uni().await {
+                if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                    if !buf.is_empty() {
+                        println!("Received packet on B (size: {} bytes)", buf.len());
+                        return Some(buf);
                     }
                 }
-                Err(_) => {}
             }
             None
         };
@@ -772,7 +769,7 @@ mod tests {
 
         match test_result {
             Ok(Ok(())) => println!("Test completed successfully"),
-            Ok(Err(e)) => panic!("Test failed: {}", e),
+            Ok(Err(e)) => panic!("Test failed: {e}"),
             Err(_) => panic!("Test timed out after 15 seconds"),
         }
     }
@@ -823,16 +820,13 @@ mod tests {
         let [count_a, count_b, count_c] = get_all_user_counts(&[user_a, user_b, user_c])[..] else {
             panic!("Expected exactly 3 user counts");
         };
-        println!(
-            "Initial counts: A={}, B={}, C={}",
-            count_a, count_b, count_c
-        );
+        println!("Initial counts: A={count_a}, B={count_b}, C={count_c}");
 
         // Alice sends 3 packets to her lobby (should only reach Charlie, not Bob)
         for i in 1..=3 {
-            let packet = create_test_packet(user_a, VcMediaType::AUDIO, format!("alice-msg-{}", i));
+            let packet = create_test_packet(user_a, VcMediaType::AUDIO, format!("alice-msg-{i}"));
             send_packet(&session_a, packet).await;
-            println!("✓ Alice sent packet #{}", i);
+            println!("✓ Alice sent packet #{i}");
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -843,8 +837,7 @@ mod tests {
             panic!("Expected exactly 3 user counts");
         };
         println!(
-            "After Alice's packets: A={}, B={}, C={}",
-            alice_count_after, bob_count_after, charlie_count_after
+            "After Alice's packets: A={alice_count_after}, B={bob_count_after}, C={charlie_count_after}"
         );
 
         // Bob should have received ZERO packets (different lobby)
@@ -881,9 +874,9 @@ mod tests {
         // Charlie responds to Alice with 2 packets
         for i in 1..=2 {
             let packet =
-                create_test_packet(user_c, VcMediaType::VIDEO, format!("charlie-reply-{}", i));
+                create_test_packet(user_c, VcMediaType::VIDEO, format!("charlie-reply-{i}"));
             send_packet(&session_c, packet).await;
-            println!("✓ Charlie sent reply #{}", i);
+            println!("✓ Charlie sent reply #{i}");
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -894,8 +887,7 @@ mod tests {
             panic!("Expected exactly 3 user counts");
         };
         println!(
-            "After Charlie's replies: A={}, B={}, C={}",
-            alice_after_bidi, bob_after_bidi, charlie_after_bidi
+            "After Charlie's replies: A={alice_after_bidi}, B={bob_after_bidi}, C={charlie_after_bidi}"
         );
 
         // Alice should receive Charlie's replies
@@ -941,8 +933,7 @@ mod tests {
             panic!("Expected exactly 3 user counts");
         };
         println!(
-            "After Bob's packet: A={}, B={}, C={}",
-            alice_after_bob, bob_after_bob, charlie_after_bob
+            "After Bob's packet: A={alice_after_bob}, B={bob_after_bob}, C={charlie_after_bob}"
         );
 
         // Alice and Charlie should not receive Bob's packet
@@ -972,9 +963,9 @@ mod tests {
             panic!("Expected exactly 3 user counts");
         };
         println!("Final packet counts:");
-        println!("  • Alice (lobby-secure): {}", alice_final);
-        println!("  • Bob   (lobby-public):  {}", bob_final);
-        println!("  • Charlie (lobby-secure): {}", charlie_final);
+        println!("  • Alice (lobby-secure): {alice_final}");
+        println!("  • Bob   (lobby-public):  {bob_final}");
+        println!("  • Charlie (lobby-secure): {charlie_final}");
         println!("✅ All lobby isolation requirements verified!");
         println!("✅ Self-echo prevention verified for all users!");
 

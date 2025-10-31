@@ -1,6 +1,6 @@
 [package]
 name = "videocall-nokhwa-bindings-macos"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["l1npengtul", "Dario Lencina <dario@securityunion.dev>"]
 license = "Apache-2.0"

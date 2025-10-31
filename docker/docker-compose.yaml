@@ -17,7 +17,8 @@ services:
       - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
       - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
       - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
-      - ENABLE_OAUTH=false
+      - ENABLE_OAUTH=${ENABLE_OAUTH:-false}
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8080}
       - LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
       - RUST_BACKTRACE=1
@@ -76,11 +77,12 @@ services:
     environment:
       - ACTIX_PORT=${ACTIX_PORT:-8080}
       - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:80}
-      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}
-      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL}
-      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL}
-      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}
-      - OAUTH_REDIRECT_URL=http://localhost:${ACTIX_PORT:-8080}/login/callback
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
+      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-https://accounts.google.com/o/oauth2/v2/auth}
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-https://oauth2.googleapis.com/token}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET:-}
+      - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:8080/login/callback}
+      - DATABASE_ENABLED=${DATABASE_ENABLED:-true}
       - RUST_LOG=debug,async_nats=info
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222

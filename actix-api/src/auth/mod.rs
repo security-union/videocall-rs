@@ -156,23 +156,15 @@ pub async fn request_token(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await?;
-        error!(
-            "OAuth token request failed. Status: {}, Body: {}",
-            status, body
-        );
-        return Err(anyhow!("OAuth token request failed with status {}", status));
+        error!("OAuth token request failed. Status: {status}, Body: {body}");
+        return Err(anyhow!("OAuth token request failed with status {status}"));
     }
 
     let body_text = response.text().await?;
-    info!("OAuth response body: {}", body_text);
+    info!("OAuth response body: {body_text}");
 
-    let oauth_response: OAuthResponse = serde_json::from_str(&body_text).map_err(|e| {
-        anyhow!(
-            "Failed to parse OAuth response: {}. Body was: {}",
-            e,
-            body_text
-        )
-    })?;
+    let oauth_response: OAuthResponse = serde_json::from_str(&body_text)
+        .map_err(|e| anyhow!("Failed to parse OAuth response: {e}. Body was: {body_text}"))?;
     let jwt_token = oauth_response
         .clone()
         .id_token

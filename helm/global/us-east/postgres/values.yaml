@@ -3,9 +3,11 @@ postgresql:
   # Database credentials
   auth:
     enablePostgresUser: true
-    postgresPassword: "changeme-prod-password"  # TODO: Use Kubernetes secret in production
+    existingSecret: "postgres-credentials"
+    secretKeys:
+      adminPasswordKey: "postgres-password"
+      userPasswordKey: "password"
     username: "postgres"
-    password: "changeme-prod-password"  # TODO: Use Kubernetes secret in production
     database: "actix-api-db"
 
   # Persistent Volume configuration

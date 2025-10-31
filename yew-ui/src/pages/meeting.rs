@@ -65,7 +65,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                             auth_checked.set(true);
                         }
                         Err(e) => {
-                            log::warn!("No active session, redirecting to login. Error: {:?}", e);
+                            log::warn!("No active session, redirecting to login. Error: {e:?}");
                             navigator.push(&Route::Login);
                         }
                     }

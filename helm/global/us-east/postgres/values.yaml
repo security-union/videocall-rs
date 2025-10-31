@@ -1,5 +1,25 @@
 # PostgreSQL configuration for US East region
+
+# Allow AWS ECR images
+global:
+  security:
+    allowInsecureImages: true
+
 postgresql:
+  # Use AWS ECR for Bitnami images (Bitnami no longer hosts on Docker Hub)
+  image:
+    registry: public.ecr.aws
+    repository: bitnami/postgresql
+    
+  # Metrics exporter image
+  metrics:
+    enabled: true
+    image:
+      registry: public.ecr.aws
+      repository: bitnami/postgres-exporter
+    serviceMonitor:
+      enabled: false
+  
   # Database credentials
   auth:
     enablePostgresUser: true
@@ -24,38 +44,32 @@ postgresql:
     # Resource limits
     resources:
       limits:
-        cpu: 1000m
-        memory: 1Gi
+        cpu: 200m
+        memory: 256Mi
       requests:
-        cpu: 500m
-        memory: 512Mi
+        cpu: 100m
+        memory: 128Mi
 
     # PostgreSQL configuration
     extendedConfiguration: |
-      max_connections = 200
-      shared_buffers = 256MB
-      effective_cache_size = 1GB
-      maintenance_work_mem = 64MB
+      max_connections = 50
+      shared_buffers = 32MB
+      effective_cache_size = 128MB
+      maintenance_work_mem = 16MB
       checkpoint_completion_target = 0.9
-      wal_buffers = 16MB
+      wal_buffers = 4MB
       default_statistics_target = 100
       random_page_cost = 1.1
       effective_io_concurrency = 200
-      work_mem = 1MB
-      min_wal_size = 1GB
-      max_wal_size = 4GB
+      work_mem = 512kB
+      min_wal_size = 256MB
+      max_wal_size = 512MB
 
   # Service configuration
   service:
     type: ClusterIP
     ports:
       postgresql: 5432
-
-  # Metrics (optional, but useful for monitoring)
-  metrics:
-    enabled: true
-    serviceMonitor:
-      enabled: false  # Enable if you have Prometheus Operator
 
   # Backup configuration (optional)
   backup:

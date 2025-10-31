@@ -84,6 +84,7 @@ services:
       - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:8080/login/callback}
       - DATABASE_ENABLED=${DATABASE_ENABLED:-true}
       - RUST_LOG=debug,async_nats=info
+      - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222
       - REGION=${REGION:-us-east}

@@ -141,20 +141,28 @@ async fn handle_google_oauth_callback(
     })?;
 
     // 4. Create session cookie with email.
-    let cookie = Cookie::build("email", claims.email.clone())
+    let cookie_domain = std::env::var("COOKIE_DOMAIN").ok();
+
+    let mut cookie_builder = Cookie::build("email", claims.email.clone())
         .path("/")
         .same_site(SameSite::Lax)
-        // Session lasts forever (10 years)
-        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(87600)))
-        .finish();
+        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(87600)));
+
+    if let Some(domain) = cookie_domain.as_ref() {
+        cookie_builder = cookie_builder.domain(domain.clone());
+    }
+    let cookie = cookie_builder.finish();
 
     // Also store the name in a separate cookie
-    let name_cookie = Cookie::build("name", claims.name.clone())
+    let mut name_cookie_builder = Cookie::build("name", claims.name.clone())
         .path("/")
         .same_site(SameSite::Lax)
-        // Session lasts forever (10 years)
-        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(87600)))
-        .finish();
+        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(87600)));
+
+    if let Some(domain) = cookie_domain.as_ref() {
+        name_cookie_builder = name_cookie_builder.domain(domain.clone());
+    }
+    let name_cookie = name_cookie_builder.finish();
 
     // 5. Send cookies and redirect browser to AFTER_LOGIN_URL
     info!(
@@ -216,16 +224,26 @@ async fn get_profile(req: HttpRequest) -> Result<HttpResponse, Error> {
 async fn logout() -> Result<HttpResponse, Error> {
     info!("User logging out");
 
-    // Create expired cookies to clear them
-    let email_cookie = Cookie::build("email", "")
-        .path("/")
-        .expires(OffsetDateTime::now_utc())
-        .finish();
+    let cookie_domain = std::env::var("COOKIE_DOMAIN").ok();
 
-    let name_cookie = Cookie::build("name", "")
+    // Create expired cookies to clear them
+    let mut email_cookie_builder = Cookie::build("email", "")
         .path("/")
-        .expires(OffsetDateTime::now_utc())
-        .finish();
+        .expires(OffsetDateTime::now_utc());
+
+    if let Some(domain) = cookie_domain.as_ref() {
+        email_cookie_builder = email_cookie_builder.domain(domain.clone());
+    }
+    let email_cookie = email_cookie_builder.finish();
+
+    let mut name_cookie_builder = Cookie::build("name", "")
+        .path("/")
+        .expires(OffsetDateTime::now_utc());
+
+    if let Some(domain) = cookie_domain.as_ref() {
+        name_cookie_builder = name_cookie_builder.domain(domain.clone());
+    }
+    let name_cookie = name_cookie_builder.finish();
 
     let mut response = HttpResponse::Ok();
     response.cookie(email_cookie);

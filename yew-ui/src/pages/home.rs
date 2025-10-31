@@ -88,7 +88,7 @@ pub fn home() -> Html {
     //     let _ = window.open_with_url("https://github.com/security-union/videocall-rs");
     // });
 
-    let set_active_tab = {
+    let _set_active_tab = {
         let active_tab = active_tab.clone();
         Callback::from(move |tab: usize| {
             active_tab.set(tab);

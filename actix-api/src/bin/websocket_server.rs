@@ -47,7 +47,7 @@ use sec_api::{
 use tracing::{debug, error, info};
 use videocall_types::truthy;
 
-const SCOPE: &str = "email%20profile%20openid";
+const SCOPE: &str = "email profile";
 /**
  * Function used by the Web Application to initiate OAuth.
  *
@@ -117,7 +117,7 @@ async fn handle_google_oauth_callback(
 
     // 2. Request token from OAuth provider.
     let (oauth_response, claims) = request_token(
-        &cfg.oauth_auth_url,
+        &cfg.oauth_redirect_url,
         &cfg.oauth_client_id,
         &cfg.oauth_secret,
         &oauth_request.pkce_verifier,
@@ -141,17 +141,94 @@ async fn handle_google_oauth_callback(
     })?;
 
     // 4. Create session cookie with email.
-    let cookie = Cookie::build("email", claims.email)
+    let cookie = Cookie::build("email", claims.email.clone())
         .path("/")
         .same_site(SameSite::Lax)
-        // Session lasts only 360 secs to test cookie expiration.
-        .expires(OffsetDateTime::now_utc().checked_add(Duration::seconds(360)))
+        // Session lasts 24 hours
+        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(24)))
         .finish();
 
-    // 5. Send cookie and redirect browser to AFTER_LOGIN_URL
+    // Also store the name in a separate cookie
+    let name_cookie = Cookie::build("name", claims.name.clone())
+        .path("/")
+        .same_site(SameSite::Lax)
+        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(24)))
+        .finish();
+
+    // 5. Send cookies and redirect browser to AFTER_LOGIN_URL
+    info!(
+        "OAuth login successful for user: {} ({})",
+        claims.name, claims.email
+    );
     let mut response = HttpResponse::Found();
     response.append_header((LOCATION, cfg.after_login_url.clone()));
     response.cookie(cookie);
+    response.cookie(name_cookie);
+    Ok(response.finish())
+}
+
+/**
+ * Check if the user has an active session
+ * Returns 200 if session is valid, 401 if not
+ */
+#[get("/session")]
+async fn check_session(req: HttpRequest) -> Result<HttpResponse, Error> {
+    debug!("Session check request from: {:?}", req.connection_info());
+    debug!("All cookies: {:?}", req.cookies());
+
+    if let Some(cookie) = req.cookie("email") {
+        if !cookie.value().is_empty() {
+            info!("Session valid for: {}", cookie.value());
+            return Ok(HttpResponse::Ok().finish());
+        }
+    }
+    info!("No valid session found, returning 401");
+    Ok(HttpResponse::Unauthorized().finish())
+}
+
+/**
+ * Get the current user's profile
+ * Returns email and name from session cookies
+ */
+#[get("/profile")]
+async fn get_profile(req: HttpRequest) -> Result<HttpResponse, Error> {
+    let email = req
+        .cookie("email")
+        .map(|c| c.value().to_string())
+        .ok_or_else(|| error::ErrorUnauthorized("No session"))?;
+
+    let name = req
+        .cookie("name")
+        .map(|c| c.value().to_string())
+        .unwrap_or_else(|| email.clone());
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "email": email,
+        "name": name
+    })))
+}
+
+/**
+ * Logout endpoint - clears session cookies
+ */
+#[get("/logout")]
+async fn logout() -> Result<HttpResponse, Error> {
+    info!("User logging out");
+
+    // Create expired cookies to clear them
+    let email_cookie = Cookie::build("email", "")
+        .path("/")
+        .expires(OffsetDateTime::now_utc())
+        .finish();
+
+    let name_cookie = Cookie::build("name", "")
+        .path("/")
+        .expires(OffsetDateTime::now_utc())
+        .finish();
+
+    let mut response = HttpResponse::Ok();
+    response.cookie(email_cookie);
+    response.cookie(name_cookie);
     Ok(response.finish())
 }
 
@@ -256,9 +333,13 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
                 }))
+                .service(check_session)
+                .service(get_profile)
+                .service(logout)
                 .service(ws_connect)
-        } else {
-            let pool = if db_enabled { Some(get_pool()) } else { None };
+        } else if db_enabled {
+            // OAuth requires database
+            let pool = get_pool();
             App::new()
                 .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(AppState {
@@ -277,6 +358,23 @@ async fn main() -> std::io::Result<()> {
                 .wrap(cors)
                 .service(handle_google_oauth_callback)
                 .service(login)
+                .service(check_session)
+                .service(get_profile)
+                .service(logout)
+                .service(ws_connect)
+        } else {
+            // OAuth configured but database disabled - skip OAuth routes
+            error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");
+            App::new()
+                .wrap(cors)
+                .app_data(web::Data::new(AppState {
+                    chat: chat.clone(),
+                    nats_client: nats_client.clone(),
+                    tracker_sender: tracker_sender.clone(),
+                }))
+                .service(check_session)
+                .service(get_profile)
+                .service(logout)
                 .service(ws_connect)
         }
     })

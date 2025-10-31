@@ -35,7 +35,6 @@ use web_sys::*;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
 
-
 #[derive(Debug)]
 pub enum WsAction {
     Connect,
@@ -601,14 +600,15 @@ impl Component for AttendantsComponent {
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
-
         let rows: Vec<Html> = display_peers_vec
             .iter()
             .take(CANVAS_LIMIT)
             .enumerate()
             .map(|(i, peer_id)| {
                 let is_host = peer_id == &(email.clone() + " (You)");
-                let full_bleed = (display_peers_vec.len() == 1 && !self.client.is_screen_share_enabled_for_peer(peer_id)) || num_display_peers == 1;
+                let full_bleed = (display_peers_vec.len() == 1
+                    && !self.client.is_screen_share_enabled_for_peer(peer_id))
+                    || num_display_peers == 1;
                 let on_toggle_change_name = if is_host {
                     self.host_toggle_change_name.clone()
                 } else {

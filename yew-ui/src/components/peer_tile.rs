@@ -141,7 +141,11 @@ impl Component for PeerTile {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        log::info!("YEW-UI: ******* Rendering PeerTile: id: {}   is host: {}", &ctx.props().peer_id, ctx.props().is_host);
+        log::info!(
+            "YEW-UI: Rendering Peer Tile: {} {}",
+            &ctx.props().peer_id,
+            if ctx.props().is_host { "(host)" } else { "" }
+        );
 
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
         generate_canvas_tile(

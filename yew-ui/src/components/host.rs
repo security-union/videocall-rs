@@ -187,9 +187,10 @@ impl Component for Host {
         // Load devices
         media_devices.load();
 
-        ctx.props()
-            .register_toggle_change_name
-            .emit(ctx.link().callback(|_: MouseEvent| Msg::ToggleChangeNameModal));
+        ctx.props().register_toggle_change_name.emit(
+            ctx.link()
+                .callback(|_: MouseEvent| Msg::ToggleChangeNameModal),
+        );
 
         Self {
             camera,

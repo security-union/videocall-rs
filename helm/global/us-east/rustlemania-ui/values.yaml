@@ -10,7 +10,7 @@ rustlemania-ui:
     apiBaseUrl: "https://app.videocall.rs"
     wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
     webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
-    oauthEnabled: "false"
+    oauthEnabled: "true"
     e2eeEnabled: "false"
     webTransportEnabled: "true"
     usersAllowedToStream: ""

@@ -23,6 +23,7 @@ use wasm_bindgen::JsValue;
 use web_sys::window;
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct RuntimeConfig {
     #[serde(rename = "apiBaseUrl")]
     pub api_base_url: String,
@@ -30,6 +31,8 @@ pub struct RuntimeConfig {
     pub ws_url: String,
     #[serde(rename = "webTransportHost")]
     pub web_transport_host: String,
+    #[serde(rename = "oauthEnabled")]
+    pub oauth_enabled: String,
     #[serde(rename = "e2eeEnabled")]
     pub e2ee_enabled: String,
     #[serde(rename = "webTransportEnabled")]
@@ -101,6 +104,9 @@ pub fn webtransport_host_base() -> Result<String, String> {
 
 pub fn webtransport_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.web_transport_enabled.as_str())))
+}
+pub fn oauth_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.oauth_enabled.as_str())))
 }
 pub fn e2ee_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.e2ee_enabled.as_str())))

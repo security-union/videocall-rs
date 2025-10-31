@@ -7,10 +7,10 @@ rustlemania-ui:
 
   runtimeConfig:
     # Using values aligned with docker/Dockerfile.yew
-    apiBaseUrl: "https://app.videocall.rs"
+    apiBaseUrl: "https://api.videocall.rs"
     wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
     webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
-    oauthEnabled: "false"
+    oauthEnabled: "true"
     e2eeEnabled: "false"
     webTransportEnabled: "true"
     usersAllowedToStream: ""
@@ -23,7 +23,7 @@ rustlemania-ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: latest
+    tag: add-auth-7f419aaa
 
   resources:
     limits:

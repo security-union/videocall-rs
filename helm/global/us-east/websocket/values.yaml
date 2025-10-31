@@ -18,9 +18,9 @@ rustlemania-websocket:
     - name: NATS_URL
       value: nats-us-east:4222  # Connect to US East NATS cluster
     - name: DATABASE_ENABLED
-      value: "false"
+      value: "true"
     - name: DATABASE_URL
-      value: abc
+      value: postgres://postgres:changeme-prod-password@postgres-us-east-postgresql:5432/actix-api-db?sslmode=disable
     - name: REGION
       value: "us-east"
     - name: HOSTNAME
@@ -37,6 +37,25 @@ rustlemania-websocket:
       value: "5"
     - name: TOKIO_WORKER_THREADS
       value: "2"  # Optimal for 2400m CPU (I/O bound WebSocket operations)
+    # OAuth Configuration (from secret)
+    - name: OAUTH_CLIENT_ID
+      valueFrom:
+        secretKeyRef:
+          name: google-oauth-credentials
+          key: client-id
+    - name: OAUTH_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: google-oauth-credentials
+          key: client-secret
+    - name: OAUTH_AUTH_URL
+      value: "https://accounts.google.com/o/oauth2/v2/auth"
+    - name: OAUTH_TOKEN_URL
+      value: "https://oauth2.googleapis.com/token"
+    - name: OAUTH_REDIRECT_URL
+      value: "https://websocket-us-east.webtransport.video/login/callback"
+    - name: UI_ENDPOINT
+      value: "https://rustlemania-ui-us-east.webtransport.video"
 
 
   resources:

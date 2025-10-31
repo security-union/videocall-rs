@@ -1,0 +1,10 @@
+apiVersion: v2
+name: postgres-us-east
+version: 0.1.0
+description: PostgreSQL database for US East region with persistent storage
+
+dependencies:
+  - name: postgresql
+    version: 12.12.10
+    repository: https://charts.bitnami.com/bitnami
+

@@ -1,0 +1,65 @@
+# PostgreSQL configuration for US East region
+postgresql:
+  # Database credentials
+  auth:
+    enablePostgresUser: true
+    postgresPassword: "changeme-prod-password"  # TODO: Use Kubernetes secret in production
+    username: "postgres"
+    password: "changeme-prod-password"  # TODO: Use Kubernetes secret in production
+    database: "actix-api-db"
+
+  # Persistent Volume configuration
+  primary:
+    persistence:
+      enabled: true
+      storageClass: "do-block-storage"  # DigitalOcean Block Storage
+      size: 10Gi  # 10GB storage
+      # PVC will persist after helm uninstall by default
+      # Add this annotation to be explicit:
+      annotations:
+        helm.sh/resource-policy: keep
+
+    # Resource limits
+    resources:
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+      requests:
+        cpu: 500m
+        memory: 512Mi
+
+    # PostgreSQL configuration
+    extendedConfiguration: |
+      max_connections = 200
+      shared_buffers = 256MB
+      effective_cache_size = 1GB
+      maintenance_work_mem = 64MB
+      checkpoint_completion_target = 0.9
+      wal_buffers = 16MB
+      default_statistics_target = 100
+      random_page_cost = 1.1
+      effective_io_concurrency = 200
+      work_mem = 1MB
+      min_wal_size = 1GB
+      max_wal_size = 4GB
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    ports:
+      postgresql: 5432
+
+  # Metrics (optional, but useful for monitoring)
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false  # Enable if you have Prometheus Operator
+
+  # Backup configuration (optional)
+  backup:
+    enabled: false
+
+  # Read replicas (optional, for high availability)
+  readReplicas:
+    replicaCount: 0  # Set to 1+ for read replicas
+

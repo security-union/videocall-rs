@@ -144,15 +144,16 @@ async fn handle_google_oauth_callback(
     let cookie = Cookie::build("email", claims.email.clone())
         .path("/")
         .same_site(SameSite::Lax)
-        // Session lasts 24 hours
-        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(24)))
+        // Session lasts forever (10 years)
+        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(87600)))
         .finish();
 
     // Also store the name in a separate cookie
     let name_cookie = Cookie::build("name", claims.name.clone())
         .path("/")
         .same_site(SameSite::Lax)
-        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(24)))
+        // Session lasts forever (10 years)
+        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(87600)))
         .finish();
 
     // 5. Send cookies and redirect browser to AFTER_LOGIN_URL

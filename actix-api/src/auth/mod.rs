@@ -120,12 +120,14 @@ pub fn upsert_user(
 ) -> Anysult<()> {
     let mut connection = pool.get()?;
     connection.query(
-        "INSERT INTO users (email, access_token, refresh_token) VALUES ($1, $2, $3)
-                ON CONFLICT (email)
-                    DO UPDATE
-                        SET access_token = $2, refresh_token = $3",
+        "INSERT INTO users (email, name, access_token, refresh_token, created_at, last_login) 
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT (email)
+         DO UPDATE
+         SET access_token = $3, refresh_token = $4, name = $2, last_login = CURRENT_TIMESTAMP",
         &[
             &claims.email,
+            &claims.name,
             &oauth_response.access_token,
             &oauth_response.refresh_token,
         ],

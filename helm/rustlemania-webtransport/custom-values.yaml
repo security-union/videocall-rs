@@ -1,0 +1,61 @@
+fullnameOverride: "rustlemania-webtransport"
+
+image:
+  repository: securityunion/rustlemania-api
+  pullPolicy: Always
+  tag: latest
+
+# The TLS secret name that contains the certificate files
+tlsSecret: webtransport-tls
+
+certificateDomain: "webtransport.YOUR_DOMAIN_NAME"
+certificate:
+  issuerName: "letsencrypt-prod"
+
+env:
+  - name: RUST_LOG
+    value: info
+  - name: NATS_URL
+    value: "nats://nats:4222"
+  - name: LISTEN_URL
+    value: 0.0.0.0:4433
+  - name: HEALTH_LISTEN_URL
+    value: 0.0.0.0:5321
+  - name: CERT_PATH
+    value: /certs/tls.crt
+  - name: KEY_PATH
+    value: /certs/tls.key
+  - name: TOKIO_WORKER_THREADS
+    value: "1"
+  - name: TOKIO_BLOCKING_THREADS
+    value: "2"
+  - name: REGION
+    value: "us-east"
+  - name: HOSTNAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: SERVER_ID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: SERVICE_TYPE
+    value: webtransport
+  - name: SERVER_STATS_INTERVAL_SECS
+    value: "5"
+
+resources:
+  limits:
+    cpu: "500m"
+    memory: "768Mi"
+  requests:
+    cpu: "500m"
+    memory: "384Mi"
+
+# Service configuration
+service:
+  port: 4433
+  healthPort: 5321
+
+loadBalancerAnnotations:
+  external-dns.alpha.kubernetes.io/hostname: "webtransport.YOUR_DOMAIN_NAME"

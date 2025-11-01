@@ -24,14 +24,12 @@ use super::task::Task;
 use super::ConnectOptions;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
-use protobuf::Message;
+use crate::flatbuffer_helpers::{MediaPacketBuilder, HeartbeatMetadataBuilder, serialize_packet_wrapper};
+use flatbuffers::FlatBufferBuilder;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_flatbuffers::{MediaType, PacketType, MediaPacket, PacketWrapper};
 use yew::prelude::Callback;
 
 #[derive(Clone, Copy, Debug)]
@@ -115,29 +113,21 @@ impl Connection {
         let audio_enabled = Rc::clone(&self.audio_enabled);
         let screen_enabled = Rc::clone(&self.screen_enabled);
         self.heartbeat = Some(Interval::new(1000, move || {
-            let heartbeat_metadata = HeartbeatMetadata {
-                video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                ..Default::default()
-            };
+            let video = video_enabled.load(std::sync::atomic::Ordering::Relaxed);
+            let audio = audio_enabled.load(std::sync::atomic::Ordering::Relaxed);
+            let screen = screen_enabled.load(std::sync::atomic::Ordering::Relaxed);
 
-            let packet = MediaPacket {
-                media_type: MediaType::HEARTBEAT.into(),
-                email: userid.clone(),
-                timestamp: js_sys::Date::now(),
-                heartbeat_metadata: Some(heartbeat_metadata).into(),
-                ..Default::default()
-            };
-            let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();
-            let packet = PacketWrapper {
-                data,
-                email: userid.clone(),
-                packet_type: PacketType::MEDIA.into(),
-                ..Default::default()
-            };
+            let packet_bytes = crate::flatbuffer_helpers::serialize_heartbeat_packet(
+                &userid,
+                video,
+                audio,
+                screen,
+            );
+            let data = aes.encrypt(&packet_bytes).unwrap();
+            let wrapper_bytes = serialize_packet_wrapper(PacketType::MEDIA, &userid, &data);
+            
             if let Status::Connected = status.get() {
-                task.send_packet(packet);
+                task.send_raw_bytes(wrapper_bytes);
             }
         }));
     }

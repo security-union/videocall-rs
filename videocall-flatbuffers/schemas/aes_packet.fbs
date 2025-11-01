@@ -1,0 +1,8 @@
+namespace videocall.protocol;
+
+table AesPacket {
+  key: [ubyte];
+  iv: [ubyte];
+}
+
+root_type AesPacket;

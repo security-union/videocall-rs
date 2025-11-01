@@ -1,0 +1,41 @@
+namespace videocall.protocol;
+
+enum MediaType : byte {
+  VIDEO = 0,
+  AUDIO = 1,
+  SCREEN = 2,
+  HEARTBEAT = 3,
+  RTT = 4
+}
+
+table AudioMetadata {
+  audio_format: string;
+  audio_number_of_channels: uint32;
+  audio_number_of_frames: uint32;
+  audio_sample_rate: float;
+  sequence: uint64;
+}
+
+table VideoMetadata {
+  sequence: uint64;
+}
+
+table HeartbeatMetadata {
+  video_enabled: bool;
+  audio_enabled: bool;
+  screen_enabled: bool;
+}
+
+table MediaPacket {
+  media_type: MediaType;
+  email: string;
+  data: [ubyte];
+  frame_type: string;
+  timestamp: double;
+  duration: double;
+  audio_metadata: AudioMetadata;
+  video_metadata: VideoMetadata;
+  heartbeat_metadata: HeartbeatMetadata;
+}
+
+root_type MediaPacket;

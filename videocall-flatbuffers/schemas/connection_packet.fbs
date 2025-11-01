@@ -1,0 +1,7 @@
+namespace videocall.protocol;
+
+table ConnectionPacket {
+  meeting_id: string;
+}
+
+root_type ConnectionPacket;

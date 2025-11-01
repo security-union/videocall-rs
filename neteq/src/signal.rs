@@ -42,35 +42,37 @@ pub fn best_normalized_correlation(a: &[f32], b: &[f32], len: usize) -> (usize, 
     debug_assert_eq!(a.len(), b.len());
     debug_assert!(a.len() >= len);
 
-    let mut sum_ab = 0.0;
-    let mut sum_a2 = 0.0;
-    let mut sum_b2 = 0.0;
+    let mut corr = 0.0;
+    let mut energy = 0.0;
     let mut best_pos = 0;
-    let mut best_corr2 = 0.0;
+    let mut best_corr = -1.0;
     for i in 0..a.len() {
-        sum_ab += a[i] * b[i];
-        sum_a2 += a[i] * a[i];
-        sum_b2 += b[i] * b[i];
-        if i >= len {
-            sum_ab -= a[i - len] * b[i - len];
-            sum_a2 -= a[i - len] * a[i - len];
-            sum_b2 -= b[i - len] * b[i - len];
-            let corr2 = if sum_a2 == 0.0 || sum_b2 == 0.0 {
-                0.0
-            } else if sum_ab < 0.0 {
-                -(sum_ab * sum_ab / (sum_a2 * sum_b2))
-            } else {
-                sum_ab * sum_ab / (sum_a2 * sum_b2)
-            };
+        let x = a[i];
+        let y = b[i];
+        corr += x * y;
+        energy += (x * x).max(y * y);
+        if i + 1 >= len {
+            let normalized_corr = if energy == 0.0 { 1.0 } else { corr / energy };
 
-            if corr2 > best_corr2 {
-                best_corr2 = corr2;
-                best_pos = i;
+            let i_start = i + 1 - len;
+
+            if normalized_corr >= 1.0 {
+                return (i_start, 1.0);
             }
+
+            if normalized_corr > best_corr {
+                best_corr = normalized_corr;
+                best_pos = i_start;
+            }
+
+            let old_x = a[i_start];
+            let old_y = b[i_start];
+            corr -= old_x * old_y;
+            energy -= (old_x * old_x).max(old_y * old_y);
         }
     }
 
-    (best_pos, best_corr2)
+    (best_pos, best_corr)
 }
 
 /// Cross-fade `fade_len` samples between the tail of `prev` and the head of `next`,

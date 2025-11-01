@@ -505,8 +505,26 @@ impl NetEq {
         // Reset for next frame (matches WebRTC decision_logic.cc:245-246)
         self.timestretch_added_samples = 0;
 
+        // Use WebRTC-style threshold calculations
+        let samples_per_ms = self.config.sample_rate / 1000;
+        let target_level_samples = target_delay_ms * samples_per_ms;
+
+        // Calculate thresholds like WebRTC
+        let low_limit = std::cmp::max(
+            target_level_samples * 3 / 4,
+            target_level_samples
+                .saturating_sub(K_DECELERATION_TARGET_LEVEL_OFFSET_MS * samples_per_ms),
+        );
+        let high_limit = std::cmp::max(target_level_samples, low_limit + 20 * samples_per_ms);
+
         if !self.leftover_time_stretched_samples.is_empty() {
             return Ok(Operation::TimeStretchBuffer);
+        }
+
+        if self.consecutive_expands > 0 && current_buffer_samples < low_limit as usize {
+            // prefer a single continous expand over many small ones
+            self.consecutive_expands = self.consecutive_expands.saturating_add(1);
+            return Ok(Operation::Expand);
         }
 
         if current_buffer_samples < self.output_frame_size_samples * 3 / 2
@@ -528,39 +546,7 @@ impl NetEq {
             return Ok(Operation::ExpandEnd);
         }
 
-        // Use WebRTC-style threshold calculations
-        let samples_per_ms = self.config.sample_rate / 1000;
-        let target_level_samples = target_delay_ms * samples_per_ms;
-
-        // Calculate thresholds like WebRTC
-        let low_limit = std::cmp::max(
-            target_level_samples * 3 / 4,
-            target_level_samples
-                .saturating_sub(K_DECELERATION_TARGET_LEVEL_OFFSET_MS * samples_per_ms),
-        );
-        let high_limit = std::cmp::max(target_level_samples, low_limit + 20 * samples_per_ms);
-
         let buffer_level_samples = self.buffer_level_filter.filtered_current_level();
-
-        // Fast accelerate: 4x high limit (aggressive acceleration for large buffers)
-        if buffer_level_samples >= (high_limit << 2) as usize {
-            self.consecutive_expands = 0;
-            return Ok(Operation::FastAccelerate);
-        }
-
-        // Normal accelerate: at high limit
-        if buffer_level_samples >= high_limit as usize {
-            self.consecutive_expands = 0;
-            return Ok(Operation::Accelerate);
-        }
-
-        // Preemptive expand: below low limit (requires ~30ms of audio)
-        if buffer_level_samples < low_limit as usize
-            && current_buffer_samples >= self.output_frame_size_samples * 3
-        {
-            self.consecutive_expands = 0;
-            return Ok(Operation::PreemptiveExpand);
-        }
 
         // Check for continuous expansion limit (WebRTC uses much higher limits)
         if self.consecutive_expands > 600 {
@@ -569,8 +555,26 @@ impl NetEq {
             return Ok(Operation::Normal);
         }
 
-        // Normal operation
         self.consecutive_expands = 0;
+
+        // Fast accelerate: 4x high limit (aggressive acceleration for large buffers)
+        if buffer_level_samples >= (high_limit << 2) as usize {
+            return Ok(Operation::FastAccelerate);
+        }
+
+        // Normal accelerate: at high limit
+        if buffer_level_samples >= high_limit as usize {
+            return Ok(Operation::Accelerate);
+        }
+
+        // Preemptive expand: below low limit (requires ~30ms of audio)
+        if buffer_level_samples < low_limit as usize
+            && current_buffer_samples >= self.output_frame_size_samples * 3
+        {
+            return Ok(Operation::PreemptiveExpand);
+        }
+
+        // Normal operation
         Ok(Operation::Normal)
     }
 
@@ -826,44 +830,46 @@ impl NetEq {
         }
 
         if start {
+            let overlap_length = self.calculate_overlap_length(self.config.sample_rate);
+
             let mut end_of_audio = AudioFrame::new(
                 self.config.sample_rate,
                 self.config.channels,
-                (frame.samples_per_channel as f32 * 0.5) as usize,
+                overlap_length,
             );
 
             self.decode_normal(&mut end_of_audio)?;
 
-            let fade_len = end_of_audio.samples.len();
-            let start_of_frame = frame.samples[..fade_len].to_vec();
+            let start_of_frame = frame.samples[..overlap_length].to_vec();
 
             // Crossfade with end of audio
             crate::signal::crossfade(
                 &end_of_audio.samples,
                 &start_of_frame,
-                fade_len,
-                &mut frame.samples[..fade_len],
+                overlap_length,
+                &mut frame.samples[..overlap_length],
             );
         }
 
         if end {
+            let overlap_length = self.calculate_overlap_length(self.config.sample_rate);
+
             let mut start_of_audio = AudioFrame::new(
                 self.config.sample_rate,
                 self.config.channels,
-                (frame.samples_per_channel as f32 * 0.5) as usize,
+                overlap_length,
             );
 
             self.decode_normal(&mut start_of_audio)?;
 
-            let fade_len = start_of_audio.samples.len();
-            let end_of_frame_start = frame.samples.len() - fade_len;
+            let end_of_frame_start = frame.samples.len() - overlap_length;
             let end_of_frame = frame.samples[end_of_frame_start..].to_vec();
 
             // Crossfade with end of audio
             crate::signal::crossfade(
                 &end_of_frame,
                 &start_of_audio.samples,
-                fade_len,
+                overlap_length,
                 &mut frame.samples[end_of_frame_start..],
             );
         }
@@ -887,6 +893,11 @@ impl NetEq {
         );
 
         Ok(())
+    }
+
+    fn calculate_overlap_length(&self, sample_rate: u32) -> usize {
+        // Calculate overlap length based on sample rate (typically 4-6ms)
+        ((sample_rate as f32 * 0.003) as usize).max(32) // Minimum 32 samples
     }
 
     fn decode_merge(&mut self, frame: &mut AudioFrame) -> Result<()> {

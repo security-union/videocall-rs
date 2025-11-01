@@ -84,10 +84,9 @@ impl WebCodecsAudioDecoder {
         Reflect::set(&init, &"error".into(), error_cb.as_ref())
             .map_err(js_err("Failed to set error callback"))?;
 
-        // Get AudioDecoder constructor
-        let window = web_sys::window()
-            .ok_or_else(|| crate::NetEqError::DecoderError("No window available".to_string()))?;
-        let audio_decoder_ctor = Reflect::get(&JsValue::from(window), &"AudioDecoder".into())
+        // Get AudioDecoder constructor from global scope (works in both window and worker)
+        let global = js_sys::global();
+        let audio_decoder_ctor = Reflect::get(&global, &"AudioDecoder".into())
             .map_err(js_err("AudioDecoder not found"))?;
 
         // Create decoder instance
@@ -184,22 +183,9 @@ impl WebCodecsAudioDecoder {
     pub fn get_decoder_type(&self) -> &'static str {
         "WebCodecs"
     }
-}
 
-impl AudioDecoder for WebCodecsAudioDecoder {
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn channels(&self) -> u8 {
-        self.channels
-    }
-
-    fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>> {
-        let decoder = self.decoder.as_ref().ok_or_else(|| {
-            crate::NetEqError::DecoderError("Decoder not initialized".to_string())
-        })?;
-
+    /// Queue a decode operation (async - results will arrive in output callback)
+    fn queue_decode_operation(&mut self, decoder: &JsValue, encoded: &[u8]) -> Result<()> {
         // Reuse input buffer
         if self.input_buffer.length() < encoded.len() as u32 {
             self.input_buffer = Uint8Array::new_with_length(encoded.len() as u32);
@@ -219,9 +205,8 @@ impl AudioDecoder for WebCodecsAudioDecoder {
         )
         .map_err(js_err("Failed to set data"))?;
 
-        let window = web_sys::window()
-            .ok_or_else(|| crate::NetEqError::DecoderError("No window".to_string()))?;
-        let encoded_chunk_ctor = Reflect::get(&JsValue::from(window), &"EncodedAudioChunk".into())
+        let global = js_sys::global();
+        let encoded_chunk_ctor = Reflect::get(&global, &"EncodedAudioChunk".into())
             .map_err(js_err("EncodedAudioChunk not found"))?;
         let chunk = Reflect::construct(
             &encoded_chunk_ctor.unchecked_into::<Function>(),
@@ -229,7 +214,7 @@ impl AudioDecoder for WebCodecsAudioDecoder {
         )
         .map_err(js_err("Failed to construct EncodedAudioChunk"))?;
 
-        // Decode
+        // Queue decode (async - output will come via callback)
         let decode_fn = Reflect::get(decoder, &"decode".into())
             .map_err(js_err("Failed to get decode method"))?
             .dyn_into::<Function>()
@@ -239,19 +224,41 @@ impl AudioDecoder for WebCodecsAudioDecoder {
             .call1(decoder, &chunk)
             .map_err(|e| crate::NetEqError::DecoderError(format!("Decode failed: {e:?}")))?;
 
-        // Flush to ensure output
-        let flush_fn = Reflect::get(decoder, &"flush".into())
-            .map_err(js_err("Failed to get flush method"))?
-            .dyn_into::<Function>()
-            .ok();
+        Ok(())
+    }
+}
 
-        if let Some(flush) = flush_fn {
-            let _ = flush.call0(decoder);
+impl AudioDecoder for WebCodecsAudioDecoder {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channels(&self) -> u8 {
+        self.channels
+    }
+
+    fn decode(&mut self, encoded: &[u8]) -> Result<Vec<f32>> {
+        // IMPORTANT: WebCodecs decode() is asynchronous - the output callback will be
+        // called later. To work with NetEq's synchronous interface, we return samples
+        // from the PREVIOUS decode call while queuing the current one.
+        // This adds ~10-20ms of latency but is necessary for the API design.
+
+        // First, grab any samples from previous decode operations
+        let samples_to_return = self.output_buffer.borrow_mut().drain(..).collect();
+
+        // Clone the decoder JsValue to avoid borrow conflicts
+        let decoder = self
+            .decoder
+            .as_ref()
+            .ok_or_else(|| crate::NetEqError::DecoderError("Decoder not initialized".to_string()))?
+            .clone();
+
+        // Now queue the current packet for decoding (async - results will come later)
+        if let Err(e) = self.queue_decode_operation(&decoder, encoded) {
+            console::warn_1(&format!("WebCodecs decode queue failed: {e:?}").into());
+            // Return what we have buffered, even if queuing failed
         }
 
-        // Return buffered samples (blocking for now - WebCodecs is async)
-        // In production, you'd poll or use a better async strategy
-        let samples = self.output_buffer.borrow_mut().drain(..).collect();
-        Ok(samples)
+        Ok(samples_to_return)
     }
 }

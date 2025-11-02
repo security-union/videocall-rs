@@ -1,6 +1,6 @@
 [package]
 name = "videocall-client"
-version = "1.1.27"
+version = "1.1.28"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A client for the videocall project"
@@ -38,7 +38,7 @@ yew-websocket = "1.21.0"
 yew-webtransport = "0.21.1"
 prost = "0.11"
 videocall-codecs = { path = "../videocall-codecs", features = ["wasm"], version = "0.1.9" }
-neteq = { path = "../neteq", features = ["web"], version = "0.7.0", optional = true,  default-features = false }
+neteq = { path = "../neteq", features = ["web"], version = "0.7.1", optional = true,  default-features = false }
 serde-wasm-bindgen = "0.6.5"
 serde_bytes = "0.11"
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.2" }

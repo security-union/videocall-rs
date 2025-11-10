@@ -16,17 +16,22 @@
  * conditions.
  */
 
-use crate::messages::{
-    server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
-    session::Message,
+use crate::{
+    db::PostgresPool,
+    messages::{
+        server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
+        session::Message,
+    },
+    models::{self, build_subject_and_queue},
 };
-use crate::models::build_subject_and_queue;
+
+use chrono::Utc;
 
 use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
 use futures::StreamExt;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tracing::{error, info, trace};
 
 use super::chat_session::SessionId;
 
@@ -34,20 +39,61 @@ pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
     active_subs: HashMap<SessionId, JoinHandle<()>>,
+    room_participants: HashMap<String, usize>, // Track number of participants per room
+    db_pool: Option<PostgresPool>,
 }
 
 impl ChatServer {
-    pub async fn new(nats_connection: async_nats::client::Client) -> Self {
+    pub async fn new(
+        nats_connection: async_nats::client::Client,
+        db_pool: Option<PostgresPool>,
+    ) -> Self {
         ChatServer {
             nats_connection,
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
+            room_participants: HashMap::new(),
+            db_pool,
         }
     }
 
-    pub fn leave_rooms(&mut self, session_id: &SessionId) {
+    pub fn leave_rooms(&mut self, session_id: &SessionId, room: Option<&str>) {
+        // Remove the subscription task
         if let Some(task) = self.active_subs.remove(session_id) {
             task.abort();
+        }
+
+
+        // Get the total subscribers from the NATS server
+        // TODO: Get the total subscribers from the NATS server, to know the total number of participants in the room
+        // let total_subscribers = self.nats_connection.total_subscribers().await;
+        
+
+        // Update participant count and end meeting if needed
+        if let Some(room_id) = room {
+            if let Some(count) = self.room_participants.get_mut(room_id) {
+                if *count > 0 {
+                    *count -= 1;
+                }
+
+                // If no more participants, end the meeting
+                if *count == 0 {
+                    self.room_participants.remove(room_id);
+
+                    // End the meeting in the database if we have a connection
+                    if let Some(_) = &self.db_pool {
+                        let room_id = room_id.to_string();
+                        tokio::spawn(async move {
+                            // End the meeting in the database
+                            if let Err(e) = models::Meeting::end_meeting(&room_id).await {
+                                error!("Failed to end meeting for room {}: {}", room_id, e);
+                            } else {
+                                info!("Ended meeting for room {}", room_id);
+                            }
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -73,7 +119,18 @@ impl Handler<Disconnect> for ChatServer {
         Disconnect { session }: Disconnect,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        self.leave_rooms(&session);
+        // Find the room this session is in
+        let room = self.active_subs.iter().find_map(|(s, _)| {
+            if s == &session {
+                // Extract room from the subscription key if needed
+                // For now, we'll just return None since we can't determine the room
+                None
+            } else {
+                None
+            }
+        });
+
+        self.leave_rooms(&session, room);
         let _ = self.sessions.remove(&session);
     }
 }
@@ -81,8 +138,8 @@ impl Handler<Disconnect> for ChatServer {
 impl Handler<Leave> for ChatServer {
     type Result = ();
 
-    fn handle(&mut self, Leave { session }: Leave, _ctx: &mut Self::Context) -> Self::Result {
-        self.leave_rooms(&session);
+    fn handle(&mut self, Leave { session, room }: Leave, _ctx: &mut Self::Context) -> Self::Result {
+        self.leave_rooms(&session, Some(&room));
     }
 }
 
@@ -114,64 +171,92 @@ impl Handler<ClientMessage> for ChatServer {
 
 impl Handler<JoinRoom> for ChatServer {
     type Result = MessageResult<JoinRoom>;
+
     fn handle(
         &mut self,
         JoinRoom { session, room }: JoinRoom,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        self.leave_rooms(&session);
+        if self.active_subs.contains_key(&session) {
+            return MessageResult(Ok(()));
+        }
+
+        let is_first_participant = !self.room_participants.contains_key(&room);
+        *self.room_participants.entry(room.clone()).or_insert(0) += 1;
+
+        if is_first_participant && self.db_pool.is_some() {
+            let room_clone = room.clone();
+
+            tokio::spawn(async move {
+                let now = Utc::now();
+                match models::Meeting::create(&room_clone, now).await {
+                    Ok(meeting) => {
+                        info!(
+                            "Meeting started for room {} at {}",
+                            room_clone, meeting.started_at
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to create meeting record for room {}: {}",
+                            room_clone, e
+                        );
+                    }
+                }
+            });
+        }
 
         let (subject, queue) = build_subject_and_queue(&room, &session);
         let session_recipient = match self.sessions.get(&session) {
-            Some(recipient) => recipient.clone(),
+            Some(addr) => addr.clone(),
             None => {
-                let err = format!("session {session} is not connected");
-                error!("{err}");
-                return MessageResult(Err(err));
+                if let Some(count) = self.room_participants.get_mut(&room) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.room_participants.remove(&room);
+                    }
+                }
+
+                return MessageResult(Err("Session not found".into()));
             }
         };
 
         let nc = self.nats_connection.clone();
-        let session_2 = session.clone();
-        let task = actix::spawn(async move {
-            match nc
-                .queue_subscribe(subject.clone(), queue.clone())
-                .await
-                .map_err(|e| handle_subscription_error(e, &subject))
-            {
+        let session_clone = session.clone();
+        let room_clone = room.clone();
+
+        let handle = tokio::spawn(async move {
+            match nc.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
-                    debug!("Subscribed to subject {subject} with queue {queue}");
-                    info!(
-                        "someone connected to room {room} with session {}",
-                        session_2.trim(),
-                    );
                     while let Some(msg) = sub.next().await {
-                        if let Err(e) =
-                            handle_msg(session_recipient.clone(), room.clone(), session_2.clone())(
-                                msg,
-                            )
+                        if let Err(e) = handle_msg(
+                            session_recipient.clone(),
+                            room_clone.clone(),
+                            session_clone.clone(),
+                        )(msg)
                         {
-                            error!("{}", e);
+                            error!("Error handling message: {}", e);
+                            break;
                         }
                     }
                 }
                 Err(e) => {
-                    error!("{}", e);
+                    error!("{}", e)
                 }
             }
         });
 
-        self.active_subs.insert(session, task);
+        self.active_subs.insert(session, handle);
 
         MessageResult(Ok(()))
     }
 }
 
-fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {
-    let err = format!("error subscribing to subject {subject}: {e}");
-    error!("{err}");
-    err
-}
+// fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {
+//     let err = format!("error subscribing to subject {subject}: {e}");
+//     error!("{err}");
+//     err
+// }
 
 fn handle_msg(
     session_recipient: Recipient<Message>, // Assuming Recipient is a type

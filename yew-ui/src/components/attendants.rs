@@ -24,7 +24,7 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use gloo_timers::callback::Timeout;
+use gloo_timers::callback::{Interval, Timeout};
 use gloo_utils::window;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
@@ -45,6 +45,8 @@ pub enum WsAction {
     MediaPermissionsError(String),
     Log(String),
     EncoderSettingsUpdated(String),
+    TimerTick,
+    MeetingInfoReceived(u64),
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -135,6 +137,9 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp
+    pub call_start_time: Option<f64>,           // Track when the call started
+    _timer: Option<Interval>,
 }
 
 impl AttendantsComponent {
@@ -222,6 +227,15 @@ impl AttendantsComponent {
             }),
             rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
             rtt_probe_interval_ms: Some(200),
+            on_meeting_info: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |start_time_ms: f64| {
+                    log::info!("🕐 Meeting started at Unix timestamp: {}", start_time_ms);
+                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                        start_time_ms as u64,
+                    )))
+                })
+            }),
         };
 
         VideoCallClient::new(opts)
@@ -315,6 +329,48 @@ impl AttendantsComponent {
             }
         }
     }
+
+    fn format_call_duration(&self) -> String {
+        if let Some(server_start_ms) = self.meeting_start_time_server {
+            let now_ms = js_sys::Date::now();
+            let elapsed_ms = (now_ms - server_start_ms).max(0.0);
+
+            let elapsed_secs = (elapsed_ms / 1000.0) as u64;
+            let hours = elapsed_secs / 3600;
+            let minutes = (elapsed_secs % 3600) / 60;
+            let seconds = elapsed_secs % 60;
+
+            if hours > 0 {
+                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+            } else {
+                return format!("{:02}:{:02}", minutes, seconds);
+            }
+            // Some(server_start) => server_start,
+            // None => &match self.call_start_time {
+            //     Some(local_start) => local_start,
+            //     None => return "00:00".to_string(),
+            // },
+        } else if let Some(local_start) = self.call_start_time {
+            let now = web_sys::window()
+                .and_then(|w| w.performance())
+                .map(|p| p.now())
+                .unwrap_or(local_start + 1000.0);
+
+            let elapsed_ms = (now - local_start).max(0.0);
+            let elapsed_secs = (elapsed_ms / 1000.0) as u64;
+            let hours = elapsed_secs / 3600;
+            let minutes = (elapsed_secs % 3600) / 60;
+            let seconds = elapsed_secs % 60;
+
+            if hours > 0 {
+                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+            } else {
+                format!("{:02}:{:02}", minutes, seconds)
+            }
+        } else {
+            "00:00".to_string()
+        }
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -346,6 +402,9 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            call_start_time: None,
+            _timer: None,
+            meeting_start_time_server: None,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -380,8 +439,24 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
+
+                    if self.meeting_start_time_server.is_none() {
+                        self.call_start_time =
+                            Some(web_sys::window().unwrap().performance().unwrap().now());
+                    }
+
+                    if self._timer.is_none() {
+                        let link = ctx.link().clone();
+                        let interval = Interval::new(1000, move || {
+                            link.send_message(Msg::WsAction(WsAction::TimerTick));
+                        });
+                        self._timer = Some(interval);
+                    }
                     true
                 }
+
+                WsAction::TimerTick => true,
+
                 WsAction::Log(msg) => {
                     warn!("{msg}");
                     false
@@ -425,11 +500,46 @@ impl Component for AttendantsComponent {
                     self.encoder_settings = Some(settings);
                     true
                 }
+                WsAction::MeetingInfoReceived(start_time) => {
+                    log::info!(
+                        "📅 Received meeting start time from server: {} ms",
+                        start_time
+                    );
+
+                    self.meeting_start_time_server = Some(start_time as f64);
+
+                    if self._timer.is_none() {
+                        let link = ctx.link().clone();
+                        let interval = Interval::new(1000, move || {
+                            link.send_message(Msg::WsAction(WsAction::TimerTick));
+                        });
+                        self._timer = Some(interval);
+                    }
+
+                    true
+                }
             },
             Msg::OnPeerAdded(email) => {
                 log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
+
+                // Make sure timer is running when someone joins
+                if self.meeting_start_time_server.is_none() && self.call_start_time.is_none() {
+                    self.call_start_time = web_sys::window()
+                        .and_then(|w| w.performance())
+                        .map(|p| p.now());
+                    if self.call_start_time.is_some() && self._timer.is_none() {
+                        let link = ctx.link().clone();
+                        // Clear any existing timer
+                        //  self._timer = None;
+                        // Create a new interval that triggers an update every second
+                        let interval = Interval::new(1000, move || {
+                            link.send_message(Msg::WsAction(WsAction::TimerTick));
+                        });
+                        self._timer = Some(interval);
+                    }
+                }
                 true
             }
             Msg::OnPeerRemoved(_peer_id) => {
@@ -628,11 +738,49 @@ impl Component for AttendantsComponent {
             grid_container_classes.push("force-desktop-grid");
         }
 
+        // Create the call timer HTML if the call has started
+        let call_timer =
+            if self.meeting_start_time_server.is_some() || self.call_start_time.is_some() {
+                html! {
+                    <div class="call-timer" >
+                        { self.format_call_duration() }
+                    </div>
+                }
+            } else {
+                html! {} // TODO: show a loading spinner
+            };
+
+        // In the view method, before the call_timer declaration
+        log::info!(
+            "Timer debug - meeting_joined: {}, meeting_start_time: {:?}, call_start_time: {:?}",
+            self.meeting_joined,
+            self.meeting_start_time_server,
+            self.call_start_time
+        );
+
+        // Create the top-right controls
+        let top_right_controls = html! {
+            <div class="top-right-controls">
+                {call_timer}
+                <button
+                    class={classes!("control-button", self.diagnostics_open.then_some("active"))}
+                    onclick={toggle_diagnostics.clone()}
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="12" y1="8" x2="12" y2="12"></line>
+                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                </button>
+            </div>
+        };
+
         // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
             return html! {
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
+                    {top_right_controls}
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
                         <div style="text-align: center; color: white; margin-bottom: 2rem;">
                             <h2>{"Ready to join the meeting?"}</h2>
@@ -657,6 +805,7 @@ impl Component for AttendantsComponent {
         html! {
             <div id="main-container" class="meeting-page">
                 <BrowserCompatibility/>
+                {top_right_controls.clone()}
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}
@@ -765,7 +914,7 @@ impl Component for AttendantsComponent {
                                                         html! {
                                                             <>
                                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
+                                                                    <path d="M16 16v1a4 4 0 0 1-4 4H3a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
                                                                     <line x1="1" y1="1" x2="23" y2="23"></line>
                                                                 </svg>
                                                                 <span class="tooltip">{ "Start Video" }</span>

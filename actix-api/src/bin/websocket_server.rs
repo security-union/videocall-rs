@@ -41,6 +41,7 @@ use sec_api::{
     },
     constants::VALID_ID_PATTERN,
     db::{get_pool, PostgresPool},
+    meeting::MeetingManager,
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
 };
@@ -197,7 +198,8 @@ pub async fn ws_connect(
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
-    let actor = WsChatSession::new(chat, room_clean, email_clean, nats_client, tracker_sender);
+    let meeting_manager = state.meeting_manager.clone();
+    let actor = WsChatSession::new(chat, room_clean, email_clean, nats_client, tracker_sender, meeting_manager);
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)
 }
@@ -218,7 +220,15 @@ async fn main() -> std::io::Result<()> {
         .connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
-    let chat = ChatServer::new(nats_client.clone()).await.start();
+    // Get database pool if enabled
+    // let db_pool = if db_enabled {
+    //     Some(get_pool())
+    // } else {
+    //     None
+    // };
+    
+    let db_pool = Some(get_pool());
+    let chat = ChatServer::new(nats_client.clone(), db_pool).await.start();
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
@@ -255,6 +265,7 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
+                    meeting_manager: MeetingManager::new(),
                 }))
                 .service(ws_connect)
         } else {
@@ -265,6 +276,7 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
+                    meeting_manager: MeetingManager::new(),
                 }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),

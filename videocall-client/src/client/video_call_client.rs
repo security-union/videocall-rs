@@ -110,6 +110,9 @@ pub struct VideoCallClientOptions {
 
     /// Interval between RTT probes in milliseconds (default: 200ms)
     pub rtt_probe_interval_ms: Option<u64>,
+
+    /// Callback for meeting info
+    pub on_meeting_info: Option<Callback<f64>>,
 }
 
 #[derive(Debug)]

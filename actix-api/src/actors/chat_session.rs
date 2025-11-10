@@ -22,7 +22,7 @@ use crate::messages::session::Message;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
 };
-use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
+use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT, meeting::MeetingManager};
 use std::sync::Arc;
 
 use crate::{
@@ -56,6 +56,7 @@ pub struct WsChatSession {
     pub email: Email,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
+    pub meeting_manager: MeetingManager,
 }
 
 impl WsChatSession {
@@ -65,17 +66,19 @@ impl WsChatSession {
         email: String,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
+        meeting_manager: MeetingManager,
     ) -> Self {
         info!("new session with room {} and email {}", room, email);
 
         WsChatSession {
             id: Uuid::new_v4().to_string(),
             heartbeat: Instant::now(),
-            room,
+            room: room.clone(),
             email,
             addr,
             nats_client,
             tracker_sender,
+            meeting_manager,
         }
     }
 
@@ -124,6 +127,36 @@ impl Actor for WsChatSession {
             "websocket".to_string(),
         );
 
+        // Get or create meeting state for this room
+        let meeting_manager = self.meeting_manager.clone();
+        let room_id = self.room.clone();
+        
+        // Use actix's async context to handle the async meeting manager
+        ctx.wait(
+            async move {
+                 match meeting_manager.start_meeting(&room_id).await {
+                    Ok(start_time) => Some(start_time),
+                    Err(e) => {
+                        error!("failed to start meeting: {}", e);
+                        None
+                    }
+                }
+            }
+            .into_actor(self)
+            .map(|start_time_opt, act, ctx| {
+                if let Some(start_time_ms) = start_time_opt  {
+                    let meeting_info = serde_json::json!({
+                        "type": "meeting_info",
+                        "room_id": act.room,
+                        "start_time_ms": start_time_ms,
+                    });
+                    if let Ok(bytes) = serde_json::to_vec(&meeting_info) {
+                        ctx.binary(bytes);
+                    }
+                }
+            })
+        );
+
         self.heartbeat(ctx);
         let addr = ctx.address();
         self.addr
@@ -140,6 +173,8 @@ impl Actor for WsChatSession {
                 fut::ready(())
             })
             .wait(ctx);
+
+        // Join the room
         self.join(self.room.clone(), ctx);
     }
 

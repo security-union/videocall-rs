@@ -82,7 +82,7 @@ pub fn generate_and_store_oauth_request(
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     connection.query(
         "INSERT INTO oauth_requests (pkce_challenge, pkce_verifier, csrf_state)
-                       VALUES ($1, $2, $3)
+                VALUES ($1, $2, $3)
             ",
         &[
             &pkce_challenge.as_str(),

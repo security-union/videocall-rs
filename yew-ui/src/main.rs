@@ -16,6 +16,7 @@
  * conditions.
  */
 
+mod auth;
 #[allow(non_camel_case_types)]
 mod components;
 mod constants;
@@ -23,17 +24,16 @@ mod context;
 mod pages;
 mod types;
 
-use constants::login_url;
-
 use crate::constants::app_config;
+
 use components::config_error::ConfigError;
 use enum_display::EnumDisplay;
-use gloo_utils::window;
 use matomo_logger::{MatomoConfig, MatomoLogger};
 use pages::home::Home;
 use yew::prelude::*;
 use yew_router::prelude::*;
 
+use components::login::Login;
 use context::{load_username_from_storage, UsernameCtx};
 use pages::meeting::MeetingPage;
 
@@ -78,19 +78,6 @@ fn switch(routes: Route) -> Html {
         } => html! { <MeetingPage id={id} /> },
         Route::NotFound => html! { <h1>{ "404" }</h1> },
     }
-}
-
-#[function_component(Login)]
-fn login() -> Html {
-    let login = Callback::from(|_: MouseEvent| match login_url() {
-        Ok(url) => {
-            let _ = window().location().set_href(&url);
-        }
-        Err(e) => log::error!("{e:?}"),
-    });
-    html! {<>
-        <input type="image" onclick={login.clone()} src="/assets/btn_google.png" />
-    </>}
 }
 
 #[function_component(AppRoot)]

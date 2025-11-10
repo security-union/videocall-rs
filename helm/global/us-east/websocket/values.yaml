@@ -18,9 +18,14 @@ rustlemania-websocket:
     - name: NATS_URL
       value: nats-us-east:4222  # Connect to US East NATS cluster
     - name: DATABASE_ENABLED
-      value: "false"
+      value: "true"
+    - name: PG_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: postgres-credentials
+          key: password
     - name: DATABASE_URL
-      value: abc
+      value: postgres://postgres:$(PG_PASSWORD)@postgres-postgresql:5432/actix-api-db?sslmode=disable
     - name: REGION
       value: "us-east"
     - name: HOSTNAME
@@ -36,16 +41,37 @@ rustlemania-websocket:
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
     - name: TOKIO_WORKER_THREADS
-      value: "1"  # Optimal for 700m CPU (I/O bound WebSocket operations)
+      value: "2"  # Optimal for 2400m CPU (I/O bound WebSocket operations)
+    # OAuth Configuration (from secret)
+    - name: OAUTH_CLIENT_ID
+      valueFrom:
+        secretKeyRef:
+          name: google-oauth-credentials
+          key: client-id
+    - name: OAUTH_CLIENT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: google-oauth-credentials
+          key: client-secret
+    - name: OAUTH_AUTH_URL
+      value: "https://accounts.google.com/o/oauth2/v2/auth"
+    - name: OAUTH_TOKEN_URL
+      value: "https://oauth2.googleapis.com/token"
+    - name: OAUTH_REDIRECT_URL
+      value: "https://api.videocall.rs/login/callback"
+    - name: UI_ENDPOINT
+      value: "https://app.videocall.rs"
+    - name: COOKIE_DOMAIN
+      value: ".videocall.rs"
 
 
   resources:
     limits:
-      cpu: "700m"
-      memory: "1000Mi"
+      cpu: "2200m"
+      memory: "4000Mi"
     requests:
-      cpu: "700m"
-      memory: "1000Mi"
+      cpu: "2200m"
+      memory: "4000Mi"
 
   service:
     type: ClusterIP  # Changed to ClusterIP for ingress
@@ -67,11 +93,22 @@ rustlemania-websocket:
               name: websocket-us-east
               port:
                 number: 8080
+      - host: api.videocall.rs
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: websocket-us-east
+              port:
+                number: 8080
     tls:
       - secretName: websocket-us-east-tls
         hosts:
           - websocket-us-east.webtransport.video
           - webtransport-us-east.webtransport.video
+      - secretName: api-videocall-rs-tls
+        hosts:
+          - api.videocall.rs
 
   autoscaling:
     enabled: false

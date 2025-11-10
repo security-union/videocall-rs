@@ -442,7 +442,7 @@ impl VideoCallClient {
             Ok(inner) => {
                 if let Some(connection_controller) = &inner.connection_controller {
                     if let Err(e) = connection_controller.send_packet(media) {
-                        error!("Failed to send {packet_type:?} packet: {e}");
+                        debug!("Failed to send {packet_type:?} packet: {e}");
                     }
                 } else {
                     error!("No connection manager available for {packet_type:?} packet");

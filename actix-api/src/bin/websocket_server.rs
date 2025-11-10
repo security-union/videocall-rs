@@ -402,6 +402,7 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
+                    meeting_manager: MeetingManager::new(),
                 }))
                 .service(check_session)
                 .service(get_profile)

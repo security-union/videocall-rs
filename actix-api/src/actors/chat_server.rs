@@ -189,7 +189,7 @@ impl Handler<JoinRoom> for ChatServer {
 
             tokio::spawn(async move {
                 let now = Utc::now();
-                match models::Meeting::create(&room_clone, now).await {
+                match models::Meeting::create(&room_clone, now) {
                     Ok(meeting) => {
                         info!(
                             "Meeting started for room {} at {}",

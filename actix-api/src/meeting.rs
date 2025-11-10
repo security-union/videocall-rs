@@ -142,7 +142,7 @@ impl MeetingManager {
 
         let state = Arc::new(MeetingState::new(room_id.to_string()));
 
-        state.load_from_db();
+        state.load_from_db().await;
         meetings.insert(room_id.to_string(), state.clone());
         state
     }

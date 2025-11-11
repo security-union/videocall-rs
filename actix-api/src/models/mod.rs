@@ -16,15 +16,20 @@
  * conditions.
  */
 
+pub mod meeting;
+
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
 use crate::server_diagnostics::TrackerSender;
+use crate::meeting::MeetingManager;
+
 
 pub struct AppState {
     pub chat: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
+    pub meeting_manager: MeetingManager,
 }
 
 pub struct AppConfig {

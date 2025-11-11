@@ -62,4 +62,5 @@ pub struct Disconnect {
 #[rtype(result = "()")]
 pub struct Leave {
     pub session: SessionId,
+    pub room: RoomId,
 }

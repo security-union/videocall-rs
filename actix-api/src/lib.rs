@@ -26,3 +26,4 @@ pub mod metrics;
 pub mod models;
 pub mod server_diagnostics;
 pub mod webtransport;
+pub mod meeting;

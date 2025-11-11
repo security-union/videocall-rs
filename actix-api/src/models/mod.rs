@@ -17,13 +17,13 @@
  */
 
 pub mod meeting;
-pub use meeting::Meeting;
 
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
-use crate::meeting::MeetingManager;
 use crate::server_diagnostics::TrackerSender;
+use crate::meeting::MeetingManager;
+
 
 pub struct AppState {
     pub chat: Addr<ChatServer>,

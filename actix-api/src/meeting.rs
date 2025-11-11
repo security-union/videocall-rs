@@ -84,14 +84,6 @@ impl Default for MeetingManager {
     }
 }
 
-// impl Clone for MeetingManager {
-//     fn clone(&self) -> Self {
-//         Self {
-//             meetings: self.meetings.clone(),
-//         }
-//     }
-// }
-
 impl MeetingManager {
     pub fn new() -> Self {
         Self::default()

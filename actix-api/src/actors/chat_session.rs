@@ -257,7 +257,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 } else {
                     // Normal packet processing - forward to chat server
                     ctx.notify(Packet {
-                        data: Arc::new(msg_bytes),
+                        data: Arc::new(msg_bytes), 
                     });
                 }
             }

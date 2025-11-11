@@ -316,15 +316,8 @@ async fn main() -> std::io::Result<()> {
         .connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
-    // Get database pool if enabled
-    // let db_pool = if db_enabled {
-    //     Some(get_pool())
-    // } else {
-    //     None
-    // };
-    
-    let db_pool = Some(get_pool());
-    let chat = ChatServer::new(nats_client.clone(), db_pool).await.start();
+
+    let chat = ChatServer::new(nats_client.clone()).await.start();
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =

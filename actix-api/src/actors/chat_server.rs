@@ -17,15 +17,12 @@
  */
 
 use crate::{
-    db::PostgresPool,
     messages::{
         server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
     },
-    models::{self, build_subject_and_queue},
+    models::build_subject_and_queue,
 };
-
-use chrono::Utc;
 
 use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
 use futures::StreamExt;
@@ -40,20 +37,17 @@ pub struct ChatServer {
     sessions: HashMap<SessionId, Recipient<Message>>,
     active_subs: HashMap<SessionId, JoinHandle<()>>,
     room_participants: HashMap<String, usize>, // Track number of participants per room
-    db_pool: Option<PostgresPool>,
 }
 
 impl ChatServer {
     pub async fn new(
         nats_connection: async_nats::client::Client,
-        db_pool: Option<PostgresPool>,
     ) -> Self {
         ChatServer {
             nats_connection,
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
             room_participants: HashMap::new(),
-            db_pool,
         }
     }
 
@@ -79,19 +73,7 @@ impl ChatServer {
                 // If no more participants, end the meeting
                 if *count == 0 {
                     self.room_participants.remove(room_id);
-
-                    // End the meeting in the database if we have a connection
-                    if let Some(_) = &self.db_pool {
-                        let room_id = room_id.to_string();
-                        tokio::spawn(async move {
-                            // End the meeting in the database
-                            if let Err(e) = models::Meeting::end_meeting(&room_id).await {
-                                error!("Failed to end meeting for room {}: {}", room_id, e);
-                            } else {
-                                info!("Ended meeting for room {}", room_id);
-                            }
-                        });
-                    }
+                    info!("Last participant left room {}", room_id);
                 }
             }
         }
@@ -181,30 +163,7 @@ impl Handler<JoinRoom> for ChatServer {
             return MessageResult(Ok(()));
         }
 
-        let is_first_participant = !self.room_participants.contains_key(&room);
         *self.room_participants.entry(room.clone()).or_insert(0) += 1;
-
-        if is_first_participant && self.db_pool.is_some() {
-            let room_clone = room.clone();
-
-            tokio::spawn(async move {
-                let now = Utc::now();
-                match models::Meeting::create(&room_clone, now) {
-                    Ok(meeting) => {
-                        info!(
-                            "Meeting started for room {} at {}",
-                            room_clone, meeting.started_at
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to create meeting record for room {}: {}",
-                            room_clone, e
-                        );
-                    }
-                }
-            });
-        }
 
         let (subject, queue) = build_subject_and_queue(&room, &session);
         let session_recipient = match self.sessions.get(&session) {

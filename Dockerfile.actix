@@ -13,7 +13,7 @@ RUN mkdir -p /app/binaries && \
 
 FROM debian:bookworm-slim as production
 
-RUN apt-get --yes update && apt-get --yes install libssl-dev
+RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
 
 COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
 # Copy all binary executables from actix-api

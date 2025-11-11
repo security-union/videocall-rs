@@ -25,8 +25,6 @@ use web_sys::{AudioContext, AudioWorkletNode, AudioWorkletNodeOptions, MessagePo
 
 use wasm_bindgen::prelude::*;
 
-use gloo_utils::format::JsValueSerdeExt;
-
 #[derive(Serialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct EncoderInitOptions {
@@ -173,7 +171,7 @@ impl AudioWorkletCodec {
         self.get_port()
             .ok_or(JsValue::from_str("AudioWorkletNode is not instantiated"))
             .and_then(|port| {
-                JsValue::from_serde(&message)
+                serde_wasm_bindgen::to_value(&message)
                     .map_err(|e| JsValue::from_str(&e.to_string()))
                     .and_then(|val| port.post_message(&val))
             })

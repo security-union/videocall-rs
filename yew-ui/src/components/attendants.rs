@@ -45,6 +45,7 @@ pub enum WsAction {
     MediaPermissionsError(String),
     Log(String),
     EncoderSettingsUpdated(String),
+    ToggleDropdown,
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -111,6 +112,15 @@ pub struct AttendantsComponentProps {
     pub e2ee_enabled: bool,
 
     pub webtransport_enabled: bool,
+
+    #[prop_or_default]
+    pub user_name: Option<String>,
+
+    #[prop_or_default]
+    pub user_email: Option<String>,
+
+    #[prop_or_default]
+    pub on_logout: Option<Callback<()>>,
 }
 
 pub struct AttendantsComponent {
@@ -135,6 +145,7 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    show_dropdown: bool,
 }
 
 impl AttendantsComponent {
@@ -346,6 +357,7 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            show_dropdown: false,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -423,6 +435,10 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::EncoderSettingsUpdated(settings) => {
                     self.encoder_settings = Some(settings);
+                    true
+                }
+                WsAction::ToggleDropdown => {
+                    self.show_dropdown = !self.show_dropdown;
                     true
                 }
             },
@@ -634,6 +650,50 @@ impl Component for AttendantsComponent {
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
+                        // Logout dropdown (top-right corner)
+                        {
+                            if let (Some(name), Some(email), Some(on_logout)) = (&ctx.props().user_name, &ctx.props().user_email, &ctx.props().on_logout) {
+                                html! {
+                                    <div style="position: absolute; top: 1rem; right: 1rem; z-index: 1001;">
+                                        <button
+                                            onclick={ctx.link().callback(|_| WsAction::ToggleDropdown)}
+                                            class="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm transition-colors"
+                                            style="display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; background: #1f2937; border-radius: 0.5rem; color: white; font-size: 0.875rem; transition: background 0.2s; border: none; cursor: pointer;"
+                                        >
+                                            <span>{name}</span>
+                                            <svg style="width: 1rem; height: 1rem;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                                            </svg>
+                                        </button>
+
+                                        {
+                                            if self.show_dropdown {
+                                                html! {
+                                                    <div style="position: absolute; right: 0; margin-top: 0.5rem; width: 14rem; background: white; border-radius: 0.5rem; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); border: 1px solid #e5e7eb; padding: 0.25rem 0;">
+                                                        <div style="padding: 0.75rem 1rem; border-bottom: 1px solid #e5e7eb;">
+                                                            <p style="font-size: 0.875rem; font-weight: 500; color: #111827; margin: 0;">{name}</p>
+                                                            <p style="font-size: 0.75rem; color: #6b7280; margin: 0; overflow: hidden; text-overflow: ellipsis;">{email}</p>
+                                                        </div>
+                                                        <button
+                                                            onclick={on_logout.reform(|_| ())}
+                                                            class="logout-button"
+                                                            style="width: 100%; text-align: left; padding: 0.5rem 1rem; font-size: 0.875rem; color: #dc2626; background: transparent; border: none; cursor: pointer;"
+                                                        >
+                                                            {"Sign out"}
+                                                        </button>
+                                                    </div>
+                                                }
+                                            } else {
+                                                html! {}
+                                            }
+                                        }
+                                    </div>
+                                }
+                            } else {
+                                html! {}
+                            }
+                        }
+
                         <div style="text-align: center; color: white; margin-bottom: 2rem;">
                             <h2>{"Ready to join the meeting?"}</h2>
                             <p>{"Click the button below to join and start listening to others."}</p>

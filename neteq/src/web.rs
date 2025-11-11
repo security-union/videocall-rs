@@ -20,6 +20,8 @@
 // a Dedicated Web Worker or AudioWorklet.
 
 use crate::{codec::UnifiedOpusDecoder, AudioPacket, NetEq, NetEqConfig, RtpHeader};
+#[cfg(feature = "matomo-logger")]
+use matomo_logger::worker as matomo_worker;
 use serde_wasm_bindgen;
 use wasm_bindgen::prelude::*;
 
@@ -28,16 +30,22 @@ pub struct WebNetEq {
     neteq: std::cell::RefCell<Option<NetEq>>,
     sample_rate: u32,
     channels: u8,
+    additional_delay_ms: u32,
 }
 
 #[wasm_bindgen]
 impl WebNetEq {
     #[wasm_bindgen(constructor)]
-    pub fn new(sample_rate: u32, channels: u8) -> Result<WebNetEq, JsValue> {
+    pub fn new(
+        sample_rate: u32,
+        channels: u8,
+        additional_delay_ms: u32,
+    ) -> Result<WebNetEq, JsValue> {
         Ok(WebNetEq {
             neteq: std::cell::RefCell::new(None), // Will be initialized in init()
             sample_rate,
             channels,
+            additional_delay_ms,
         })
     }
 
@@ -48,7 +56,7 @@ impl WebNetEq {
         let cfg = NetEqConfig {
             sample_rate: self.sample_rate,
             channels: self.channels,
-            min_delay_ms: 80,
+            additional_delay_ms: self.additional_delay_ms,
             ..Default::default()
         };
         let mut neteq = NetEq::new(cfg).map_err(Self::map_err)?;
@@ -120,5 +128,24 @@ impl WebNetEq {
 
     fn map_err(e: crate::NetEqError) -> JsValue {
         JsValue::from_str(&e.to_string())
+    }
+}
+
+#[wasm_bindgen(js_name = initNetEq)]
+pub fn init_net_eq() {
+    // Initialize worker-side logger bridge: forward WARN+ to main thread (Matomo)
+    // Keep console at INFO for local visibility inside the workers
+    #[cfg(all(feature = "matomo-logger", target_arch = "wasm32"))]
+    {
+        use log::LevelFilter;
+
+        if let Err(_e) = matomo_worker::init_with_bridge(LevelFilter::Info, LevelFilter::Debug, {
+            // The bridge expects the object as 'arguments[0]'
+            js_sys::Function::new_no_args("self.postMessage(arguments[0]);")
+        }) {
+            use web_sys::console;
+
+            console::error_1(&"[neteq-worker] Failed to initialize matomo worker bridge".into());
+        }
     }
 }

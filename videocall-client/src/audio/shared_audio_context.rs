@@ -201,7 +201,7 @@ impl SharedAudioContext {
         )?;
         worklet.port().unwrap().post_message(&config)?;
 
-        log::info!("Created peer playback nodes for {peer_id}");
+        log::debug!("Created peer playback nodes for {peer_id}");
         Ok((worklet, peer_gain))
     }
 

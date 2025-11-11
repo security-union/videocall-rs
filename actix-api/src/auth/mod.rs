@@ -21,6 +21,7 @@ use anyhow::{anyhow, Result as Anysult};
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::{error, info};
 
 use crate::db::PostgresPool;
 
@@ -59,13 +60,14 @@ pub struct OAuthRequest {
     pub csrf_state: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct OAuthResponse {
     pub access_token: String,
     pub token_type: String,
-    pub scope: String,
-    pub id_token: String,
+    pub scope: Option<String>,
+    pub id_token: Option<String>,
     pub refresh_token: Option<String>,
+    pub expires_in: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -118,12 +120,14 @@ pub fn upsert_user(
 ) -> Anysult<()> {
     let mut connection = pool.get()?;
     connection.query(
-        "INSERT INTO users (email, access_token, refresh_token) VALUES ($1, $2, $3)
-                ON CONFLICT (email)
-                    DO UPDATE
-                        SET access_token = $2, refresh_token = $3",
+        "INSERT INTO users (email, name, access_token, refresh_token, created_at, last_login) 
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT (email)
+         DO UPDATE
+         SET access_token = $3, refresh_token = $4, name = $2, last_login = CURRENT_TIMESTAMP",
         &[
             &claims.email,
+            &claims.name,
             &oauth_response.access_token,
             &oauth_response.refresh_token,
         ],
@@ -149,8 +153,25 @@ pub async fn request_token(
         ("pkce_verifier", pkce_verifier),
     ];
     let response = client.post(oauth_token_url).form(&params).send().await?;
-    let oauth_response: OAuthResponse = response.json().await?;
-    let claims: Vec<&str> = oauth_response.id_token.split('.').collect();
+
+    // Log the response for debugging
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await?;
+        error!("OAuth token request failed. Status: {status}, Body: {body}");
+        return Err(anyhow!("OAuth token request failed with status {status}"));
+    }
+
+    let body_text = response.text().await?;
+    info!("OAuth response body: {body_text}");
+
+    let oauth_response: OAuthResponse = serde_json::from_str(&body_text)
+        .map_err(|e| anyhow!("Failed to parse OAuth response: {e}. Body was: {body_text}"))?;
+    let jwt_token = oauth_response
+        .clone()
+        .id_token
+        .unwrap_or_else(|| String::from(""));
+    let claims: Vec<&str> = jwt_token.split('.').collect();
     let claims_chunk = claims
         .get(1)
         .ok_or_else(|| anyhow!("Unable to parse jwt token"))?;

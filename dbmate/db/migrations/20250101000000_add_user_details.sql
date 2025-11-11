@@ -1,0 +1,12 @@
+-- migrate:up
+ALTER TABLE users
+ADD COLUMN name TEXT,
+ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+ADD COLUMN last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+-- migrate:down
+ALTER TABLE users
+DROP COLUMN name,
+DROP COLUMN created_at,
+DROP COLUMN last_login;
+

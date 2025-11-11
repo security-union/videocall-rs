@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.13](https://github.com/security-union/videocall-rs/compare/bot-v1.0.12...bot-v1.0.13) - 2025-10-30
+
+### Other
+
+- Fix matomo ([#454](https://github.com/security-union/videocall-rs/pull/454))
+
 ## [1.0.12](https://github.com/security-union/videocall-rs/compare/bot-v1.0.11...bot-v1.0.12) - 2025-10-13
 
 ### Other

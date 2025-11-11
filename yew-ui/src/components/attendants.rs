@@ -241,7 +241,7 @@ impl AttendantsComponent {
             on_meeting_info: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |start_time_ms: f64| {
-                    log::info!("🕐 Meeting started at Unix timestamp: {}", start_time_ms);
+                    log::info!("Meeting started at Unix timestamp: {}", start_time_ms);
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         start_time_ms as u64,
                     )))
@@ -514,7 +514,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MeetingInfoReceived(start_time) => {
                     log::info!(
-                        "📅 Received meeting start time from server: {} ms",
+                        "Received meeting start time from server: {} ms",
                         start_time
                     );
 

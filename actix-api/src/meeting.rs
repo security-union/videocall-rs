@@ -1,8 +1,8 @@
 use crate::models::meeting::Meeting as DbMeeting;
+use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use chrono::Utc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 
@@ -32,19 +32,37 @@ impl MeetingState {
             .is_ok()
     }
 
+    pub async fn save_to_db(
+        &self,
+        timestamp_ms: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let room_id = self.room_id.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // Convert timestamp to DateTime
+            let started_at = chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
+                .ok_or("Invalid timestamp")?;
+
+            // Call the SYNCHRONOUS get_or_create, NOT create
+            DbMeeting::create(&room_id, started_at)?;
+            info!("Meeting {} saved to database", room_id);
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        })
+        .await
+        .map_err(|e| format!("Spawn blocking failed: {}", e))?
+    }
+
     /// Load the meeting state from the database
     pub async fn load_from_db(&self) -> bool {
         let room_id = self.room_id.clone();
         let start_time = self.start_time.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
-            DbMeeting::get_by_room_id(&room_id)
-        }).await; 
-        
+        let result = tokio::task::spawn_blocking(move || DbMeeting::get_by_room_id(&room_id)).await;
+
         match result {
             Ok(Ok(Some(meeting))) => {
                 let timestamp_ms = meeting.start_time_unix_ms() as u64;
-               // info!("Loaded meeting {} with start time {}", room_id, timestamp_ms);
+                // info!("Loaded meeting {} with start time {}", room_id, timestamp_ms);
                 start_time.store(timestamp_ms, Ordering::SeqCst);
                 true
             }
@@ -63,10 +81,11 @@ impl MeetingState {
         }
     }
 
-    pub async fn end_meeting(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn end_meeting(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let room_id = self.room_id.clone();
-        
-        DbMeeting::end_meeting(&room_id).await?;
+        DbMeeting::end_meeting(&room_id)
+            .await
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e.to_string()))?;
         Ok(())
     }
 }
@@ -90,29 +109,38 @@ impl MeetingManager {
     }
 
     /// Initialize meeting when first participant joins
-    pub async fn start_meeting(&self, room_id: &str) -> Result<u64, Box<dyn std::error::Error>> {
-        let meeting = self.get_or_create_meeting(room_id).await; 
+    pub async fn start_meeting(
+        &self,
+        room_id: &str,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        info!("🔵 start_meeting called for room: {}", room_id); // ← Should see this
+
+        let meeting = self.get_or_create_meeting(room_id).await;
 
         let current_start = meeting.get_start_time();
         if current_start != 0 {
-            return Ok(current_start)
+            info!("Meeting {} already started at {}", room_id, current_start);
+            return Ok(current_start);
         }
 
-        let now_ms = Utc::now().timestamp_millis() as u64; 
+        let now_ms = Utc::now().timestamp_millis() as u64;
+        info!("🟢 Setting start time {} for room {}", now_ms, room_id); // ← Should see this
 
         if meeting.set_start_time(now_ms) {
-            let room_id_clone = room_id.to_string();
-            let meeting_clone = meeting.clone();
+            info!("✅ Meeting {} started at {}", room_id, now_ms);
 
-            tokio::task::spawn_blocking(async move || {
-                if let Err(e) = meeting_clone.end_meeting().await {
-                    error!("Failed to persist meeting {}: {}", room_id_clone, e);
+            let meeting_clone = meeting.clone();
+            tokio::spawn(async move {
+                info!("💾 Attempting to save meeting to database"); // ← Should see this
+                if let Err(e) = meeting_clone.save_to_db(now_ms).await {
+                    error!("❌ Failed to save meeting: {}", e);
+                } else {
+                    info!("✅ Meeting saved to database successfully"); // ← Should see this
                 }
             });
 
             Ok(now_ms)
-        }
-        else {
+        } else {
             Ok(meeting.get_start_time())
         }
     }
@@ -130,7 +158,7 @@ impl MeetingManager {
 
         if let Some(meetings) = meetings.get(room_id) {
             return meetings.clone();
-        } 
+        }
 
         let state = Arc::new(MeetingState::new(room_id.to_string()));
 
@@ -152,6 +180,11 @@ impl MeetingManager {
 
         Ok(())
     }
+
+    // pub async fn save_to_db(&self, now_ms: u64) -> Result<(), Box<dyn std::error::Error>> {
+    //     DbMeeting::create(&self.room_id, now_ms).await?;
+    //     Ok(())
+    // }
 
     /// Remove meeting from memory (but keeps it in the database)
     pub async fn cleanup_meeting(&self, room_id: &str) {

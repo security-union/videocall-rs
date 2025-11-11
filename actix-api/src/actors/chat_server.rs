@@ -228,6 +228,7 @@ fn handle_msg(
         }
         let message = Message {
             msg: msg.payload.to_vec(),
+            session: session.clone(),
         };
 
         session_recipient.try_send(message).map_err(|e| {

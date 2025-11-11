@@ -44,7 +44,7 @@ impl Meeting {
             VALUES ($1, $2, NULL) 
             ON CONFLICT (room_id) DO UPDATE 
             SET started_at = EXCLUDED.started_at, updated_at = NOW() 
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at",
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at",
             &[&room_id, &started_at],
         )?;
 
@@ -66,7 +66,7 @@ impl Meeting {
             "UPDATE meetings 
              SET ended_at = NOW(), updated_at = NOW() 
              WHERE room_id = $1 AND ended_at IS NULL
-             RETURNING id, room_id, started_at, ended_at, created_at, updated_at",
+             RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at",
             &[&room_id],
         )?;
 
@@ -84,13 +84,19 @@ impl Meeting {
     /// Get meeting by room_id
     pub fn get_by_room_id(room_id: &str) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let mut conn = get_connection_query()?;
-        match conn.query_one(
-            "SELECT id, room_id, started_at, ended_at, created_at, updated_at 
+        let rows = conn.query(
+            "SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at 
              FROM meetings 
              WHERE room_id = $1 AND deleted_at IS NULL",
             &[&room_id],
-        ) {
-            Ok(row) => Ok(Some(Meeting{
+        )?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        else {
+            let row = &rows[0]; 
+            Ok(Some(Meeting{
                 id: row.get("id"),
                 room_id: row.get("room_id"),
                 started_at: row.get("started_at"),
@@ -98,9 +104,7 @@ impl Meeting {
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
                 deleted_at: row.get("deleted_at"),
-            })),
-            Err(e) if e.to_string().contains("no rows") => Ok(None),
-            Err(e) => Err(Box::new(e))
+            }))
         }
     }
 

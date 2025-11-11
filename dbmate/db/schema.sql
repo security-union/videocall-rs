@@ -37,7 +37,8 @@ CREATE TABLE public.meetings (
     started_at timestamp with time zone NOT NULL,
     ended_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
-    updated_at timestamp with time zone DEFAULT now()
+    updated_at timestamp with time zone DEFAULT now(),
+    deleted_at timestamp with time zone
 );
 
 
@@ -88,7 +89,10 @@ CREATE TABLE public.schema_migrations (
 CREATE TABLE public.users (
     email character varying(255) NOT NULL,
     access_token text,
-    refresh_token text
+    refresh_token text,
+    name text,
+    created_at timestamp without time zone DEFAULT CURRENT_TIMESTAMP,
+    last_login timestamp without time zone DEFAULT CURRENT_TIMESTAMP
 );
 
 
@@ -156,5 +160,7 @@ CREATE TRIGGER update_meetings_updated_at BEFORE UPDATE ON public.meetings FOR E
 
 INSERT INTO public.schema_migrations (version) VALUES
     ('20220807000000'),
+    ('20250101000000'),
     ('20251109111824'),
-    ('20251109143240');
+    ('20251109143240'),
+    ('20251110232152');

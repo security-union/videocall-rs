@@ -307,7 +307,7 @@ pub struct PreemptiveExpand {
     _channels: u8,
     used_input_samples: usize,
     overlap_length: usize,
-    corr_thershold: f32,
+    corr_threshold: f32,
 }
 
 impl PreemptiveExpand {
@@ -318,7 +318,7 @@ impl PreemptiveExpand {
             _channels: channels,
             used_input_samples: 0,
             overlap_length: Self::calculate_overlap_length(sample_rate),
-            corr_thershold: 0.99,
+            corr_threshold: 0.99,
         }
     }
 
@@ -374,15 +374,15 @@ impl PreemptiveExpand {
             }
         }
 
-        if best_corr < self.corr_thershold {
-            self.corr_thershold *= 0.98;
+        if best_corr < self.corr_threshold {
+            self.corr_threshold *= 0.98;
 
             // Correlation is too low
             output.copy_from_slice(&input[..output.len()]);
             self.used_input_samples = output.len();
             return TimeStretchResult::NoStretch;
         } else {
-            self.corr_thershold = self.corr_thershold.max(best_corr * 0.95);
+            self.corr_threshold = self.corr_threshold.max(best_corr * 0.95);
         }
 
         let usable_input = &input[..output.len() - best_add_len];

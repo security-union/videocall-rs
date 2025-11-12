@@ -16,6 +16,9 @@
  * conditions.
  */
 
+const ENERGY_THRESHOLD_DECREASE_FACTOR: f32 = 0.995;
+const ENERGY_THRESHOLD_INCREASE_FACTOR: f32 = 1.002;
+
 /// Return codes for time-stretching operations
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TimeStretchResult {
@@ -188,12 +191,10 @@ impl Accelerate {
 
         if best_len > max_remove {
             // we have more than enough to remove, lower the energy threshold
-            self.low_energy_threshold *= 0.995;
-        }
-
-        if best_len < max_remove / 2 {
+            self.low_energy_threshold *= ENERGY_THRESHOLD_DECREASE_FACTOR;
+        } else if best_len < max_remove / 2 {
             // not enough to remove, slowly increase the energy threshold
-            self.low_energy_threshold /= 0.998;
+            self.low_energy_threshold *= ENERGY_THRESHOLD_INCREASE_FACTOR;
         }
 
         let samples_to_remove = best_len.saturating_sub(self.overlap_length).min(max_remove);

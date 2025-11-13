@@ -48,6 +48,16 @@ use tracing::{debug, error, info};
 use videocall_types::truthy;
 
 const SCOPE: &str = "email profile";
+
+/**
+ * Query parameters for the login endpoint
+ */
+#[derive(Debug, serde::Deserialize)]
+struct LoginQuery {
+    #[serde(rename = "returnTo")]
+    return_to: Option<String>,
+}
+
 /**
  * Function used by the Web Application to initiate OAuth.
  *
@@ -59,14 +69,18 @@ const SCOPE: &str = "email profile";
 async fn login(
     pool: web::Data<PostgresPool>,
     cfg: web::Data<AppConfig>,
+    query: web::Query<LoginQuery>,
 ) -> Result<HttpResponse, Error> {
     // TODO: verify if user exists in the db by looking at the session cookie, (if the client provides one.)
+    info!("Login endpoint called with query: {:?}", query);
     let pool2 = pool.clone();
+    let return_to = query.return_to.clone();
+    info!("return_to value: {:?}", return_to);
 
     // 2. Generate and Store OAuth Request.
     let (csrf_token, pkce_challenge) = {
         let pool = pool2.clone();
-        web::block(move || generate_and_store_oauth_request(pool)).await?
+        web::block(move || generate_and_store_oauth_request(pool, return_to)).await?
     }
     .map_err(|e| {
         error!("{:?}", e);
@@ -164,13 +178,16 @@ async fn handle_google_oauth_callback(
     }
     let name_cookie = name_cookie_builder.finish();
 
-    // 5. Send cookies and redirect browser to AFTER_LOGIN_URL
+    // 5. Send cookies and redirect browser to return_to URL or fallback to after_login_url
+    let redirect_url = oauth_request
+        .return_to
+        .unwrap_or_else(|| cfg.after_login_url.clone());
     info!(
-        "OAuth login successful for user: {} ({})",
-        claims.name, claims.email
+        "OAuth login successful for user: {} ({}), redirecting to: {}",
+        claims.name, claims.email, redirect_url
     );
     let mut response = HttpResponse::Found();
-    response.append_header((LOCATION, cfg.after_login_url.clone()));
+    response.append_header((LOCATION, redirect_url));
     response.cookie(cookie);
     response.cookie(name_cookie);
     Ok(response.finish())
@@ -336,7 +353,8 @@ async fn main() -> std::io::Result<()> {
         std::env::var("OAUTH_CLIENT_SECRET").unwrap_or_else(|_| String::from(""));
     let oauth_redirect_url: String =
         std::env::var("OAUTH_REDIRECT_URL").unwrap_or_else(|_| String::from(""));
-    let after_login_url: String = std::env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from(""));
+    let after_login_url: String =
+        std::env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from("/"));
     let db_enabled: bool = truthy(Some(
         &std::env::var("DATABASE_ENABLED").unwrap_or_else(|_| String::from("false")),
     ));

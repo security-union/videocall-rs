@@ -1,8 +1,8 @@
 window.__APP_CONFIG = Object.freeze({
-  apiBaseUrl: "https://api.videocall.rs",
+  apiBaseUrl: "http://localhost:8080",
   wsUrl: "ws://localhost:8080",
-  webTransportHost: "https://webtransport-us-east.webtransport.video",
-  oauthEnabled: "false",
+  webTransportHost: "https://127.0.0.1:4433",
+  oauthEnabled: "true",
   e2eeEnabled: "false",
   webTransportEnabled: "true",
   usersAllowedToStream: "",

@@ -26,7 +26,9 @@
 mod wasm_worker {
     const AUDIO_PRODUCTION_INTERVAL_MS: i32 = 5;
 
-    use neteq::web::init_net_eq;
+    use log::LevelFilter;
+    #[cfg(feature = "matomo-logger")]
+    use matomo_logger::worker as matomo_worker;
     use neteq::WebNetEq;
     use serde::{Deserialize, Serialize};
     use wasm_bindgen::prelude::*;
@@ -84,7 +86,21 @@ mod wasm_worker {
         console_error_panic_hook::set_once();
         console::log_1(&"[neteq-worker] starting".into());
 
-        init_net_eq();
+        // Initialize worker-side logger bridge: forward WARN+ to main thread (Matomo)
+        // Keep console at INFO for local visibility inside the worker
+        #[cfg(feature = "matomo-logger")]
+        {
+            if let Err(_e) =
+                matomo_worker::init_with_bridge(LevelFilter::Info, LevelFilter::Warn, {
+                    // The bridge expects the object as 'arguments[0]'
+                    js_sys::Function::new_no_args("self.postMessage(arguments[0]);")
+                })
+            {
+                console::error_1(
+                    &"[neteq-worker] Failed to initialize matomo worker bridge".into(),
+                );
+            }
+        }
 
         // Load opus-decoder library in worker context by evaluating the script directly
         let global_scope: DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
@@ -126,7 +142,7 @@ mod wasm_worker {
         // populated.
         NETEQ.with(|cell| {
             if cell.borrow().is_none() {
-                match WebNetEq::new(48_000, 1, 80) {
+                match WebNetEq::new(48_000, 1) {
                     Ok(eq) => {
                         // Spawn async initialization
                         wasm_bindgen_futures::spawn_local(async move {
@@ -286,20 +302,20 @@ mod wasm_worker {
                     if should_produce {
                         NETEQ.with(|cell| {
                             if let Some(eq) = cell.borrow().as_ref() {
-                                    if let Ok(pcm) = eq.get_audio() {
-                                        TOTAL_FRAMES_PRODUCED += 1;
-                                        LAST_PRODUCTION_TIME = now;
-                                        let sab = js_sys::Array::of1(&pcm.buffer());
-                                        let _ = js_sys::global()
-                                            .unchecked_into::<DedicatedWorkerGlobalScope>()
-                                            .post_message_with_transfer(&pcm, &sab);
+                                if let Ok(pcm) = eq.get_audio() {
+                                    TOTAL_FRAMES_PRODUCED += 1;
+                                    LAST_PRODUCTION_TIME = now;
+                                    let sab = js_sys::Array::of1(&pcm.buffer());
+                                    let _ = js_sys::global()
+                                        .unchecked_into::<DedicatedWorkerGlobalScope>()
+                                        .post_message_with_transfer(&pcm, &sab);
                                     // Track timing adjustments for debugging
                                     if frames_behind > 1 {
                                         TIMING_ADJUSTMENTS += 1;
                                     }
-                                    } else {
-                                        // NetEq couldn't provide audio - this is expected sometimes
-                                        console::log_1(&"📭 NetEq: No audio available this cycle".into());
+                                } else {
+                                    // NetEq couldn't provide audio - this is expected sometimes
+                                    console::log_1(&"📭 NetEq: No audio available this cycle".into());
                                 }
                             }
                         });

@@ -23,7 +23,7 @@ rustlemania-ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: main-b3ce8900
+    tag: latest
 
   resources:
     limits:

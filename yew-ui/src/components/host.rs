@@ -22,14 +22,16 @@ use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use log::debug;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
-use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, VideoCallClient};
+use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
 use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
 };
-use crate::context::{is_valid_username, load_username_from_storage, save_username_to_storage};
+use crate::context::{
+    is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
+};
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -58,6 +60,7 @@ pub enum Msg {
 }
 
 pub struct Host {
+    client: videocall_client::VideoCallClient,
     pub camera: CameraEncoder,
     pub microphone: Box<dyn MicrophoneEncoderTrait>,
     pub screen: ScreenEncoder,
@@ -100,8 +103,6 @@ pub struct MeetingProps {
     #[prop_or_default]
     pub id: String,
 
-    pub client: VideoCallClient,
-
     pub share_screen: bool,
 
     pub mic_enabled: bool,
@@ -125,7 +126,11 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let client = ctx.props().client.clone();
+        // Get client from context
+        let (client, _) = ctx
+            .link()
+            .context::<VideoCallClientCtx>(Callback::noop())
+            .expect("VideoCallClient context missing");
 
         // Create 3 callbacks for the 3 encoders
         let camera_callback = ctx.link().callback(Msg::CameraEncoderSettingsUpdated);
@@ -185,6 +190,7 @@ impl Component for Host {
         media_devices.load();
 
         Self {
+            client,
             camera,
             microphone,
             screen,
@@ -235,9 +241,9 @@ impl Component for Host {
 
         // Update videocallclient with the encoder settings
         // TODO: use atomic bools for the encoders
-        ctx.props().client.set_audio_enabled(self.mic_enabled);
-        ctx.props().client.set_video_enabled(self.video_enabled);
-        ctx.props().client.set_screen_enabled(self.share_screen);
+        self.client.set_audio_enabled(self.mic_enabled);
+        self.client.set_video_enabled(self.video_enabled);
+        self.client.set_screen_enabled(self.share_screen);
 
         if first_render {
             ctx.link().send_message(Msg::Start);
@@ -366,8 +372,7 @@ impl Component for Host {
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_outputs.select(&speaker.device_id);
                 // Update the speaker device for all connected peers
-                if let Err(e) = ctx
-                    .props()
+                if let Err(e) = self
                     .client
                     .update_speaker_device(Some(speaker.device_id.clone()))
                 {

@@ -20,10 +20,10 @@ use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::constants::users_allowed_to_stream;
+use crate::context::VideoCallClientCtx;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
-use wasm_bindgen::JsCast;
-use web_sys::{window, CanvasRenderingContext2d, HtmlCanvasElement};
+use web_sys::{window, HtmlCanvasElement};
 use yew::prelude::*;
 use yew::{html, Html};
 
@@ -76,7 +76,7 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
                         let div_id = (*screen_share_div_id).clone();
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
                     })}>
-                        <canvas id={format!("screen-share-{}", &key)}></canvas>
+                        <ScreenCanvas peer_id={key.clone()} />
                         <h4 class="floating-name" title={format!("{}-screen", &key)} dir={"auto"}>{format!("{}-screen", &key)}</h4>
                         <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*screen_share_div_id).clone()); })} class="pin-icon">
                             <PushPinIcon/>
@@ -125,24 +125,59 @@ struct UserVideoProps {
 // user video functional component
 #[function_component(UserVideo)]
 fn user_video(props: &UserVideoProps) -> Html {
-    // create use_effect hook that gets called only once and sets a thumbnail
-    // for the user video
-    let video_ref = use_state(NodeRef::default);
-    let video_ref_clone = video_ref.clone();
-    use_effect_with(vec![props.id.clone()], move |_| {
-        // Set thumbnail for the video
-        let video = (*video_ref_clone).cast::<HtmlCanvasElement>().unwrap();
-        let ctx = video
-            .get_context("2d")
-            .unwrap()
-            .unwrap()
-            .unchecked_into::<CanvasRenderingContext2d>();
-        ctx.clear_rect(0.0, 0.0, video.width() as f64, video.height() as f64);
-        || ()
-    });
+    let video_ref = use_node_ref();
+    let client = use_context::<VideoCallClientCtx>().expect("VideoCallClient context missing");
+
+    // Pass canvas reference to client when mounted
+    {
+        let video_ref = video_ref.clone();
+        let peer_id = props.id.clone();
+        let client = client.clone();
+
+        use_effect_with(video_ref.clone(), move |_| {
+            if let Some(canvas) = video_ref.cast::<HtmlCanvasElement>() {
+                if let Err(e) = client.set_peer_video_canvas(&peer_id, canvas) {
+                    log::debug!("Canvas not yet ready for peer {peer_id}: {e:?}");
+                }
+            }
+            || ()
+        });
+    }
 
     html! {
-        <canvas ref={(*video_ref).clone()} id={props.id.clone()} hidden={props.hidden}></canvas>
+        <canvas ref={video_ref} id={props.id.clone()} hidden={props.hidden}></canvas>
+    }
+}
+
+// Screen canvas component
+#[derive(Properties, Debug, PartialEq)]
+struct ScreenCanvasProps {
+    pub peer_id: String,
+}
+
+#[function_component(ScreenCanvas)]
+fn screen_canvas(props: &ScreenCanvasProps) -> Html {
+    let canvas_ref = use_node_ref();
+    let client = use_context::<VideoCallClientCtx>().expect("VideoCallClient context missing");
+
+    // Pass canvas reference to client when mounted
+    {
+        let canvas_ref = canvas_ref.clone();
+        let peer_id = props.peer_id.clone();
+        let client = client.clone();
+
+        use_effect_with(canvas_ref.clone(), move |_| {
+            if let Some(canvas) = canvas_ref.cast::<HtmlCanvasElement>() {
+                if let Err(e) = client.set_peer_screen_canvas(&peer_id, canvas) {
+                    log::debug!("Screen canvas not yet ready for peer {peer_id}: {e:?}");
+                }
+            }
+            || ()
+        });
+    }
+
+    html! {
+        <canvas ref={canvas_ref} id={format!("screen-share-{}", props.peer_id)}></canvas>
     }
 }
 

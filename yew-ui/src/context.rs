@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Username context helpers
+//! Context providers for the application
 //!
-//! This module centralises everything related to persisting the chosen
-//! username in `localStorage` and sharing it across the component tree
-//! through Yew's `ContextProvider`.
+//! This module centralises shared state that needs to be accessed across
+//! the component tree through Yew's `ContextProvider`.
 
+use videocall_client::VideoCallClient;
 use yew::prelude::*;
 
 /// Type alias used throughout the app when accessing the username context.
@@ -13,6 +13,12 @@ use yew::prelude::*;
 /// `UseStateHandle<Option<String>>` allows both read-only access (via
 /// deref) and mutation by calling `.set(Some("new_name".into()))`.
 pub type UsernameCtx = UseStateHandle<Option<String>>;
+
+/// VideoCallClient context for sharing the client instance across components.
+///
+/// This eliminates props drilling and provides clean access to the client
+/// from any component in the tree.
+pub type VideoCallClientCtx = VideoCallClient;
 
 // -----------------------------------------------------------------------------
 // Local-storage helpers

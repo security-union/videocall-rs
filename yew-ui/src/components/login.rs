@@ -24,7 +24,14 @@ use crate::constants::login_url;
 #[function_component(Login)]
 pub fn login() -> Html {
     let login = Callback::from(|_: MouseEvent| match login_url() {
-        Ok(url) => {
+        Ok(mut url) => {
+            // Check if there's a returnTo parameter in the current URL
+            if let Some(win) = window().location().search().ok() {
+                if !win.is_empty() {
+                    // Append the query parameters from the current URL to the backend login URL
+                    url = format!("{}{}", url, win);
+                }
+            }
             let _ = window().location().set_href(&url);
         }
         Err(e) => log::error!("Failed to get login URL: {e:?}"),

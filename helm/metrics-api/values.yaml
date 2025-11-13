@@ -27,7 +27,7 @@ metricsApi:
   # Environment variables
   env:
     METRICS_PORT: "9091"
-    NATS_URL: "nats://nats-us-east:4222"
+    NATS_URL: "nats://nats:4222"
     REGION: "us-east"
     SERVICE_TYPE: "metrics"
     RUST_LOG: "warn,async_nats=warn"
@@ -92,7 +92,7 @@ serverStats:
   # Environment variables for server stats
   env:
     METRICS_PORT: "9092"
-    NATS_URL: "nats://nats-us-east:4222"
+    NATS_URL: "nats://nats:4222"
     REGION: "us-east"
     SERVICE_TYPE: "server-stats"
     RUST_LOG: "debug,async_nats=info"

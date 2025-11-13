@@ -2,20 +2,20 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 nameOverride: ""
-fullnameOverride: ""
+fullnameOverride: "rustlemania-ui"
 
 replicaCount: 1
 image:
   repository: securityunion/rustlemania-ui
   pullPolicy: Always
   tag: latest
-resources:
-  limits:
-    cpu: "50m" # 50% of a single CPU
-    memory: "10Mi" # 512 MiB of memory
-  requests:
-    cpu: "20m" # 25% of a single CPU
-    memory: "10Mi" # 256 MiB of memory
+  resources:
+    limits:
+      cpu: "100m" # 100% of a single CPU
+      memory: "128Mi" # 128 * 1024 *1024 bytes
+    requests:
+      cpu: "50m" # 50% of a single CPU
+      memory: "64Mi"#  64 * 1024 *1024 bytes
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}
@@ -33,29 +33,28 @@ tolerations: []
 affinity: {}
 
 runtimeConfig:
-  # Using values aligned with docker/Dockerfile.yew
-  apiBaseUrl: "https://app.videocall.rs"
-  wsUrl: "wss://websocket-singapore.webtransport.video,wss://websocket-us-east.webtransport.video"
-  webTransportHost: "https://webtransport-singapore.webtransport.video,https://webtransport-us-east.webtransport.video"
+  apiBaseUrl: "https://api.YOUR_DOMAIN_NAME"
+  wsUrl: "wss://websocket.YOUR_DOMAIN_NAME"
+  webTransportHost: "https://webtransport.YOUR_DOMAIN_NAME:443"
   oauthEnabled: "false"
   e2eeEnabled: "false"
   webTransportEnabled: "true"
   usersAllowedToStream: ""
   serverElectionPeriodMs: 2000
-  audioBitrateKbps: 65
-  videoBitrateKbps: 1000
-  screenBitrateKbps: 1000
+  audioBitrateKbps: 16
+  videoBitrateKbps: 160
+  screenBitrateKbps: 160
 
 ingress:
   enabled: true
-  redirect: true
+  redirect: false
   className: nginx
   annotations:
     cert-manager.io/issuer: letsencrypt-prod
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     kubernetes.io/tls-acme: "true"
   hosts:
-    - host: app.videocall.rs
+    - host: app.YOUR_DOMAIN_NAME
       paths:
         - path: /
           pathType: Prefix
@@ -63,11 +62,7 @@ ingress:
             name: rustlemania-ui
             port:
               number: 80
-    # setup redirect from rustlemania.com to app.videocall.rs
-    # NOTE: rustlemania.com is now handled by a separate redirect Ingress defined in templates/redirect-ingress.yaml
   tls:
     - secretName: rustlemania-ui-tls
       hosts:
-        - app.videocall.rs
-        - transport.rustlemania.com
-        # rustlemania.com cert is still referenced by redirect Ingress
+        - app.YOUR_DOMAIN_NAME

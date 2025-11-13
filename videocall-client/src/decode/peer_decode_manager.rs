@@ -32,6 +32,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
@@ -143,10 +144,31 @@ impl Peer {
         ),
         JsValue,
     > {
+        // Create decoders without canvas (will be set later via set_canvas)
+        // We still keep the canvas IDs for backward compatibility with existing code
+        let video_decoder = VideoPeerDecoder::new(None)?;
+        let screen_decoder = VideoPeerDecoder::new(None)?;
+
+        // Attempt to set canvas immediately if available in DOM
+        if let Some(window) = web_sys::window() {
+            if let Some(document) = window.document() {
+                if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
+                    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+                        let _ = video_decoder.set_canvas(canvas);
+                    }
+                }
+                if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
+                    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+                        let _ = screen_decoder.set_canvas(canvas);
+                    }
+                }
+            }
+        }
+
         Ok((
             create_audio_peer_decoder(None, peer_id.to_string())?,
-            VideoPeerDecoder::new(video_canvas_id)?,
-            VideoPeerDecoder::new(screen_canvas_id)?,
+            video_decoder,
+            screen_decoder,
         ))
     }
 
@@ -408,6 +430,32 @@ impl PeerDecodeManager {
 
     pub fn get(&self, key: &String) -> Option<&Peer> {
         self.connected_peers.get(key)
+    }
+
+    /// Set the canvas element for a peer's video decoder
+    pub fn set_peer_video_canvas(
+        &self,
+        peer_id: &str,
+        canvas: web_sys::HtmlCanvasElement,
+    ) -> Result<(), JsValue> {
+        if let Some(peer) = self.connected_peers.get(&peer_id.to_string()) {
+            peer.video.set_canvas(canvas)
+        } else {
+            Err(JsValue::from_str(&format!("Peer {peer_id} not found")))
+        }
+    }
+
+    /// Set the canvas element for a peer's screen share decoder
+    pub fn set_peer_screen_canvas(
+        &self,
+        peer_id: &str,
+        canvas: web_sys::HtmlCanvasElement,
+    ) -> Result<(), JsValue> {
+        if let Some(peer) = self.connected_peers.get(&peer_id.to_string()) {
+            peer.screen.set_canvas(canvas)
+        } else {
+            Err(JsValue::from_str(&format!("Peer {peer_id} not found")))
+        }
     }
 
     pub fn run_peer_monitor(&mut self) {

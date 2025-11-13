@@ -53,7 +53,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     // Auth check effect
     {
         let auth_checked = auth_checked.clone();
-        let navigator = navigator.clone();
         use_effect_with((), move |_| {
             log::info!("OAuth enabled check: {}", oauth_enabled().unwrap_or(false));
             if oauth_enabled().unwrap_or(false) {
@@ -66,7 +65,17 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         }
                         Err(e) => {
                             log::warn!("No active session, redirecting to login. Error: {e:?}");
-                            navigator.push(&Route::Login);
+                            // Redirect to login with returnTo parameter to preserve meeting URL
+                            if let Some(win) = window() {
+                                if let Ok(current_url) = win.location().href() {
+                                    let login_url = format!(
+                                        "/login?returnTo={}",
+                                        urlencoding::encode(&current_url)
+                                    );
+                                    log::info!("Redirecting to: {}", login_url);
+                                    let _ = win.location().set_href(&login_url);
+                                }
+                            }
                         }
                     }
                 });

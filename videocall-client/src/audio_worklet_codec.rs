@@ -18,6 +18,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use gloo_utils::format::JsValueSerdeExt;
 use js_sys::{Array, Function};
 use serde::Serialize;
 use wasm_bindgen_futures::JsFuture;

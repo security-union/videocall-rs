@@ -26,7 +26,7 @@ pub fn login() -> Html {
     let login = Callback::from(|_: MouseEvent| match login_url() {
         Ok(mut url) => {
             // Check if there's a returnTo parameter in the current URL
-            if let Some(win) = window().location().search().ok() {
+            if let Ok(win) = window().location().search() {
                 if !win.is_empty() {
                     // Append the query parameters from the current URL to the backend login URL
                     url = format!("{}{}", url, win);

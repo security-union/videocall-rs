@@ -17,15 +17,14 @@
  */
 
 use crate::components::canvas_generator::generate_for_peer;
+use crate::context::VideoCallClientCtx;
 use futures::future::{AbortHandle, Abortable};
-use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use yew::prelude::*;
 
 #[derive(Properties, Debug, PartialEq, Clone)]
 pub struct PeerTileProps {
     pub peer_id: String,
-    pub client: VideoCallClient,
     /// True when layout has only this peer and no screen share; affects styling
     #[prop_or(false)]
     pub full_bleed: bool,
@@ -36,6 +35,7 @@ pub enum Msg {
 }
 
 pub struct PeerTile {
+    client: videocall_client::VideoCallClient,
     audio_enabled: bool,
     video_enabled: bool,
     screen_enabled: bool,
@@ -46,8 +46,15 @@ impl Component for PeerTile {
     type Message = Msg;
     type Properties = PeerTileProps;
 
-    fn create(_ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self {
+        // Query context ONCE on creation and cache it
+        let (client, _) = ctx
+            .link()
+            .context::<VideoCallClientCtx>(Callback::noop())
+            .expect("VideoCallClient context missing");
+
         Self {
+            client,
             audio_enabled: false,
             video_enabled: false,
             screen_enabled: false,
@@ -58,16 +65,9 @@ impl Component for PeerTile {
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         if first_render {
             // Initialize from client snapshot to avoid waiting for first diagnostic
-            self.audio_enabled = ctx
-                .props()
-                .client
-                .is_audio_enabled_for_peer(&ctx.props().peer_id);
-            self.video_enabled = ctx
-                .props()
-                .client
-                .is_video_enabled_for_peer(&ctx.props().peer_id);
-            self.screen_enabled = ctx
-                .props()
+            self.audio_enabled = self.client.is_audio_enabled_for_peer(&ctx.props().peer_id);
+            self.video_enabled = self.client.is_video_enabled_for_peer(&ctx.props().peer_id);
+            self.screen_enabled = self
                 .client
                 .is_screen_share_enabled_for_peer(&ctx.props().peer_id);
 
@@ -139,11 +139,7 @@ impl Component for PeerTile {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
-        generate_for_peer(
-            &ctx.props().client,
-            &ctx.props().peer_id,
-            ctx.props().full_bleed,
-        )
+        generate_for_peer(&self.client, &ctx.props().peer_id, ctx.props().full_bleed)
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {

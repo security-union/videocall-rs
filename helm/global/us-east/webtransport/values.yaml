@@ -45,6 +45,8 @@ rustlemania-webtransport:
     - name: TOKIO_BLOCKING_THREADS
       value: "2"  # Small pool for blocking crypto operations
 
+  certificateDomain: "webtransport-us-east.webtransport.video"
+
   resources:
     limits:
       cpu: "3500m"

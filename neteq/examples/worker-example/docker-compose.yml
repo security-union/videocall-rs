@@ -16,7 +16,6 @@ services:
         RUN go mod download
 
         COPY main.go ./
-        COPY oggreader ./oggreader
         RUN CGO_ENABLED=0 GOOS=linux go build -o /tmp/audio-streamer main.go
 
         # Build WASM

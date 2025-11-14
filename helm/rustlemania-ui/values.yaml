@@ -9,13 +9,13 @@ image:
   repository: securityunion/rustlemania-ui
   pullPolicy: Always
   tag: latest
-  resources:
-    limits:
-      cpu: "100m" # 100% of a single CPU
-      memory: "128Mi" # 128 * 1024 *1024 bytes
-    requests:
-      cpu: "50m" # 50% of a single CPU
-      memory: "64Mi"#  64 * 1024 *1024 bytes
+resources:
+  limits:
+    cpu: "100m" # 100% of a single CPU
+    memory: "128Mi" # 128 * 1024 *1024 bytes
+  requests:
+    cpu: "50m" # 50% of a single CPU
+    memory: "64Mi"#  64 * 1024 *1024 bytes
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}

@@ -34,6 +34,25 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             {{- toYaml .Values.env | nindent 12 }}
+            {{- if (lookup "v1" "Secret" .Release.Namespace "postgres-credentials") }}
+              - name: PG_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: postgres-credentials
+                    key: password
+            {{- end }}
+            {{- if (lookup "v1" "Secret" .Release.Namespace "google-oauth-credentials") }}
+              - name: OAUTH_CLIENT_ID
+                valueFrom:
+                  secretKeyRef:
+                    name: google-oauth-credentials
+                    key: client-id
+              - name: OAUTH_CLIENT_SECRET
+                valueFrom:
+                  secretKeyRef:
+                    name: google-oauth-credentials
+                    key: client-secret
+            {{- end }}
           ports:
             - name: ws-api
               containerPort: {{ .Values.service.port }}

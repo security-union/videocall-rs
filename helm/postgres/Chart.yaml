@@ -1,8 +1,10 @@
 apiVersion: v2
-name: rustlemania-postgres
-version: 1.0.0
+name: postgres-us-east
+version: 0.1.0
+description: PostgreSQL database
 
 dependencies:
   - name: postgresql
-    version: 12.5.7
+    version: 18.1.3
     repository: https://charts.bitnami.com/bitnami
+

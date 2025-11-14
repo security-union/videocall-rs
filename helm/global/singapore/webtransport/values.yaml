@@ -57,7 +57,8 @@ rustlemania-webtransport:
     type: LoadBalancer  # LoadBalancer for UDP traffic
     port: 443
     healthPort: 444
-    annotations:
+
+  loadBalancerAnnotations:
       service.beta.kubernetes.io/do-loadbalancer-name: "webtransport-singapore"
       service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
       service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"

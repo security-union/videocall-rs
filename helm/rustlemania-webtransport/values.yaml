@@ -2,19 +2,22 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 nameOverride: ""
-fullnameOverride: ""
+fullnameOverride: "rustlemania-webtransport"
 
 replicaCount: 1
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always
-  tag: high-availability-cf63fcce
+  tag: latest
 command: ['webtransport_server']
 args: []
-tlsSecret: rustlemania-ui-tls
+tlsSecret: webtransport-tls
+certificateDomain: "webtransport.YOUR_DOMAIN_NAME"
+certificate:
+  issuerName: "letsencrypt-prod"
 env:
   - name: RUST_LOG
-    value: debug,quinn=warn
+    value: warn,quinn=warn,web-transport-quinn=warn,async_nats=warn
   - name: NATS_URL
     value: nats:4222
   - name: LISTEN_URL
@@ -29,13 +32,27 @@ env:
     value: "1"  # Default for WebTransport services - adjust per region as needed
   - name: TOKIO_BLOCKING_THREADS
     value: "2"  # Small pool for blocking crypto operations
+  - name: REGION
+    value: "us-east"
+  - name: HOSTNAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: SERVER_ID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: SERVICE_TYPE
+    value: webtransport
+  - name: SERVER_STATS_INTERVAL_SECS
+    value: "5"
 resources:
   limits:
-    cpu: "300m"
-    memory: "300Mi"
+    cpu: "500m"
+    memory: "768Mi"
   requests:
-    cpu: "300m"
-    memory: "300Mi"
+    cpu: "500m"
+    memory: "384Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}
@@ -54,12 +71,4 @@ tolerations: []
 affinity: {}
 # Used to configure cloud provider specific LB service type
 loadBalancerAnnotations:
-  external-dns.alpha.kubernetes.io/hostname: "transport.rustlemania.com"
-  service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
-  service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "3"
-  service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "4"
-  service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
-  service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "5"
-  service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
-  service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
-  service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
+  external-dns.alpha.kubernetes.io/hostname: "webtransport.YOUR_DOMAIN_NAME"

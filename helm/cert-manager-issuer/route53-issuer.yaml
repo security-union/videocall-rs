@@ -1,0 +1,21 @@
+piVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-prod
+  namespace: videocall
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: your-email@yourdomain.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - dns01:
+        route53:
+          region: us-east-1
+          accessKeyIDSecretRef:
+            name: route53-creds
+            key: aws_access_key_id
+          secretAccessKeySecretRef:
+            name: route53-creds
+            key: aws_secret_access_key

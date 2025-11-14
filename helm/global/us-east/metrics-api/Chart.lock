@@ -1,0 +1,6 @@
+dependencies:
+- name: metrics-api
+  repository: file://../../../metrics-api
+  version: 0.1.0
+digest: sha256:29e0657f2530c414e018c5f70b0c02458361919d548095e92b74d24b04731858
+generated: "2025-11-14T11:37:27.808905037-05:00"

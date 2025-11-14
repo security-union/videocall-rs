@@ -84,7 +84,6 @@ ingress:
         - path: /
           pathType: Prefix
           service:
-            name: websocket-rustlemania-websocket
             port:
               number: 8080
     - host: api.YOUR_DOMAIN_NAME
@@ -92,7 +91,6 @@ ingress:
         - path: /
           pathType: Prefix
           service:
-            name: websocket-rustlemania-websocket
             port:
               number: 8080
   tls:

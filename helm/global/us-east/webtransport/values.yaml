@@ -57,17 +57,18 @@ rustlemania-webtransport:
     type: LoadBalancer  # LoadBalancer for UDP traffic
     port: 443
     healthPort: 444
-    annotations:
-      service.beta.kubernetes.io/do-loadbalancer-name: "webtransport-us-east"
-      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
-      service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
-      external-dns.alpha.kubernetes.io/hostname: "webtransport-us-east.webtransport.video"
+
+  loadBalancerAnnotations:
+    external-dns.alpha.kubernetes.io/hostname: "webtransport-us-east.webtransport.video"
+    service.beta.kubernetes.io/do-loadbalancer-name: "webtransport-us-east"
+    service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
+    service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
 
   autoscaling:
     enabled: false

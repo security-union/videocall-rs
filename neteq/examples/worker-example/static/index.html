@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Audio Streamer</title>
+    <script type="module" src="index.js"></script>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 2em;
+      }
+      input,
+      button {
+        font-size: 1em;
+        padding: 0.5em;
+      }
+      #status {
+        margin-top: 1em;
+        color: #555;
+      }
+      .grid-container {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr); /* 2 columns */
+        gap: 10px; /* optional spacing */
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Audio Streamer</h1>
+    <div class="grid-container" style="max-width: 1000px">
+      <div class="item">
+        <input
+          id="url"
+          type="text"
+          placeholder="Enter audio URL (mp3, wav, etc.)"
+          value="https://raw.githubusercontent.com/revdotcom/speech-datasets/main/earnings21/media/4320211.mp3"
+          size="60"
+        />
+      </div>
+      <div class="item">
+        <button id="start">Start Streaming</button>
+      </div>
+      <div class="item">
+        <label>Jitter (ms):</label>
+        <input id="jitter" type="text" placeholder="Jitter (ms)" value="0" size="5" />
+        <label>Packet loss (between 0.0 and 1.0):</label>
+        <input id="packet-loss" type="text" placeholder="Packet loss (between 0.0 and 1.0)" value="0" size="5" />
+      </div>
+      <div class="item">
+        <button id="configure">Set jitter & packet loss</button>
+      </div>
+      <div class="item">
+        <label>Simulate wi-fi drop (pause packet sending for x ms):</label>
+        <input id="pause-duration" type="text" placeholder="Simulate wi-fi drop (ms)" value="500" size="5" />
+      </div>
+      <div class="item">
+        <button id="pause-packets">Pause packets</button>
+      </div>
+      <div class="grid-container">
+        <div>Target delay:</div>
+        <div id="target-delay">0 ms</div>
+        <div>Buffered audio:</div>
+        <div id="buffered-audio">0 ms</div>
+      </div>
+    </div>
+    <div id="status"></div>
+  </body>
+</html>

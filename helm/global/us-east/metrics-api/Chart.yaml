@@ -1,0 +1,17 @@
+apiVersion: v2
+name: metrics-api
+description: Metrics API service for videocall monitoring
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - metrics
+  - monitoring
+  - nats
+  - videocall
+home: https://github.com/your-org/videocall-rs
+sources:
+  - https://github.com/your-org/videocall-rs
+maintainers:
+  - name: Your Name
+    email: your-email@example.com 

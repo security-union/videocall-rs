@@ -14,8 +14,8 @@ window.__APP_CONFIG = Object.freeze({
   usersAllowedToStream: "${USERS_ALLOWED_TO_STREAM:-}",
   serverElectionPeriodMs: ${SERVER_ELECTION_PERIOD_MS:-2000},
   audioBitrateKbps: ${AUDIO_BITRATE_KBPS:-65},
-  videoBitrateKbps: ${VIDEO_BITRATE_KBPS:-1000},
-  screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-1000}
+  videoBitrateKbps: ${VIDEO_BITRATE_KBPS:-100},
+  screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-100}
 });
 EOF
 

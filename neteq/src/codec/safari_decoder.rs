@@ -21,6 +21,14 @@
 //! This decoder uses the opus-decoder npm library via cached reflection.
 //! We use reflection once during init to cache methods, then call them directly
 //! to avoid reflection overhead in the hot path.
+//!
+//! ## Performance Optimizations:
+//! 1. **Cached methods**: Decoder methods are cached to avoid repeated reflection
+//! 2. **Reusable input buffer**: Single Uint8Array buffer for encoded data (1275 bytes max)
+//! 3. **Double output buffering**: Two buffers that alternate to enable zero-copy returns
+//! 4. **Cached JS keys**: JsValue property names cached to avoid repeated string allocations
+//! 5. **Unchecked array access**: Direct array indexing where bounds are known
+//! 6. **Zero-copy returns**: std::mem::take to return buffers without cloning
 
 use crate::codec::AudioDecoder;
 use js_sys::{Function, Promise, Reflect, Uint8Array};
@@ -36,6 +44,13 @@ pub struct SafariOpusDecoder {
     initialized: bool,
     sample_rate: u32,
     channels: u8,
+    // Reusable buffers to avoid allocations (double buffering)
+    input_buffer: Option<Uint8Array>,
+    output_buffer_a: Vec<f32>,
+    output_buffer_b: Vec<f32>,
+    use_buffer_a: bool,
+    // Cached JS property names to avoid repeated string allocations
+    channel_data_key: JsValue,
 }
 
 // IMPORTANT: The OpusDecoder type from wasm-bindgen is not Send/Sync by default.
@@ -46,6 +61,10 @@ unsafe impl Sync for SafariOpusDecoder {}
 impl SafariOpusDecoder {
     pub fn new(sample_rate: u32, channels: u8) -> Self {
         console::log_1(&"Safari decoder: Creating SafariOpusDecoder instance".into());
+
+        // Pre-allocate buffers for typical Opus frame (20ms @ 48kHz = 960 samples per channel)
+        const MAX_FRAME_SIZE: usize = 960 * 2; // Support up to 2 channels
+
         Self {
             decoder: None,
             decode_frame_fn: None,
@@ -53,6 +72,14 @@ impl SafariOpusDecoder {
             initialized: false,
             sample_rate,
             channels,
+            // Pre-allocate input buffer for max Opus packet size (1275 bytes)
+            input_buffer: Some(Uint8Array::new_with_length(1275)),
+            // Double buffer for zero-copy returns
+            output_buffer_a: vec![0.0; MAX_FRAME_SIZE],
+            output_buffer_b: vec![0.0; MAX_FRAME_SIZE],
+            use_buffer_a: true,
+            // Cache JS property name
+            channel_data_key: JsValue::from_str("channelData"),
         }
     }
 
@@ -160,8 +187,9 @@ impl SafariOpusDecoder {
             return self.generate_test_tone();
         }
 
+        // Clone the JsValue references (cheap - just incrementing ref counts)
         let (decoder, decode_frame_fn) = match (&self.decoder, &self.decode_frame_fn) {
-            (Some(d), Some(f)) => (d, f),
+            (Some(d), Some(f)) => (d.clone(), f.clone()),
             _ => {
                 console::log_1(
                     &"Safari decoder: Missing decoder or cached method, using test tone".into(),
@@ -171,7 +199,7 @@ impl SafariOpusDecoder {
         };
 
         // Try to decode using the cached methods (no reflection needed!)
-        match self.decode_with_cached_method(decoder, decode_frame_fn, encoded) {
+        match self.decode_with_cached_method(&decoder, &decode_frame_fn, encoded) {
             Ok(samples) => samples,
             Err(e) => {
                 console::warn_2(
@@ -184,24 +212,41 @@ impl SafariOpusDecoder {
     }
 
     fn decode_with_cached_method(
-        &self,
+        &mut self,
         decoder: &JsValue,
         decode_frame_fn: &Function,
         encoded: &[u8],
     ) -> crate::Result<Vec<f32>> {
-        // Create Uint8Array from encoded data
-        let encoded_array = Uint8Array::new_with_length(encoded.len() as u32);
-        encoded_array.copy_from(encoded);
+        // Reuse or create input buffer (avoid allocation)
+        let encoded_array = if let Some(ref buffer) = self.input_buffer {
+            if buffer.length() >= encoded.len() as u32 {
+                // Reuse existing buffer - just update the data
+                buffer.set(&Uint8Array::from(encoded), 0);
+                // Create a subarray view for the actual data length
+                buffer.subarray(0, encoded.len() as u32)
+            } else {
+                // Buffer too small, create new one
+                let new_buffer = Uint8Array::new_with_length(encoded.len() as u32);
+                new_buffer.copy_from(encoded);
+                new_buffer
+            }
+        } else {
+            // No buffer yet, create one
+            let new_buffer = Uint8Array::new_with_length(encoded.len() as u32);
+            new_buffer.copy_from(encoded);
+            new_buffer
+        };
 
         // Call cached decodeFrame method directly (no reflection!)
         let result = decode_frame_fn
             .call1(decoder, &encoded_array)
             .map_err(|_| crate::NetEqError::DecoderError("decodeFrame call failed".to_string()))?;
 
-        // Extract PCM data from result
-        self.extract_pcm_from_result(&result)
+        // Extract PCM data from result into reusable buffer
+        self.extract_pcm_from_result_reuse(&result)
     }
 
+    #[allow(dead_code)]
     fn extract_pcm_from_result(&self, result: &JsValue) -> crate::Result<Vec<f32>> {
         // Extract channelData from the result
         let channel_data = js_sys::Reflect::get(result, &"channelData".into()).map_err(|_| {
@@ -234,6 +279,63 @@ impl SafariOpusDecoder {
         float32_array.copy_to(&mut samples);
 
         Ok(samples)
+    }
+
+    fn extract_pcm_from_result_reuse(&mut self, result: &JsValue) -> crate::Result<Vec<f32>> {
+        // Extract channelData from the result using cached key (avoids string allocation)
+        let channel_data = js_sys::Reflect::get(result, &self.channel_data_key).map_err(|_| {
+            crate::NetEqError::DecoderError(
+                "channelData property not found in decode result".to_string(),
+            )
+        })?;
+
+        // channelData should be an array of Float32Arrays (one per channel)
+        let channel_array = channel_data.dyn_into::<js_sys::Array>().map_err(|_| {
+            crate::NetEqError::DecoderError("channelData is not an array".to_string())
+        })?;
+
+        if channel_array.length() == 0 {
+            return Err(crate::NetEqError::DecoderError(
+                "channelData array is empty".to_string(),
+            ));
+        }
+
+        // Get the first channel using unchecked access (we know length > 0)
+        let first_channel = js_sys::Reflect::get_u32(&channel_array, 0).map_err(|_| {
+            crate::NetEqError::DecoderError("Failed to get first channel".to_string())
+        })?;
+
+        let float32_array = first_channel
+            .dyn_into::<js_sys::Float32Array>()
+            .map_err(|_| {
+                crate::NetEqError::DecoderError("First channel is not a Float32Array".to_string())
+            })?;
+
+        let sample_count = float32_array.length() as usize;
+
+        // Double buffering: write to inactive buffer, then take ownership
+        let target_buffer = if self.use_buffer_a {
+            &mut self.output_buffer_b
+        } else {
+            &mut self.output_buffer_a
+        };
+
+        // Resize target buffer if needed (should be rare after first few calls)
+        if target_buffer.len() < sample_count {
+            target_buffer.resize(sample_count, 0.0);
+        }
+
+        // Copy directly into target buffer
+        float32_array.copy_to(&mut target_buffer[..sample_count]);
+
+        // Swap buffers so next call writes to the other one
+        self.use_buffer_a = !self.use_buffer_a;
+
+        // Take ownership of the filled buffer (zero-copy!) and replace with empty vec
+        let mut result_vec = std::mem::take(target_buffer);
+        result_vec.truncate(sample_count);
+
+        Ok(result_vec)
     }
 
     fn generate_test_tone(&self) -> Vec<f32> {

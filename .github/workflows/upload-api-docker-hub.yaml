@@ -7,7 +7,7 @@ on:
   push:
     branches:
       - main
-      - fix-disconnects
+      - add-auth
     paths:
       - 'actix-api/**'
       - 'types/**'

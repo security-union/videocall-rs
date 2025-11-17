@@ -18,14 +18,13 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use gloo_utils::format::JsValueSerdeExt;
 use js_sys::{Array, Function};
 use serde::Serialize;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{AudioContext, AudioWorkletNode, AudioWorkletNodeOptions, MessagePort};
 
 use wasm_bindgen::prelude::*;
-
-use gloo_utils::format::JsValueSerdeExt;
 
 #[derive(Serialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]

@@ -47,7 +47,17 @@ use sec_api::{
 use tracing::{debug, error, info};
 use videocall_types::truthy;
 
-const SCOPE: &str = "email%20profile%20openid";
+const SCOPE: &str = "email profile";
+
+/**
+ * Query parameters for the login endpoint
+ */
+#[derive(Debug, serde::Deserialize)]
+struct LoginQuery {
+    #[serde(rename = "returnTo")]
+    return_to: Option<String>,
+}
+
 /**
  * Function used by the Web Application to initiate OAuth.
  *
@@ -59,14 +69,18 @@ const SCOPE: &str = "email%20profile%20openid";
 async fn login(
     pool: web::Data<PostgresPool>,
     cfg: web::Data<AppConfig>,
+    query: web::Query<LoginQuery>,
 ) -> Result<HttpResponse, Error> {
     // TODO: verify if user exists in the db by looking at the session cookie, (if the client provides one.)
+    info!("Login endpoint called with query: {:?}", query);
     let pool2 = pool.clone();
+    let return_to = query.return_to.clone();
+    info!("return_to value: {:?}", return_to);
 
     // 2. Generate and Store OAuth Request.
     let (csrf_token, pkce_challenge) = {
         let pool = pool2.clone();
-        web::block(move || generate_and_store_oauth_request(pool)).await?
+        web::block(move || generate_and_store_oauth_request(pool, return_to)).await?
     }
     .map_err(|e| {
         error!("{:?}", e);
@@ -117,7 +131,7 @@ async fn handle_google_oauth_callback(
 
     // 2. Request token from OAuth provider.
     let (oauth_response, claims) = request_token(
-        &cfg.oauth_auth_url,
+        &cfg.oauth_redirect_url,
         &cfg.oauth_client_id,
         &cfg.oauth_secret,
         &oauth_request.pkce_verifier,
@@ -141,17 +155,116 @@ async fn handle_google_oauth_callback(
     })?;
 
     // 4. Create session cookie with email.
-    let cookie = Cookie::build("email", claims.email)
+    let cookie_domain = std::env::var("COOKIE_DOMAIN").ok();
+
+    let mut cookie_builder = Cookie::build("email", claims.email.clone())
         .path("/")
         .same_site(SameSite::Lax)
-        // Session lasts only 360 secs to test cookie expiration.
-        .expires(OffsetDateTime::now_utc().checked_add(Duration::seconds(360)))
-        .finish();
+        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(87600)));
 
-    // 5. Send cookie and redirect browser to AFTER_LOGIN_URL
+    if let Some(domain) = cookie_domain.as_ref() {
+        cookie_builder = cookie_builder.domain(domain.clone());
+    }
+    let cookie = cookie_builder.finish();
+
+    // Also store the name in a separate cookie
+    let mut name_cookie_builder = Cookie::build("name", claims.name.clone())
+        .path("/")
+        .same_site(SameSite::Lax)
+        .expires(OffsetDateTime::now_utc().checked_add(Duration::hours(87600)));
+
+    if let Some(domain) = cookie_domain.as_ref() {
+        name_cookie_builder = name_cookie_builder.domain(domain.clone());
+    }
+    let name_cookie = name_cookie_builder.finish();
+
+    // 5. Send cookies and redirect browser to return_to URL or fallback to after_login_url
+    let redirect_url = oauth_request
+        .return_to
+        .unwrap_or_else(|| cfg.after_login_url.clone());
+    info!(
+        "OAuth login successful for user: {} ({}), redirecting to: {}",
+        claims.name, claims.email, redirect_url
+    );
     let mut response = HttpResponse::Found();
-    response.append_header((LOCATION, cfg.after_login_url.clone()));
+    response.append_header((LOCATION, redirect_url));
     response.cookie(cookie);
+    response.cookie(name_cookie);
+    Ok(response.finish())
+}
+
+/**
+ * Check if the user has an active session
+ * Returns 200 if session is valid, 401 if not
+ */
+#[get("/session")]
+async fn check_session(req: HttpRequest) -> Result<HttpResponse, Error> {
+    debug!("Session check request from: {:?}", req.connection_info());
+    debug!("All cookies: {:?}", req.cookies());
+
+    if let Some(cookie) = req.cookie("email") {
+        if !cookie.value().is_empty() {
+            info!("Session valid for: {}", cookie.value());
+            return Ok(HttpResponse::Ok().finish());
+        }
+    }
+    info!("No valid session found, returning 401");
+    Ok(HttpResponse::Unauthorized().finish())
+}
+
+/**
+ * Get the current user's profile
+ * Returns email and name from session cookies
+ */
+#[get("/profile")]
+async fn get_profile(req: HttpRequest) -> Result<HttpResponse, Error> {
+    let email = req
+        .cookie("email")
+        .map(|c| c.value().to_string())
+        .ok_or_else(|| error::ErrorUnauthorized("No session"))?;
+
+    let name = req
+        .cookie("name")
+        .map(|c| c.value().to_string())
+        .unwrap_or_else(|| email.clone());
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "email": email,
+        "name": name
+    })))
+}
+
+/**
+ * Logout endpoint - clears session cookies
+ */
+#[get("/logout")]
+async fn logout() -> Result<HttpResponse, Error> {
+    info!("User logging out");
+
+    let cookie_domain = std::env::var("COOKIE_DOMAIN").ok();
+
+    // Create expired cookies to clear them
+    let mut email_cookie_builder = Cookie::build("email", "")
+        .path("/")
+        .expires(OffsetDateTime::now_utc());
+
+    if let Some(domain) = cookie_domain.as_ref() {
+        email_cookie_builder = email_cookie_builder.domain(domain.clone());
+    }
+    let email_cookie = email_cookie_builder.finish();
+
+    let mut name_cookie_builder = Cookie::build("name", "")
+        .path("/")
+        .expires(OffsetDateTime::now_utc());
+
+    if let Some(domain) = cookie_domain.as_ref() {
+        name_cookie_builder = name_cookie_builder.domain(domain.clone());
+    }
+    let name_cookie = name_cookie_builder.finish();
+
+    let mut response = HttpResponse::Ok();
+    response.cookie(email_cookie);
+    response.cookie(name_cookie);
     Ok(response.finish())
 }
 
@@ -240,7 +353,8 @@ async fn main() -> std::io::Result<()> {
         std::env::var("OAUTH_CLIENT_SECRET").unwrap_or_else(|_| String::from(""));
     let oauth_redirect_url: String =
         std::env::var("OAUTH_REDIRECT_URL").unwrap_or_else(|_| String::from(""));
-    let after_login_url: String = std::env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from(""));
+    let after_login_url: String =
+        std::env::var("UI_ENDPOINT").unwrap_or_else(|_| String::from("/"));
     let db_enabled: bool = truthy(Some(
         &std::env::var("DATABASE_ENABLED").unwrap_or_else(|_| String::from("false")),
     ));
@@ -256,9 +370,13 @@ async fn main() -> std::io::Result<()> {
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
                 }))
+                .service(check_session)
+                .service(get_profile)
+                .service(logout)
                 .service(ws_connect)
-        } else {
-            let pool = if db_enabled { Some(get_pool()) } else { None };
+        } else if db_enabled {
+            // OAuth requires database
+            let pool = get_pool();
             App::new()
                 .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(AppState {
@@ -277,6 +395,23 @@ async fn main() -> std::io::Result<()> {
                 .wrap(cors)
                 .service(handle_google_oauth_callback)
                 .service(login)
+                .service(check_session)
+                .service(get_profile)
+                .service(logout)
+                .service(ws_connect)
+        } else {
+            // OAuth configured but database disabled - skip OAuth routes
+            error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");
+            App::new()
+                .wrap(cors)
+                .app_data(web::Data::new(AppState {
+                    chat: chat.clone(),
+                    nats_client: nats_client.clone(),
+                    tracker_sender: tracker_sender.clone(),
+                }))
+                .service(check_session)
+                .service(get_profile)
+                .service(logout)
                 .service(ws_connect)
         }
     })

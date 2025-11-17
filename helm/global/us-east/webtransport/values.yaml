@@ -41,17 +41,17 @@ rustlemania-webtransport:
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
     - name: TOKIO_WORKER_THREADS
-      value: "1"  # Optimal for 1000m CPU (WebTransport + crypto operations)
+      value: "4"  # Optimal for 3500m CPU (WebTransport + crypto operations)
     - name: TOKIO_BLOCKING_THREADS
       value: "2"  # Small pool for blocking crypto operations
 
   resources:
     limits:
-      cpu: "1000m"
-      memory: "1400Mi"
+      cpu: "3500m"
+      memory: "6000Mi"
     requests:
-      cpu: "1000m"
-      memory: "1400Mi"
+      cpu: "3500m"
+      memory: "6000Mi"
 
   service:
     type: LoadBalancer  # LoadBalancer for UDP traffic

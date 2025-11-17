@@ -439,7 +439,7 @@ impl VideoCallClient {
             Ok(inner) => {
                 if let Some(connection_controller) = &inner.connection_controller {
                     if let Err(e) = connection_controller.send_packet(media) {
-                        error!("Failed to send {packet_type:?} packet: {e}");
+                        debug!("Failed to send {packet_type:?} packet: {e}");
                     }
                 } else {
                     error!("No connection manager available for {packet_type:?} packet");
@@ -574,6 +574,58 @@ impl VideoCallClient {
     /// or None if diagnostics are disabled.
     pub fn get_diagnostics(&self) -> Option<String> {
         self.inner.borrow().peer_decode_manager.get_all_fps_stats()
+    }
+
+    /// Set the canvas element for a peer's video rendering
+    ///
+    /// This method allows you to pass a canvas reference directly instead of relying on DOM queries.
+    /// Should be called when the canvas element is mounted in the UI.
+    ///
+    /// # Arguments
+    /// * `peer_id` - The ID of the peer
+    /// * `canvas` - The HtmlCanvasElement to render video frames to
+    ///
+    /// # Returns
+    /// * `Ok(())` if successful
+    /// * `Err(JsValue)` if the peer doesn't exist or canvas setup fails
+    pub fn set_peer_video_canvas(
+        &self,
+        peer_id: &str,
+        canvas: web_sys::HtmlCanvasElement,
+    ) -> Result<(), JsValue> {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner
+                .peer_decode_manager
+                .set_peer_video_canvas(peer_id, canvas)
+        } else {
+            Err(JsValue::from_str("Failed to borrow inner state"))
+        }
+    }
+
+    /// Set the canvas element for a peer's screen share rendering
+    ///
+    /// This method allows you to pass a canvas reference directly instead of relying on DOM queries.
+    /// Should be called when the canvas element is mounted in the UI.
+    ///
+    /// # Arguments
+    /// * `peer_id` - The ID of the peer
+    /// * `canvas` - The HtmlCanvasElement to render screen frames to
+    ///
+    /// # Returns
+    /// * `Ok(())` if successful
+    /// * `Err(JsValue)` if the peer doesn't exist or canvas setup fails
+    pub fn set_peer_screen_canvas(
+        &self,
+        peer_id: &str,
+        canvas: web_sys::HtmlCanvasElement,
+    ) -> Result<(), JsValue> {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner
+                .peer_decode_manager
+                .set_peer_screen_canvas(peer_id, canvas)
+        } else {
+            Err(JsValue::from_str("Failed to borrow inner state"))
+        }
     }
 
     /// Get the FPS for a specific peer and media type

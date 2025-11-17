@@ -78,7 +78,7 @@ impl NetEqAudioPeerDecoder {
             self.send_message_immediate(msg);
         } else {
             // Worker not ready - queue the message
-            log::info!(
+            log::debug!(
                 "🔄 Queueing message for peer {} (worker not ready)",
                 self.peer_id
             );
@@ -379,7 +379,7 @@ impl NetEqAudioPeerDecoder {
                                     {
                                         log::error!("Failed to send queued message: {e:?}");
                                     } else {
-                                        log::info!("📤 Sent queued message: {msg:?}");
+                                        log::debug!("📤 Sent queued message: {msg:?}");
                                     }
                                 }
                             }
@@ -565,7 +565,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
             self.peer_id,
             muted
         );
-        log::info!(
+        log::debug!(
             "✅ Mute message {} for peer {} (muted: {}) at {:.0}ms",
             if is_ready {
                 "sent immediately"

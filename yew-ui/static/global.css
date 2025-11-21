@@ -38,6 +38,10 @@
   width: 100vw;
   height: 100vh;
   z-index: 0;
+
+  /* No borders for full bleed */
+  border-width: 0;
+  border-radius: 0;
 }
 .grid-item.full-bleed .canvas-container,
 .grid-item.full-bleed canvas {

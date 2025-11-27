@@ -1,0 +1,51 @@
+services:
+  server:
+    build:
+      context: .
+      additional_contexts:
+        project_root: ../../..
+      dockerfile_inline: |
+        # Build server
+        FROM golang:1.24-alpine AS go-builder
+
+        RUN apk add --no-cache git build-base
+
+        WORKDIR /app
+
+        COPY go.mod go.sum* ./
+        RUN go mod download
+
+        COPY main.go ./
+        RUN CGO_ENABLED=0 GOOS=linux go build -o /tmp/audio-streamer main.go
+
+        # Build WASM
+        FROM rust:1-slim AS rust-builder
+
+        RUN apt-get update -y && apt-get install -y git curl
+
+        RUN rustup target add wasm32-unknown-unknown
+        RUN cargo install wasm-bindgen-cli --version 0.2.104
+
+        WORKDIR /app
+
+        COPY --from=project_root . .
+
+        RUN cargo build --target wasm32-unknown-unknown --features web,matomo-logger --bin neteq_wasm --no-default-features --release
+        RUN wasm-bindgen ./target/wasm32-unknown-unknown/release/neteq_wasm.wasm --out-dir "/tmp/wasm" --target web
+
+        # Put everything together
+        FROM alpine:3.20
+
+        RUN apk add --no-cache ffmpeg ca-certificates
+
+        WORKDIR /app
+
+        COPY --from=go-builder /tmp/audio-streamer /app/audio-streamer
+        COPY --from=rust-builder /tmp/wasm /app/wasm
+
+        # Default command
+        CMD ["/app/audio-streamer"]
+    ports:
+      - 8080:8080
+    volumes:
+      - ./static:/app/static

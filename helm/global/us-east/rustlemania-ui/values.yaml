@@ -23,7 +23,7 @@ rustlemania-ui:
   image:
     repository: securityunion/rustlemania-ui
     pullPolicy: Always
-    tag: add-auth-7f419aaa
+    tag: latest
 
   resources:
     limits:

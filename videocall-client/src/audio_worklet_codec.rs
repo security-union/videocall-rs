@@ -18,6 +18,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use gloo_utils::format::JsValueSerdeExt;
 use js_sys::{Array, Function};
 use serde::Serialize;
 use wasm_bindgen_futures::JsFuture;
@@ -171,7 +172,7 @@ impl AudioWorkletCodec {
         self.get_port()
             .ok_or(JsValue::from_str("AudioWorkletNode is not instantiated"))
             .and_then(|port| {
-                serde_wasm_bindgen::to_value(&message)
+                JsValue::from_serde(&message)
                     .map_err(|e| JsValue::from_str(&e.to_string()))
                     .and_then(|val| port.post_message(&val))
             })

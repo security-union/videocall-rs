@@ -16,6 +16,9 @@
  * conditions.
  */
 
+const ENERGY_THRESHOLD_DECREASE_FACTOR: f32 = 0.995;
+const ENERGY_THRESHOLD_INCREASE_FACTOR: f32 = 1.002;
+
 /// Return codes for time-stretching operations
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TimeStretchResult {
@@ -45,6 +48,7 @@ pub struct Accelerate {
     used_input_samples: usize,
     overlap_length: usize,
     _max_change_rate: f32,
+    low_energy_threshold: f32,
 }
 
 impl Accelerate {
@@ -56,6 +60,7 @@ impl Accelerate {
             used_input_samples: 0,
             overlap_length: Self::calculate_overlap_length(sample_rate),
             _max_change_rate: 0.25, // Maximum 25% reduction
+            low_energy_threshold: 0.0001,
         }
     }
 
@@ -176,10 +181,21 @@ impl Accelerate {
     ) -> (usize, usize) {
         let usable_input = &input[..output.len() + max_remove];
 
-        let (best_pos, best_len) =
-            Self::longest_low_energy_region(usable_input, 0.001, |i: usize, len: usize| -> bool {
+        let (best_pos, best_len) = Self::longest_low_energy_region(
+            usable_input,
+            self.low_energy_threshold,
+            |i: usize, len: usize| -> bool {
                 i + len.saturating_sub(self.overlap_length).min(max_remove) <= output.len()
-            });
+            },
+        );
+
+        if best_len > max_remove {
+            // we have more than enough to remove, lower the energy threshold
+            self.low_energy_threshold *= ENERGY_THRESHOLD_DECREASE_FACTOR;
+        } else if best_len < max_remove / 2 {
+            // not enough to remove, slowly increase the energy threshold
+            self.low_energy_threshold *= ENERGY_THRESHOLD_INCREASE_FACTOR;
+        }
 
         let samples_to_remove = best_len.saturating_sub(self.overlap_length).min(max_remove);
 

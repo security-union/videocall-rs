@@ -323,7 +323,7 @@ pub struct PreemptiveExpand {
     _channels: u8,
     used_input_samples: usize,
     overlap_length: usize,
-    max_expansion_rate: f32,
+    corr_threshold: f32,
 }
 
 impl PreemptiveExpand {
@@ -334,7 +334,7 @@ impl PreemptiveExpand {
             _channels: channels,
             used_input_samples: 0,
             overlap_length: Self::calculate_overlap_length(sample_rate),
-            max_expansion_rate: 0.25, // Maximum 25% expansion
+            corr_threshold: 0.99,
         }
     }
 
@@ -361,8 +361,11 @@ impl PreemptiveExpand {
         let energy = self.calculate_energy(input);
         let is_low_energy = energy < 0.01; // Threshold for low energy detection
 
-        // Target to add 25% of frame length but cap by max_expansion_rate
-        let max_add = (output.len() as f32 / (1.0 + 1.0 / self.max_expansion_rate)) as usize;
+        // With 30ms input overlap_length is 3ms and max_add is about 13.5ms. Human voice
+        // is around 85 to 400Hz (including children). 85Hz is about 12ms, 400Hz is about
+        // 2.5ms. The correlation lag (aka: add_len) goes from overlap_length (3ms) to
+        // max_add (13.5ms), which mostly covers the range of the human voice.
+        let max_add = (output.len() - self.overlap_length) / 2;
         if max_add < self.overlap_length {
             // Not enough samples to expand
             output.copy_from_slice(&input[..output.len()]);
@@ -370,39 +373,50 @@ impl PreemptiveExpand {
             return TimeStretchResult::NoStretch;
         }
 
-        let mut best_corr2 = -1.0f32;
+        let mut best_corr = -1.0f32;
         let mut best_pos = 0;
         let mut best_add_len = 0;
         for add_len in self.overlap_length..max_add {
-            let correlation_len = output.len() - add_len * 2 - self.overlap_length;
-            let (pos, corr2) = crate::signal::best_normalized_correlation(
+            let correlation_len = output.len() - add_len * 2;
+            let (pos, corr) = crate::signal::best_normalized_correlation(
                 &input[add_len..correlation_len + add_len],
                 &input[..correlation_len],
                 self.overlap_length,
             );
-            if corr2 > best_corr2 {
-                best_corr2 = corr2;
-                best_pos = add_len + pos;
+            if corr > best_corr {
+                best_corr = corr;
+                best_pos = pos;
                 best_add_len = add_len;
             }
+        }
+
+        if best_corr < self.corr_threshold {
+            self.corr_threshold *= 0.98;
+
+            // Correlation is too low
+            output.copy_from_slice(&input[..output.len()]);
+            self.used_input_samples = output.len();
+            return TimeStretchResult::NoStretch;
+        } else {
+            self.corr_threshold = self.corr_threshold.max(best_corr * 0.95);
         }
 
         let usable_input = &input[..output.len() - best_add_len];
 
         // Copy first part
-        output[..best_pos].copy_from_slice(&usable_input[..best_pos]);
+        output[..best_add_len + best_pos].copy_from_slice(&usable_input[..best_add_len + best_pos]);
 
         // Crossfade duplicate region
         crate::signal::crossfade(
+            &usable_input[best_add_len + best_pos..best_add_len + best_pos + self.overlap_length],
             &usable_input[best_pos..best_pos + self.overlap_length],
-            &usable_input[best_pos - best_add_len..best_pos - best_add_len + self.overlap_length],
             self.overlap_length,
-            &mut output[best_pos..best_pos + self.overlap_length],
+            &mut output[best_add_len + best_pos..best_add_len + best_pos + self.overlap_length],
         );
 
         // Append rest
-        output[best_pos + self.overlap_length..]
-            .copy_from_slice(&usable_input[best_pos - best_add_len + self.overlap_length..]);
+        output[best_add_len + best_pos + self.overlap_length..]
+            .copy_from_slice(&usable_input[best_pos + self.overlap_length..]);
 
         self.used_input_samples = usable_input.len();
 

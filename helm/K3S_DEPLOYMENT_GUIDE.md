@@ -1,6 +1,10 @@
 # K3s Deployment Guide for VideoCall-RS
 
-This guide outlines how to deploy a simple Kubernetes cluster with VideoCall-RS application on a bare K3s cluster. It includes both the infrastructure components and application-specific services with a simplified configuration.  We encourage you to read through this doc in its entirety first, ensure you understand what values need to be customized (and customize them!) before you go crazy deploying with cut and paste!
+This guide outlines how to deploy a simple Kubernetes cluster with VideoCall-RS application on a bare K3s cluster. It includes both the infrastructure components and application-specific services with a simplified configuration.
+
+**Updated for Unified Chart**: This guide now uses the unified `videocall` Helm chart which deploys all application components (UI, WebSocket, WebTransport, Website, Metrics) in a single install. Infrastructure components (NATS, Prometheus, etc.) are installed separately from `helm-videocall-deployment/infrastructure/`.
+
+We encourage you to read through this doc in its entirety first, ensure you understand what values need to be customized (and customize them!) before you go crazy deploying with cut and paste!
 
 ## Prerequisites
 
@@ -9,11 +13,46 @@ This guide outlines how to deploy a simple Kubernetes cluster with VideoCall-RS 
 - Ability to open necessary ports (80, 443, 443/UDP for WebTransport)
 - Clone the github repo https://github.com/security-union/videocall-rs locally and ensure you do your work from the root of the cloned repo (within the `videocall-rs` directory)
 
-**Before proceeding, find all occurrences of `YOUR_DOMAIN_NAME` within the files located in the `videocall-rs/helm` directory tree.  Every occurrence should be replaced with your domain name where you will be deploying.  You must have a valid domain name, the procedure below requires you to use cert-manager and optionally external dns to set DNS entries for use with obtaining valid SSL certificates and resolving DNS names.  For example:**
+**Before proceeding, you'll need to create a values file for your domain.** You must have a valid domain name - the procedure below requires cert-manager and optionally external-dns to set DNS entries for use with obtaining valid SSL certificates and resolving DNS names.
+
+Create a custom values file for your deployment:
 ```bash
-find helm -type f -name "*.yaml" -exec sed -i 's/YOUR_DOMAIN_NAME/yourdomainname/g' {} +
+cat > my-values.yaml <<EOF
+global:
+  domain: "yourdomain.com"  # Replace with your actual domain
+  region: "your-region"
+  natsUrl: "nats:4222"
+
+ui:
+  enabled: true
+  runtimeConfig:
+    apiBaseUrl: "https://api.yourdomain.com"
+    wsUrl: "wss://websocket.yourdomain.com"
+    webTransportHost: "https://webtransport.yourdomain.com:443"
+
+websocket:
+  enabled: true
+  ingress:
+    hosts:
+      - host: websocket.yourdomain.com
+      - host: api.yourdomain.com
+
+webtransport:
+  enabled: true
+  certificateDomain: "webtransport.yourdomain.com"
+
+website:
+  enabled: false  # Optional
+
+metricsClient:
+  enabled: true
+
+metricsServer:
+  enabled: true
+EOF
 ```
-but use your actual domain name in the place of "yourdomainname" (e.g., `example.com`).
+
+Replace `yourdomain.com` with your actual domain (e.g., `example.com`).
 
 ## 1. K3s Base Installation
 
@@ -99,9 +138,9 @@ helm repo update
 ```
 Install Cert Manager:
 ```bash
-helm install cert-manager helm/cert-manager \
+helm install cert-manager helm-videocall-deployment/infrastructure/cert-manager \
   --namespace cert-manager \
-  --create-namespace \
+  --create-namespace
 ```
 
 You only need to install one Issuer.  Below are examples of a AWS Route 53 Issuer and a CloudFlare Issuer.  If you are using different DNS management, consult the Cert Manager documentation: https://cert-manager.io/docs/configuration/acme/dns01
@@ -137,7 +176,7 @@ Configure the LetsEncrypt Issuer in the videocall namespace using AWS Route 53 f
 Refer to [Configuring DNS01 Challenge Provider](https://cert-manager.io/docs/configuration/acme/dns01/).
 
 
-In the steps below, you must use your own AWS Access Key details.  Additionally, locate and edit the `helm/cluster-manager-issuer/route53-issuer.yaml` and update the `email` attribute with your own email.   Do that now before continuing.
+In the steps below, you must use your own AWS Access Key details.  Additionally, locate and edit `helm-videocall-deployment/infrastructure/cert-manager-issuer/route53-issuer.yaml` and update the `email` attribute with your own email.   Do that now before continuing.
 ```bash
 # Create a secret for AWS Route53 API credentials
 kubectl create secret generic route53-creds -n videocall \
@@ -145,7 +184,7 @@ kubectl create secret generic route53-creds -n videocall \
   --from-literal=aws_secret_access_key=YOUR_AWS_SECRET_ACCESS_KEY
 
 # Create the namespace-scoped Issuer with DNS01 challenge using Route53
-kubectl apply -f helm/cert-manager-issuer/route53-issuer.yaml
+kubectl apply -f helm-videocall-deployment/infrastructure/cert-manager-issuer/route53-issuer.yaml
 ```
 
 > **Note**: This configuration uses DNS01 challenge with AWS Route53, which is required for validating wildcard certificates and is generally more reliable than HTTP01 validation. This deployment will use this method for certificate validation. You can use other DNS providers supported by cert-manager, or switch to HTTP01 validation (which doesn't work for wildcard certificates) if your deployment is available on the internet.
@@ -162,11 +201,11 @@ kubectl create secret generic cloudflare-api-token-secret -n videocall \
   --from-literal=api-token=YOUR_CLOUDFLARE_API_TOKEN
 ```
 
-3. Edit the `helm/cluster-manager-issuer/cloudflare-issuer.yaml` and update the two `email` attributes with your own email.   Do that now before continuing.
+3. Edit `helm-videocall-deployment/infrastructure/cert-manager-issuer/cloudflare-issuer.yaml` and update the two `email` attributes with your own email.   Do that now before continuing.
 
 4. Create the Issuer:
 ```bash
-kubectl apply -f helm/cert-manager-issuer/cloudflare-issuer.yaml
+kubectl apply -f helm-videocall-deployment/infrastructure/cert-manager-issuer/cloudflare-issuer.yaml
 ```
 > **Note**: This configuration uses DNS01 challenge with Cloudflare. You must use an API token (not your global API key) with the correct permissions. For more details, see [cert-manager Cloudflare DNS01 documentation](https://cert-manager.io/docs/configuration/acme/dns01/cloudflare/).
 
@@ -207,7 +246,7 @@ Install External DNS with AWS Route53 configuration
 ```bash
 helm install external-dns external-dns/external-dns \
   --namespace externaldns \
-  --values ./helm/external-dns/route53.yaml
+  --values ./helm-videocall-deployment/infrastructure/external-dns/route53.yaml
 ```
 
 
@@ -237,8 +276,8 @@ Install Prometheus for metrics collection:
 
 ```bash
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm dependency build helm/prometheus
-helm install prometheus helm/prometheus --namespace videocall
+helm dependency build helm-videocall-deployment/infrastructure/prometheus
+helm install prometheus helm-videocall-deployment/infrastructure/prometheus --namespace videocall
 ```
 
 Key configurations to review:
@@ -246,7 +285,7 @@ Key configurations to review:
 - Storage size and class
 - Scrape configurations (especially for service endpoints)
 
-revise `./helm/prometheus/values.yaml` as necessary prior to install.
+revise `./helm-videocall-deployment/infrastructure/prometheus/values.yaml` as necessary prior to install.
 
 
 ### 3.2 Grafana
@@ -257,7 +296,7 @@ Setup the required Helm repository:
 
 ```bash
 helm repo add grafana  https://grafana.github.io/helm-charts
-helm dependency build helm/grafana
+helm dependency build helm-videocall-deployment/infrastructure/grafana
 ```
 Use a custom value for the Grafana Admin Password:
 ```bash
@@ -266,7 +305,7 @@ export GRAFANA_ADMIN_PASSWORD=videocall-monitoring-2024
 ```
 Install:
 ```bash
-helm upgrade --install grafana  helm/grafana \
+helm upgrade --install grafana  helm-videocall-deployment/infrastructure/grafana \
   --namespace videocall \
   --set grafana.adminUser=$GRAFANA_ADMIN_USER  \
   --set grafana.adminPassword=$GRAFANA_ADMIN_PASSWORD  \
@@ -276,7 +315,7 @@ helm upgrade --install grafana  helm/grafana \
 
 
 
-## 4. Video Call Application Components
+## 4. Video Call Application
 
 ### 4.1 NATS Message Broker
 
@@ -284,54 +323,48 @@ Before installing NATS, add the NATS Helm repository and build chart dependencie
 
 ```bash
 helm repo add nats https://nats-io.github.io/k8s/helm/charts/
-helm dependency build helm/nats
+helm dependency build helm-videocall-deployment/infrastructure/nats
 ```
 
 Install NATS for application messaging:
 
 ```bash
-helm install nats helm/nats --namespace videocall
+helm install nats helm-videocall-deployment/infrastructure/nats --namespace videocall
 ```
 
-This uses a very simple, non persisted NATS configuration. 
+This uses a very simple, non-persisted NATS configuration. 
 
-### 4.2 Metrics API Services
+### 4.2 Videocall Application (Unified Chart)
 
-Install the metrics API services:
+Install the complete Videocall application using the unified chart and your custom values file:
 
 ```bash
-helm install metrics-api ./helm/metrics-api --namespace videocall
+helm install videocall ./helm/videocall \
+  --namespace videocall \
+  -f my-values.yaml
 ```
 
-### 4.3 WebSocket Server
+This single command deploys all six application components:
+- **UI** - Web application frontend (port 80)
+- **WebSocket** - Real-time signaling server (port 8080)
+- **WebTransport** - High-performance media transport (port 443 UDP)
+- **Website** - Marketing site (port 80, optional)
+- **Metrics Client** - Client metrics collection (port 9091)
+- **Metrics Server** - Server stats tracking (port 9092)
 
-Install the WebSocket server:
+> **Important**: The WebTransport server does not use the NGINX Ingress Controller. Instead, it's exposed directly using a Kubernetes LoadBalancer Service that handles UDP traffic required for HTTP3/WebTransport protocol. The WebTransport server handles its own TLS termination using mounted certificates, and clients connect directly to this service rather than through NGINX. This is necessary because WebTransport requires direct UDP connectivity for the QUIC protocol.
 
+> **Note**: The WebTransport pod may restart several times before success, typically because it tries to start before cert-manager has obtained the SSL certificate. You can view the pod logs to confirm:
 ```bash
-helm install websocket ./helm/rustlemania-websocket --namespace videocall
+kubectl logs -l app.kubernetes.io/component=webtransport
 ```
 
-
-### 4.4 WebTransport Server
-
-Install the WebTransport server:
-
+To verify all components are deployed:
 ```bash
-helm install webtransport ./helm/rustlemania-webtransport --namespace videocall
+kubectl get pods -l app.kubernetes.io/instance=videocall
 ```
 
-> **Important**: Unlike other services, the WebTransport server does not use the NGINX Ingress Controller. Instead, it's exposed directly using a Kubernetes LoadBalancer Service that handles UDP traffic required for HTTP3/WebTransport protocol. The WebTransport server handles its own TLS termination using mounted certificates, and clients connect directly to this service rather than through NGINX. This is necessary because WebTransport requires direct UDP connectivity for the QUIC protocol.  
-
-> Note:  The webtransport server may restart several times before success. Generally this is because it tries to start before cert-manager has obtained and setup the necessary SSL cert.  You can view the pod logs to confirm if your webtranport pod is failing to start.
-
-
-### 4.5 UI Application
-
-Install the UI application:
-
-```bash
-helm install ui ./helm/rustlemania-ui --namespace videocall
-```
+You should see pods for each enabled component with unique `app.kubernetes.io/component` labels.
 
 
 ## 5. Post-Installation Verification
@@ -343,7 +376,6 @@ Check that all services are running:
 ```bash
 $ kubectl get pods,services,ingress
 NAME                                                     READY   STATUS    RESTARTS   AGE
-pod/client-metrics-api-68889cbdb6-k7sh4                  1/1     Running   0          149m
 pod/grafana-c44db467f-xkztd                              1/1     Running   0          5h25m
 pod/nats-0                                               3/3     Running   0          5d1h
 pod/nats-box-69b79775f4-5fxgn                            1/1     Running   0          5d1h
@@ -351,30 +383,34 @@ pod/prometheus-kube-state-metrics-686d9fd46c-jx6b9       1/1     Running   0    
 pod/prometheus-prometheus-node-exporter-4zrz4            1/1     Running   0          4h18m
 pod/prometheus-prometheus-pushgateway-6bf748ccc9-zlhb6   1/1     Running   0          4h18m
 pod/prometheus-server-58cc4bc869-m6pnk                   2/2     Running   0          4h18m
-pod/rustlemania-ui-cb7f7f5b-j8s5j                        1/1     Running   0          29h
-pod/rustlemania-websocket-7d5685bf44-vs7sf               1/1     Running   0          29h
-pod/rustlemania-webtransport-6db5b5678f-pthjk            1/1     Running   0          29h
-pod/server-metrics-api-75447fcc86-nc4pq                  1/1     Running   0          4h44m
+pod/videocall-metrics-client-68889cbdb6-k7sh4            1/1     Running   0          149m
+pod/videocall-metrics-server-75447fcc86-nc4pq            1/1     Running   0          4h44m
+pod/videocall-ui-cb7f7f5b-j8s5j                          1/1     Running   0          29h
+pod/videocall-websocket-7d5685bf44-vs7sf                 1/1     Running   0          29h
+pod/videocall-webtransport-6db5b5678f-pthjk              1/1     Running   0          29h
 
 NAME                                          TYPE           CLUSTER-IP      EXTERNAL-IP      PORT(S)                                                 AGE
-service/client-metrics-api                    ClusterIP      10.43.112.83    <none>           9091/TCP                                                4h45m
 service/grafana                               ClusterIP      10.43.157.225   <none>           80/TCP                                                  5h25m
 service/nats                                  ClusterIP      None            <none>           4222/TCP,6222/TCP,8222/TCP,7777/TCP,7422/TCP,7522/TCP   5d1h
 service/prometheus-kube-state-metrics         ClusterIP      10.43.243.0     <none>           8080/TCP                                                5h31m
 service/prometheus-prometheus-node-exporter   ClusterIP      10.43.143.191   <none>           9100/TCP                                                5h31m
 service/prometheus-prometheus-pushgateway     ClusterIP      10.43.20.225    <none>           9091/TCP                                                5h31m
 service/prometheus-server                     ClusterIP      10.43.32.88     <none>           80/TCP                                                  5h31m
-service/rustlemania-ui                        ClusterIP      10.43.115.124   <none>           80/TCP                                                  47h
-service/rustlemania-websocket                 ClusterIP      10.43.136.127   <none>           8080/TCP                                                29h
-service/rustlemania-webtransport-lb           LoadBalancer   10.43.74.88     10.190.252.181   5321:32767/TCP,443:32463/UDP                          47h
-service/server-metrics-api                    ClusterIP      10.43.18.91     <none>           9092/TCP                                                4h45m
+service/videocall-metrics-client              ClusterIP      10.43.112.83    <none>           9091/TCP                                                4h45m
+service/videocall-metrics-server              ClusterIP      10.43.18.91     <none>           9092/TCP                                                4h45m
+service/videocall-ui                          ClusterIP      10.43.115.124   <none>           80/TCP                                                  47h
+service/videocall-websocket                   ClusterIP      10.43.136.127   <none>           8080/TCP                                                29h
+service/videocall-webtransport-lb             LoadBalancer   10.43.74.88     10.190.252.181   444:32767/TCP,443:32463/UDP                           47h
 
-NAME                                              CLASS    HOSTS                    ADDRESS          PORTS     AGE
-ingress.networking.k8s.io/grafana                 <none>   grafana.yourdomain.com      10.190.252.181   80, 443   5h25m
-ingress.networking.k8s.io/prometheus-server       <none>   prometheus.yourdomain.com   10.190.252.181   80, 443   4h18m
-ingress.networking.k8s.io/rustlemania-ui          nginx    app.yourdomain.com          10.190.252.181   80, 443   47h
-ingress.networking.k8s.io/rustlemania-websocket   nginx    websocket.yourdomain.com    10.190.252.181   80, 443   29h
+NAME                                              CLASS    HOSTS                         ADDRESS          PORTS     AGE
+ingress.networking.k8s.io/grafana                 <none>   grafana.yourdomain.com        10.190.252.181   80, 443   5h25m
+ingress.networking.k8s.io/prometheus-server       <none>   prometheus.yourdomain.com     10.190.252.181   80, 443   4h18m
+ingress.networking.k8s.io/videocall-ui            nginx    app.yourdomain.com            10.190.252.181   80, 443   47h
+ingress.networking.k8s.io/videocall-websocket     nginx    websocket.yourdomain.com      10.190.252.181   80, 443   29h
+                                                           api.yourdomain.com
 ```
+
+Note the naming: All videocall components now have the `videocall-` prefix and use the `app.kubernetes.io/component` label for differentiation.
 
 ### 5.2 Verify TLS Certificates
 
@@ -382,12 +418,13 @@ Ensure certificates are properly issued, they should be ready:
 
 ```bash
 $ kubectl get certificates -n videocall
-NAME                           READY   SECRET             AGE
-grafana-tls                    True    grafana-tls        5h18m
-prometheus-tls                 True    prometheus-tls     4h16m
-rustlemania-webtransport-tls   True    webtransport-tls   47h
-ui-tls                         True    ui-tls             47h
-websocket-tls                  True    websocket-tls      29h
+NAME                              READY   SECRET                  AGE
+grafana-tls                       True    grafana-tls             5h18m
+prometheus-tls                    True    prometheus-tls          4h16m
+videocall-ui-tls                  True    videocall-ui-tls        47h
+videocall-webtransport-cert       True    webtransport-tls        47h
+websocket-tls                     True    websocket-tls           29h
+api-tls                           True    api-tls                 29h
 ```
 
 
@@ -399,56 +436,71 @@ Test connectivity to the various services:
 - WebTransport: https://webtransport.yourdomain.com
 - Grafana: https://grafana.yourdomain.com
 
-## 6. Custom Values Files to Review
+## 6. Configuration Files to Review
 
-The following custom values files should be reviewed and updated for your deployment:
+The following configuration files should be reviewed and customized for your deployment:
 
-1. **WebSocket Server**: `./helm/rustlemania-websocket/values.yaml`
-   - Update image repository and tag
-   - Configure resource limits (min 384Mi memory request, 768Mi limit)
-   - Set appropriate ingress hostname
-   - Configure environment variables
+### 6.1 Videocall Application
 
-2. **WebTransport Server**: `./helm/rustlemania-webtransport/values.yaml`
-   - Update image repository and tag
-   - Configure resource limits (min 384Mi memory request, 768Mi limit)
-   - Set TLS certificate name
-   - Configure service type and ports
-   - Configure environment variables
+**Your custom values file** (`my-values.yaml`):
+- Domain settings in `global.domain`
+- Component enablement flags (`ui.enabled`, `websocket.enabled`, etc.)
+- Resource limits for each component
+- Ingress hostnames
+- Image tags and repositories
 
-3. **UI Application**: `./helm/rustlemania-ui/values.yaml`
-   - Update image repository and tag
-   - Configure ingress hostname
-   - Set environment variables
+**Reference template**: `./helm/videocall/values.yaml` (967 lines, fully documented)
+- Contains all available configuration options
+- Every parameter is explained with comments
+- Use this as a reference when creating your `my-values.yaml`
 
-4. **NATS**: `./helm/nats/values.yaml`
+### 6.2 Infrastructure Components
+
+1. **NATS**: `./helm-videocall-deployment/infrastructure/nats/values.yaml`
    - Configure authentication if needed
    - Adjust resource limits
 
-5. **Prometheus**: `./helm/prometheus/values.yaml`
+2. **Prometheus**: `./helm-videocall-deployment/infrastructure/prometheus/values.yaml`
    - Adjust retention and storage
 
-6. **Grafana**: `./helm/grafana/values.yaml`
+3. **Grafana**: `./helm-videocall-deployment/infrastructure/grafana/values.yaml`
    - Configure admin credentials
    - Set up dashboards and data sources
+
+### Quick Configuration Example
+
+To customize component resources in your `my-values.yaml`:
+
+```yaml
+websocket:
+  replicaCount: 2
+  resources:
+    limits:
+      cpu: "2000m"
+      memory: "4Gi"
+    requests:
+      cpu: "1000m"
+      memory: "2Gi"
+```
 
 
 ## 7. Monitoring
 
-Grafana is used for monitoring and visualizing metrics in this deployment. Two dashboards are provided for quick insights:
+Grafana is used for monitoring and visualizing metrics in this deployment.
 
-- **Server Connections Analytics**: `./helm/global/us-east/grafana/dashboards/server-connections-analytics.json`
-- **Videocall Health**: `./helm/global/us-east/grafana/dashboards/videocall-health.json`
+### Accessing Grafana
 
-### Importing Dashboards into Grafana
+1. Log in to your Grafana instance (https://grafana.yourdomain.com). The admin username and password were specified when you installed Grafana (see the `$GRAFANA_ADMIN_USER` and `$GRAFANA_ADMIN_PASSWORD` environment variables).
+2. Configure Prometheus as a data source if not already configured
+3. Access metrics from the Videocall components:
+   - Client metrics: `videocall-metrics-client:9091/metrics`
+   - Server stats: `videocall-metrics-server:9092/metrics`
 
-1. Log in to your Grafana instance (https://grafana.yourdomain.com). The admin username and password was specified in `helm/global/us-east/grafana/values.yaml` (see `adminUser` and `adminPassword`).
-2. In the left sidebar, click the **Dashboards** (four squares) icon, then select **Import**.
-3. Click **Upload JSON file** and select either `server-connections-analytics.json` or `videocall-health.json` from `./helm/global/us-east/grafana/dashboards/`.
-4. Choose the Prometheus data source if prompted, then click **Import**.
-5. Repeat for the second dashboard.
-
-You should now see both dashboards available in your Grafana instance for monitoring system health and analytics.
+Create dashboards to visualize:
+- Active connections per server
+- Client engagement metrics
+- Media quality statistics
+- Server health and resource usage
 
 ---
 ## 8. Troubleshooting

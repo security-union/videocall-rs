@@ -1,0 +1,57 @@
+{{- if .Values.website.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "website") }}
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "website") | nindent 4 }}
+spec:
+  {{- if not .Values.website.autoscaling.enabled }}
+  replicas: {{ .Values.website.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "videocall.selectorLabels" (dict "root" . "component" "website") | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.website.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "videocall.selectorLabels" (dict "root" . "component" "website") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.website.podSecurityContext | nindent 8 }}
+      containers:
+        - name: website
+          securityContext:
+            {{- toYaml .Values.website.securityContext | nindent 12 }}
+          image: "{{ .Values.website.image.repository }}:{{ .Values.website.image.tag }}"
+          imagePullPolicy: {{ .Values.website.image.pullPolicy }}
+          env:
+            {{- toYaml .Values.website.env | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.website.service.port }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.website.resources | nindent 12 }}
+      {{- with .Values.website.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.website.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.website.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+

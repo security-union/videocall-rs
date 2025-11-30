@@ -1,5 +1,0 @@
-apiVersion: v2
-name: rustlemania-ui
-description: A Helm chart for rustlemania-ui
-type: application
-version: 0.1.0

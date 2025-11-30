@@ -1,0 +1,12 @@
+{{- if .Values.ui.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "ui") }}-config
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "ui") | nindent 4 }}
+data:
+  config.js: |
+    {{- include "videocall.ui.configjs" . | nindent 4 }}
+{{- end }}
+

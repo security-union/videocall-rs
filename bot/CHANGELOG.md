@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.14](https://github.com/security-union/videocall-rs/compare/bot-v1.0.13...bot-v1.0.14) - 2025-11-30
+
+### Other
+
+- Delete commented code and address clippy warnings ([#489](https://github.com/security-union/videocall-rs/pull/489))
+
 ## [1.0.13](https://github.com/security-union/videocall-rs/compare/bot-v1.0.12...bot-v1.0.13) - 2025-10-30
 
 ### Other

@@ -1,6 +1,6 @@
 [package]
 name = "videocall-nokhwa-bindings-windows"
-version = "0.4.4"
+version = "0.4.5"
 authors = ["l1npengtul", "Dario Lencina <dario@securityunion.dev>"]
 edition = "2021"
 license = "Apache-2.0"

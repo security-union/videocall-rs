@@ -16,26 +16,6 @@
  * conditions.
  */
 
-/// Simple signal-processing helpers used by time-stretch routines.
-/// Compute normalized cross-correlation of two equal-length  slices.
-/// Returns value in [-1,1].
-pub fn normalized_correlation(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut sum_ab = 0.0;
-    let mut sum_a2 = 0.0;
-    let mut sum_b2 = 0.0;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        sum_ab += x * y;
-        sum_a2 += x * x;
-        sum_b2 += y * y;
-    }
-    if sum_a2 == 0.0 || sum_b2 == 0.0 {
-        0.0
-    } else {
-        sum_ab / (sum_a2.sqrt() * sum_b2.sqrt())
-    }
-}
-
 /// Compute the best normalized cross-correlation of given length
 /// between two equal-length slices.
 pub fn best_normalized_correlation(a: &[f32], b: &[f32], len: usize) -> (usize, f32) {
@@ -93,60 +73,6 @@ pub fn crossfade(prev: &[f32], next: &[f32], fade_len: usize, out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Test 1: Known Values Test
-    /// Catches the copy-paste bug with simple, verifiable cases
-    #[test]
-    fn test_normalized_correlation_known_values() {
-        // Test 1: Identical signals should have correlation of 1.0
-        let a = vec![1.0, 2.0, 3.0, 4.0];
-        let b = vec![1.0, 2.0, 3.0, 4.0];
-        let corr = normalized_correlation(&a, &b);
-        assert!(
-            (corr - 1.0).abs() < 0.001,
-            "Identical signals should correlate at 1.0, got {corr}"
-        );
-
-        // Test 2: Opposite signals should have correlation of -1.0
-        let a = vec![1.0, 2.0, 3.0, 4.0];
-        let b = vec![-1.0, -2.0, -3.0, -4.0];
-        let corr = normalized_correlation(&a, &b);
-        assert!(
-            (corr + 1.0).abs() < 0.001,
-            "Opposite signals should correlate at -1.0, got {corr}"
-        );
-
-        // Test 3: Orthogonal signals should have correlation near 0
-        let a = vec![1.0, 0.0, -1.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0, -1.0];
-        let corr = normalized_correlation(&a, &b);
-        assert!(
-            corr.abs() < 0.001,
-            "Orthogonal signals should have ~0 correlation, got {corr}"
-        );
-    }
-
-    // /// Test 2: Consistency Check
-    // /// The sliding window version should match manual calculation
-    // #[test]
-    // fn test_best_correlation_consistency() {
-    //     let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    //     let b = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]; // b is a shifted
-    //     let len = 3;
-
-    //     let (best_pos, best_corr) = best_normalized_correlation(&a, &b, len);
-
-    //     // Manually verify the best position
-    //     // At position where they align best, compute correlation manually
-    //     let window_a = &a[best_pos - len + 1..=best_pos];
-    //     let window_b = &b[best_pos - len + 1..=best_pos];
-    //     let manual_corr = normalized_correlation(window_a, window_b);
-
-    //     assert!(
-    //         (best_corr - manual_corr).abs() < 0.001,
-    //         "Sliding window correlation should match manual calculation: {best_corr} vs {manual_corr}"
-    //     );
-    // }
 
     /// Test 2: Consistency Check
     /// The sliding window version should match manual calculation
@@ -257,28 +183,6 @@ mod tests {
                 best_corr
             );
         }
-    }
-
-    /// Test 3: Mathematical Property Test
-    /// Correlation coefficient must be in [-1, 1]
-    #[test]
-    fn test_correlation_bounds() {
-        // Random-ish signals
-        let a = vec![1.5, -2.3, 4.1, -0.5, 3.2, -1.8, 2.7];
-        let b = vec![0.8, 3.4, -1.2, 2.9, -0.7, 1.6, -2.1];
-
-        let corr = normalized_correlation(&a, &b);
-        assert!(
-            corr >= -1.0 && corr <= 1.0,
-            "Correlation must be in [-1, 1], got {corr}"
-        );
-
-        let len = 3;
-        let (_pos, corr) = best_normalized_correlation(&a, &b, len);
-        assert!(
-            corr >= -1.0 && corr <= 1.0,
-            "Correlation must be in [-1, 1], got {corr}"
-        );
     }
 
     #[test]

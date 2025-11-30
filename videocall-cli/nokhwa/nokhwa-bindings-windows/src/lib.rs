@@ -1350,7 +1350,7 @@ pub mod wmf {
             ))
         }
 
-        pub fn raw_bytes(&mut self) -> Result<Cow<[u8]>, NokhwaError> {
+        pub fn raw_bytes(&mut self) -> Result<Cow<'_, [u8]>, NokhwaError> {
             Err(NokhwaError::NotImplementedError(
                 "Only on Windows".to_string(),
             ))

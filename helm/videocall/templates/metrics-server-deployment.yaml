@@ -1,0 +1,57 @@
+{{- if .Values.metricsServer.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "metrics-server") }}
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "metrics-server") | nindent 4 }}
+spec:
+  replicas: {{ .Values.metricsServer.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "videocall.selectorLabels" (dict "root" . "component" "metrics-server") | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.metricsServer.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "videocall.selectorLabels" (dict "root" . "component" "metrics-server") | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.metricsServer.podSecurityContext | nindent 8 }}
+      containers:
+        - name: metrics-server
+          securityContext:
+            {{- toYaml .Values.metricsServer.securityContext | nindent 12 }}
+          image: "{{ .Values.metricsServer.image.repository }}:{{ .Values.metricsServer.image.tag }}"
+          imagePullPolicy: {{ .Values.metricsServer.image.pullPolicy }}
+          command: {{ .Values.metricsServer.command }}
+          workingDir: {{ .Values.metricsServer.workingDir }}
+          env:
+            {{- toYaml .Values.metricsServer.env | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.metricsServer.service.targetPort }}
+              protocol: TCP
+          livenessProbe:
+            {{- toYaml .Values.metricsServer.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.metricsServer.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.metricsServer.resources | nindent 12 }}
+      {{- with .Values.metricsServer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metricsServer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.metricsServer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+

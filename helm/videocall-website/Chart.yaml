@@ -1,5 +1,0 @@
-apiVersion: v2
-name: videocall-website
-description: A Helm chart for videocall-website
-type: application
-version: 0.1.0

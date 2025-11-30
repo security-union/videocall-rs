@@ -1,0 +1,18 @@
+{{- if .Values.websocket.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "websocket") }}
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "websocket") | nindent 4 }}
+spec:
+  type: {{ .Values.websocket.service.type }}
+  ports:
+    - port: {{ .Values.websocket.service.port }}
+      targetPort: ws-api
+      protocol: TCP
+      name: ws-api
+  selector:
+    {{- include "videocall.selectorLabels" (dict "root" . "component" "websocket") | nindent 4 }}
+{{- end }}
+

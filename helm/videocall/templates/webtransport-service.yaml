@@ -1,0 +1,28 @@
+{{- if .Values.webtransport.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "webtransport") }}-lb
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "webtransport") | nindent 4 }}
+  {{- if .Values.webtransport.loadBalancerAnnotations }}
+  annotations:
+    {{- range $key, $value := .Values.webtransport.loadBalancerAnnotations }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.webtransport.service.type }}
+  selector:
+    {{- include "videocall.selectorLabels" (dict "root" . "component" "webtransport") | nindent 4 }}
+  ports:
+    - protocol: TCP
+      port: {{ .Values.webtransport.service.healthPort }}
+      targetPort: wt-api-health
+      name: wt-api-health
+    - protocol: UDP
+      port: {{ .Values.webtransport.service.port }}
+      targetPort: wt-api
+      name: wt-api
+{{- end }}
+

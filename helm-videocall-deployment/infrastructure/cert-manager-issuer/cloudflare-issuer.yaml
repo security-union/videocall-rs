@@ -1,0 +1,18 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt-prod
+  namespace: videocall
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: your-email@yourdomain.com
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - dns01:
+        cloudflare:
+          email: your-email@yourdomain.com
+          apiTokenSecretRef:
+            name: cloudflare-api-token-secret
+            key: api-token

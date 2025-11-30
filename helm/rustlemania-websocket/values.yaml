@@ -2,36 +2,59 @@
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
 nameOverride: ""
-fullnameOverride: ""
+fullnameOverride: "rustlemania-websocket"
 
 
 replicaCount: 1
 image:
   repository: securityunion/rustlemania-api
   pullPolicy: Always
-  tag: high-availability-cf63fcce
+  tag: latest
 env:
   - name: RUST_LOG
-    value: info
+    value: warn
   - name: ACTIX_PORT
     value: "8080"
-  - name: UI_ENDPOINT
-    value: https://rustlemania.com
   - name: NATS_URL
     value: nats:4222
   - name: DATABASE_ENABLED
     value: "false"
   - name: DATABASE_URL
-    value: abc
+    value: "postgres://postgres:$(PG_PASSWORD)@postgres-postgresql:5432/actix-api-db?sslmode=disable"
   - name: TOKIO_WORKER_THREADS
     value: "1"  # Default for WebSocket services - adjust per region as needed
+  - name: REGION
+    value: "us-east"
+  - name: HOSTNAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: SERVER_ID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: SERVICE_TYPE
+    value: websocket
+  - name: SERVER_STATS_INTERVAL_SECS
+    value: "5"
+  - name: OAUTH_AUTH_URL
+    value: "https://accounts.google.com/o/oauth2/v2/auth"
+  - name: OAUTH_TOKEN_URL
+    value: "https://oauth2.googleapis.com/token"
+  - name: OAUTH_REDIRECT_URL
+    value: "https://api.YOUR_DOMAIN_NAME/login/callback"
+  - name: UI_ENDPOINT
+    value: "https://app.YOUR_DOMAIN_NAME"
+  - name: COOKIE_DOMAIN
+    value: ".YOUR_DOMAIN_NAME"
+
 resources:
   limits:
-    cpu: "50m"
-    memory: "10Mi"
+    cpu: "500m"
+    memory: "384Mi"
   requests:
-    cpu: "20m"
-    memory: "10Mi"
+    cpu: "200m"
+    memory: "192Mi"
 podAnnotations: {}
 podSecurityContext: {}
 securityContext: {}
@@ -56,15 +79,24 @@ ingress:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     kubernetes.io/tls-acme: "true"
   hosts:
-    - host: api.rustlemania.com
+    - host: websocket.YOUR_DOMAIN_NAME
       paths:
         - path: /
           pathType: Prefix
           service:
-            name: rustlemania-websocket
+            port:
+              number: 8080
+    - host: api.YOUR_DOMAIN_NAME
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
             port:
               number: 8080
   tls:
-    - secretName: rustlemania-websocket-tls
+    - secretName: websocket-tls
       hosts:
-        - api.rustlemania.com
+        - websocket.YOUR_DOMAIN_NAME
+    - secretName: api-tls
+      hosts:
+        - api.YOUR_DOMAIN_NAME

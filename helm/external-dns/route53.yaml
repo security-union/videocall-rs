@@ -1,0 +1,20 @@
+# AWS Route53 Provider Configuration
+provider:
+  name: aws
+
+# AWS Credentials Configuration
+env:
+  - name: AWS_SHARED_CREDENTIALS_FILE
+    value: /etc/aws/credentials/dns-creds
+  - name: AWS_DEFAULT_REGION
+    value: us-east-1
+
+# Mount AWS credentials from secret
+extraVolumeMounts:
+  - mountPath: /etc/aws/credentials
+    name: aws-credentials
+    readOnly: true
+extraVolumes:
+  - name: aws-credentials
+    secret:
+      secretName: external-dns

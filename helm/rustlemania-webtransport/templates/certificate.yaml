@@ -1,0 +1,20 @@
+# This template creates a TLS certificate for the WebTransport service.
+# The certificate is issued by the namespace-scoped Issuer and stored in a secret
+# that will be mounted by the WebTransport pod.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "rustlemania.fullname" . }}-tls
+  labels:
+    {{- include "rustlemania.labels" . | nindent 4 }}
+spec:
+  dnsNames:
+  - {{ .Values.certificateDomain }}
+  issuerRef:
+    group: cert-manager.io
+    kind: Issuer
+    name: {{ .Values.certificate.issuerName | default "letsencrypt-prod" }}
+  secretName: {{ .Values.tlsSecret | default (printf "%s-tls" (include "rustlemania.fullname" .)) }}
+  usages:
+  - digital signature
+  - key encipherment

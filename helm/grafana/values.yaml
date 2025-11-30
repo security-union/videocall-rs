@@ -1,0 +1,90 @@
+# Grafana values for videocall monitoring (minimal resources)
+grafana:
+  # Image configuration
+  image:
+    tag: "10.0.0"
+
+  # Minimal resources for cost optimization
+  resources:
+    limits:
+      cpu: 50m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
+
+  # Single replica
+  replicas: 1
+
+  # Persistence (minimal)
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClassName: "local-path"
+
+  # Admin credentials from secret
+  adminUser: admin
+  adminPassword: password
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    port: 80
+
+  # Ingress configuration
+  ingress:
+    enabled: true
+    annotations:
+      kubernetes.io/ingress.class: "nginx"
+      cert-manager.io/issuer: "letsencrypt-prod"
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"
+      nginx.ingress.kubernetes.io/proxy-busy-buffers-size: "16k"
+    hosts:
+      - grafana.YOUR_DOMAIN_NAME
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.YOUR_DOMAIN_NAME
+
+  # Grafana configuration
+  grafana.ini:
+    server:
+      domain: grafana.YOUR_DOMAIN_NAME
+      root_url: https://grafana.YOUR_DOMAIN_NAME
+    security:
+      admin_user: admin
+      admin_password: password
+    users:
+      allow_sign_up: false
+    auth.anonymous:
+      enabled: false
+
+  # Datasources
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://prometheus-server:80
+          access: proxy
+          isDefault: true
+
+  # Dashboard provisioning
+  dashboards:
+    default:
+      videocall-health:
+        file: dashboards/videocall-health.json
+
+  # Security context
+  securityContext:
+    runAsUser: 472
+    runAsGroup: 472
+    fsGroup: 472
+
+  # Pod security context
+  podSecurityContext:
+    runAsUser: 472
+    runAsGroup: 472
+    fsGroup: 472

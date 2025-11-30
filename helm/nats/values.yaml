@@ -1,0 +1,34 @@
+nats:
+  nats:
+    natsbox:
+      enabled: true
+    # Basic cluster configuration (simplified for single region)
+    cluster:
+      enabled: true
+      replicas: 1  # Single instance for minimal deployment
+      noAdvertise: true
+    # Gateway configuration disabled for simple deployment
+    gateway:
+      enabled: false  # No cross-region needed
+    # JetStream (persistence) disabled for simplicity (can enable if needed)
+    jetstream:
+      enabled: false
+    # Simplified monitoring config
+    exporter:
+      enabled: true
+      serviceMonitor:
+        enabled: false  # Set to true if you have Prometheus operator
+    # Simplified auth configuration
+    auth:
+      enabled: false  # Simplified for basic deployment
+    # Adjusted resource limits for smaller deployments
+    resources:
+      limits:
+        cpu: 300m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+    # Service configuration for simple deployment
+    service:
+      type: ClusterIP  # Use ingress instead of LoadBalancer

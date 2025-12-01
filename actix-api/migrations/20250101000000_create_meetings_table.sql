@@ -1,18 +1,15 @@
--- migrate:up
+-- Create meetings table to track meeting times
 CREATE TABLE IF NOT EXISTS meetings (
     id SERIAL PRIMARY KEY,
-    room_id VARCHAR(255) NOT NULL UNIQUE,
-    started_at TIMESTAMPTZ NOT NULL,
-    ended_at TIMESTAMPTZ NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    deleted_at TIMESTAMPTZ NULL,
-    creator_id VARCHAR(255) NULL
+    room_id TEXT NOT NULL UNIQUE,
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    ended_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- Create index on room_id for faster lookups
 CREATE INDEX IF NOT EXISTS idx_meetings_room_id ON meetings(room_id);
-CREATE INDEX idx_meetings_creator_id ON meetings(creator_id);
 
 -- Create a function to update the updated_at column
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -28,8 +25,3 @@ CREATE TRIGGER update_meetings_updated_at
 BEFORE UPDATE ON meetings
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
-
-
-
--- migrate:down
-DROP TABLE IF EXISTS meetings;

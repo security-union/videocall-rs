@@ -38,7 +38,8 @@ CREATE TABLE public.meetings (
     ended_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
-    deleted_at timestamp with time zone
+    deleted_at timestamp with time zone,
+    creator_id integer NOT NULL
 );
 
 
@@ -163,4 +164,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20250101000000'),
     ('20251109111824'),
     ('20251109143240'),
-    ('20251110232152');
+    ('20251110232152'),
+    ('20251129183430');

@@ -38,6 +38,7 @@ matomo-logger = { path = "../matomo-logger", version = "0.1.0" }
 serde-wasm-bindgen = "0.6"
 reqwasm = "0.5"
 anyhow = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
 
 [dependencies.web-sys]
 version = "0.3.72"

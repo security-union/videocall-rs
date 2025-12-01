@@ -27,6 +27,7 @@ use crate::constants::{
 use gloo_timers::callback::{Interval, Timeout};
 use gloo_utils::window;
 use log::{error, warn};
+use serde::Deserialize;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -65,6 +66,15 @@ pub enum UserScreenToggleAction {
     DeviceSettings,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MeetingInfoData {
+    pub room_id: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub duration_ms: i64,
+    pub is_active: bool,
+}
+
 #[derive(Debug)]
 pub enum Msg {
     WsAction(WsAction),
@@ -83,6 +93,10 @@ pub enum Msg {
     ToggleForceDesktopGrid,
     HangUp,
     ShowCopyToast(bool),
+    #[allow(dead_code)]
+    FetchMeetingInfo,
+    MeetingInfoFetched(Result<MeetingInfoData, String>),
+    MeetingEnded(String),
 }
 
 impl From<WsAction> for Msg {
@@ -151,6 +165,8 @@ pub struct AttendantsComponent {
     pub call_start_time: Option<f64>,           // Track when the call started
     _timer: Option<Interval>,
     show_dropdown: bool,
+    meeting_info_data: Option<MeetingInfoData>, //Meeting info data
+    meeting_ended_message: Option<String>,
 }
 
 impl AttendantsComponent {
@@ -245,6 +261,19 @@ impl AttendantsComponent {
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         start_time_ms as u64,
                     )))
+                })
+            }),
+            on_meeting_ended: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |(end_time_ms, message): (f64, String)| {
+                    log::info!("Meeting ended at Unix timestamp: {}", end_time_ms);
+                    // link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                    //     end_time_ms as u64,
+                    // )));
+                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                        end_time_ms as u64,
+                    )));
+                    link.send_message(Msg::MeetingEnded(message));
                 })
             }),
         };
@@ -356,11 +385,6 @@ impl AttendantsComponent {
             } else {
                 return format!("{:02}:{:02}", minutes, seconds);
             }
-            // Some(server_start) => server_start,
-            // None => &match self.call_start_time {
-            //     Some(local_start) => local_start,
-            //     None => return "00:00".to_string(),
-            // },
         } else if let Some(local_start) = self.call_start_time {
             let now = web_sys::window()
                 .and_then(|w| w.performance())
@@ -417,6 +441,8 @@ impl Component for AttendantsComponent {
             _timer: None,
             meeting_start_time_server: None,
             show_dropdown: false,
+            meeting_info_data: None,
+            meeting_ended_message: None,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -513,10 +539,7 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::MeetingInfoReceived(start_time) => {
-                    log::info!(
-                        "Received meeting start time from server: {} ms",
-                        start_time
-                    );
+                    log::info!("Received meeting start time from server: {} ms", start_time);
 
                     self.meeting_start_time_server = Some(start_time as f64);
 
@@ -684,11 +707,79 @@ impl Component for AttendantsComponent {
             }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
-                let _ = window().location().reload(); // Refresh page for clean state
+
+                if self.client.is_connected() {
+                    match self.client.disconnect() {
+                        Ok(_) => {
+                            log::info!("Disconnected from server");
+                        }
+                        Err(e) => {
+                            log::error!("Error disconnecting from server: {e}");
+                        }
+                    }
+                }
+
+                self._timer = None;
+                self.meeting_joined = false;
+                self.mic_enabled = false;
+                self.video_enabled = false;
+                self.call_start_time = None;
+                self.meeting_start_time_server = None;
+
+                // Timeout::new(500, move || {
+                //     log::info!("Navigating to home page after disconnect delay");
+                //     let _ = window().location().set_href("/"); // Refresh page for clean state
+                // })
+                // .forget();
+                true
+            }
+
+            Msg::FetchMeetingInfo => {
+                let room_id = ctx.props().id.clone();
+                let link = ctx.link().clone();
+
+                wasm_bindgen_futures::spawn_local(async move {
+                    let url = format!("/api/meeting/{}/info", room_id);
+
+                    let result = match reqwest::get(&url).await {
+                        Ok(response) => {
+                            if response.status().is_success() {
+                                match response.json().await {
+                                    Ok(data) => data,
+                                    Err(e) => Err(format!("Failed to parse: {}", e)),
+                                }
+                            } else {
+                                Err(format!("Server error: {}", response.status()))
+                            }
+                        }
+                        Err(e) => Err(format!("Error fetching meeting info: {}", e)),
+                    };
+
+                    link.send_message(Msg::MeetingInfoFetched(result));
+                });
+
+                false
+            }
+
+            Msg::MeetingInfoFetched(result) => {
+                match result {
+                    Ok(data) => {
+                        self.meeting_info_data = Some(data);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to fetch meeting info: {}", e);
+                        // Err(format!("Failed to fetch meeting info: {}", e))
+                    }
+                }
+
+                true
+            }
+
+            Msg::MeetingEnded(end_time) => {
+                self.meeting_ended_message = Some(end_time);
                 true
             }
         }
-    
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
@@ -1180,6 +1271,39 @@ impl Component for AttendantsComponent {
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
                     <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
                 </div>
+
+                {
+                    if let Some(ref message) = self.meeting_ended_message {
+                        html! {
+                            <div class="glass-backdrop" style="z-index: 9999;">  // ADD THIS WRAPPER
+                                <div class="card-apple" style="width: 420px; text-align: center;">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2" style="margin: 0 auto 1rem;">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <line x1="15" y1="9" x2="9" y2="15"></line>
+                                        <line x1="9" y1="9" x2="15" y2="15"></line>
+                                    </svg>
+                                    <h4 style="margin-top:0; margin-bottom: 0.5rem;">{"Meeting Ended"}</h4>
+                                    <p style="font-size: 1rem; margin: 1.5rem 0; color: #666;">
+                                        {message}
+                                    </p>
+                                    <button
+                                        class="btn-apple btn-primary"
+                                        onclick={Callback::from(|_| {
+                                            if let Some(window) = web_sys::window() {
+                                                let _ = window.location().set_href("/");
+                                            }
+                                        })}>
+                                        {"Return to Home"}
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+
+
                 {
                     if self.diagnostics_open {
                         html!{
@@ -1193,7 +1317,7 @@ impl Component for AttendantsComponent {
                         }
                     } else { html!{} }
                 }
-            
+
             </div>
         }
     }

@@ -113,6 +113,9 @@ pub struct VideoCallClientOptions {
 
     /// Callback for meeting info
     pub on_meeting_info: Option<Callback<f64>>,
+
+    /// Callback for meeting ended
+    pub on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
 #[derive(Debug)]
@@ -462,6 +465,31 @@ impl VideoCallClient {
             }
         };
         false
+    }
+
+    /// Disconnect from the current server.
+    pub fn disconnect(&self) -> anyhow::Result<()> {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            // if let Some(health_reporter) = &inner.health_reporter {
+            //     if let Ok(reporter) = health_reporter.try_borrow_mut() {
+            //         reporter.stop_health_reporting();
+            //     }
+            // }
+
+            if let Some(connection_controller) = &mut inner.connection_controller {
+                connection_controller.disconnect();
+            }
+
+            inner.connection_controller = None;
+            inner.connection_state =  ConnectionState::Failed { 
+                error: "Disconnected".to_string(), 
+                last_known_server: None 
+            };
+            return Ok(());
+        }
+        else {
+            Err(anyhow::anyhow!("Unable to borrow inner"))
+        }
     }
 
     /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.

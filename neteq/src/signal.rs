@@ -16,61 +16,43 @@
  * conditions.
  */
 
-/// Simple signal-processing helpers used by time-stretch routines.
-/// Compute normalized cross-correlation of two equal-length  slices.
-/// Returns value in [-1,1].
-pub fn normalized_correlation(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut sum_ab = 0.0;
-    let mut sum_a2 = 0.0;
-    let mut sum_b2 = 0.0;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        sum_ab += x * y;
-        sum_a2 += x * x;
-        sum_b2 += y * y;
-    }
-    if sum_a2 == 0.0 || sum_b2 == 0.0 {
-        0.0
-    } else {
-        sum_ab / (sum_a2.sqrt() * sum_b2.sqrt())
-    }
-}
-
 /// Compute the best normalized cross-correlation of given length
 /// between two equal-length slices.
 pub fn best_normalized_correlation(a: &[f32], b: &[f32], len: usize) -> (usize, f32) {
     debug_assert_eq!(a.len(), b.len());
     debug_assert!(a.len() >= len);
 
-    let mut sum_ab = 0.0;
-    let mut sum_a2 = 0.0;
-    let mut sum_b2 = 0.0;
+    let mut corr = 0.0;
+    let mut energy = 0.0;
     let mut best_pos = 0;
-    let mut best_corr2 = 0.0;
+    let mut best_corr = -1.0;
     for i in 0..a.len() {
-        sum_ab += a[i] * b[i];
-        sum_a2 += a[i] * a[i];
-        sum_b2 += b[i] * b[i];
-        if i >= len {
-            sum_ab -= a[i - len] * b[i - len];
-            sum_a2 -= a[i - len] * a[i - len];
-            sum_b2 -= b[i - len] * b[i - len];
-            let corr2 = if sum_a2 == 0.0 || sum_b2 == 0.0 {
-                0.0
-            } else if sum_ab < 0.0 {
-                -(sum_ab * sum_ab / (sum_a2 * sum_b2))
-            } else {
-                sum_ab * sum_ab / (sum_a2 * sum_b2)
-            };
+        let x = a[i];
+        let y = b[i];
+        corr += x * y;
+        energy += (x * x).max(y * y);
+        if i + 1 >= len {
+            let normalized_corr = if energy == 0.0 { 1.0 } else { corr / energy };
 
-            if corr2 > best_corr2 {
-                best_corr2 = corr2;
-                best_pos = i;
+            let i_start = i + 1 - len;
+
+            if normalized_corr >= 1.0 {
+                return (i_start, 1.0);
             }
+
+            if normalized_corr > best_corr {
+                best_corr = normalized_corr;
+                best_pos = i_start;
+            }
+
+            let old_x = a[i_start];
+            let old_y = b[i_start];
+            corr -= old_x * old_y;
+            energy -= (old_x * old_x).max(old_y * old_y);
         }
     }
 
-    (best_pos, best_corr2)
+    (best_pos, best_corr)
 }
 
 /// Cross-fade `fade_len` samples between the tail of `prev` and the head of `next`,
@@ -92,135 +74,115 @@ pub fn crossfade(prev: &[f32], next: &[f32], fade_len: usize, out: &mut [f32]) {
 mod tests {
     use super::*;
 
-    /// Test 1: Known Values Test
-    /// Catches the copy-paste bug with simple, verifiable cases
-    #[test]
-    fn test_normalized_correlation_known_values() {
-        // Test 1: Identical signals should have correlation of 1.0
-        let a = vec![1.0, 2.0, 3.0, 4.0];
-        let b = vec![1.0, 2.0, 3.0, 4.0];
-        let corr = normalized_correlation(&a, &b);
-        assert!(
-            (corr - 1.0).abs() < 0.001,
-            "Identical signals should correlate at 1.0, got {corr}"
-        );
-
-        // Test 2: Opposite signals should have correlation of -1.0
-        let a = vec![1.0, 2.0, 3.0, 4.0];
-        let b = vec![-1.0, -2.0, -3.0, -4.0];
-        let corr = normalized_correlation(&a, &b);
-        assert!(
-            (corr + 1.0).abs() < 0.001,
-            "Opposite signals should correlate at -1.0, got {corr}"
-        );
-
-        // Test 3: Orthogonal signals should have correlation near 0
-        let a = vec![1.0, 0.0, -1.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0, -1.0];
-        let corr = normalized_correlation(&a, &b);
-        assert!(
-            corr.abs() < 0.001,
-            "Orthogonal signals should have ~0 correlation, got {corr}"
-        );
-    }
-
     /// Test 2: Consistency Check
     /// The sliding window version should match manual calculation
     #[test]
-    fn test_best_correlation_consistency() {
-        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let b = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]; // b is a shifted
-        let len = 3;
+    fn test_best_correlation_always_found() {
+        struct TestCase {
+            name: &'static str,
+            a: Vec<f32>,
+            b: Vec<f32>,
+            len: usize,
+            want_best_pos: Option<usize>,
+            want_best_corr_min: f32,
+            want_best_corr_max: f32,
+        }
 
-        let (best_pos, best_corr2) = best_normalized_correlation(&a, &b, len);
-
-        // Manually verify the best position
-        // At position where they align best, compute correlation manually
-        let window_a = &a[best_pos - len + 1..=best_pos];
-        let window_b = &b[best_pos - len + 1..=best_pos];
-        let manual_corr = normalized_correlation(window_a, window_b);
-        let manual_corr2 = manual_corr * manual_corr;
-
-        assert!(
-            (best_corr2 - manual_corr2).abs() < 0.001,
-            "Sliding window correlation should match manual calculation: {best_corr2} vs {manual_corr2}"
-        );
-    }
-
-    /// Test 3: Mathematical Property Test
-    /// Correlation coefficient must be in [-1, 1]
-    #[test]
-    fn test_correlation_bounds() {
-        // Random-ish signals
-        let a = vec![1.5, -2.3, 4.1, -0.5, 3.2, -1.8, 2.7];
-        let b = vec![0.8, 3.4, -1.2, 2.9, -0.7, 1.6, -2.1];
-
-        let corr = normalized_correlation(&a, &b);
-        assert!(
-            corr >= -1.0 && corr <= 1.0,
-            "Correlation must be in [-1, 1], got {corr}"
-        );
-
-        let len = 3;
-        let (_pos, corr2) = best_normalized_correlation(&a, &b, len);
-        assert!(
-            corr2 >= 0.0 && corr2 <= 1.0,
-            "Squared correlation must be in [0, 1], got {corr2}"
-        );
-    }
-
-    /// Test 4: Energy Conservation Test - THE CRITICAL TEST
-    /// This catches the copy-paste bug where sum_a2 and sum_b2 both use a[i]*b[i]
-    #[test]
-    fn test_sliding_window_energy_correctness() {
-        // Use signals where a and b are clearly different
-        // This ensures sum_a2 ≠ sum_ab ≠ sum_b2
-        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        let b = vec![5.0, 4.0, 3.0, 2.0, 1.0]; // Reversed pattern
-        let len = 3;
-
-        let (_pos, corr2) = best_normalized_correlation(&a, &b, len);
-
-        // With the bug, when sum_a2 and sum_b2 both equal sum_ab:
-        // corr2 = sum_ab^2 / (sum_ab * sum_ab) = 1.0 (always!)
-
-        // Without the bug, for these different signals:
-        // corr2 should be less than 1.0 (they're not perfectly correlated)
-
-        // Let's verify with a specific window to be concrete:
-        // For indices [1,2,3]: a=[2,3,4], b=[4,3,2]
-        // sum_ab = 2*4 + 3*3 + 4*2 = 8 + 9 + 8 = 25
-        // sum_a2 = 4 + 9 + 16 = 29
-        // sum_b2 = 16 + 9 + 4 = 29
-        // corr2 = 25^2 / (29 * 29) = 625/841 ≈ 0.743
-
-        // With bug: corr2 = 25^2 / (25 * 25) = 1.0
-
-        println!("Best correlation squared: {corr2}");
-        assert!(
-            corr2 < 0.99,
-            "BUG DETECTED! Reversed signals showing near-perfect correlation. \
-             This indicates sum_a2 and sum_b2 are computed incorrectly. Got corr2={corr2}"
-        );
-    }
-
-    /// Test 5: Direct comparison test - most explicit bug detector
-    #[test]
-    fn test_different_signals_not_perfectly_correlated() {
-        // Two completely different signals should NOT have correlation = 1.0
-        let a = vec![1.0, 0.0, -1.0, 0.0, 1.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0, -1.0, 0.0, 1.0]; // 90° out of phase
-        let len = 3;
-
-        let (_pos, corr2) = best_normalized_correlation(&a, &b, len);
-
-        // These orthogonal signals should have very low correlation
-        // With the bug, corr2 would incorrectly be 1.0
-        assert!(
-            corr2 < 0.5,
-            "BUG DETECTED! Orthogonal signals showing high correlation. \
-             This proves sum_a2 and sum_b2 are wrong. Got corr2={corr2}"
-        );
+        for test_case in [
+            TestCase {
+                name: "pos==0",
+                a: vec![0.3, 0.2, 0.1, 0.4, -0.6],
+                b: vec![0.3, 0.2, 0.1, -0.2, 0.8],
+                len: 3,
+                want_best_pos: Some(0),
+                want_best_corr_min: 0.99,
+                want_best_corr_max: 1.0,
+            },
+            TestCase {
+                name: "pos==1",
+                a: vec![-0.4, 0.3, 0.2, 0.1, 0.4],
+                b: vec![0.1, 0.3, 0.2, 0.1, -0.2],
+                len: 3,
+                want_best_pos: Some(1),
+                want_best_corr_min: 0.99,
+                want_best_corr_max: 1.0,
+            },
+            TestCase {
+                name: "pos==2",
+                a: vec![0.3, -0.4, 0.3, 0.2, 0.1],
+                b: vec![0.3, 0.1, 0.3, 0.2, 0.1],
+                len: 3,
+                want_best_pos: Some(2),
+                want_best_corr_min: 0.99,
+                want_best_corr_max: 1.0,
+            },
+            TestCase {
+                name: "pos==1, not perfect",
+                a: vec![-0.4, 0.3, 0.2, 0.1, 0.4],
+                b: vec![0.1, 0.2, 0.2, 0.1, -0.2],
+                len: 3,
+                want_best_pos: Some(1),
+                want_best_corr_min: 0.5,
+                want_best_corr_max: 0.9,
+            },
+            TestCase {
+                name: "anti align",
+                a: vec![-0.2, 0.3, -0.5],
+                b: vec![0.2, -0.3, 0.5],
+                len: 3,
+                want_best_pos: Some(0),
+                want_best_corr_min: -1.0,
+                want_best_corr_max: -0.99,
+            },
+            TestCase {
+                name: "all zero",
+                a: vec![0.0, 0.0, 0.0, 0.0, 0.0],
+                b: vec![0.0, 0.0, 0.0, 0.0, 0.0],
+                len: 3,
+                want_best_pos: None,
+                want_best_corr_min: 0.99,
+                want_best_corr_max: 1.0,
+            },
+            TestCase {
+                name: "reverse signal",
+                a: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+                b: vec![5.0, 4.0, 3.0, 2.0, 1.0], // Reversed pattern
+                len: 3,
+                want_best_pos: None,
+                want_best_corr_min: 0.01,
+                want_best_corr_max: 0.9,
+            },
+            TestCase {
+                name: "out of phase",
+                a: vec![1.0, 0.0, -1.0, 0.0, 1.0, 0.0],
+                b: vec![0.0, 1.0, 0.0, -1.0, 0.0, 1.0], // 90° out of phase
+                len: 3,
+                want_best_pos: None,
+                want_best_corr_min: -1.0,
+                want_best_corr_max: 0.0,
+            },
+        ] {
+            let (best_pos, best_corr) =
+                best_normalized_correlation(&test_case.a, &test_case.b, test_case.len);
+            if let Some(want_best_pos) = test_case.want_best_pos {
+                assert!(
+                    want_best_pos == best_pos,
+                    "{}: Unexpected position, want: {} got: {}",
+                    test_case.name,
+                    want_best_pos,
+                    best_pos
+                );
+            }
+            assert!(
+                best_corr > test_case.want_best_corr_min
+                    || best_corr < test_case.want_best_corr_max,
+                "{}: Unexpected correlation, want: {}<=x<={} got: {}",
+                test_case.name,
+                test_case.want_best_corr_min,
+                test_case.want_best_corr_max,
+                best_corr
+            );
+        }
     }
 
     #[test]

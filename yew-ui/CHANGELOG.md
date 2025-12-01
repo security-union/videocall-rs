@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.33](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.32...videocall-ui-v1.1.33) - 2025-11-30
+
+### Other
+
+- Optimize videocallclient and canvas integration via Yew Context ([#486](https://github.com/security-union/videocall-rs/pull/486))
+- Fix OAuth redirectURL ([#485](https://github.com/security-union/videocall-rs/pull/485))
+
 ## [1.1.32](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.31...videocall-ui-v1.1.32) - 2025-11-02
 
 ### Other

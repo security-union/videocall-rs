@@ -28,19 +28,11 @@ graph TD
 
 ## Key Components
 
-- **actix-api:** Rust-based backend server using Actix Web framework
-- **videocall-types:** Shared data types and protocol definitions
-
 ### 1. Client Applications
 
 - **Web Client**: Built with Yew (Rust-to-WebAssembly framework)
-  - **`yew-ui`** Web frontend built with the Yew framework and compiled to WebAssembly
-  - **`tailwind-yew`** css
-  - **`videocall-client`** Client library for native integration
 - **CLI Client**: Native Rust client for headless devices
-  - **`videocall-cli`** Command-line interface for headless video streaming
 - **Mobile Clients**: Native mobile applications (in development)
-  - **`videocall-sdk`**
 
 ### 2. Transport Servers
 

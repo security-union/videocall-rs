@@ -453,5 +453,3 @@ The deployment architecture supports multiple environments through value overrid
 Each environment uses separate value files (e.g., `values.yaml`).
 
 ---
-
-This architecture document is meant to provide a clear understanding of how videocall.rs components fit together. For more detailed implementation information, please refer to the codebase documentation and comments.

@@ -1255,10 +1255,40 @@ body {
   display: block !important;
 }
 
+.grid-item .canvas-container .crop-icon {
+  position: absolute !important;
+  top: 8px !important;
+  right: 88px !important; /* 8px edge + mic + pin + 8px gaps */
+  left: auto !important;
+  transform: none !important;
+  opacity: 0.6 !important;
+  background-color: rgba(0, 0, 0, 0.6) !important;
+  border-radius: 50% !important;
+  padding: 6px !important;
+  text-align: center !important;
+  line-height: 1 !important;
+  cursor: pointer !important;
+  z-index: 10 !important;
+  transition: opacity 0.2s ease !important;
+  border: none !important;
+  visibility: hidden !important;
+}
+
+.grid-item .canvas-container .crop-icon svg {
+  width: 20px !important;
+  height: 20px !important;
+  display: block !important;
+}
+
 /* Hide pin icon by default on desktop, show on hover */
 @media (min-width: 768px) {
   .grid-item .canvas-container .pin-icon { opacity: 0 !important; }
   .grid-item .canvas-container:hover .pin-icon {
+    visibility: visible !important;
+    opacity: 0.6 !important;
+  }
+  .grid-item .canvas-container .crop-icon { opacity: 0 !important; }
+  .grid-item .canvas-container:hover .crop-icon {
     visibility: visible !important;
     opacity: 0.6 !important;
   }
@@ -1267,7 +1297,11 @@ body {
 /* Hide pin icon on mobile – tap tile to pin instead */
 @media (max-width: 767px) {
   .grid-item .canvas-container .pin-icon { display: none !important; }
+  .grid-item .canvas-container .crop-icon { display: none !important; }
 }
+
+.grid-item .canvas-container canvas.cropped { object-fit: cover !important; }
+.grid-item .canvas-container canvas.uncropped { object-fit: contain !important; }
 
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
 .copy-button {

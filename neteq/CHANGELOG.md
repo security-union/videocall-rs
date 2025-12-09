@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/security-union/videocall-rs/compare/neteq-v0.7.1...neteq-v0.8.0) - 2025-11-30
+
+### Other
+
+- Delete commented code and address clippy warnings ([#489](https://github.com/security-union/videocall-rs/pull/489))
+- neteq preemptive expand improvements ([#476](https://github.com/security-union/videocall-rs/pull/476))
+- improved accelerate ([#475](https://github.com/security-union/videocall-rs/pull/475))
+
 ## [0.7.1](https://github.com/security-union/videocall-rs/compare/neteq-v0.7.0...neteq-v0.7.1) - 2025-11-02
 
 ### Other

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.29](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.28...videocall-client-v1.1.29) - 2025-11-30
+
+### Other
+
+- Delete commented code and address clippy warnings ([#489](https://github.com/security-union/videocall-rs/pull/489))
+- Optimize videocallclient and canvas integration via Yew Context ([#486](https://github.com/security-union/videocall-rs/pull/486))
+- Fix Critical Audio Worklet Message Serialization Bug ([#482](https://github.com/security-union/videocall-rs/pull/482))
+
 ## [1.1.28](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.27...videocall-client-v1.1.28) - 2025-11-02
 
 ### Other

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.4](https://github.com/security-union/videocall-rs/compare/videocall-cli-v3.0.3...videocall-cli-v3.0.4) - 2025-11-30
+
+### Other
+
+- Delete commented code and address clippy warnings ([#489](https://github.com/security-union/videocall-rs/pull/489))
+
 ## [3.0.3](https://github.com/security-union/videocall-rs/compare/videocall-cli-v3.0.2...videocall-cli-v3.0.3) - 2025-11-02
 
 ### Other

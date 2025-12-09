@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-core-v0.1.7...videocall-nokhwa-core-v0.1.8) - 2025-11-30
+
+### Other
+
+- Delete commented code and address clippy warnings ([#489](https://github.com/security-union/videocall-rs/pull/489))
+
 ## [0.1.7](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-core-v0.1.6...videocall-nokhwa-core-v0.1.7) - 2025-06-23
 
 ### Other

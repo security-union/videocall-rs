@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/security-union/videocall-rs/compare/videocall-diagnostics-v0.1.2...videocall-diagnostics-v0.1.3) - 2025-11-30
+
+### Other
+
+- Fix OAuth redirectURL ([#485](https://github.com/security-union/videocall-rs/pull/485))
+
 ## [0.1.2](https://github.com/security-union/videocall-rs/compare/videocall-diagnostics-v0.1.1...videocall-diagnostics-v0.1.2) - 2025-08-08
 
 ### Other

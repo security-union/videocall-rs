@@ -150,7 +150,7 @@ impl VideoEncoder {
         Ok(())
     }
 
-    pub fn encode(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames> {
+    pub fn encode(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames<'_>> {
         let image = MaybeUninit::zeroed();
         let mut image = unsafe { image.assume_init() };
 

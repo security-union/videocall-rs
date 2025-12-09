@@ -82,7 +82,7 @@ impl RequestedFormat<'_> {
     pub fn with_formats(
         requested: RequestedFormatType,
         decoder: &[FrameFormat],
-    ) -> RequestedFormat {
+    ) -> RequestedFormat<'_> {
         RequestedFormat {
             requested_format: requested,
             wanted_decoder: decoder,

@@ -1,6 +1,6 @@
 [package]
 name = "videocall-codecs"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -78,7 +78,7 @@ web-sys = { version = "0.3", optional = true, features = [
     "HtmlElement",
     "HtmlLinkElement",
 ] }
-videocall-diagnostics = { path = "../videocall-diagnostics", optional = true, version = "0.1.2" }
+videocall-diagnostics = { path = "../videocall-diagnostics", optional = true, version = "0.1.3" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env-libvpx-sys = { workspace = true }

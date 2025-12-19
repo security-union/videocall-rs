@@ -27,9 +27,11 @@ use crate::{
 
 use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
 use futures::StreamExt;
+use protobuf::Message as ProtoMessage;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace};
+use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
 use super::chat_session::SessionId;
 
@@ -85,6 +87,10 @@ impl ChatServer {
                         let is_creator = manager.is_creator(&room_id_clone, &user_id_clone).await;
 
                         if is_creator && remaining_count > 0 {
+                            info!(
+                                "Creator {} leaving room {} - ending meeting for all",
+                                user_id_clone, room_id_clone
+                            );
                             match manager.end_meeting(&room_id_clone).await {
                                 Ok(_) => {
                                     let meeting_ended_msg = serde_json::json!({
@@ -109,6 +115,40 @@ impl ChatServer {
                                 }
                                 Err(e) => {
                                     error!("Error ending meeting for room {}: {}", room_id_clone, e)
+                                }
+                            }
+
+                            let message = "MEETING_ENDED:The host has ended the meeting";
+
+                            let packet = PacketWrapper {
+                                packet_type: PacketType::CONNECTION.into(),
+                                email: "system".to_string(),
+                                data: message.as_bytes().to_vec(),
+                                ..Default::default()
+                            };
+
+                            match packet.write_to_bytes() {
+                                Ok(packet_bytes) => {
+                                    //let subject = format!("room.{}", room_id_clone);
+                                    let subject =
+                                        format!("room.{}.system", room_id_clone.replace(' ', "_"));
+                                    match nc.publish(subject.clone(), packet_bytes.into()).await {
+                                        Ok(_) => {
+                                            info!(
+                                                "Successfully published MEETING_ENDED to {}",
+                                                subject
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Failed to publish MEETING_ENDED to {}: {}",
+                                                subject, e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to serialize MEETING_ENDED packet: {}", e);
                                 }
                             }
                         } else if remaining_count == 0 {
@@ -249,15 +289,18 @@ impl Handler<JoinRoom> for ChatServer {
             let manager = self.meeting_manager.clone();
             let room_clone = room.clone();
             let user_id_clone = user_id.clone();
+            let nc = self.nats_connection.clone();
 
             tokio::spawn(async move {
                 tokio::spawn(async move {
                     match manager.start_meeting(&room_clone, &user_id_clone).await {
                         Ok(start_time) => {
                             info!(
-                                "✅ Meeting started for room {} at {} by creator {}",
+                                "Meeting started for room {} at {} by creator {}",
                                 room_clone, start_time, user_id_clone
                             );
+
+                            send_meeting_info(&nc, &room_clone, &session, start_time).await;
                         }
                         Err(e) => {
                             error!("Error starting meeting for room {}: {}", room_clone, e);
@@ -310,6 +353,35 @@ impl Handler<JoinRoom> for ChatServer {
         self.active_subs.insert(session, handle);
 
         MessageResult(Ok(()))
+    }
+}
+
+
+
+async fn send_meeting_info(
+    nc: &async_nats::client::Client,
+    room: &str,
+    session: &str,
+    start_time_ms: u64,
+) {
+    let message = format!("MEETING_INFO:{}", start_time_ms);
+
+    let packet = PacketWrapper {
+        packet_type: PacketType::CONNECTION.into(),
+        email: "system".to_string(),
+        data: message.as_bytes().to_vec(),
+        ..Default::default()
+    };
+
+    match packet.write_to_bytes() {
+        Ok(packet_byte) => {
+            let subject = format!("room.{}.{}", room.replace(' ', "_"), session);
+            match nc.publish(subject.clone(), packet_byte.into()).await {
+                Ok(_) => info!("Sent meeting start time {} to {} {}", start_time_ms, room, session),
+                Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
+            }
+        }
+        Err(e) => error!("Failed to serialize packet: {}", e),
     }
 }
 

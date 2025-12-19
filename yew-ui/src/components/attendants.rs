@@ -64,6 +64,7 @@ pub enum UserScreenToggleAction {
     PeerList,
     Diagnostics,
     DeviceSettings,
+    MeetingInfo,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -167,6 +168,7 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_info_data: Option<MeetingInfoData>, //Meeting info data
     meeting_ended_message: Option<String>,
+    meeting_info_open: bool,
 }
 
 impl AttendantsComponent {
@@ -370,12 +372,20 @@ impl AttendantsComponent {
         }
     }
 
-    fn format_call_duration(&self) -> String {
+    fn format_meeting_duration(&self) -> String {
+        log::info!(
+            "format_meeting_duration - meeting_start_time_server: {:?}",
+            self.meeting_start_time_server
+        );
         if let Some(server_start_ms) = self.meeting_start_time_server {
             let now_ms = js_sys::Date::now();
+
+            log::info!("Server start: {}, Now: {}", server_start_ms, now_ms);
             let elapsed_ms = (now_ms - server_start_ms).max(0.0);
 
             let elapsed_secs = (elapsed_ms / 1000.0) as u64;
+
+            log::info!("Elapsed seconds: {}", elapsed_secs);
             let hours = elapsed_secs / 3600;
             let minutes = (elapsed_secs % 3600) / 60;
             let seconds = elapsed_secs % 60;
@@ -383,9 +393,16 @@ impl AttendantsComponent {
             if hours > 0 {
                 format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
             } else {
-                return format!("{:02}:{:02}", minutes, seconds);
+                format!("{:02}:{:02}", minutes, seconds)
             }
-        } else if let Some(local_start) = self.call_start_time {
+        } else {
+            log::warn!("meeting_start_time_server is None, falling back to user duration");
+            "00:00".to_string()
+        }
+    }
+
+    pub fn format_user_duration(&self) -> String {
+        if let Some(local_start) = self.call_start_time {
             let now = web_sys::window()
                 .and_then(|w| w.performance())
                 .map(|p| p.now())
@@ -443,6 +460,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_info_data: None,
             meeting_ended_message: None,
+            meeting_info_open: false,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -479,6 +497,7 @@ impl Component for AttendantsComponent {
                     log::info!("YEW-UI: Connection established successfully!");
 
                     if self.meeting_start_time_server.is_none() {
+                        self.meeting_start_time_server = Some(js_sys::Date::now());
                         self.call_start_time =
                             Some(web_sys::window().unwrap().performance().unwrap().now());
                     }
@@ -493,7 +512,14 @@ impl Component for AttendantsComponent {
                     true
                 }
 
-                WsAction::TimerTick => true,
+                WsAction::TimerTick => {
+                    log::debug!(
+                        "Timer tick - meeting_start: {:?}, user_start: {:?}",
+                        self.meeting_start_time_server,
+                        self.call_start_time
+                    );
+                    true
+                }
 
                 WsAction::Log(msg) => {
                     warn!("{msg}");
@@ -539,9 +565,11 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::MeetingInfoReceived(start_time) => {
-                    log::info!("Received meeting start time from server: {} ms", start_time);
+                    log::info!("Stored meeting_start_time_server: {:?}", start_time);
 
                     self.meeting_start_time_server = Some(start_time as f64);
+
+                    log::info!("Stored meeting_start_time_server: {:?}", self.meeting_start_time_server);
 
                     if self._timer.is_none() {
                         let link = ctx.link().clone();
@@ -658,6 +686,16 @@ impl Component for AttendantsComponent {
                             self.diagnostics_open = false;
                         }
                     }
+
+                    UserScreenToggleAction::MeetingInfo => {
+                        self.meeting_info_open = !self.meeting_info_open;
+                        if self.meeting_info_open {
+                            //  self.peer_list_open = false;
+                            self.diagnostics_open = false;
+                            self.device_settings_open = false;
+                        }
+                        ctx.link().send_message(Msg::FetchMeetingInfo);
+                    }
                 }
                 true
             }
@@ -726,11 +764,11 @@ impl Component for AttendantsComponent {
                 self.call_start_time = None;
                 self.meeting_start_time_server = None;
 
-                // Timeout::new(500, move || {
-                //     log::info!("Navigating to home page after disconnect delay");
-                //     let _ = window().location().set_href("/"); // Refresh page for clean state
-                // })
-                // .forget();
+                Timeout::new(500, move || {
+                    let _ = window().location().set_href("/");
+                })
+                .forget();
+
                 true
             }
 
@@ -850,7 +888,7 @@ impl Component for AttendantsComponent {
             if self.meeting_start_time_server.is_some() || self.call_start_time.is_some() {
                 html! {
                     <div class="call-timer" >
-                        { self.format_call_duration() }
+                        { self.format_meeting_duration() }
                     </div>
                 }
             } else {
@@ -1269,13 +1307,35 @@ impl Component for AttendantsComponent {
                     }
                 </div>
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
-                    <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
+                    {
+                        if self.peer_list_open {
+                            let toggle_meeting_info = ctx.link().callback(|_| UserScreenToggleAction::MeetingInfo);
+                            html! {
+                                <PeerList
+                                    peers={display_peers_vec.clone()}
+                                    onclose={toggle_peer_list}
+
+                                    show_meeting_info={self.meeting_info_open}
+                                    room_id={ctx.props().id.clone()}
+                                    num_participants={num_display_peers}
+                                    meeting_duration={self.format_meeting_duration()}
+                                    user_meeting_duration={self.format_user_duration()}
+                                    started_at={self.meeting_info_data.as_ref().map(|d| d.started_at.clone())}
+                                    ended_at={self.meeting_info_data.as_ref().and_then(|d| d.ended_at.clone())}
+                                    is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
+                                    on_toggle_meeting_info={toggle_meeting_info}
+                                />
+                            }
+                        } else {
+                                html! {}
+                        }
+                    }
                 </div>
 
                 {
                     if let Some(ref message) = self.meeting_ended_message {
                         html! {
-                            <div class="glass-backdrop" style="z-index: 9999;">  // ADD THIS WRAPPER
+                            <div class="glass-backdrop" style="z-index: 9999;">
                                 <div class="card-apple" style="width: 420px; text-align: center;">
                                     <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2" style="margin: 0 auto 1rem;">
                                         <circle cx="12" cy="12" r="10"></circle>
@@ -1302,7 +1362,6 @@ impl Component for AttendantsComponent {
                         html! {}
                     }
                 }
-
 
                 {
                     if self.diagnostics_open {

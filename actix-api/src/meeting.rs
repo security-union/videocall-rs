@@ -1,6 +1,6 @@
-use actix_web::{ web, HttpResponse };
 use crate::models::meeting::Meeting;
 use crate::models::meeting::Meeting as DbMeeting;
+use actix_web::{web, HttpResponse};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -99,8 +99,6 @@ impl MeetingState {
     pub fn is_creator(&self, user_id: &str) -> bool {
         self.creator_id == Some(user_id.to_string())
     }
-
-
 }
 
 #[derive(Debug, Clone)]
@@ -118,9 +116,9 @@ impl Default for MeetingManager {
 
 #[derive(Serialize)]
 struct MeetingInfo {
-    room_id: String, 
-    started_at: String, 
-    ended_at: Option<String>, 
+    room_id: String,
+    started_at: String,
+    ended_at: Option<String>,
     duration_ms: i64,
     is_active: bool,
 }
@@ -136,9 +134,11 @@ impl MeetingManager {
         room_id: &str,
         creator_id: &str,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        info!(" start_meeting called for room: {}", room_id); // ← Should see this
+        info!(" start_meeting called for room: {}", room_id);
 
-        let meeting = self.get_or_create_meeting(room_id, Some(creator_id.to_string())).await;
+        let meeting = self
+            .get_or_create_meeting(room_id, Some(creator_id.to_string()))
+            .await;
 
         let current_start = meeting.get_start_time();
         if current_start != 0 {
@@ -147,18 +147,18 @@ impl MeetingManager {
         }
 
         let now_ms = Utc::now().timestamp_millis() as u64;
-        info!(" Setting start time {} for room {}", now_ms, room_id); // ← Should see this
+        info!(" Setting start time {} for room {}", now_ms, room_id);
 
         if meeting.set_start_time(now_ms) {
             info!(" Meeting {} started at {}", room_id, now_ms);
 
             let meeting_clone = meeting.clone();
             tokio::spawn(async move {
-                info!(" Attempting to save meeting to database"); // ← Should see this
+                info!(" Attempting to save meeting to database");
                 if let Err(e) = meeting_clone.save_to_db(now_ms).await {
                     error!("Failed to save meeting: {}", e);
                 } else {
-                    info!(" Meeting saved to database successfully"); // ← Should see this
+                    info!(" Meeting saved to database successfully");
                 }
             });
 
@@ -169,7 +169,11 @@ impl MeetingManager {
     }
 
     /// Get or create a meeting
-    pub async fn get_or_create_meeting(&self, room_id: &str, creator_id: Option<String>) -> Arc<MeetingState> {
+    pub async fn get_or_create_meeting(
+        &self,
+        room_id: &str,
+        creator_id: Option<String>,
+    ) -> Arc<MeetingState> {
         {
             let meetings = self.meetings.read().await;
             if let Some(meeting) = meetings.get(room_id) {
@@ -195,47 +199,44 @@ impl MeetingManager {
         &self,
         room_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        error!(
-            "MeetingManager::end_meeting called for room: {}",
-            room_id
-        );
+        error!("MeetingManager::end_meeting called for room: {}", room_id);
 
         let room_id_clone = room_id.to_string();
 
         match tokio::task::spawn_blocking(move || {
             error!("Inside spawn_blocking, calling DbMeeting::end_meeting");
             DbMeeting::end_meeting(&room_id_clone)
-        }).await {
+        })
+        .await
+        {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 error!("Error ending meeting: {}", e);
                 Err(e)
-            },
+            }
             Err(join_err) => {
                 let error_msg = join_err.to_string();
                 error!("Join error in end_meeting: {}", error_msg);
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    error_msg,
-                )) as Box<dyn std::error::Error + Send + Sync>)
+                Err(
+                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, error_msg))
+                        as Box<dyn std::error::Error + Send + Sync>,
+                )
             }
         }
     }
 
     pub async fn get_meeting_info(&self, room_id: &str) -> Result<HttpResponse, actix_web::Error> {
         let room_id_clone = room_id.to_string();
-        
-        let meeting = tokio::task::spawn_blocking(move || {
-            Meeting::get_by_room_id(&room_id_clone)
-        })
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
-        
+
+        let meeting = tokio::task::spawn_blocking(move || Meeting::get_by_room_id(&room_id_clone))
+            .await
+            .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+
         match meeting {
             Ok(Some(meeting)) => {
                 let meeting_info = MeetingInfo {
-                    room_id: meeting.room_id.clone(), 
-                    started_at: meeting.started_at.to_rfc3339(), 
+                    room_id: meeting.room_id.clone(),
+                    started_at: meeting.started_at.to_rfc3339(),
                     ended_at: meeting.ended_at.map(|dt| dt.to_rfc3339()),
                     duration_ms: meeting.current_durtion_ms(),
                     is_active: meeting.is_active(),
@@ -243,12 +244,8 @@ impl MeetingManager {
 
                 Ok(HttpResponse::Ok().json(meeting_info))
             }
-            Ok(None) => {
-                Ok(HttpResponse::NotFound().json(serde_json::json!("error: Not found")))
-            }
-            Err(e) => {
-                Err(actix_web::error::ErrorInternalServerError(e))
-            }
+            Ok(None) => Ok(HttpResponse::NotFound().json(serde_json::json!("error: Not found"))),
+            Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
         }
     }
 
@@ -260,22 +257,26 @@ impl MeetingManager {
         }
     }
 
-
-    pub async fn get_meeting_info_route(room_id: web::Path<String>, meeting_manager: web::Data<MeetingManager> ) -> Result<HttpResponse, actix_web::Error> {
+    pub async fn get_meeting_info_route(
+        room_id: web::Path<String>,
+        meeting_manager: web::Data<MeetingManager>,
+    ) -> Result<HttpResponse, actix_web::Error> {
         meeting_manager.get_meeting_info(&room_id).await
     }
 
     pub async fn is_creator(&self, room_id: &str, user_id: &str) -> bool {
-        let meetings = self.meetings.read().await; 
-        meetings.get(room_id).map(|m| m.is_creator(user_id)).unwrap_or(false)
+        let meetings = self.meetings.read().await;
+        meetings
+            .get(room_id)
+            .map(|m| m.is_creator(user_id))
+            .unwrap_or(false)
     }
 
     pub fn configure(&self, cfg: &mut web::ServiceConfig) {
-        let manager = Arc::new(self.clone()); 
-        cfg.app_data(web::Data::new(manager))
-            .service(
-                web::resource("/api/meeting/{room_id}/info")
-                    .route(web::get().to(Self::get_meeting_info_route))
-            );
+        let manager = Arc::new(self.clone());
+        cfg.app_data(web::Data::new(manager)).service(
+            web::resource("/api/meeting/{room_id}/info")
+                .route(web::get().to(Self::get_meeting_info_route)),
+        );
     }
 }

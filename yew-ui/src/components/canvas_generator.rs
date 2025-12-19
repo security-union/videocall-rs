@@ -16,10 +16,10 @@
  * conditions.
  */
 
+use crate::components::icons::crop::CropIcon;
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
-use crate::components::icons::crop::CropIcon;
 use crate::constants::users_allowed_to_stream;
 use crate::context::VideoCallClientCtx;
 use std::rc::Rc;

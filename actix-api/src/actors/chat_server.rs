@@ -282,16 +282,15 @@ impl Handler<JoinRoom> for ChatServer {
         }
 
         let count = self.room_participants.entry(room.clone()).or_insert(0);
-        let is_first_participant = *count == 0;
+        let is_first_participant = *count == 0; 
         *count += 1;
 
-        let session_for_meeting_info = session.clone();
         let manager = self.meeting_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
         let nc = self.nats_connection.clone();
 
-        tokio::spawn(async move {
+        let send_info_task = tokio::spawn(async move {
             if is_first_participant {
                 match manager.start_meeting(&room_clone, &user_id_clone).await {
                     Ok(start_time) => {
@@ -300,8 +299,7 @@ impl Handler<JoinRoom> for ChatServer {
                             room_clone, start_time, user_id_clone
                         );
 
-                        send_meeting_info(&nc, &room_clone, &session_for_meeting_info, start_time)
-                            .await;
+                        send_meeting_info(&nc, &room_clone, start_time).await;
                     }
                     Err(e) => {
                         error!("Error starting meeting for room {}: {}", room_clone, e);
@@ -315,7 +313,6 @@ impl Handler<JoinRoom> for ChatServer {
                         send_meeting_info(
                             &nc,
                             &room_clone,
-                            &session_for_meeting_info,
                             start_time as u64,
                         ).await;
                     }
@@ -333,6 +330,7 @@ impl Handler<JoinRoom> for ChatServer {
         });
 
         let (subject, queue) = build_subject_and_queue(&room, &session.as_str());
+        info!("🔍 Subscription - subject: {}, queue: {}", subject, queue);
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
@@ -351,9 +349,13 @@ impl Handler<JoinRoom> for ChatServer {
         let session_clone = session.clone();
         let room_clone = room.clone();
 
+
+
+
         let handle = tokio::spawn(async move {
             match nc.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
+                    let _ = send_info_task;
                     while let Some(msg) = sub.next().await {
                         if let Err(e) = handle_msg(
                             session_recipient.clone(),
@@ -381,7 +383,6 @@ impl Handler<JoinRoom> for ChatServer {
 async fn send_meeting_info(
     nc: &async_nats::client::Client,
     room: &str,
-    session: &str,
     start_time_ms: u64,
 ) {
     let message = format!("MEETING_INFO:{}", start_time_ms);
@@ -395,16 +396,13 @@ async fn send_meeting_info(
 
     match packet.write_to_bytes() {
         Ok(packet_byte) => {
-            let subject = format!("room.{}.{}", room.replace(' ', "_"), session);
+            let subject = format!("room.{}.system", room.replace(' ', "_"));
             match nc.publish(subject.clone(), packet_byte.into()).await {
-                Ok(_) => info!(
-                    "Sent meeting start time {} to {} {}",
-                    start_time_ms, room, session
-                ),
+                Ok(_) =>  info!("✅ Sent meeting start time {} to {}", start_time_ms, subject),
                 Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
             }
         }
-        Err(e) => error!("Failed to serialize packet: {}", e),
+        Err(e) => error!("Failed to serialize packet: {}", e),  
     }
 }
 

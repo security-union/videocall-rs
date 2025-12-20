@@ -162,8 +162,8 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
-    pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp
-    pub call_start_time: Option<f64>,           // Track when the call started
+    pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp - the actual meeting time
+    pub call_start_time: Option<f64>,           // Track when the call started for a user
     _timer: Option<Interval>,
     show_dropdown: bool,
     meeting_info_data: Option<MeetingInfoData>, //Meeting info data
@@ -396,19 +396,15 @@ impl AttendantsComponent {
                 format!("{:02}:{:02}", minutes, seconds)
             }
         } else {
-            log::warn!("meeting_start_time_server is None, falling back to user duration");
             "00:00".to_string()
         }
     }
 
     pub fn format_user_duration(&self) -> String {
         if let Some(local_start) = self.call_start_time {
-            let now = web_sys::window()
-                .and_then(|w| w.performance())
-                .map(|p| p.now())
-                .unwrap_or(local_start + 1000.0);
+            let now_ms = js_sys::Date::now();
 
-            let elapsed_ms = (now - local_start).max(0.0);
+            let elapsed_ms = (now_ms - local_start).max(0.0);
             let elapsed_secs = (elapsed_ms / 1000.0) as u64;
             let hours = elapsed_secs / 3600;
             let minutes = (elapsed_secs % 3600) / 60;
@@ -496,11 +492,7 @@ impl Component for AttendantsComponent {
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
 
-                    if self.meeting_start_time_server.is_none() {
-                        self.meeting_start_time_server = Some(js_sys::Date::now());
-                        self.call_start_time =
-                            Some(web_sys::window().unwrap().performance().unwrap().now());
-                    }
+                    self.call_start_time = Some(js_sys::Date::now());
 
                     if self._timer.is_none() {
                         let link = ctx.link().clone();
@@ -590,22 +582,7 @@ impl Component for AttendantsComponent {
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
 
-                // Make sure timer is running when someone joins
-                if self.meeting_start_time_server.is_none() && self.call_start_time.is_none() {
-                    self.call_start_time = web_sys::window()
-                        .and_then(|w| w.performance())
-                        .map(|p| p.now());
-                    if self.call_start_time.is_some() && self._timer.is_none() {
-                        let link = ctx.link().clone();
-                        // Clear any existing timer
-                        //  self._timer = None;
-                        // Create a new interval that triggers an update every second
-                        let interval = Interval::new(1000, move || {
-                            link.send_message(Msg::WsAction(WsAction::TimerTick));
-                        });
-                        self._timer = Some(interval);
-                    }
-                }
+
                 true
             }
             Msg::OnPeerRemoved(_peer_id) => {
@@ -885,10 +862,10 @@ impl Component for AttendantsComponent {
 
         // Create the call timer HTML if the call has started
         let call_timer =
-            if self.meeting_start_time_server.is_some() || self.call_start_time.is_some() {
+            if self.call_start_time.is_some() {
                 html! {
                     <div class="call-timer" >
-                        { self.format_meeting_duration() }
+                        { self.format_user_duration() }
                     </div>
                 }
             } else {
@@ -1314,7 +1291,6 @@ impl Component for AttendantsComponent {
                                 <PeerList
                                     peers={display_peers_vec.clone()}
                                     onclose={toggle_peer_list}
-
                                     show_meeting_info={self.meeting_info_open}
                                     room_id={ctx.props().id.clone()}
                                     num_participants={num_display_peers}
@@ -1360,7 +1336,7 @@ impl Component for AttendantsComponent {
                         }
                     } else {
                         html! {}
-                    }
+                    } 
                 }
 
                 {

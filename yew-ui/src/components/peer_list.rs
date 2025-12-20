@@ -159,8 +159,7 @@ impl Component for PeerList {
                                             </svg>
                                             {if ctx.props().show_meeting_info { "Hide Meeting Info" } else { "Show Meeting Info" }}
                                         </button>
-                                    
-                                    
+                                
                                     </div>
                                 }
                             } else {

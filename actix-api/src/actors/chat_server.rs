@@ -285,32 +285,54 @@ impl Handler<JoinRoom> for ChatServer {
         let is_first_participant = *count == 0;
         *count += 1;
 
-        if is_first_participant {
-            let manager = self.meeting_manager.clone();
-            let room_clone = room.clone();
-            let user_id_clone = user_id.clone();
-            let nc = self.nats_connection.clone();
+        let session_for_meeting_info = session.clone();
+        let manager = self.meeting_manager.clone();
+        let room_clone = room.clone();
+        let user_id_clone = user_id.clone();
+        let nc = self.nats_connection.clone();
 
-            tokio::spawn(async move {
-                tokio::spawn(async move {
-                    match manager.start_meeting(&room_clone, &user_id_clone).await {
-                        Ok(start_time) => {
-                            info!(
-                                "Meeting started for room {} at {} by creator {}",
-                                room_clone, start_time, user_id_clone
-                            );
+        tokio::spawn(async move {
+            if is_first_participant {
+                match manager.start_meeting(&room_clone, &user_id_clone).await {
+                    Ok(start_time) => {
+                        info!(
+                            "Meeting started for room {} at {} by creator {}",
+                            room_clone, start_time, user_id_clone
+                        );
 
-                            send_meeting_info(&nc, &room_clone, &session, start_time).await;
-                        }
-                        Err(e) => {
-                            error!("Error starting meeting for room {}: {}", room_clone, e);
-                        }
+                        send_meeting_info(&nc, &room_clone, &session_for_meeting_info, start_time)
+                            .await;
                     }
-                })
-            });
-        }
+                    Err(e) => {
+                        error!("Error starting meeting for room {}: {}", room_clone, e);
+                    }
+                }
+            } else {
+                match manager.get_meeting_start_time(&room_clone).await {
+                    Ok(Some(start_time)) => {
+                        info!("Meeting info for room {}", room_clone);
 
-        let (subject, queue) = build_subject_and_queue(&room, &session);
+                        send_meeting_info(
+                            &nc,
+                            &room_clone,
+                            &session_for_meeting_info,
+                            start_time as u64,
+                        ).await;
+                    }
+                    Ok(None) => {
+                        error!("Meeting {} exists but has no start time", room_clone);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Error getting meeting start time for room {}: {}",
+                            room_clone, e
+                        );
+                    }
+                }
+            }
+        });
+
+        let (subject, queue) = build_subject_and_queue(&room, &session.as_str());
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
@@ -356,8 +378,6 @@ impl Handler<JoinRoom> for ChatServer {
     }
 }
 
-
-
 async fn send_meeting_info(
     nc: &async_nats::client::Client,
     room: &str,
@@ -377,7 +397,10 @@ async fn send_meeting_info(
         Ok(packet_byte) => {
             let subject = format!("room.{}.{}", room.replace(' ', "_"), session);
             match nc.publish(subject.clone(), packet_byte.into()).await {
-                Ok(_) => info!("Sent meeting start time {} to {} {}", start_time_ms, room, session),
+                Ok(_) => info!(
+                    "Sent meeting start time {} to {} {}",
+                    start_time_ms, room, session
+                ),
                 Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
             }
         }

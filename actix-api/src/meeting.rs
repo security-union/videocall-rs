@@ -225,6 +225,14 @@ impl MeetingManager {
         }
     }
 
+    pub async fn get_meeting_start_time(&self, room_id: &str) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>>  {
+        let room_id = room_id.to_string();
+
+        tokio::task::spawn_blocking(move || Meeting::get_meeting_start_time(&room_id))
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+    }
+
     pub async fn get_meeting_info(&self, room_id: &str) -> Result<HttpResponse, actix_web::Error> {
         let room_id_clone = room_id.to_string();
 
@@ -249,13 +257,6 @@ impl MeetingManager {
         }
     }
 
-    /// Remove meeting from memory (but keeps it in the database)
-    pub async fn cleanup_meeting(&self, room_id: &str) {
-        let mut meetings = self.meetings.write().await;
-        if meetings.remove(room_id).is_some() {
-            info!("Meeting {} removed from memory", room_id);
-        }
-    }
 
     pub async fn get_meeting_info_route(
         room_id: web::Path<String>,

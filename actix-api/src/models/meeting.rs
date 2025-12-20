@@ -2,7 +2,7 @@ use crate::db::get_connection_query;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use tracing::{ error };
+use tracing::error;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Meeting {
@@ -75,7 +75,11 @@ impl Meeting {
             &[&room_id],
         )?;
 
-        error!("Meeting {} ended at: {:?}", room_id, row.get::<_, Option<DateTime<Utc>>>("ended_at"));
+        error!(
+            "Meeting {} ended at: {:?}",
+            room_id,
+            row.get::<_, Option<DateTime<Utc>>>("ended_at")
+        );
 
         Ok(Meeting {
             id: row.get("id"),
@@ -147,6 +151,23 @@ impl Meeting {
                 let now = Utc::now();
                 Self::create(room_id, now, None)
             }
+        }
+    }
+
+    pub fn get_meeting_start_time(
+        room_id: &str,
+    ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = get_connection_query()?;
+        let rows = conn.query(
+            "SELECT started_at FROM meetings WHERE room_id = $1 AND ended_at IS NULL",
+            &[&room_id],
+        )?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        } else {
+            let started_at: DateTime<Utc> = rows[0].get("started_at");
+            Ok(Some(started_at.timestamp_millis()))
         }
     }
 }

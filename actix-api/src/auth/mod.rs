@@ -58,6 +58,7 @@ pub struct OAuthRequest {
     pub pkce_challenge: String,
     pub pkce_verifier: String,
     pub csrf_state: String,
+    pub return_to: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -78,18 +79,20 @@ pub struct Claims {
 
 pub fn generate_and_store_oauth_request(
     pool: web::Data<PostgresPool>,
+    return_to: Option<String>,
 ) -> Anysult<(CsrfToken, PkceCodeChallenge)> {
     let mut connection = pool.get()?;
     let csrf_state = CsrfToken::new_random();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
     connection.query(
-        "INSERT INTO oauth_requests (pkce_challenge, pkce_verifier, csrf_state)
-                VALUES ($1, $2, $3)
+        "INSERT INTO oauth_requests (pkce_challenge, pkce_verifier, csrf_state, return_to)
+                       VALUES ($1, $2, $3, $4)
             ",
         &[
             &pkce_challenge.as_str(),
             &pkce_verifier.secret().as_str(),
             &csrf_state.secret().clone(),
+            &return_to,
         ],
     )?;
     Ok((csrf_state, pkce_challenge))
@@ -109,6 +112,7 @@ pub fn fetch_oauth_request(pool: web::Data<PostgresPool>, state: String) -> Anys
                 csrf_state: row.get("csrf_state"),
                 pkce_challenge: row.get("pkce_challenge"),
                 pkce_verifier: row.get("pkce_verifier"),
+                return_to: row.get("return_to"),
             })
         })
 }

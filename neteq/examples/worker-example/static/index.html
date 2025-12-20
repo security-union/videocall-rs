@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Audio Streamer</title>
+    <script type="module" src="index.js"></script>
+    <style>
+      body {
+        font-family: sans-serif;
+        margin: 2em;
+      }
+      input,
+      button {
+        font-size: 1em;
+        padding: 0.5em;
+      }
+      #status {
+        margin-top: 1em;
+        color: #555;
+      }
+      .grid-container {
+        display: grid;
+        align-items: center;
+        grid-template-columns: repeat(2, 1fr); /* 2 columns */
+        gap: 12px; /* optional spacing */
+      }
+      .description {
+        font-size: 0.9em;
+        color: #555;
+        display: block;
+      }
+      .input-container {
+        display: flex;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+      .input-description {
+        flex: 1;
+      }
+      .input {
+        flex: 0;
+      }
+      h3.item {
+        grid-column: 1 / -1;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Audio Streamer</h1>
+    <div class="grid-container" style="max-width: 1000px">
+      <h3 class="item">Audio file url</h3>
+      <div class="item">
+        <input
+          id="url"
+          type="text"
+          placeholder="Enter audio URL (mp3, wav, etc.)"
+          value="https://raw.githubusercontent.com/revdotcom/speech-datasets/main/earnings21/media/4320211.mp3"
+          size="60"
+        />
+      </div>
+      <div class="item">
+        <button id="start">Start Streaming</button>
+      </div>
+      <h3 class="item">Configuration</h3>
+      <div class="item">
+        <div class="input-container">
+          <div class="input-description">
+            <label>Jitter (ms)</label>
+            <span class="description">Introduce random delay when sending packets. Random delay will be between 0 and the value set here in ms.</span>
+          </div>
+          <div class="input">
+            <input id="jitter" type="text" value="0" size="5" />
+          </div>
+        </div>
+
+        <div class="input-container">
+          <div class="input-description">
+            <label>Packet loss (between 0.0 and 1.0):</label>
+            <span class="description">Eg: 0.1 means 10% packet loss.</span>
+          </div>
+          <div class="input">
+            <input id="packet-loss" type="text" value="0" size="5" />
+          </div>
+        </div>
+      </div>
+      <div class="item">
+        <button id="configure">Set jitter & packet loss</button>
+      </div>
+      <h3 class="item">Simulate one time lag spike</h3>
+      <div class="item">
+        <div class="input-container">
+          <div class="input-description">
+            <label>Lag duration (ms)</label>
+            <span class="description">
+              Insert a single lag spike: pause sending packets for a short duration, then send all held up packets at once. This is similar to what happens when
+              the wifi connection is unstable.
+            </span>
+          </div>
+          <div class="input">
+            <input id="pause-duration" type="text" value="500" size="5" />
+          </div>
+        </div>
+      </div>
+      <div class="item">
+        <button id="pause-packets">Insert lag spike</button>
+      </div>
+      <h3 class="item">Statistics</h3>
+      <div class="grid-container">
+        <div>Target delay:</div>
+        <div id="target-delay">0 ms</div>
+        <div>Buffered audio:</div>
+        <div id="buffered-audio">0 ms</div>
+      </div>
+    </div>
+    <div id="status"></div>
+  </body>
+</html>

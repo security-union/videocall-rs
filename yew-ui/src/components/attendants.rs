@@ -24,6 +24,7 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
+use crate::context::VideoCallClientCtx;
 use gloo_timers::callback::{Interval, Timeout};
 use gloo_utils::window;
 use log::{error, warn};
@@ -823,7 +824,7 @@ impl Component for AttendantsComponent {
             .map(|(i, peer_id)| {
                 let full_bleed = display_peers_vec.len() == 1
                     && !self.client.is_screen_share_enabled_for_peer(peer_id);
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} client={self.client.clone()} full_bleed={full_bleed} /> }
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} /> }
             })
             .collect();
 
@@ -900,9 +901,10 @@ impl Component for AttendantsComponent {
         // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
             return html! {
-                <div id="main-container" class="meeting-page">
-                    <BrowserCompatibility/>
-                    {top_right_controls}
+                <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
+                    <div id="main-container" class="meeting-page">
+                        <BrowserCompatibility/>
+                         {top_right_controls}
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
                         // Logout dropdown (top-right corner)
                         {
@@ -964,14 +966,16 @@ impl Component for AttendantsComponent {
                             {"Join Meeting"}
                         </button>
                     </div>
-                </div>
+                    </div>
+                </ContextProvider<VideoCallClientCtx>>
             };
         }
 
         html! {
-            <div id="main-container" class="meeting-page">
-                <BrowserCompatibility/>
-                {top_right_controls.clone()}
+            <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
+                <div id="main-container" class="meeting-page">
+                    <BrowserCompatibility/>
+                     {top_right_controls.clone()}
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}
@@ -1258,7 +1262,6 @@ impl Component for AttendantsComponent {
                                     {
                                          if media_access_granted {
                                              html! {<Host
-                                                 client={self.client.clone()}
                                                  share_screen={self.share_screen}
                                                  mic_enabled={self.mic_enabled}
                                                  video_enabled={self.video_enabled}
@@ -1352,8 +1355,8 @@ impl Component for AttendantsComponent {
                         }
                     } else { html!{} }
                 }
-
-            </div>
+                </div>
+            </ContextProvider<VideoCallClientCtx>>
         }
     }
 }

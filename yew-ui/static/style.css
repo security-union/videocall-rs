@@ -188,6 +188,13 @@ h3 {
   align-items: center;
   overflow: hidden; /* Prevent content like oversized canvas from breaking layout */
   background-color: #2d2d2d; /* Slightly different background for items */
+
+  /* Border for visual separation */
+  border-width: 2px;
+  border-style: solid;
+  border-color: rgb(68, 68, 68);
+  border-image: initial;
+  border-radius: 10px;
 }
 
 /* --- Layouts for specific number of peers --- */
@@ -518,7 +525,6 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: hidden;
 }
 
 canvas {
@@ -748,6 +754,27 @@ select {
   align-items: center;
   justify-content: center;
   z-index: 2;
+}
+
+.crop-icon {
+  visibility: hidden;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 2em;
+  opacity: 0.6;
+  background-color: black;
+  border-radius: 50%;
+  padding: 10px;
+  text-align: center;
+  line-height: 1;
+  cursor: pointer;
+  z-index: 2;
+}
+
+.grid-item:hover .crop-icon {
+  visibility: visible;
 }
 
 /* No additional local positioning; unified in global.css to match mic size */

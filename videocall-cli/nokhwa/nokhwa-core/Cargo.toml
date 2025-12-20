@@ -1,6 +1,6 @@
 [package]
 name = "videocall-nokhwa-core"
-version = "0.1.7"
+version = "0.1.8"
 authors = ["l1npengtul <l1npengtul@protonmail.com>", "Dario Lencina <dario@securityunion.dev>"]
 edition = "2021"
 description = "Core type definitions for nokhwa"

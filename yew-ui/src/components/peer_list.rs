@@ -131,10 +131,10 @@ impl Component for PeerList {
 
                 <div class="sidebar-header">
                     <h2>{ "Attendants" }</h2>
-                    
+
                     <div class="header-actions">
-                        <button 
-                            class="menu-button" 
+                        <button
+                            class="menu-button"
                             onclick={toggle_context_menu}
                             aria-label="More options">
                             <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -144,12 +144,12 @@ impl Component for PeerList {
                             </svg>
                         </button>
                         <button class="close-button" onclick={ctx.props().onclose.clone()}>{"×"}</button>
-                        
+
                         {
                             if self.show_context_menu {
                                 html! {
                                     <div class="context-menu">
-                                        <button 
+                                        <button
                                             class="context-menu-item"
                                             onclick={ctx.props().on_toggle_meeting_info.reform(|_| ())}>
                                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -159,7 +159,7 @@ impl Component for PeerList {
                                             </svg>
                                             {if ctx.props().show_meeting_info { "Hide Meeting Info" } else { "Show Meeting Info" }}
                                         </button>
-                                
+
                                     </div>
                                 }
                             } else {

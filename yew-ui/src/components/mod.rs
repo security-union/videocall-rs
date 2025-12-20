@@ -25,9 +25,9 @@ pub mod diagnostics;
 pub mod host;
 pub mod icons;
 pub mod login;
+pub mod meeting_info;
 pub mod neteq_chart;
 pub mod top_bar;
-pub mod meeting_info;
 
 mod canvas_generator;
 mod peer_list;

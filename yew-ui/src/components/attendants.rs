@@ -562,7 +562,10 @@ impl Component for AttendantsComponent {
 
                     self.meeting_start_time_server = Some(start_time as f64);
 
-                    log::info!("Stored meeting_start_time_server: {:?}", self.meeting_start_time_server);
+                    log::info!(
+                        "Stored meeting_start_time_server: {:?}",
+                        self.meeting_start_time_server
+                    );
 
                     if self._timer.is_none() {
                         let link = ctx.link().clone();
@@ -582,7 +585,6 @@ impl Component for AttendantsComponent {
                 log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
-
 
                 true
             }
@@ -862,16 +864,15 @@ impl Component for AttendantsComponent {
         }
 
         // Create the call timer HTML if the call has started
-        let call_timer =
-            if self.call_start_time.is_some() {
-                html! {
-                    <div class="call-timer" >
-                        { self.format_user_duration() }
-                    </div>
-                }
-            } else {
-                html! {} // TODO: show a loading spinner
-            };
+        let call_timer = if self.call_start_time.is_some() {
+            html! {
+                <div class="call-timer" >
+                    { self.format_user_duration() }
+                </div>
+            }
+        } else {
+            html! {} // TODO: show a loading spinner
+        };
 
         // In the view method, before the call_timer declaration
         log::info!(
@@ -1339,7 +1340,7 @@ impl Component for AttendantsComponent {
                         }
                     } else {
                         html! {}
-                    } 
+                    }
                 }
 
                 {

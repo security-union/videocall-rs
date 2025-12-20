@@ -1,4 +1,4 @@
-use yew::{Html, Properties, function_component, html};
+use yew::{function_component, html, Html, Properties};
 
 #[derive(Properties, PartialEq)]
 pub struct MeetingInfoProps {

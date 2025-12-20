@@ -18,7 +18,7 @@
 
 use super::connection_manager::{ConnectionManager, ConnectionManagerOptions, ConnectionState};
 use crate::crypto::aes::Aes128State;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
 use log::{debug, info};
 use std::cell::RefCell;
@@ -160,7 +160,7 @@ impl ConnectionController {
     }
 
     /// Disconnect from the current connection and clean up resources
-    pub fn disconnect(&self) -> anyhow::Result<()>{
+    pub fn disconnect(&self) -> anyhow::Result<()> {
         let mut inner = self
             .inner
             .try_borrow_mut()

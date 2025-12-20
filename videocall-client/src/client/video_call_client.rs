@@ -904,15 +904,21 @@ impl Inner {
                     }
                 } else if data_str.starts_with("MEETING_INFO:") {
                     if let Some(time_str) = data_str.strip_prefix("MEETING_INFO:") {
-                        if let Ok(start_time_ms) = time_str.parse::<f64>() {   
-                            info!("Received MEETING_INFO via CONNECTION packet: {}ms", start_time_ms);
+                        if let Ok(start_time_ms) = time_str.parse::<f64>() {
+                            info!(
+                                "Received MEETING_INFO via CONNECTION packet: {}ms",
+                                start_time_ms
+                            );
                             if let Some(callback) = &self.options.on_meeting_info {
                                 callback.emit(start_time_ms);
-                            }else {
+                            } else {
                                 error!("No on_meeting_info callback provided");
                             }
                         } else {
-                            error!("Failed to parse MEETING_INFO via CONNECTION packet: {}", data_str);
+                            error!(
+                                "Failed to parse MEETING_INFO via CONNECTION packet: {}",
+                                data_str
+                            );
                         }
                     }
                 } else {

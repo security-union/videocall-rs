@@ -42,9 +42,6 @@ pub fn get_pool() -> PostgresPool {
         .expect("Failed to build a database connection pool")
 }
 
-
-
-
 pub fn get_connection_query() -> Result<PostgresConnection, r2d2::Error> {
     get_pool().get()
 }

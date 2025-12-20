@@ -54,7 +54,7 @@ pub enum ConnectionState {
     Failed {
         error: String,
         last_known_server: Option<String>,
-    }, 
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -816,9 +816,9 @@ impl ConnectionManager {
     }
 
     pub fn disconnect(&mut self) -> anyhow::Result<()> {
-       self.connections.clear(); 
-       self.get_connection_state();
-       Ok(())
+        self.connections.clear();
+        self.get_connection_state();
+        Ok(())
     }
 
     /// Get current RTT measurements (for debugging)

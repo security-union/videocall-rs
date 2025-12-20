@@ -104,7 +104,7 @@ impl Meeting {
         )?;
 
         if rows.is_empty() {
-            return Ok(None);
+            Ok(None)
         } else {
             let row = &rows[0];
             Ok(Some(Meeting {
@@ -164,7 +164,7 @@ impl Meeting {
         )?;
 
         if rows.is_empty() {
-            return Ok(None);
+            Ok(None)
         } else {
             let started_at: DateTime<Utc> = rows[0].get("started_at");
             Ok(Some(started_at.timestamp_millis()))

@@ -21,9 +21,8 @@ pub mod meeting;
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
-use crate::server_diagnostics::TrackerSender;
 use crate::meeting::MeetingManager;
-
+use crate::server_diagnostics::TrackerSender;
 
 pub struct AppState {
     pub chat: Addr<ChatServer>,

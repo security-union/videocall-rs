@@ -225,7 +225,10 @@ impl MeetingManager {
         }
     }
 
-    pub async fn get_meeting_start_time(&self, room_id: &str) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>>  {
+    pub async fn get_meeting_start_time(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<i64>, Box<dyn std::error::Error + Send + Sync>> {
         let room_id = room_id.to_string();
 
         tokio::task::spawn_blocking(move || Meeting::get_meeting_start_time(&room_id))
@@ -238,7 +241,7 @@ impl MeetingManager {
 
         let meeting = tokio::task::spawn_blocking(move || Meeting::get_by_room_id(&room_id_clone))
             .await
-            .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
+            .map_err(actix_web::error::ErrorInternalServerError)?;
 
         match meeting {
             Ok(Some(meeting)) => {
@@ -256,7 +259,6 @@ impl MeetingManager {
             Err(e) => Err(actix_web::error::ErrorInternalServerError(e)),
         }
     }
-
 
     pub async fn get_meeting_info_route(
         room_id: web::Path<String>,

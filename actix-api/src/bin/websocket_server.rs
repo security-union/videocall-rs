@@ -312,7 +312,14 @@ pub async fn ws_connect(
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
     let meeting_manager = state.meeting_manager.clone();
-    let actor = WsChatSession::new(chat, room_clean, email_clean, nats_client, tracker_sender, meeting_manager);
+    let actor = WsChatSession::new(
+        chat,
+        room_clean,
+        email_clean,
+        nats_client,
+        tracker_sender,
+        meeting_manager,
+    );
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)
 }

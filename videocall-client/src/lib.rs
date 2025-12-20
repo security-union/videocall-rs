@@ -66,7 +66,7 @@
 //!     on_peer_removed: None,
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
-//!     ..Default::default()
+//!    
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!

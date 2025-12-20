@@ -90,7 +90,7 @@
 //! #     on_peer_removed: None,
 //! #     on_meeting_info: None,
 //! #     on_meeting_ended: None,
-//! #     ..Default::default()
+//! #
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(

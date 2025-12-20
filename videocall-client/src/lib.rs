@@ -64,6 +64,9 @@
 //!     rtt_probe_interval_ms: None,
 //!     health_reporting_interval_ms: Some(5000), // Send health every 5 seconds
 //!     on_peer_removed: None,
+//!     on_meeting_info: None,
+//!     on_meeting_ended: None,
+//!     ..Default::default()
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -85,6 +88,9 @@
 //! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
 //! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
 //! #     on_peer_removed: None,
+//! #     on_meeting_info: None,
+//! #     on_meeting_ended: None,
+//! #     ..Default::default()
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(

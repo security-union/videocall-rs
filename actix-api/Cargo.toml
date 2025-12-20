@@ -62,3 +62,7 @@ postgres-types = { version = "0.2.11", features = ["with-chrono-0_4"] }
 
 [dev-dependencies]
 url = "2"
+
+
+[package.metadata.cargo-machete]
+ignored = ["postgres-types"]

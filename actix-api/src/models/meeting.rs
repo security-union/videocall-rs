@@ -1,8 +1,11 @@
-use crate::db::get_connection_query;
+use crate::{
+    constants::DEFAULT_SALT, db::get_connection_query, models::meeting_owner::MeetingOwner,
+};
+use bcrypt::{hash, verify};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use tracing::error;
+use tracing::{error, info};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Meeting {
@@ -14,6 +17,10 @@ pub struct Meeting {
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub creator_id: Option<String>,
+    pub meeting_title: Option<String>,
+    pub password_hash: Option<String>,
+    pub waiting_room_enabled: bool,
+    pub meeting_status: String, // our db enum values are 'not_started', 'active', 'ended'
 }
 
 impl Meeting {
@@ -40,19 +47,37 @@ impl Meeting {
         room_id: &str,
         started_at: DateTime<Utc>,
         creator_id: Option<String>,
+        meeting_title: Option<String>,
+        password_hash: Option<String>,
+        waiting_room_enabled: bool,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let mut conn = get_connection_query()?;
+
+        let password_hash = if let Some(pwd) = password_hash {
+            Some(hash(pwd, DEFAULT_SALT)?)
+        } else {
+            None
+        };
+
+        let meeting_status = if password_hash.is_some() || waiting_room_enabled {
+            "not_started"
+        } else {
+            "active"
+        };
+
+        let started_at = Utc::now();
+
         let row = conn.query_one(
             "
-            INSERT INTO meetings (room_id, started_at, ended_at, creator_id) 
-            VALUES ($1, $2, NULL, $3) 
+            INSERT INTO meetings (room_id, started_at, ended_at, creator_id, meeting_title, password_hash, waiting_room_enabled, meeting_status) 
+            VALUES ($1, $2, NULL, $3, $4, $5, $6, $7) 
             ON CONFLICT (room_id) DO UPDATE 
-            SET started_at = EXCLUDED.started_at, updated_at = NOW() 
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id",
-            &[&room_id, &started_at, &creator_id],
+            SET updated_at = NOW() 
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id, meeting_title, password_hash, waiting_room_enabled, meeting_status",
+            &[&room_id, &started_at, &creator_id, &meeting_title, &password_hash, &waiting_room_enabled, &meeting_status    ],
         )?;
 
-        Ok(Meeting {
+        let meeting = Meeting {
             id: row.get("id"),
             room_id: row.get("room_id"),
             started_at: row.get("started_at"),
@@ -61,7 +86,24 @@ impl Meeting {
             updated_at: row.get("updated_at"),
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
-        })
+            meeting_title: row.get("meeting_title"),
+            password_hash: row.get("password_hash"),
+            waiting_room_enabled: row.get("waiting_room_enabled"),
+            meeting_status: row.get("meeting_status"),
+        };
+
+        if let Some(ref creator) = meeting.creator_id {
+            match MeetingOwner::create(&meeting.room_id, creator, None) {
+                Ok(_) => {
+                    info!("Meeting owner created: {}", creator);
+                }
+                Err(e) => {
+                    error!("Failed to create meeting owner: {}", e);
+                }
+            }
+        }
+
+        Ok(meeting)
     }
 
     /// End a meeting by setting ended_at timestamp
@@ -90,6 +132,10 @@ impl Meeting {
             updated_at: row.get("updated_at"),
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
+            meeting_title: row.get("meeting_title"),
+            password_hash: row.get("password_hash"),
+            waiting_room_enabled: row.get("waiting_room_enabled"),
+            meeting_status: row.get("meeting_status"),
         })
     }
 
@@ -116,6 +162,10 @@ impl Meeting {
                 updated_at: row.get("updated_at"),
                 deleted_at: row.get("deleted_at"),
                 creator_id: row.get("creator_id"),
+                meeting_title: row.get("meeting_title"),
+                password_hash: row.get("password_hash"),
+                waiting_room_enabled: row.get("waiting_room_enabled"),
+                meeting_status: row.get("meeting_status"),
             }))
         }
     }
@@ -140,6 +190,10 @@ impl Meeting {
             updated_at: row.get("updated_at"),
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
+            meeting_title: row.get("meeting_title"),
+            password_hash: row.get("password_hash"),
+            waiting_room_enabled: row.get("waiting_room_enabled"),
+            meeting_status: row.get("meeting_status"),
         })
     }
 
@@ -149,7 +203,7 @@ impl Meeting {
             Some(meeting) => Ok(meeting),
             None => {
                 let now = Utc::now();
-                Self::create(room_id, now, None)
+                Self::create(room_id, now, None, None, None, false)
             }
         }
     }
@@ -169,5 +223,17 @@ impl Meeting {
             let started_at: DateTime<Utc> = rows[0].get("started_at");
             Ok(Some(started_at.timestamp_millis()))
         }
+    }
+
+    pub fn verify_password(&self, password: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        match &self.password_hash {
+            Some(hash) => Ok(verify(password, hash)?),
+            None => Ok(true),
+        }
+    }
+
+    /// Check if the meeting requires a password
+    pub fn requires_password(&self) -> bool {
+        self.password_hash.is_some()
     }
 }

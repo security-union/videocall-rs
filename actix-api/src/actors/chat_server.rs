@@ -387,7 +387,7 @@ async fn send_meeting_info(nc: &async_nats::client::Client, room: &str, start_ti
             let subject = format!("room.{}.system", room.replace(' ', "_"));
             match nc.publish(subject.clone(), packet_byte.into()).await {
                 Ok(_) => info!(
-                    "✅ Sent meeting start time {} to {}",
+                    "Sent meeting start time {} to {}",
                     start_time_ms, subject
                 ),
                 Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),

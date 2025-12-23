@@ -4,9 +4,9 @@ use actix_web::{web, HttpResponse};
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{error, info};
 
 #[derive(Debug, Clone)]
@@ -40,6 +40,9 @@ impl MeetingState {
     pub async fn save_to_db(
         &self,
         timestamp_ms: u64,
+        meeting_title: Option<String>,
+        password: Option<String>,
+        waiting_room_enabled: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let room_id = self.room_id.clone();
         let creator_id = self.creator_id.clone();
@@ -52,7 +55,14 @@ impl MeetingState {
             let creator = creator_id.as_deref().unwrap_or("unknown");
 
             // Call the SYNCHRONOUS get_or_create, NOT create
-            DbMeeting::create(&room_id, started_at, Some(creator.to_string()))?;
+            DbMeeting::create(
+                &room_id,
+                started_at,
+                Some(creator.to_string()),
+                meeting_title,
+                password,
+                waiting_room_enabled,
+            )?;
             info!("Meeting {} saved to database", room_id);
             Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
         })
@@ -103,13 +113,13 @@ impl MeetingState {
 
 #[derive(Debug, Clone)]
 pub struct MeetingManager {
-    meetings: Arc<RwLock<HashMap<String, Arc<MeetingState>>>>,
+    //   meetings: Arc<RwLock<HashMap<String, Arc<MeetingState>>>>,
 }
 
 impl Default for MeetingManager {
     fn default() -> Self {
         Self {
-            meetings: Arc::new(RwLock::new(HashMap::new())),
+           // meetings: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -128,6 +138,10 @@ impl MeetingManager {
         Self::default()
     }
 
+    pub async fn get_by_room_id(&self, room_id: &str) -> Result<Option<Meeting>, Box<dyn Error + Send + Sync>> {
+        DbMeeting::get_by_room_id(room_id)
+    }
+
     /// Initialize meeting when first participant joins
     pub async fn start_meeting(
         &self,
@@ -136,36 +150,16 @@ impl MeetingManager {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         info!(" start_meeting called for room: {}", room_id);
 
-        let meeting = self
-            .get_or_create_meeting(room_id, Some(creator_id.to_string()))
-            .await;
+        let meeting = match self.get_by_room_id(room_id).await? {
+            Some(m) => Ok(m.start_time_unix_ms() as u64),
+            None => {
+                let now = Utc::now();
+                Meeting::create(room_id, now, Some(creator_id.to_string()), None, None, false)?;
+                Ok(now.timestamp_millis() as u64)
+            }
+        };
 
-        let current_start = meeting.get_start_time();
-        if current_start != 0 {
-            info!("Meeting {} already started at {}", room_id, current_start);
-            return Ok(current_start);
-        }
-
-        let now_ms = Utc::now().timestamp_millis() as u64;
-        info!(" Setting start time {} for room {}", now_ms, room_id);
-
-        if meeting.set_start_time(now_ms) {
-            info!(" Meeting {} started at {}", room_id, now_ms);
-
-            let meeting_clone = meeting.clone();
-            tokio::spawn(async move {
-                info!(" Attempting to save meeting to database");
-                if let Err(e) = meeting_clone.save_to_db(now_ms).await {
-                    error!("Failed to save meeting: {}", e);
-                } else {
-                    info!(" Meeting saved to database successfully");
-                }
-            });
-
-            Ok(now_ms)
-        } else {
-            Ok(meeting.get_start_time())
-        }
+        meeting
     }
 
     /// Get or create a meeting
@@ -174,24 +168,55 @@ impl MeetingManager {
         room_id: &str,
         creator_id: Option<String>,
     ) -> Arc<MeetingState> {
-        {
-            let meetings = self.meetings.read().await;
-            if let Some(meeting) = meetings.get(room_id) {
-                return meeting.clone();
+        // {
+        //     let meetings = self.meetings.read().await;
+        //     if let Some(meeting) = meetings.get(room_id) {
+        //         return meeting.clone();
+        //     }
+        // }
+
+        // let mut meetings = self.meetings.write().await;
+
+        // if let Some(meetings) = meetings.get(room_id) {
+        //     return meetings.clone();
+        // }
+
+        // let state = Arc::new(MeetingState::new(room_id.to_string(), creator_id));
+
+        // state.load_from_db().await;
+        // meetings.insert(room_id.to_string(), state.clone());
+
+        let meeting = match Meeting::get_by_room_id(room_id) {
+            Ok(Some(meeting)) => {
+                let state = Arc::new(MeetingState {
+                    room_id: meeting.room_id.clone(), 
+                    creator_id: meeting.creator_id,
+                }); 
+
+                return state; 
             }
-        }
+            Ok(None) => {
+                let now = Utc::now(); 
+                if let Ok(meeting) = Meeting::create(
+                    room_id, 
+                    now, 
+                    creator_id.clone(), 
+                    None, 
+                    None,
+                    false
+                )
+            }
+            Err(e) => {
+                error!("Failed to get meeting: {}", e);
+                
+            }
+        }; 
 
-        let mut meetings = self.meetings.write().await;
 
-        if let Some(meetings) = meetings.get(room_id) {
-            return meetings.clone();
-        }
-
-        let state = Arc::new(MeetingState::new(room_id.to_string(), creator_id));
-
-        state.load_from_db().await;
-        meetings.insert(room_id.to_string(), state.clone());
-        state
+        meeting
+        //Let's fallback to in-memory state if database operation fails
+        // let state = Arc::new(MeetingState::new(room_id.to_string(), creator_id));
+        // state
     }
 
     /// End the meeting and save to the database
@@ -268,11 +293,19 @@ impl MeetingManager {
     }
 
     pub async fn is_creator(&self, room_id: &str, user_id: &str) -> bool {
-        let meetings = self.meetings.read().await;
-        meetings
-            .get(room_id)
-            .map(|m| m.is_creator(user_id))
-            .unwrap_or(false)
+        let is_creator = match Meeting::get_by_room_id(room_id) {
+            Ok(Some(meeting)) => {
+                if let Some(creator_id) = &meeting.creator_id {
+                    creator_id == user_id
+                }
+                else {
+                    false
+                }
+            }
+            _ => false, // default to false
+        };
+
+        is_creator
     }
 
     pub fn configure(&self, cfg: &mut web::ServiceConfig) {

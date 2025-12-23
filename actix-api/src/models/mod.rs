@@ -17,6 +17,7 @@
  */
 
 pub mod meeting;
+pub mod meeting_owner;
 
 use actix::Addr;
 

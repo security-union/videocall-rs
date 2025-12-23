@@ -21,6 +21,7 @@ use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
 };
+use crate::meeting::MeetingManager;
 use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
 use futures::StreamExt;
@@ -285,6 +286,7 @@ async fn handle_webtransport_session(
     nc: async_nats::client::Client,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
+    let meeting_manager = MeetingManager::new();
     // Generate unique session ID for this WebTransport connection
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -295,6 +297,8 @@ async fn handle_webtransport_session(
         username.to_string(),
         lobby_id.to_string(),
         "webtransport".to_string(),
+        username,
+        &meeting_manager,
     );
 
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -498,7 +502,7 @@ async fn handle_webtransport_session(
     join_set.shutdown().await;
 
     // Track connection end for metrics
-    send_connection_ended(&tracker_sender, session_id.clone());
+    send_connection_ended(&tracker_sender, session_id.clone(), &meeting_manager, lobby_id);
 
     warn!("Finished handling session: {session_id} (username: {username}, lobby: {lobby_id})");
     Ok(())

@@ -94,7 +94,7 @@ impl Meeting {
     }
 
     /// Get meeting by room_id
-    pub fn get_by_room_id(room_id: &str) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+    pub  fn get_by_room_id(room_id: &str) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let mut conn = get_connection_query()?;
         let rows = conn.query(
             "SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id 

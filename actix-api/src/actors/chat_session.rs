@@ -132,6 +132,8 @@ impl Actor for WsChatSession {
             self.email.clone(),
             self.room.clone(),
             "websocket".to_string(),
+            &self.creator_id.clone(),
+            &self.meeting_manager,
         );
 
         // Get or create meeting state for this room
@@ -227,7 +229,7 @@ impl Actor for WsChatSession {
         error!("   Room: {}", self.room);
         error!("   Email: {}", self.email);
         // Track connection end for metrics
-        send_connection_ended(&self.tracker_sender, self.id.clone());
+        send_connection_ended(&self.tracker_sender, self.id.clone(), &self.meeting_manager, &self.creator_id);
 
         // notify chat server
         self.addr.do_send(Disconnect {
@@ -324,12 +326,12 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 error!("   Reason: {:?}", reason);
 
                 // Send Disconnect BEFORE closing
-                error!("📤 Sending Disconnect message to ChatServer");
+                error!(" Sending Disconnect message to ChatServer");
                 self.addr.do_send(Disconnect {
                     session: self.id.clone(),
                 });
 
-                error!("📤 Sending Leave message to ChatServer");
+                error!(" Sending Leave message to ChatServer");
                 self.addr.do_send(Leave {
                     session: self.id.clone(),
                     room: self.room.clone(),

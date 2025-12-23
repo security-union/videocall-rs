@@ -288,7 +288,7 @@ impl Handler<JoinRoom> for ChatServer {
         let manager = self.meeting_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
-        let nc = self.nats_connection.clone();
+        let nc = self.nats_connection.clone(); 
 
         let send_info_task = tokio::spawn(async move {
             if is_first_participant {

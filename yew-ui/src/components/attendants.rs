@@ -95,9 +95,6 @@ pub enum Msg {
     ToggleForceDesktopGrid,
     HangUp,
     ShowCopyToast(bool),
-    #[allow(dead_code)]
-    FetchMeetingInfo,
-    MeetingInfoFetched(Result<MeetingInfoData, String>),
     MeetingEnded(String),
 }
 
@@ -674,7 +671,6 @@ impl Component for AttendantsComponent {
                             self.diagnostics_open = false;
                             self.device_settings_open = false;
                         }
-                        ctx.link().send_message(Msg::FetchMeetingInfo);
                     }
                 }
                 true
@@ -748,47 +744,6 @@ impl Component for AttendantsComponent {
                     let _ = window().location().set_href("/");
                 })
                 .forget();
-
-                true
-            }
-
-            Msg::FetchMeetingInfo => {
-                let room_id = ctx.props().id.clone();
-                let link = ctx.link().clone();
-
-                wasm_bindgen_futures::spawn_local(async move {
-                    let url = format!("/api/meeting/{}/info", room_id);
-
-                    let result = match reqwest::get(&url).await {
-                        Ok(response) => {
-                            if response.status().is_success() {
-                                match response.json().await {
-                                    Ok(data) => data,
-                                    Err(e) => Err(format!("Failed to parse: {}", e)),
-                                }
-                            } else {
-                                Err(format!("Server error: {}", response.status()))
-                            }
-                        }
-                        Err(e) => Err(format!("Error fetching meeting info: {}", e)),
-                    };
-
-                    link.send_message(Msg::MeetingInfoFetched(result));
-                });
-
-                false
-            }
-
-            Msg::MeetingInfoFetched(result) => {
-                match result {
-                    Ok(data) => {
-                        self.meeting_info_data = Some(data);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to fetch meeting info: {}", e);
-                        // Err(format!("Failed to fetch meeting info: {}", e))
-                    }
-                }
 
                 true
             }

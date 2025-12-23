@@ -29,6 +29,7 @@ use tracing::{debug, error, info};
 use videocall_types::protos::server_connection_packet::{
     ConnectionMetadata, DataTransferInfo, EventType, ServerConnectionPacket,
 };
+use crate::meeting::MeetingManager;
 
 /// Messages for the ServerDiagnostics task
 #[derive(Debug, Clone)]
@@ -67,17 +68,23 @@ pub fn send_connection_started(
     customer_email: String,
     meeting_id: String,
     protocol: String,
+    username: &str,
+    meeting_manager: &MeetingManager,
 ) {
     let _ = sender.send(TrackerMessage::ConnectionStarted {
         session_id,
         customer_email,
-        meeting_id,
+        meeting_id: meeting_id.clone(),
         protocol,
     });
+
+    let _ = meeting_manager.start_meeting(&meeting_id, &username);
 }
 
-pub fn send_connection_ended(sender: &TrackerSender, session_id: String) {
+pub fn send_connection_ended(sender: &TrackerSender, session_id: String, meeting_manager: &MeetingManager, meeting_id: &str) {
     let _ = sender.send(TrackerMessage::ConnectionEnded { session_id });
+
+    let _ = meeting_manager.end_meeting(&meeting_id);
 }
 
 impl DataTracker {

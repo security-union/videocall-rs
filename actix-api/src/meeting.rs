@@ -127,7 +127,7 @@ impl MeetingManager {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         info!(" start_meeting called for room: {}", room_id);
 
-        let meeting = match self.get_by_room_id(room_id).await? {
+        match self.get_by_room_id(room_id).await? {
             Some(m) => Ok(m.start_time_unix_ms() as u64),
             None => {
                 let now = Utc::now();
@@ -139,9 +139,7 @@ impl MeetingManager {
                     }
                 }
             }
-        };
-
-        meeting
+        }
     }
 
     pub async fn get_by_room_id(
@@ -160,25 +158,21 @@ impl MeetingManager {
         let now = Utc::now();
         let start_time = Arc::new(AtomicU64::new(now.timestamp_millis() as u64));
 
-        let meeting_state = match Meeting::get_by_room_id(room_id).await {
+        match Meeting::get_by_room_id(room_id).await {
             Ok(Some(meeting)) => {
-                let state = Arc::new(MeetingState {
+                Arc::new(MeetingState {
                     room_id: meeting.room_id.clone(),
                     creator_id: meeting.creator_id,
                     start_time,
-                });
-
-                return state;
+                })
             }
             Ok(None) => {
                 if let Ok(meeting) = Meeting::create(room_id, now, creator_id.clone()).await {
-                    let state = Arc::new(MeetingState {
+                    Arc::new(MeetingState {
                         room_id: meeting.room_id.clone(),
                         creator_id: meeting.creator_id,
                         start_time,
-                    });
-
-                    return state;
+                    })
                 } else {
                     Arc::new(MeetingState {
                         room_id: room_id.to_string(),
@@ -195,9 +189,7 @@ impl MeetingManager {
                     start_time,
                 })
             }
-        };
-
-        meeting_state
+        }
     }
 
     /// End the meeting and save to the database

@@ -98,7 +98,7 @@ impl Meeting {
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
         })
-    }
+    } 
 
     /// Get meeting by room_id
     pub async fn get_by_room_id(

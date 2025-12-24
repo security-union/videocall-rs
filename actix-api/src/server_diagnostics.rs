@@ -76,10 +76,7 @@ pub fn send_connection_started(
     });
 }
 
-pub fn send_connection_ended(
-    sender: &TrackerSender,
-    session_id: String,
-) {
+pub fn send_connection_ended(sender: &TrackerSender, session_id: String) {
     let _ = sender.send(TrackerMessage::ConnectionEnded { session_id });
 }
 

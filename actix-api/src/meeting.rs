@@ -159,13 +159,11 @@ impl MeetingManager {
         let start_time = Arc::new(AtomicU64::new(now.timestamp_millis() as u64));
 
         match Meeting::get_by_room_id(room_id).await {
-            Ok(Some(meeting)) => {
-                Arc::new(MeetingState {
-                    room_id: meeting.room_id.clone(),
-                    creator_id: meeting.creator_id,
-                    start_time,
-                })
-            }
+            Ok(Some(meeting)) => Arc::new(MeetingState {
+                room_id: meeting.room_id.clone(),
+                creator_id: meeting.creator_id,
+                start_time,
+            }),
             Ok(None) => {
                 if let Ok(meeting) = Meeting::create(room_id, now, creator_id.clone()).await {
                     Arc::new(MeetingState {

@@ -150,7 +150,7 @@ impl Actor for WsChatSession {
                     Err(e) => {
                         error!("failed to start meeting: {}", e);
                         None
-                    }  
+                    }
                 }
             }
             .into_actor(self)

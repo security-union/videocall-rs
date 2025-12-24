@@ -297,7 +297,8 @@ async fn handle_webtransport_session(
         username.to_string(),
         &meeting_manager,
         lobby_id,
-    ).await;
+    )
+    .await;
 
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
@@ -500,12 +501,17 @@ async fn handle_webtransport_session(
     join_set.shutdown().await;
 
     // Track connection end for metrics
-    handle_send_connection_ended(&tracker_sender, session_id.clone(), &meeting_manager, lobby_id).await;
+    handle_send_connection_ended(
+        &tracker_sender,
+        session_id.clone(),
+        &meeting_manager,
+        lobby_id,
+    )
+    .await;
 
     warn!("Finished handling session: {session_id} (username: {username}, lobby: {lobby_id})");
     Ok(())
 }
-
 
 pub async fn handle_send_connection_started(
     tracker_sender: &TrackerSender,
@@ -514,7 +520,6 @@ pub async fn handle_send_connection_started(
     meeting_manager: &MeetingManager,
     lobby_id: &str,
 ) {
-
     send_connection_started(
         tracker_sender,
         session_id.clone(),
@@ -532,11 +537,7 @@ pub async fn handle_send_connection_ended(
     meeting_manager: &MeetingManager,
     lobby_id: &str,
 ) {
-
-    send_connection_ended(
-        tracker_sender,
-        session_id.clone(),
-    );
+    send_connection_ended(tracker_sender, session_id.clone());
 
     let _ = meeting_manager.end_meeting(lobby_id).await;
 }

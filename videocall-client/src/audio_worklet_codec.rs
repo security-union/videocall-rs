@@ -16,11 +16,11 @@
  * conditions.
  */
 
-use std::{cell::RefCell, rc::Rc};
 #[allow(unused_imports)]
 use gloo_utils::format::JsValueSerdeExt;
 use js_sys::{Array, Function};
 use serde::Serialize;
+use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{AudioContext, AudioWorkletNode, AudioWorkletNodeOptions, MessagePort};
 

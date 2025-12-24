@@ -68,7 +68,6 @@ impl Meeting {
         })
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?
-
     }
 
     /// End a meeting by setting ended_at timestamp
@@ -98,7 +97,7 @@ impl Meeting {
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
         })
-    } 
+    }
 
     /// Get meeting by room_id
     pub async fn get_by_room_id(

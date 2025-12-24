@@ -132,8 +132,6 @@ impl Actor for WsChatSession {
             self.email.clone(),
             self.room.clone(),
             "websocket".to_string(),
-            &self.creator_id.clone(),
-            &self.meeting_manager,
         );
 
         // Get or create meeting state for this room
@@ -152,7 +150,7 @@ impl Actor for WsChatSession {
                     Err(e) => {
                         error!("failed to start meeting: {}", e);
                         None
-                    }
+                    }  
                 }
             }
             .into_actor(self)
@@ -229,7 +227,7 @@ impl Actor for WsChatSession {
         error!("   Room: {}", self.room);
         error!("   Email: {}", self.email);
         // Track connection end for metrics
-        send_connection_ended(&self.tracker_sender, self.id.clone(), &self.meeting_manager, &self.creator_id);
+        send_connection_ended(&self.tracker_sender, self.id.clone());
 
         // notify chat server
         self.addr.do_send(Disconnect {

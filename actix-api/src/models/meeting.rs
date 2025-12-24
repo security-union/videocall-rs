@@ -36,32 +36,39 @@ impl Meeting {
     }
 
     /// Create or update a meeting with a start time
-    pub fn create(
+    pub async fn create(
         room_id: &str,
         started_at: DateTime<Utc>,
         creator_id: Option<String>,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let mut conn = get_connection_query()?;
-        let row = conn.query_one(
-            "
-            INSERT INTO meetings (room_id, started_at, ended_at, creator_id) 
-            VALUES ($1, $2, NULL, $3) 
-            ON CONFLICT (room_id) DO UPDATE 
-            SET started_at = EXCLUDED.started_at, updated_at = NOW() 
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id",
-            &[&room_id, &started_at, &creator_id],
-        )?;
+        let room_id = room_id.to_string();
 
-        Ok(Meeting {
-            id: row.get("id"),
-            room_id: row.get("room_id"),
-            started_at: row.get("started_at"),
-            ended_at: row.get("ended_at"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-            deleted_at: row.get("deleted_at"),
-            creator_id: row.get("creator_id"),
+        tokio::task::spawn_blocking(move || {
+            let mut conn = get_connection_query()?;
+            let row = conn.query_one(
+            "
+                INSERT INTO meetings (room_id, started_at, ended_at, creator_id) 
+                VALUES ($1, $2, NULL, $3) 
+                ON CONFLICT (room_id) DO UPDATE 
+                SET started_at = EXCLUDED.started_at, updated_at = NOW() 
+                RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id",
+                &[&room_id, &started_at, &creator_id],
+            )?;
+
+            Ok(Meeting {
+                id: row.get("id"),
+                room_id: row.get("room_id"),
+                started_at: row.get("started_at"),
+                ended_at: row.get("ended_at"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+                deleted_at: row.get("deleted_at"),
+                creator_id: row.get("creator_id"),
+            })
         })
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?
+
     }
 
     /// End a meeting by setting ended_at timestamp
@@ -94,30 +101,38 @@ impl Meeting {
     }
 
     /// Get meeting by room_id
-    pub  fn get_by_room_id(room_id: &str) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
-        let mut conn = get_connection_query()?;
-        let rows = conn.query(
-            "SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id 
-             FROM meetings 
-             WHERE room_id = $1 AND deleted_at IS NULL",
-            &[&room_id],
-        )?;
+    pub async fn get_by_room_id(
+        room_id: &str,
+    ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+        let room_id = room_id.to_string();
 
-        if rows.is_empty() {
-            Ok(None)
-        } else {
-            let row = &rows[0];
-            Ok(Some(Meeting {
-                id: row.get("id"),
-                room_id: row.get("room_id"),
-                started_at: row.get("started_at"),
-                ended_at: row.get("ended_at"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                deleted_at: row.get("deleted_at"),
-                creator_id: row.get("creator_id"),
-            }))
-        }
+        tokio::task::spawn_blocking(move || {
+            let mut conn = get_connection_query()?;
+            let rows = conn.query(
+                "SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id 
+                FROM meetings 
+                WHERE room_id = $1 AND deleted_at IS NULL",
+                &[&room_id],
+            )?;
+
+            if rows.is_empty() {
+                Ok(None)
+            } else {
+                let row = &rows[0];
+                Ok(Some(Meeting {
+                    id: row.get("id"),
+                    room_id: row.get("room_id"),
+                    started_at: row.get("started_at"),
+                    ended_at: row.get("ended_at"),
+                    created_at: row.get("created_at"),
+                    updated_at: row.get("updated_at"),
+                    deleted_at: row.get("deleted_at"),
+                    creator_id: row.get("creator_id"),
+                }))
+            }
+        })
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?
     }
 
     /// Soft delete a meeting
@@ -144,12 +159,12 @@ impl Meeting {
     }
 
     /// Get or create a meeting - used when first user joins
-    pub fn get_or_create(room_id: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        match Self::get_by_room_id(room_id)? {
+    pub async fn get_or_create(room_id: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        match Self::get_by_room_id(room_id).await? {
             Some(meeting) => Ok(meeting),
             None => {
                 let now = Utc::now();
-                Self::create(room_id, now, None)
+                Self::create(room_id, now, None).await
             }
         }
     }

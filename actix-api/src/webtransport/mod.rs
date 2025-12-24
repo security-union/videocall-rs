@@ -18,10 +18,10 @@
 
 use crate::client_diagnostics::health_processor;
 use crate::constants::VALID_ID_PATTERN;
+use crate::meeting::MeetingManager;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
 };
-use crate::meeting::MeetingManager;
 use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
 use futures::StreamExt;
@@ -291,15 +291,13 @@ async fn handle_webtransport_session(
     let session_id = uuid::Uuid::new_v4().to_string();
 
     // Track connection start for metrics
-    send_connection_started(
+    handle_send_connection_started(
         &tracker_sender,
         session_id.clone(),
         username.to_string(),
-        lobby_id.to_string(),
-        "webtransport".to_string(),
-        username,
         &meeting_manager,
-    );
+        lobby_id,
+    ).await;
 
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
@@ -502,10 +500,45 @@ async fn handle_webtransport_session(
     join_set.shutdown().await;
 
     // Track connection end for metrics
-    send_connection_ended(&tracker_sender, session_id.clone(), &meeting_manager, lobby_id);
+    handle_send_connection_ended(&tracker_sender, session_id.clone(), &meeting_manager, lobby_id).await;
 
     warn!("Finished handling session: {session_id} (username: {username}, lobby: {lobby_id})");
     Ok(())
+}
+
+
+pub async fn handle_send_connection_started(
+    tracker_sender: &TrackerSender,
+    session_id: String,
+    customer_email: String,
+    meeting_manager: &MeetingManager,
+    lobby_id: &str,
+) {
+
+    send_connection_started(
+        tracker_sender,
+        session_id.clone(),
+        customer_email,
+        lobby_id.to_string(),
+        "webtransport".to_string(),
+    );
+
+    let _ = meeting_manager.end_meeting(lobby_id).await;
+}
+
+pub async fn handle_send_connection_ended(
+    tracker_sender: &TrackerSender,
+    session_id: String,
+    meeting_manager: &MeetingManager,
+    lobby_id: &str,
+) {
+
+    send_connection_ended(
+        tracker_sender,
+        session_id.clone(),
+    );
+
+    let _ = meeting_manager.end_meeting(lobby_id).await;
 }
 
 #[cfg(test)]

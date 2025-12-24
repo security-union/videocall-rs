@@ -489,7 +489,7 @@ impl VideoCallClient {
                 error: "Disconnected".to_string(),
                 last_known_server: None,
             };
-            return Ok(());
+            Ok(())
         } else {
             Err(anyhow::anyhow!("Unable to borrow inner"))
         }
@@ -906,8 +906,7 @@ impl Inner {
                     if let Some(time_str) = data_str.strip_prefix("MEETING_INFO:") {
                         if let Ok(start_time_ms) = time_str.parse::<f64>() {
                             info!(
-                                "Received MEETING_INFO via CONNECTION packet: {}ms",
-                                start_time_ms
+                                "Received MEETING_INFO via CONNECTION packet: {start_time_ms}ms"
                             );
                             if let Some(callback) = &self.options.on_meeting_info {
                                 callback.emit(start_time_ms);
@@ -916,13 +915,12 @@ impl Inner {
                             }
                         } else {
                             error!(
-                                "Failed to parse MEETING_INFO via CONNECTION packet: {}",
-                                data_str
+                                "Failed to parse MEETING_INFO via CONNECTION packet: {data_str}"
                             );
                         }
                     }
                 } else {
-                    debug!("Received CONNECTION packet: {}", data_str);
+                    debug!("Received CONNECTION packet: {data_str}");
                 }
             }
             Ok(PacketType::DIAGNOSTICS) => {

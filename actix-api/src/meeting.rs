@@ -42,20 +42,25 @@ impl MeetingState {
         let room_id = self.room_id.clone();
         let creator_id = self.creator_id.clone();
 
-        tokio::task::spawn_blocking(move || {
-            // Convert timestamp to DateTime
-            let started_at = chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
-                .ok_or("Invalid timestamp")?;
+        // Convert timestamp to DateTime
+        let started_at = chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
+            .ok_or("Invalid timestamp")?;
 
-            let creator = creator_id.as_deref().unwrap_or("unknown");
+        let creator = creator_id.as_deref().unwrap_or("unknown");
 
-            // Call the SYNCHRONOUS get_or_create, NOT create
-            DbMeeting::create(&room_id, started_at, Some(creator.to_string()))?;
-            info!("Meeting {} saved to database", room_id);
-            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
-        })
-        .await
-        .map_err(|e| format!("Spawn blocking failed: {}", e))?
+        let result = DbMeeting::create(&room_id, started_at, Some(creator.to_string())).await;
+
+        // Call the async-synchronous create
+        match result {
+            Ok(_) => {
+                info!("Meeting {} saved to database", room_id);
+                Ok(())
+            }
+            Err(e) => {
+                info!("Meeting {} saved to database", room_id);
+                Err(e)
+            }
+        }
     }
 
     /// Load the meeting state from the database
@@ -63,25 +68,21 @@ impl MeetingState {
         let room_id = self.room_id.clone();
         let start_time = self.start_time.clone();
 
-        let result = tokio::task::spawn_blocking(move || DbMeeting::get_by_room_id(&room_id)).await;
+        //   let result = tokio::task::spawn_blocking(move || DbMeeting::get_by_room_id(&room_id)).await;
 
-        match result {
-            Ok(Ok(Some(meeting))) => {
+        match DbMeeting::get_by_room_id(&room_id).await {
+            Ok(Some(meeting)) => {
                 let timestamp_ms = meeting.start_time_unix_ms() as u64;
                 // info!("Loaded meeting {} with start time {}", room_id, timestamp_ms);
                 start_time.store(timestamp_ms, Ordering::SeqCst);
                 true
             }
-            Ok(Ok(None)) => {
+            Ok(None) => {
                 //info!("No existing meeting for {}", room_id);
                 false
             }
-            Ok(Err(e)) => {
-                error!("Failed to load meeting: {}", e);
-                false
-            }
             Err(e) => {
-                error!("Spawn blocking failed: {}", e);
+                error!("Failed to load meeting: {}", e);
                 false
             }
         }
@@ -99,17 +100,9 @@ impl MeetingState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MeetingManager {
     // meetings: Arc<RwLock<HashMap<String, Arc<MeetingState>>>>,
-}
-
-impl Default for MeetingManager {
-    fn default() -> Self {
-        Self {
-           // meetings: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -138,8 +131,13 @@ impl MeetingManager {
             Some(m) => Ok(m.start_time_unix_ms() as u64),
             None => {
                 let now = Utc::now();
-                Meeting::create(room_id, now, Some(creator_id.to_string()))?;
-                Ok(now.timestamp_millis() as u64)
+                match Meeting::create(room_id, now, Some(creator_id.to_string())).await {
+                    Ok(_) => Ok(now.timestamp_millis() as u64),
+                    Err(e) => {
+                        error!("Failed to create meeting: {}", e);
+                        Err(e)
+                    }
+                }
             }
         };
 
@@ -150,7 +148,7 @@ impl MeetingManager {
         &self,
         room_id: &str,
     ) -> Result<Option<Meeting>, Box<dyn std::error::Error + Send + Sync>> {
-        DbMeeting::get_by_room_id(room_id)
+        DbMeeting::get_by_room_id(room_id).await
     }
 
     /// Get or create a meeting
@@ -162,7 +160,7 @@ impl MeetingManager {
         let now = Utc::now();
         let start_time = Arc::new(AtomicU64::new(now.timestamp_millis() as u64));
 
-        let meeting_state: Arc<MeetingState> = match Meeting::get_by_room_id(room_id) {
+        let meeting_state = match Meeting::get_by_room_id(room_id).await {
             Ok(Some(meeting)) => {
                 let state = Arc::new(MeetingState {
                     room_id: meeting.room_id.clone(),
@@ -173,7 +171,7 @@ impl MeetingManager {
                 return state;
             }
             Ok(None) => {
-                if let Ok(meeting) = Meeting::create(room_id, now, creator_id.clone()) {
+                if let Ok(meeting) = Meeting::create(room_id, now, creator_id.clone()).await {
                     let state = Arc::new(MeetingState {
                         room_id: meeting.room_id.clone(),
                         creator_id: meeting.creator_id,
@@ -225,10 +223,8 @@ impl MeetingManager {
             Err(join_err) => {
                 let error_msg = join_err.to_string();
                 error!("Join error in end_meeting: {}", error_msg);
-                Err(
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, error_msg))
-                        as Box<dyn std::error::Error + Send + Sync>,
-                )
+                Err(Box::new(std::io::Error::other(error_msg))
+                    as Box<dyn std::error::Error + Send + Sync>)
             }
         }
     }
@@ -245,13 +241,7 @@ impl MeetingManager {
     }
 
     pub async fn get_meeting_info(&self, room_id: &str) -> Result<HttpResponse, actix_web::Error> {
-        let room_id_clone = room_id.to_string();
-
-        let meeting = tokio::task::spawn_blocking(move || Meeting::get_by_room_id(&room_id_clone))
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?;
-
-        match meeting {
+        match Meeting::get_by_room_id(room_id).await {
             Ok(Some(meeting)) => {
                 let meeting_info = MeetingInfo {
                     room_id: meeting.room_id.clone(),
@@ -276,7 +266,7 @@ impl MeetingManager {
     }
 
     pub async fn is_creator(&self, room_id: &str, user_id: &str) -> bool {
-        let is_creator = match Meeting::get_by_room_id(room_id) {
+        match Meeting::get_by_room_id(room_id).await {
             Ok(Some(meeting)) => {
                 if let Some(creator_id) = &meeting.creator_id {
                     creator_id == user_id
@@ -285,8 +275,6 @@ impl MeetingManager {
                 }
             }
             _ => false,
-        };
-
-        is_creator
+        }
     }
 }

@@ -257,7 +257,7 @@ impl AttendantsComponent {
             on_meeting_info: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |start_time_ms: f64| {
-                    log::info!("Meeting started at Unix timestamp: {}", start_time_ms);
+                    log::info!("Meeting started at Unix timestamp: {start_time_ms}");
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         start_time_ms as u64,
                     )))
@@ -266,7 +266,7 @@ impl AttendantsComponent {
             on_meeting_ended: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |(end_time_ms, message): (f64, String)| {
-                    log::info!("Meeting ended at Unix timestamp: {}", end_time_ms);
+                    log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
                     // link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                     //     end_time_ms as u64,
                     // )));
@@ -378,20 +378,20 @@ impl AttendantsComponent {
         if let Some(server_start_ms) = self.meeting_start_time_server {
             let now_ms = js_sys::Date::now();
 
-            log::info!("Server start: {}, Now: {}", server_start_ms, now_ms);
+            log::info!("Server start: {server_start_ms}, Now: {now_ms}");
             let elapsed_ms = (now_ms - server_start_ms).max(0.0);
 
             let elapsed_secs = (elapsed_ms / 1000.0) as u64;
 
-            log::info!("Elapsed seconds: {}", elapsed_secs);
+            log::info!("Elapsed seconds: {elapsed_secs}");
             let hours = elapsed_secs / 3600;
             let minutes = (elapsed_secs % 3600) / 60;
             let seconds = elapsed_secs % 60;
 
             if hours > 0 {
-                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
             } else {
-                format!("{:02}:{:02}", minutes, seconds)
+                format!("{minutes:02}:{seconds:02}")
             }
         } else {
             "00:00".to_string()
@@ -409,9 +409,9 @@ impl AttendantsComponent {
             let seconds = elapsed_secs % 60;
 
             if hours > 0 {
-                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
             } else {
-                format!("{:02}:{:02}", minutes, seconds)
+                format!("{minutes:02}:{seconds:02}")
             }
         } else {
             "00:00".to_string()
@@ -555,7 +555,7 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::MeetingInfoReceived(start_time) => {
-                    log::info!("Stored meeting_start_time_server: {:?}", start_time);
+                    log::info!("Stored meeting_start_time_server: {start_time:?}");
 
                     self.meeting_start_time_server = Some(start_time as f64);
 

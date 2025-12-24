@@ -288,7 +288,7 @@ impl Handler<JoinRoom> for ChatServer {
         let manager = self.meeting_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
-        let nc = self.nats_connection.clone(); 
+        let nc = self.nats_connection.clone();
 
         let send_info_task = tokio::spawn(async move {
             if is_first_participant {
@@ -373,7 +373,7 @@ impl Handler<JoinRoom> for ChatServer {
 }
 
 async fn send_meeting_info(nc: &async_nats::client::Client, room: &str, start_time_ms: u64) {
-    let message = format!("MEETING_INFO:{}", start_time_ms);
+    let message = format!("MEETING_INFO:{start_time_ms}");
 
     let packet = PacketWrapper {
         packet_type: PacketType::CONNECTION.into(),

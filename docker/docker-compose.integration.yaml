@@ -1,7 +1,6 @@
 services:
   postgres:
     image: postgres:12
-    platform: linux/arm64
     environment:
       POSTGRES_PASSWORD: "docker"
       PGPASSWORD: "docker"
@@ -14,16 +13,12 @@ services:
 
   nats:
     image: nats:2.10-alpine
-    platform: linux/arm64
     command: ["-js", "--http_port", "8222"]
 
   rust-tests:
     build:
       dockerfile: ../docker/Dockerfile.actix
       context: ../docker
-      platforms:
-        - linux/arm64
-    platform: linux/arm64
     working_dir: /app/actix-api
     dns:
       - 8.8.8.8

@@ -20,12 +20,13 @@ use crate::models::meeting::Meeting;
 use crate::models::session_participant::SessionParticipant;
 use protobuf::Message as ProtoMessage;
 use sqlx::PgPool;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{error, info};
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::SYSTEM_USER_EMAIL;
+use videocall_types::{FeatureFlags, SYSTEM_USER_EMAIL};
 
 /// Error type for session management operations
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +83,8 @@ impl SessionManager {
     /// Called when a user connects to a room.
     /// Records participant in DB and starts meeting if first participant.
     ///
+    /// When FEATURE_MEETING_MANAGEMENT is disabled, returns defaults without DB operations.
+    ///
     /// # Errors
     /// Returns `SessionError::ReservedUserEmail` if user_id matches the system email.
     pub async fn start_session(
@@ -89,9 +92,21 @@ impl SessionManager {
         room_id: &str,
         user_id: &str,
     ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Reject reserved system email
+        // Reject reserved system email (always enforced)
         if user_id == SYSTEM_USER_EMAIL {
             return Err(Box::new(SessionError::ReservedUserEmail));
+        }
+
+        // Feature flag check - return defaults if disabled
+        if !FeatureFlags::meeting_management_enabled() {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            return Ok(SessionStartResult {
+                start_time_ms: now_ms,
+                is_first_participant: true,
+            });
         }
 
         // Record participant join in DB
@@ -130,11 +145,18 @@ impl SessionManager {
 
     /// Called when a user disconnects from a room.
     /// Returns what action was taken.
+    ///
+    /// When FEATURE_MEETING_MANAGEMENT is disabled, returns no-op result without DB operations.
     pub async fn end_session(
         &self,
         room_id: &str,
         user_id: &str,
     ) -> Result<SessionEndResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Feature flag check - return no-op if disabled
+        if !FeatureFlags::meeting_management_enabled() {
+            return Ok(SessionEndResult::MeetingContinues { remaining_count: 0 });
+        }
+
         // Check if user is host before marking them as left
         let is_host = self.is_host(room_id, user_id).await;
 
@@ -179,14 +201,24 @@ impl SessionManager {
     }
 
     /// Get current participant count for a room (from DB)
+    ///
+    /// When FEATURE_MEETING_MANAGEMENT is disabled, returns 0.
     pub async fn get_participant_count(&self, room_id: &str) -> i64 {
+        if !FeatureFlags::meeting_management_enabled() {
+            return 0;
+        }
         SessionParticipant::count_active(&self.pool, room_id)
             .await
             .unwrap_or(0)
     }
 
     /// Check if a user is the host/creator of a room
+    ///
+    /// When FEATURE_MEETING_MANAGEMENT is disabled, returns false.
     pub async fn is_host(&self, room_id: &str, user_id: &str) -> bool {
+        if !FeatureFlags::meeting_management_enabled() {
+            return false;
+        }
         match Meeting::get_by_room_id_async(&self.pool, room_id).await {
             Ok(Some(meeting)) => meeting.creator_id.as_deref() == Some(user_id),
             _ => false,
@@ -279,11 +311,23 @@ mod tests {
             .await;
     }
 
+    /// Setup for tests that require meeting management enabled
+    fn setup_meeting_management_enabled() {
+        FeatureFlags::set_meeting_management_override(true);
+    }
+
+    /// Teardown for tests - clear FF override
+    fn teardown_meeting_management() {
+        FeatureFlags::clear_meeting_management_override();
+    }
+
     // ==========================================================================
     // TEST 1: Meeting Creation - First user creates a meeting
     // ==========================================================================
     #[tokio::test]
     async fn test_meeting_creation_first_user_creates_meeting() {
+        setup_meeting_management_enabled();
+
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
         let room_id = "test-room-create-1";
@@ -318,6 +362,7 @@ mod tests {
         );
 
         cleanup_test_room(&pool, room_id).await;
+        teardown_meeting_management();
     }
 
     // ==========================================================================
@@ -325,6 +370,8 @@ mod tests {
     // ==========================================================================
     #[tokio::test]
     async fn test_others_can_join_meeting() {
+        setup_meeting_management_enabled();
+
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
         let room_id = "test-room-join-2";
@@ -363,6 +410,7 @@ mod tests {
         );
 
         cleanup_test_room(&pool, room_id).await;
+        teardown_meeting_management();
     }
 
     // ==========================================================================
@@ -370,6 +418,8 @@ mod tests {
     // ==========================================================================
     #[tokio::test]
     async fn test_everyone_leaving_ends_meeting() {
+        setup_meeting_management_enabled();
+
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
         let room_id = "test-room-leave-3";
@@ -417,6 +467,7 @@ mod tests {
         );
 
         cleanup_test_room(&pool, room_id).await;
+        teardown_meeting_management();
     }
 
     // ==========================================================================
@@ -424,6 +475,8 @@ mod tests {
     // ==========================================================================
     #[tokio::test]
     async fn test_host_leaving_ends_meeting() {
+        setup_meeting_management_enabled();
+
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
         let room_id = "test-room-host-4";
@@ -456,6 +509,7 @@ mod tests {
         );
 
         cleanup_test_room(&pool, room_id).await;
+        teardown_meeting_management();
     }
 
     // ==========================================================================
@@ -463,6 +517,8 @@ mod tests {
     // ==========================================================================
     #[tokio::test]
     async fn test_multiple_rooms_isolated() {
+        setup_meeting_management_enabled();
+
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
 
@@ -494,6 +550,7 @@ mod tests {
 
         cleanup_test_room(&pool, "room-a-iso").await;
         cleanup_test_room(&pool, "room-b-iso").await;
+        teardown_meeting_management();
     }
 
     // ==========================================================================
@@ -550,13 +607,157 @@ mod tests {
             "Error message should mention reserved system email: {err}"
         );
 
-        // Verify no participant was added
+        // Verify no participant was added (with FF enabled for this check)
+        FeatureFlags::set_meeting_management_override(true);
         assert_eq!(
             manager.get_participant_count(room_id).await,
             0,
             "No participant should be added for reserved email"
         );
+        FeatureFlags::clear_meeting_management_override();
 
+        cleanup_test_room(&pool, room_id).await;
+    }
+
+    // ==========================================================================
+    // TEST 8: Feature flag OFF - start_session returns defaults without DB ops
+    // ==========================================================================
+    #[tokio::test]
+    async fn test_feature_flag_off_start_session_returns_defaults() {
+        let pool = get_test_pool().await;
+        let manager = SessionManager::new(pool.clone());
+        let room_id = "test-room-ff-off-8";
+
+        cleanup_test_room(&pool, room_id).await;
+
+        // Disable feature flag
+        FeatureFlags::set_meeting_management_override(false);
+
+        // start_session should return defaults without touching DB
+        let result = manager.start_session(room_id, "alice").await.unwrap();
+
+        // Should return a valid start time (current time)
+        assert!(result.start_time_ms > 0, "Should have a start time");
+        assert!(
+            result.is_first_participant,
+            "Should default to first participant"
+        );
+
+        // Enable FF to verify no DB records were created
+        FeatureFlags::set_meeting_management_override(true);
+        assert_eq!(
+            manager.get_participant_count(room_id).await,
+            0,
+            "No participant should be in DB when FF is off"
+        );
+        let meeting = manager.get_meeting_info(room_id).await.unwrap();
+        assert!(
+            meeting.is_none(),
+            "No meeting should be created when FF is off"
+        );
+
+        FeatureFlags::clear_meeting_management_override();
+        cleanup_test_room(&pool, room_id).await;
+    }
+
+    // ==========================================================================
+    // TEST 9: Feature flag OFF - end_session returns no-op
+    // ==========================================================================
+    #[tokio::test]
+    async fn test_feature_flag_off_end_session_returns_noop() {
+        let pool = get_test_pool().await;
+        let manager = SessionManager::new(pool.clone());
+        let room_id = "test-room-ff-off-9";
+
+        cleanup_test_room(&pool, room_id).await;
+
+        // Disable feature flag
+        FeatureFlags::set_meeting_management_override(false);
+
+        // end_session should return no-op result
+        let result = manager.end_session(room_id, "alice").await.unwrap();
+        assert_eq!(
+            result,
+            SessionEndResult::MeetingContinues { remaining_count: 0 },
+            "Should return no-op result when FF is off"
+        );
+
+        FeatureFlags::clear_meeting_management_override();
+        cleanup_test_room(&pool, room_id).await;
+    }
+
+    // ==========================================================================
+    // TEST 10: Feature flag ON - normal behavior with DB operations
+    // ==========================================================================
+    #[tokio::test]
+    async fn test_feature_flag_on_normal_behavior() {
+        let pool = get_test_pool().await;
+        let manager = SessionManager::new(pool.clone());
+        let room_id = "test-room-ff-on-10";
+
+        cleanup_test_room(&pool, room_id).await;
+
+        // Enable feature flag explicitly
+        FeatureFlags::set_meeting_management_override(true);
+
+        // start_session should create DB records
+        let result = manager.start_session(room_id, "alice").await.unwrap();
+        assert!(result.is_first_participant);
+        assert!(result.start_time_ms > 0);
+
+        // Verify DB records exist
+        assert_eq!(
+            manager.get_participant_count(room_id).await,
+            1,
+            "Participant should be in DB"
+        );
+        let meeting = manager.get_meeting_info(room_id).await.unwrap();
+        assert!(meeting.is_some(), "Meeting should be created in DB");
+        assert_eq!(
+            meeting.unwrap().creator_id,
+            Some("alice".to_string()),
+            "Alice should be creator"
+        );
+
+        // end_session should update DB
+        let end_result = manager.end_session(room_id, "alice").await.unwrap();
+        assert_eq!(
+            end_result,
+            SessionEndResult::LastParticipantLeft,
+            "Should end meeting when last participant leaves"
+        );
+
+        FeatureFlags::clear_meeting_management_override();
+        cleanup_test_room(&pool, room_id).await;
+    }
+
+    // ==========================================================================
+    // TEST 11: Feature flag OFF - is_host returns false
+    // ==========================================================================
+    #[tokio::test]
+    async fn test_feature_flag_off_is_host_returns_false() {
+        let pool = get_test_pool().await;
+        let manager = SessionManager::new(pool.clone());
+        let room_id = "test-room-ff-host-11";
+
+        cleanup_test_room(&pool, room_id).await;
+
+        // First create a meeting with FF on
+        FeatureFlags::set_meeting_management_override(true);
+        let _ = manager.start_session(room_id, "alice").await.unwrap();
+        assert!(
+            manager.is_host(room_id, "alice").await,
+            "Alice should be host"
+        );
+
+        // Now disable FF - is_host should return false
+        FeatureFlags::set_meeting_management_override(false);
+        assert!(
+            !manager.is_host(room_id, "alice").await,
+            "is_host should return false when FF is off"
+        );
+
+        FeatureFlags::clear_meeting_management_override();
         cleanup_test_room(&pool, room_id).await;
     }
 }

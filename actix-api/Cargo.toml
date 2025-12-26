@@ -63,6 +63,7 @@ postgres-types = { version = "0.2.11", features = ["with-chrono-0_4"] }
 
 [dev-dependencies]
 url = "2"
+videocall-types = { path = "../videocall-types", version = "3.0.1", features = ["testing"] }
 
 
 [package.metadata.cargo-machete]

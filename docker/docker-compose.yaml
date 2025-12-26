@@ -96,6 +96,7 @@ services:
       - LOGIN_URL="" # needed for UI CI tests
       - ACTIX_UI_BACKEND_URL="" # needed for UI CI tests
       - WEBTRANSPORT_HOST="" # needed for UI CI tests
+      - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
     ports:
       - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
     volumes:
@@ -189,6 +190,7 @@ services:
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
+      - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
     ports:
       - "4433:4433/udp"
     volumes:

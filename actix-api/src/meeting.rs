@@ -57,7 +57,7 @@ impl MeetingState {
                 Ok(())
             }
             Err(e) => {
-                info!("Meeting {} saved to database", room_id);
+                error!("Failed to save meeting {} to database: {}", room_id, e);
                 Err(e)
             }
         }

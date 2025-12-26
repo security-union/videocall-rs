@@ -17,15 +17,15 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics, host::Host,
-    peer_list::PeerList, peer_tile::PeerTile,
+    browser_compatibility::BrowserCompatibility, call_timer::CallTimer, diagnostics::Diagnostics,
+    host::Host, peer_list::PeerList, peer_tile::PeerTile,
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::VideoCallClientCtx;
-use gloo_timers::callback::{Interval, Timeout};
+use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
 use serde::Deserialize;
@@ -47,7 +47,6 @@ pub enum WsAction {
     MediaPermissionsError(String),
     Log(String),
     EncoderSettingsUpdated(String),
-    TimerTick,
     MeetingInfoReceived(u64),
     ToggleDropdown,
 }
@@ -162,7 +161,6 @@ pub struct AttendantsComponent {
     show_copy_toast: bool,
     pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp - the actual meeting time
     pub call_start_time: Option<f64>,           // Track when the call started for a user
-    _timer: Option<Interval>,
     show_dropdown: bool,
     meeting_info_data: Option<MeetingInfoData>, //Meeting info data
     meeting_ended_message: Option<String>,
@@ -449,7 +447,6 @@ impl Component for AttendantsComponent {
             simulation_info_message: None,
             show_copy_toast: false,
             call_start_time: None,
-            _timer: None,
             meeting_start_time_server: None,
             show_dropdown: false,
             meeting_info_data: None,
@@ -489,25 +486,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
-
                     self.call_start_time = Some(js_sys::Date::now());
-
-                    if self._timer.is_none() {
-                        let link = ctx.link().clone();
-                        let interval = Interval::new(1000, move || {
-                            link.send_message(Msg::WsAction(WsAction::TimerTick));
-                        });
-                        self._timer = Some(interval);
-                    }
-                    true
-                }
-
-                WsAction::TimerTick => {
-                    log::debug!(
-                        "Timer tick - meeting_start: {:?}, user_start: {:?}",
-                        self.meeting_start_time_server,
-                        self.call_start_time
-                    );
                     true
                 }
 
@@ -555,22 +534,8 @@ impl Component for AttendantsComponent {
                     true
                 }
                 WsAction::MeetingInfoReceived(start_time) => {
-                    log::info!("Stored meeting_start_time_server: {start_time:?}");
-
+                    log::info!("Meeting info received, start_time: {start_time:?}");
                     self.meeting_start_time_server = Some(start_time as f64);
-
-                    log::info!(
-                        "Stored meeting_start_time_server: {:?}",
-                        self.meeting_start_time_server
-                    );
-
-                    if self._timer.is_none() {
-                        let link = ctx.link().clone();
-                        let interval = Interval::new(1000, move || {
-                            link.send_message(Msg::WsAction(WsAction::TimerTick));
-                        });
-                        self._timer = Some(interval);
-                    }
                     true
                 }
                 WsAction::ToggleDropdown => {
@@ -733,7 +698,6 @@ impl Component for AttendantsComponent {
                     }
                 }
 
-                self._timer = None;
                 self.meeting_joined = false;
                 self.mic_enabled = false;
                 self.video_enabled = false;
@@ -818,39 +782,11 @@ impl Component for AttendantsComponent {
             grid_container_classes.push("force-desktop-grid");
         }
 
-        // Create the call timer HTML if the call has started
-        let call_timer = if self.call_start_time.is_some() {
-            html! {
-                <div class="call-timer" >
-                    { self.format_user_duration() }
-                </div>
-            }
-        } else {
-            html! {} // TODO: show a loading spinner
-        };
-
-        // In the view method, before the call_timer declaration
-        log::info!(
-            "Timer debug - meeting_joined: {}, meeting_start_time: {:?}, call_start_time: {:?}",
-            self.meeting_joined,
-            self.meeting_start_time_server,
-            self.call_start_time
-        );
-
-        // Create the top-right controls
+        // Create the top-right controls with CallTimer component
+        // CallTimer manages its own interval internally, avoiding parent re-renders
         let top_right_controls = html! {
             <div class="top-right-controls">
-                {call_timer}
-                <button
-                    class={classes!("control-button", self.diagnostics_open.then_some("active"))}
-                    onclick={toggle_diagnostics.clone()}
-                >
-                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="10"></circle>
-                        <line x1="12" y1="8" x2="12" y2="12"></line>
-                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
-                    </svg>
-                </button>
+                <CallTimer start_time_ms={self.call_start_time} />
             </div>
         };
 

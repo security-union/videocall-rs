@@ -16,8 +16,10 @@
  * conditions.
  */
 
+pub mod feature_flags;
 pub mod protos;
 
+pub use feature_flags::FeatureFlags;
 use protobuf::Message;
 
 /// System username used for server-generated messages (meeting info, meeting started/ended).

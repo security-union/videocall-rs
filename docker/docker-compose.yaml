@@ -61,7 +61,7 @@ services:
     working_dir: /app/leptos-website
     command: bash -c "cargo leptos watch"
     environment:
-      - LEPTOS_SITE_ADDR="0.0.0.0:4600"
+      - LEPTOS_SITE_ADDR=0.0.0.0:4600
       - CARGO_TARGET_DIR=/app/leptos-website/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
@@ -185,6 +185,7 @@ services:
       - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
       - KEY_PATH=certs/localhost.key
+      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
@@ -200,6 +201,7 @@ services:
       - rustlemania-actix-webtransport-cache:/app/actix-api/target
     depends_on:
       - nats
+      - postgres
 
   synthetic-clients:
     build:

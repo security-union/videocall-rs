@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace};
 use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+use videocall_types::SYSTEM_USER_EMAIL;
 
 use super::chat_session::SessionId;
 
@@ -200,8 +201,19 @@ impl Handler<JoinRoom> for ChatServer {
         let user_id_clone = user_id.clone();
         let nc = self.nats_connection.clone();
 
-        // Start session using SessionManager
-        let send_info_task = tokio::spawn(async move {
+        let (subject, queue) = build_subject_and_queue(&room, session.as_str());
+        let session_recipient = match self.sessions.get(&session) {
+            Some(addr) => addr.clone(),
+            None => {
+                return MessageResult(Err("Session not found".into()));
+            }
+        };
+
+        let nc2 = self.nats_connection.clone();
+        let session_clone = session.clone();
+
+        let handle = tokio::spawn(async move {
+            // Start session using SessionManager - await result before subscribing
             match session_manager
                 .start_session(&room_clone, &user_id_clone)
                 .await
@@ -214,27 +226,17 @@ impl Handler<JoinRoom> for ChatServer {
                     send_meeting_info(&nc, &room_clone, result.start_time_ms).await;
                 }
                 Err(e) => {
-                    error!("Error starting session for room {}: {}", room_clone, e);
+                    error!(
+                        "Error starting session for room {}: {} - rejecting join",
+                        room_clone, e
+                    );
+                    // Session rejected - don't subscribe, just return
+                    return;
                 }
             }
-        });
 
-        let (subject, queue) = build_subject_and_queue(&room, session.as_str());
-        let session_recipient = match self.sessions.get(&session) {
-            Some(addr) => addr.clone(),
-            None => {
-                return MessageResult(Err("Session not found".into()));
-            }
-        };
-
-        let nc = self.nats_connection.clone();
-        let session_clone = session.clone();
-        let room_clone = room.clone();
-
-        let handle = tokio::spawn(async move {
-            match nc.queue_subscribe(subject, queue).await {
+            match nc2.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
-                    drop(send_info_task);
                     while let Some(msg) = sub.next().await {
                         if let Err(e) = handle_msg(
                             session_recipient.clone(),
@@ -264,7 +266,7 @@ async fn send_meeting_info(nc: &async_nats::client::Client, room: &str, start_ti
 
     let packet = PacketWrapper {
         packet_type: PacketType::CONNECTION.into(),
-        email: "system".to_string(),
+        email: SYSTEM_USER_EMAIL.to_string(),
         data: message.as_bytes().to_vec(),
         ..Default::default()
     };

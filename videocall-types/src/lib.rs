@@ -19,6 +19,10 @@
 pub mod protos;
 
 use protobuf::Message;
+
+/// System username used for server-generated messages (meeting info, meeting started/ended).
+/// This is not a real user and should be filtered out in UI/peer management.
+pub const SYSTEM_USER_EMAIL: &str = "system-&^%$#@!";
 use yew_websocket::websocket::{Binary, Text};
 
 impl std::fmt::Display for protos::media_packet::media_packet::MediaType {

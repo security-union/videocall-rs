@@ -25,6 +25,29 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::SYSTEM_USER_EMAIL;
+
+/// Error type for session management operations
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionError {
+    /// User tried to use the reserved system email
+    ReservedUserEmail,
+    /// Database or other internal error
+    Internal(String),
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::ReservedUserEmail => {
+                write!(f, "Cannot use reserved system email as user ID")
+            }
+            SessionError::Internal(msg) => write!(f, "Internal error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
 
 /// Result of starting a session
 #[derive(Debug, Clone)]
@@ -58,11 +81,19 @@ impl SessionManager {
 
     /// Called when a user connects to a room.
     /// Records participant in DB and starts meeting if first participant.
+    ///
+    /// # Errors
+    /// Returns `SessionError::ReservedUserEmail` if user_id matches the system email.
     pub async fn start_session(
         &self,
         room_id: &str,
         user_id: &str,
     ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Reject reserved system email
+        if user_id == SYSTEM_USER_EMAIL {
+            return Err(Box::new(SessionError::ReservedUserEmail));
+        }
+
         // Record participant join in DB
         SessionParticipant::join(&self.pool, room_id, user_id).await?;
 
@@ -186,7 +217,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            email: "system".to_string(),
+            email: SYSTEM_USER_EMAIL.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -205,7 +236,7 @@ impl SessionManager {
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
-            email: "system".to_string(),
+            email: SYSTEM_USER_EMAIL.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -496,5 +527,36 @@ mod tests {
         assert_eq!(inner.event_type, MeetingEventType::MEETING_ENDED.into());
         assert_eq!(inner.room_id, "my-room");
         assert_eq!(inner.message, "Host left");
+    }
+
+    // ==========================================================================
+    // TEST 7: Reserved system email is rejected
+    // ==========================================================================
+    #[tokio::test]
+    async fn test_system_email_rejected() {
+        let pool = get_test_pool().await;
+        let manager = SessionManager::new(pool.clone());
+        let room_id = "test-room-system-7";
+
+        cleanup_test_room(&pool, room_id).await;
+
+        // Attempt to join with reserved system email should fail
+        let result = manager.start_session(room_id, SYSTEM_USER_EMAIL).await;
+        assert!(result.is_err(), "Should reject reserved system email");
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("reserved system email"),
+            "Error message should mention reserved system email: {err}"
+        );
+
+        // Verify no participant was added
+        assert_eq!(
+            manager.get_participant_count(room_id).await,
+            0,
+            "No participant should be added for reserved email"
+        );
+
+        cleanup_test_room(&pool, room_id).await;
     }
 }

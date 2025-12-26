@@ -568,7 +568,17 @@ pub async fn handle_send_connection_started(
                 Err(e) => error!("Error opening stream for MEETING_STARTED: {}", e),
             }
         }
-        Err(e) => error!("Failed to start session: {}", e),
+        Err(e) => {
+            error!("Failed to start session: {}", e);
+            // Send error to client and close connection
+            let error_msg = format!("Session rejected: {e}");
+            let error_bytes = SessionManager::build_meeting_ended_packet(lobby_id, &error_msg);
+            if let Ok(mut stream) = session.open_uni().await {
+                let _ = stream.write_all(&error_bytes).await;
+            }
+            // Close the session - user is rejected
+            session.close(1u32, b"Session rejected");
+        }
     }
 }
 

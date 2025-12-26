@@ -44,6 +44,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
@@ -802,7 +803,12 @@ impl Inner {
             response.packet_type.enum_value(),
             response.email
         );
-        let peer_status = self.peer_decode_manager.ensure_peer(&response.email);
+        // Skip creating peers for system messages (meeting info, meeting started/ended)
+        let peer_status = if response.email == SYSTEM_USER_EMAIL {
+            PeerStatus::NoChange
+        } else {
+            self.peer_decode_manager.ensure_peer(&response.email)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {

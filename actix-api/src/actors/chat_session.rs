@@ -142,23 +142,38 @@ impl Actor for WsChatSession {
         ctx.wait(
             async move {
                 match session_manager.start_session(&room_id, &creator_id).await {
-                    Ok(result) => Some((result.start_time_ms, creator_id)),
+                    Ok(result) => Ok((result.start_time_ms, creator_id)),
                     Err(e) => {
                         error!("failed to start session: {}", e);
-                        None
+                        Err(e.to_string())
                     }
                 }
             }
             .into_actor(self)
-            .map(|result_opt, act, ctx| {
-                if let Some((start_time_ms, creator_id)) = result_opt {
-                    // Send MEETING_STARTED packet (protobuf)
-                    let bytes = SessionManager::build_meeting_started_packet(
-                        &act.room,
-                        start_time_ms,
-                        &creator_id,
-                    );
-                    ctx.binary(bytes);
+            .map(|result, act, ctx| {
+                match result {
+                    Ok((start_time_ms, creator_id)) => {
+                        // Send MEETING_STARTED packet (protobuf)
+                        let bytes = SessionManager::build_meeting_started_packet(
+                            &act.room,
+                            start_time_ms,
+                            &creator_id,
+                        );
+                        ctx.binary(bytes);
+                    }
+                    Err(error_msg) => {
+                        // Send error to client and close connection
+                        let bytes = SessionManager::build_meeting_ended_packet(
+                            &act.room,
+                            &format!("Session rejected: {error_msg}"),
+                        );
+                        ctx.binary(bytes);
+                        ctx.close(Some(actix_web_actors::ws::CloseReason {
+                            code: actix_web_actors::ws::CloseCode::Policy,
+                            description: Some("Session rejected".to_string()),
+                        }));
+                        ctx.stop();
+                    }
                 }
             }),
         );

@@ -25,9 +25,10 @@ use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::VideoCallClientCtx;
-use gloo_timers::callback::Timeout;
+use gloo_timers::callback::{Interval, Timeout};
 use gloo_utils::window;
 use log::{error, warn};
+use serde::Deserialize;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -46,6 +47,8 @@ pub enum WsAction {
     MediaPermissionsError(String),
     Log(String),
     EncoderSettingsUpdated(String),
+    TimerTick,
+    MeetingInfoReceived(u64),
     ToggleDropdown,
 }
 
@@ -62,6 +65,16 @@ pub enum UserScreenToggleAction {
     PeerList,
     Diagnostics,
     DeviceSettings,
+    MeetingInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MeetingInfoData {
+    pub room_id: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub duration_ms: i64,
+    pub is_active: bool,
 }
 
 #[derive(Debug)]
@@ -82,6 +95,7 @@ pub enum Msg {
     ToggleForceDesktopGrid,
     HangUp,
     ShowCopyToast(bool),
+    MeetingEnded(String),
 }
 
 impl From<WsAction> for Msg {
@@ -146,7 +160,13 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp - the actual meeting time
+    pub call_start_time: Option<f64>,           // Track when the call started for a user
+    _timer: Option<Interval>,
     show_dropdown: bool,
+    meeting_info_data: Option<MeetingInfoData>, //Meeting info data
+    meeting_ended_message: Option<String>,
+    meeting_info_open: bool,
 }
 
 impl AttendantsComponent {
@@ -234,6 +254,28 @@ impl AttendantsComponent {
             }),
             rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
             rtt_probe_interval_ms: Some(200),
+            on_meeting_info: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |start_time_ms: f64| {
+                    log::info!("Meeting started at Unix timestamp: {start_time_ms}");
+                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                        start_time_ms as u64,
+                    )))
+                })
+            }),
+            on_meeting_ended: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |(end_time_ms, message): (f64, String)| {
+                    log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
+                    // link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                    //     end_time_ms as u64,
+                    // )));
+                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                        end_time_ms as u64,
+                    )));
+                    link.send_message(Msg::MeetingEnded(message));
+                })
+            }),
         };
 
         VideoCallClient::new(opts)
@@ -327,6 +369,54 @@ impl AttendantsComponent {
             }
         }
     }
+
+    fn format_meeting_duration(&self) -> String {
+        log::info!(
+            "format_meeting_duration - meeting_start_time_server: {:?}",
+            self.meeting_start_time_server
+        );
+        if let Some(server_start_ms) = self.meeting_start_time_server {
+            let now_ms = js_sys::Date::now();
+
+            log::info!("Server start: {server_start_ms}, Now: {now_ms}");
+            let elapsed_ms = (now_ms - server_start_ms).max(0.0);
+
+            let elapsed_secs = (elapsed_ms / 1000.0) as u64;
+
+            log::info!("Elapsed seconds: {elapsed_secs}");
+            let hours = elapsed_secs / 3600;
+            let minutes = (elapsed_secs % 3600) / 60;
+            let seconds = elapsed_secs % 60;
+
+            if hours > 0 {
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
+            } else {
+                format!("{minutes:02}:{seconds:02}")
+            }
+        } else {
+            "00:00".to_string()
+        }
+    }
+
+    pub fn format_user_duration(&self) -> String {
+        if let Some(local_start) = self.call_start_time {
+            let now_ms = js_sys::Date::now();
+
+            let elapsed_ms = (now_ms - local_start).max(0.0);
+            let elapsed_secs = (elapsed_ms / 1000.0) as u64;
+            let hours = elapsed_secs / 3600;
+            let minutes = (elapsed_secs % 3600) / 60;
+            let seconds = elapsed_secs % 60;
+
+            if hours > 0 {
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
+            } else {
+                format!("{minutes:02}:{seconds:02}")
+            }
+        } else {
+            "00:00".to_string()
+        }
+    }
 }
 
 impl Component for AttendantsComponent {
@@ -358,7 +448,13 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            call_start_time: None,
+            _timer: None,
+            meeting_start_time_server: None,
             show_dropdown: false,
+            meeting_info_data: None,
+            meeting_ended_message: None,
+            meeting_info_open: false,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -393,8 +489,28 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
+
+                    self.call_start_time = Some(js_sys::Date::now());
+
+                    if self._timer.is_none() {
+                        let link = ctx.link().clone();
+                        let interval = Interval::new(1000, move || {
+                            link.send_message(Msg::WsAction(WsAction::TimerTick));
+                        });
+                        self._timer = Some(interval);
+                    }
                     true
                 }
+
+                WsAction::TimerTick => {
+                    log::debug!(
+                        "Timer tick - meeting_start: {:?}, user_start: {:?}",
+                        self.meeting_start_time_server,
+                        self.call_start_time
+                    );
+                    true
+                }
+
                 WsAction::Log(msg) => {
                     warn!("{msg}");
                     false
@@ -438,6 +554,25 @@ impl Component for AttendantsComponent {
                     self.encoder_settings = Some(settings);
                     true
                 }
+                WsAction::MeetingInfoReceived(start_time) => {
+                    log::info!("Stored meeting_start_time_server: {start_time:?}");
+
+                    self.meeting_start_time_server = Some(start_time as f64);
+
+                    log::info!(
+                        "Stored meeting_start_time_server: {:?}",
+                        self.meeting_start_time_server
+                    );
+
+                    if self._timer.is_none() {
+                        let link = ctx.link().clone();
+                        let interval = Interval::new(1000, move || {
+                            link.send_message(Msg::WsAction(WsAction::TimerTick));
+                        });
+                        self._timer = Some(interval);
+                    }
+                    true
+                }
                 WsAction::ToggleDropdown => {
                     self.show_dropdown = !self.show_dropdown;
                     true
@@ -447,6 +582,7 @@ impl Component for AttendantsComponent {
                 log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
+
                 true
             }
             Msg::OnPeerRemoved(_peer_id) => {
@@ -527,6 +663,15 @@ impl Component for AttendantsComponent {
                             self.diagnostics_open = false;
                         }
                     }
+
+                    UserScreenToggleAction::MeetingInfo => {
+                        self.meeting_info_open = !self.meeting_info_open;
+                        if self.meeting_info_open {
+                            //  self.peer_list_open = false;
+                            self.diagnostics_open = false;
+                            self.device_settings_open = false;
+                        }
+                    }
                 }
                 true
             }
@@ -576,7 +721,35 @@ impl Component for AttendantsComponent {
             }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
-                let _ = window().location().reload(); // Refresh page for clean state
+
+                if self.client.is_connected() {
+                    match self.client.disconnect() {
+                        Ok(_) => {
+                            log::info!("Disconnected from server");
+                        }
+                        Err(e) => {
+                            log::error!("Error disconnecting from server: {e}");
+                        }
+                    }
+                }
+
+                self._timer = None;
+                self.meeting_joined = false;
+                self.mic_enabled = false;
+                self.video_enabled = false;
+                self.call_start_time = None;
+                self.meeting_start_time_server = None;
+
+                Timeout::new(500, move || {
+                    let _ = window().location().set_href("/");
+                })
+                .forget();
+
+                true
+            }
+
+            Msg::MeetingEnded(end_time) => {
+                self.meeting_ended_message = Some(end_time);
                 true
             }
         }
@@ -645,12 +818,49 @@ impl Component for AttendantsComponent {
             grid_container_classes.push("force-desktop-grid");
         }
 
+        // Create the call timer HTML if the call has started
+        let call_timer = if self.call_start_time.is_some() {
+            html! {
+                <div class="call-timer" >
+                    { self.format_user_duration() }
+                </div>
+            }
+        } else {
+            html! {} // TODO: show a loading spinner
+        };
+
+        // In the view method, before the call_timer declaration
+        log::info!(
+            "Timer debug - meeting_joined: {}, meeting_start_time: {:?}, call_start_time: {:?}",
+            self.meeting_joined,
+            self.meeting_start_time_server,
+            self.call_start_time
+        );
+
+        // Create the top-right controls
+        let top_right_controls = html! {
+            <div class="top-right-controls">
+                {call_timer}
+                <button
+                    class={classes!("control-button", self.diagnostics_open.then_some("active"))}
+                    onclick={toggle_diagnostics.clone()}
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="12" y1="8" x2="12" y2="12"></line>
+                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                </button>
+            </div>
+        };
+
         // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
             return html! {
                 <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                     <div id="main-container" class="meeting-page">
                         <BrowserCompatibility/>
+                         {top_right_controls}
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
                         // Logout dropdown (top-right corner)
                         {
@@ -721,6 +931,7 @@ impl Component for AttendantsComponent {
             <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
+                     {top_right_controls.clone()}
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}
@@ -829,7 +1040,7 @@ impl Component for AttendantsComponent {
                                                         html! {
                                                             <>
                                                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
+                                                                    <path d="M16 16v1a4 4 0 0 1-4 4H3a4 4 0 0 1-4-4V7a4 4 0 0 1 4-4h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
                                                                     <line x1="1" y1="1" x2="23" y2="23"></line>
                                                                 </svg>
                                                                 <span class="tooltip">{ "Start Video" }</span>
@@ -1032,8 +1243,61 @@ impl Component for AttendantsComponent {
                     }
                 </div>
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
-                    <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
+                    {
+                        if self.peer_list_open {
+                            let toggle_meeting_info = ctx.link().callback(|_| UserScreenToggleAction::MeetingInfo);
+                            html! {
+                                <PeerList
+                                    peers={display_peers_vec.clone()}
+                                    onclose={toggle_peer_list}
+                                    show_meeting_info={self.meeting_info_open}
+                                    room_id={ctx.props().id.clone()}
+                                    num_participants={num_display_peers}
+                                    meeting_duration={self.format_meeting_duration()}
+                                    user_meeting_duration={self.format_user_duration()}
+                                    started_at={self.meeting_info_data.as_ref().map(|d| d.started_at.clone())}
+                                    ended_at={self.meeting_info_data.as_ref().and_then(|d| d.ended_at.clone())}
+                                    is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
+                                    on_toggle_meeting_info={toggle_meeting_info}
+                                />
+                            }
+                        } else {
+                                html! {}
+                        }
+                    }
                 </div>
+
+                {
+                    if let Some(ref message) = self.meeting_ended_message {
+                        html! {
+                            <div class="glass-backdrop" style="z-index: 9999;">
+                                <div class="card-apple" style="width: 420px; text-align: center;">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2" style="margin: 0 auto 1rem;">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <line x1="15" y1="9" x2="9" y2="15"></line>
+                                        <line x1="9" y1="9" x2="15" y2="15"></line>
+                                    </svg>
+                                    <h4 style="margin-top:0; margin-bottom: 0.5rem;">{"Meeting Ended"}</h4>
+                                    <p style="font-size: 1rem; margin: 1.5rem 0; color: #666;">
+                                        {message}
+                                    </p>
+                                    <button
+                                        class="btn-apple btn-primary"
+                                        onclick={Callback::from(|_| {
+                                            if let Some(window) = web_sys::window() {
+                                                let _ = window.location().set_href("/");
+                                            }
+                                        })}>
+                                        {"Return to Home"}
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+
                 {
                     if self.diagnostics_open {
                         html!{

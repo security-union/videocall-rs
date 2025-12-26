@@ -110,6 +110,12 @@ pub struct VideoCallClientOptions {
 
     /// Interval between RTT probes in milliseconds (default: 200ms)
     pub rtt_probe_interval_ms: Option<u64>,
+
+    /// Callback triggered when meeting info is received (optional)
+    pub on_meeting_info: Option<Callback<f64>>,
+
+    /// Callback triggered when the meeting ends (optional)
+    pub on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
 #[derive(Debug)]
@@ -117,6 +123,8 @@ struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
     on_peer_added: Callback<String>,
+    on_meeting_info: Option<Callback<f64>>,
+    on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
 #[derive(Debug)]
@@ -228,6 +236,8 @@ impl VideoCallClient {
                     enable_e2ee: options.enable_e2ee,
                     userid: options.userid.clone(),
                     on_peer_added: options.on_peer_added.clone(),
+                    on_meeting_ended: options.on_meeting_ended.clone(),
+                    on_meeting_info: options.on_meeting_info.clone(),
                 },
                 connection_controller: None,
                 connection_state: ConnectionState::Failed {
@@ -459,6 +469,30 @@ impl VideoCallClient {
             }
         };
         false
+    }
+
+    /// Disconnect from the current server.
+    pub fn disconnect(&self) -> anyhow::Result<()> {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            // if let Some(health_reporter) = &inner.health_reporter {
+            //     if let Ok(reporter) = health_reporter.try_borrow_mut() {
+            //         reporter.stop_health_reporting();
+            //     }
+            // }
+
+            if let Some(connection_controller) = &mut inner.connection_controller {
+                let _ = connection_controller.disconnect();
+            }
+
+            inner.connection_controller = None;
+            inner.connection_state = ConnectionState::Failed {
+                error: "Disconnected".to_string(),
+                last_known_server: None,
+            };
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Unable to borrow inner"))
+        }
     }
 
     /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.
@@ -853,7 +887,39 @@ impl Inner {
                 }
             }
             Ok(PacketType::CONNECTION) => {
-                error!("Not implemented: CONNECTION packet type");
+                let data_str = String::from_utf8_lossy(&response.data);
+
+                if data_str.starts_with("MEETING_ENDED:") {
+                    let message = data_str
+                        .strip_prefix("MEETING_ENDED:")
+                        .unwrap_or("The host has ended the meeting")
+                        .to_string();
+
+                    if let Some(callback) = &self.options.on_meeting_ended {
+                        let end_time_ms = web_time::SystemTime::now()
+                            .duration_since(web_time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as f64)
+                            .unwrap_or(0.0);
+                        callback.emit((end_time_ms, message));
+                    }
+                } else if data_str.starts_with("MEETING_INFO:") {
+                    if let Some(time_str) = data_str.strip_prefix("MEETING_INFO:") {
+                        if let Ok(start_time_ms) = time_str.parse::<f64>() {
+                            info!("Received MEETING_INFO via CONNECTION packet: {start_time_ms}ms");
+                            if let Some(callback) = &self.options.on_meeting_info {
+                                callback.emit(start_time_ms);
+                            } else {
+                                error!("No on_meeting_info callback provided");
+                            }
+                        } else {
+                            error!(
+                                "Failed to parse MEETING_INFO via CONNECTION packet: {data_str}"
+                            );
+                        }
+                    }
+                } else {
+                    debug!("Received CONNECTION packet: {data_str}");
+                }
             }
             Ok(PacketType::DIAGNOSTICS) => {
                 // Parse and handle the diagnostics packet

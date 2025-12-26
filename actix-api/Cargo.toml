@@ -50,6 +50,7 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 serde = "1.0.140"
 serde_json = "1.0.82"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
 tokio = { version = "1.28.2", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["fmt", "ansi", "env-filter", "time", "tracing-log"] }

@@ -50,6 +50,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::HEALTH => {
                 write!(f, "HEALTH")
             }
+            protos::packet_wrapper::packet_wrapper::PacketType::MEETING => {
+                write!(f, "MEETING")
+            }
         }
     }
 }

@@ -1,18 +1,40 @@
 services:
+  postgres:
+    image: postgres:12
+    platform: linux/arm64
+    environment:
+      POSTGRES_PASSWORD: "docker"
+      PGPASSWORD: "docker"
+      POSTGRES_DB: "actix-api-db"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
   nats:
     image: nats:2.10-alpine
+    platform: linux/arm64
     command: ["-js", "--http_port", "8222"]
 
   rust-tests:
     build:
       dockerfile: ../docker/Dockerfile.actix
       context: ../docker
+      platforms:
+        - linux/arm64
+    platform: linux/arm64
     working_dir: /app/actix-api
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       - RUST_LOG=info
       - WEBTRANSPORT_URL=https://127.0.0.1:4433
       - HEALTH_URL=http://127.0.0.1:5321/healthz
       - NATS_URL=nats:4222
+      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - DATABASE_ENABLED=true
       - INSECURE=true
       - LISTEN_URL=0.0.0.0:4433
       - HEALTH_LISTEN_URL=0.0.0.0:5321
@@ -30,10 +52,16 @@ services:
       - rustlemania-it-tests-target:/usr/local/cargo/target
       - rustlemania-it-tests-cache:/app/actix-api/target
     depends_on:
-      - nats
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
     command: >
       bash -lc '
         set -euo pipefail
+        echo "=== RUNNING DATABASE MIGRATIONS ==="
+        cd /app/dbmate && dbmate wait && dbmate up
+        cd /app/actix-api
         echo "=== STARTING CARGO TEST ==="
         cargo test -p videocall-api -- --nocapture --test-threads=1
         echo "=== CARGO TEST FINISHED WITH EXIT CODE: $? ==="

@@ -17,18 +17,19 @@
  */
 
 pub mod meeting;
+pub mod session_participant;
 
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
-use crate::meeting::MeetingManager;
 use crate::server_diagnostics::TrackerSender;
+use crate::session_manager::SessionManager;
 
 pub struct AppState {
     pub chat: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
-    pub meeting_manager: MeetingManager,
+    pub session_manager: SessionManager,
 }
 
 pub struct AppConfig {

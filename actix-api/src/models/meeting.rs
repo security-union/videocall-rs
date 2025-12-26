@@ -1,10 +1,11 @@
 use crate::db::get_connection_query;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::error::Error;
-use tracing::error;
+use tracing::{error, info};
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
 pub struct Meeting {
     pub id: i32,
     pub room_id: String,
@@ -183,5 +184,89 @@ impl Meeting {
             let started_at: DateTime<Utc> = rows[0].get("started_at");
             Ok(Some(started_at.timestamp_millis()))
         }
+    }
+
+    // =========================================================================
+    // Async sqlx methods - preferred for new code
+    // =========================================================================
+
+    /// Create a meeting using sqlx (async, no spawn_blocking)
+    pub async fn create_async(
+        pool: &PgPool,
+        room_id: &str,
+        creator_id: Option<&str>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let now = Utc::now();
+        let meeting = sqlx::query_as::<_, Meeting>(
+            r#"
+            INSERT INTO meetings (room_id, started_at, ended_at, creator_id)
+            VALUES ($1, $2, NULL, $3)
+            ON CONFLICT (room_id) DO UPDATE
+            SET started_at = CASE
+                WHEN meetings.ended_at IS NOT NULL THEN EXCLUDED.started_at
+                ELSE meetings.started_at
+            END,
+            ended_at = NULL,
+            creator_id = CASE
+                WHEN meetings.ended_at IS NOT NULL THEN EXCLUDED.creator_id
+                ELSE meetings.creator_id
+            END,
+            updated_at = NOW()
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            "#,
+        )
+        .bind(room_id)
+        .bind(now)
+        .bind(creator_id)
+        .fetch_one(pool)
+        .await?;
+
+        info!(
+            "Meeting created/updated for room {} by {:?}",
+            room_id, creator_id
+        );
+        Ok(meeting)
+    }
+
+    /// Get meeting by room_id using sqlx (async, no spawn_blocking)
+    pub async fn get_by_room_id_async(
+        pool: &PgPool,
+        room_id: &str,
+    ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+        let meeting = sqlx::query_as::<_, Meeting>(
+            r#"
+            SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            FROM meetings
+            WHERE room_id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(room_id)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(meeting)
+    }
+
+    /// End a meeting using sqlx (async, no spawn_blocking)
+    pub async fn end_meeting_async(
+        pool: &PgPool,
+        room_id: &str,
+    ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
+        let meeting = sqlx::query_as::<_, Meeting>(
+            r#"
+            UPDATE meetings
+            SET ended_at = NOW(), updated_at = NOW()
+            WHERE room_id = $1 AND ended_at IS NULL
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            "#,
+        )
+        .bind(room_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some(ref m) = meeting {
+            info!("Meeting {} ended at: {:?}", room_id, m.ended_at);
+        }
+        Ok(meeting)
     }
 }

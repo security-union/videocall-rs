@@ -18,15 +18,17 @@
 
 use crate::client_diagnostics::health_processor;
 use crate::constants::VALID_ID_PATTERN;
-use crate::meeting::MeetingManager;
+use crate::db_pool;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
 };
+use crate::session_manager::{SessionEndResult, SessionManager};
 use anyhow::{anyhow, Context, Result};
 use async_nats::Subject;
 use futures::StreamExt;
 use protobuf::Message;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use sqlx::PgPool;
 use std::io::Read;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
@@ -208,6 +210,11 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
             .await
             .unwrap();
 
+    // Create database pool
+    let pool = db_pool::create_pool()
+        .await
+        .expect("Failed to create database pool");
+
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
         ServerDiagnostics::new_with_channel(nc.clone());
@@ -223,11 +230,12 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
     while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
         let nc = nc.clone();
+        let pool = pool.clone();
         let tracker_sender = tracker_sender.clone();
         tokio::spawn(async move {
             // Handle WebTransport request directly using 0.7.3 API
             if let Err(err) =
-                run_webtransport_connection_from_request(request, nc, tracker_sender).await
+                run_webtransport_connection_from_request(request, nc, pool, tracker_sender).await
             {
                 error!("Failed to handle WebTransport connection: {err:?}");
             }
@@ -240,6 +248,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     nc: async_nats::client::Client,
+    pool: PgPool,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
     warn!("received WebTransport request: {}", request.url());
@@ -271,40 +280,35 @@ async fn run_webtransport_connection_from_request(
 
     // Run the session
     if let Err(err) =
-        handle_webtransport_session(session, &username, &lobby_id, nc, tracker_sender).await
+        handle_webtransport_session(session, &username, &lobby_id, nc, pool, tracker_sender).await
     {
         info!("closing session: {}", err);
     }
     Ok(())
 }
 
-#[tracing::instrument(level = "trace", skip(session))]
+#[tracing::instrument(level = "trace", skip(session, pool))]
 async fn handle_webtransport_session(
     session: Session,
     username: &str,
     lobby_id: &str,
     nc: async_nats::client::Client,
+    pool: PgPool,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
-    let meeting_manager = MeetingManager::new();
+    let session_manager = SessionManager::new(pool);
     // Generate unique session ID for this WebTransport connection
     let session_id = uuid::Uuid::new_v4().to_string();
-
-    // Track connection start for metrics
-    handle_send_connection_started(
-        &tracker_sender,
-        session_id.clone(),
-        username.to_string(),
-        &meeting_manager,
-        lobby_id,
-    )
-    .await;
 
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     // Create shutdown channel to signal connection errors
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
+    // IMPORTANT: Subscribe to NATS FIRST, before sending MEETING_STARTED.
+    // This ensures that when the client receives MEETING_STARTED, the server
+    // is already subscribed and ready to relay packets. This eliminates the
+    // race condition where packets could be lost if sent before subscription.
     let subject = format!("room.{lobby_id}.*").replace(' ', "_");
     let specific_subject: Subject = format!("room.{lobby_id}.{username}")
         .replace(' ', "_")
@@ -323,6 +327,18 @@ async fn handle_webtransport_session(
             return Err(anyhow!(err));
         }
     };
+
+    // NOW send MEETING_STARTED - client can safely start sending packets
+    // because NATS subscription is ready
+    handle_send_connection_started(
+        &tracker_sender,
+        session_id.clone(),
+        username.to_string(),
+        &session_manager,
+        lobby_id,
+        &session,
+    )
+    .await;
 
     let specific_subject_clone = specific_subject.clone();
 
@@ -459,6 +475,9 @@ async fn handle_webtransport_session(
         });
     }
 
+    // Clone nc for use after join_set finishes
+    let nc_for_end = nc.clone();
+
     // WebTransport datagram receive task
     {
         let session = session.clone();
@@ -500,12 +519,14 @@ async fn handle_webtransport_session(
     join_set.join_next().await;
     join_set.shutdown().await;
 
-    // Track connection end for metrics
+    // Track connection end and handle meeting lifecycle
     handle_send_connection_ended(
         &tracker_sender,
         session_id.clone(),
-        &meeting_manager,
+        &session_manager,
         lobby_id,
+        username,
+        &nc_for_end,
     )
     .await;
 
@@ -516,30 +537,72 @@ async fn handle_webtransport_session(
 pub async fn handle_send_connection_started(
     tracker_sender: &TrackerSender,
     session_id: String,
-    customer_email: String,
-    meeting_manager: &MeetingManager,
+    user_id: String,
+    session_manager: &SessionManager,
     lobby_id: &str,
+    session: &Session,
 ) {
     send_connection_started(
         tracker_sender,
         session_id.clone(),
-        customer_email,
+        user_id.clone(),
         lobby_id.to_string(),
         "webtransport".to_string(),
     );
 
-    let _ = meeting_manager.end_meeting(lobby_id).await;
+    // Start session (handles meeting creation if first participant)
+    match session_manager.start_session(lobby_id, &user_id).await {
+        Ok(result) => {
+            // Send MEETING_STARTED packet to client (protobuf)
+            let bytes = SessionManager::build_meeting_started_packet(
+                lobby_id,
+                result.start_time_ms,
+                &user_id,
+            );
+            match session.open_uni().await {
+                Ok(mut stream) => {
+                    if let Err(e) = stream.write_all(&bytes).await {
+                        error!("Error sending MEETING_STARTED: {}", e);
+                    }
+                }
+                Err(e) => error!("Error opening stream for MEETING_STARTED: {}", e),
+            }
+        }
+        Err(e) => error!("Failed to start session: {}", e),
+    }
 }
 
 pub async fn handle_send_connection_ended(
     tracker_sender: &TrackerSender,
     session_id: String,
-    meeting_manager: &MeetingManager,
+    session_manager: &SessionManager,
     lobby_id: &str,
+    user_id: &str,
+    nc: &async_nats::client::Client,
 ) {
     send_connection_ended(tracker_sender, session_id.clone());
 
-    let _ = meeting_manager.end_meeting(lobby_id).await;
+    // End session (handles meeting end logic based on participant count and host status)
+    match session_manager.end_session(lobby_id, user_id).await {
+        Ok(SessionEndResult::HostEndedMeeting) => {
+            // Notify all participants that host ended the meeting (protobuf)
+            let bytes = SessionManager::build_meeting_ended_packet(
+                lobby_id,
+                "The host has ended the meeting",
+            );
+            let subject = format!("room.{}.system", lobby_id.replace(' ', "_"));
+            if let Err(e) = nc.publish(subject, bytes.into()).await {
+                error!("Error publishing MEETING_ENDED: {}", e);
+            }
+        }
+        Ok(SessionEndResult::LastParticipantLeft) => {
+            info!("Meeting ended - last participant left");
+        }
+        Ok(SessionEndResult::MeetingContinues { remaining_count }) => {
+            info!("Session ended, {} participants remaining", remaining_count);
+        }
+        Err(e) => error!("Error ending session: {}", e),
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +741,43 @@ mod tests {
         }
     }
 
+    /// Wait for a session to receive its MEETING_STARTED packet.
+    /// The server subscribes to NATS BEFORE sending MEETING_STARTED, so receiving
+    /// this packet confirms the session is fully initialized and ready to relay packets.
+    async fn wait_for_session_ready(
+        session: &web_transport_quinn::Session,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        println!("Waiting for {name} to receive MEETING_STARTED...");
+        let session_clone = session.clone();
+        wait_for_condition(
+            || {
+                let session = session_clone.clone();
+                async move {
+                    if let Ok(mut stream) = session.accept_uni().await {
+                        if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                            if !buf.is_empty() {
+                                if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&buf) {
+                                    if wrapper.packet_type
+                                        == videocall_types::protos::packet_wrapper::packet_wrapper::PacketType::MEETING.into()
+                                    {
+                                        println!("✓ {name} received MEETING_STARTED - session ready");
+                                        return Some(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .map(|_| ())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_relay_packet_webtransport_between_two_clients() {
         let _ = tracing_subscriber::fmt()
@@ -724,6 +824,15 @@ mod tests {
             .expect("connect client B");
         println!("Client B connected!");
 
+        // Wait for both sessions to be fully ready (receive MEETING_STARTED)
+        // This confirms NATS subscriptions are established
+        wait_for_session_ready(&session_a, "client A")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        wait_for_session_ready(&session_b, "client B")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
         // Start keep-alive tasks that will be cancelled when test ends
         let session_a_keep = session_a.clone();
         let session_b_keep = session_b.clone();
@@ -759,32 +868,34 @@ mod tests {
         let bytes = packet.write_to_bytes().expect("serialize wrapper");
 
         println!("Sending packet from A to B (size: {} bytes)", bytes.len());
-        // Send from A
         send_packet(&session_a, bytes.clone()).await;
         println!("Packet sent from A!");
 
-        // Give NATS time to relay the message
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
+        // Wait for B to receive the packet
         println!("Waiting for packet on B...");
-        // Receive on B
-        let condition = || async {
-            if let Ok(mut stream) = session_b.accept_uni().await {
-                if let Ok(buf) = stream.read_to_end(usize::MAX).await {
-                    if !buf.is_empty() {
-                        println!("Received packet on B (size: {} bytes)", buf.len());
-                        return Some(buf);
+        let session_b_recv = session_b.clone();
+        let received = wait_for_condition(
+            || {
+                let session = session_b_recv.clone();
+                async move {
+                    if let Ok(mut stream) = session.accept_uni().await {
+                        if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                            if !buf.is_empty() {
+                                println!("Received packet on B (size: {} bytes)", buf.len());
+                                return Some(buf);
+                            }
+                        }
                     }
+                    None
                 }
-            }
-            None
-        };
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("Should receive packet from A on B");
 
-        let received =
-            wait_for_condition(condition, Duration::from_secs(5), Duration::from_millis(50))
-                .await
-                .expect("timely receive");
-
+        println!("Packet successfully relayed!");
         assert_eq!(bytes, received, "B must receive the exact bytes sent by A");
 
         println!("=== INTEGRATION TEST PASSED ===");
@@ -849,6 +960,18 @@ mod tests {
             .expect("connect charlie");
         println!("✓ Charlie connected to lobby-secure");
 
+        // Wait for all sessions to be fully ready (receive MEETING_STARTED)
+        // This confirms NATS subscriptions are established before sending test packets
+        wait_for_session_ready(&session_a, "Alice")
+            .await
+            .expect("Alice session ready");
+        wait_for_session_ready(&session_b, "Bob")
+            .await
+            .expect("Bob session ready");
+        wait_for_session_ready(&session_c, "Charlie")
+            .await
+            .expect("Charlie session ready");
+
         // Keep connections alive
         start_keep_alive_tasks(&session_a, &session_b, &session_c).await;
 
@@ -867,7 +990,15 @@ mod tests {
             println!("✓ Alice sent packet #{i}");
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Wait for Charlie to receive Alice's 3 packets
+        let expected_charlie_count = count_c + 3;
+        wait_for_condition_bool(
+            || async move { get_test_packet_counter_for_user(user_c) >= expected_charlie_count },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("Charlie should receive Alice's packets");
 
         let [alice_count_after, bob_count_after, charlie_count_after] =
             get_all_user_counts(&[user_a, user_b, user_c])[..]
@@ -917,7 +1048,15 @@ mod tests {
             println!("✓ Charlie sent reply #{i}");
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Wait for Alice to receive Charlie's 2 packets
+        let expected_alice_count = alice_before_bidi + 2;
+        wait_for_condition_bool(
+            || async move { get_test_packet_counter_for_user(user_a) >= expected_alice_count },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("Alice should receive Charlie's replies");
 
         let [alice_after_bidi, bob_after_bidi, charlie_after_bidi] =
             get_all_user_counts(&[user_a, user_b, user_c])[..]
@@ -963,7 +1102,20 @@ mod tests {
         send_packet(&session_b, packet).await;
         println!("✓ Bob sent packet in lobby-public");
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Wait to verify isolation - expect this to timeout since no one should receive Bob's packet
+        // We use a short timeout since we're verifying nothing happens
+        let _ = wait_for_condition_bool(
+            || async move {
+                // This should never become true - Bob is alone in his lobby
+                get_test_packet_counter_for_user(user_a) > alice_before_bob
+                    || get_test_packet_counter_for_user(user_b) > bob_before_bob
+                    || get_test_packet_counter_for_user(user_c) > charlie_before_bob
+            },
+            Duration::from_millis(300), // Short timeout - we expect this to fail
+            Duration::from_millis(50),
+        )
+        .await;
+        // We don't care if this times out - that's expected behavior
 
         let [alice_after_bob, bob_after_bob, charlie_after_bob] =
             get_all_user_counts(&[user_a, user_b, user_c])[..]

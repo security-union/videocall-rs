@@ -22,7 +22,8 @@ use crate::messages::session::Message;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
 };
-use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT, meeting::MeetingManager};
+use crate::session_manager::SessionManager;
+use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
 use std::sync::Arc;
 
 use crate::{
@@ -57,7 +58,7 @@ pub struct WsChatSession {
     pub creator_id: String,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
-    pub meeting_manager: MeetingManager,
+    pub session_manager: SessionManager,
 }
 
 impl WsChatSession {
@@ -65,10 +66,9 @@ impl WsChatSession {
         addr: Addr<ChatServer>,
         room: String,
         email: String,
-        // creator_id: String,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
-        meeting_manager: MeetingManager,
+        session_manager: SessionManager,
     ) -> Self {
         let session_id = Uuid::new_v4().to_string();
         info!(
@@ -85,7 +85,7 @@ impl WsChatSession {
             addr,
             nats_client,
             tracker_sender,
-            meeting_manager,
+            session_manager,
         }
     }
 
@@ -134,36 +134,31 @@ impl Actor for WsChatSession {
             "websocket".to_string(),
         );
 
-        // Get or create meeting state for this room
-        let meeting_manager = self.meeting_manager.clone();
+        // Start session using SessionManager
+        let session_manager = self.session_manager.clone();
         let room_id = self.room.clone();
         let creator_id = self.creator_id.clone();
 
-        // Use actix's async context to handle the async meeting manager
         ctx.wait(
             async move {
-                match meeting_manager
-                    .start_meeting(&room_id, creator_id.as_str())
-                    .await
-                {
-                    Ok(start_time) => Some(start_time),
+                match session_manager.start_session(&room_id, &creator_id).await {
+                    Ok(result) => Some((result.start_time_ms, creator_id)),
                     Err(e) => {
-                        error!("failed to start meeting: {}", e);
+                        error!("failed to start session: {}", e);
                         None
                     }
                 }
             }
             .into_actor(self)
-            .map(|start_time_opt, act, ctx| {
-                if let Some(start_time_ms) = start_time_opt {
-                    let meeting_info = serde_json::json!({
-                        "type": "meeting_info",
-                        "room_id": act.room,
-                        "start_time_ms": start_time_ms,
-                    });
-                    if let Ok(bytes) = serde_json::to_vec(&meeting_info) {
-                        ctx.binary(bytes);
-                    }
+            .map(|result_opt, act, ctx| {
+                if let Some((start_time_ms, creator_id)) = result_opt {
+                    // Send MEETING_STARTED packet (protobuf)
+                    let bytes = SessionManager::build_meeting_started_packet(
+                        &act.room,
+                        start_time_ms,
+                        &creator_id,
+                    );
+                    ctx.binary(bytes);
                 }
             }),
         );
@@ -187,45 +182,10 @@ impl Actor for WsChatSession {
 
         // Join the room
         self.join(self.room.clone(), ctx);
-
-        // Start meeting (non-blocking spawn independently)
-        let meeting_manager = self.meeting_manager.clone();
-        let room_id = self.room.clone();
-        let ctx_addr = ctx.address();
-        let creator_id = self.creator_id.clone();
-
-        tokio::spawn(async move {
-            info!("Starting meeting for room: {}", room_id);
-            match meeting_manager
-                .start_meeting(&room_id, creator_id.as_str())
-                .await
-            {
-                Ok(start_time_ms) => {
-                    info!("Meeting {} started at {}", room_id, start_time_ms);
-                    let meeting_info = serde_json::json!({
-                        "type": "meeting_info",
-                        "room_id": room_id,
-                        "start_time_ms": start_time_ms,
-                    });
-                    if let Ok(bytes) = serde_json::to_vec(&meeting_info) {
-                        ctx_addr.do_send(Message {
-                            session: room_id,
-                            msg: bytes,
-                        });
-                    }
-                }
-                Err(e) => {
-                    error!("failed to start meeting: {}", e);
-                }
-            }
-        });
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
-        error!(" STOPPING METHOD CALLED");
-        error!("   Session ID: {}", self.id);
-        error!("   Room: {}", self.room);
-        error!("   Email: {}", self.email);
+        info!("Session stopping: {} in room {}", self.id, self.room);
         // Track connection end for metrics
         send_connection_ended(&self.tracker_sender, self.id.clone());
 
@@ -234,7 +194,6 @@ impl Actor for WsChatSession {
             session: self.id.clone(),
         });
 
-        error!(" Disconnect message sent, returning Running::Stop");
         Running::Stop
     }
 }
@@ -276,7 +235,6 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             Ok(msg) => msg,
             Err(err) => {
                 error!("protocol error 2 {:?}", err);
-                // ctx.text(WsMessage::err(err.to_string()));
                 ctx.stop();
                 return;
             }
@@ -318,18 +276,12 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 self.heartbeat = Instant::now();
             }
             ws::Message::Close(reason) => {
-                error!("CLOSE MESSAGE RECEIVED");
-                error!("   Session ID: {}", self.id);
-                error!("   Room: {}", self.room);
-                error!("   Reason: {:?}", reason);
+                info!(
+                    "Close received for session {} in room {}",
+                    self.id, self.room
+                );
 
-                // Send Disconnect BEFORE closing
-                error!(" Sending Disconnect message to ChatServer");
-                self.addr.do_send(Disconnect {
-                    session: self.id.clone(),
-                });
-
-                error!(" Sending Leave message to ChatServer");
+                // Send Leave message to ChatServer (which will handle session end via SessionManager)
                 self.addr.do_send(Leave {
                     session: self.id.clone(),
                     room: self.room.clone(),
@@ -337,7 +289,6 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 });
 
                 ctx.close(reason);
-                error!("socket closed");
                 ctx.stop();
             }
             _ => (),

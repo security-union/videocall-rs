@@ -21,6 +21,23 @@ pub type UsernameCtx = UseStateHandle<Option<String>>;
 pub type VideoCallClientCtx = VideoCallClient;
 
 // -----------------------------------------------------------------------------
+// Meeting Time Context
+// -----------------------------------------------------------------------------
+
+/// Holds meeting timing information for components that need it.
+/// Updated by AttendantsComponent when connection events occur.
+#[derive(Clone, PartialEq, Default)]
+pub struct MeetingTime {
+    /// Unix timestamp (ms) when the current user joined the call
+    pub call_start_time: Option<f64>,
+    /// Unix timestamp (ms) when the meeting started (from server)
+    pub meeting_start_time: Option<f64>,
+}
+
+/// Context type for meeting time - read-only access to timing info
+pub type MeetingTimeCtx = MeetingTime;
+
+// -----------------------------------------------------------------------------
 // Local-storage helpers
 // -----------------------------------------------------------------------------
 

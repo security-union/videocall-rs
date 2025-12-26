@@ -1,4 +1,6 @@
-use yew::{function_component, html, Html, Properties};
+use crate::components::call_timer::CallTimer;
+use crate::context::MeetingTimeCtx;
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct MeetingInfoProps {
@@ -6,7 +8,7 @@ pub struct MeetingInfoProps {
     pub is_open: bool,
 
     #[prop_or_default]
-    pub onclose: yew::Callback<()>,
+    pub onclose: Callback<()>,
 
     #[prop_or_default]
     pub room_id: String,
@@ -15,26 +17,20 @@ pub struct MeetingInfoProps {
     pub num_participants: usize,
 
     #[prop_or_default]
-    pub meeting_duration: String,
-
-    #[prop_or_default]
-    pub user_meeting_duration: String,
-
-    #[prop_or_default]
-    pub started_at: Option<String>,
-
-    #[prop_or_default]
-    pub ended_at: Option<String>,
-
-    #[prop_or_default]
     pub is_active: bool,
 }
 
 #[function_component(MeetingInfo)]
 pub fn meeting_info(props: &MeetingInfoProps) -> Html {
+    // Read meeting time from context - hydrated when sidebar opens
+    let meeting_time = use_context::<MeetingTimeCtx>().unwrap_or_default();
+
     if !props.is_open {
         return html! {};
     }
+
+    let meeting_start = meeting_time.meeting_start_time;
+    let call_start = meeting_time.call_start_time;
 
     html! {
         <div class="meeting-info-panel">
@@ -64,7 +60,7 @@ pub fn meeting_info(props: &MeetingInfoProps) -> Html {
                         <div class="info-details">
                             <span class="info-label">{"Meeting Duration"}</span>
                             <span class="info-value">
-                                {&props.meeting_duration}
+                                <CallTimer start_time_ms={meeting_start} inline={true} />
                                 {
                                     if props.is_active {
                                         html! { <span class="live-badge">{"LIVE"}</span> }
@@ -76,7 +72,6 @@ pub fn meeting_info(props: &MeetingInfoProps) -> Html {
                         </div>
                     </div>
 
-
                     <div class="info-item">
                         <div class="info-icon">
                             <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -87,7 +82,7 @@ pub fn meeting_info(props: &MeetingInfoProps) -> Html {
                         <div class="info-details">
                             <span class="info-label">{"My Duration"}</span>
                             <span class="info-value">
-                                {&props.user_meeting_duration}
+                                <CallTimer start_time_ms={call_start} inline={true} />
                                 {
                                     if props.is_active {
                                         html! { <span class="live-badge">{"LIVE"}</span> }
@@ -142,52 +137,6 @@ pub fn meeting_info(props: &MeetingInfoProps) -> Html {
                             </span>
                         </div>
                     </div>
-
-                    {
-                        if let Some(ref started) = props.started_at {
-                            html! {
-                                <div class="info-item">
-                                    <div class="info-icon">
-                                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                            <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
-                                            <line x1="16" y1="2" x2="16" y2="6"></line>
-                                            <line x1="8" y1="2" x2="8" y2="6"></line>
-                                            <line x1="3" y1="10" x2="21" y2="10"></line>
-                                        </svg>
-                                    </div>
-                                    <div class="info-details">
-                                        <span class="info-label">{"Started"}</span>
-                                        <span class="info-value">{started}</span>
-                                    </div>
-                                </div>
-                            }
-                        } else {
-                            html! {}
-                        }
-                    }
-
-                    {
-                        if let Some(ref ended) = props.ended_at {
-                            html! {
-                                <div class="info-item">
-                                    <div class="info-icon">
-                                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                            <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
-                                            <line x1="16" y1="2" x2="16" y2="6"></line>
-                                            <line x1="8" y1="2" x2="8" y2="6"></line>
-                                            <line x1="3" y1="10" x2="21" y2="10"></line>
-                                        </svg>
-                                    </div>
-                                    <div class="info-details">
-                                        <span class="info-label">{"Ended"}</span>
-                                        <span class="info-value">{ended}</span>
-                                    </div>
-                                </div>
-                            }
-                        } else {
-                            html! {}
-                        }
-                    }
                 </div>
             </div>
         </div>

@@ -1351,15 +1351,24 @@ select {
   display: block;
 }
 
-/* Top right controls for the timer duration */
-.top-right-controls {
+/* Bottom left timer display */
+.bottom-left-timer {
   position: fixed;
-  top: 20px;
-  right: 20px;
+  bottom: 100px;
+  left: 20px;
   display: flex;
   align-items: center;
   gap: 10px;
   z-index: 10;
+  pointer-events: none;
+}
+
+/* Adjust for mobile - position above the control bar */
+@media (max-width: 600px) {
+  .bottom-left-timer {
+    bottom: 90px;
+    left: 10px;
+  }
 }
 
 .call-timer {

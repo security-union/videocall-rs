@@ -16,9 +16,13 @@ use yew::prelude::*;
 
 #[derive(Properties, PartialEq, Clone)]
 pub struct CallTimerProps {
-    /// Unix timestamp in milliseconds when the user joined the call
+    /// Unix timestamp in milliseconds when the timer started
     #[prop_or_default]
     pub start_time_ms: Option<f64>,
+
+    /// If true, renders inline text without wrapper div (for use inside other elements)
+    #[prop_or_default]
+    pub inline: bool,
 }
 
 /// Self-contained timer component that updates independently without
@@ -58,14 +62,24 @@ pub fn call_timer(props: &CallTimerProps) -> Html {
         });
     }
 
-    if props.start_time_ms.is_some() {
+    if props.start_time_ms.is_none() {
+        return if props.inline {
+            html! { {"00:00"} }
+        } else {
+            html! {}
+        };
+    }
+
+    if props.inline {
+        // Inline mode: just the text, no wrapper
+        html! { { (*duration).clone() } }
+    } else {
+        // Block mode: styled timer badge
         html! {
             <div class="call-timer">
                 { (*duration).clone() }
             </div>
         }
-    } else {
-        html! {}
     }
 }
 

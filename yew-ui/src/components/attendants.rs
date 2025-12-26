@@ -17,18 +17,17 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, call_timer::CallTimer, diagnostics::Diagnostics,
-    host::Host, peer_list::PeerList, peer_tile::PeerTile,
+    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics, host::Host,
+    peer_list::PeerList, peer_tile::PeerTile,
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::VideoCallClientCtx;
+use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
-use serde::Deserialize;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -65,15 +64,6 @@ pub enum UserScreenToggleAction {
     Diagnostics,
     DeviceSettings,
     MeetingInfo,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct MeetingInfoData {
-    pub room_id: String,
-    pub started_at: String,
-    pub ended_at: Option<String>,
-    pub duration_ms: i64,
-    pub is_active: bool,
 }
 
 #[derive(Debug)]
@@ -162,7 +152,6 @@ pub struct AttendantsComponent {
     pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp - the actual meeting time
     pub call_start_time: Option<f64>,           // Track when the call started for a user
     show_dropdown: bool,
-    meeting_info_data: Option<MeetingInfoData>, //Meeting info data
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
 }
@@ -367,54 +356,6 @@ impl AttendantsComponent {
             }
         }
     }
-
-    fn format_meeting_duration(&self) -> String {
-        log::info!(
-            "format_meeting_duration - meeting_start_time_server: {:?}",
-            self.meeting_start_time_server
-        );
-        if let Some(server_start_ms) = self.meeting_start_time_server {
-            let now_ms = js_sys::Date::now();
-
-            log::info!("Server start: {server_start_ms}, Now: {now_ms}");
-            let elapsed_ms = (now_ms - server_start_ms).max(0.0);
-
-            let elapsed_secs = (elapsed_ms / 1000.0) as u64;
-
-            log::info!("Elapsed seconds: {elapsed_secs}");
-            let hours = elapsed_secs / 3600;
-            let minutes = (elapsed_secs % 3600) / 60;
-            let seconds = elapsed_secs % 60;
-
-            if hours > 0 {
-                format!("{hours:02}:{minutes:02}:{seconds:02}")
-            } else {
-                format!("{minutes:02}:{seconds:02}")
-            }
-        } else {
-            "00:00".to_string()
-        }
-    }
-
-    pub fn format_user_duration(&self) -> String {
-        if let Some(local_start) = self.call_start_time {
-            let now_ms = js_sys::Date::now();
-
-            let elapsed_ms = (now_ms - local_start).max(0.0);
-            let elapsed_secs = (elapsed_ms / 1000.0) as u64;
-            let hours = elapsed_secs / 3600;
-            let minutes = (elapsed_secs % 3600) / 60;
-            let seconds = elapsed_secs % 60;
-
-            if hours > 0 {
-                format!("{hours:02}:{minutes:02}:{seconds:02}")
-            } else {
-                format!("{minutes:02}:{seconds:02}")
-            }
-        } else {
-            "00:00".to_string()
-        }
-    }
 }
 
 impl Component for AttendantsComponent {
@@ -449,7 +390,6 @@ impl Component for AttendantsComponent {
             call_start_time: None,
             meeting_start_time_server: None,
             show_dropdown: false,
-            meeting_info_data: None,
             meeting_ended_message: None,
             meeting_info_open: false,
         };
@@ -782,21 +722,12 @@ impl Component for AttendantsComponent {
             grid_container_classes.push("force-desktop-grid");
         }
 
-        // Create the top-right controls with CallTimer component
-        // CallTimer manages its own interval internally, avoiding parent re-renders
-        let top_right_controls = html! {
-            <div class="top-right-controls">
-                <CallTimer start_time_ms={self.call_start_time} />
-            </div>
-        };
-
         // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
             return html! {
                 <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                     <div id="main-container" class="meeting-page">
                         <BrowserCompatibility/>
-                         {top_right_controls}
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
                         // Logout dropdown (top-right corner)
                         {
@@ -863,11 +794,17 @@ impl Component for AttendantsComponent {
             };
         }
 
+        // Create MeetingTime for context - child components (MeetingInfo) read from this
+        let meeting_time = MeetingTime {
+            call_start_time: self.call_start_time,
+            meeting_start_time: self.meeting_start_time_server,
+        };
+
         html! {
+            <ContextProvider<MeetingTimeCtx> context={meeting_time}>
             <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
-                     {top_right_controls.clone()}
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}
@@ -1189,10 +1126,6 @@ impl Component for AttendantsComponent {
                                     show_meeting_info={self.meeting_info_open}
                                     room_id={ctx.props().id.clone()}
                                     num_participants={num_display_peers}
-                                    meeting_duration={self.format_meeting_duration()}
-                                    user_meeting_duration={self.format_user_duration()}
-                                    started_at={self.meeting_info_data.as_ref().map(|d| d.started_at.clone())}
-                                    ended_at={self.meeting_info_data.as_ref().and_then(|d| d.ended_at.clone())}
                                     is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
                                     on_toggle_meeting_info={toggle_meeting_info}
                                 />
@@ -1249,6 +1182,7 @@ impl Component for AttendantsComponent {
                 }
                 </div>
             </ContextProvider<VideoCallClientCtx>>
+            </ContextProvider<MeetingTimeCtx>>
         }
     }
 }

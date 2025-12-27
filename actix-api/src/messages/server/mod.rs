@@ -57,6 +57,8 @@ pub struct Packet {
 #[rtype(result = "()")]
 pub struct Disconnect {
     pub session: SessionId,
+    pub room: RoomId,
+    pub user_id: String,
 }
 
 #[derive(ActixMessage)]

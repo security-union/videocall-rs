@@ -8,6 +8,7 @@ message PacketWrapper {
     CONNECTION = 3;
     DIAGNOSTICS = 4;
     HEALTH = 5;
+    MEETING = 6;
   }
   PacketType packet_type = 1;
   string email = 2;

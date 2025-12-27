@@ -1,6 +1,6 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d && docker compose -f $(COMPOSE_IT) run --rm rust-tests bash -c "cargo clippy -- -D warnings && cargo fmt --check && cargo machete && cargo test -- --nocapture --test-threads=1"
@@ -36,3 +36,17 @@ check:
 clean:
 		docker compose -f docker/docker-compose.yaml down --remove-orphans \
 			--volumes --rmi all
+
+# Clean stale Docker resources (networks, containers)
+clean-docker:
+		docker compose -f docker/docker-compose.yaml down --remove-orphans
+		docker network prune -f
+
+# Rebuild all images from scratch (use after Dockerfile changes or for ARM64 migration)
+rebuild:
+		docker compose -f docker/docker-compose.yaml build --no-cache
+
+# Rebuild and start (fresh build + run)
+rebuild-up:
+		docker compose -f docker/docker-compose.yaml build --no-cache
+		docker compose -f docker/docker-compose.yaml up

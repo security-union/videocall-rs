@@ -37,10 +37,6 @@ pub struct PeerListProperties {
     pub show_meeting_info: bool,
     pub room_id: String,
     pub num_participants: usize,
-    pub meeting_duration: String,
-    pub user_meeting_duration: String,
-    pub started_at: Option<String>,
-    pub ended_at: Option<String>,
     pub is_active: bool,
     pub on_toggle_meeting_info: yew::Callback<()>,
 }
@@ -110,6 +106,7 @@ impl Component for PeerList {
 
                 {
                     // Show meeting information at the top when enabled
+                    // MeetingInfo reads timing from MeetingTimeContext directly
                     if ctx.props().show_meeting_info {
                         html! {
                             <MeetingInfo
@@ -117,10 +114,6 @@ impl Component for PeerList {
                                 onclose={ctx.props().on_toggle_meeting_info.clone()}
                                 room_id={ctx.props().room_id.clone()}
                                 num_participants={ctx.props().num_participants}
-                                meeting_duration={ctx.props().meeting_duration.clone()}
-                                user_meeting_duration={ctx.props().user_meeting_duration.clone()}
-                                started_at={ctx.props().started_at.clone()}
-                                ended_at={ctx.props().ended_at.clone()}
                                 is_active={ctx.props().is_active}
                             />
                         }

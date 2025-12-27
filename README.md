@@ -26,6 +26,7 @@ An open-source, high-performance video conferencing platform built with Rust, pr
 - [Usage](#usage)
 - [Performance](#performance)
 - [Security](#security)
+- [Feature Flags](#feature-flags)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Project Structure](#project-structure)
@@ -120,7 +121,7 @@ We strongly recommend using the Docker-based setup for development, as it's well
 
 - Modern Linux distribution, macOS, or Windows 10/11
 - [Docker](https://docs.docker.com/engine/install/) and Docker Compose (for containerized setup)
-- [Rust toolchain](https://rustup.rs/) 1.85+ (for manual setup)
+- [Rust toolchain](https://rustup.rs/) 1.89+ (for manual setup)
 - Chromium-based browser (Chrome, Edge, Brave) for frontend access - Firefox is not supported
 - Safari both in iOS and macOS are supported for frontend access
 
@@ -276,6 +277,37 @@ Security is a core focus of videocall.rs:
 - **Access Controls:** Fine-grained permission system for meeting rooms.
 
 For details on our security model and best practices, see our [security documentation](https://docs.videocall.rs/security).
+
+## Feature Flags
+
+videocall.rs uses environment-based feature flags to enable or disable experimental or optional functionality at runtime. Flags are loaded lazily on first access and can be overridden for testing purposes.
+
+### Configuration
+
+Feature flags are set via environment variables with the `FEATURE_` prefix:
+
+```bash
+# Enable a feature flag
+export FEATURE_MEETING_MANAGEMENT=true
+
+# Or when running with Docker
+docker run -e FEATURE_MEETING_MANAGEMENT=true ...
+```
+
+### Available Flags
+
+| Flag | Environment Variable | Description | Default |
+|------|---------------------|-------------|---------|
+| Meeting Management | `FEATURE_MEETING_MANAGEMENT` | Enable meeting lifecycle management including creation, tracking, and host controls | `false` |
+
+### Truthy Values
+
+The following values are recognized as enabling a flag (case-insensitive):
+- `true`
+- `1`
+- `yes`
+
+Any other value (or unset variable) is treated as `false`.
 
 ## Roadmap
 

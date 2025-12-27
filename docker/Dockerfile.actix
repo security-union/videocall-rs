@@ -1,7 +1,19 @@
-FROM docker.io/securityunion/rustlemania-api-base:fix-ci-7d7323a2
+FROM rust:1.89-slim
 
-RUN apt-get update && apt-get install -y pkg-config libclang-dev \
-    libvpx-dev libasound2-dev libv4l-dev cmake nasm
+# Install dependencies for native platform (works on both ARM64 and AMD64)
+RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev nasm \
+    libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake
+
+# Detect architecture and download appropriate dbmate binary
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then \
+        curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-arm64 -L -o /usr/bin/dbmate; \
+    else \
+        curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate; \
+    fi && \
+    chmod +x /usr/bin/dbmate
+
+RUN cargo install cargo-watch
 
 RUN rustup component add clippy
 RUN rustup component add rustfmt

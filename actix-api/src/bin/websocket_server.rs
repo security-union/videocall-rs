@@ -41,9 +41,10 @@ use sec_api::{
     },
     constants::VALID_ID_PATTERN,
     db::{get_pool, PostgresPool},
-    meeting::MeetingManager,
+    db_pool,
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
+    session_manager::SessionManager,
 };
 use tracing::{debug, error, info};
 use videocall_types::truthy;
@@ -311,14 +312,14 @@ pub async fn ws_connect(
     let chat = state.chat.clone();
     let nats_client = state.nats_client.clone();
     let tracker_sender = state.tracker_sender.clone();
-    let meeting_manager = state.meeting_manager.clone();
+    let session_manager = state.session_manager.clone();
     let actor = WsChatSession::new(
         chat,
         room_clean,
         email_clean,
         nats_client,
         tracker_sender,
-        meeting_manager,
+        session_manager,
     );
     let codec = Codec::new().max_size(1_000_000);
     start_with_codec(actor, &req, stream, codec)
@@ -341,7 +342,17 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to NATS");
 
-    let chat = ChatServer::new(nats_client.clone()).await.start();
+    // Create sqlx pool for session management
+    let sqlx_pool = db_pool::create_pool()
+        .await
+        .expect("Failed to create database pool");
+
+    let chat = ChatServer::new(nats_client.clone(), sqlx_pool.clone())
+        .await
+        .start();
+
+    // Create SessionManager with the pool
+    let session_manager = SessionManager::new(sqlx_pool.clone());
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
@@ -379,14 +390,14 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
-                    meeting_manager: MeetingManager::new(),
+                    session_manager: session_manager.clone(),
                 }))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect)
         } else if db_enabled {
-            // OAuth requires database
+            // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
             App::new()
                 .app_data(web::Data::new(pool))
@@ -394,7 +405,7 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
-                    meeting_manager: MeetingManager::new(),
+                    session_manager: session_manager.clone(),
                 }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),
@@ -420,7 +431,7 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
-                    meeting_manager: MeetingManager::new(),
+                    session_manager: session_manager.clone(),
                 }))
                 .service(check_session)
                 .service(get_profile)

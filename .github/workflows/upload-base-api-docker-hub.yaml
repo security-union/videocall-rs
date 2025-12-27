@@ -2,8 +2,11 @@ name: Publish Base API to Docker image
 
 on:
   push:
+    branches:
+      - main
     paths:
       - docker/base_images/Dockerfile.actix
+  workflow_dispatch:
 
 jobs:
   push_to_registry:
@@ -11,24 +14,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repo
-        uses: actions/checkout@v3
-        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@f4ef78c080cd8ba55a85445d5b36e214a81df20a
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
       
       - name: Extract SHA
         id: extract_sha
-        run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA::8})"
+        run: echo "sha8=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
 
       - name: Build and push Base API Docker image
-        uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./docker/base_images/Dockerfile.actix
           push: true
           tags: |
-            securityunion/rustlemania-api-base:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/actix-base:${{ github.ref_name }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/actix-base:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

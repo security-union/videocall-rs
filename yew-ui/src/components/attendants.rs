@@ -35,7 +35,6 @@ use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
-use serde::Deserialize;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -362,54 +361,6 @@ impl AttendantsComponent {
             } else {
                 log::warn!("Failed to create audio element for notification sound");
             }
-        }
-    }
-
-    fn format_meeting_duration(&self) -> String {
-        log::info!(
-            "format_meeting_duration - meeting_start_time_server: {:?}",
-            self.meeting_start_time_server
-        );
-        if let Some(server_start_ms) = self.meeting_start_time_server {
-            let now_ms = js_sys::Date::now();
-
-            log::info!("Server start: {}, Now: {}", server_start_ms, now_ms);
-            let elapsed_ms = (now_ms - server_start_ms).max(0.0);
-
-            let elapsed_secs = (elapsed_ms / 1000.0) as u64;
-
-            log::info!("Elapsed seconds: {}", elapsed_secs);
-            let hours = elapsed_secs / 3600;
-            let minutes = (elapsed_secs % 3600) / 60;
-            let seconds = elapsed_secs % 60;
-
-            if hours > 0 {
-                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-            } else {
-                format!("{:02}:{:02}", minutes, seconds)
-            }
-        } else {
-            "00:00".to_string()
-        }
-    }
-
-    pub fn format_user_duration(&self) -> String {
-        if let Some(local_start) = self.call_start_time {
-            let now_ms = js_sys::Date::now();
-
-            let elapsed_ms = (now_ms - local_start).max(0.0);
-            let elapsed_secs = (elapsed_ms / 1000.0) as u64;
-            let hours = elapsed_secs / 3600;
-            let minutes = (elapsed_secs % 3600) / 60;
-            let seconds = elapsed_secs % 60;
-
-            if hours > 0 {
-                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-            } else {
-                format!("{:02}:{:02}", minutes, seconds)
-            }
-        } else {
-            "00:00".to_string()
         }
     }
 }
@@ -778,49 +729,12 @@ impl Component for AttendantsComponent {
             grid_container_classes.push("force-desktop-grid");
         }
 
-        // Create the call timer HTML if the call has started
-        let call_timer = if self.call_start_time.is_some() {
-            html! {
-                <div class="call-timer" >
-                    { self.format_user_duration() }
-                </div>
-            }
-        } else {
-            html! {} // TODO: show a loading spinner
-        };
-
-        // In the view method, before the call_timer declaration
-        log::info!(
-            "Timer debug - meeting_joined: {}, meeting_start_time: {:?}, call_start_time: {:?}",
-            self.meeting_joined,
-            self.meeting_start_time_server,
-            self.call_start_time
-        );
-
-        // Create the top-right controls
-        let top_right_controls = html! {
-            <div class="top-right-controls">
-                {call_timer}
-                <button
-                    class={classes!("control-button", self.diagnostics_open.then_some("active"))}
-                    onclick={toggle_diagnostics.clone()}
-                >
-                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="10"></circle>
-                        <line x1="12" y1="8" x2="12" y2="12"></line>
-                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
-                    </svg>
-                </button>
-            </div>
-        };
-
         // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
             return html! {
                 <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                     <div id="main-container" class="meeting-page">
                         <BrowserCompatibility/>
-                         {top_right_controls}
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
                         // Logout dropdown (top-right corner)
                         {
@@ -898,7 +812,6 @@ impl Component for AttendantsComponent {
             <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
-                     {top_right_controls.clone()}
                 <div id="grid-container"
                     class={grid_container_classes}
                     data-peers={num_peers_for_styling.to_string()}

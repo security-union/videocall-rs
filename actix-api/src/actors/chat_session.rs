@@ -66,7 +66,6 @@ impl WsChatSession {
         addr: Addr<ChatServer>,
         room: String,
         email: String,
-        // creator_id: String,
         nats_client: async_nats::client::Client,
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
@@ -201,38 +200,6 @@ impl Actor for WsChatSession {
 
         // Join the room
         self.join(self.room.clone(), ctx);
-
-        // Start meeting (non-blocking spawn independently)
-        let meeting_manager = self.meeting_manager.clone();
-        let room_id = self.room.clone();
-        let ctx_addr = ctx.address();
-        let creator_id = self.creator_id.clone();
-
-        tokio::spawn(async move {
-            info!("Starting meeting for room: {}", room_id);
-            match meeting_manager
-                .start_meeting(&room_id, creator_id.as_str())
-                .await
-            {
-                Ok(start_time_ms) => {
-                    info!("Meeting {} started at {}", room_id, start_time_ms);
-                    let meeting_info = serde_json::json!({
-                        "type": "meeting_info",
-                        "room_id": room_id,
-                        "start_time_ms": start_time_ms,
-                    });
-                    if let Ok(bytes) = serde_json::to_vec(&meeting_info) {
-                        ctx_addr.do_send(Message {
-                            session: room_id,
-                            msg: bytes,
-                        });
-                    }
-                }
-                Err(e) => {
-                    error!("failed to start meeting: {}", e);
-                }
-            }
-        });
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {

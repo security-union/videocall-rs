@@ -29,7 +29,7 @@ pub fn login() -> Html {
             if let Ok(win) = window().location().search() {
                 if !win.is_empty() {
                     // Append the query parameters from the current URL to the backend login URL
-                    url = format!("{}{}", url, win);
+                    url = format!("{url}{win}");
                 }
             }
             let _ = window().location().set_href(&url);

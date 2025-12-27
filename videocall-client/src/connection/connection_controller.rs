@@ -159,6 +159,15 @@ impl ConnectionController {
         }
     }
 
+    /// Disconnect from the current connection and clean up resources
+    pub fn disconnect(&self) -> anyhow::Result<()> {
+        let mut inner = self
+            .inner
+            .try_borrow_mut()
+            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
+        inner.connection_manager.disconnect()
+    }
+
     /// Get current connection state for UI
     pub fn get_connection_state(&self) -> ConnectionState {
         if let Ok(inner) = self.inner.try_borrow() {

@@ -120,7 +120,7 @@ We strongly recommend using the Docker-based setup for development, as it's well
 
 - Modern Linux distribution, macOS, or Windows 10/11
 - [Docker](https://docs.docker.com/engine/install/) and Docker Compose (for containerized setup)
-- [Rust toolchain](https://rustup.rs/) 1.85+ (for manual setup)
+- [Rust toolchain](https://rustup.rs/) 1.89+ (for manual setup)
 - Chromium-based browser (Chrome, Edge, Brave) for frontend access - Firefox is not supported
 - Safari both in iOS and macOS are supported for frontend access
 

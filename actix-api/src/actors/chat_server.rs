@@ -27,12 +27,10 @@ use crate::{
 
 use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
 use futures::StreamExt;
-use protobuf::Message as ProtoMessage;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace};
-use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 use videocall_types::SYSTEM_USER_EMAIL;
 
 use super::chat_session::SessionId;
@@ -234,7 +232,7 @@ impl Handler<JoinRoom> for ChatServer {
                         "Session started for room {} (first: {}) at {}",
                         room_clone, result.is_first_participant, result.start_time_ms
                     );
-                    send_meeting_info(&nc, &room_clone, result.start_time_ms).await;
+                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &user_id_clone).await;
                 }
                 Err(e) => {
                     error!(
@@ -272,25 +270,21 @@ impl Handler<JoinRoom> for ChatServer {
     }
 }
 
-async fn send_meeting_info(nc: &async_nats::client::Client, room: &str, start_time_ms: u64) {
-    let message = format!("MEETING_INFO:{start_time_ms}");
+async fn send_meeting_info(
+    nc: &async_nats::client::Client,
+    room: &str,
+    start_time_ms: u64,
+    creator_id: &str,
+) {
+    // Use SessionManager's packet builder to create a proper MEETING packet with protobuf
+    // This ensures WebSocket clients receive the same format as WebTransport clients
+    let packet_bytes =
+        SessionManager::build_meeting_started_packet(room, start_time_ms, creator_id);
 
-    let packet = PacketWrapper {
-        packet_type: PacketType::CONNECTION.into(),
-        email: SYSTEM_USER_EMAIL.to_string(),
-        data: message.as_bytes().to_vec(),
-        ..Default::default()
-    };
-
-    match packet.write_to_bytes() {
-        Ok(packet_byte) => {
-            let subject = format!("room.{}.system", room.replace(' ', "_"));
-            match nc.publish(subject.clone(), packet_byte.into()).await {
-                Ok(_) => info!("Sent meeting start time {} to {}", start_time_ms, subject),
-                Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
-            }
-        }
-        Err(e) => error!("Failed to serialize packet: {}", e),
+    let subject = format!("room.{}.system", room.replace(' ', "_"));
+    match nc.publish(subject.clone(), packet_bytes.into()).await {
+        Ok(_) => info!("Sent meeting start time {} to {}", start_time_ms, subject),
+        Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
     }
 }
 

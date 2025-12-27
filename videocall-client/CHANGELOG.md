@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.29...videocall-client-v2.0.0) - 2025-12-27
+
+### Other
+
+- Meeting Ownership Project (behind feature flag) ([#503](https://github.com/security-union/videocall-rs/pull/503))
+
 ## [1.1.29](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.28...videocall-client-v1.1.29) - 2025-11-30
 
 ### Other

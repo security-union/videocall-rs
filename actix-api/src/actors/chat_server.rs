@@ -196,6 +196,13 @@ impl Handler<JoinRoom> for ChatServer {
         }: JoinRoom,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
+        // Validate user_id synchronously BEFORE spawning async task.
+        // This ensures we return an error to the client if validation fails,
+        // rather than returning Ok and silently failing in the spawned task.
+        if user_id == SYSTEM_USER_EMAIL {
+            return MessageResult(Err("Cannot use reserved system email as user ID".into()));
+        }
+
         if self.active_subs.contains_key(&session) {
             return MessageResult(Ok(()));
         }
@@ -305,5 +312,175 @@ fn handle_msg(
             error!("error sending message to session {}: {}", session, e);
             std::io::Error::other(e)
         })
+    }
+}
+
+// ==========================================================================
+// Unit Tests for ChatServer
+// ==========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix::Actor;
+    use serial_test::serial;
+    use sqlx::PgPool;
+
+    async fn get_test_pool() -> PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+        PgPool::connect(&database_url)
+            .await
+            .expect("Failed to connect to test database")
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom rejects reserved system email synchronously
+    // ==========================================================================
+    // This test verifies the fix for the race condition where JoinRoom would
+    // spawn an async task and immediately return Ok(()), even if validation
+    // would fail inside the task. Now validation happens synchronously.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_rejects_system_email_synchronously() {
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        // Start the ChatServer actor
+        let chat_server = ChatServer::new(nats_client, pool).await.start();
+
+        // Create a mock session recipient
+        // We need a real actor to receive messages, so we use a simple dummy
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-1".to_string();
+
+        // Register the session first
+        chat_server
+            .send(Connect {
+                id: session_id.clone(),
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Attempt to join with the reserved system email
+        // This should return an error SYNCHRONOUSLY (not Ok then fail async)
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room".to_string(),
+                user_id: SYSTEM_USER_EMAIL.to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        // The key assertion: JoinRoom should return Err immediately
+        assert!(
+            result.is_err(),
+            "JoinRoom with system email should return Err, not Ok"
+        );
+
+        let error_msg = result.unwrap_err();
+        assert!(
+            error_msg.contains("reserved system email"),
+            "Error should mention reserved system email, got: {error_msg}"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom succeeds with valid user_id
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_succeeds_with_valid_user() {
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client, pool).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-valid".to_string();
+
+        // Register the session
+        chat_server
+            .send(Connect {
+                id: session_id.clone(),
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Join with a valid user_id - should succeed
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room-valid".to_string(),
+                user_id: "valid-user@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_ok(),
+            "JoinRoom with valid user should return Ok, got: {:?}",
+            result
+        );
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom fails if session not registered
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_fails_without_session() {
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client, pool).await.start();
+
+        // Try to join WITHOUT registering the session first
+        let result = chat_server
+            .send(JoinRoom {
+                session: "nonexistent-session".to_string(),
+                room: "test-room".to_string(),
+                user_id: "valid-user@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_err(),
+            "JoinRoom without registered session should return Err"
+        );
+        assert!(
+            result.unwrap_err().contains("Session not found"),
+            "Error should mention session not found"
+        );
     }
 }

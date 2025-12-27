@@ -21,6 +21,7 @@ pub mod auth;
 pub mod client_diagnostics;
 pub mod constants;
 pub mod db;
+pub mod meeting;
 pub mod messages;
 pub mod metrics;
 pub mod models;

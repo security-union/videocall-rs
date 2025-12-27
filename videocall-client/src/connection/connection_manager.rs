@@ -815,6 +815,12 @@ impl ConnectionManager {
             && matches!(self.election_state, ElectionState::Elected { .. })
     }
 
+    pub fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.connections.clear();
+        self.get_connection_state();
+        Ok(())
+    }
+
     /// Get current RTT measurements (for debugging)
     pub fn get_rtt_measurements(&self) -> &HashMap<String, ServerRttMeasurement> {
         &self.rtt_measurements

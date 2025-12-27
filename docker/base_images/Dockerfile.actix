@@ -1,3 +1,4 @@
+# Base image for actix-api builds (multi-arch: amd64/arm64)
 FROM rust:1.89-slim
 
 # Install system dependencies (works on both ARM64 and AMD64)

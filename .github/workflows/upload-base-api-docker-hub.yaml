@@ -2,8 +2,6 @@ name: Publish Base API to Docker image
 
 on:
   push:
-    branches:
-      - main
     paths:
       - docker/base_images/Dockerfile.actix
   workflow_dispatch:

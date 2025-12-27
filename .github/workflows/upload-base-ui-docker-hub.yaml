@@ -2,8 +2,6 @@ name: Publish Base UI to Docker image
 
 on:
   push:
-    branches:
-      - main
     paths:
       - docker/base_images/Dockerfile.yew
   workflow_dispatch:

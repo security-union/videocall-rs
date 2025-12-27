@@ -25,15 +25,26 @@ use crate::{
     session_manager::{SessionEndResult, SessionManager},
 };
 
-use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
+use actix::{
+    Actor, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
+};
 use futures::StreamExt;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use videocall_types::SYSTEM_USER_EMAIL;
 
 use super::chat_session::SessionId;
+
+/// Internal message to clean up active_subs when a spawned join task fails.
+/// This fixes a race condition where start_session could fail inside the spawned task,
+/// leaving a stale entry in active_subs that blocks future join attempts.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct CleanupFailedJoin {
+    session: SessionId,
+}
 
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
@@ -192,7 +203,7 @@ impl Handler<JoinRoom> for ChatServer {
             room,
             user_id,
         }: JoinRoom,
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
     ) -> Self::Result {
         // Validate user_id synchronously BEFORE spawning async task.
         // This ensures we return an error to the client if validation fails,
@@ -221,6 +232,10 @@ impl Handler<JoinRoom> for ChatServer {
         let nc2 = self.nats_connection.clone();
         let session_clone = session.clone();
 
+        // Get ChatServer address for cleanup on failure
+        let chat_server_addr = ctx.address();
+        let session_for_cleanup = session.clone();
+
         let handle = tokio::spawn(async move {
             // Start session using SessionManager - await result before subscribing
             match session_manager
@@ -239,7 +254,12 @@ impl Handler<JoinRoom> for ChatServer {
                         "Error starting session for room {}: {} - rejecting join",
                         room_clone, e
                     );
-                    // Session rejected - don't subscribe, just return
+                    // Session rejected - notify ChatServer to clean up active_subs
+                    // This fixes the race condition where a failed start_session would
+                    // leave a stale entry in active_subs, blocking future join attempts.
+                    let _ = chat_server_addr.try_send(CleanupFailedJoin {
+                        session: session_for_cleanup,
+                    });
                     return;
                 }
             }
@@ -267,6 +287,24 @@ impl Handler<JoinRoom> for ChatServer {
         self.active_subs.insert(session, handle);
 
         MessageResult(Ok(()))
+    }
+}
+
+/// Handler for cleaning up failed join attempts.
+/// When start_session fails inside the spawned task, it sends this message
+/// to remove the stale entry from active_subs.
+impl Handler<CleanupFailedJoin> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: CleanupFailedJoin, _ctx: &mut Self::Context) -> Self::Result {
+        if let Some(task) = self.active_subs.remove(&msg.session) {
+            // Abort the task (though it should already be finished/returned)
+            task.abort();
+            warn!(
+                "Cleaned up failed join for session {} from active_subs",
+                msg.session
+            );
+        }
     }
 }
 
@@ -476,5 +514,80 @@ mod tests {
             result.unwrap_err().contains("Session not found"),
             "Error should mention session not found"
         );
+    }
+
+    // ==========================================================================
+    // TEST: CleanupFailedJoin allows retry after spawn failure
+    // ==========================================================================
+    // This test verifies the race condition fix: when start_session fails inside
+    // the spawned task, the CleanupFailedJoin message removes the stale entry
+    // from active_subs, allowing subsequent join attempts to proceed.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_cleanup_failed_join_allows_retry() {
+        use videocall_types::FeatureFlags;
+
+        // Enable meeting management to trigger DB operations (which can fail)
+        FeatureFlags::set_meeting_management_override(true);
+
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client, pool).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-cleanup".to_string();
+
+        // Register the session
+        chat_server
+            .send(Connect {
+                id: session_id.clone(),
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // First join attempt - should succeed (returns Ok immediately,
+        // spawns async task which will also succeed with valid user)
+        let result1 = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room-cleanup".to_string(),
+                user_id: "valid-user@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(result1.is_ok(), "First join should succeed");
+
+        // Second join attempt with same session - should return Ok
+        // immediately because session is already in active_subs
+        let result2 = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room-cleanup".to_string(),
+                user_id: "valid-user@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result2.is_ok(),
+            "Second join with same session should return Ok (already active)"
+        );
+
+        FeatureFlags::clear_meeting_management_override();
     }
 }

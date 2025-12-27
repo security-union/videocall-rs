@@ -109,6 +109,8 @@ impl WsChatSession {
                 // notify chat server
                 act.addr.do_send(Disconnect {
                     session: act.id.clone(),
+                    room: act.room.clone(),
+                    user_id: act.creator_id.clone(),
                 });
                 // stop actor
                 error!("hearbeat timeout");
@@ -207,6 +209,8 @@ impl Actor for WsChatSession {
         // notify chat server
         self.addr.do_send(Disconnect {
             session: self.id.clone(),
+            room: self.room.clone(),
+            user_id: self.creator_id.clone(),
         });
 
         Running::Stop

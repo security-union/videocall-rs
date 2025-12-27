@@ -130,10 +130,14 @@ impl Handler<Disconnect> for ChatServer {
 
     fn handle(
         &mut self,
-        Disconnect { session }: Disconnect,
+        Disconnect {
+            session,
+            room,
+            user_id,
+        }: Disconnect,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        self.leave_rooms(&session, None, None);
+        self.leave_rooms(&session, Some(&room), Some(&user_id));
         let _ = self.sessions.remove(&session);
     }
 }

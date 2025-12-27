@@ -1,0 +1,966 @@
+# ============================================================================
+# Videocall.rs Helm Chart Values
+# ============================================================================
+# This is the default values file for the Videocall.rs unified Helm chart.
+# It deploys all four components of the video calling application:
+#   - UI (Web Application)
+#   - WebSocket API (Real-time signaling server)
+#   - WebTransport API (High-performance media transport)
+#   - Website (Marketing/landing pages)
+#
+# Each component can be independently enabled/disabled and configured.
+# Override these values in your deployment-specific values.yaml file.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Global Configuration
+# ----------------------------------------------------------------------------
+# Settings shared across all components
+
+global:
+  # Domain name for your videocall deployment
+  # This is used to construct default hostnames for all services
+  # Example: "videocall.rs" or "yourdomain.com"
+  domain: "YOUR_DOMAIN_NAME"
+
+  # Deployment region identifier
+  # Used for multi-region deployments and service discovery
+  # Example: "us-east", "eu-west", "ap-south"
+  region: "us-east"
+
+  # NATS server connection URL
+  # NATS is used for pub/sub messaging between components
+  # Format: "host:port" or comma-separated for cluster: "nats-1:4222,nats-2:4222"
+  natsUrl: "nats:4222"
+
+  # Docker image pull policy
+  # Options: "Always", "IfNotPresent", "Never"
+  imagePullPolicy: Always
+
+# ----------------------------------------------------------------------------
+# UI Component Configuration
+# ----------------------------------------------------------------------------
+# The frontend web application that users interact with
+# Serves the React/Yew-based video calling interface
+
+ui:
+  # Enable or disable the UI component deployment
+  enabled: true
+
+  # Override the component name (leave empty to use default: videocall-ui)
+  nameOverride: ""
+  
+  # Override the full resource name (leave empty to use chart-generated name)
+  fullnameOverride: ""
+
+  # Number of UI pod replicas to run
+  # Increase for high availability and load distribution
+  replicaCount: 1
+
+  # Container image configuration
+  image:
+    # Docker image repository for the UI
+    repository: securityunion/rustlemania-ui
+    
+    # Image pull policy (overrides global if set)
+    pullPolicy: Always
+    
+    # Image tag (defaults to chart appVersion if not specified)
+    # Use "latest" for development, specific versions for production
+    tag: latest
+
+  # Runtime configuration injected into the UI
+  # These values are written to config.js and loaded by the frontend
+  runtimeConfig:
+    # Base URL for the REST API
+    # Example: "https://api.videocall.rs"
+    apiBaseUrl: "https://api.YOUR_DOMAIN_NAME"
+    
+    # WebSocket server URL(s) for real-time signaling
+    # Supports comma-separated list for multi-region fallback
+    # Example: "wss://websocket.YOUR_DOMAIN_NAME" or "wss://ws-us.domain.com,wss://ws-eu.domain.com"
+    wsUrl: "wss://websocket.YOUR_DOMAIN_NAME"
+    
+    # WebTransport server URL(s) for high-performance media transport
+    # Supports comma-separated list for multi-region fallback
+    # Must include port (typically 443)
+    # Example: "https://webtransport.YOUR_DOMAIN_NAME:443"
+    webTransportHost: "https://webtransport.YOUR_DOMAIN_NAME:443"
+    
+    # Enable OAuth authentication (Google OAuth)
+    # Set to "true" to require users to sign in, "false" for anonymous access
+    oauthEnabled: "false"
+    
+    # Enable end-to-end encryption for media streams
+    # Requires client-side key exchange implementation
+    e2eeEnabled: "false"
+    
+    # Enable WebTransport protocol (recommended for best performance)
+    # Falls back to WebSocket if disabled or unavailable
+    webTransportEnabled: "true"
+    
+    # Comma-separated list of user IDs allowed to stream
+    # Empty string allows all users (default)
+    # Example: "user1@example.com,user2@example.com"
+    usersAllowedToStream: ""
+    
+    # Server election period in milliseconds
+    # How often clients re-evaluate which media server to connect to
+    # Lower values = faster failover, higher control plane load
+    serverElectionPeriodMs: 2000
+    
+    # Audio bitrate in kilobits per second
+    # Typical range: 8-32 kbps for voice
+    audioBitrateKbps: 16
+    
+    # Video bitrate in kilobits per second
+    # Typical range: 100-500 kbps for video calls
+    videoBitrateKbps: 160
+    
+    # Screen sharing bitrate in kilobits per second
+    # Typical range: 200-1000 kbps depending on content
+    screenBitrateKbps: 160
+
+  # Resource limits and requests
+  resources:
+    # Maximum resources the container can use (enforced)
+    limits:
+      cpu: "100m"      # 0.1 CPU cores
+      memory: "128Mi"  # 128 mebibytes
+    
+    # Minimum resources guaranteed to the container
+    requests:
+      cpu: "50m"       # 0.05 CPU cores
+      memory: "64Mi"   # 64 mebibytes
+
+  # Kubernetes service configuration
+  service:
+    # Service type: ClusterIP (internal), NodePort, LoadBalancer
+    type: ClusterIP
+    
+    # Port the service listens on
+    port: 80
+
+  # Ingress configuration for external access
+  ingress:
+    # Enable ingress resource creation
+    enabled: true
+    
+    # Ingress class name (e.g., "nginx", "traefik")
+    className: nginx
+    
+    # Ingress annotations for SSL, redirects, etc.
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    
+    # Hostname and path configuration
+    hosts:
+      - host: app.YOUR_DOMAIN_NAME
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: videocall-ui
+              port:
+                number: 80
+    
+    # TLS/SSL certificate configuration
+    tls:
+      - secretName: videocall-ui-tls
+        hosts:
+          - app.YOUR_DOMAIN_NAME
+
+  # Horizontal Pod Autoscaler configuration
+  autoscaling:
+    # Enable automatic scaling based on metrics
+    enabled: false
+    
+    # Minimum number of replicas
+    minReplicas: 1
+    
+    # Maximum number of replicas
+    maxReplicas: 10
+    
+    # Target CPU utilization percentage to trigger scaling
+    targetCPUUtilizationPercentage: 80
+    
+    # Target memory utilization percentage to trigger scaling
+    targetMemoryUtilizationPercentage: 80
+
+  # Pod annotations (e.g., for Prometheus scraping)
+  podAnnotations: {}
+
+  # Pod security context (run as non-root, etc.)
+  podSecurityContext: {}
+
+  # Container security context
+  securityContext: {}
+
+  # Node selector for pod placement
+  # Example: {topology.kubernetes.io/region: "us-east"}
+  nodeSelector: {}
+
+  # Tolerations for node taints
+  tolerations: []
+
+  # Pod affinity/anti-affinity rules
+  affinity: {}
+
+# ----------------------------------------------------------------------------
+# WebSocket Component Configuration
+# ----------------------------------------------------------------------------
+# Real-time signaling server using WebSocket protocol
+# Handles user connections, room management, and message routing
+
+websocket:
+  # Enable or disable the WebSocket component deployment
+  enabled: true
+
+  # Override the component name (leave empty to use default: videocall-websocket)
+  nameOverride: ""
+  
+  # Override the full resource name
+  fullnameOverride: ""
+
+  # Number of WebSocket server pod replicas
+  # Scale horizontally for high concurrency
+  replicaCount: 1
+
+  # Container image configuration
+  image:
+    # Docker image repository (same as webtransport, different command)
+    repository: securityunion/rustlemania-api
+    
+    # Image pull policy
+    pullPolicy: Always
+    
+    # Image tag
+    tag: latest
+
+  # Environment variables for the WebSocket server
+  env:
+    - name: RUST_LOG
+      # Rust logging level: trace, debug, info, warn, error
+      value: warn
+    
+    - name: ACTIX_PORT
+      # Port the Actix web server binds to inside the container
+      value: "8080"
+    
+    - name: NATS_URL
+      # NATS server connection (uses global.natsUrl by default in deployment)
+      value: nats:4222
+    
+    - name: DATABASE_ENABLED
+      # Enable PostgreSQL database for persistence
+      value: "false"
+    
+    - name: DATABASE_URL
+      # PostgreSQL connection string (uses secret if DATABASE_ENABLED=true)
+      value: "postgres://postgres:$(PG_PASSWORD)@postgres-postgresql:5432/actix-api-db?sslmode=disable"
+    
+    - name: TOKIO_WORKER_THREADS
+      # Number of Tokio async runtime worker threads
+      # Recommended: 1-2 per CPU core for I/O-bound workloads
+      value: "1"
+    
+    - name: REGION
+      # Deployment region (uses global.region in deployment)
+      value: "us-east"
+    
+    - name: HOSTNAME
+      # Automatically populated with pod name via downward API
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    
+    - name: SERVER_ID
+      # Unique server identifier (uses pod name)
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    
+    - name: SERVICE_TYPE
+      # Service type identifier for metrics and logging
+      value: websocket
+    
+    - name: SERVER_STATS_INTERVAL_SECS
+      # How often to publish server statistics to NATS (seconds)
+      value: "5"
+    
+    - name: OAUTH_AUTH_URL
+      # Google OAuth authorization endpoint
+      value: "https://accounts.google.com/o/oauth2/v2/auth"
+    
+    - name: OAUTH_TOKEN_URL
+      # Google OAuth token endpoint
+      value: "https://oauth2.googleapis.com/token"
+    
+    - name: OAUTH_REDIRECT_URL
+      # OAuth callback URL (must match Google Cloud Console configuration)
+      value: "https://api.YOUR_DOMAIN_NAME/login/callback"
+    
+    - name: UI_ENDPOINT
+      # Frontend URL for OAuth redirects after login
+      value: "https://app.YOUR_DOMAIN_NAME"
+    
+    - name: COOKIE_DOMAIN
+      # Domain for session cookies (must include leading dot for subdomains)
+      value: ".YOUR_DOMAIN_NAME"
+
+  # Resource limits and requests
+  # WebSocket servers are I/O-bound, tune based on concurrent connections
+  resources:
+    limits:
+      cpu: "500m"      # 0.5 CPU cores
+      memory: "384Mi"  # 384 mebibytes
+    requests:
+      cpu: "200m"      # 0.2 CPU cores
+      memory: "192Mi"  # 192 mebibytes
+
+  # Kubernetes service configuration
+  service:
+    # Service type (ClusterIP for ingress-based routing)
+    type: ClusterIP
+    
+    # Service port
+    port: 8080
+
+  # Ingress configuration
+  ingress:
+    # Enable ingress
+    enabled: true
+    
+    # Ingress class
+    className: nginx
+    
+    # Annotations
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    
+    # Multiple hostnames (WebSocket + API endpoints)
+    hosts:
+      - host: websocket.YOUR_DOMAIN_NAME
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              port:
+                number: 8080
+      - host: api.YOUR_DOMAIN_NAME
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              port:
+                number: 8080
+    
+    # TLS configuration for both hostnames
+    tls:
+      - secretName: websocket-tls
+        hosts:
+          - websocket.YOUR_DOMAIN_NAME
+      - secretName: api-tls
+        hosts:
+          - api.YOUR_DOMAIN_NAME
+
+  # Horizontal Pod Autoscaler
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
+
+  # Pod configuration
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ----------------------------------------------------------------------------
+# WebTransport Component Configuration
+# ----------------------------------------------------------------------------
+# High-performance media transport server using QUIC/WebTransport
+# Handles audio/video streams with lower latency than WebSocket
+
+webtransport:
+  # Enable or disable the WebTransport component deployment
+  enabled: true
+
+  # Override the component name
+  nameOverride: ""
+  
+  # Override the full resource name
+  fullnameOverride: ""
+
+  # Number of WebTransport server replicas
+  # Scale based on concurrent media streams
+  replicaCount: 1
+
+  # Container image configuration
+  image:
+    # Same image as websocket, different entrypoint
+    repository: securityunion/rustlemania-api
+    
+    # Image pull policy
+    pullPolicy: Always
+    
+    # Image tag
+    tag: latest
+
+  # Container command override (runs webtransport_server binary)
+  command: ['webtransport_server']
+  
+  # Container command arguments
+  args: []
+
+  # TLS certificate secret name
+  # Must contain tls.crt and tls.key
+  tlsSecret: webtransport-tls
+
+  # Domain name for TLS certificate
+  # Used by cert-manager to issue certificates
+  certificateDomain: "webtransport.YOUR_DOMAIN_NAME"
+
+  # Certificate issuer configuration
+  certificate:
+    # Name of the cert-manager Issuer or ClusterIssuer
+    issuerName: "letsencrypt-prod"
+
+  # Environment variables for WebTransport server
+  env:
+    - name: RUST_LOG
+      # Reduce logging for noisy QUIC libraries
+      value: warn,quinn=warn,web-transport-quinn=warn,async_nats=warn
+    
+    - name: NATS_URL
+      # NATS connection
+      value: nats:4222
+    
+    - name: LISTEN_URL
+      # WebTransport listen address (UDP on port 443)
+      value: 0.0.0.0:443
+    
+    - name: HEALTH_LISTEN_URL
+      # Health check HTTP server (TCP)
+      value: 0.0.0.0:444
+    
+    - name: CERT_PATH
+      # Path to TLS certificate (mounted from secret)
+      value: /certs/tls.crt
+    
+    - name: KEY_PATH
+      # Path to TLS private key (mounted from secret)
+      value: /certs/tls.key
+    
+    - name: TOKIO_WORKER_THREADS
+      # Worker threads (WebTransport is compute-intensive due to crypto)
+      value: "1"
+    
+    - name: TOKIO_BLOCKING_THREADS
+      # Blocking thread pool for synchronous crypto operations
+      value: "2"
+    
+    - name: REGION
+      # Deployment region
+      value: "us-east"
+    
+    - name: HOSTNAME
+      # Pod name via downward API
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    
+    - name: SERVER_ID
+      # Unique server ID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    
+    - name: SERVICE_TYPE
+      # Service type identifier
+      value: webtransport
+    
+    - name: SERVER_STATS_INTERVAL_SECS
+      # Statistics publishing interval
+      value: "5"
+
+  # Resource configuration
+  # WebTransport is more resource-intensive due to QUIC crypto
+  resources:
+    limits:
+      cpu: "500m"      # 0.5 CPU cores
+      memory: "768Mi"  # 768 mebibytes
+    requests:
+      cpu: "500m"      # 0.5 CPU cores (CPU-bound, request = limit)
+      memory: "384Mi"  # 384 mebibytes
+
+  # Kubernetes service configuration
+  service:
+    # NodePort or LoadBalancer required for UDP traffic
+    type: NodePort
+    
+    # WebTransport UDP port
+    port: 443
+    
+    # Health check HTTP port (TCP)
+    healthPort: 444
+
+  # Load balancer annotations (cloud provider specific)
+  # Used when service.type is LoadBalancer
+  loadBalancerAnnotations:
+    # External DNS hostname registration
+    external-dns.alpha.kubernetes.io/hostname: "webtransport.YOUR_DOMAIN_NAME"
+    
+    # Example DigitalOcean annotations (adjust for your cloud provider)
+    # service.beta.kubernetes.io/do-loadbalancer-name: "webtransport-lb"
+    # service.beta.kubernetes.io/do-loadbalancer-protocol: "tcp"
+    # service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
+    # service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
+
+  # Horizontal Pod Autoscaler
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
+
+  # Pod configuration
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ----------------------------------------------------------------------------
+# Website Component Configuration
+# ----------------------------------------------------------------------------
+# Marketing and informational website (built with Leptos)
+# Serves landing pages, documentation, and public content
+
+website:
+  # Enable or disable the website component deployment
+  enabled: true
+
+  # Override the component name
+  nameOverride: ""
+  
+  # Override the full resource name
+  fullnameOverride: ""
+
+  # Number of website pod replicas
+  replicaCount: 1
+
+  # Container image configuration
+  image:
+    # Website Docker image
+    repository: securityunion/video-call-rs-website
+    
+    # Image pull policy
+    pullPolicy: Always
+    
+    # Image tag
+    tag: latest
+
+  # Environment variables for the website
+  env:
+    - name: RUST_LOG
+      # Logging level
+      value: info
+    
+    - name: LISTEN_URL
+      # HTTP listen address
+      value: "0.0.0.0:80"
+    
+    - name: LEPTOS_SITE_ADDR
+      # Leptos framework listen address
+      value: "0.0.0.0:80"
+
+  # Resource configuration
+  # Static website requires minimal resources
+  resources:
+    limits:
+      cpu: "50m"      # 0.05 CPU cores
+      memory: "128Mi" # 128 mebibytes
+    requests:
+      cpu: "20m"      # 0.02 CPU cores
+      memory: "64Mi"  # 64 mebibytes
+
+  # Kubernetes service configuration
+  service:
+    # Service name (defaults to component name if not specified)
+    name: videocall-website
+    
+    # Service type
+    type: ClusterIP
+    
+    # Service port
+    port: 80
+
+  # Ingress configuration
+  ingress:
+    # Enable ingress
+    enabled: true
+    
+    # Ingress class
+    className: nginx
+    
+    # Annotations
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    
+    # Multiple hostnames (apex and www)
+    hosts:
+      - host: www.videocall.rs
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: videocall-website
+              port:
+                number: 80
+      - host: videocall.rs
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: videocall-website
+              port:
+                number: 80
+    
+    # TLS configuration
+    tls:
+      - secretName: videocall-website-tls
+        hosts:
+          - videocall.rs
+          - www.videocall.rs
+
+  # Horizontal Pod Autoscaler
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: 80
+
+  # Pod configuration
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ----------------------------------------------------------------------------
+# Additional Configuration
+# ----------------------------------------------------------------------------
+
+# Image pull secrets for private Docker registries
+# Example: [{"name": "regcred"}]
+imagePullSecrets: []
+
+# Service account configuration (if needed)
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: false
+  
+  # Annotations to add to the service account
+  annotations: {}
+  
+  # The name of the service account to use
+  # If not set and create is true, a name is generated using fullname template
+  name: ""
+
+# ----------------------------------------------------------------------------
+# Metrics Client Component Configuration
+# ----------------------------------------------------------------------------
+# Collects and aggregates client-side metrics from NATS
+# Provides metrics endpoint for Prometheus scraping
+
+metricsClient:
+  # Enable or disable the metrics client component deployment
+  enabled: true
+
+  # Override the component name
+  nameOverride: ""
+  
+  # Override the full resource name
+  fullnameOverride: ""
+
+  # Number of metrics client pod replicas
+  # Typically one replica is sufficient for metrics collection
+  replicaCount: 1
+
+  # Container image configuration
+  image:
+    # Docker image repository (same as websocket/webtransport)
+    repository: securityunion/rustlemania-api
+    
+    # Image pull policy
+    pullPolicy: Always
+    
+    # Image tag
+    tag: latest
+
+  # Container command override (runs metrics_server binary)
+  command: ["/usr/bin/metrics_server"]
+
+  # Working directory inside container
+  workingDir: /app/actix-api
+
+  # Environment variables for metrics client
+  env:
+    - name: METRICS_PORT
+      # Port for Prometheus metrics endpoint
+      value: "9091"
+    
+    - name: NATS_URL
+      # NATS connection for receiving metrics events
+      value: nats:4222
+    
+    - name: REGION
+      # Deployment region
+      value: "us-east"
+    
+    - name: HOSTNAME
+      # Pod name via downward API
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    
+    - name: SERVER_ID
+      # Unique server ID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    
+    - name: SERVICE_TYPE
+      # Service type identifier
+      value: metrics
+    
+    - name: RUST_LOG
+      # Logging level (reduced for metrics collection)
+      value: "warn,async_nats=warn"
+    
+    - name: TOKIO_WORKER_THREADS
+      # Single thread sufficient for I/O-bound metrics collection
+      value: "1"
+
+  # Resource configuration (minimal for cost optimization)
+  resources:
+    limits:
+      cpu: "50m"      # 0.05 CPU cores
+      memory: "128Mi" # 128 mebibytes
+    requests:
+      cpu: "25m"      # 0.025 CPU cores
+      memory: "64Mi"  # 64 mebibytes
+
+  # Kubernetes service configuration
+  service:
+    # Service type
+    type: ClusterIP
+    
+    # Service port (Prometheus scrape port)
+    port: 9091
+    
+    # Target port on pod
+    targetPort: 9091
+
+  # Liveness probe configuration
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 9091
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  # Readiness probe configuration
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 9091
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+  # Pod annotations (e.g., for Prometheus scraping)
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9091"
+    prometheus.io/path: "/metrics"
+
+  # Pod security context
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  # Container security context
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+
+  # Node selector for pod placement
+  nodeSelector: {}
+
+  # Tolerations for node taints
+  tolerations: []
+
+  # Pod affinity/anti-affinity rules
+  affinity: {}
+
+# ----------------------------------------------------------------------------
+# Metrics Server Component Configuration
+# ----------------------------------------------------------------------------
+# Tracks server connection statistics and publishes snapshots
+# Separate from client metrics for different aggregation logic
+
+metricsServer:
+  # Enable or disable the metrics server component deployment
+  enabled: true
+
+  # Override the component name
+  nameOverride: ""
+  
+  # Override the full resource name
+  fullnameOverride: ""
+
+  # Number of metrics server pod replicas
+  # Single replica for stateless snapshot approach
+  replicaCount: 1
+
+  # Container image configuration
+  image:
+    # Docker image repository (same image, different binary)
+    repository: securityunion/rustlemania-api
+    
+    # Image pull policy
+    pullPolicy: Always
+    
+    # Image tag
+    tag: latest
+
+  # Container command override (runs metrics_server_snapshot binary)
+  command: ["/usr/bin/metrics_server_snapshot"]
+
+  # Working directory inside container
+  workingDir: /app/actix-api
+
+  # Environment variables for metrics server
+  env:
+    - name: METRICS_PORT
+      # Port for Prometheus metrics endpoint (different from client)
+      value: "9092"
+    
+    - name: NATS_URL
+      # NATS connection for receiving server stats events
+      value: nats:4222
+    
+    - name: REGION
+      # Deployment region
+      value: "us-east"
+    
+    - name: HOSTNAME
+      # Pod name via downward API
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    
+    - name: SERVER_ID
+      # Unique server ID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    
+    - name: SERVICE_TYPE
+      # Service type identifier
+      value: server-stats
+    
+    - name: RUST_LOG
+      # Debug logging for server stats tracking
+      value: "debug,async_nats=info"
+    
+    - name: TOKIO_WORKER_THREADS
+      # Single thread for I/O-bound aggregation
+      value: "1"
+
+  # Resource configuration
+  resources:
+    limits:
+      cpu: "100m"     # 0.1 CPU cores (higher than client for aggregation)
+      memory: "128Mi" # 128 mebibytes
+    requests:
+      cpu: "50m"      # 0.05 CPU cores
+      memory: "64Mi"  # 64 mebibytes
+
+  # Kubernetes service configuration
+  service:
+    # Service type
+    type: ClusterIP
+    
+    # Service port (Prometheus scrape port, different from client)
+    port: 9092
+    
+    # Target port on pod
+    targetPort: 9092
+
+  # Liveness probe configuration
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 9092
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  # Readiness probe configuration
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 9092
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+  # Pod annotations (for Prometheus scraping)
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9092"
+    prometheus.io/path: "/metrics"
+
+  # Pod security context
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+
+  # Container security context
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+
+  # Node selector for pod placement
+  nodeSelector: {}
+
+  # Tolerations for node taints
+  tolerations: []
+
+  # Pod affinity/anti-affinity rules
+  affinity: {}
+

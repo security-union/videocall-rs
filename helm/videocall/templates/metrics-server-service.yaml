@@ -1,0 +1,18 @@
+{{- if .Values.metricsServer.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "metrics-server") }}
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "metrics-server") | nindent 4 }}
+spec:
+  type: {{ .Values.metricsServer.service.type }}
+  ports:
+    - port: {{ .Values.metricsServer.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "videocall.selectorLabels" (dict "root" . "component" "metrics-server") | nindent 4 }}
+{{- end }}
+

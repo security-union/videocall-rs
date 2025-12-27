@@ -144,7 +144,8 @@ impl Actor for WsChatSession {
         ctx.wait(
             async move {
                 match session_manager.start_session(&room_id, &creator_id).await {
-                    Ok(result) => Ok((result.start_time_ms, creator_id)),
+                    // Return result.creator_id to ensure correct host is identified (not the joining user)
+                    Ok(result) => Ok((result.start_time_ms, result.creator_id)),
                     Err(e) => {
                         error!("failed to start session: {}", e);
                         Err(e.to_string())
@@ -154,12 +155,12 @@ impl Actor for WsChatSession {
             .into_actor(self)
             .map(|result, act, ctx| {
                 match result {
-                    Ok((start_time_ms, creator_id)) => {
+                    Ok((start_time_ms, actual_creator_id)) => {
                         // Send MEETING_STARTED packet (protobuf)
                         let bytes = SessionManager::build_meeting_started_packet(
                             &act.room,
                             start_time_ms,
-                            &creator_id,
+                            &actual_creator_id,
                         );
                         ctx.binary(bytes);
                     }

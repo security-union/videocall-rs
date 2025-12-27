@@ -244,10 +244,14 @@ impl Handler<JoinRoom> for ChatServer {
             {
                 Ok(result) => {
                     info!(
-                        "Session started for room {} (first: {}) at {}",
-                        room_clone, result.is_first_participant, result.start_time_ms
+                        "Session started for room {} (first: {}) at {} by creator {}",
+                        room_clone,
+                        result.is_first_participant,
+                        result.start_time_ms,
+                        result.creator_id
                     );
-                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &user_id_clone).await;
+                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
+                        .await;
                 }
                 Err(e) => {
                     error!(

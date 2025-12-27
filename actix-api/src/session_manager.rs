@@ -55,6 +55,8 @@ impl std::error::Error for SessionError {}
 pub struct SessionStartResult {
     pub start_time_ms: u64,
     pub is_first_participant: bool,
+    /// The user_id of the meeting creator/host
+    pub creator_id: String,
 }
 
 /// Result of ending a session
@@ -106,6 +108,7 @@ impl SessionManager {
             return Ok(SessionStartResult {
                 start_time_ms: now_ms,
                 is_first_participant: true,
+                creator_id: user_id.to_string(),
             });
         }
 
@@ -117,22 +120,31 @@ impl SessionManager {
             SessionParticipant::is_first_participant(&self.pool, room_id).await?;
 
         // Get or create meeting
-        let start_time_ms = if is_first_participant {
+        let (start_time_ms, creator_id) = if is_first_participant {
             info!(
                 "First participant {} joined room {}, starting meeting",
                 user_id, room_id
             );
             let meeting = Meeting::create_async(&self.pool, room_id, Some(user_id)).await?;
-            meeting.start_time_unix_ms() as u64
+            (
+                meeting.start_time_unix_ms() as u64,
+                meeting.creator_id.unwrap_or_else(|| user_id.to_string()),
+            )
         } else {
-            // Get existing meeting start time
+            // Get existing meeting info (start time and creator)
             match Meeting::get_by_room_id_async(&self.pool, room_id).await? {
-                Some(meeting) => meeting.start_time_unix_ms() as u64,
+                Some(meeting) => (
+                    meeting.start_time_unix_ms() as u64,
+                    meeting.creator_id.unwrap_or_else(|| user_id.to_string()),
+                ),
                 None => {
                     // Edge case: meeting doesn't exist but participants do
                     // This shouldn't happen but handle it gracefully
                     let meeting = Meeting::create_async(&self.pool, room_id, Some(user_id)).await?;
-                    meeting.start_time_unix_ms() as u64
+                    (
+                        meeting.start_time_unix_ms() as u64,
+                        meeting.creator_id.unwrap_or_else(|| user_id.to_string()),
+                    )
                 }
             }
         };
@@ -140,6 +152,7 @@ impl SessionManager {
         Ok(SessionStartResult {
             start_time_ms,
             is_first_participant,
+            creator_id,
         })
     }
 
@@ -411,6 +424,60 @@ mod tests {
         assert_eq!(
             bob_result.start_time_ms, charlie_result.start_time_ms,
             "Bob and Charlie should have same start time"
+        );
+
+        cleanup_test_room(&pool, room_id).await;
+        teardown_meeting_management();
+    }
+
+    // ==========================================================================
+    // TEST 2b: Joining user gets correct creator_id (not their own ID)
+    // ==========================================================================
+    // This test verifies the fix for the bug where non-first participants
+    // would receive their own user_id as creator_id in the MEETING_STARTED packet.
+    #[tokio::test]
+    #[serial]
+    async fn test_joining_user_gets_correct_creator_id() {
+        setup_meeting_management_enabled();
+
+        let pool = get_test_pool().await;
+        let manager = SessionManager::new(pool.clone());
+        let room_id = "test-room-creator-id";
+
+        cleanup_test_room(&pool, room_id).await;
+
+        // Alice creates the meeting - she should be the creator
+        let alice_result = manager.start_session(room_id, "alice").await.unwrap();
+        assert!(alice_result.is_first_participant);
+        assert_eq!(
+            alice_result.creator_id, "alice",
+            "First participant should get their own ID as creator"
+        );
+
+        // Bob joins - he should get Alice's ID as the creator, NOT his own
+        let bob_result = manager.start_session(room_id, "bob").await.unwrap();
+        assert!(!bob_result.is_first_participant);
+        assert_eq!(
+            bob_result.creator_id, "alice",
+            "Second participant should get first participant (alice) as creator, not their own ID (bob)"
+        );
+
+        // Charlie joins - he should also get Alice's ID as the creator
+        let charlie_result = manager.start_session(room_id, "charlie").await.unwrap();
+        assert!(!charlie_result.is_first_participant);
+        assert_eq!(
+            charlie_result.creator_id, "alice",
+            "Third participant should get first participant (alice) as creator, not their own ID (charlie)"
+        );
+
+        // All participants should have the same creator_id
+        assert_eq!(
+            alice_result.creator_id, bob_result.creator_id,
+            "Alice and Bob should have same creator_id"
+        );
+        assert_eq!(
+            bob_result.creator_id, charlie_result.creator_id,
+            "Bob and Charlie should have same creator_id"
         );
 
         cleanup_test_room(&pool, room_id).await;

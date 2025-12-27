@@ -554,10 +554,11 @@ pub async fn handle_send_connection_started(
     match session_manager.start_session(lobby_id, &user_id).await {
         Ok(result) => {
             // Send MEETING_STARTED packet to client (protobuf)
+            // Use result.creator_id to ensure correct host is identified (not the joining user)
             let bytes = SessionManager::build_meeting_started_packet(
                 lobby_id,
                 result.start_time_ms,
-                &user_id,
+                &result.creator_id,
             );
             match session.open_uni().await {
                 Ok(mut stream) => {

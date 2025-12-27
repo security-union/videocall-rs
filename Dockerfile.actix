@@ -1,17 +1,4 @@
-FROM rust:1.89-slim as build
-
-# Install dependencies for native platform (works on both ARM64 and AMD64)
-RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev nasm \
-    libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake
-
-# Detect architecture and download appropriate dbmate binary
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then \
-        curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-arm64 -L -o /usr/bin/dbmate; \
-    else \
-        curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate; \
-    fi && \
-    chmod +x /usr/bin/dbmate
+FROM securityunion/actix-base:meeting-ownership-branch-c4b19265 as build
 
 ENV CARGO_TARGET_DIR=/app/actix-api/target
 COPY . /app

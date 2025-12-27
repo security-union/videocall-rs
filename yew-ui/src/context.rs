@@ -24,17 +24,28 @@ pub type VideoCallClientCtx = VideoCallClient;
 // Meeting Time Context
 // -----------------------------------------------------------------------------
 
-/// Holds meeting timing information for components that need it.
-/// Updated by AttendantsComponent when connection events occur.
+/// Holds meeting timing information shared via Yew context.
+///
+/// # Lifecycle
+/// - Created with `Default::default()` (both fields `None`)
+/// - `call_start_time` is set when WebSocket/WebTransport connection succeeds
+/// - `meeting_start_time` is set when `MEETING_STARTED` packet is received from server
+///
+/// # Usage
+/// Components access this via `use_context::<MeetingTimeCtx>()`. If context is
+/// missing, `unwrap_or_default()` returns empty values and timers show "--:--".
 #[derive(Clone, PartialEq, Default)]
 pub struct MeetingTime {
-    /// Unix timestamp (ms) when the current user joined the call
+    /// Unix timestamp (ms) when the current user joined the call.
+    /// Set on successful connection. `None` before connection.
     pub call_start_time: Option<f64>,
-    /// Unix timestamp (ms) when the meeting started (from server)
+
+    /// Unix timestamp (ms) when the meeting started (from server).
+    /// Set when `MEETING_STARTED` packet is received. `None` if not yet received.
     pub meeting_start_time: Option<f64>,
 }
 
-/// Context type for meeting time - read-only access to timing info
+/// Context type for meeting time - read-only access to timing info.
 pub type MeetingTimeCtx = MeetingTime;
 
 // -----------------------------------------------------------------------------

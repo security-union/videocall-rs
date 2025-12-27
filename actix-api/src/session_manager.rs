@@ -285,10 +285,12 @@ impl SessionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // ==========================================================================
     // Integration tests - require DATABASE_URL environment variable
     // Run with: make tests_run
+    // These tests use #[serial] to prevent race conditions on global feature flags.
     // ==========================================================================
 
     async fn get_test_pool() -> PgPool {
@@ -325,6 +327,7 @@ mod tests {
     // TEST 1: Meeting Creation - First user creates a meeting
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_meeting_creation_first_user_creates_meeting() {
         setup_meeting_management_enabled();
 
@@ -369,6 +372,7 @@ mod tests {
     // TEST 2: Others Join Meeting - Subsequent users join existing meeting
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_others_can_join_meeting() {
         setup_meeting_management_enabled();
 
@@ -417,6 +421,7 @@ mod tests {
     // TEST 3: Everyone Leaving - Last participant ends the meeting
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_everyone_leaving_ends_meeting() {
         setup_meeting_management_enabled();
 
@@ -474,6 +479,7 @@ mod tests {
     // TEST 4: Host leaves - Meeting ends for everyone
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_host_leaving_ends_meeting() {
         setup_meeting_management_enabled();
 
@@ -516,6 +522,7 @@ mod tests {
     // TEST 5: Multiple rooms are isolated
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_multiple_rooms_isolated() {
         setup_meeting_management_enabled();
 
@@ -557,6 +564,7 @@ mod tests {
     // TEST 6: Protobuf packet builders work correctly
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_protobuf_packet_builders() {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -590,6 +598,7 @@ mod tests {
     // TEST 7: Reserved system email is rejected
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_system_email_rejected() {
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
@@ -623,6 +632,7 @@ mod tests {
     // TEST 8: Feature flag OFF - start_session returns defaults without DB ops
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_feature_flag_off_start_session_returns_defaults() {
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
@@ -664,6 +674,7 @@ mod tests {
     // TEST 9: Feature flag OFF - end_session returns no-op
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_feature_flag_off_end_session_returns_noop() {
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
@@ -690,6 +701,7 @@ mod tests {
     // TEST 10: Feature flag ON - normal behavior with DB operations
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_feature_flag_on_normal_behavior() {
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());
@@ -735,6 +747,7 @@ mod tests {
     // TEST 11: Feature flag OFF - is_host returns false
     // ==========================================================================
     #[tokio::test]
+    #[serial]
     async fn test_feature_flag_off_is_host_returns_false() {
         let pool = get_test_pool().await;
         let manager = SessionManager::new(pool.clone());

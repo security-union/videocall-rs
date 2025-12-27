@@ -65,6 +65,8 @@ postgres-types = { version = "0.2.11", features = ["with-chrono-0_4"] }
 url = "2"
 serial_test = "3"
 videocall-types = { path = "../videocall-types", version = "3.0.1", features = ["testing"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
 
 
 [package.metadata.cargo-machete]

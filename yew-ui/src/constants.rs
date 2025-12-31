@@ -118,3 +118,6 @@ pub fn users_allowed_to_stream() -> Result<Vec<String>, String> {
 pub fn server_election_period_ms() -> Result<u64, String> {
     app_config().map(|c| c.server_election_period_ms)
 }
+
+/// Local storage key for session ID
+pub const SESSION_ID_KEY: &str = "vc_session_id";

@@ -119,15 +119,26 @@ pub struct VideoCallClientOptions {
 
     /// Callback triggered when the meeting ends (optional)
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
+
+    // Session ID for the meeting
+    pub session_id: String,
+
+    // Display name for the user
+    pub display_name: String,
+
+    /// Callback triggered when a peer's display name changes (optional)
+    pub on_peer_display_name_changed: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
 struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
+    display_name: RefCell<String>,
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
+    on_peer_display_name_changed: Option<Callback<(String, String)>>,
 }
 
 #[derive(Debug)]
@@ -238,9 +249,11 @@ impl VideoCallClient {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
                     userid: options.userid.clone(),
+                    display_name: RefCell::new(options.display_name.clone()),
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
                     on_meeting_info: options.on_meeting_info.clone(),
+                    on_peer_display_name_changed: options.on_peer_display_name_changed.clone(),
                 },
                 connection_controller: None,
                 connection_state: ConnectionState::Failed {
@@ -794,20 +807,68 @@ impl VideoCallClient {
             }
         }
     }
+
+    /// Update the display name and broadcast to all peers
+    ///
+    pub fn update_display_name(&self, new_name: &str) -> Result<()> {
+        if let Ok(inner) = self.inner.try_borrow() {
+            *inner.options.display_name.borrow_mut() = new_name.to_string();
+
+            if let Some(connection_controller) = &inner.connection_controller {
+                let packet = PacketWrapper {
+                    packet_type: PacketType::MEETING.into(),
+                    email: inner.options.userid.clone(),
+                    session_id: inner.options.userid.clone(), //am not certain
+                    display_name: new_name.to_string(),
+                    data: vec![],
+                    special_fields: Default::default(),
+                };
+
+                connection_controller.send_packet(packet)?;
+            }
+
+            info!("Sent display name update: {}", new_name);
+        }
+
+        Ok(())
+    }
+
+    /// Get the current display name
+    pub fn display_name(&self) -> String {
+        if let Ok(inner) = self.inner.try_borrow() {
+            return inner.options.display_name.borrow().clone();
+        }
+
+        String::new()
+    }
 }
 
 impl Inner {
     fn on_inbound_media(&mut self, response: PacketWrapper) {
+        let session_id = if !response.session_id.is_empty() {
+            response.session_id.clone()
+        } else {
+            response.email.clone()
+        };
+
+        let display_name = if !response.display_name.is_empty() {
+            response.display_name.clone()
+        } else {
+            response.email.clone()
+        };
+
         debug!(
-            "<< Received {:?} from {}",
+            "<< Received {:?} from {} ({})",
             response.packet_type.enum_value(),
-            response.email
+            session_id,
+            display_name
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         let peer_status = if response.email == SYSTEM_USER_EMAIL {
             PeerStatus::NoChange
         } else {
-            self.peer_decode_manager.ensure_peer(&response.email)
+            self.peer_decode_manager
+                .ensure_peer(&session_id, &display_name)
         };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
@@ -815,11 +876,11 @@ impl Inner {
                     return;
                 }
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                    debug!("Decrypted AES_KEY from {}", response.email);
+                    debug!("Decrypted AES_KEY from {}", session_id);
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
-                                &response.email,
+                                &session_id,
                                 Aes128State::from_vecs(
                                     aes_packet.key,
                                     aes_packet.iv,
@@ -922,59 +983,78 @@ impl Inner {
             }
             Ok(PacketType::MEETING) => {
                 // Parse MeetingPacket protobuf
-                match MeetingPacket::parse_from_bytes(&response.data) {
-                    Ok(meeting_packet) => {
-                        match meeting_packet.event_type.enum_value() {
-                            Ok(MeetingEventType::MEETING_STARTED) => {
-                                info!(
-                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
-                                    meeting_packet.room_id,
-                                    meeting_packet.start_time_ms,
-                                    meeting_packet.creator_id
-                                );
-                                if let Some(callback) = &self.options.on_meeting_info {
-                                    callback.emit(meeting_packet.start_time_ms as f64);
-                                }
-                            }
-                            Ok(MeetingEventType::MEETING_ENDED) => {
-                                info!(
-                                    "Received MEETING_ENDED: room={}, message={}",
-                                    meeting_packet.room_id, meeting_packet.message
-                                );
-                                if let Some(callback) = &self.options.on_meeting_ended {
-                                    let end_time_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as f64)
-                                        .unwrap_or(0.0);
-                                    callback.emit((end_time_ms, meeting_packet.message));
-                                }
-                            }
-                            Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                                info!(
-                                    "Received PARTICIPANT_JOINED: room={}, count={}",
-                                    meeting_packet.room_id, meeting_packet.participant_count
-                                );
-                                // Future: could emit participant joined event
-                            }
-                            Ok(MeetingEventType::PARTICIPANT_LEFT) => {
-                                info!(
-                                    "Received PARTICIPANT_LEFT: room={}, count={}",
-                                    meeting_packet.room_id, meeting_packet.participant_count
-                                );
-                                // Future: could emit participant left event
-                            }
-                            Err(e) => {
-                                error!("Unknown MeetingEventType: {e}");
+                if let Ok(meeting_packet) = MeetingPacket::parse_from_bytes(&response.data) {
+                    match meeting_packet.event_type.enum_value() {
+                        Ok(MeetingEventType::MEETING_STARTED) => {
+                            info!(
+                                "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
+                                meeting_packet.room_id,
+                                meeting_packet.start_time_ms,
+                                meeting_packet.creator_id
+                            );
+                            if let Some(callback) = &self.options.on_meeting_info {
+                                callback.emit(meeting_packet.start_time_ms as f64);
                             }
                         }
+                        Ok(MeetingEventType::MEETING_ENDED) => {
+                            info!(
+                                "Received MEETING_ENDED: room={}, message={}",
+                                meeting_packet.room_id, meeting_packet.message
+                            );
+                            if let Some(callback) = &self.options.on_meeting_ended {
+                                let end_time_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as f64)
+                                    .unwrap_or(0.0);
+                                callback.emit((end_time_ms, meeting_packet.message));
+                            }
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_JOINED) => {
+                            info!(
+                                "Received PARTICIPANT_JOINED: room={}, count={}",
+                                meeting_packet.room_id, meeting_packet.participant_count
+                            );
+                            // Future: could emit participant joined event
+                        }
+                        Ok(MeetingEventType::PARTICIPANT_LEFT) => {
+                            info!(
+                                "Received PARTICIPANT_LEFT: room={}, count={}",
+                                meeting_packet.room_id, meeting_packet.participant_count
+                            );
+                            // Future: could emit participant left event
+                        }
+                        Err(e) => {
+                            error!("Unknown MeetingEventType: {e}");
+                        }
                     }
-                    Err(e) => {
-                        error!("Failed to parse MeetingPacket: {e}");
+                } else {
+                    let session_id = if response.session_id.is_empty() {
+                        response.email.clone()
+                    } else {
+                        response.session_id.clone()
+                    };
+
+                    let display_name = if response.display_name.is_empty() {
+                        response.email.clone()
+                    } else {
+                        response.display_name.clone()
+                    };
+
+                    info!(
+                        "Received METADATA packet with session_id: {}, display_name: {}",
+                        session_id, display_name
+                    );
+
+                    self.peer_decode_manager
+                        .update_peer_display_name(&session_id, &display_name);
+
+                    if let Some(callback) = &self.options.on_peer_display_name_changed {
+                        callback.emit((session_id, display_name));
                     }
                 }
             }
             Err(e) => {
-                error!("Failed to parse packet type: {e}");
+                error!("Failed to parse packet: {}", e);
             }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {

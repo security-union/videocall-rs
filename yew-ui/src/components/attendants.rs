@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use crate::components::{
+use crate::{components::{
     browser_compatibility::BrowserCompatibility,
     diagnostics::Diagnostics,
     host::Host,
@@ -26,7 +26,7 @@ use crate::components::{
         CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
         PeerListButton, ScreenShareButton,
     },
-};
+}, constants::SESSION_ID_KEY};
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
@@ -92,6 +92,7 @@ pub enum Msg {
     HangUp,
     ShowCopyToast(bool),
     MeetingEnded(String),
+    OnPeerDisplayNameChanged(String, String)
 }
 
 impl From<WsAction> for Msg {
@@ -161,21 +162,25 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    pub session_id: String,
+    pub display_name: String,
 }
 
 impl AttendantsComponent {
     fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
+        let session_id = Self::get_or_create_session_id();
+        let display_name = ctx.props().email.clone();
         let email = ctx.props().email.clone();
         let id = ctx.props().id.clone();
         let websocket_urls = actix_websocket_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(|s| format!("{s}/lobby/{session_id}/{id}"))
             .collect::<Vec<String>>();
         let webtransport_urls = webtransport_host_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(|s| format!("{s}/lobby/{session_id}/{id}"))
             .collect::<Vec<String>>();
 
         log::info!(
@@ -192,6 +197,8 @@ impl AttendantsComponent {
 
         let opts = VideoCallClientOptions {
             userid: email.clone(),
+            session_id: session_id.to_string(),
+            display_name: display_name.to_string(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -270,9 +277,47 @@ impl AttendantsComponent {
                     link.send_message(Msg::MeetingEnded(message));
                 })
             }),
+            on_peer_display_name_changed: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |(session_id, new_name): (String, String)| {
+                    log::info!("Peer {} changed name to: {}", session_id, new_name);
+                    link.send_message(Msg::OnPeerDisplayNameChanged(session_id, new_name));
+                })
+            })
         };
 
         VideoCallClient::new(opts)
+    }
+
+    fn random_segment() -> String {
+        (0..3)
+            .map(|_| {
+                let n = (js_sys::Math::random() * 26.0).floor() as u8;
+                (b'a' + n) as char
+            })
+            .collect::<String>()
+    }
+
+    fn generate_session_id() -> String {
+        format!("{}-{}-{}", Self::random_segment(), Self::random_segment(), Self::random_segment())
+    }
+
+    fn get_or_create_session_id() -> String {
+        if let Some(storage) = web_sys::window()
+            .and_then(|w| w.local_storage().ok())
+            .flatten()
+        {
+            if let Ok(Some(id)) = storage.get_item("session_id") {
+                return id;
+            }
+
+            let new_id = Self::generate_session_id();
+            let _ = storage.set_item(SESSION_ID_KEY, &new_id);
+            new_id
+        }
+        else {
+            Self::generate_session_id()
+        }
     }
 
     fn create_media_device_access(ctx: &Context<Self>) -> MediaDeviceAccess {
@@ -370,9 +415,13 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
+        let session_id = Self::get_or_create_session_id();
+        let display_name = ctx.props().email.clone();
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
         let mut self_ = Self {
+            session_id,
+            display_name,
             client,
             media_device_access,
             share_screen: false,
@@ -661,6 +710,13 @@ impl Component for AttendantsComponent {
 
             Msg::MeetingEnded(end_time) => {
                 self.meeting_ended_message = Some(end_time);
+                true
+            }
+
+            Msg::OnPeerDisplayNameChanged(session_id, new_name) => {
+                self.session_id = session_id.clone();
+                self.display_name = new_name.clone();
+                log::info!("Peer display name changed: {} -> {}", session_id, new_name);
                 true
             }
         }

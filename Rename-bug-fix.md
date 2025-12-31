@@ -19,3 +19,55 @@ The solution is to handle the username change event properly and update the user
 
 ### My Solution - 2
 We can add the user username to the Websocket/WebTransport protocol message type for name update. This will allow local state not to disconnect and also broadcast the name update to all other participants. The client will send **NameUpdate** to the server, the server validates and broadcasts to all participants. Client update their local peer connection list.
+
+
+# Diagram
+
+## Current Flow (Broken)
+
+```
+User changes name
+       │
+       ▼
+URL changes: /meeting/old-name/room → /meeting/new-name/room
+       │
+       ▼
+Page reloads → Connection drops → Rejoin as "new user"
+       │
+       ▼
+Other participants see the previous name left and the new name joined
+```
+
+## Implementation Flow
+
+```
+User changes name
+       │
+       ▼
+Send metadata update message (same connection)
+       │
+       ▼
+Server broadcasts new name to all participants
+       │
+       ▼
+All participants see the name update in place
+```
+
+## Model Change
+
+```
+BEFORE:
+┌─────────────────────────┐
+│  email = "john@x.com"   │ ◄── Used for EVERYTHING
+│  - Connection ID        │
+│  - Display name         │
+│  - Routing key          │
+└─────────────────────────┘
+
+AFTER:
+┌─────────────────────────┐
+│  session_id = "uuid-1"  │ ◄── Stable (never changes)
+├─────────────────────────┤
+│  display_name = "John"  │ ◄── Mutable (can update)
+└─────────────────────────┘
+```

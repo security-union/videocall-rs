@@ -530,7 +530,7 @@ impl PeerDecodeManager {
         display_name: &str,
         aes: Option<Aes128State>,
     ) -> Result<(), JsValue> {
-        debug!("Adding peer {} ({})", display_name, session_id);
+        debug!("Adding peer {display_name} ({session_id})");
         self.connected_peers.insert(
             display_name.to_owned(),
             Peer::new(
@@ -558,7 +558,7 @@ impl PeerDecodeManager {
             }
             PeerStatus::NoChange
         } else if let Err(e) = self.add_peer(session_id, display_name, None) {
-            log::error!("Error adding peer {} ({}): {e:?}", display_name, session_id);
+            log::error!("Error adding peer {display_name} ({session_id}): {e:?}");
             PeerStatus::NoChange
         } else {
             PeerStatus::Added(session_id.to_string())

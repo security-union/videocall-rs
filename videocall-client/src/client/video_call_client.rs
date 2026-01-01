@@ -827,7 +827,7 @@ impl VideoCallClient {
                 connection_controller.send_packet(packet)?;
             }
 
-            info!("Sent display name update: {}", new_name);
+            info!("Sent display name update: {new_name}");
         }
 
         Ok(())
@@ -876,7 +876,7 @@ impl Inner {
                     return;
                 }
                 if let Ok(bytes) = self.rsa.decrypt(&response.data) {
-                    debug!("Decrypted AES_KEY from {}", session_id);
+                    debug!("Decrypted AES_KEY from {session_id}");
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
@@ -1041,8 +1041,7 @@ impl Inner {
                     };
 
                     info!(
-                        "Received METADATA packet with session_id: {}, display_name: {}",
-                        session_id, display_name
+                        "Received METADATA packet with session_id: {session_id}, display_name: {display_name}"
                     );
 
                     self.peer_decode_manager
@@ -1054,7 +1053,7 @@ impl Inner {
                 }
             }
             Err(e) => {
-                error!("Failed to parse packet: {}", e);
+                error!("Failed to parse packet: {e}");
             }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {

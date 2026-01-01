@@ -280,7 +280,7 @@ impl AttendantsComponent {
             on_peer_display_name_changed: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |(session_id, new_name): (String, String)| {
-                    log::info!("Peer {} changed name to: {}", session_id, new_name);
+                    log::info!("Peer {session_id} changed name to: {new_name}");
                     link.send_message(Msg::OnPeerDisplayNameChanged(session_id, new_name));
                 })
             })
@@ -716,7 +716,7 @@ impl Component for AttendantsComponent {
             Msg::OnPeerDisplayNameChanged(session_id, new_name) => {
                 self.session_id = session_id.clone();
                 self.display_name = new_name.clone();
-                log::info!("Peer display name changed: {} -> {}", session_id, new_name);
+                log::info!("Peer display name changed: {session_id} -> {new_name}");
                 true
             }
         }

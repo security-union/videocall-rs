@@ -16,22 +16,25 @@
  * conditions.
  */
 
-use crate::{components::{
-    browser_compatibility::BrowserCompatibility,
-    diagnostics::Diagnostics,
-    host::Host,
-    peer_list::PeerList,
-    peer_tile::PeerTile,
-    video_control_buttons::{
-        CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
-        PeerListButton, ScreenShareButton,
-    },
-}, constants::SESSION_ID_KEY};
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
+use crate::{
+    components::{
+        browser_compatibility::BrowserCompatibility,
+        diagnostics::Diagnostics,
+        host::Host,
+        peer_list::PeerList,
+        peer_tile::PeerTile,
+        video_control_buttons::{
+            CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
+            PeerListButton, ScreenShareButton,
+        },
+    },
+    constants::SESSION_ID_KEY,
+};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
@@ -92,7 +95,7 @@ pub enum Msg {
     HangUp,
     ShowCopyToast(bool),
     MeetingEnded(String),
-    OnPeerDisplayNameChanged(String, String)
+    OnPeerDisplayNameChanged(String, String),
 }
 
 impl From<WsAction> for Msg {
@@ -283,7 +286,7 @@ impl AttendantsComponent {
                     log::info!("Peer {session_id} changed name to: {new_name}");
                     link.send_message(Msg::OnPeerDisplayNameChanged(session_id, new_name));
                 })
-            })
+            }),
         };
 
         VideoCallClient::new(opts)
@@ -299,7 +302,12 @@ impl AttendantsComponent {
     }
 
     fn generate_session_id() -> String {
-        format!("{}-{}-{}", Self::random_segment(), Self::random_segment(), Self::random_segment())
+        format!(
+            "{}-{}-{}",
+            Self::random_segment(),
+            Self::random_segment(),
+            Self::random_segment()
+        )
     }
 
     fn get_or_create_session_id() -> String {
@@ -314,8 +322,7 @@ impl AttendantsComponent {
             let new_id = Self::generate_session_id();
             let _ = storage.set_item(SESSION_ID_KEY, &new_id);
             new_id
-        }
-        else {
+        } else {
             Self::generate_session_id()
         }
     }

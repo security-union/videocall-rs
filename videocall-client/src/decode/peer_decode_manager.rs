@@ -485,9 +485,9 @@ impl PeerDecodeManager {
         let packet = Arc::new(response);
         let email = packet.email.clone();
         let session_id = if !packet.session_id.is_empty() {
-                packet.session_id.clone()
+            packet.session_id.clone()
         } else {
-                packet.email.clone()
+            packet.email.clone()
         };
         if let Some(peer) = self.connected_peers.get_mut(&session_id) {
             // Set worker diagnostics context once per peer

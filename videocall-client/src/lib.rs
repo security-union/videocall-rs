@@ -66,7 +66,9 @@
 //!     on_peer_removed: None,
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
-//!    
+//!     session_id: "session123".to_string(),
+//!     display_name: "User 123".to_string(),
+//!     on_peer_display_name_changed: None,
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -90,7 +92,9 @@
 //! #     on_peer_removed: None,
 //! #     on_meeting_info: None,
 //! #     on_meeting_ended: None,
-//! #
+//! #     session_id: "session123".to_string(),
+//! #     display_name: "User 123".to_string(),
+//! #     on_peer_display_name_changed: None,
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(

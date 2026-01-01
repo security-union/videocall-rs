@@ -26,3 +26,6 @@ pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Regex pattern for validating usernames and room IDs
 /// Allows alphanumeric characters, underscores, and hyphens
 pub const VALID_ID_PATTERN: &str = "^[a-zA-Z0-9_-]*$";
+
+/// Default salt for bcrypt
+pub const DEFAULT_SALT: u32 = 10;

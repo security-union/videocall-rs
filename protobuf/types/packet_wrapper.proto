@@ -13,4 +13,6 @@ message PacketWrapper {
   PacketType packet_type = 1;
   string email = 2;
   bytes data = 3;
+  string session_id = 10;
+  string display_name = 11; 
 }

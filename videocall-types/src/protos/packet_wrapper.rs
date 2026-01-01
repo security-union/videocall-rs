@@ -34,6 +34,10 @@ pub struct PacketWrapper {
     pub email: ::std::string::String,
     // @@protoc_insertion_point(field:PacketWrapper.data)
     pub data: ::std::vec::Vec<u8>,
+    // @@protoc_insertion_point(field:PacketWrapper.session_id)
+    pub session_id: ::std::string::String,
+    // @@protoc_insertion_point(field:PacketWrapper.display_name)
+    pub display_name: ::std::string::String,
     // special fields
     // @@protoc_insertion_point(special_field:PacketWrapper.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -51,7 +55,7 @@ impl PacketWrapper {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut fields = ::std::vec::Vec::with_capacity(5);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "packet_type",
@@ -67,6 +71,16 @@ impl PacketWrapper {
             "data",
             |m: &PacketWrapper| { &m.data },
             |m: &mut PacketWrapper| { &mut m.data },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "session_id",
+            |m: &PacketWrapper| { &m.session_id },
+            |m: &mut PacketWrapper| { &mut m.session_id },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "display_name",
+            |m: &PacketWrapper| { &m.display_name },
+            |m: &mut PacketWrapper| { &mut m.display_name },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<PacketWrapper>(
             "PacketWrapper",
@@ -95,6 +109,12 @@ impl ::protobuf::Message for PacketWrapper {
                 26 => {
                     self.data = is.read_bytes()?;
                 },
+                82 => {
+                    self.session_id = is.read_string()?;
+                },
+                90 => {
+                    self.display_name = is.read_string()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -116,6 +136,12 @@ impl ::protobuf::Message for PacketWrapper {
         if !self.data.is_empty() {
             my_size += ::protobuf::rt::bytes_size(3, &self.data);
         }
+        if !self.session_id.is_empty() {
+            my_size += ::protobuf::rt::string_size(10, &self.session_id);
+        }
+        if !self.display_name.is_empty() {
+            my_size += ::protobuf::rt::string_size(11, &self.display_name);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -130,6 +156,12 @@ impl ::protobuf::Message for PacketWrapper {
         }
         if !self.data.is_empty() {
             os.write_bytes(3, &self.data)?;
+        }
+        if !self.session_id.is_empty() {
+            os.write_string(10, &self.session_id)?;
+        }
+        if !self.display_name.is_empty() {
+            os.write_string(11, &self.display_name)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -151,6 +183,8 @@ impl ::protobuf::Message for PacketWrapper {
         self.packet_type = ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::RSA_PUB_KEY);
         self.email.clear();
         self.data.clear();
+        self.session_id.clear();
+        self.display_name.clear();
         self.special_fields.clear();
     }
 
@@ -159,6 +193,8 @@ impl ::protobuf::Message for PacketWrapper {
             packet_type: ::protobuf::EnumOrUnknown::from_i32(0),
             email: ::std::string::String::new(),
             data: ::std::vec::Vec::new(),
+            session_id: ::std::string::String::new(),
+            display_name: ::std::string::String::new(),
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance
@@ -273,40 +309,47 @@ pub mod packet_wrapper {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/packet_wrapper.proto\"\xe6\x01\n\rPacketWrapper\x12:\n\x0bpa\
+    \n\x1atypes/packet_wrapper.proto\"\xa8\x02\n\rPacketWrapper\x12:\n\x0bpa\
     cket_type\x18\x01\x20\x01(\x0e2\x19.PacketWrapper.PacketTypeR\npacketTyp\
     e\x12\x14\n\x05email\x18\x02\x20\x01(\tR\x05email\x12\x12\n\x04data\x18\
-    \x03\x20\x01(\x0cR\x04data\"o\n\nPacketType\x12\x0f\n\x0bRSA_PUB_KEY\x10\
-    \0\x12\x0b\n\x07AES_KEY\x10\x01\x12\t\n\x05MEDIA\x10\x02\x12\x0e\n\nCONN\
-    ECTION\x10\x03\x12\x0f\n\x0bDIAGNOSTICS\x10\x04\x12\n\n\x06HEALTH\x10\
-    \x05\x12\x0b\n\x07MEETING\x10\x06J\xb4\x04\n\x06\x12\x04\0\0\x0f\x01\n\
-    \x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x0f\x01\n\n\
-    \n\x03\x04\0\x01\x12\x03\x02\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x03\
-    \x02\x0b\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x03\x07\x11\n\r\n\x06\
-    \x04\0\x04\0\x02\0\x12\x03\x04\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\
-    \x12\x03\x04\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x04\x12\
-    \x13\n\r\n\x06\x04\0\x04\0\x02\x01\x12\x03\x05\x04\x10\n\x0e\n\x07\x04\0\
-    \x04\0\x02\x01\x01\x12\x03\x05\x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\x01\
-    \x02\x12\x03\x05\x0e\x0f\n\r\n\x06\x04\0\x04\0\x02\x02\x12\x03\x06\x04\
-    \x0e\n\x0e\n\x07\x04\0\x04\0\x02\x02\x01\x12\x03\x06\x04\t\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x02\x02\x12\x03\x06\x0c\r\n\r\n\x06\x04\0\x04\0\x02\x03\
-    \x12\x03\x07\x04\x13\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\x12\x03\x07\x04\
-    \x0e\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x07\x11\x12\n\r\n\x06\
-    \x04\0\x04\0\x02\x04\x12\x03\x08\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x04\
-    \x01\x12\x03\x08\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\x12\x03\x08\
-    \x12\x13\n\r\n\x06\x04\0\x04\0\x02\x05\x12\x03\t\x04\x0f\n\x0e\n\x07\x04\
-    \0\x04\0\x02\x05\x01\x12\x03\t\x04\n\n\x0e\n\x07\x04\0\x04\0\x02\x05\x02\
-    \x12\x03\t\r\x0e\n\r\n\x06\x04\0\x04\0\x02\x06\x12\x03\n\x04\x10\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x06\x01\x12\x03\n\x04\x0b\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x06\x02\x12\x03\n\x0e\x0f\n\x0b\n\x04\x04\0\x02\0\x12\x03\x0c\x02\
-    \x1d\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03\x0c\x02\x0c\n\x0c\n\x05\x04\0\
-    \x02\0\x01\x12\x03\x0c\r\x18\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x0c\x1b\
-    \x1c\n\x0b\n\x04\x04\0\x02\x01\x12\x03\r\x02\x13\n\x0c\n\x05\x04\0\x02\
-    \x01\x05\x12\x03\r\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\r\t\x0e\
-    \n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\r\x11\x12\n\x0b\n\x04\x04\0\x02\
-    \x02\x12\x03\x0e\x02\x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x0e\x02\
-    \x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x0e\x08\x0c\n\x0c\n\x05\x04\0\
-    \x02\x02\x03\x12\x03\x0e\x0f\x10b\x06proto3\
+    \x03\x20\x01(\x0cR\x04data\x12\x1d\n\nsession_id\x18\n\x20\x01(\tR\tsess\
+    ionId\x12!\n\x0cdisplay_name\x18\x0b\x20\x01(\tR\x0bdisplayName\"o\n\nPa\
+    cketType\x12\x0f\n\x0bRSA_PUB_KEY\x10\0\x12\x0b\n\x07AES_KEY\x10\x01\x12\
+    \t\n\x05MEDIA\x10\x02\x12\x0e\n\nCONNECTION\x10\x03\x12\x0f\n\x0bDIAGNOS\
+    TICS\x10\x04\x12\n\n\x06HEALTH\x10\x05\x12\x0b\n\x07MEETING\x10\x06J\xa2\
+    \x05\n\x06\x12\x04\0\0\x11\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\
+    \x04\0\x12\x04\x02\0\x11\x01\n\n\n\x03\x04\0\x01\x12\x03\x02\x08\x15\n\
+    \x0c\n\x04\x04\0\x04\0\x12\x04\x03\x02\x0b\x03\n\x0c\n\x05\x04\0\x04\0\
+    \x01\x12\x03\x03\x07\x11\n\r\n\x06\x04\0\x04\0\x02\0\x12\x03\x04\x04\x14\
+    \n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x04\x04\x0f\n\x0e\n\x07\x04\0\
+    \x04\0\x02\0\x02\x12\x03\x04\x12\x13\n\r\n\x06\x04\0\x04\0\x02\x01\x12\
+    \x03\x05\x04\x10\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\x03\x05\x04\x0b\
+    \n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x05\x0e\x0f\n\r\n\x06\x04\0\
+    \x04\0\x02\x02\x12\x03\x06\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x02\x01\
+    \x12\x03\x06\x04\t\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\x03\x06\x0c\r\
+    \n\r\n\x06\x04\0\x04\0\x02\x03\x12\x03\x07\x04\x13\n\x0e\n\x07\x04\0\x04\
+    \0\x02\x03\x01\x12\x03\x07\x04\x0e\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\
+    \x12\x03\x07\x11\x12\n\r\n\x06\x04\0\x04\0\x02\x04\x12\x03\x08\x04\x14\n\
+    \x0e\n\x07\x04\0\x04\0\x02\x04\x01\x12\x03\x08\x04\x0f\n\x0e\n\x07\x04\0\
+    \x04\0\x02\x04\x02\x12\x03\x08\x12\x13\n\r\n\x06\x04\0\x04\0\x02\x05\x12\
+    \x03\t\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x05\x01\x12\x03\t\x04\n\n\x0e\
+    \n\x07\x04\0\x04\0\x02\x05\x02\x12\x03\t\r\x0e\n\r\n\x06\x04\0\x04\0\x02\
+    \x06\x12\x03\n\x04\x10\n\x0e\n\x07\x04\0\x04\0\x02\x06\x01\x12\x03\n\x04\
+    \x0b\n\x0e\n\x07\x04\0\x04\0\x02\x06\x02\x12\x03\n\x0e\x0f\n\x0b\n\x04\
+    \x04\0\x02\0\x12\x03\x0c\x02\x1d\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03\x0c\
+    \x02\x0c\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x0c\r\x18\n\x0c\n\x05\x04\0\
+    \x02\0\x03\x12\x03\x0c\x1b\x1c\n\x0b\n\x04\x04\0\x02\x01\x12\x03\r\x02\
+    \x13\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\r\x02\x08\n\x0c\n\x05\x04\0\
+    \x02\x01\x01\x12\x03\r\t\x0e\n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\r\x11\
+    \x12\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x0e\x02\x11\n\x0c\n\x05\x04\0\x02\
+    \x02\x05\x12\x03\x0e\x02\x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x0e\
+    \x08\x0c\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x0e\x0f\x10\n\x0b\n\x04\
+    \x04\0\x02\x03\x12\x03\x0f\x02\x19\n\x0c\n\x05\x04\0\x02\x03\x05\x12\x03\
+    \x0f\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x0f\t\x13\n\x0c\n\x05\
+    \x04\0\x02\x03\x03\x12\x03\x0f\x16\x18\n\x0b\n\x04\x04\0\x02\x04\x12\x03\
+    \x10\x02\x1b\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\x10\x02\x08\n\x0c\n\
+    \x05\x04\0\x02\x04\x01\x12\x03\x10\t\x15\n\x0c\n\x05\x04\0\x02\x04\x03\
+    \x12\x03\x10\x18\x1ab\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

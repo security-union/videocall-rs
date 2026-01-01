@@ -330,6 +330,12 @@ async fn send_meeting_info(
     }
 }
 
+// fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {
+//     let err = format!("error subscribing to subject {subject}: {e}");
+//     error!("{err}");
+//     err
+// }
+
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
@@ -481,8 +487,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "JoinRoom with valid user should return Ok, got: {:?}",
-            result
+            "JoinRoom with valid user should return Ok, got: {result:?}"
         );
     }
 

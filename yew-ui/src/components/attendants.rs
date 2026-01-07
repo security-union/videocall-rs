@@ -17,14 +17,21 @@
  */
 
 use crate::components::{
-    browser_compatibility::BrowserCompatibility, diagnostics::Diagnostics, host::Host,
-    peer_list::PeerList, peer_tile::PeerTile,
+    browser_compatibility::BrowserCompatibility,
+    diagnostics::Diagnostics,
+    host::Host,
+    peer_list::PeerList,
+    peer_tile::PeerTile,
+    video_control_buttons::{
+        CameraButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton, MicButton,
+        PeerListButton, ScreenShareButton,
+    },
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::VideoCallClientCtx;
+use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
@@ -46,6 +53,7 @@ pub enum WsAction {
     MediaPermissionsError(String),
     Log(String),
     EncoderSettingsUpdated(String),
+    MeetingInfoReceived(u64),
     ToggleDropdown,
 }
 
@@ -62,6 +70,7 @@ pub enum UserScreenToggleAction {
     PeerList,
     Diagnostics,
     DeviceSettings,
+    MeetingInfo,
 }
 
 #[derive(Debug)]
@@ -82,6 +91,7 @@ pub enum Msg {
     ToggleForceDesktopGrid,
     HangUp,
     ShowCopyToast(bool),
+    MeetingEnded(String),
 }
 
 impl From<WsAction> for Msg {
@@ -146,7 +156,11 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
+    pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp - the actual meeting time
+    pub call_start_time: Option<f64>,           // Track when the call started for a user
     show_dropdown: bool,
+    meeting_ended_message: Option<String>,
+    meeting_info_open: bool,
 }
 
 impl AttendantsComponent {
@@ -234,6 +248,28 @@ impl AttendantsComponent {
             }),
             rtt_testing_period_ms: server_election_period_ms().unwrap_or(2000),
             rtt_probe_interval_ms: Some(200),
+            on_meeting_info: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |start_time_ms: f64| {
+                    log::info!("Meeting started at Unix timestamp: {start_time_ms}");
+                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                        start_time_ms as u64,
+                    )))
+                })
+            }),
+            on_meeting_ended: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |(end_time_ms, message): (f64, String)| {
+                    log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
+                    // link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                    //     end_time_ms as u64,
+                    // )));
+                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
+                        end_time_ms as u64,
+                    )));
+                    link.send_message(Msg::MeetingEnded(message));
+                })
+            }),
         };
 
         VideoCallClient::new(opts)
@@ -358,7 +394,11 @@ impl Component for AttendantsComponent {
             force_desktop_grid_on_mobile: true,
             simulation_info_message: None,
             show_copy_toast: false,
+            call_start_time: None,
+            meeting_start_time_server: None,
             show_dropdown: false,
+            meeting_ended_message: None,
+            meeting_info_open: false,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -393,8 +433,10 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
+                    self.call_start_time = Some(js_sys::Date::now());
                     true
                 }
+
                 WsAction::Log(msg) => {
                     warn!("{msg}");
                     false
@@ -438,6 +480,11 @@ impl Component for AttendantsComponent {
                     self.encoder_settings = Some(settings);
                     true
                 }
+                WsAction::MeetingInfoReceived(start_time) => {
+                    log::info!("Meeting info received, start_time: {start_time:?}");
+                    self.meeting_start_time_server = Some(start_time as f64);
+                    true
+                }
                 WsAction::ToggleDropdown => {
                     self.show_dropdown = !self.show_dropdown;
                     true
@@ -447,6 +494,7 @@ impl Component for AttendantsComponent {
                 log::info!("New user joined: {email}");
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
+
                 true
             }
             Msg::OnPeerRemoved(_peer_id) => {
@@ -527,6 +575,15 @@ impl Component for AttendantsComponent {
                             self.diagnostics_open = false;
                         }
                     }
+
+                    UserScreenToggleAction::MeetingInfo => {
+                        self.meeting_info_open = !self.meeting_info_open;
+                        if self.meeting_info_open {
+                            //  self.peer_list_open = false;
+                            self.diagnostics_open = false;
+                            self.device_settings_open = false;
+                        }
+                    }
                 }
                 true
             }
@@ -576,7 +633,34 @@ impl Component for AttendantsComponent {
             }
             Msg::HangUp => {
                 log::info!("Hanging up - resetting to initial state");
-                let _ = window().location().reload(); // Refresh page for clean state
+
+                if self.client.is_connected() {
+                    match self.client.disconnect() {
+                        Ok(_) => {
+                            log::info!("Disconnected from server");
+                        }
+                        Err(e) => {
+                            log::error!("Error disconnecting from server: {e}");
+                        }
+                    }
+                }
+
+                self.meeting_joined = false;
+                self.mic_enabled = false;
+                self.video_enabled = false;
+                self.call_start_time = None;
+                self.meeting_start_time_server = None;
+
+                Timeout::new(500, move || {
+                    let _ = window().location().set_href("/");
+                })
+                .forget();
+
+                true
+            }
+
+            Msg::MeetingEnded(end_time) => {
+                self.meeting_ended_message = Some(end_time);
                 true
             }
         }
@@ -717,7 +801,14 @@ impl Component for AttendantsComponent {
             };
         }
 
+        // Create MeetingTime for context - child components (MeetingInfo) read from this
+        let meeting_time = MeetingTime {
+            call_start_time: self.call_start_time,
+            meeting_start_time: self.meeting_start_time_server,
+        };
+
         html! {
+            <ContextProvider<MeetingTimeCtx> context={meeting_time}>
             <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
@@ -781,199 +872,44 @@ impl Component for AttendantsComponent {
                                 <nav class="host">
                                     <div class="controls">
                                         <nav class="video-controls-container">
-                                            <button
-                                                class={classes!("video-control-button", self.mic_enabled.then_some("active"))}
-                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>
-                                                {
-                                                    if self.mic_enabled {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"></path>
-                                                                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                                                                    <line x1="12" y1="19" x2="12" y2="22"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Mute" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <line x1="1" y1="1" x2="23" y2="23"></line>
-                                                                    <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V5a3 3 0 0 0-5.94-.6"></path>
-                                                                    <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path>
-                                                                    <line x1="12" y1="19" x2="12" y2="22"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Unmute" }</span>
-                                                            </>
-                                                        }
-                                                    }
-                                                }
-                                            </button>
-                                            <button
-                                                class={classes!("video-control-button", self.video_enabled.then_some("active"))}
-                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}>
-                                                {
-                                                    if self.video_enabled {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <polygon points="23 7 16 12 23 17 23 7"></polygon>
-                                                                    <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Stop Video" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
-                                                                    <line x1="1" y1="1" x2="23" y2="23"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Start Video" }</span>
-                                                            </>
-                                                        }
-                                                    }
-                                                }
-                                            </button>
-
+                                            <MicButton
+                                                enabled={self.mic_enabled}
+                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}
+                                            />
+                                            <CameraButton
+                                                enabled={self.video_enabled}
+                                                onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}
+                                            />
                                             // Hide screen share button on Safari/iOS devices
                                             {
                                                 if !is_ios() {
                                                     html! {
-                                                        <button
-                                                            class={classes!("video-control-button", self.share_screen.then_some("active"))}
-                                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}>
-                                                            {
-                                                                if self.share_screen {
-                                                                    html! {
-                                                                        <>
-                                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                                <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
-                                                                                <line x1="8" y1="21" x2="16" y2="21"></line>
-                                                                                <line x1="12" y1="17" x2="12" y2="21"></line>
-                                                                            </svg>
-                                                                            <span class="tooltip">{ "Stop Screen Share" }</span>
-                                                                        </>
-                                                                    }
-                                                                } else {
-                                                                    html! {
-                                                                        <>
-                                                                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                                <path d="M13 3H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-3"></path>
-                                                                                <polyline points="8 21 12 17 16 21"></polyline>
-                                                                                <polyline points="16 7 20 7 20 3"></polyline>
-                                                                                <line x1="10" y1="14" x2="21" y2="3"></line>
-                                                                            </svg>
-                                                                            <span class="tooltip">{ "Share Screen" }</span>
-                                                                        </>
-                                                                    }
-                                                                }
-                                                            }
-                                                        </button>
+                                                        <ScreenShareButton
+                                                            active={self.share_screen}
+                                                            onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}
+                                                        />
                                                     }
                                                 } else {
                                                     html! {}
                                                 }
                                             }
-                                            <button
-                                                class={classes!("video-control-button", self.peer_list_open.then_some("active"))}
-                                                onclick={toggle_peer_list.clone()}>
-                                                {
-                                                    if self.peer_list_open {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                                                                    <circle cx="9" cy="7" r="4"></circle>
-                                                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                                                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-                                                                    <line x1="1" y1="1" x2="23" y2="23"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Close Peers" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                                                                    <circle cx="9" cy="7" r="4"></circle>
-                                                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                                                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Open Peers" }</span>
-                                                            </>
-                                                        }
-                                                    }
-                                                }
-                                            </button>
-                                            <button
-                                                class={classes!("video-control-button", self.diagnostics_open.then_some("active"))}
-                                                onclick={toggle_diagnostics.clone()}>
-                                                {
-                                                    if self.diagnostics_open {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
-                                                                    <line x1="3" y1="3" x2="21" y2="21"></line>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Close Diagnostics" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <path d="M2 12h2l3.5-7L12 19l2.5-5H20"></path>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Open Diagnostics" }</span>
-                                                            </>
-                                                        }
-                                                    }
-                                                }
-                                            </button>
-                                            <button
-                                                class={classes!("video-control-button", "mobile-only-device-settings", self.device_settings_open.then_some("active"))}
-                                                onclick={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}>
-                                                {
-                                                    if self.device_settings_open {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <circle cx="12" cy="12" r="3"></circle>
-                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Close Settings" }</span>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                                    <circle cx="12" cy="12" r="3"></circle>
-                                                                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                                                                </svg>
-                                                                <span class="tooltip">{ "Device Settings" }</span>
-                                                            </>
-                                                        }
-                                                    }
-                                                }
-                                            </button>
-                                            <button
-                                                class="video-control-button danger"
-                                                onclick={ctx.link().callback(|_| Msg::HangUp)}>
-                                                <span class="tooltip">{"Hang Up"}</span>
-                                                <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 24 24">
-                                                    <path d="M12.017 6.995c-2.306 0-4.534.408-6.215 1.507-1.737 1.135-2.788 2.944-2.797 5.451a4.8 4.8 0 0 0 .01.62c.015.193.047.512.138.763a2.557 2.557 0 0 0 2.579 1.677H7.31a2.685 2.685 0 0 0 2.685-2.684v-.645a.684.684 0 0 1 .684-.684h2.647a.686.686 0 0 1 .686.687v.645c0 .712.284 1.395.787 1.898.478.478 1.101.787 1.847.787h1.647a2.555 2.555 0 0 0 2.575-1.674c.09-.25.123-.57.137-.763.015-.2.022-.433.01-.617-.002-2.508-1.049-4.32-2.785-5.458-1.68-1.1-3.907-1.51-6.213-1.51Z"/>
-                                                </svg>
-                                            </button>
+                                            <PeerListButton
+                                                open={self.peer_list_open}
+                                                onclick={toggle_peer_list.clone()}
+                                            />
+                                            <DiagnosticsButton
+                                                open={self.diagnostics_open}
+                                                onclick={toggle_diagnostics.clone()}
+                                            />
+                                            <DeviceSettingsButton
+                                                open={self.device_settings_open}
+                                                onclick={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                            />
+                                            <HangUpButton
+                                                onclick={ctx.link().callback(|_| Msg::HangUp)}
+                                            />
                                             { self.view_grid_toggle(ctx) }
                                             { self.view_fake_peer_buttons(ctx, add_fake_peer_disabled) }
-
                                         </nav>
                                         { html!{} }
                                                                 {
@@ -1032,8 +968,57 @@ impl Component for AttendantsComponent {
                     }
                 </div>
                 <div id="peer-list-container" class={if self.peer_list_open {"visible"} else {""}}>
-                    <PeerList peers={display_peers_vec} onclose={toggle_peer_list} />
+                    {
+                        if self.peer_list_open {
+                            let toggle_meeting_info = ctx.link().callback(|_| UserScreenToggleAction::MeetingInfo);
+                            html! {
+                                <PeerList
+                                    peers={display_peers_vec.clone()}
+                                    onclose={toggle_peer_list}
+                                    show_meeting_info={self.meeting_info_open}
+                                    room_id={ctx.props().id.clone()}
+                                    num_participants={num_display_peers}
+                                    is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
+                                    on_toggle_meeting_info={toggle_meeting_info}
+                                />
+                            }
+                        } else {
+                                html! {}
+                        }
+                    }
                 </div>
+
+                {
+                    if let Some(ref message) = self.meeting_ended_message {
+                        html! {
+                            <div class="glass-backdrop" style="z-index: 9999;">
+                                <div class="card-apple" style="width: 420px; text-align: center;">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2" style="margin: 0 auto 1rem;">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <line x1="15" y1="9" x2="9" y2="15"></line>
+                                        <line x1="9" y1="9" x2="15" y2="15"></line>
+                                    </svg>
+                                    <h4 style="margin-top:0; margin-bottom: 0.5rem;">{"Meeting Ended"}</h4>
+                                    <p style="font-size: 1rem; margin: 1.5rem 0; color: #666;">
+                                        {message}
+                                    </p>
+                                    <button
+                                        class="btn-apple btn-primary"
+                                        onclick={Callback::from(|_| {
+                                            if let Some(window) = web_sys::window() {
+                                                let _ = window.location().set_href("/");
+                                            }
+                                        })}>
+                                        {"Return to Home"}
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+
                 {
                     if self.diagnostics_open {
                         html!{
@@ -1049,6 +1034,7 @@ impl Component for AttendantsComponent {
                 }
                 </div>
             </ContextProvider<VideoCallClientCtx>>
+            </ContextProvider<MeetingTimeCtx>>
         }
     }
 }

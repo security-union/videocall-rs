@@ -37,6 +37,7 @@ pub struct ClientMessage {
 pub struct JoinRoom {
     pub session: SessionId,
     pub room: RoomId,
+    pub user_id: String,
 }
 
 #[derive(ActixMessage)]
@@ -56,10 +57,14 @@ pub struct Packet {
 #[rtype(result = "()")]
 pub struct Disconnect {
     pub session: SessionId,
+    pub room: RoomId,
+    pub user_id: String,
 }
 
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct Leave {
     pub session: SessionId,
+    pub room: RoomId,
+    pub user_id: String,
 }

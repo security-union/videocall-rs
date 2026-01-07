@@ -19,6 +19,7 @@
 mod auth;
 #[allow(non_camel_case_types)]
 mod components;
+mod modals;
 mod constants;
 mod context;
 mod pages;

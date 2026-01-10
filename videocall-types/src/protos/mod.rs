@@ -5,6 +5,7 @@ pub mod connection_packet;
 pub mod diagnostics_packet;
 pub mod health_packet;
 pub mod media_packet;
+pub mod meeting_packet;
 pub mod packet_wrapper;
 pub mod rsa_packet;
 pub mod server_connection_packet;

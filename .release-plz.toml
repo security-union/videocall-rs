@@ -54,9 +54,9 @@ git_release_enable = true
 
 [[package]]
 name = "videocall-diagnostics"
-publish = false
+publish = true
 changelog_update = true
-git_release_enable = false
+git_release_enable = true
 
 [[package]]
 name = "matomo-logger"

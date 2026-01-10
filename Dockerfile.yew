@@ -1,10 +1,9 @@
-FROM securityunion/yew:main-68edb47a as build
+FROM securityunion/yew-base:meeting-ownership-branch-c4b19265 as build
 
 WORKDIR /app
 COPY . .
 WORKDIR /app/yew-ui
 
-RUN rustup target add wasm32-unknown-unknown
 RUN trunk build --release
 
 FROM nginx:1.21.5-alpine as production

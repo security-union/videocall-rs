@@ -1,0 +1,11 @@
+#!/bin/bash
+# This script is run before a push to the remote repository.
+# It runs cargo fmt and cargo clippy to ensure the code is formatted and free of warnings.
+# If the code is not formatted or free of warnings, the push is aborted.
+
+set -e 
+echo "Running Clippy before push..."
+cargo clippy -- -D warnings
+echo "Running Fmt before push..."
+cargo fmt -- --check
+echo "Pushing to remote repository..."

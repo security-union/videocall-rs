@@ -16,6 +16,7 @@
  * conditions.
  */
 
+pub mod crop;
 pub mod digital_ocean;
 pub mod discord;
 pub mod mic;

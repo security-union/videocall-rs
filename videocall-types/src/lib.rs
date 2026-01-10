@@ -16,9 +16,15 @@
  * conditions.
  */
 
+pub mod feature_flags;
 pub mod protos;
 
+pub use feature_flags::FeatureFlags;
 use protobuf::Message;
+
+/// System username used for server-generated messages (meeting info, meeting started/ended).
+/// This is not a real user and should be filtered out in UI/peer management.
+pub const SYSTEM_USER_EMAIL: &str = "system-&^%$#@!";
 use yew_websocket::websocket::{Binary, Text};
 
 impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
@@ -49,6 +55,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             }
             protos::packet_wrapper::packet_wrapper::PacketType::HEALTH => {
                 write!(f, "HEALTH")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::MEETING => {
+                write!(f, "MEETING")
             }
         }
     }

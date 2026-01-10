@@ -72,7 +72,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                         "/login?returnTo={}",
                                         urlencoding::encode(&current_url)
                                     );
-                                    log::info!("Redirecting to: {}", login_url);
+                                    log::info!("Redirecting to: {login_url}");
                                     let _ = win.location().set_href(&login_url);
                                 }
                             }

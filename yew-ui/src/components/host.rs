@@ -28,10 +28,12 @@ use yew::prelude::*;
 
 use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
+    icons::crop::CropIcon, icons::push_pin::PushPinIcon,
 };
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
 };
+use web_sys::window;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -119,6 +121,10 @@ pub struct MeetingProps {
     /// The parent should disable the mic and optionally display an error.
     #[prop_or_default]
     pub on_microphone_error: Callback<String>,
+
+    /// Whether the client is connected to the server
+    #[prop_or_default]
+    pub is_connected: bool,
 }
 
 impl Component for Host {
@@ -478,7 +484,7 @@ impl Component for Host {
                     <div class={classes!("canvas-container", if ctx.props().video_enabled { "video-on" } else { "" })}>
                         // Video element - ALWAYS present in DOM for CameraEncoder, hidden via CSS when video is off
                         <video
-                            class={classes!("self-camera", if !ctx.props().video_enabled { "video-hidden" } else { "" })}
+                            class={classes!("self-camera", "uncropped", if !ctx.props().video_enabled { "video-hidden" } else { "" })}
                             autoplay=true
                             id={VIDEO_ELEMENT_ID}
                             playsinline={true}
@@ -533,6 +539,22 @@ impl Component for Host {
                             </svg>
                         </div>
 
+                        // Crop button (hover-only, like peer tiles)
+                        <button
+                            onclick={Callback::from(|_| toggle_video_crop(VIDEO_ELEMENT_ID))}
+                            class="crop-icon"
+                        >
+                            <CropIcon/>
+                        </button>
+
+                        // Pin button (hover-only, like peer tiles)
+                        <button
+                            onclick={Callback::from(|_| toggle_pinned_div("self-video-div"))}
+                            class="pin-icon"
+                        >
+                            <PushPinIcon/>
+                        </button>
+
                         // Edit name button (hover-only, positioned like pin/crop icons)
                         <button class="edit-name-icon" title="Change name"
                             onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
@@ -544,6 +566,10 @@ impl Component for Host {
 
                         // Device selector icons (hover-only, inside the canvas)
                         <div class="self-tile-device-selectors">
+                            // Connection LED indicator
+                            <div class={classes!("connection-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
+                                title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
+                            </div>
                             <DeviceSelector
                                 microphones={microphones.clone()}
                                 cameras={cameras.clone()}
@@ -667,5 +693,37 @@ impl Host {
         };
 
         DeviceInfo::new(device_id.to_string(), device_name)
+    }
+}
+
+/// Toggle pinned state for the self-video div
+fn toggle_pinned_div(div_id: &str) {
+    if let Some(div) = window()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.get_element_by_id(div_id))
+    {
+        if !div.class_list().contains("grid-item-pinned") {
+            let _ = div.class_list().add_1("grid-item-pinned");
+        } else {
+            let _ = div.class_list().remove_1("grid-item-pinned");
+        }
+    }
+}
+
+/// Toggle crop mode for the video element
+fn toggle_video_crop(video_id: &str) {
+    if let Some(video) = window()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.get_element_by_id(video_id))
+    {
+        let class_list = video.class_list();
+        let is_cropped = class_list.contains("cropped");
+        if is_cropped {
+            let _ = class_list.remove_1("cropped");
+            let _ = class_list.add_1("uncropped");
+        } else {
+            let _ = class_list.remove_1("uncropped");
+            let _ = class_list.add_1("cropped");
+        }
     }
 }

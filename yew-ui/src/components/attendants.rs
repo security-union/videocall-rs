@@ -831,6 +831,7 @@ impl Component for AttendantsComponent {
                                     device_settings_open={self.device_settings_open}
                                     on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
                                     on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                    is_connected={self.client.is_connected()}
                                 />
                             }
                         } else {
@@ -961,7 +962,6 @@ impl Component for AttendantsComponent {
                                             }
                                         } else { html!{} }
                                     }
-                                    <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
                                 </nav>
                             }
                         } else {

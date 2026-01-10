@@ -619,6 +619,20 @@ canvas {
   right: 12px;
 }
 
+/* Host badge - crown icon inside floating-name chip */
+.host-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 4px;
+}
+
+.host-badge svg.crown-icon {
+  width: 14px;
+  height: 14px;
+  stroke: #FFD700; /* Gold color for the crown */
+  fill: none;
+}
+
 /* Recommendation 2: subtle bottom gradient scrim for readability */
 .grid-item .canvas-container.video-on::after {
   content: "";

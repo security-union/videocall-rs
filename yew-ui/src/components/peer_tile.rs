@@ -17,7 +17,7 @@
  */
 
 use crate::components::canvas_generator::generate_for_peer;
-use crate::context::VideoCallClientCtx;
+use crate::context::{MeetingTimeCtx, VideoCallClientCtx};
 use futures::future::{AbortHandle, Abortable};
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use yew::prelude::*;
@@ -39,6 +39,7 @@ pub struct PeerTile {
     audio_enabled: bool,
     video_enabled: bool,
     screen_enabled: bool,
+    host_id: Option<String>,
     abort_handle: Option<AbortHandle>,
 }
 
@@ -53,11 +54,19 @@ impl Component for PeerTile {
             .context::<VideoCallClientCtx>(Callback::noop())
             .expect("VideoCallClient context missing");
 
+        // Get host_id from MeetingTimeCtx if available
+        let host_id = ctx
+            .link()
+            .context::<MeetingTimeCtx>(Callback::noop())
+            .map(|(meeting_time, _)| meeting_time.host_id.clone())
+            .unwrap_or(None);
+
         Self {
             client,
             audio_enabled: false,
             video_enabled: false,
             screen_enabled: false,
+            host_id,
             abort_handle: None,
         }
     }
@@ -139,7 +148,12 @@ impl Component for PeerTile {
 
     fn view(&self, ctx: &Context<Self>) -> Html {
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
-        generate_for_peer(&self.client, &ctx.props().peer_id, ctx.props().full_bleed)
+        generate_for_peer(
+            &self.client,
+            &ctx.props().peer_id,
+            ctx.props().full_bleed,
+            self.host_id.as_ref(),
+        )
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {

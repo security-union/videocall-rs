@@ -36,7 +36,7 @@ use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
-use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_client::{MediaDeviceAccess, MeetingInfo, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -53,7 +53,7 @@ pub enum WsAction {
     MediaPermissionsError(String),
     Log(String),
     EncoderSettingsUpdated(String),
-    MeetingInfoReceived(u64),
+    MeetingInfoReceived(MeetingInfo),
     ToggleDropdown,
 }
 
@@ -158,6 +158,7 @@ pub struct AttendantsComponent {
     show_copy_toast: bool,
     pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp - the actual meeting time
     pub call_start_time: Option<f64>,           // Track when the call started for a user
+    pub host_id: Option<String>,                // The meeting host/creator ID
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
@@ -250,23 +251,16 @@ impl AttendantsComponent {
             rtt_probe_interval_ms: Some(200),
             on_meeting_info: Some({
                 let link = ctx.link().clone();
-                Callback::from(move |start_time_ms: f64| {
-                    log::info!("Meeting started at Unix timestamp: {start_time_ms}");
-                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
-                        start_time_ms as u64,
-                    )))
+                Callback::from(move |info: MeetingInfo| {
+                    log::info!("Meeting started at Unix timestamp: {}, host: {}",
+                        info.start_time_ms, info.creator_id);
+                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(info)))
                 })
             }),
             on_meeting_ended: Some({
                 let link = ctx.link().clone();
                 Callback::from(move |(end_time_ms, message): (f64, String)| {
                     log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
-                    // link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
-                    //     end_time_ms as u64,
-                    // )));
-                    link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
-                        end_time_ms as u64,
-                    )));
                     link.send_message(Msg::MeetingEnded(message));
                 })
             }),
@@ -396,6 +390,7 @@ impl Component for AttendantsComponent {
             show_copy_toast: false,
             call_start_time: None,
             meeting_start_time_server: None,
+            host_id: None,
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
@@ -480,9 +475,11 @@ impl Component for AttendantsComponent {
                     self.encoder_settings = Some(settings);
                     true
                 }
-                WsAction::MeetingInfoReceived(start_time) => {
-                    log::info!("Meeting info received, start_time: {start_time:?}");
-                    self.meeting_start_time_server = Some(start_time as f64);
+                WsAction::MeetingInfoReceived(info) => {
+                    log::info!("Meeting info received, start_time: {:?}, host: {:?}",
+                        info.start_time_ms, info.creator_id);
+                    self.meeting_start_time_server = Some(info.start_time_ms);
+                    self.host_id = Some(info.creator_id);
                     true
                 }
                 WsAction::ToggleDropdown => {
@@ -805,6 +802,7 @@ impl Component for AttendantsComponent {
         let meeting_time = MeetingTime {
             call_start_time: self.call_start_time,
             meeting_start_time: self.meeting_start_time_server,
+            host_id: self.host_id.clone(),
         };
 
         html! {

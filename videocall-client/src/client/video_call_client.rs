@@ -48,6 +48,15 @@ use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
+/// Meeting information received from the server when a meeting starts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeetingInfo {
+    /// Unix timestamp (ms) when the meeting started.
+    pub start_time_ms: f64,
+    /// The user ID of the meeting host/creator.
+    pub creator_id: String,
+}
+
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoCallClientOptions {
@@ -115,7 +124,7 @@ pub struct VideoCallClientOptions {
     pub rtt_probe_interval_ms: Option<u64>,
 
     /// Callback triggered when meeting info is received (optional)
-    pub on_meeting_info: Option<Callback<f64>>,
+    pub on_meeting_info: Option<Callback<MeetingInfo>>,
 
     /// Callback triggered when the meeting ends (optional)
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
@@ -126,7 +135,7 @@ struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
     on_peer_added: Callback<String>,
-    on_meeting_info: Option<Callback<f64>>,
+    on_meeting_info: Option<Callback<MeetingInfo>>,
     on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
@@ -933,7 +942,10 @@ impl Inner {
                                     meeting_packet.creator_id
                                 );
                                 if let Some(callback) = &self.options.on_meeting_info {
-                                    callback.emit(meeting_packet.start_time_ms as f64);
+                                    callback.emit(MeetingInfo {
+                                        start_time_ms: meeting_packet.start_time_ms as f64,
+                                        creator_id: meeting_packet.creator_id.clone(),
+                                    });
                                 }
                             }
                             Ok(MeetingEventType::MEETING_ENDED) => {

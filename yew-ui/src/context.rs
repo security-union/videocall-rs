@@ -43,6 +43,10 @@ pub struct MeetingTime {
     /// Unix timestamp (ms) when the meeting started (from server).
     /// Set when `MEETING_STARTED` packet is received. `None` if not yet received.
     pub meeting_start_time: Option<f64>,
+
+    /// The user ID of the meeting host/creator.
+    /// Set when `MEETING_STARTED` packet is received. `None` if not yet received.
+    pub host_id: Option<String>,
 }
 
 /// Context type for meeting time - read-only access to timing info.

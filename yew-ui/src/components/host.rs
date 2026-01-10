@@ -468,66 +468,98 @@ impl Component for Host {
         let selected_camera_id = self.media_devices.video_inputs.selected();
         let selected_speaker_id = self.media_devices.audio_outputs.selected();
 
+        // Get username from storage for display
+        let username = load_username_from_storage().unwrap_or_else(|| "You".to_string());
+
         html! {
             <>
-                {
-                    if ctx.props().video_enabled {
-                        html! {
-                            <div class="host-video-wrapper" style="position:relative;">
-                                <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
-                                <button class="change-name-fab" title="Change name"
-                                    onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
-                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-                                </button>
-                            </div>
-                        }
-                    } else {
-                        html! {
-                            <div class="" style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem; position:relative;">
-                                <div class="placeholder-content">
-                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                        <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
-                                        <line x1="1" y1="1" x2="23" y2="23"></line>
-                                    </svg>
-                                    <span class="placeholder-text">{"Camera Off"}</span>
-                                </div>
-                                <button class="change-name-fab" title="Change name"
-                                    onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
-                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-                                </button>
-                            </div>
-                        }
-                    }
-                }
+                // Self tile - rendered as a grid item
+                <div class="grid-item self-tile" id="self-video-div">
+                    <div class={classes!("canvas-container", if ctx.props().video_enabled { "video-on" } else { "" })}>
+                        // Video element - ALWAYS present in DOM for CameraEncoder, hidden via CSS when video is off
+                        <video
+                            class={classes!("self-camera", if !ctx.props().video_enabled { "video-hidden" } else { "" })}
+                            autoplay=true
+                            id={VIDEO_ELEMENT_ID}
+                            playsinline={true}
+                            controls={false}
+                        ></video>
 
-                // Device Settings Menu Button (positioned outside the host video)
-                <button
-                    class="device-settings-menu-button btn-apple btn-secondary"
-                    onclick={ctx.props().on_device_settings_toggle.clone()}
-                    title="Device Settings"
-                >
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="3"></circle>
-                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                    </svg>
-                </button>
+                        // Placeholder shown when video is off
+                        {
+                            if !ctx.props().video_enabled {
+                                html! {
+                                    <div class="placeholder-content">
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
+                                            <line x1="1" y1="1" x2="23" y2="23"></line>
+                                        </svg>
+                                        <span class="placeholder-text">{"Camera Off"}</span>
+                                    </div>
+                                }
+                            } else {
+                                html! {}
+                            }
+                        }
 
-                // Desktop Device Selector (hidden on mobile)
-                <div class="desktop-device-selector">
-                    <DeviceSelector
-                        microphones={microphones.clone()}
-                        cameras={cameras.clone()}
-                        speakers={speakers.clone()}
-                        selected_microphone_id={selected_microphone_id.clone()}
-                        selected_camera_id={selected_camera_id.clone()}
-                        selected_speaker_id={selected_speaker_id.clone()}
-                        on_microphone_select={mic_callback.clone()}
-                        on_camera_select={cam_callback.clone()}
-                        on_speaker_select={speaker_callback.clone()}
-                    />
+                        // Floating name chip (like peer tiles)
+                        <h4 class="floating-name" title={username.clone()} dir={"auto"}>{username}{" (You)"}</h4>
+
+                        // Audio indicator (showing mic status)
+                        <div class="audio-indicator">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                {
+                                    if ctx.props().mic_enabled {
+                                        html! {
+                                            <>
+                                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                                                <line x1="12" y1="19" x2="12" y2="23"></line>
+                                                <line x1="8" y1="23" x2="16" y2="23"></line>
+                                            </>
+                                        }
+                                    } else {
+                                        html! {
+                                            <>
+                                                <line x1="1" y1="1" x2="23" y2="23"></line>
+                                                <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"></path>
+                                                <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path>
+                                                <line x1="12" y1="19" x2="12" y2="23"></line>
+                                                <line x1="8" y1="23" x2="16" y2="23"></line>
+                                            </>
+                                        }
+                                    }
+                                }
+                            </svg>
+                        </div>
+
+                        // Edit name button (hover-only, positioned like pin/crop icons)
+                        <button class="edit-name-icon" title="Change name"
+                            onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M12 20h9"></path>
+                                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"></path>
+                            </svg>
+                        </button>
+
+                        // Device selector icons (hover-only, inside the canvas)
+                        <div class="self-tile-device-selectors">
+                            <DeviceSelector
+                                microphones={microphones.clone()}
+                                cameras={cameras.clone()}
+                                speakers={speakers.clone()}
+                                selected_microphone_id={selected_microphone_id.clone()}
+                                selected_camera_id={selected_camera_id.clone()}
+                                selected_speaker_id={selected_speaker_id.clone()}
+                                on_microphone_select={mic_callback.clone()}
+                                on_camera_select={cam_callback.clone()}
+                                on_speaker_select={speaker_callback.clone()}
+                            />
+                        </div>
+                    </div>
                 </div>
 
-                // Mobile Device Settings Modal
+                // Mobile Device Settings Modal (keep for mobile support)
                 <DeviceSettingsModal
                     microphones={microphones}
                     cameras={cameras}

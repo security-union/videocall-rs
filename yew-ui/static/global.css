@@ -1384,3 +1384,98 @@ body {
   .copy-toast { animation: none; opacity: 1; transform: none; }
   .sparkles { display: none; }
 }
+
+/* Self-tile styles (local user video in peer grid) */
+.self-tile .canvas-container {
+  position: relative;
+}
+
+.self-tile .self-camera {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+/* Hide video visually but keep in DOM for CameraEncoder */
+.self-tile .self-camera.video-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+/* Edit name icon - positioned like pin/crop icons */
+.grid-item .canvas-container .edit-name-icon {
+  position: absolute !important;
+  top: 8px !important;
+  right: 128px !important; /* After mic (8), crop (48+8), pin (88+8) */
+  left: auto !important;
+  transform: none !important;
+  opacity: 0.6 !important;
+  background-color: rgba(0, 0, 0, 0.6) !important;
+  border-radius: 50% !important;
+  padding: 6px !important;
+  text-align: center !important;
+  line-height: 1 !important;
+  cursor: pointer !important;
+  z-index: 10 !important;
+  transition: opacity 0.2s ease !important;
+  border: none !important;
+  visibility: hidden !important;
+}
+
+.grid-item .canvas-container .edit-name-icon svg {
+  width: 20px !important;
+  height: 20px !important;
+  display: block !important;
+  stroke: white;
+}
+
+/* Show edit name icon on hover (desktop) */
+@media (min-width: 768px) {
+  .grid-item .canvas-container .edit-name-icon { opacity: 0 !important; }
+  .grid-item .canvas-container:hover .edit-name-icon {
+    visibility: visible !important;
+    opacity: 0.6 !important;
+  }
+}
+
+/* Hide edit name icon on mobile */
+@media (max-width: 767px) {
+  .grid-item .canvas-container .edit-name-icon { display: none !important; }
+}
+
+/* Self-tile device selectors - positioned at bottom of tile, visible on hover */
+.self-tile-device-selectors {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0));
+  padding: 12px 8px 8px;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0.2s ease;
+  z-index: 5;
+}
+
+/* Show device selectors on hover (desktop) */
+@media (min-width: 768px) {
+  .grid-item .canvas-container:hover .self-tile-device-selectors {
+    opacity: 1;
+    visibility: visible;
+  }
+}
+
+/* Hide device selectors on mobile - use modal instead */
+@media (max-width: 767px) {
+  .self-tile-device-selectors {
+    display: none !important;
+  }
+}

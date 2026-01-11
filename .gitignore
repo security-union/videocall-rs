@@ -4,7 +4,7 @@
 .mov
 .mp4
 .env
-.idea/
+.idea
 target/
 helm/digital-ocean-secret
 helm/global/us-east/grafana/secret.yaml

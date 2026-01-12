@@ -1580,8 +1580,7 @@ body {
 }
 
 /* Position toggle icon - positioned like other hover icons */
-.grid-item .canvas-container .position-toggle-icon,
-.self-tile-floating .canvas-container .position-toggle-icon {
+.grid-item .canvas-container .position-toggle-icon {
   position: absolute !important;
   top: 8px !important;
   right: 168px !important; /* After mic (8), pin (48), crop (88), edit-name (128) + 40 */
@@ -1598,6 +1597,26 @@ body {
   transition: opacity 0.2s ease !important;
   border: none !important;
   visibility: hidden !important;
+}
+
+/* Position toggle icon in floating mode - next to the audio indicator (mic) */
+.self-tile-floating .canvas-container .position-toggle-icon {
+  position: absolute !important;
+  top: 8px !important;
+  right: 48px !important; /* Next to audio indicator: 8px edge + 32px mic + 8px gap */
+  left: auto !important;
+  transform: none !important;
+  opacity: 0.6 !important;
+  background-color: rgba(0, 0, 0, 0.6) !important;
+  border-radius: 50% !important;
+  padding: 6px !important;
+  text-align: center !important;
+  line-height: 1 !important;
+  cursor: pointer !important;
+  z-index: 10 !important;
+  transition: opacity 0.2s ease !important;
+  border: none !important;
+  visibility: visible !important; /* Always visible in floating mode */
 }
 
 .grid-item .canvas-container .position-toggle-icon svg,

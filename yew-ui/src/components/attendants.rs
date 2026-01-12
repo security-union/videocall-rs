@@ -31,7 +31,10 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
+use crate::context::{
+    load_self_video_position_from_storage, save_self_video_position_to_storage, MeetingTime,
+    MeetingTimeCtx, VideoCallClientCtx,
+};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
@@ -403,7 +406,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
-            self_video_floating: false, // Start in grid position
+            self_video_floating: load_self_video_position_from_storage(),
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -591,6 +594,7 @@ impl Component for AttendantsComponent {
                     }
                     UserScreenToggleAction::SelfVideoPosition => {
                         self.self_video_floating = !self.self_video_floating;
+                        save_self_video_position_to_storage(self.self_video_floating);
                     }
                 }
                 true

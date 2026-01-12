@@ -71,6 +71,7 @@ pub enum UserScreenToggleAction {
     Diagnostics,
     DeviceSettings,
     MeetingInfo,
+    SelfVideoPosition,
 }
 
 #[derive(Debug)]
@@ -161,6 +162,9 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    /// When true, self-video is rendered as floating overlay (original position);
+    /// when false, rendered as grid item
+    self_video_floating: bool,
 }
 
 impl AttendantsComponent {
@@ -399,6 +403,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            self_video_floating: false, // Start in grid position
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -583,6 +588,9 @@ impl Component for AttendantsComponent {
                             self.diagnostics_open = false;
                             self.device_settings_open = false;
                         }
+                    }
+                    UserScreenToggleAction::SelfVideoPosition => {
+                        self.self_video_floating = !self.self_video_floating;
                     }
                 }
                 true
@@ -817,9 +825,9 @@ impl Component for AttendantsComponent {
                     <BrowserCompatibility/>
                 <div id="grid-container"
                     class={grid_container_classes}
-                    data-peers={(num_peers_for_styling + if media_access_granted { 1 } else { 0 }).to_string()}
+                    data-peers={(num_peers_for_styling + if media_access_granted && !self.self_video_floating { 1 } else { 0 }).to_string()}
                     style={container_style}>
-                    // Self-tile (Host component) rendered as a grid item
+                    // Self-tile (Host component) rendered as grid item or floating based on state
                     {
                         if media_access_granted && (users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty()) {
                             html! {
@@ -832,6 +840,8 @@ impl Component for AttendantsComponent {
                                     on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
                                     on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
                                     is_connected={self.client.is_connected()}
+                                    is_floating={self.self_video_floating}
+                                    on_position_toggle={ctx.link().callback(|_| UserScreenToggleAction::SelfVideoPosition)}
                                 />
                             }
                         } else {

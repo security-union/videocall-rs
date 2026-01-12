@@ -125,6 +125,14 @@ pub struct MeetingProps {
     /// Whether the client is connected to the server
     #[prop_or_default]
     pub is_connected: bool,
+
+    /// Whether the self-video is in floating position (true) or grid position (false)
+    #[prop_or_default]
+    pub is_floating: bool,
+
+    /// Callback to toggle the self-video position between floating and grid
+    #[prop_or_default]
+    pub on_position_toggle: Callback<MouseEvent>,
 }
 
 impl Component for Host {
@@ -477,10 +485,17 @@ impl Component for Host {
         // Get username from storage for display
         let username = load_username_from_storage().unwrap_or_else(|| "You".to_string());
 
+        // Determine container class based on floating state
+        let container_class = if ctx.props().is_floating {
+            "self-tile-floating"
+        } else {
+            "grid-item self-tile"
+        };
+
         html! {
             <>
-                // Self tile - rendered as a grid item
-                <div class="grid-item self-tile" id="self-video-div">
+                // Self tile - rendered as grid item or floating overlay based on is_floating prop
+                <div class={container_class} id="self-video-div">
                     <div class={classes!("canvas-container", if ctx.props().video_enabled { "video-on" } else { "" })}>
                         // Video element - ALWAYS present in DOM for CameraEncoder, hidden via CSS when video is off
                         <video
@@ -555,6 +570,35 @@ impl Component for Host {
                             <PushPinIcon/>
                         </button>
 
+                        // Position toggle button (hover-only) - switches between grid and floating
+                        <button
+                            onclick={ctx.props().on_position_toggle.clone()}
+                            class="position-toggle-icon"
+                            title={if ctx.props().is_floating { "Move to grid" } else { "Move to corner" }}
+                        >
+                            {
+                                if ctx.props().is_floating {
+                                    // Grid icon - when floating, click to go back to grid
+                                    html! {
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <rect x="3" y="3" width="7" height="7"></rect>
+                                            <rect x="14" y="3" width="7" height="7"></rect>
+                                            <rect x="14" y="14" width="7" height="7"></rect>
+                                            <rect x="3" y="14" width="7" height="7"></rect>
+                                        </svg>
+                                    }
+                                } else {
+                                    // Picture-in-picture / corner icon - when in grid, click to float
+                                    html! {
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <rect x="2" y="2" width="20" height="14" rx="2"></rect>
+                                            <rect x="12" y="10" width="8" height="8" rx="1" fill="currentColor" opacity="0.3"></rect>
+                                        </svg>
+                                    }
+                                }
+                            }
+                        </button>
+
                         // Edit name button (hover-only, positioned like pin/crop icons)
                         <button class="edit-name-icon" title="Change name"
                             onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
@@ -564,25 +608,57 @@ impl Component for Host {
                             </svg>
                         </button>
 
-                        // Device selector icons (hover-only, inside the canvas)
-                        <div class="self-tile-device-selectors">
-                            // Connection LED indicator
-                            <div class={classes!("connection-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
-                                title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
-                            </div>
-                            <DeviceSelector
-                                microphones={microphones.clone()}
-                                cameras={cameras.clone()}
-                                speakers={speakers.clone()}
-                                selected_microphone_id={selected_microphone_id.clone()}
-                                selected_camera_id={selected_camera_id.clone()}
-                                selected_speaker_id={selected_speaker_id.clone()}
-                                on_microphone_select={mic_callback.clone()}
-                                on_camera_select={cam_callback.clone()}
-                                on_speaker_select={speaker_callback.clone()}
-                            />
-                        </div>
+                        // Device selector icons - inside canvas-container when in grid mode (hover-only)
+                        {
+                            if !ctx.props().is_floating {
+                                html! {
+                                    <div class="self-tile-device-selectors">
+                                        <div class={classes!("connection-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
+                                            title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
+                                        </div>
+                                        <DeviceSelector
+                                            microphones={microphones.clone()}
+                                            cameras={cameras.clone()}
+                                            speakers={speakers.clone()}
+                                            selected_microphone_id={selected_microphone_id.clone()}
+                                            selected_camera_id={selected_camera_id.clone()}
+                                            selected_speaker_id={selected_speaker_id.clone()}
+                                            on_microphone_select={mic_callback.clone()}
+                                            on_camera_select={cam_callback.clone()}
+                                            on_speaker_select={speaker_callback.clone()}
+                                        />
+                                    </div>
+                                }
+                            } else {
+                                html! {}
+                            }
+                        }
                     </div>
+                    // Device selectors - outside canvas-container when floating (always visible below video)
+                    {
+                        if ctx.props().is_floating {
+                            html! {
+                                <div class="self-tile-device-selectors floating-selectors">
+                                    <div class={classes!("connection-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
+                                        title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
+                                    </div>
+                                    <DeviceSelector
+                                        microphones={microphones.clone()}
+                                        cameras={cameras.clone()}
+                                        speakers={speakers.clone()}
+                                        selected_microphone_id={selected_microphone_id.clone()}
+                                        selected_camera_id={selected_camera_id.clone()}
+                                        selected_speaker_id={selected_speaker_id.clone()}
+                                        on_microphone_select={mic_callback.clone()}
+                                        on_camera_select={cam_callback.clone()}
+                                        on_speaker_select={speaker_callback.clone()}
+                                    />
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }
+                    }
                 </div>
 
                 // Mobile Device Settings Modal (keep for mobile support)

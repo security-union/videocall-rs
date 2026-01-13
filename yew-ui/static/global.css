@@ -1541,6 +1541,19 @@ body {
   object-fit: cover;
 }
 
+/* Hide audio indicator in floating mode - mute control is in meeting controls */
+.self-tile-floating .audio-indicator {
+  display: none;
+}
+
+/* Connection LED in upper right corner of floating self video */
+.self-tile-floating .connection-led.floating-led {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 10;
+}
+
 /* Placeholder fills the canvas container in floating mode */
 .self-tile-floating .canvas-container .placeholder-content {
   position: absolute;

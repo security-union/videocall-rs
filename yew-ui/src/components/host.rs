@@ -634,14 +634,23 @@ impl Component for Host {
                             }
                         }
                     </div>
+                    // Connection LED - positioned in upper right corner when floating
+                    {
+                        if ctx.props().is_floating {
+                            html! {
+                                <div class={classes!("connection-led", "floating-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
+                                    title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
+                                </div>
+                            }
+                        } else {
+                            html! {}
+                        }
+                    }
                     // Device selectors - outside canvas-container when floating (always visible below video)
                     {
                         if ctx.props().is_floating {
                             html! {
                                 <div class="self-tile-device-selectors floating-selectors">
-                                    <div class={classes!("connection-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
-                                        title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
-                                    </div>
                                     <DeviceSelector
                                         microphones={microphones.clone()}
                                         cameras={cameras.clone()}

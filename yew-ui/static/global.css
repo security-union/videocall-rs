@@ -1503,8 +1503,8 @@ body {
   bottom: 15px;
   right: 16px;
   width: 25%;
-  max-width: 360px;
-  min-width: 280px;
+  max-width: 240px;
+  min-width: 150px;
   border-radius: 12px;
   overflow: visible; /* Allow hover icons to show outside bounds */
   z-index: 15;
@@ -1647,12 +1647,12 @@ body {
     display: none !important;
   }
 
-  /* Floating self-tile adjustments for mobile */
+  /* Floating self-tile adjustments for mobile - position above video controls */
   .self-tile-floating {
     width: 40%;
     max-width: 200px;
     min-width: 160px;
-    bottom: 15px;
+    bottom: 95px; /* Above video controls (~70px height + 16px bottom margin) */
     right: 8px;
   }
 }

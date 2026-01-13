@@ -661,7 +661,6 @@ canvas {
     0.85
   ); /* Darker, slightly transparent background for the selectors area */
   flex-shrink: 0; /* ADDED: Prevent this container from shrinking */
-  border-top: 1px solid #444; /* Separator line if video is above */
   border-radius: 0 0 6px 6px; /* Rounded bottom corners */
 }
 

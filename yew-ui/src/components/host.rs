@@ -523,8 +523,23 @@ impl Component for Host {
                             }
                         }
 
-                        // Floating name chip (like peer tiles)
-                        <h4 class="floating-name" title={username.clone()} dir={"auto"}>{username}{" (You)"}</h4>
+                        // Floating name chip with LED when floating
+                        {
+                            if ctx.props().is_floating {
+                                html! {
+                                    <div class="floating-name-wrapper">
+                                        <div class={classes!("connection-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
+                                            title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
+                                        </div>
+                                        <h4 class="floating-name" title={username.clone()} dir={"auto"}>{username.clone()}{" (You)"}</h4>
+                                    </div>
+                                }
+                            } else {
+                                html! {
+                                    <h4 class="floating-name" title={username.clone()} dir={"auto"}>{username}{" (You)"}</h4>
+                                }
+                            }
+                        }
 
                         // Audio indicator (showing mic status)
                         <div class="audio-indicator">
@@ -634,18 +649,6 @@ impl Component for Host {
                             }
                         }
                     </div>
-                    // Connection LED - positioned in upper right corner when floating
-                    {
-                        if ctx.props().is_floating {
-                            html! {
-                                <div class={classes!("connection-led", "floating-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
-                                    title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
-                                </div>
-                            }
-                        } else {
-                            html! {}
-                        }
-                    }
                     // Device selectors - outside canvas-container when floating (always visible below video)
                     {
                         if ctx.props().is_floating {

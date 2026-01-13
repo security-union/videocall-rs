@@ -537,15 +537,15 @@ body {
 .video-controls-container {
   position: fixed;
   left: 50%;
-  bottom: 16px; /* minimal safe space */
+  bottom: 12px; /* minimal safe space */
   transform: translateX(-50%);
   display: flex;
-  gap: 1.2rem; /* add breathing room between control buttons */
+  gap: 1rem; /* add breathing room between control buttons */
   z-index: 100;
-  padding: 0.6rem 1.25rem;
+  padding: 0.5rem 1.1rem;
   background: rgba(28, 28, 30, 0.85);
   backdrop-filter: blur(14px);
-  border-radius: 2.5rem;
+  border-radius: 2.2rem;
   border: 1px solid #38383A;
   box-shadow: 0 10px 25px -5px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.05);
   transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
@@ -564,8 +564,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 3.1rem;
-  height: 3.1rem;
+  width: 2.75rem;
+  height: 2.75rem;
   border-radius: 50%;
   background-color: #1C1C1E;
   border: 1px solid #48484A;
@@ -619,8 +619,8 @@ body {
 }
 
 .video-control-button svg {
-  width: 1.5rem;
-  height: 1.5rem;
+  width: 1.35rem;
+  height: 1.35rem;
   transition: transform 0.2s ease;
 }
 
@@ -1294,10 +1294,27 @@ body {
   }
 }
 
-/* Hide pin icon on mobile – tap tile to pin instead */
+/* Hide pin/crop icons on mobile for peer tiles – tap tile to pin instead */
 @media (max-width: 767px) {
-  .grid-item .canvas-container .pin-icon { display: none !important; }
-  .grid-item .canvas-container .crop-icon { display: none !important; }
+  .grid-item:not(.self-tile) .canvas-container .pin-icon { display: none !important; }
+  .grid-item:not(.self-tile) .canvas-container .crop-icon { display: none !important; }
+
+  /* Self-tile in grid mode: show hover buttons on mobile */
+  .grid-item.self-tile .canvas-container .pin-icon,
+  .grid-item.self-tile .canvas-container .crop-icon,
+  .grid-item.self-tile .canvas-container .edit-name-icon,
+  .grid-item.self-tile .canvas-container .position-toggle-icon {
+    opacity: 0 !important;
+    visibility: hidden !important;
+    display: block !important;
+  }
+  .grid-item.self-tile .canvas-container:hover .pin-icon,
+  .grid-item.self-tile .canvas-container:hover .crop-icon,
+  .grid-item.self-tile .canvas-container:hover .edit-name-icon,
+  .grid-item.self-tile .canvas-container:hover .position-toggle-icon {
+    visibility: visible !important;
+    opacity: 0.6 !important;
+  }
 }
 
 .grid-item .canvas-container canvas.cropped { object-fit: cover !important; }
@@ -1448,9 +1465,44 @@ body {
   }
 }
 
-/* Hide edit name icon on mobile */
+/* Hide edit name icon on mobile for peer tiles only */
 @media (max-width: 767px) {
-  .grid-item .canvas-container .edit-name-icon { display: none !important; }
+  .grid-item:not(.self-tile) .canvas-container .edit-name-icon { display: none !important; }
+}
+
+/* Self-tile fills entire screen when alone in meeting */
+#grid-container[data-peers="1"] {
+  grid-auto-rows: calc(100vh - 100px) !important;
+}
+
+#grid-container[data-peers="1"] .grid-item.self-tile {
+  width: 100%;
+  height: calc(100vh - 100px);
+}
+
+#grid-container[data-peers="1"] .grid-item.self-tile .canvas-container {
+  width: 100%;
+  height: 100%;
+}
+
+#grid-container[data-peers="1"] .grid-item.self-tile .self-camera {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* Self-tile button positioning - shifted right since audio indicator is hidden */
+.grid-item.self-tile .canvas-container .position-toggle-icon {
+  right: 8px !important;
+}
+.grid-item.self-tile .canvas-container .edit-name-icon {
+  right: 48px !important;
+}
+.grid-item.self-tile .canvas-container .crop-icon {
+  right: 88px !important;
+}
+.grid-item.self-tile .canvas-container .pin-icon {
+  right: 128px !important;
 }
 
 /* Self-tile device selectors - positioned on right bottom corner of self-tile, visible on hover */
@@ -1541,17 +1593,31 @@ body {
   object-fit: cover;
 }
 
-/* Hide audio indicator in floating mode - mute control is in meeting controls */
+/* Hide audio indicator in self-tile - mute control is in meeting controls */
+.self-tile .audio-indicator,
 .self-tile-floating .audio-indicator {
   display: none;
 }
 
-/* Connection LED in upper right corner of floating self video */
-.self-tile-floating .connection-led.floating-led {
+/* Floating name wrapper with LED - positioned like floating-name */
+.self-tile-floating .floating-name-wrapper {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 10;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  z-index: 2;
+}
+
+/* Hide name in floating mode, keep LED visible */
+.self-tile-floating .floating-name-wrapper .floating-name {
+  display: none;
+}
+
+.self-tile-floating .floating-name-wrapper .connection-led {
+  position: static;
+  flex-shrink: 0;
 }
 
 /* Placeholder fills the canvas container in floating mode */
@@ -1586,7 +1652,6 @@ body {
   padding: 8px 10px;
   border-radius: 0 0 10px 10px;
   border: none;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
   opacity: 1;
   visibility: visible;
   flex-shrink: 0;
@@ -1612,11 +1677,11 @@ body {
   visibility: hidden !important;
 }
 
-/* Position toggle icon in floating mode - next to the audio indicator (mic) */
+/* Position toggle icon in floating mode - upper right corner */
 .self-tile-floating .canvas-container .position-toggle-icon {
   position: absolute !important;
   top: 8px !important;
-  right: 48px !important; /* Next to audio indicator: 8px edge + 32px mic + 8px gap */
+  right: 8px !important;
   left: auto !important;
   transform: none !important;
   opacity: 0.6 !important;
@@ -1632,6 +1697,33 @@ body {
   visibility: visible !important; /* Always visible in floating mode */
 }
 
+/* Edit name icon in floating mode - next to position toggle */
+.self-tile-floating .canvas-container .edit-name-icon {
+  position: absolute !important;
+  top: 8px !important;
+  right: 48px !important; /* Next to position toggle: 8px + 32px button + 8px gap */
+  left: auto !important;
+  transform: none !important;
+  opacity: 0.6 !important;
+  background-color: rgba(0, 0, 0, 0.6) !important;
+  border-radius: 50% !important;
+  padding: 6px !important;
+  text-align: center !important;
+  line-height: 1 !important;
+  cursor: pointer !important;
+  z-index: 10 !important;
+  transition: opacity 0.2s ease !important;
+  border: none !important;
+  visibility: hidden !important;
+}
+
+.self-tile-floating .canvas-container .edit-name-icon svg {
+  width: 20px !important;
+  height: 20px !important;
+  display: block !important;
+  stroke: white;
+}
+
 .grid-item .canvas-container .position-toggle-icon svg,
 .self-tile-floating .canvas-container .position-toggle-icon svg {
   width: 20px !important;
@@ -1640,24 +1732,38 @@ body {
   stroke: white;
 }
 
-/* Show position toggle icon on hover (desktop) */
+/* Show position toggle and edit name icons on hover (desktop) */
 @media (min-width: 768px) {
   .grid-item .canvas-container .position-toggle-icon,
-  .self-tile-floating .canvas-container .position-toggle-icon {
+  .self-tile-floating .canvas-container .position-toggle-icon,
+  .self-tile-floating .canvas-container .edit-name-icon {
     opacity: 0 !important;
   }
   .grid-item .canvas-container:hover .position-toggle-icon,
-  .self-tile-floating .canvas-container:hover .position-toggle-icon {
+  .self-tile-floating .canvas-container:hover .position-toggle-icon,
+  .self-tile-floating .canvas-container:hover .edit-name-icon {
     visibility: visible !important;
     opacity: 0.6 !important;
   }
 }
 
-/* Hide position toggle icon on mobile */
+/* Hide position toggle icon on mobile for peer tiles only */
 @media (max-width: 767px) {
-  .grid-item .canvas-container .position-toggle-icon,
-  .self-tile-floating .canvas-container .position-toggle-icon {
+  .grid-item:not(.self-tile) .canvas-container .position-toggle-icon {
     display: none !important;
+  }
+
+  /* Show edit name and position toggle on hover for floating self-tile on mobile */
+  .self-tile-floating .canvas-container .position-toggle-icon,
+  .self-tile-floating .canvas-container .edit-name-icon {
+    opacity: 0 !important;
+    visibility: hidden !important;
+    display: block !important;
+  }
+  .self-tile-floating .canvas-container:hover .position-toggle-icon,
+  .self-tile-floating .canvas-container:hover .edit-name-icon {
+    visibility: visible !important;
+    opacity: 0.6 !important;
   }
 
   /* Floating self-tile adjustments for mobile - position above video controls */

@@ -54,7 +54,7 @@ pub struct ChatServer {
 }
 
 impl ChatServer {
-    pub async fn new(nats_connection: async_nats::client::Client, pool: PgPool) -> Self {
+    pub async fn new(nats_connection: async_nats::client::Client, pool: Option<PgPool>) -> Self {
         ChatServer {
             nats_connection,
             active_subs: HashMap::new(),

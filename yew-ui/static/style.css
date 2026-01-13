@@ -536,32 +536,26 @@ canvas {
 /* Host camera frame rendered in the bottom right corner */
 .host {
   position: absolute;
-  bottom: 16px; /* Default spacing from bottom */
-  right: 16px; /* Default spacing from right */
-  width: 20%; /* Default width */
-  max-width: 240px; /* Max width to prevent it from being too large on wide screens */
-  min-width: 145px; /* Min width to ensure it's usable, increased to accommodate selectors */
-  /* height: auto; */ /* Let content dictate height with flex */
-  /* aspect-ratio: 16/9; */ /* Aspect ratio might be tricky with added selectors, manage via video element */
-  /* border: 2px solid #444; */
+  bottom: 16px;
+  right: 16px;
+  width: 20%;
+  max-width: 240px;
+  min-width: 145px;
   border-radius: 8px;
-  /* overflow: hidden; */ /* Remove to prevent clipping, flexbox will manage layout */
-  z-index: 15; /* Make sure it's above the grid items if any overlap occurs */
-  background-color: #1c1c1c; /* Slightly different background for the host box */
-  display: flex; /* ADDED for layout */
-  flex-direction: column; /* ADDED: Stack video and selectors vertically */
+  z-index: 15;
+  background-color: #1c1c1c;
+  display: flex;
+  flex-direction: column;
 }
 
-.host canvas, /* Target canvas if used directly by video encoder */
+.host canvas,
 .host .self-camera {
-  /* Target video element */
   width: 100%;
-  /* height: 100%; */ /* Let flexbox determine height or set specific flex properties */
-  object-fit: contain; /* Contain to ensure full video is visible */
-  flex-grow: 1; /* ADDED: Allow video to take up available space */
-  min-height: 0; /* ADDED: Important for flex item shrinking */
-  background-color: #000; /* Background for video area */
-  border-radius: 6px 6px 0 0; /* Rounded top corners if selectors are below */
+  object-fit: contain;
+  flex-grow: 1;
+  min-height: 0;
+  background-color: #000;
+  border-radius: 6px 6px 0 0;
 }
 
 .hidden {
@@ -637,8 +631,6 @@ canvas {
   left: 0;
   margin-top: 0;
   margin-left: 0;
-  /* ADDED: Ensure controls (if this refers to device selectors) are styled */
-  /* This class seems generic, the more specific .device-selector-wrapper is better */
 }
 
 .device-selector {
@@ -652,8 +644,7 @@ canvas {
 }
 
 .device-selector-wrapper {
-  /* margin-bottom: 20px; */ /* Original, might not be needed with flex */
-  padding: 8px 5px 5px 5px; /* Add padding */
+  padding: 8px 5px 5px 5px;
   background-color: rgba(
     30,
     30,

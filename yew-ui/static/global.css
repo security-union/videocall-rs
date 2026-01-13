@@ -1473,11 +1473,14 @@ body {
 /* Self-tile fills entire screen when alone in meeting */
 #grid-container[data-peers="1"] {
   grid-auto-rows: calc(100vh - 100px) !important;
+  align-content: start;
+  align-items: start;
 }
 
 #grid-container[data-peers="1"] .grid-item.self-tile {
   width: 100%;
   height: calc(100vh - 100px);
+  max-height: calc(100vh - 100px);
 }
 
 #grid-container[data-peers="1"] .grid-item.self-tile .canvas-container {
@@ -1489,6 +1492,24 @@ body {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+/* Mobile adjustments for self-tile when alone */
+@media (max-width: 600px) {
+  #grid-container[data-peers="1"] {
+    padding: 8px !important;
+    align-content: start !important;
+    align-items: start !important;
+    justify-content: center;
+    overflow: hidden;
+    grid-auto-rows: auto !important;
+  }
+
+  #grid-container[data-peers="1"] .grid-item.self-tile {
+    height: auto;
+    max-height: calc(100vh - 80px);
+    aspect-ratio: 16/9;
+  }
 }
 
 /* Self-tile button positioning - shifted right since audio indicator is hidden */

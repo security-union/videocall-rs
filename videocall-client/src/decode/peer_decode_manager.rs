@@ -281,7 +281,7 @@ impl Peer {
                     let audio_state_changed = self.audio_enabled != metadata.audio_enabled;
 
                     if !metadata.audio_enabled {
-                                self.is_speaking = false;
+                        self.is_speaking = false;
                     }
 
                     // Set mute state on audio decoder when audio state changes (before updating state)

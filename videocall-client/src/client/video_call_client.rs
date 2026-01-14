@@ -585,6 +585,14 @@ impl VideoCallClient {
         None
     }
 
+    pub fn is_peer_speaking(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.peer_decode_manager.is_peer_speaking(key)
+        } else {
+            false
+        }
+    }
+
     /// Send RTT probes manually (for testing)
     pub fn send_rtt_probes(&self) -> anyhow::Result<()> {
         if let Ok(inner) = self.inner.try_borrow() {

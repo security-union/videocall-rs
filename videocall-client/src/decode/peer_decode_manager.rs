@@ -87,6 +87,8 @@ pub struct Peer {
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub screen_enabled: bool,
+    pub is_speaking: bool,
+    last_audio_packet_time: std::time::Instant
     context_initialized: bool,
 }
 
@@ -128,6 +130,8 @@ impl Peer {
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
+            is_speaking: false,
+            last_audio_packet_time: std::time::Instant::now(),
             context_initialized: false,
         })
     }
@@ -234,6 +238,7 @@ impl Peer {
                 if !self.audio_enabled {
                     // Peer is muted, don't send packet to NetEq to avoid expand packets (hissing sound)
                     debug!("Peer {} is muted, skipping audio packet", self.email);
+                    self.is_speaking = false;
                     Ok((
                         media_type,
                         DecodeStatus {
@@ -242,6 +247,8 @@ impl Peer {
                         },
                     ))
                 } else {
+                    self.last_audio_packet_time = std::time::Instant::now();
+                    self.is_speaking = true;
                     Ok((
                         media_type,
                         self.audio
@@ -272,6 +279,10 @@ impl Peer {
                     let audio_turned_off = self.audio_enabled && !metadata.audio_enabled;
                     // Check if audio state changed at all
                     let audio_state_changed = self.audio_enabled != metadata.audio_enabled;
+
+                    if !metadata.audio_enabled {
+                                self.is_speaking = false;
+                    }
 
                     // Set mute state on audio decoder when audio state changes (before updating state)
                     if audio_state_changed {
@@ -410,6 +421,18 @@ impl PeerDecodeManager {
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
             diagnostics: None,
             on_peer_removed: Callback::noop(),
+        }
+    }
+
+    pub fn is_peer_speaking(&self, key: &String) -> bool {
+        if let Some(peer) = self.get(key) {
+            if !peer.audio_enabled {
+                return false;
+            }
+            let silence_duration = std::time::Instant::now().duration_since(peer.last_audio_packet_time);
+            peer.is_speaking && silence_duration.as_millis() < 300
+        } else {
+            false
         }
     }
 

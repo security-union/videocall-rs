@@ -89,6 +89,7 @@ fn reset_test_packet_counters() {
     counters_map.clear();
 }
 
+use videocall_types::feature_flags::FeatureFlags;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
@@ -210,10 +211,17 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
             .await
             .unwrap();
 
-    // Create database pool
-    let pool = db_pool::create_pool()
-        .await
-        .expect("Failed to create database pool");
+    // Create database pool only if enabled
+    let pool = if FeatureFlags::database_enabled() {
+        Some(
+            db_pool::create_pool()
+                .await
+                .expect("Failed to create database pool"),
+        )
+    } else {
+        warn!("DATABASE_ENABLED=false, database features will be disabled");
+        None
+    };
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
@@ -248,7 +256,7 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     nc: async_nats::client::Client,
-    pool: PgPool,
+    pool: Option<PgPool>,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
     warn!("received WebTransport request: {}", request.url());
@@ -293,10 +301,10 @@ async fn handle_webtransport_session(
     username: &str,
     lobby_id: &str,
     nc: async_nats::client::Client,
-    pool: PgPool,
+    pool: Option<PgPool>,
     tracker_sender: TrackerSender,
 ) -> anyhow::Result<()> {
-    let session_manager = SessionManager::new(pool);
+    let session_manager = SessionManager::new(pool.clone());
     // Generate unique session ID for this WebTransport connection
     let session_id = uuid::Uuid::new_v4().to_string();
 

@@ -88,7 +88,7 @@ pub struct Peer {
     pub audio_enabled: bool,
     pub screen_enabled: bool,
     pub is_speaking: bool,
-    last_audio_packet_time: std::time::Instant
+    last_audio_packet_time: std::time::Instant,
     context_initialized: bool,
 }
 

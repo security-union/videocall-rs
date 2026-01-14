@@ -377,7 +377,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-create-1";
 
         cleanup_test_room(&pool, room_id).await;
@@ -422,7 +422,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-join-2";
 
         cleanup_test_room(&pool, room_id).await;
@@ -473,7 +473,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-creator-id";
 
         cleanup_test_room(&pool, room_id).await;
@@ -525,7 +525,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-leave-3";
 
         cleanup_test_room(&pool, room_id).await;
@@ -583,7 +583,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-host-4";
 
         cleanup_test_room(&pool, room_id).await;
@@ -626,7 +626,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
 
         cleanup_test_room(&pool, "room-a-iso").await;
         cleanup_test_room(&pool, "room-b-iso").await;
@@ -700,7 +700,7 @@ mod tests {
     #[serial]
     async fn test_system_email_rejected() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-system-7";
 
         cleanup_test_room(&pool, room_id).await;
@@ -734,7 +734,7 @@ mod tests {
     #[serial]
     async fn test_feature_flag_off_start_session_returns_defaults() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-ff-off-8";
 
         cleanup_test_room(&pool, room_id).await;
@@ -776,7 +776,7 @@ mod tests {
     #[serial]
     async fn test_feature_flag_off_end_session_returns_noop() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-ff-off-9";
 
         cleanup_test_room(&pool, room_id).await;
@@ -803,7 +803,7 @@ mod tests {
     #[serial]
     async fn test_feature_flag_on_normal_behavior() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-ff-on-10";
 
         cleanup_test_room(&pool, room_id).await;
@@ -849,7 +849,7 @@ mod tests {
     #[serial]
     async fn test_feature_flag_off_is_host_returns_false() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-ff-host-11";
 
         cleanup_test_room(&pool, room_id).await;

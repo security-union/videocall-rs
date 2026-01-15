@@ -11,7 +11,7 @@ RUN mkdir -p /app/binaries && \
     -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
     -exec cp {} /app/binaries/ \;
 
-FROM debian:bookworm-slim as production
+FROM debian:trixie-slim as production
 
 RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
 

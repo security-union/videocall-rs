@@ -36,6 +36,10 @@ pub struct FeatureFlags {
     /// Enable meeting lifecycle management (creation, tracking, host controls).
     /// Env: FEATURE_MEETING_MANAGEMENT=true
     pub meeting_management: bool,
+
+    /// Enable database connections (PostgreSQL).
+    /// Env: DATABASE_ENABLED=true
+    pub database: bool,
 }
 
 impl FeatureFlags {
@@ -43,6 +47,7 @@ impl FeatureFlags {
     fn from_env() -> Self {
         Self {
             meeting_management: read_bool_env("MEETING_MANAGEMENT"),
+            database: read_bool_no_prefix("DATABASE_ENABLED"),
         }
     }
 
@@ -62,6 +67,12 @@ impl FeatureFlags {
             OVERRIDE_FALSE => false,
             _ => Self::global().meeting_management,
         }
+    }
+
+    /// Check if database is enabled.
+    #[inline]
+    pub fn database_enabled() -> bool {
+        Self::global().database
     }
 
     /// Override meeting_management flag for testing.
@@ -92,6 +103,14 @@ impl FeatureFlags {
 fn read_bool_env(name: &str) -> bool {
     let full_name = format!("{ENV_PREFIX}{name}");
     std::env::var(&full_name)
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Read a boolean environment variable without prefix (for legacy env vars like DATABASE_ENABLED).
+/// Returns false if not set or not a truthy value.
+fn read_bool_no_prefix(name: &str) -> bool {
+    std::env::var(name)
         .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(false)
 }

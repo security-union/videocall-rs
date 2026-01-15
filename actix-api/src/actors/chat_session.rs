@@ -397,10 +397,10 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat = ChatServer::new(nats_client.clone(), pool.clone())
+        let chat = ChatServer::new(nats_client.clone(), Some(pool.clone()))
             .await
             .start();
-        let session_manager = SessionManager::new(pool);
+        let session_manager = SessionManager::new(Some(pool));
 
         let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
 

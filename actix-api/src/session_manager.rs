@@ -74,11 +74,11 @@ pub enum SessionEndResult {
 /// All state is persisted in PostgreSQL - no in-memory state.
 #[derive(Debug, Clone)]
 pub struct SessionManager {
-    pool: PgPool,
+    pool: Option<PgPool>,
 }
 
 impl SessionManager {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: Option<PgPool>) -> Self {
         Self { pool }
     }
 
@@ -112,12 +112,28 @@ impl SessionManager {
             });
         }
 
+        // Check if database pool is available
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => {
+                // No database - return defaults
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                return Ok(SessionStartResult {
+                    start_time_ms: now_ms,
+                    is_first_participant: true,
+                    creator_id: user_id.to_string(),
+                });
+            }
+        };
+
         // Record participant join in DB
-        SessionParticipant::join(&self.pool, room_id, user_id).await?;
+        SessionParticipant::join(pool, room_id, user_id).await?;
 
         // Check if this is the first participant
-        let is_first_participant =
-            SessionParticipant::is_first_participant(&self.pool, room_id).await?;
+        let is_first_participant = SessionParticipant::is_first_participant(pool, room_id).await?;
 
         // Get or create meeting
         let (start_time_ms, creator_id) = if is_first_participant {
@@ -125,14 +141,14 @@ impl SessionManager {
                 "First participant {} joined room {}, starting meeting",
                 user_id, room_id
             );
-            let meeting = Meeting::create_async(&self.pool, room_id, Some(user_id)).await?;
+            let meeting = Meeting::create_async(pool, room_id, Some(user_id)).await?;
             (
                 meeting.start_time_unix_ms() as u64,
                 meeting.creator_id.unwrap_or_else(|| user_id.to_string()),
             )
         } else {
             // Get existing meeting info (start time and creator)
-            match Meeting::get_by_room_id_async(&self.pool, room_id).await? {
+            match Meeting::get_by_room_id_async(pool, room_id).await? {
                 Some(meeting) => (
                     meeting.start_time_unix_ms() as u64,
                     meeting.creator_id.unwrap_or_else(|| user_id.to_string()),
@@ -140,7 +156,7 @@ impl SessionManager {
                 None => {
                     // Edge case: meeting doesn't exist but participants do
                     // This shouldn't happen but handle it gracefully
-                    let meeting = Meeting::create_async(&self.pool, room_id, Some(user_id)).await?;
+                    let meeting = Meeting::create_async(pool, room_id, Some(user_id)).await?;
                     (
                         meeting.start_time_unix_ms() as u64,
                         meeting.creator_id.unwrap_or_else(|| user_id.to_string()),
@@ -170,14 +186,20 @@ impl SessionManager {
             return Ok(SessionEndResult::MeetingContinues { remaining_count: 0 });
         }
 
+        // Check if database pool is available
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(SessionEndResult::MeetingContinues { remaining_count: 0 }),
+        };
+
         // Check if user is host before marking them as left
         let is_host = self.is_host(room_id, user_id).await;
 
         // Mark participant as left in DB
-        SessionParticipant::leave(&self.pool, room_id, user_id).await?;
+        SessionParticipant::leave(pool, room_id, user_id).await?;
 
         // Get remaining count from DB
-        let remaining_count = SessionParticipant::count_active(&self.pool, room_id).await?;
+        let remaining_count = SessionParticipant::count_active(pool, room_id).await?;
 
         // Determine what to do
         if is_host && remaining_count > 0 {
@@ -187,9 +209,9 @@ impl SessionManager {
                 user_id, room_id, remaining_count
             );
             // Mark all remaining participants as left
-            SessionParticipant::leave_all(&self.pool, room_id).await?;
+            SessionParticipant::leave_all(pool, room_id).await?;
             // End meeting in DB
-            if let Err(e) = Meeting::end_meeting_async(&self.pool, room_id).await {
+            if let Err(e) = Meeting::end_meeting_async(pool, room_id).await {
                 error!("Error ending meeting: {}", e);
             }
             Ok(SessionEndResult::HostEndedMeeting)
@@ -199,7 +221,7 @@ impl SessionManager {
                 "Last participant {} left room {} - ending meeting",
                 user_id, room_id
             );
-            if let Err(e) = Meeting::end_meeting_async(&self.pool, room_id).await {
+            if let Err(e) = Meeting::end_meeting_async(pool, room_id).await {
                 error!("Error ending meeting: {}", e);
             }
             Ok(SessionEndResult::LastParticipantLeft)
@@ -220,9 +242,12 @@ impl SessionManager {
         if !FeatureFlags::meeting_management_enabled() {
             return 0;
         }
-        SessionParticipant::count_active(&self.pool, room_id)
-            .await
-            .unwrap_or(0)
+        match &self.pool {
+            Some(pool) => SessionParticipant::count_active(pool, room_id)
+                .await
+                .unwrap_or(0),
+            None => 0,
+        }
     }
 
     /// Check if a user is the host/creator of a room
@@ -232,7 +257,11 @@ impl SessionManager {
         if !FeatureFlags::meeting_management_enabled() {
             return false;
         }
-        match Meeting::get_by_room_id_async(&self.pool, room_id).await {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return false,
+        };
+        match Meeting::get_by_room_id_async(pool, room_id).await {
             Ok(Some(meeting)) => meeting.creator_id.as_deref() == Some(user_id),
             _ => false,
         }
@@ -243,7 +272,10 @@ impl SessionManager {
         &self,
         room_id: &str,
     ) -> Result<Option<Meeting>, Box<dyn std::error::Error + Send + Sync>> {
-        Meeting::get_by_room_id_async(&self.pool, room_id).await
+        match &self.pool {
+            Some(pool) => Meeting::get_by_room_id_async(pool, room_id).await,
+            None => Ok(None),
+        }
     }
 
     /// Build MEETING_STARTED packet to send to client (protobuf)
@@ -290,8 +322,8 @@ impl SessionManager {
     }
 
     /// Get the database pool (for passing to other components)
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    pub fn pool(&self) -> Option<&PgPool> {
+        self.pool.as_ref()
     }
 }
 
@@ -345,7 +377,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-create-1";
 
         cleanup_test_room(&pool, room_id).await;
@@ -390,7 +422,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-join-2";
 
         cleanup_test_room(&pool, room_id).await;
@@ -441,7 +473,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-creator-id";
 
         cleanup_test_room(&pool, room_id).await;
@@ -493,7 +525,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-leave-3";
 
         cleanup_test_room(&pool, room_id).await;
@@ -551,7 +583,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-host-4";
 
         cleanup_test_room(&pool, room_id).await;
@@ -594,7 +626,7 @@ mod tests {
         setup_meeting_management_enabled();
 
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
 
         cleanup_test_room(&pool, "room-a-iso").await;
         cleanup_test_room(&pool, "room-b-iso").await;
@@ -668,7 +700,7 @@ mod tests {
     #[serial]
     async fn test_system_email_rejected() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-system-7";
 
         cleanup_test_room(&pool, room_id).await;
@@ -702,7 +734,7 @@ mod tests {
     #[serial]
     async fn test_feature_flag_off_start_session_returns_defaults() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-ff-off-8";
 
         cleanup_test_room(&pool, room_id).await;
@@ -744,7 +776,7 @@ mod tests {
     #[serial]
     async fn test_feature_flag_off_end_session_returns_noop() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-ff-off-9";
 
         cleanup_test_room(&pool, room_id).await;
@@ -771,7 +803,7 @@ mod tests {
     #[serial]
     async fn test_feature_flag_on_normal_behavior() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-ff-on-10";
 
         cleanup_test_room(&pool, room_id).await;
@@ -817,7 +849,7 @@ mod tests {
     #[serial]
     async fn test_feature_flag_off_is_host_returns_false() {
         let pool = get_test_pool().await;
-        let manager = SessionManager::new(pool.clone());
+        let manager = SessionManager::new(Some(pool.clone()));
         let room_id = "test-room-ff-host-11";
 
         cleanup_test_room(&pool, room_id).await;

@@ -46,8 +46,8 @@ use sec_api::{
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
 };
-use tracing::{debug, error, info};
-use videocall_types::truthy;
+use tracing::{debug, error, info, warn};
+use videocall_types::{feature_flags::FeatureFlags, truthy};
 
 const SCOPE: &str = "email profile";
 
@@ -342,10 +342,17 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to NATS");
 
-    // Create sqlx pool for session management
-    let sqlx_pool = db_pool::create_pool()
-        .await
-        .expect("Failed to create database pool");
+    // Create sqlx pool for session management only if database is enabled
+    let sqlx_pool = if FeatureFlags::database_enabled() {
+        Some(
+            db_pool::create_pool()
+                .await
+                .expect("Failed to create database pool"),
+        )
+    } else {
+        warn!("DATABASE_ENABLED=false, database features will be disabled");
+        None
+    };
 
     let chat = ChatServer::new(nats_client.clone(), sqlx_pool.clone())
         .await

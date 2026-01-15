@@ -31,7 +31,10 @@ use crate::constants::actix_websocket_base;
 use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
-use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
+use crate::context::{
+    load_self_video_position_from_storage, save_self_video_position_to_storage, MeetingTime,
+    MeetingTimeCtx, VideoCallClientCtx,
+};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
@@ -71,6 +74,7 @@ pub enum UserScreenToggleAction {
     Diagnostics,
     DeviceSettings,
     MeetingInfo,
+    SelfVideoPosition,
 }
 
 #[derive(Debug)]
@@ -161,6 +165,9 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    /// When true, self-video is rendered as floating overlay (original position);
+    /// when false, rendered as grid item
+    self_video_floating: bool,
 }
 
 impl AttendantsComponent {
@@ -399,6 +406,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            self_video_floating: load_self_video_position_from_storage(),
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -584,6 +592,10 @@ impl Component for AttendantsComponent {
                             self.device_settings_open = false;
                         }
                     }
+                    UserScreenToggleAction::SelfVideoPosition => {
+                        self.self_video_floating = !self.self_video_floating;
+                        save_self_video_position_to_storage(self.self_video_floating);
+                    }
                 }
                 true
             }
@@ -690,8 +702,11 @@ impl Component for AttendantsComponent {
             .take(CANVAS_LIMIT)
             .enumerate()
             .map(|(i, peer_id)| {
+                // Only apply full_bleed if we have exactly 1 peer AND no self-tile (media not granted)
+                // When media is granted, self-tile is shown so we have 2+ tiles
                 let full_bleed = display_peers_vec.len() == 1
-                    && !self.client.is_screen_share_enabled_for_peer(peer_id);
+                    && !self.client.is_screen_share_enabled_for_peer(peer_id)
+                    && !media_access_granted;
                 html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} /> }
             })
             .collect();
@@ -814,8 +829,29 @@ impl Component for AttendantsComponent {
                     <BrowserCompatibility/>
                 <div id="grid-container"
                     class={grid_container_classes}
-                    data-peers={num_peers_for_styling.to_string()}
+                    data-peers={(num_peers_for_styling + if media_access_granted && !self.self_video_floating { 1 } else { 0 }).to_string()}
                     style={container_style}>
+                    // Self-tile (Host component) rendered as grid item or floating based on state
+                    {
+                        if media_access_granted && (users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty()) {
+                            html! {
+                                <Host
+                                    share_screen={self.share_screen}
+                                    mic_enabled={self.mic_enabled}
+                                    video_enabled={self.video_enabled}
+                                    on_encoder_settings_update={on_encoder_settings_update.clone()}
+                                    device_settings_open={self.device_settings_open}
+                                    on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                    on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                    is_connected={self.client.is_connected()}
+                                    is_floating={self.self_video_floating}
+                                    on_position_toggle={ctx.link().callback(|_| UserScreenToggleAction::SelfVideoPosition)}
+                                />
+                            }
+                        } else {
+                            html! {}
+                        }
+                    }
                     { rows }
 
                     { // Invitation overlay when there are no connected peers
@@ -940,23 +976,6 @@ impl Component for AttendantsComponent {
                                             }
                                         } else { html!{} }
                                     }
-                                    {
-                                         if media_access_granted {
-                                             html! {<Host
-                                                 share_screen={self.share_screen}
-                                                 mic_enabled={self.mic_enabled}
-                                                 video_enabled={self.video_enabled}
-                                                 on_encoder_settings_update={on_encoder_settings_update}
-                                                 device_settings_open={self.device_settings_open}
-                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
-                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
-                                             />}
-                                         } else {
-                                             html! {<></>}
-                                         }
-                                    }
-                                    <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
-
                                 </nav>
                             }
                         } else {

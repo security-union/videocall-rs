@@ -5,6 +5,8 @@
 .mp4
 .env
 .claude
+#for jet brains products
+.idea
 target/
 helm/digital-ocean-secret
 helm/global/us-east/grafana/secret.yaml

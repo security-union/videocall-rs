@@ -40,12 +40,20 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
 
+    let border_style = if is_audio_enabled_for_peer {
+        "border: 3px solid #00ff41; box-shadow: 0 0 15px rgba(0, 255, 65, 0.5); border-radius: 8px; transition: all 0.2s;"
+    } else {
+        ""
+    };
+
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {
         let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+
         return html! {
             <div class="grid-item full-bleed" id={(*peer_video_div_id).clone()}>
                 <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
+                    style={border_style}
                     onclick={Callback::from({
                         let div_id = (*peer_video_div_id).clone();
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }
@@ -69,6 +77,7 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
     };
     let screen_share_div_id = Rc::new(format!("screen-share-{}-div", &key));
     let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
+
     html! {
         <>
             // Canvas for Screen share.
@@ -94,6 +103,7 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
             <div class="grid-item" id={(*peer_video_div_id).clone()}>
                 // One canvas for the User Video
                 <div class={classes!("canvas-container", if is_video_enabled_for_peer { "video-on" } else { "" })}
+                    style={border_style}
                     onclick={Callback::from({
                         let div_id = (*peer_video_div_id).clone();
                         move |_| { if is_mobile_viewport() { toggle_pinned_div(&div_id) } }

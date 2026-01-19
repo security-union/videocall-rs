@@ -1,0 +1,101 @@
+=========================================================================
+  ____   ____  _       _                                _  _          
+ |  _ \ / ___|| | ___ | |__    ___     _ __   ___  __ _| || |_   _   
+ | | | | |    | |/ _ \| '_ \  / _ \   | '__| / _ \/ _` | || | | | |  
+ | |_| | |___ | | (_) | |_) ||  __/   | |   |  __/ (_| | || | |_| |  
+ |____/ \____||_|\___/|_.__/  \___|   |_|    \___|\__,_|_||_|\__, |  
+                                                              |___/   
+=========================================================================
+
+Thank you for installing {{ .Chart.Name }} version {{ .Chart.Version }}!
+
+Your videocall application has been deployed with the following components:
+
+{{- if .Values.ui.enabled }}
+✓ UI Application
+  - Accessible at: {{ range .Values.ui.ingress.hosts }}{{ .host }}{{ end }}
+  - Service: {{ include "videocall.componentFullname" (dict "root" . "component" "ui") }}
+  - Replicas: {{ .Values.ui.replicaCount }}
+{{- end }}
+
+{{- if .Values.websocket.enabled }}
+✓ WebSocket API Server
+  - Accessible at: {{ range .Values.websocket.ingress.hosts }}{{ .host }} {{ end }}
+  - Service: {{ include "videocall.componentFullname" (dict "root" . "component" "websocket") }}
+  - Replicas: {{ .Values.websocket.replicaCount }}
+{{- end }}
+
+{{- if .Values.webtransport.enabled }}
+✓ WebTransport Server
+  - Domain: {{ .Values.webtransport.certificateDomain }}
+  - Service: {{ include "videocall.componentFullname" (dict "root" . "component" "webtransport") }}-lb
+  - Replicas: {{ .Values.webtransport.replicaCount }}
+{{- end }}
+
+{{- if .Values.website.enabled }}
+✓ Marketing Website
+  - Accessible at: {{ range .Values.website.ingress.hosts }}{{ .host }} {{ end }}
+  - Service: {{ include "videocall.componentFullname" (dict "root" . "component" "website") }}
+  - Replicas: {{ .Values.website.replicaCount }}
+{{- end }}
+
+{{- if .Values.metricsClient.enabled }}
+✓ Metrics Client (Client Metrics Collection)
+  - Metrics endpoint: http://{{ include "videocall.componentFullname" (dict "root" . "component" "metrics-client") }}:{{ .Values.metricsClient.service.port }}/metrics
+  - Service: {{ include "videocall.componentFullname" (dict "root" . "component" "metrics-client") }}
+  - Replicas: {{ .Values.metricsClient.replicaCount }}
+{{- end }}
+
+{{- if .Values.metricsServer.enabled }}
+✓ Metrics Server (Server Stats Tracking)
+  - Metrics endpoint: http://{{ include "videocall.componentFullname" (dict "root" . "component" "metrics-server") }}:{{ .Values.metricsServer.service.port }}/metrics
+  - Service: {{ include "videocall.componentFullname" (dict "root" . "component" "metrics-server") }}
+  - Replicas: {{ .Values.metricsServer.replicaCount }}
+{{- end }}
+
+=========================================================================
+
+To get the status of your deployment:
+
+  kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+To view logs for a specific component:
+
+{{- if .Values.ui.enabled }}
+  kubectl logs -l app.kubernetes.io/component=ui
+{{- end }}
+{{- if .Values.websocket.enabled }}
+  kubectl logs -l app.kubernetes.io/component=websocket
+{{- end }}
+{{- if .Values.webtransport.enabled }}
+  kubectl logs -l app.kubernetes.io/component=webtransport
+{{- end }}
+{{- if .Values.website.enabled }}
+  kubectl logs -l app.kubernetes.io/component=website
+{{- end }}
+{{- if .Values.metricsClient.enabled }}
+  kubectl logs -l app.kubernetes.io/component=metrics-client
+{{- end }}
+{{- if .Values.metricsServer.enabled }}
+  kubectl logs -l app.kubernetes.io/component=metrics-server
+{{- end }}
+
+To access the application:
+{{- if .Values.ui.enabled }}
+
+  1. Wait for the UI ingress to be ready:
+     kubectl wait --for=condition=ready ingress/{{ include "videocall.componentFullname" (dict "root" . "component" "ui") }}
+
+  2. Visit the application:
+     {{- range .Values.ui.ingress.hosts }}
+     https://{{ .host }}
+     {{- end }}
+{{- end }}
+
+For more information about Videocall.rs:
+  - Documentation: https://videocall.rs
+  - GitHub: https://github.com/security-union/videocall-rs
+  - Issues: https://github.com/security-union/videocall-rs/issues
+
+=========================================================================
+

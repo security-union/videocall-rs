@@ -1,0 +1,18 @@
+apiVersion: v2
+name: videocall
+description: A unified Helm chart for deploying the complete Videocall.rs application stack
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - videocall
+  - webrtc
+  - rust
+  - real-time-communication
+maintainers:
+  - name: Security Union
+    url: https://github.com/security-union
+home: https://videocall.rs
+sources:
+  - https://github.com/security-union/videocall-rs
+

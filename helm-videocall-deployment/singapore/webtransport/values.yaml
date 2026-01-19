@@ -1,0 +1,94 @@
+# Singapore WebTransport server configuration
+rustlemania-webtransport:
+  nameOverride: "webtransport-singapore"
+  fullnameOverride: "webtransport-singapore"
+
+  replicaCount: 1
+
+  command: ['webtransport_server']
+  tlsSecret: webtransport-singapore-tls
+  
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: latest
+
+  env:
+    - name: RUST_LOG
+      value: warn,quinn=warn,async_nats=warn
+    - name: NATS_URL
+      value: nats-singapore:4222  # Connect to Singapore NATS cluster
+    - name: LISTEN_URL
+      value: 0.0.0.0:443
+    - name: HEALTH_LISTEN_URL
+      value: 0.0.0.0:444
+    - name: CERT_PATH
+      value: /certs/tls.crt
+    - name: KEY_PATH
+      value: /certs/tls.key
+    - name: REGION
+      value: "singapore"
+    - name: HOSTNAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: SERVER_ID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: SERVICE_TYPE
+      value: webtransport
+    - name: SERVER_STATS_INTERVAL_SECS
+      value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "1"  # Optimal for 1000m CPU (WebTransport + crypto operations)
+    - name: TOKIO_BLOCKING_THREADS
+      value: "2"  # Small pool for blocking crypto operations
+
+  resources:
+    limits:
+      cpu: "1000m"
+      memory: "1400Mi"
+    requests:
+      cpu: "1000m"
+      memory: "1400Mi"
+
+  service:
+    type: LoadBalancer  # LoadBalancer for UDP traffic
+    port: 443
+    healthPort: 444
+
+  loadBalancerAnnotations:
+      service.beta.kubernetes.io/do-loadbalancer-name: "webtransport-singapore"
+      service.beta.kubernetes.io/do-loadbalancer-size-unit: "1"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-protocol: "http"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-check-interval-seconds: "10"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-response-timeout-seconds: "5"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-unhealthy-threshold: "3"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-healthy-threshold: "2"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-port: "444"
+      service.beta.kubernetes.io/do-loadbalancer-healthcheck-path: "/healthz"
+      external-dns.alpha.kubernetes.io/hostname: "webtransport-singapore.webtransport.video"
+
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  # Node selector for Singapore region
+  nodeSelector:
+    topology.kubernetes.io/region: "sgp1"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - webtransport-singapore
+          topologyKey: kubernetes.io/hostname 

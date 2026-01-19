@@ -1,0 +1,33 @@
+{{- if and .Values.websocket.enabled .Values.websocket.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "websocket") }}
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "websocket") | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "videocall.componentFullname" (dict "root" . "component" "websocket") }}
+  minReplicas: {{ .Values.websocket.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.websocket.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.websocket.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.websocket.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.websocket.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.websocket.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+{{- end }}
+

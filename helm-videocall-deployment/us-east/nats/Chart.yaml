@@ -1,0 +1,9 @@
+apiVersion: v2
+name: nats-us-east
+version: 0.1.0
+description: NATS cluster for US East region with cross-region gateway
+
+dependencies:
+  - name: nats
+    version: 0.19.15
+    repository: https://nats-io.github.io/k8s/helm/charts/

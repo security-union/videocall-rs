@@ -1,0 +1,71 @@
+{{- if .Values.webtransport.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "webtransport") }}
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "webtransport") | nindent 4 }}
+spec:
+  {{- if not .Values.webtransport.autoscaling.enabled }}
+  replicas: {{ .Values.webtransport.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "videocall.selectorLabels" (dict "root" . "component" "webtransport") | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.webtransport.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "videocall.selectorLabels" (dict "root" . "component" "webtransport") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.webtransport.podSecurityContext | nindent 8 }}
+      containers:
+        - name: webtransport
+          securityContext:
+            {{- toYaml .Values.webtransport.securityContext | nindent 12 }}
+          image: "{{ .Values.webtransport.image.repository }}:{{ .Values.webtransport.image.tag }}"
+          command: {{ .Values.webtransport.command }}
+          args: {{ .Values.webtransport.args }}
+          imagePullPolicy: {{ .Values.webtransport.image.pullPolicy }}
+          env:
+            {{- toYaml .Values.webtransport.env | nindent 12 }}
+          ports:
+            - name: wt-api
+              containerPort: {{ .Values.webtransport.service.port }}
+              protocol: UDP
+            - name: wt-api-health
+              containerPort: {{ .Values.webtransport.service.healthPort }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.webtransport.resources | nindent 12 }}
+          volumeMounts:
+            - name: tls
+              mountPath: "/certs"
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: {{ .Values.webtransport.tlsSecret }}
+            optional: true
+      {{- with .Values.webtransport.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webtransport.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.webtransport.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+

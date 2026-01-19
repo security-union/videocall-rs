@@ -1,0 +1,76 @@
+{{- if .Values.websocket.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "websocket") }}
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "websocket") | nindent 4 }}
+spec:
+  {{- if not .Values.websocket.autoscaling.enabled }}
+  replicas: {{ .Values.websocket.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "videocall.selectorLabels" (dict "root" . "component" "websocket") | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.websocket.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "videocall.selectorLabels" (dict "root" . "component" "websocket") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.websocket.podSecurityContext | nindent 8 }}
+      containers:
+        - name: websocket
+          securityContext:
+            {{- toYaml .Values.websocket.securityContext | nindent 12 }}
+          image: "{{ .Values.websocket.image.repository }}:{{ .Values.websocket.image.tag }}"
+          imagePullPolicy: {{ .Values.websocket.image.pullPolicy }}
+          env:
+            {{- toYaml .Values.websocket.env | nindent 12 }}
+            {{- if (lookup "v1" "Secret" .Release.Namespace "postgres-credentials") }}
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: password
+            {{- end }}
+            {{- if (lookup "v1" "Secret" .Release.Namespace "google-oauth-credentials") }}
+            - name: OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: google-oauth-credentials
+                  key: client-id
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: google-oauth-credentials
+                  key: client-secret
+            {{- end }}
+          ports:
+            - name: ws-api
+              containerPort: {{ .Values.websocket.service.port }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.websocket.resources | nindent 12 }}
+      {{- with .Values.websocket.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.websocket.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.websocket.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+

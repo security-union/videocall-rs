@@ -1,0 +1,16 @@
+{{- if .Values.webtransport.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "videocall.componentFullname" (dict "root" . "component" "webtransport") }}-cert
+  labels:
+    {{- include "videocall.labels" (dict "root" . "component" "webtransport") | nindent 4 }}
+spec:
+  secretName: {{ .Values.webtransport.tlsSecret }}
+  issuerRef:
+    name: {{ .Values.webtransport.certificate.issuerName }}
+    kind: ClusterIssuer
+  dnsNames:
+    - {{ .Values.webtransport.certificateDomain }}
+{{- end }}
+

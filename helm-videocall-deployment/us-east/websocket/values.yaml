@@ -1,0 +1,118 @@
+# US East WebSocket server configuration
+rustlemania-websocket:
+  nameOverride: "websocket-us-east"
+  fullnameOverride: "websocket-us-east"
+
+  replicaCount: 1  # Higher replicas for primary region
+
+  image:
+    repository: securityunion/rustlemania-api
+    pullPolicy: Always
+    tag: latest
+
+  env:
+    - name: RUST_LOG
+      value: warn
+    - name: ACTIX_PORT
+      value: "8080"
+    - name: NATS_URL
+      value: nats-us-east:4222  # Connect to US East NATS cluster
+    - name: DATABASE_ENABLED
+      value: "true"
+    - name: DATABASE_URL
+      value: postgres://postgres:$(PG_PASSWORD)@postgres-postgresql:5432/actix-api-db?sslmode=disable
+    - name: REGION
+      value: "us-east"
+    - name: HOSTNAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: SERVER_ID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: SERVICE_TYPE
+      value: websocket
+    - name: SERVER_STATS_INTERVAL_SECS
+      value: "5"
+    - name: TOKIO_WORKER_THREADS
+      value: "2"  # Optimal for 2400m CPU (I/O bound WebSocket operations)
+    - name: OAUTH_AUTH_URL
+      value: "https://accounts.google.com/o/oauth2/v2/auth"
+    - name: OAUTH_TOKEN_URL
+      value: "https://oauth2.googleapis.com/token"
+    - name: OAUTH_REDIRECT_URL
+      value: "https://api.videocall.rs/login/callback"
+    - name: UI_ENDPOINT
+      value: "https://app.videocall.rs"
+    - name: COOKIE_DOMAIN
+      value: ".videocall.rs"
+
+
+  resources:
+    limits:
+      cpu: "2200m"
+      memory: "4000Mi"
+    requests:
+      cpu: "2200m"
+      memory: "4000Mi"
+
+  service:
+    type: ClusterIP  # Changed to ClusterIP for ingress
+    port: 8080
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      kubernetes.io/tls-acme: "true"
+    hosts:
+      - host: websocket-us-east.webtransport.video
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: websocket-us-east
+              port:
+                number: 8080
+      - host: api.videocall.rs
+        paths:
+          - path: /
+            pathType: Prefix
+            service:
+              name: websocket-us-east
+              port:
+                number: 8080
+    tls:
+      - secretName: websocket-us-east-tls
+        hosts:
+          - websocket-us-east.webtransport.video
+          - webtransport-us-east.webtransport.video
+      - secretName: api-videocall-rs-tls
+        hosts:
+          - api.videocall.rs
+
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 70
+
+  # Node selector for US East region
+  nodeSelector:
+    topology.kubernetes.io/region: "nyc1"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app
+              operator: In
+              values:
+              - websocket-us-east
+          topologyKey: kubernetes.io/hostname 

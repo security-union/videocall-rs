@@ -38,6 +38,7 @@ use crate::context::{
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
+use uuid;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -171,23 +172,35 @@ pub struct AttendantsComponent {
 }
 
 impl AttendantsComponent {
-    fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
-        let email = ctx.props().email.clone();
+    /// Generate a unique instance ID
+    fn generate_instance_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// Generate a unique user ID based on username + instance_id
+    fn generate_unique_userid(username: &str, instance_id: &str) -> String {
+        format!("{}-{}", username, instance_id)
+    }
+
+    fn create_video_call_client(ctx: &Context<Self>, instance_id: &str) -> VideoCallClient {
+        let username = ctx.props().email.clone();
+        let unique_userid = Self::generate_unique_userid(&username, instance_id);
         let id = ctx.props().id.clone();
         let websocket_urls = actix_websocket_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(|s| format!("{s}/lobby/{unique_userid}/{id}"))
             .collect::<Vec<String>>();
         let webtransport_urls = webtransport_host_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(|s| format!("{s}/lobby/{unique_userid}/{id}"))
             .collect::<Vec<String>>();
 
         log::info!(
-            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}",
-            email,
+            "YEW-UI: Creating VideoCallClient for {} (unique_id: {}) in meeting {} with webtransport_enabled={}",
+            username,
+            unique_userid,
             id,
             ctx.props().webtransport_enabled
         );
@@ -198,7 +211,7 @@ impl AttendantsComponent {
         log::info!("YEW-UI: WebTransport URLs: {webtransport_urls:?}");
 
         let opts = VideoCallClientOptions {
-            userid: email.clone(),
+            userid: unique_userid.clone(),
             meeting_id: id.clone(),
             websocket_urls,
             webtransport_urls,
@@ -377,7 +390,8 @@ impl Component for AttendantsComponent {
     type Properties = AttendantsComponentProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let client = Self::create_video_call_client(ctx);
+        let instance_id = Self::generate_instance_id();
+        let client = Self::create_video_call_client(ctx, &instance_id);
         let media_device_access = Self::create_media_device_access(ctx);
         let mut self_ = Self {
             client,
@@ -679,7 +693,7 @@ impl Component for AttendantsComponent {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        let email = ctx.props().email.clone();
+        let username = ctx.props().email.clone();
         let media_access_granted = self.media_device_access.is_granted();
 
         let toggle_peer_list = ctx.link().callback(|_| UserScreenToggleAction::PeerList);
@@ -833,7 +847,7 @@ impl Component for AttendantsComponent {
                     style={container_style}>
                     // Self-tile (Host component) rendered as grid item or floating based on state
                     {
-                        if media_access_granted && (users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty()) {
+                        if media_access_granted && (users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &username) || users_allowed_to_stream().unwrap_or_default().is_empty()) {
                             html! {
                                 <Host
                                     share_screen={self.share_screen}
@@ -903,7 +917,7 @@ impl Component for AttendantsComponent {
                     }
 
                     {
-                        if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty() {
+                        if users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &username) || users_allowed_to_stream().unwrap_or_default().is_empty() {
                             html! {
                                 <nav class="host">
                                     <div class="controls">

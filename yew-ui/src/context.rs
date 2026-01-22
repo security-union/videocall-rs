@@ -100,3 +100,8 @@ static USERNAME_RE: Lazy<regex::Regex> =
 pub fn is_valid_username(name: &str) -> bool {
     !name.is_empty() && USERNAME_RE.is_match(name)
 }
+
+/// Extract username from unique user ID.
+pub fn extract_username_from_userid(userid: &str) -> String {
+    userid.split('-').next().unwrap_or(userid).to_string()
+}

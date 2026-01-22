@@ -157,7 +157,7 @@ impl ScreenEncoder {
     /// The user is prompted by the browser to select which window or screen to encode.
     ///
     /// This will toggle the enabled state of the encoder.
-    pub fn start(&mut self) {
+    pub fn start(&mut self, screen_stream: MediaStream) {
         let EncoderState {
             enabled,
             destroy,
@@ -169,6 +169,7 @@ impl ScreenEncoder {
         enabled.store(true, Ordering::Release);
         destroy.store(false, Ordering::Release);
 
+        let screen_to_share = screen_stream;
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
@@ -176,26 +177,6 @@ impl ScreenEncoder {
         let current_fps = self.current_fps.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
-            let navigator = window().navigator();
-            let media_devices = navigator.media_devices().unwrap_or_else(|_| {
-                error!("Failed to get media devices - browser may not support screen sharing");
-                panic!("MediaDevices not available");
-            });
-
-            let screen_to_share: MediaStream = match media_devices.get_display_media() {
-                Ok(promise) => match JsFuture::from(promise).await {
-                    Ok(stream) => stream.unchecked_into::<MediaStream>(),
-                    Err(e) => {
-                        error!("User denied screen sharing permission or error occurred: {e:?}");
-                        return;
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to get display media: {e:?}");
-                    return;
-                }
-            };
-
             log::info!("Screen to share: {screen_to_share:?}");
 
             let screen_track = Box::new(

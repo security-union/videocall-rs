@@ -20,7 +20,7 @@ use crate::constants::*;
 use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
-use log::debug;
+use log::{debug, info};
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -33,7 +33,7 @@ use crate::components::{
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
 };
-use web_sys::window;
+use web_sys::{MediaStream, window};
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -133,6 +133,9 @@ pub struct MeetingProps {
     /// Callback to toggle the self-video position between floating and grid
     #[prop_or_default]
     pub on_position_toggle: Callback<MouseEvent>,
+    
+    /// stream which were activated in attendants
+    pub screen_stream: Option<MediaStream>,
 }
 
 impl Component for Host {
@@ -268,7 +271,11 @@ impl Component for Host {
         log::debug!("Host update: {msg:?}");
         let should_update = match msg {
             Msg::EnableScreenShare => {
-                self.screen.start();
+                if let Some(stream) = ctx.props().screen_stream.clone() {
+                   self.screen.start(stream);
+                } else {
+                   log::error!("EnableScreenShare called but screen_stream is None");
+                }
                 true
             }
             Msg::DisableScreenShare => {

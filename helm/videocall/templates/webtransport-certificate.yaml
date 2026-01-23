@@ -9,7 +9,7 @@ spec:
   secretName: {{ .Values.webtransport.tlsSecret }}
   issuerRef:
     name: {{ .Values.webtransport.certificate.issuerName }}
-    kind: ClusterIssuer
+    kind: Issuer
   dnsNames:
     - {{ .Values.webtransport.certificateDomain }}
 {{- end }}

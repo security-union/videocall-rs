@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.10...videocall-codecs-v0.1.11) - 2026-01-27
+
+### Other
+
+- Fix firefox support by sending vp8 instead of vp9 ([#535](https://github.com/security-union/videocall-rs/pull/535))
+
 ## [0.1.10](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.9...videocall-codecs-v0.1.10) - 2025-11-30
 
 ### Other

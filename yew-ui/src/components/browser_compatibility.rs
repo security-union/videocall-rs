@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::constants::firefox_enabled;
 use wasm_bindgen::JsValue;
 use web_sys::*;
 use yew::prelude::*;
@@ -59,6 +60,20 @@ impl Component for BrowserCompatibility {
 impl BrowserCompatibility {
     fn check_browser_compatibility() -> Option<String> {
         let window = web_sys::window().unwrap();
+
+        // Check Firefox feature flag - block Firefox unless explicitly enabled
+        if Self::is_firefox() {
+            let ff_enabled = firefox_enabled().unwrap_or(false);
+            log::info!("Firefox detected, firefoxEnabled={}", ff_enabled);
+            if !ff_enabled {
+                return Some(
+                    "Hey friend! 👋 Firefox support is currently experimental and disabled. \
+                    Please use Chrome, Edge, Brave, or Safari for the best experience. \
+                    Firefox support can be enabled via the firefoxEnabled configuration flag. 🚀"
+                        .to_string(),
+                );
+            }
+        }
 
         let mut missing_features = Vec::new();
 

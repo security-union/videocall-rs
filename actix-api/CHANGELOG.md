@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: Added `_UNKNOWN = 0` variants to all protobuf enums (`PacketType`, `MediaType`, `MeetingEventType`). This shifts all existing enum values by 1. Clients and servers must be updated together.
+
 ## [0.1.0](https://github.com/security-union/videocall-rs/releases/tag/sec-api-v0.1.0) - 2025-03-24
 
 ### Other

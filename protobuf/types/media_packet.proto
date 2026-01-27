@@ -2,11 +2,12 @@ syntax = "proto3";
 
 message MediaPacket {
   enum MediaType {
-    VIDEO = 0;
-    AUDIO = 1;
-    SCREEN = 2;
-    HEARTBEAT = 3;
-    RTT = 4;  // Client to Server RTT
+    MEDIA_TYPE_UNKNOWN = 0;
+    VIDEO = 1;
+    AUDIO = 2;
+    SCREEN = 3;
+    HEARTBEAT = 4;
+    RTT = 5;  // Client to Server RTT
   }
   MediaType media_type = 1;
   string email = 2;

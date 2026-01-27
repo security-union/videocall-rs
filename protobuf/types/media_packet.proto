@@ -29,6 +29,27 @@ message AudioMetadata {
 
 message VideoMetadata {
   uint64 sequence = 1;
+  VideoCodec codec = 2;
+}
+
+// Video codec enum with profile/level details for scalability.
+// Format follows WebCodecs codec string conventions where applicable.
+enum VideoCodec {
+  VIDEO_CODEC_UNSPECIFIED = 0;  // Default - skip decoding if codec not specified
+
+  // VP8 - no profile/level variants
+  VP8 = 1;
+
+  // VP9 profiles: vp09.PP.LL.DD (Profile, Level, bit Depth)
+  VP9_PROFILE0_LEVEL10_8BIT = 2;  // vp09.00.10.08 - Profile 0, Level 1.0, 8-bit
+
+  // H.264/AVC - requires description field in decoder config
+  // AVC_BASELINE_LEVEL30 = 20;  // avc1.42001E - Baseline, Level 3.0
+  // AVC_MAIN_LEVEL31 = 21;      // avc1.4D001F - Main, Level 3.1
+  // AVC_HIGH_LEVEL40 = 22;      // avc1.640028 - High, Level 4.0
+
+  // AV1 profiles
+  // AV1_MAIN_LEVEL21_8BIT = 30;  // av01.0.01M.08 - Main, Level 2.1, 8-bit
 }
 
 message HeartbeatMetadata {

@@ -37,7 +37,7 @@
 
 use std::cell::RefCell;
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
-use videocall_codecs::frame::{FrameBuffer, VideoFrame};
+use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
 use videocall_codecs::jitter_buffer::JitterBuffer;
 use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
 use wasm_bindgen::prelude::*;
@@ -51,6 +51,7 @@ use web_sys::{
 /// WebDecoder implementation that wraps WebCodecs VideoDecoder
 struct WebDecoder {
     decoder: RefCell<Option<VideoDecoder>>,
+    current_codec: RefCell<Option<FrameCodec>>,
     self_scope: DedicatedWorkerGlobalScope,
 }
 
@@ -62,14 +63,38 @@ impl WebDecoder {
     fn new(self_scope: DedicatedWorkerGlobalScope) -> Self {
         Self {
             decoder: RefCell::new(None),
+            current_codec: RefCell::new(None),
             self_scope,
         }
     }
 
-    fn initialize_decoder(&self) -> Result<(), String> {
+    fn initialize_decoder(&self, codec: FrameCodec) -> Result<(), String> {
+        // Skip unknown codecs - cannot decode
+        let codec_str = match codec.as_webcodecs_str() {
+            Some(s) => s,
+            None => return Err("Unknown codec - cannot decode".to_string()),
+        };
+
         let mut decoder_ref = self.decoder.borrow_mut();
-        if decoder_ref.is_some() {
+        let mut codec_ref = self.current_codec.borrow_mut();
+
+        // Check if we already have a decoder with the same codec
+        if decoder_ref.is_some() && *codec_ref == Some(codec) {
             return Ok(());
+        }
+
+        // If codec changed, destroy the old decoder
+        if decoder_ref.is_some() && *codec_ref != Some(codec) {
+            console::log_1(
+                &format!(
+                    "[WORKER] Codec changed from {:?} to {:?}, reconfiguring decoder",
+                    codec_ref, codec
+                )
+                .into(),
+            );
+            if let Some(decoder) = decoder_ref.take() {
+                let _ = decoder.close();
+            }
         }
 
         let self_scope = self.self_scope.clone();
@@ -99,7 +124,10 @@ impl WebDecoder {
 
         let decoder =
             VideoDecoder::new(&init).map_err(|e| format!("Failed to create decoder: {e:?}"))?;
-        let config = VideoDecoderConfig::new("vp09.00.10.08");
+
+        // Configure with the codec from the incoming frame
+        console::log_1(&format!("[WORKER] Configuring decoder with codec: {}", codec_str).into());
+        let config = VideoDecoderConfig::new(codec_str);
         decoder
             .configure(&config)
             .map_err(|e| format!("Failed to configure decoder: {e:?}"))?;
@@ -108,7 +136,14 @@ impl WebDecoder {
         on_error.forget();
 
         *decoder_ref = Some(decoder);
-        console::log_1(&"[WORKER] WebCodecs decoder initialized".into());
+        *codec_ref = Some(codec);
+        console::log_1(
+            &format!(
+                "[WORKER] WebCodecs decoder initialized with codec: {:?}",
+                codec
+            )
+            .into(),
+        );
         Ok(())
     }
 
@@ -165,12 +200,12 @@ impl Decodable for WebDecoder {
     }
 
     fn decode(&self, frame: FrameBuffer) {
-        // Initialize decoder if needed
-        if self.decoder.borrow().is_none() {
-            if let Err(e) = self.initialize_decoder() {
-                console::error_1(&format!("[WORKER] Failed to initialize decoder: {e:?}").into());
-                return;
-            }
+        let frame_codec = frame.frame.codec;
+
+        // Initialize or reconfigure decoder based on frame's codec
+        if let Err(e) = self.initialize_decoder(frame_codec) {
+            console::error_1(&format!("[WORKER] Failed to initialize decoder: {e:?}").into());
+            return;
         }
 
         let decoder_ref = self.decoder.borrow();
@@ -282,10 +317,11 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
         }
 
         if let Some(jb) = jb_opt.as_mut() {
-            // Convert FrameBuffer to VideoFrame
+            // Convert FrameBuffer to VideoFrame, preserving the codec
             let video_frame = VideoFrame {
                 sequence_number: frame.sequence_number(),
                 frame_type: frame.frame.frame_type,
+                codec: frame.frame.codec,
                 data: frame.frame.data.clone(),
                 timestamp: frame.frame.timestamp,
             };

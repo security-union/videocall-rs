@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.5](https://github.com/security-union/videocall-rs/compare/videocall-cli-v3.0.4...videocall-cli-v3.0.5) - 2026-01-27
+
+### Other
+
+- Fix firefox support by sending vp8 instead of vp9 ([#535](https://github.com/security-union/videocall-rs/pull/535))
+
 ### Changed
 
 - **BREAKING**: Updated protobuf enums with `_UNKNOWN = 0` variants. Enum values shifted by 1. Must update server simultaneously.

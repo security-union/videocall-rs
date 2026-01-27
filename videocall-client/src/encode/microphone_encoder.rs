@@ -278,31 +278,29 @@ impl MicrophoneEncoder {
 
             // Sample Rate hasn't been added to the web_sys crate
             // Firefox doesn't report sampleRate in MediaTrackSettings, so we need a fallback
-            let input_rate: u32 =
-                match js_sys::Reflect::get(&track_settings, &JsValue::from_str("sampleRate")) {
-                    Ok(v) => match v.as_f64() {
-                        Some(f) => f as u32,
-                        None => {
-                            // Firefox fallback: create a temporary AudioContext to get system sample rate
-                            log::info!("sampleRate not in track settings (Firefox), using AudioContext default");
-                            match AudioContext::new() {
-                                Ok(temp_ctx) => {
-                                    let rate = temp_ctx.sample_rate() as u32;
-                                    let _ = temp_ctx.close();
-                                    rate
-                                }
-                                Err(e) => {
-                                    if let Some(cb) = &on_error {
-                                        cb.emit(format!("Could not determine microphone sample rate: {e:?}"));
-                                    }
-                                    return;
-                                }
+            let input_rate: u32 = match js_sys::Reflect::get(
+                &track_settings,
+                &JsValue::from_str("sampleRate"),
+            ) {
+                Ok(v) => match v.as_f64() {
+                    Some(f) => f as u32,
+                    None => {
+                        // Firefox fallback: create a temporary AudioContext to get system sample rate
+                        log::info!("sampleRate not in track settings (Firefox), using AudioContext default");
+                        match AudioContext::new() {
+                            Ok(temp_ctx) => {
+                                let rate = temp_ctx.sample_rate() as u32;
+                                let _ = temp_ctx.close();
+                                rate
                             }
-                        }
-                    },
-                    Err(e) => {
-                        if let Some(cb) = &on_error {
-                            cb.emit(format!("Failed reading microphone settings: {e:?}"));
+                            Err(e) => {
+                                if let Some(cb) = &on_error {
+                                    cb.emit(format!(
+                                        "Could not determine microphone sample rate: {e:?}"
+                                    ));
+                                }
+                                return;
+                            }
                         }
                     }
                 },

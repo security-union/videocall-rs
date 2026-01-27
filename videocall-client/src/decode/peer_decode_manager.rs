@@ -48,6 +48,8 @@ pub enum PeerDecodeError {
     NoPacketType,
     PacketParseError,
     SameUserPacket(String),
+    UnknownMediaType,
+    UnknownPacketType,
 }
 
 #[derive(Debug)]
@@ -71,6 +73,8 @@ impl Display for PeerDecodeError {
                 write!(f, "Failed to parse to protobuf MediaPacket")
             }
             PeerDecodeError::SameUserPacket(s) => write!(f, "SameUserPacket: {s}"),
+            PeerDecodeError::UnknownMediaType => write!(f, "UnknownMediaType"),
+            PeerDecodeError::UnknownPacketType => write!(f, "UnknownPacketType"),
         }
     }
 }
@@ -358,6 +362,13 @@ impl Peer {
                         first_frame: false,
                     },
                 ))
+            }
+            MediaType::MEDIA_TYPE_UNKNOWN => {
+                log::error!(
+                    "Received packet with unknown media type from peer {}",
+                    self.email
+                );
+                Err(PeerDecodeError::UnknownMediaType)
             }
         }
     }

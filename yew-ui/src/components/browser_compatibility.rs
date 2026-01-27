@@ -60,16 +60,9 @@ impl BrowserCompatibility {
     fn check_browser_compatibility() -> Option<String> {
         let window = web_sys::window().unwrap();
 
-        // First check if this is Firefox and block it specifically
-        if Self::is_firefox() {
-            return Some(
-                "🦊 Firefox Detected! Unfortunately, videocall.rs doesn't support Firefox due to incomplete MediaStreamTrackProcessor implementation. Please use Desktop Chrome, Chromium, Brave, or Edge for the best experience. 🚀".to_string()
-            );
-        }
-
         let mut missing_features = Vec::new();
 
-        // Check for MediaStreamTrackProcessor
+        // Check for MediaStreamTrackProcessor (native or polyfill from index.html)
         if js_sys::Reflect::get(&window, &JsValue::from_str("MediaStreamTrackProcessor"))
             .unwrap()
             .is_undefined()
@@ -77,7 +70,7 @@ impl BrowserCompatibility {
             missing_features.push("MediaStreamTrackProcessor");
         }
 
-        // Check for VideoEncoder
+        // Check for VideoEncoder (WebCodecs API - supported in Firefox 130+, Chrome 94+)
         if js_sys::Reflect::get(&window, &JsValue::from_str("VideoEncoder"))
             .unwrap()
             .is_undefined()
@@ -85,10 +78,33 @@ impl BrowserCompatibility {
             missing_features.push("VideoEncoder");
         }
 
+        // Check for VideoDecoder (WebCodecs API)
+        if js_sys::Reflect::get(&window, &JsValue::from_str("VideoDecoder"))
+            .unwrap()
+            .is_undefined()
+        {
+            missing_features.push("VideoDecoder");
+        }
+
+        // Check for OffscreenCanvas (required by MediaStreamTrackProcessor polyfill)
+        if js_sys::Reflect::get(&window, &JsValue::from_str("OffscreenCanvas"))
+            .unwrap()
+            .is_undefined()
+        {
+            missing_features.push("OffscreenCanvas");
+        }
+
         if !missing_features.is_empty() {
+            let browser_hint = if Self::is_firefox() {
+                "Firefox 130+ is required for WebCodecs support."
+            } else {
+                "We recommend using Desktop Chrome, Chromium, Brave, Edge, or Firefox 130+."
+            };
+
             Some(format!(
-                "Hey friend! 👋 Thanks for trying videocall.rs! We're working hard to support your browser, but we need a few more modern features to make the magic happen. Your browser is missing: {}. We recommend using Desktop Chrome, Chromium, Brave, or Edge for the best experience. 🚀",
-                missing_features.join(", ")
+                "Hey friend! 👋 Thanks for trying videocall.rs! We're working hard to support your browser, but we need a few more modern features to make the magic happen. Your browser is missing: {}. {} 🚀",
+                missing_features.join(", "),
+                browser_hint
             ))
         } else {
             None

@@ -37,6 +37,9 @@ pub struct RuntimeConfig {
     pub e2ee_enabled: String,
     #[serde(rename = "webTransportEnabled")]
     pub web_transport_enabled: String,
+    #[serde(rename = "firefoxEnabled")]
+    #[serde(default)]
+    pub firefox_enabled: String,
     #[serde(rename = "usersAllowedToStream")]
     pub users_allowed_to_stream: String,
     #[serde(rename = "serverElectionPeriodMs")]
@@ -110,6 +113,9 @@ pub fn oauth_enabled() -> Result<bool, String> {
 }
 pub fn e2ee_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.e2ee_enabled.as_str())))
+}
+pub fn firefox_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.firefox_enabled.as_str())))
 }
 
 pub fn users_allowed_to_stream() -> Result<Vec<String>, String> {

@@ -537,15 +537,15 @@ body {
 .video-controls-container {
   position: fixed;
   left: 50%;
-  bottom: 12px; /* minimal safe space */
+  bottom: 16px; /* minimal safe space */
   transform: translateX(-50%);
   display: flex;
-  gap: 1rem; /* add breathing room between control buttons */
+  gap: 1.2rem; /* add breathing room between control buttons */
   z-index: 100;
-  padding: 0.5rem 1.1rem;
+  padding: 0.6rem 1.25rem;
   background: rgba(28, 28, 30, 0.85);
   backdrop-filter: blur(14px);
-  border-radius: 2.2rem;
+  border-radius: 2.5rem;
   border: 1px solid #38383A;
   box-shadow: 0 10px 25px -5px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.05);
   transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
@@ -564,8 +564,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 2.75rem;
-  height: 2.75rem;
+  width: 3.1rem;
+  height: 3.1rem;
   border-radius: 50%;
   background-color: #1C1C1E;
   border: 1px solid #48484A;
@@ -619,8 +619,8 @@ body {
 }
 
 .video-control-button svg {
-  width: 1.35rem;
-  height: 1.35rem;
+  width: 1.5rem;
+  height: 1.5rem;
   transition: transform 0.2s ease;
 }
 
@@ -1294,33 +1294,14 @@ body {
   }
 }
 
-/* Hide pin/crop icons on mobile for peer tiles – tap tile to pin instead */
+/* Hide pin icon on mobile – tap tile to pin instead */
 @media (max-width: 767px) {
-  .grid-item:not(.self-tile) .canvas-container .pin-icon { display: none !important; }
-  .grid-item:not(.self-tile) .canvas-container .crop-icon { display: none !important; }
-
-  /* Self-tile in grid mode: show hover buttons on mobile */
-  .grid-item.self-tile .canvas-container .pin-icon,
-  .grid-item.self-tile .canvas-container .crop-icon,
-  .grid-item.self-tile .canvas-container .edit-name-icon,
-  .grid-item.self-tile .canvas-container .position-toggle-icon {
-    opacity: 0 !important;
-    visibility: hidden !important;
-    display: block !important;
-  }
-  .grid-item.self-tile .canvas-container:hover .pin-icon,
-  .grid-item.self-tile .canvas-container:hover .crop-icon,
-  .grid-item.self-tile .canvas-container:hover .edit-name-icon,
-  .grid-item.self-tile .canvas-container:hover .position-toggle-icon {
-    visibility: visible !important;
-    opacity: 0.6 !important;
-  }
+  .grid-item .canvas-container .pin-icon { display: none !important; }
+  .grid-item .canvas-container .crop-icon { display: none !important; }
 }
 
 .grid-item .canvas-container canvas.cropped { object-fit: cover !important; }
 .grid-item .canvas-container canvas.uncropped { object-fit: contain !important; }
-.grid-item .canvas-container video.cropped { object-fit: cover !important; }
-.grid-item .canvas-container video.uncropped { object-fit: contain !important; }
 
 /* Copy toast and sparkles animation (Apple-style subtle pop + sparkles) */
 .copy-button {
@@ -1402,397 +1383,4 @@ body {
   .btn-pop-animate { animation: none; }
   .copy-toast { animation: none; opacity: 1; transform: none; }
   .sparkles { display: none; }
-}
-
-/* Self-tile styles (local user video in peer grid) */
-.self-tile .canvas-container {
-  position: relative;
-}
-
-.self-tile .self-camera {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  border-radius: 8px;
-}
-
-/* Hide video visually but keep in DOM for CameraEncoder */
-.self-tile .self-camera.video-hidden {
-  position: absolute !important;
-  width: 1px !important;
-  height: 1px !important;
-  padding: 0 !important;
-  margin: -1px !important;
-  overflow: hidden !important;
-  clip: rect(0, 0, 0, 0) !important;
-  white-space: nowrap !important;
-  border: 0 !important;
-}
-
-/* Edit name icon - positioned like pin/crop icons */
-.grid-item .canvas-container .edit-name-icon {
-  position: absolute !important;
-  top: 8px !important;
-  right: 128px !important; /* After mic (8), crop (48+8), pin (88+8) */
-  left: auto !important;
-  transform: none !important;
-  opacity: 0.6 !important;
-  background-color: rgba(0, 0, 0, 0.6) !important;
-  border-radius: 50% !important;
-  padding: 6px !important;
-  text-align: center !important;
-  line-height: 1 !important;
-  cursor: pointer !important;
-  z-index: 10 !important;
-  transition: opacity 0.2s ease !important;
-  border: none !important;
-  visibility: hidden !important;
-}
-
-.grid-item .canvas-container .edit-name-icon svg {
-  width: 20px !important;
-  height: 20px !important;
-  display: block !important;
-  stroke: white;
-}
-
-/* Show edit name icon on hover (desktop) */
-@media (min-width: 768px) {
-  .grid-item .canvas-container .edit-name-icon { opacity: 0 !important; }
-  .grid-item .canvas-container:hover .edit-name-icon {
-    visibility: visible !important;
-    opacity: 0.6 !important;
-  }
-}
-
-/* Hide edit name icon on mobile for peer tiles only */
-@media (max-width: 767px) {
-  .grid-item:not(.self-tile) .canvas-container .edit-name-icon { display: none !important; }
-}
-
-/* Self-tile fills entire screen when alone in meeting */
-#grid-container[data-peers="1"] {
-  grid-auto-rows: calc(100vh - 100px) !important;
-  align-content: start;
-  align-items: start;
-}
-
-#grid-container[data-peers="1"] .grid-item.self-tile {
-  width: 100%;
-  height: calc(100vh - 100px);
-  max-height: calc(100vh - 100px);
-}
-
-#grid-container[data-peers="1"] .grid-item.self-tile .canvas-container {
-  width: 100%;
-  height: 100%;
-}
-
-#grid-container[data-peers="1"] .grid-item.self-tile .self-camera {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-}
-
-/* Mobile adjustments for self-tile when alone */
-@media (max-width: 600px) {
-  #grid-container[data-peers="1"] {
-    padding: 8px !important;
-    align-content: start !important;
-    align-items: start !important;
-    justify-content: center;
-    overflow: hidden;
-    grid-auto-rows: auto !important;
-  }
-
-  #grid-container[data-peers="1"] .grid-item.self-tile {
-    height: auto;
-    max-height: calc(100vh - 80px);
-    aspect-ratio: 16/9;
-  }
-}
-
-/* Self-tile button positioning - shifted right since audio indicator is hidden */
-.grid-item.self-tile .canvas-container .position-toggle-icon {
-  right: 8px !important;
-}
-.grid-item.self-tile .canvas-container .edit-name-icon {
-  right: 48px !important;
-}
-.grid-item.self-tile .canvas-container .crop-icon {
-  right: 88px !important;
-}
-.grid-item.self-tile .canvas-container .pin-icon {
-  right: 128px !important;
-}
-
-/* Self-tile device selectors - positioned on right bottom corner of self-tile, visible on hover */
-.self-tile .self-tile-device-selectors {
-  position: absolute;
-  bottom: 12px;
-  right: 12px;
-  width: auto;
-  max-width: 200px;
-  min-width: 160px;
-  background: rgba(28, 28, 30, 0.9);
-  backdrop-filter: blur(10px);
-  padding: 8px 10px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity 0.2s ease, visibility 0.2s ease;
-  z-index: 5;
-}
-
-/* Show device selectors on hover (desktop) */
-@media (min-width: 768px) {
-  .grid-item .canvas-container:hover .self-tile-device-selectors {
-    opacity: 1;
-    visibility: visible;
-  }
-}
-
-/* Hide device selectors on mobile - use modal instead */
-@media (max-width: 767px) {
-  .self-tile-device-selectors {
-    display: none !important;
-  }
-}
-
-/* Connection LED inside self-tile device selectors */
-.self-tile-device-selectors .connection-led {
-  position: relative;
-  top: auto;
-  right: auto;
-  display: inline-block;
-  margin-right: 8px;
-  vertical-align: middle;
-}
-
-/* Floating self-tile (original bottom-right corner position) */
-.self-tile-floating {
-  position: fixed;
-  bottom: 15px;
-  right: 16px;
-  width: 25%;
-  max-width: 240px;
-  min-width: 150px;
-  border-radius: 12px;
-  overflow: visible; /* Allow hover icons to show outside bounds */
-  z-index: 15;
-  background-color: #1c1c1c;
-  border: 2px solid #444;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  transition: all 0.3s ease;
-  display: flex;
-  flex-direction: column;
-}
-
-.self-tile-floating:hover {
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
-  transform: scale(1.02);
-}
-
-.self-tile-floating .canvas-container {
-  width: 100%;
-  min-height: 160px;
-  aspect-ratio: 16/9;
-  position: relative;
-  overflow: hidden;
-  border-radius: 10px 10px 0 0;
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background-color: #242526;
-}
-
-.self-tile-floating .self-camera {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-/* Hide audio indicator in self-tile - mute control is in meeting controls */
-.self-tile .audio-indicator,
-.self-tile-floating .audio-indicator {
-  display: none;
-}
-
-/* Floating name wrapper with LED - positioned like floating-name */
-.self-tile-floating .floating-name-wrapper {
-  position: absolute;
-  top: 12px;
-  left: 12px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  z-index: 2;
-}
-
-/* Hide name in floating mode, keep LED visible */
-.self-tile-floating .floating-name-wrapper .floating-name {
-  display: none;
-}
-
-.self-tile-floating .floating-name-wrapper .connection-led {
-  position: static;
-  flex-shrink: 0;
-}
-
-/* Placeholder fills the canvas container in floating mode */
-.self-tile-floating .canvas-container .placeholder-content {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  background-color: #242526;
-}
-
-.self-tile-floating .canvas-container .placeholder-content svg {
-  width: 48px;
-  height: 48px;
-}
-
-.self-tile-floating .canvas-container .placeholder-content .placeholder-text {
-  font-size: 0.9rem;
-}
-
-/* Floating self-tile device selectors - positioned below video (outside canvas-container) */
-.self-tile-floating .self-tile-device-selectors.floating-selectors {
-  position: relative;
-  width: 100%;
-  max-width: none;
-  min-width: auto;
-  background: rgba(28, 28, 30, 0.95);
-  backdrop-filter: blur(10px);
-  padding: 8px 10px;
-  border-radius: 0 0 10px 10px;
-  border: none;
-  opacity: 1;
-  visibility: visible;
-  flex-shrink: 0;
-}
-
-/* Position toggle icon - positioned like other hover icons */
-.grid-item .canvas-container .position-toggle-icon {
-  position: absolute !important;
-  top: 8px !important;
-  right: 168px !important; /* After mic (8), pin (48), crop (88), edit-name (128) + 40 */
-  left: auto !important;
-  transform: none !important;
-  opacity: 0.6 !important;
-  background-color: rgba(0, 0, 0, 0.6) !important;
-  border-radius: 50% !important;
-  padding: 6px !important;
-  text-align: center !important;
-  line-height: 1 !important;
-  cursor: pointer !important;
-  z-index: 10 !important;
-  transition: opacity 0.2s ease !important;
-  border: none !important;
-  visibility: hidden !important;
-}
-
-/* Position toggle icon in floating mode - upper right corner */
-.self-tile-floating .canvas-container .position-toggle-icon {
-  position: absolute !important;
-  top: 8px !important;
-  right: 8px !important;
-  left: auto !important;
-  transform: none !important;
-  opacity: 0.6 !important;
-  background-color: rgba(0, 0, 0, 0.6) !important;
-  border-radius: 50% !important;
-  padding: 6px !important;
-  text-align: center !important;
-  line-height: 1 !important;
-  cursor: pointer !important;
-  z-index: 10 !important;
-  transition: opacity 0.2s ease !important;
-  border: none !important;
-  visibility: visible !important; /* Always visible in floating mode */
-}
-
-/* Edit name icon in floating mode - next to position toggle */
-.self-tile-floating .canvas-container .edit-name-icon {
-  position: absolute !important;
-  top: 8px !important;
-  right: 48px !important; /* Next to position toggle: 8px + 32px button + 8px gap */
-  left: auto !important;
-  transform: none !important;
-  opacity: 0.6 !important;
-  background-color: rgba(0, 0, 0, 0.6) !important;
-  border-radius: 50% !important;
-  padding: 6px !important;
-  text-align: center !important;
-  line-height: 1 !important;
-  cursor: pointer !important;
-  z-index: 10 !important;
-  transition: opacity 0.2s ease !important;
-  border: none !important;
-  visibility: hidden !important;
-}
-
-.self-tile-floating .canvas-container .edit-name-icon svg {
-  width: 20px !important;
-  height: 20px !important;
-  display: block !important;
-  stroke: white;
-}
-
-.grid-item .canvas-container .position-toggle-icon svg,
-.self-tile-floating .canvas-container .position-toggle-icon svg {
-  width: 20px !important;
-  height: 20px !important;
-  display: block !important;
-  stroke: white;
-}
-
-/* Show position toggle and edit name icons on hover (desktop) */
-@media (min-width: 768px) {
-  .grid-item .canvas-container .position-toggle-icon,
-  .self-tile-floating .canvas-container .position-toggle-icon,
-  .self-tile-floating .canvas-container .edit-name-icon {
-    opacity: 0 !important;
-  }
-  .grid-item .canvas-container:hover .position-toggle-icon,
-  .self-tile-floating .canvas-container:hover .position-toggle-icon,
-  .self-tile-floating .canvas-container:hover .edit-name-icon {
-    visibility: visible !important;
-    opacity: 0.6 !important;
-  }
-}
-
-/* Hide position toggle icon on mobile for peer tiles only */
-@media (max-width: 767px) {
-  .grid-item:not(.self-tile) .canvas-container .position-toggle-icon {
-    display: none !important;
-  }
-
-  /* Show edit name and position toggle on hover for floating self-tile on mobile */
-  .self-tile-floating .canvas-container .position-toggle-icon,
-  .self-tile-floating .canvas-container .edit-name-icon {
-    opacity: 0 !important;
-    visibility: hidden !important;
-    display: block !important;
-  }
-  .self-tile-floating .canvas-container:hover .position-toggle-icon,
-  .self-tile-floating .canvas-container:hover .edit-name-icon {
-    visibility: visible !important;
-    opacity: 0.6 !important;
-  }
-
-  /* Floating self-tile adjustments for mobile - position above video controls */
-  .self-tile-floating {
-    width: 40%;
-    max-width: 200px;
-    min-width: 160px;
-    bottom: 95px; /* Above video controls (~70px height + 16px bottom margin) */
-    right: 8px;
-  }
 }

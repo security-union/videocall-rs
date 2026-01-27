@@ -20,9 +20,10 @@ use js_sys::Reflect;
 use wasm_bindgen::JsValue;
 use web_sys::window;
 
-// Cached result to avoid repeated checks
+// Cached results to avoid repeated checks
 use std::sync::OnceLock;
 static IS_IOS: OnceLock<bool> = OnceLock::new();
+static IS_FIREFOX: OnceLock<bool> = OnceLock::new();
 
 /// Detects if the current environment is likely iOS Safari.
 /// Checks user agent and the absence of AudioEncoder API which causes crashes on iOS.
@@ -75,4 +76,22 @@ fn is_audio_encoder_available() -> bool {
     } else {
         false
     }
+}
+
+/// Detects if the current browser is Firefox.
+/// Firefox uses software VP9 encoding which is slow, so we use VP8 instead.
+pub fn is_firefox() -> bool {
+    *IS_FIREFOX.get_or_init(|| {
+        if let Some(window) = window() {
+            if let Ok(ua) = window.navigator().user_agent() {
+                let ua_lower = ua.to_lowercase();
+                // Firefox user agent contains "firefox" but not "seamonkey" (which also uses Gecko)
+                let is_ff = ua_lower.contains("firefox") && !ua_lower.contains("seamonkey");
+                log::info!("Firefox detection: User Agent='{ua}', IsFirefox={is_ff}");
+                return is_ff;
+            }
+        }
+        log::warn!("Could not determine browser, assuming not Firefox.");
+        false
+    })
 }

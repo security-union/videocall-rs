@@ -10,7 +10,8 @@ on:
       - add-auth
     paths:
       - 'actix-api/**'
-      - 'types/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
       - Dockerfile.actix
       - Cargo.lock
       - Cargo.toml

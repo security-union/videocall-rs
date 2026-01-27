@@ -50,7 +50,7 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_screen_chunk;
 
-use crate::constants::VIDEO_CODEC;
+use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
 
 // Threshold for bitrate changes, represents 20% (0.2)
@@ -280,7 +280,7 @@ impl ScreenEncoder {
             // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
             let screen_encoder_config =
-                VideoEncoderConfig::new(VIDEO_CODEC, height as u32, width as u32);
+                VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
             screen_encoder_config.set_bitrate(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
@@ -327,7 +327,7 @@ impl ScreenEncoder {
                     info!("📊 Updating screen bitrate to {new_bitrate}");
                     local_bitrate = new_bitrate;
                     let new_config = VideoEncoderConfig::new(
-                        VIDEO_CODEC,
+                        get_video_codec_string(),
                         current_encoder_height,
                         current_encoder_width,
                     );
@@ -378,7 +378,7 @@ impl ScreenEncoder {
                             current_encoder_height = frame_height;
 
                             let new_config = VideoEncoderConfig::new(
-                                VIDEO_CODEC,
+                                get_video_codec_string(),
                                 current_encoder_height,
                                 current_encoder_width,
                             );

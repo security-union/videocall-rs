@@ -4,10 +4,12 @@ on:
   pull_request:
     paths:
       - 'actix-api/**'
-      - 'types/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
       - 'yew-ui/**'
       - 'docker/**'
       - 'neteq/**'
+      - 'videocall-client/**'
 name: check backend
   
 jobs:

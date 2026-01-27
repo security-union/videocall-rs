@@ -6,6 +6,7 @@ on:
       # API image dependencies
       - 'actix-api/**'
       - 'videocall-types/**'
+      - 'protobuf/**'
       - 'Dockerfile.actix'
       - 'Cargo.lock'
       - 'Cargo.toml'

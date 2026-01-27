@@ -17,6 +17,7 @@
  */
 
 use super::super::wrappers::EncodedVideoChunkTypeWrapper;
+use crate::constants::get_video_codec;
 use crate::crypto::aes::Aes128State;
 use js_sys::Uint8Array;
 use protobuf::Message;
@@ -51,6 +52,7 @@ pub fn transform_video_chunk(
         timestamp: chunk.timestamp(),
         video_metadata: Some(VideoMetadata {
             sequence,
+            codec: get_video_codec().into(),
             ..Default::default()
         })
         .into(),
@@ -88,6 +90,7 @@ pub fn transform_screen_chunk(
         timestamp: chunk.timestamp(),
         video_metadata: Some(VideoMetadata {
             sequence,
+            codec: get_video_codec().into(),
             ..Default::default()
         })
         .into(),

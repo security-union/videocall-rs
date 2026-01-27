@@ -138,7 +138,7 @@ impl ::protobuf::Message for MeetingPacket {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if self.event_type != ::protobuf::EnumOrUnknown::new(meeting_packet::MeetingEventType::MEETING_STARTED) {
+        if self.event_type != ::protobuf::EnumOrUnknown::new(meeting_packet::MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) {
             my_size += ::protobuf::rt::int32_size(1, self.event_type.value());
         }
         if !self.room_id.is_empty() {
@@ -162,7 +162,7 @@ impl ::protobuf::Message for MeetingPacket {
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if self.event_type != ::protobuf::EnumOrUnknown::new(meeting_packet::MeetingEventType::MEETING_STARTED) {
+        if self.event_type != ::protobuf::EnumOrUnknown::new(meeting_packet::MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) {
             os.write_enum(1, ::protobuf::EnumOrUnknown::value(&self.event_type))?;
         }
         if !self.room_id.is_empty() {
@@ -197,7 +197,7 @@ impl ::protobuf::Message for MeetingPacket {
     }
 
     fn clear(&mut self) {
-        self.event_type = ::protobuf::EnumOrUnknown::new(meeting_packet::MeetingEventType::MEETING_STARTED);
+        self.event_type = ::protobuf::EnumOrUnknown::new(meeting_packet::MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN);
         self.room_id.clear();
         self.start_time_ms = 0;
         self.message.clear();
@@ -242,14 +242,16 @@ pub mod meeting_packet {
     #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
     // @@protoc_insertion_point(enum:MeetingPacket.MeetingEventType)
     pub enum MeetingEventType {
+        // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.MEETING_EVENT_TYPE_UNKNOWN)
+        MEETING_EVENT_TYPE_UNKNOWN = 0,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.MEETING_STARTED)
-        MEETING_STARTED = 0,
+        MEETING_STARTED = 1,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.MEETING_ENDED)
-        MEETING_ENDED = 1,
+        MEETING_ENDED = 2,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.PARTICIPANT_JOINED)
-        PARTICIPANT_JOINED = 2,
+        PARTICIPANT_JOINED = 3,
         // @@protoc_insertion_point(enum_value:MeetingPacket.MeetingEventType.PARTICIPANT_LEFT)
-        PARTICIPANT_LEFT = 3,
+        PARTICIPANT_LEFT = 4,
     }
 
     impl ::protobuf::Enum for MeetingEventType {
@@ -261,16 +263,18 @@ pub mod meeting_packet {
 
         fn from_i32(value: i32) -> ::std::option::Option<MeetingEventType> {
             match value {
-                0 => ::std::option::Option::Some(MeetingEventType::MEETING_STARTED),
-                1 => ::std::option::Option::Some(MeetingEventType::MEETING_ENDED),
-                2 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_JOINED),
-                3 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_LEFT),
+                0 => ::std::option::Option::Some(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN),
+                1 => ::std::option::Option::Some(MeetingEventType::MEETING_STARTED),
+                2 => ::std::option::Option::Some(MeetingEventType::MEETING_ENDED),
+                3 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_JOINED),
+                4 => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_LEFT),
                 _ => ::std::option::Option::None
             }
         }
 
         fn from_str(str: &str) -> ::std::option::Option<MeetingEventType> {
             match str {
+                "MEETING_EVENT_TYPE_UNKNOWN" => ::std::option::Option::Some(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN),
                 "MEETING_STARTED" => ::std::option::Option::Some(MeetingEventType::MEETING_STARTED),
                 "MEETING_ENDED" => ::std::option::Option::Some(MeetingEventType::MEETING_ENDED),
                 "PARTICIPANT_JOINED" => ::std::option::Option::Some(MeetingEventType::PARTICIPANT_JOINED),
@@ -280,6 +284,7 @@ pub mod meeting_packet {
         }
 
         const VALUES: &'static [MeetingEventType] = &[
+            MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN,
             MeetingEventType::MEETING_STARTED,
             MeetingEventType::MEETING_ENDED,
             MeetingEventType::PARTICIPANT_JOINED,
@@ -301,7 +306,7 @@ pub mod meeting_packet {
 
     impl ::std::default::Default for MeetingEventType {
         fn default() -> Self {
-            MeetingEventType::MEETING_STARTED
+            MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN
         }
     }
 
@@ -313,49 +318,52 @@ pub mod meeting_packet {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/meeting_packet.proto\"\xdc\x02\n\rMeetingPacket\x12>\n\neven\
+    \n\x1atypes/meeting_packet.proto\"\xfd\x02\n\rMeetingPacket\x12>\n\neven\
     t_type\x18\x01\x20\x01(\x0e2\x1f.MeetingPacket.MeetingEventTypeR\teventT\
     ype\x12\x17\n\x07room_id\x18\x02\x20\x01(\tR\x06roomId\x12\"\n\rstart_ti\
     me_ms\x18\x03\x20\x01(\x04R\x0bstartTimeMs\x12\x18\n\x07message\x18\x04\
     \x20\x01(\tR\x07message\x12\x1d\n\ncreator_id\x18\x05\x20\x01(\tR\tcreat\
     orId\x12+\n\x11participant_count\x18\x06\x20\x01(\x03R\x10participantCou\
-    nt\"h\n\x10MeetingEventType\x12\x13\n\x0fMEETING_STARTED\x10\0\x12\x11\n\
-    \rMEETING_ENDED\x10\x01\x12\x16\n\x12PARTICIPANT_JOINED\x10\x02\x12\x14\
-    \n\x10PARTICIPANT_LEFT\x10\x03J\xc9\x06\n\x06\x12\x04\0\0\x15\x01\n\x08\
-    \n\x01\x0c\x12\x03\0\0\x12\nH\n\x02\x04\0\x12\x04\x03\0\x15\x01\x1a<\x20\
-    Meeting\x20lifecycle\x20messages\x20sent\x20between\x20server\x20and\x20\
-    clients\n\n\n\n\x03\x04\0\x01\x12\x03\x03\x08\x15\n\x0c\n\x04\x04\0\x04\
-    \0\x12\x04\x04\x02\r\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x04\x07\x17\
-    \nF\n\x06\x04\0\x04\0\x02\0\x12\x03\x06\x04\x18\x1a7\x20Meeting\x20start\
-    ed\x20-\x20sent\x20to\x20participants\x20when\x20they\x20join\n\n\x0e\n\
-    \x07\x04\0\x04\0\x02\0\x01\x12\x03\x06\x04\x13\n\x0e\n\x07\x04\0\x04\0\
-    \x02\0\x02\x12\x03\x06\x16\x17\nQ\n\x06\x04\0\x04\0\x02\x01\x12\x03\x08\
+    nt\"\x88\x01\n\x10MeetingEventType\x12\x1e\n\x1aMEETING_EVENT_TYPE_UNKNO\
+    WN\x10\0\x12\x13\n\x0fMEETING_STARTED\x10\x01\x12\x11\n\rMEETING_ENDED\
+    \x10\x02\x12\x16\n\x12PARTICIPANT_JOINED\x10\x03\x12\x14\n\x10PARTICIPAN\
+    T_LEFT\x10\x04J\xf8\x06\n\x06\x12\x04\0\0\x16\x01\n\x08\n\x01\x0c\x12\
+    \x03\0\0\x12\nH\n\x02\x04\0\x12\x04\x03\0\x16\x01\x1a<\x20Meeting\x20lif\
+    ecycle\x20messages\x20sent\x20between\x20server\x20and\x20clients\n\n\n\
+    \n\x03\x04\0\x01\x12\x03\x03\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x04\
+    \x02\x0e\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x04\x07\x17\n\r\n\x06\
+    \x04\0\x04\0\x02\0\x12\x03\x05\x04#\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\
+    \x12\x03\x05\x04\x1e\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x05!\"\nF\
+    \n\x06\x04\0\x04\0\x02\x01\x12\x03\x07\x04\x18\x1a7\x20Meeting\x20starte\
+    d\x20-\x20sent\x20to\x20participants\x20when\x20they\x20join\n\n\x0e\n\
+    \x07\x04\0\x04\0\x02\x01\x01\x12\x03\x07\x04\x13\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x01\x02\x12\x03\x07\x16\x17\nQ\n\x06\x04\0\x04\0\x02\x02\x12\x03\t\
     \x04\x16\x1aB\x20Meeting\x20ended\x20-\x20sent\x20when\x20host\x20leaves\
     \x20or\x20last\x20participant\x20leaves\n\n\x0e\n\x07\x04\0\x04\0\x02\
-    \x01\x01\x12\x03\x08\x04\x11\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\
-    \x08\x14\x15\n/\n\x06\x04\0\x04\0\x02\x02\x12\x03\n\x04\x1b\x1a\x20\x20P\
-    articipant\x20joined\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\x02\
-    \x01\x12\x03\n\x04\x16\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\x03\n\x19\
-    \x1a\n-\n\x06\x04\0\x04\0\x02\x03\x12\x03\x0c\x04\x19\x1a\x1e\x20Partici\
-    pant\x20left\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\x12\
-    \x03\x0c\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x0c\x17\x18\
-    \n\x0b\n\x04\x04\0\x02\0\x12\x03\x0f\x02\"\n\x0c\n\x05\x04\0\x02\0\x06\
-    \x12\x03\x0f\x02\x12\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x0f\x13\x1d\n\
-    \x0c\n\x05\x04\0\x02\0\x03\x12\x03\x0f\x20!\n\x0b\n\x04\x04\0\x02\x01\
-    \x12\x03\x10\x02\x15\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x10\x02\x08\n\
-    \x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x10\t\x10\n\x0c\n\x05\x04\0\x02\x01\
-    \x03\x12\x03\x10\x13\x14\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x11\x02\x1b\n\
-    \x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x11\x02\x08\n\x0c\n\x05\x04\0\x02\
-    \x02\x01\x12\x03\x11\t\x16\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x11\x19\
-    \x1a\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x12\x02\x15\n\x0c\n\x05\x04\0\x02\
-    \x03\x05\x12\x03\x12\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x12\t\
-    \x10\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x12\x13\x14\n\x0b\n\x04\x04\0\
-    \x02\x04\x12\x03\x13\x02\x18\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\x13\
-    \x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x13\t\x13\n\x0c\n\x05\x04\
-    \0\x02\x04\x03\x12\x03\x13\x16\x17\n\x0b\n\x04\x04\0\x02\x05\x12\x03\x14\
-    \x02\x1e\n\x0c\n\x05\x04\0\x02\x05\x05\x12\x03\x14\x02\x07\n\x0c\n\x05\
-    \x04\0\x02\x05\x01\x12\x03\x14\x08\x19\n\x0c\n\x05\x04\0\x02\x05\x03\x12\
-    \x03\x14\x1c\x1db\x06proto3\
+    \x02\x01\x12\x03\t\x04\x11\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\x03\t\
+    \x14\x15\n/\n\x06\x04\0\x04\0\x02\x03\x12\x03\x0b\x04\x1b\x1a\x20\x20Par\
+    ticipant\x20joined\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\x03\
+    \x01\x12\x03\x0b\x04\x16\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x0b\
+    \x19\x1a\n-\n\x06\x04\0\x04\0\x02\x04\x12\x03\r\x04\x19\x1a\x1e\x20Parti\
+    cipant\x20left\x20the\x20meeting\n\n\x0e\n\x07\x04\0\x04\0\x02\x04\x01\
+    \x12\x03\r\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\x12\x03\r\x17\x18\
+    \n\x0b\n\x04\x04\0\x02\0\x12\x03\x10\x02\"\n\x0c\n\x05\x04\0\x02\0\x06\
+    \x12\x03\x10\x02\x12\n\x0c\n\x05\x04\0\x02\0\x01\x12\x03\x10\x13\x1d\n\
+    \x0c\n\x05\x04\0\x02\0\x03\x12\x03\x10\x20!\n\x0b\n\x04\x04\0\x02\x01\
+    \x12\x03\x11\x02\x15\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\x11\x02\x08\n\
+    \x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x11\t\x10\n\x0c\n\x05\x04\0\x02\x01\
+    \x03\x12\x03\x11\x13\x14\n\x0b\n\x04\x04\0\x02\x02\x12\x03\x12\x02\x1b\n\
+    \x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x12\x02\x08\n\x0c\n\x05\x04\0\x02\
+    \x02\x01\x12\x03\x12\t\x16\n\x0c\n\x05\x04\0\x02\x02\x03\x12\x03\x12\x19\
+    \x1a\n\x0b\n\x04\x04\0\x02\x03\x12\x03\x13\x02\x15\n\x0c\n\x05\x04\0\x02\
+    \x03\x05\x12\x03\x13\x02\x08\n\x0c\n\x05\x04\0\x02\x03\x01\x12\x03\x13\t\
+    \x10\n\x0c\n\x05\x04\0\x02\x03\x03\x12\x03\x13\x13\x14\n\x0b\n\x04\x04\0\
+    \x02\x04\x12\x03\x14\x02\x18\n\x0c\n\x05\x04\0\x02\x04\x05\x12\x03\x14\
+    \x02\x08\n\x0c\n\x05\x04\0\x02\x04\x01\x12\x03\x14\t\x13\n\x0c\n\x05\x04\
+    \0\x02\x04\x03\x12\x03\x14\x16\x17\n\x0b\n\x04\x04\0\x02\x05\x12\x03\x15\
+    \x02\x1e\n\x0c\n\x05\x04\0\x02\x05\x05\x12\x03\x15\x02\x07\n\x0c\n\x05\
+    \x04\0\x02\x05\x01\x12\x03\x15\x08\x19\n\x0c\n\x05\x04\0\x02\x05\x03\x12\
+    \x03\x15\x1c\x1db\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

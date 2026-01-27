@@ -107,7 +107,7 @@ impl ::protobuf::Message for PacketWrapper {
     #[allow(unused_variables)]
     fn compute_size(&self) -> u64 {
         let mut my_size = 0;
-        if self.packet_type != ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::RSA_PUB_KEY) {
+        if self.packet_type != ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::PACKET_TYPE_UNKNOWN) {
             my_size += ::protobuf::rt::int32_size(1, self.packet_type.value());
         }
         if !self.email.is_empty() {
@@ -122,7 +122,7 @@ impl ::protobuf::Message for PacketWrapper {
     }
 
     fn write_to_with_cached_sizes(&self, os: &mut ::protobuf::CodedOutputStream<'_>) -> ::protobuf::Result<()> {
-        if self.packet_type != ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::RSA_PUB_KEY) {
+        if self.packet_type != ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::PACKET_TYPE_UNKNOWN) {
             os.write_enum(1, ::protobuf::EnumOrUnknown::value(&self.packet_type))?;
         }
         if !self.email.is_empty() {
@@ -148,7 +148,7 @@ impl ::protobuf::Message for PacketWrapper {
     }
 
     fn clear(&mut self) {
-        self.packet_type = ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::RSA_PUB_KEY);
+        self.packet_type = ::protobuf::EnumOrUnknown::new(packet_wrapper::PacketType::PACKET_TYPE_UNKNOWN);
         self.email.clear();
         self.data.clear();
         self.special_fields.clear();
@@ -187,20 +187,22 @@ pub mod packet_wrapper {
     #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
     // @@protoc_insertion_point(enum:PacketWrapper.PacketType)
     pub enum PacketType {
+        // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.PACKET_TYPE_UNKNOWN)
+        PACKET_TYPE_UNKNOWN = 0,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.RSA_PUB_KEY)
-        RSA_PUB_KEY = 0,
+        RSA_PUB_KEY = 1,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.AES_KEY)
-        AES_KEY = 1,
+        AES_KEY = 2,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.MEDIA)
-        MEDIA = 2,
+        MEDIA = 3,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.CONNECTION)
-        CONNECTION = 3,
+        CONNECTION = 4,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.DIAGNOSTICS)
-        DIAGNOSTICS = 4,
+        DIAGNOSTICS = 5,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.HEALTH)
-        HEALTH = 5,
+        HEALTH = 6,
         // @@protoc_insertion_point(enum_value:PacketWrapper.PacketType.MEETING)
-        MEETING = 6,
+        MEETING = 7,
     }
 
     impl ::protobuf::Enum for PacketType {
@@ -212,19 +214,21 @@ pub mod packet_wrapper {
 
         fn from_i32(value: i32) -> ::std::option::Option<PacketType> {
             match value {
-                0 => ::std::option::Option::Some(PacketType::RSA_PUB_KEY),
-                1 => ::std::option::Option::Some(PacketType::AES_KEY),
-                2 => ::std::option::Option::Some(PacketType::MEDIA),
-                3 => ::std::option::Option::Some(PacketType::CONNECTION),
-                4 => ::std::option::Option::Some(PacketType::DIAGNOSTICS),
-                5 => ::std::option::Option::Some(PacketType::HEALTH),
-                6 => ::std::option::Option::Some(PacketType::MEETING),
+                0 => ::std::option::Option::Some(PacketType::PACKET_TYPE_UNKNOWN),
+                1 => ::std::option::Option::Some(PacketType::RSA_PUB_KEY),
+                2 => ::std::option::Option::Some(PacketType::AES_KEY),
+                3 => ::std::option::Option::Some(PacketType::MEDIA),
+                4 => ::std::option::Option::Some(PacketType::CONNECTION),
+                5 => ::std::option::Option::Some(PacketType::DIAGNOSTICS),
+                6 => ::std::option::Option::Some(PacketType::HEALTH),
+                7 => ::std::option::Option::Some(PacketType::MEETING),
                 _ => ::std::option::Option::None
             }
         }
 
         fn from_str(str: &str) -> ::std::option::Option<PacketType> {
             match str {
+                "PACKET_TYPE_UNKNOWN" => ::std::option::Option::Some(PacketType::PACKET_TYPE_UNKNOWN),
                 "RSA_PUB_KEY" => ::std::option::Option::Some(PacketType::RSA_PUB_KEY),
                 "AES_KEY" => ::std::option::Option::Some(PacketType::AES_KEY),
                 "MEDIA" => ::std::option::Option::Some(PacketType::MEDIA),
@@ -237,6 +241,7 @@ pub mod packet_wrapper {
         }
 
         const VALUES: &'static [PacketType] = &[
+            PacketType::PACKET_TYPE_UNKNOWN,
             PacketType::RSA_PUB_KEY,
             PacketType::AES_KEY,
             PacketType::MEDIA,
@@ -261,7 +266,7 @@ pub mod packet_wrapper {
 
     impl ::std::default::Default for PacketType {
         fn default() -> Self {
-            PacketType::RSA_PUB_KEY
+            PacketType::PACKET_TYPE_UNKNOWN
         }
     }
 
@@ -273,40 +278,43 @@ pub mod packet_wrapper {
 }
 
 static file_descriptor_proto_data: &'static [u8] = b"\
-    \n\x1atypes/packet_wrapper.proto\"\xe6\x01\n\rPacketWrapper\x12:\n\x0bpa\
+    \n\x1atypes/packet_wrapper.proto\"\x80\x02\n\rPacketWrapper\x12:\n\x0bpa\
     cket_type\x18\x01\x20\x01(\x0e2\x19.PacketWrapper.PacketTypeR\npacketTyp\
     e\x12\x14\n\x05email\x18\x02\x20\x01(\tR\x05email\x12\x12\n\x04data\x18\
-    \x03\x20\x01(\x0cR\x04data\"o\n\nPacketType\x12\x0f\n\x0bRSA_PUB_KEY\x10\
-    \0\x12\x0b\n\x07AES_KEY\x10\x01\x12\t\n\x05MEDIA\x10\x02\x12\x0e\n\nCONN\
-    ECTION\x10\x03\x12\x0f\n\x0bDIAGNOSTICS\x10\x04\x12\n\n\x06HEALTH\x10\
-    \x05\x12\x0b\n\x07MEETING\x10\x06J\xb4\x04\n\x06\x12\x04\0\0\x0f\x01\n\
-    \x08\n\x01\x0c\x12\x03\0\0\x12\n\n\n\x02\x04\0\x12\x04\x02\0\x0f\x01\n\n\
-    \n\x03\x04\0\x01\x12\x03\x02\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x03\
-    \x02\x0b\x03\n\x0c\n\x05\x04\0\x04\0\x01\x12\x03\x03\x07\x11\n\r\n\x06\
-    \x04\0\x04\0\x02\0\x12\x03\x04\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\
-    \x12\x03\x04\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x04\x12\
-    \x13\n\r\n\x06\x04\0\x04\0\x02\x01\x12\x03\x05\x04\x10\n\x0e\n\x07\x04\0\
-    \x04\0\x02\x01\x01\x12\x03\x05\x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\x01\
-    \x02\x12\x03\x05\x0e\x0f\n\r\n\x06\x04\0\x04\0\x02\x02\x12\x03\x06\x04\
-    \x0e\n\x0e\n\x07\x04\0\x04\0\x02\x02\x01\x12\x03\x06\x04\t\n\x0e\n\x07\
-    \x04\0\x04\0\x02\x02\x02\x12\x03\x06\x0c\r\n\r\n\x06\x04\0\x04\0\x02\x03\
-    \x12\x03\x07\x04\x13\n\x0e\n\x07\x04\0\x04\0\x02\x03\x01\x12\x03\x07\x04\
-    \x0e\n\x0e\n\x07\x04\0\x04\0\x02\x03\x02\x12\x03\x07\x11\x12\n\r\n\x06\
-    \x04\0\x04\0\x02\x04\x12\x03\x08\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x04\
-    \x01\x12\x03\x08\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x04\x02\x12\x03\x08\
-    \x12\x13\n\r\n\x06\x04\0\x04\0\x02\x05\x12\x03\t\x04\x0f\n\x0e\n\x07\x04\
-    \0\x04\0\x02\x05\x01\x12\x03\t\x04\n\n\x0e\n\x07\x04\0\x04\0\x02\x05\x02\
-    \x12\x03\t\r\x0e\n\r\n\x06\x04\0\x04\0\x02\x06\x12\x03\n\x04\x10\n\x0e\n\
-    \x07\x04\0\x04\0\x02\x06\x01\x12\x03\n\x04\x0b\n\x0e\n\x07\x04\0\x04\0\
-    \x02\x06\x02\x12\x03\n\x0e\x0f\n\x0b\n\x04\x04\0\x02\0\x12\x03\x0c\x02\
-    \x1d\n\x0c\n\x05\x04\0\x02\0\x06\x12\x03\x0c\x02\x0c\n\x0c\n\x05\x04\0\
-    \x02\0\x01\x12\x03\x0c\r\x18\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\x0c\x1b\
-    \x1c\n\x0b\n\x04\x04\0\x02\x01\x12\x03\r\x02\x13\n\x0c\n\x05\x04\0\x02\
-    \x01\x05\x12\x03\r\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\r\t\x0e\
-    \n\x0c\n\x05\x04\0\x02\x01\x03\x12\x03\r\x11\x12\n\x0b\n\x04\x04\0\x02\
-    \x02\x12\x03\x0e\x02\x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x0e\x02\
-    \x07\n\x0c\n\x05\x04\0\x02\x02\x01\x12\x03\x0e\x08\x0c\n\x0c\n\x05\x04\0\
-    \x02\x02\x03\x12\x03\x0e\x0f\x10b\x06proto3\
+    \x03\x20\x01(\x0cR\x04data\"\x88\x01\n\nPacketType\x12\x17\n\x13PACKET_T\
+    YPE_UNKNOWN\x10\0\x12\x0f\n\x0bRSA_PUB_KEY\x10\x01\x12\x0b\n\x07AES_KEY\
+    \x10\x02\x12\t\n\x05MEDIA\x10\x03\x12\x0e\n\nCONNECTION\x10\x04\x12\x0f\
+    \n\x0bDIAGNOSTICS\x10\x05\x12\n\n\x06HEALTH\x10\x06\x12\x0b\n\x07MEETING\
+    \x10\x07J\xe3\x04\n\x06\x12\x04\0\0\x10\x01\n\x08\n\x01\x0c\x12\x03\0\0\
+    \x12\n\n\n\x02\x04\0\x12\x04\x02\0\x10\x01\n\n\n\x03\x04\0\x01\x12\x03\
+    \x02\x08\x15\n\x0c\n\x04\x04\0\x04\0\x12\x04\x03\x02\x0c\x03\n\x0c\n\x05\
+    \x04\0\x04\0\x01\x12\x03\x03\x07\x11\n\r\n\x06\x04\0\x04\0\x02\0\x12\x03\
+    \x04\x04\x1c\n\x0e\n\x07\x04\0\x04\0\x02\0\x01\x12\x03\x04\x04\x17\n\x0e\
+    \n\x07\x04\0\x04\0\x02\0\x02\x12\x03\x04\x1a\x1b\n\r\n\x06\x04\0\x04\0\
+    \x02\x01\x12\x03\x05\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x01\x01\x12\x03\
+    \x05\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x01\x02\x12\x03\x05\x12\x13\n\r\
+    \n\x06\x04\0\x04\0\x02\x02\x12\x03\x06\x04\x10\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x02\x01\x12\x03\x06\x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\x02\x02\x12\
+    \x03\x06\x0e\x0f\n\r\n\x06\x04\0\x04\0\x02\x03\x12\x03\x07\x04\x0e\n\x0e\
+    \n\x07\x04\0\x04\0\x02\x03\x01\x12\x03\x07\x04\t\n\x0e\n\x07\x04\0\x04\0\
+    \x02\x03\x02\x12\x03\x07\x0c\r\n\r\n\x06\x04\0\x04\0\x02\x04\x12\x03\x08\
+    \x04\x13\n\x0e\n\x07\x04\0\x04\0\x02\x04\x01\x12\x03\x08\x04\x0e\n\x0e\n\
+    \x07\x04\0\x04\0\x02\x04\x02\x12\x03\x08\x11\x12\n\r\n\x06\x04\0\x04\0\
+    \x02\x05\x12\x03\t\x04\x14\n\x0e\n\x07\x04\0\x04\0\x02\x05\x01\x12\x03\t\
+    \x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x05\x02\x12\x03\t\x12\x13\n\r\n\x06\
+    \x04\0\x04\0\x02\x06\x12\x03\n\x04\x0f\n\x0e\n\x07\x04\0\x04\0\x02\x06\
+    \x01\x12\x03\n\x04\n\n\x0e\n\x07\x04\0\x04\0\x02\x06\x02\x12\x03\n\r\x0e\
+    \n\r\n\x06\x04\0\x04\0\x02\x07\x12\x03\x0b\x04\x10\n\x0e\n\x07\x04\0\x04\
+    \0\x02\x07\x01\x12\x03\x0b\x04\x0b\n\x0e\n\x07\x04\0\x04\0\x02\x07\x02\
+    \x12\x03\x0b\x0e\x0f\n\x0b\n\x04\x04\0\x02\0\x12\x03\r\x02\x1d\n\x0c\n\
+    \x05\x04\0\x02\0\x06\x12\x03\r\x02\x0c\n\x0c\n\x05\x04\0\x02\0\x01\x12\
+    \x03\r\r\x18\n\x0c\n\x05\x04\0\x02\0\x03\x12\x03\r\x1b\x1c\n\x0b\n\x04\
+    \x04\0\x02\x01\x12\x03\x0e\x02\x13\n\x0c\n\x05\x04\0\x02\x01\x05\x12\x03\
+    \x0e\x02\x08\n\x0c\n\x05\x04\0\x02\x01\x01\x12\x03\x0e\t\x0e\n\x0c\n\x05\
+    \x04\0\x02\x01\x03\x12\x03\x0e\x11\x12\n\x0b\n\x04\x04\0\x02\x02\x12\x03\
+    \x0f\x02\x11\n\x0c\n\x05\x04\0\x02\x02\x05\x12\x03\x0f\x02\x07\n\x0c\n\
+    \x05\x04\0\x02\x02\x01\x12\x03\x0f\x08\x0c\n\x0c\n\x05\x04\0\x02\x02\x03\
+    \x12\x03\x0f\x0f\x10b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

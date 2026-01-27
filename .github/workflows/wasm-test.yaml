@@ -6,13 +6,15 @@ on:
     paths:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
-      - 'types/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
   pull_request:
     paths:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
       - 'neteq/**'
-      - 'types/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
 
 jobs:
   wasm-test:

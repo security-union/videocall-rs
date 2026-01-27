@@ -162,7 +162,7 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if self.timestamp_ms != 0 {
             my_size += ::protobuf::rt::uint64_size(4, self.timestamp_ms);
         }
-        if self.media_type != ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::VIDEO) {
+        if self.media_type != ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::MEDIA_TYPE_UNKNOWN) {
             my_size += ::protobuf::rt::int32_size(5, self.media_type.value());
         }
         if let Some(v) = self.video_metrics.as_ref() {
@@ -191,7 +191,7 @@ impl ::protobuf::Message for DiagnosticsPacket {
         if self.timestamp_ms != 0 {
             os.write_uint64(4, self.timestamp_ms)?;
         }
-        if self.media_type != ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::VIDEO) {
+        if self.media_type != ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::MEDIA_TYPE_UNKNOWN) {
             os.write_enum(5, ::protobuf::EnumOrUnknown::value(&self.media_type))?;
         }
         if let Some(v) = self.video_metrics.as_ref() {
@@ -221,7 +221,7 @@ impl ::protobuf::Message for DiagnosticsPacket {
         self.sender_id.clear();
         self.target_id.clear();
         self.timestamp_ms = 0;
-        self.media_type = ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::VIDEO);
+        self.media_type = ::protobuf::EnumOrUnknown::new(super::media_packet::media_packet::MediaType::MEDIA_TYPE_UNKNOWN);
         self.video_metrics.clear();
         self.audio_metrics.clear();
         self.special_fields.clear();

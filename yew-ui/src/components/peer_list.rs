@@ -18,7 +18,7 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
-use crate::context::UsernameCtx;
+use crate::context::{extract_username_from_userid, UsernameCtx};
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew::{html, Component, Context};
@@ -77,7 +77,8 @@ impl Component for PeerList {
             .peers
             .iter()
             .filter(|peer| {
-                peer.to_lowercase()
+                let username = extract_username_from_userid(peer);
+                username.to_lowercase()
                     .contains(&self.search_query.to_lowercase())
             })
             .cloned()
@@ -185,7 +186,7 @@ impl Component for PeerList {
 
                                 { for filtered_peers.iter().map(|peer|
                                     html!{
-                                        <li><PeerListItem name={peer.clone()}/></li>
+                                        <li><PeerListItem name={extract_username_from_userid(peer)}/></li>
                                     })
                                 }
                             </ul>

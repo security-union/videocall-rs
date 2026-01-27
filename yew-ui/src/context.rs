@@ -82,7 +82,10 @@ pub fn load_self_video_position_from_storage() -> bool {
 /// Persist the self-video position preference to `localStorage`.
 pub fn save_self_video_position_to_storage(is_floating: bool) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.set_item(SELF_VIDEO_POSITION_KEY, if is_floating { "true" } else { "false" });
+        let _ = storage.set_item(
+            SELF_VIDEO_POSITION_KEY,
+            if is_floating { "true" } else { "false" },
+        );
     }
 }
 

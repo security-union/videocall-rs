@@ -53,119 +53,188 @@
                     this.readable = new ReadableStream({	
                     async start(controller) {	
                         this.video = document.createElement("video");
-                        this.video.muted = true; // Prevent potential audio feedback	
+                        this.video.muted = true;
                         this.video.srcObject = new MediaStream([track]);	
                         await Promise.all([
                             this.video.play(),
-                            new Promise(r => this.video.onloadedmetadata = r) // Wait for metadata
+                            new Promise(r => this.video.onloadedmetadata = r)
                         ]);
                         this.track = track;	
 
-                        // Ensure initial dimensions are set before creating canvas
                         if (!this.video.videoWidth || !this.video.videoHeight) {
                             console.warn("Video dimensions not available immediately after metadata load.");
-                            // Potential fallback or wait mechanism might be needed if this happens often
                         }
 
-                        this.canvas = new OffscreenCanvas(this.video.videoWidth || 640, this.video.videoHeight || 480); // Use default dimensions as fallback
-                        this.ctx = this.canvas.getContext('2d', {desynchronized: true});	
-
-                        // --- Performance Improvement: Use requestVideoFrameCallback if available ---
-                        if (this.video.requestVideoFrameCallback) {
-                            console.log("Using requestVideoFrameCallback for MediaStreamTrackProcessor polyfill");
-                            const processFrame = (now, metadata) => {
-                                // Check if stream is closed before processing
-                                if (!controller.desiredSize) return;
-
-                                try {
-                                    if (this.video.videoWidth && this.video.videoHeight) {
-                                         // Resize canvas if video dimensions changed
-                                         if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
-                                            this.canvas.width = this.video.videoWidth;
-                                            this.canvas.height = this.video.videoHeight;
-                                            // Re-get context if needed, although usually not necessary for 2d
-                                            // this.ctx = this.canvas.getContext('2d', {desynchronized: true});
-                                         }
-                                        this.ctx.drawImage(this.video, 0, 0);
-                                        // Use mediaTime for more accurate timestamp
-                                        controller.enqueue(new VideoFrame(this.canvas, {timestamp: metadata.mediaTime * 1e6 }));
+                        // --- Worker-based approach for better main thread performance ---
+                        const useWorker = typeof Worker !== 'undefined';
+                        
+                        if (useWorker) {
+                            console.log("Using Worker-based MediaStreamTrackProcessor polyfill");
+                            
+                            // Create inline worker to avoid separate file loading issues
+                            const workerCode = `
+                                self.onmessage = (event) => {
+                                    const { type, bitmap, timestamp, width, height } = event.data;
+                                    if (type === 'frame') {
+                                        try {
+                                            const frame = new VideoFrame(bitmap, {
+                                                timestamp: timestamp,
+                                                displayWidth: width,
+                                                displayHeight: height,
+                                            });
+                                            self.postMessage({ type: 'frame', frame }, [frame]);
+                                            bitmap.close();
+                                        } catch (e) {
+                                            self.postMessage({ type: 'error', error: e.message });
+                                            try { bitmap.close(); } catch {}
+                                        }
                                     }
-                                } catch (e) {
-                                    console.error("Error processing video frame (rVFC):", e);
-                                     try { controller.error(e); } catch {} // Close stream on error
-                                } finally {
-                                     // Schedule the next frame processing only if stream is still active
-                                     if (controller.desiredSize > 0) {
-                                         try {
-                                            this.video.requestVideoFrameCallback(processFrame);
-                                         } catch (e) {
-                                             console.error("Error requesting next video frame callback:", e);
-                                             try { controller.error(e); } catch {}
-                                         }
-                                     } else {
-                                         console.log("Stopping rVFC loop as stream is closed or backed up.");
-                                         this.video?.pause(); // Pause video when stopping
-                                     }
+                                };
+                            `;
+                            const blob = new Blob([workerCode], { type: 'application/javascript' });
+                            this.worker = new Worker(URL.createObjectURL(blob));
+                            
+                            // Handle frames coming back from worker
+                            this.worker.onmessage = (event) => {
+                                if (event.data.type === 'frame') {
+                                    if (controller.desiredSize > 0) {
+                                        controller.enqueue(event.data.frame);
+                                    } else {
+                                        event.data.frame.close();
+                                    }
+                                } else if (event.data.type === 'error') {
+                                    console.error("Worker error:", event.data.error);
                                 }
                             };
-                            // Start the loop
-                            this.video.requestVideoFrameCallback(processFrame);
-                        } else {
-                            // --- Fallback to simplified requestAnimationFrame ---
-                            console.warn("requestVideoFrameCallback not supported, falling back to requestAnimationFrame for MediaStreamTrackProcessor polyfill");
-                            let lastTimestamp = -1;
-                            const processFrameRAF = (timestamp) => {
-                                 // Check if stream is closed
-                                 if (!controller.desiredSize) {
-                                     console.log("Stopping rAF loop as stream is closed or backed up.");
-                                     this.video?.pause(); // Pause video when stopping
-                                     return;
-                                 }
-
-                                 // Avoid processing the same frame multiple times if RAF fires rapidly
-                                 if (timestamp === lastTimestamp) {
-                                     requestAnimationFrame(processFrameRAF);
-                                     return;
-                                 }
-                                 lastTimestamp = timestamp;
-
-                                 try {
-                                     if (this.video.videoWidth && this.video.videoHeight) {
-                                        // Resize canvas if video dimensions changed
-                                         if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
-                                            this.canvas.width = this.video.videoWidth;
-                                            this.canvas.height = this.video.videoHeight;
-                                         }
-                                        this.ctx.drawImage(this.video, 0, 0);
-                                        // Use performance.now() for timestamp as RAF timestamp isn't media time
-                                        controller.enqueue(new VideoFrame(this.canvas, { timestamp: performance.now() * 1000 }));
+                            
+                            if (this.video.requestVideoFrameCallback) {
+                                console.log("Using requestVideoFrameCallback with Worker");
+                                const processFrame = async (now, metadata) => {
+                                    if (!controller.desiredSize) {
+                                        this.video?.pause();
+                                        return;
                                     }
-                                 } catch (e) {
-                                     console.error("Error processing video frame (RAF):", e);
-                                     try { controller.error(e); } catch {} // Close stream on error
-                                 } finally {
-                                     // Schedule the next frame
-                                     if (controller.desiredSize > 0) {
-                                         requestAnimationFrame(processFrameRAF);
-                                     } else {
-                                          console.log("Stopping rAF loop as stream is closed or backed up.");
-                                          this.video?.pause(); // Pause video when stopping
-                                     }
-                                 }
-                            };
-                             // Start the loop
-                            requestAnimationFrame(processFrameRAF);
+
+                                    try {
+                                        if (this.video.videoWidth && this.video.videoHeight) {
+                                            // createImageBitmap is potentially more optimized than canvas drawImage
+                                            const bitmap = await createImageBitmap(this.video);
+                                            this.worker.postMessage({
+                                                type: 'frame',
+                                                bitmap: bitmap,
+                                                timestamp: metadata.mediaTime * 1e6,
+                                                width: this.video.videoWidth,
+                                                height: this.video.videoHeight
+                                            }, [bitmap]);
+                                        }
+                                    } catch (e) {
+                                        console.error("Error capturing frame:", e);
+                                    }
+                                    
+                                    if (controller.desiredSize > 0) {
+                                        this.video.requestVideoFrameCallback(processFrame);
+                                    }
+                                };
+                                this.video.requestVideoFrameCallback(processFrame);
+                            } else {
+                                console.warn("requestVideoFrameCallback not supported, using requestAnimationFrame with Worker");
+                                let lastTimestamp = -1;
+                                const processFrameRAF = async (timestamp) => {
+                                    if (!controller.desiredSize) {
+                                        this.video?.pause();
+                                        return;
+                                    }
+
+                                    if (timestamp !== lastTimestamp) {
+                                        lastTimestamp = timestamp;
+                                        try {
+                                            if (this.video.videoWidth && this.video.videoHeight) {
+                                                const bitmap = await createImageBitmap(this.video);
+                                                this.worker.postMessage({
+                                                    type: 'frame',
+                                                    bitmap: bitmap,
+                                                    timestamp: performance.now() * 1000,
+                                                    width: this.video.videoWidth,
+                                                    height: this.video.videoHeight
+                                                }, [bitmap]);
+                                            }
+                                        } catch (e) {
+                                            console.error("Error capturing frame:", e);
+                                        }
+                                    }
+                                    
+                                    if (controller.desiredSize > 0) {
+                                        requestAnimationFrame(processFrameRAF);
+                                    }
+                                };
+                                requestAnimationFrame(processFrameRAF);
+                            }
+                        } else {
+                            // --- Fallback: No worker support, use original canvas approach ---
+                            console.log("Worker not available, using canvas-based polyfill");
+                            this.canvas = new OffscreenCanvas(this.video.videoWidth || 640, this.video.videoHeight || 480);
+                            this.ctx = this.canvas.getContext('2d', {desynchronized: true});	
+
+                            if (this.video.requestVideoFrameCallback) {
+                                const processFrame = (now, metadata) => {
+                                    if (!controller.desiredSize) return;
+                                    try {
+                                        if (this.video.videoWidth && this.video.videoHeight) {
+                                            if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
+                                                this.canvas.width = this.video.videoWidth;
+                                                this.canvas.height = this.video.videoHeight;
+                                            }
+                                            this.ctx.drawImage(this.video, 0, 0);
+                                            controller.enqueue(new VideoFrame(this.canvas, {timestamp: metadata.mediaTime * 1e6 }));
+                                        }
+                                    } catch (e) {
+                                        console.error("Error processing video frame:", e);
+                                        try { controller.error(e); } catch {}
+                                    }
+                                    if (controller.desiredSize > 0) {
+                                        this.video.requestVideoFrameCallback(processFrame);
+                                    } else {
+                                        this.video?.pause();
+                                    }
+                                };
+                                this.video.requestVideoFrameCallback(processFrame);
+                            } else {
+                                const processFrameRAF = (timestamp) => {
+                                    if (!controller.desiredSize) {
+                                        this.video?.pause();
+                                        return;
+                                    }
+                                    try {
+                                        if (this.video.videoWidth && this.video.videoHeight) {
+                                            if (this.canvas.width !== this.video.videoWidth || this.canvas.height !== this.video.videoHeight) {
+                                                this.canvas.width = this.video.videoWidth;
+                                                this.canvas.height = this.video.videoHeight;
+                                            }
+                                            this.ctx.drawImage(this.video, 0, 0);
+                                            controller.enqueue(new VideoFrame(this.canvas, { timestamp: performance.now() * 1000 }));
+                                        }
+                                    } catch (e) {
+                                        console.error("Error processing video frame:", e);
+                                        try { controller.error(e); } catch {}
+                                    }
+                                    if (controller.desiredSize > 0) {
+                                        requestAnimationFrame(processFrameRAF);
+                                    }
+                                };
+                                requestAnimationFrame(processFrameRAF);
+                            }
                         }
                     },	
-                    // Pull is no longer needed as the stream is now push-based
-                    // pull(controller) { ... },
                     cancel(reason) {
                         console.log("Video track processor cancelled:", reason);
+                        if (this.worker) {
+                            this.worker.terminate();
+                            this.worker = null;
+                        }
                         if (this.video) {
                             this.video.pause();
-                            this.video.srcObject = null; // Release stream resources
+                            this.video.srcObject = null;
                         }
-                        // The rVFC/rAF loops will stop automatically due to the desiredSize check
                     }	
                     });	
                 } else if (track.kind == "audio") {	

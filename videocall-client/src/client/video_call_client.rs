@@ -37,11 +37,14 @@ use std::rc::{Rc, Weak};
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
@@ -489,7 +492,7 @@ impl VideoCallClient {
                 error: "Disconnected".to_string(),
                 last_known_server: None,
             };
-            return Ok(());
+            Ok(())
         } else {
             Err(anyhow::anyhow!("Unable to borrow inner"))
         }
@@ -800,7 +803,12 @@ impl Inner {
             response.packet_type.enum_value(),
             response.email
         );
-        let peer_status = self.peer_decode_manager.ensure_peer(&response.email);
+        // Skip creating peers for system messages (meeting info, meeting started/ended)
+        let peer_status = if response.email == SYSTEM_USER_EMAIL {
+            PeerStatus::NoChange
+        } else {
+            self.peer_decode_manager.ensure_peer(&response.email)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {
@@ -887,43 +895,10 @@ impl Inner {
                 }
             }
             Ok(PacketType::CONNECTION) => {
+                // CONNECTION packets are used for other purposes now
+                // Meeting info is sent via MEETING packet type with protobuf
                 let data_str = String::from_utf8_lossy(&response.data);
-
-                if data_str.starts_with("MEETING_ENDED:") {
-                    let message = data_str
-                        .strip_prefix("MEETING_ENDED:")
-                        .unwrap_or("The host has ended the meeting")
-                        .to_string();
-
-                    if let Some(callback) = &self.options.on_meeting_ended {
-                        let end_time_ms = web_time::SystemTime::now()
-                            .duration_since(web_time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as f64)
-                            .unwrap_or(0.0);
-                        callback.emit((end_time_ms, message));
-                    }
-                } else if data_str.starts_with("MEETING_INFO:") {
-                    if let Some(time_str) = data_str.strip_prefix("MEETING_INFO:") {
-                        if let Ok(start_time_ms) = time_str.parse::<f64>() {
-                            info!(
-                                "Received MEETING_INFO via CONNECTION packet: {}ms",
-                                start_time_ms
-                            );
-                            if let Some(callback) = &self.options.on_meeting_info {
-                                callback.emit(start_time_ms);
-                            } else {
-                                error!("No on_meeting_info callback provided");
-                            }
-                        } else {
-                            error!(
-                                "Failed to parse MEETING_INFO via CONNECTION packet: {}",
-                                data_str
-                            );
-                        }
-                    }
-                } else {
-                    debug!("Received CONNECTION packet: {}", data_str);
-                }
+                debug!("Received CONNECTION packet: {data_str}");
             }
             Ok(PacketType::DIAGNOSTICS) => {
                 // Parse and handle the diagnostics packet
@@ -945,8 +920,61 @@ impl Inner {
                     response.email
                 );
             }
+            Ok(PacketType::MEETING) => {
+                // Parse MeetingPacket protobuf
+                match MeetingPacket::parse_from_bytes(&response.data) {
+                    Ok(meeting_packet) => {
+                        match meeting_packet.event_type.enum_value() {
+                            Ok(MeetingEventType::MEETING_STARTED) => {
+                                info!(
+                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
+                                    meeting_packet.room_id,
+                                    meeting_packet.start_time_ms,
+                                    meeting_packet.creator_id
+                                );
+                                if let Some(callback) = &self.options.on_meeting_info {
+                                    callback.emit(meeting_packet.start_time_ms as f64);
+                                }
+                            }
+                            Ok(MeetingEventType::MEETING_ENDED) => {
+                                info!(
+                                    "Received MEETING_ENDED: room={}, message={}",
+                                    meeting_packet.room_id, meeting_packet.message
+                                );
+                                if let Some(callback) = &self.options.on_meeting_ended {
+                                    let end_time_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as f64)
+                                        .unwrap_or(0.0);
+                                    callback.emit((end_time_ms, meeting_packet.message));
+                                }
+                            }
+                            Ok(MeetingEventType::PARTICIPANT_JOINED) => {
+                                info!(
+                                    "Received PARTICIPANT_JOINED: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
+                                );
+                                // Future: could emit participant joined event
+                            }
+                            Ok(MeetingEventType::PARTICIPANT_LEFT) => {
+                                info!(
+                                    "Received PARTICIPANT_LEFT: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
+                                );
+                                // Future: could emit participant left event
+                            }
+                            Err(e) => {
+                                error!("Unknown MeetingEventType: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse MeetingPacket: {e}");
+                    }
+                }
+            }
             Err(e) => {
-                error!("Failed to parse diagnostics packet: {e}");
+                error!("Failed to parse packet type: {e}");
             }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {

@@ -17,40 +17,49 @@
  */
 
 use crate::{
-    meeting::MeetingManager,
     messages::{
         server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
     },
     models::build_subject_and_queue,
+    session_manager::{SessionEndResult, SessionManager},
 };
 
-use actix::{Actor, AsyncContext, Context, Handler, MessageResult, Recipient};
+use actix::{
+    Actor, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
+};
 use futures::StreamExt;
-use protobuf::Message as ProtoMessage;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
-use tracing::{error, info, trace};
-use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+use tracing::{error, info, trace, warn};
+use videocall_types::SYSTEM_USER_EMAIL;
 
 use super::chat_session::SessionId;
+
+/// Internal message to clean up active_subs when a spawned join task fails.
+/// This fixes a race condition where start_session could fail inside the spawned task,
+/// leaving a stale entry in active_subs that blocks future join attempts.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct CleanupFailedJoin {
+    session: SessionId,
+}
 
 pub struct ChatServer {
     nats_connection: async_nats::client::Client,
     sessions: HashMap<SessionId, Recipient<Message>>,
     active_subs: HashMap<SessionId, JoinHandle<()>>,
-    room_participants: HashMap<String, usize>,
-    meeting_manager: MeetingManager,
+    session_manager: SessionManager,
 }
 
 impl ChatServer {
-    pub async fn new(nats_connection: async_nats::client::Client) -> Self {
+    pub async fn new(nats_connection: async_nats::client::Client, pool: PgPool) -> Self {
         ChatServer {
             nats_connection,
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
-            room_participants: HashMap::new(),
-            meeting_manager: MeetingManager::new(),
+            session_manager: SessionManager::new(pool),
         }
     }
 
@@ -65,123 +74,50 @@ impl ChatServer {
             task.abort();
         }
 
-        // Get the total subscribers from the NATS server
-        // TODO: Get the total subscribers from the NATS server, to know the total number of participants in the room
-        // let total_subscribers = self.nats_connection.total_subscribers().await;
+        // End session using SessionManager
+        if let (Some(room_id), Some(uid)) = (room, user_id) {
+            let room_id = room_id.to_string();
+            let user_id = uid.to_string();
+            let session_manager = self.session_manager.clone();
+            let nc = self.nats_connection.clone();
 
-        // Update participant count and end meeting if needed
-        if let Some(room_id) = room {
-            if let Some(count) = self.room_participants.get_mut(room_id) {
-                if *count > 0 {
-                    *count -= 1;
-                }
-
-                if let Some(uid) = user_id {
-                    let room_id_clone = room_id.to_string();
-                    let user_id_clone = uid.to_string();
-                    let manager = self.meeting_manager.clone();
-                    let nc = self.nats_connection.clone();
-                    let remaining_count = *count;
-
-                    tokio::spawn(async move {
-                        let is_creator = manager.is_creator(&room_id_clone, &user_id_clone).await;
-
-                        if is_creator && remaining_count > 0 {
-                            info!(
-                                "Creator {} leaving room {} - ending meeting for all",
-                                user_id_clone, room_id_clone
-                            );
-                            match manager.end_meeting(&room_id_clone).await {
-                                Ok(_) => {
-                                    let meeting_ended_msg = serde_json::json!({
-                                        "type": "meeting_ended",
-                                        "room_id": room_id_clone,
-                                        "message": "The host has ended the meeting"
-                                    });
-
-                                    let subject =
-                                        format!("room.{}", room_id_clone.replace(' ', "_"));
-                                    if let Err(e) = nc
-                                        .publish(
-                                            subject.clone(),
-                                            bytes::Bytes::from(
-                                                serde_json::to_vec(&meeting_ended_msg).unwrap(),
-                                            ),
-                                        )
-                                        .await
-                                    {
-                                        error!("Error publishing meeting ended message: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Error ending meeting for room {}: {}", room_id_clone, e)
-                                }
-                            }
-
-                            let message = "MEETING_ENDED:The host has ended the meeting";
-
-                            let packet = PacketWrapper {
-                                packet_type: PacketType::CONNECTION.into(),
-                                email: "system".to_string(),
-                                data: message.as_bytes().to_vec(),
-                                ..Default::default()
-                            };
-
-                            match packet.write_to_bytes() {
-                                Ok(packet_bytes) => {
-                                    //let subject = format!("room.{}", room_id_clone);
-                                    let subject =
-                                        format!("room.{}.system", room_id_clone.replace(' ', "_"));
-                                    match nc.publish(subject.clone(), packet_bytes.into()).await {
-                                        Ok(_) => {
-                                            info!(
-                                                "Successfully published MEETING_ENDED to {}",
-                                                subject
-                                            );
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "Failed to publish MEETING_ENDED to {}: {}",
-                                                subject, e
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to serialize MEETING_ENDED packet: {}", e);
-                                }
-                            }
-                        } else if remaining_count == 0 {
-                            info!("Last participant left room {}", room_id_clone);
-                            match manager.end_meeting(&room_id_clone).await {
-                                Ok(_) => info!("Meeting ended for room {}", room_id_clone),
-                                Err(e) => {
-                                    error!("Error ending meeting for room {}: {}", room_id_clone, e)
-                                }
-                            }
+            tokio::spawn(async move {
+                match session_manager.end_session(&room_id, &user_id).await {
+                    Ok(SessionEndResult::HostEndedMeeting) => {
+                        info!(
+                            "Host {} left room {} - ending meeting for all",
+                            user_id, room_id
+                        );
+                        // Notify all participants using MEETING packet (protobuf)
+                        let bytes = SessionManager::build_meeting_ended_packet(
+                            &room_id,
+                            "The host has ended the meeting",
+                        );
+                        let subject = format!("room.{}.system", room_id.replace(' ', "_"));
+                        if let Err(e) = nc.publish(subject, bytes.into()).await {
+                            error!("Error publishing MEETING_ENDED: {}", e);
                         }
-                    });
-                } else if *count == 0 {
-                    self.room_participants.remove(room_id);
-                    let room_id_clone = room_id.to_string();
-                    let manager = self.meeting_manager.clone();
-                    info!("Last participant left room {}", room_id_clone);
-                    tokio::spawn(async move {
-                        match manager.end_meeting(&room_id_clone).await {
-                            Ok(_) => info!("Meeting ended for room {}", room_id_clone),
-                            Err(e) => {
-                                error!("Error ending meeting for room {}: {}", room_id_clone, e)
-                            }
-                        }
-                    });
-                } else {
-                    info!(
-                        "No participant count found for room {} (session: {})",
-                        room_id, session_id
-                    );
+                    }
+                    Ok(SessionEndResult::LastParticipantLeft) => {
+                        info!("Last participant {} left room {}", user_id, room_id);
+                    }
+                    Ok(SessionEndResult::MeetingContinues { remaining_count }) => {
+                        info!(
+                            "Participant {} left room {}, {} remaining",
+                            user_id, room_id, remaining_count
+                        );
+                    }
+                    Err(e) => {
+                        error!("Error ending session for room {}: {}", room_id, e);
+                    }
                 }
-            }
+            });
         }
+    }
+
+    /// Get the session manager (for use by chat_session)
+    pub fn session_manager(&self) -> &SessionManager {
+        &self.session_manager
     }
 }
 
@@ -203,22 +139,14 @@ impl Handler<Disconnect> for ChatServer {
 
     fn handle(
         &mut self,
-        Disconnect { session }: Disconnect,
+        Disconnect {
+            session,
+            room,
+            user_id,
+        }: Disconnect,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        // Find the room this session is in
-        let room = self.active_subs.iter().find_map(|(s, _)| {
-            if s == &session {
-                // Extract room from the subscription key if needed
-                // For now, we'll just return None since we can't determine the room
-                None
-            } else {
-                None
-            }
-        });
-
-        //self.leave_rooms(&session, room);
-        self.leave_rooms(&session, room, None);
+        self.leave_rooms(&session, Some(&room), Some(&user_id));
         let _ = self.sessions.remove(&session);
     }
 }
@@ -275,79 +203,73 @@ impl Handler<JoinRoom> for ChatServer {
             room,
             user_id,
         }: JoinRoom,
-        _ctx: &mut Self::Context,
+        ctx: &mut Self::Context,
     ) -> Self::Result {
+        // Validate user_id synchronously BEFORE spawning async task.
+        // This ensures we return an error to the client if validation fails,
+        // rather than returning Ok and silently failing in the spawned task.
+        if user_id == SYSTEM_USER_EMAIL {
+            return MessageResult(Err("Cannot use reserved system email as user ID".into()));
+        }
+
         if self.active_subs.contains_key(&session) {
             return MessageResult(Ok(()));
         }
 
-        let count = self.room_participants.entry(room.clone()).or_insert(0);
-        let is_first_participant = *count == 0;
-        *count += 1;
-
-        let manager = self.meeting_manager.clone();
+        let session_manager = self.session_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
         let nc = self.nats_connection.clone();
-
-        let send_info_task = tokio::spawn(async move {
-            if is_first_participant {
-                match manager.start_meeting(&room_clone, &user_id_clone).await {
-                    Ok(start_time) => {
-                        info!(
-                            "Meeting started for room {} at {} by creator {}",
-                            room_clone, start_time, user_id_clone
-                        );
-
-                        send_meeting_info(&nc, &room_clone, start_time).await;
-                    }
-                    Err(e) => {
-                        error!("Error starting meeting for room {}: {}", room_clone, e);
-                    }
-                }
-            } else {
-                match manager.get_meeting_start_time(&room_clone).await {
-                    Ok(Some(start_time)) => {
-                        info!("Meeting info for room {}", room_clone);
-
-                        send_meeting_info(&nc, &room_clone, start_time as u64).await;
-                    }
-                    Ok(None) => {
-                        error!("Meeting {} exists but has no start time", room_clone);
-                    }
-                    Err(e) => {
-                        error!(
-                            "Error getting meeting start time for room {}: {}",
-                            room_clone, e
-                        );
-                    }
-                }
-            }
-        });
 
         let (subject, queue) = build_subject_and_queue(&room, session.as_str());
         let session_recipient = match self.sessions.get(&session) {
             Some(addr) => addr.clone(),
             None => {
-                if let Some(count) = self.room_participants.get_mut(&room) {
-                    *count -= 1;
-                    if *count == 0 {
-                        self.room_participants.remove(&room);
-                    }
-                }
-
                 return MessageResult(Err("Session not found".into()));
             }
         };
 
-        let nc = self.nats_connection.clone();
+        let nc2 = self.nats_connection.clone();
         let session_clone = session.clone();
-        let room_clone = room.clone();
+
+        // Get ChatServer address for cleanup on failure
+        let chat_server_addr = ctx.address();
+        let session_for_cleanup = session.clone();
 
         let handle = tokio::spawn(async move {
-            match nc.queue_subscribe(subject, queue).await {
+            // Start session using SessionManager - await result before subscribing
+            match session_manager
+                .start_session(&room_clone, &user_id_clone)
+                .await
+            {
+                Ok(result) => {
+                    info!(
+                        "Session started for room {} (first: {}) at {} by creator {}",
+                        room_clone,
+                        result.is_first_participant,
+                        result.start_time_ms,
+                        result.creator_id
+                    );
+                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
+                        .await;
+                }
+                Err(e) => {
+                    error!(
+                        "Error starting session for room {}: {} - rejecting join",
+                        room_clone, e
+                    );
+                    // Session rejected - notify ChatServer to clean up active_subs
+                    // This fixes the race condition where a failed start_session would
+                    // leave a stale entry in active_subs, blocking future join attempts.
+                    let _ = chat_server_addr.try_send(CleanupFailedJoin {
+                        session: session_for_cleanup,
+                    });
+                    return;
+                }
+            }
+
+            match nc2.queue_subscribe(subject, queue).await {
                 Ok(mut sub) => {
-                    drop(send_info_task);
                     while let Some(msg) = sub.next().await {
                         if let Err(e) = handle_msg(
                             session_recipient.clone(),
@@ -372,28 +294,39 @@ impl Handler<JoinRoom> for ChatServer {
     }
 }
 
-async fn send_meeting_info(nc: &async_nats::client::Client, room: &str, start_time_ms: u64) {
-    let message = format!("MEETING_INFO:{}", start_time_ms);
+/// Handler for cleaning up failed join attempts.
+/// When start_session fails inside the spawned task, it sends this message
+/// to remove the stale entry from active_subs.
+impl Handler<CleanupFailedJoin> for ChatServer {
+    type Result = ();
 
-    let packet = PacketWrapper {
-        packet_type: PacketType::CONNECTION.into(),
-        email: "system".to_string(),
-        data: message.as_bytes().to_vec(),
-        ..Default::default()
-    };
-
-    match packet.write_to_bytes() {
-        Ok(packet_byte) => {
-            let subject = format!("room.{}.system", room.replace(' ', "_"));
-            match nc.publish(subject.clone(), packet_byte.into()).await {
-                Ok(_) => info!(
-                    "Sent meeting start time {} to {}",
-                    start_time_ms, subject
-                ),
-                Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
-            }
+    fn handle(&mut self, msg: CleanupFailedJoin, _ctx: &mut Self::Context) -> Self::Result {
+        if let Some(task) = self.active_subs.remove(&msg.session) {
+            // Abort the task (though it should already be finished/returned)
+            task.abort();
+            warn!(
+                "Cleaned up failed join for session {} from active_subs",
+                msg.session
+            );
         }
-        Err(e) => error!("Failed to serialize packet: {}", e),
+    }
+}
+
+async fn send_meeting_info(
+    nc: &async_nats::client::Client,
+    room: &str,
+    start_time_ms: u64,
+    creator_id: &str,
+) {
+    // Use SessionManager's packet builder to create a proper MEETING packet with protobuf
+    // This ensures WebSocket clients receive the same format as WebTransport clients
+    let packet_bytes =
+        SessionManager::build_meeting_started_packet(room, start_time_ms, creator_id);
+
+    let subject = format!("room.{}.system", room.replace(' ', "_"));
+    match nc.publish(subject.clone(), packet_bytes.into()).await {
+        Ok(_) => info!("Sent meeting start time {} to {}", start_time_ms, subject),
+        Err(e) => error!("Failed to send meeting info to room {}: {}", room, e),
     }
 }
 
@@ -404,7 +337,7 @@ async fn send_meeting_info(nc: &async_nats::client::Client, room: &str, start_ti
 // }
 
 fn handle_msg(
-    session_recipient: Recipient<Message>, // Assuming Recipient is a type
+    session_recipient: Recipient<Message>,
     room: String,
     session: SessionId,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
@@ -421,5 +354,250 @@ fn handle_msg(
             error!("error sending message to session {}: {}", session, e);
             std::io::Error::other(e)
         })
+    }
+}
+
+// ==========================================================================
+// Unit Tests for ChatServer
+// ==========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix::Actor;
+    use serial_test::serial;
+    use sqlx::PgPool;
+
+    async fn get_test_pool() -> PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+        PgPool::connect(&database_url)
+            .await
+            .expect("Failed to connect to test database")
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom rejects reserved system email synchronously
+    // ==========================================================================
+    // This test verifies the fix for the race condition where JoinRoom would
+    // spawn an async task and immediately return Ok(()), even if validation
+    // would fail inside the task. Now validation happens synchronously.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_rejects_system_email_synchronously() {
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        // Start the ChatServer actor
+        let chat_server = ChatServer::new(nats_client, pool).await.start();
+
+        // Create a mock session recipient
+        // We need a real actor to receive messages, so we use a simple dummy
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-1".to_string();
+
+        // Register the session first
+        chat_server
+            .send(Connect {
+                id: session_id.clone(),
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Attempt to join with the reserved system email
+        // This should return an error SYNCHRONOUSLY (not Ok then fail async)
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room".to_string(),
+                user_id: SYSTEM_USER_EMAIL.to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        // The key assertion: JoinRoom should return Err immediately
+        assert!(
+            result.is_err(),
+            "JoinRoom with system email should return Err, not Ok"
+        );
+
+        let error_msg = result.unwrap_err();
+        assert!(
+            error_msg.contains("reserved system email"),
+            "Error should mention reserved system email, got: {error_msg}"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom succeeds with valid user_id
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_succeeds_with_valid_user() {
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client, pool).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-valid".to_string();
+
+        // Register the session
+        chat_server
+            .send(Connect {
+                id: session_id.clone(),
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // Join with a valid user_id - should succeed
+        let result = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room-valid".to_string(),
+                user_id: "valid-user@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_ok(),
+            "JoinRoom with valid user should return Ok, got: {:?}",
+            result
+        );
+    }
+
+    // ==========================================================================
+    // TEST: JoinRoom fails if session not registered
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_join_room_fails_without_session() {
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client, pool).await.start();
+
+        // Try to join WITHOUT registering the session first
+        let result = chat_server
+            .send(JoinRoom {
+                session: "nonexistent-session".to_string(),
+                room: "test-room".to_string(),
+                user_id: "valid-user@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result.is_err(),
+            "JoinRoom without registered session should return Err"
+        );
+        assert!(
+            result.unwrap_err().contains("Session not found"),
+            "Error should mention session not found"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: CleanupFailedJoin allows retry after spawn failure
+    // ==========================================================================
+    // This test verifies the race condition fix: when start_session fails inside
+    // the spawned task, the CleanupFailedJoin message removes the stale entry
+    // from active_subs, allowing subsequent join attempts to proceed.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_cleanup_failed_join_allows_retry() {
+        use videocall_types::FeatureFlags;
+
+        // Enable meeting management to trigger DB operations (which can fail)
+        FeatureFlags::set_meeting_management_override(true);
+
+        let pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client, pool).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = "test-session-cleanup".to_string();
+
+        // Register the session
+        chat_server
+            .send(Connect {
+                id: session_id.clone(),
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+
+        // First join attempt - should succeed (returns Ok immediately,
+        // spawns async task which will also succeed with valid user)
+        let result1 = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room-cleanup".to_string(),
+                user_id: "valid-user@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(result1.is_ok(), "First join should succeed");
+
+        // Second join attempt with same session - should return Ok
+        // immediately because session is already in active_subs
+        let result2 = chat_server
+            .send(JoinRoom {
+                session: session_id.clone(),
+                room: "test-room-cleanup".to_string(),
+                user_id: "valid-user@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        assert!(
+            result2.is_ok(),
+            "Second join with same session should return Ok (already active)"
+        );
+
+        FeatureFlags::clear_meeting_management_override();
     }
 }

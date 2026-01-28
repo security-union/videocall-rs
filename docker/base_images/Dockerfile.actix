@@ -1,7 +1,31 @@
+# Base image for actix-api builds (multi-arch: amd64/arm64)
 FROM rust:1.89-slim
 
-# Install dependencies
+# Install system dependencies (works on both ARM64 and AMD64)
+RUN apt-get --yes update && apt-get --yes install \
+    curl \
+    git \
+    pkg-config \
+    libssl-dev \
+    nasm \
+    libclang-dev \
+    libvpx-dev \
+    libasound2-dev \
+    libv4l-dev \
+    cmake
 
-RUN apt-get --yes update && apt-get --yes install curl git pkg-config libssl-dev nasm
-RUN curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate && chmod +x /usr/bin/dbmate
-RUN cargo install cargo-watch
+# Detect architecture and download appropriate dbmate binary
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then \
+        curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-arm64 -L -o /usr/bin/dbmate; \
+    else \
+        curl https://github.com/amacneil/dbmate/releases/download/v2.4.0/dbmate-linux-amd64 -L -o /usr/bin/dbmate; \
+    fi && \
+    chmod +x /usr/bin/dbmate
+
+# Install cargo tools
+RUN cargo install cargo-watch --locked
+RUN cargo install cargo-chef --locked
+
+# Pre-warm cargo registry
+RUN cargo search --limit 1 || true

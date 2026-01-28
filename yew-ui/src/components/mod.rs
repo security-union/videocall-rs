@@ -18,6 +18,7 @@
 
 pub mod attendants;
 pub mod browser_compatibility;
+pub mod call_timer;
 pub mod config_error;
 pub mod device_selector;
 pub mod device_settings_modal;
@@ -28,6 +29,7 @@ pub mod login;
 pub mod meeting_info;
 pub mod neteq_chart;
 pub mod top_bar;
+pub mod video_control_buttons;
 
 mod canvas_generator;
 mod peer_list;

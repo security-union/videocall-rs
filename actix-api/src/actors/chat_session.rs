@@ -19,6 +19,7 @@
 use crate::client_diagnostics::health_processor;
 use crate::messages::server::{ClientMessage, Leave, Packet};
 use crate::messages::session::Message;
+use crate::models::meeting::Meeting;
 use crate::server_diagnostics::{
     send_connection_ended, send_connection_started, DataTracker, TrackerSender,
 };
@@ -42,6 +43,7 @@ use tracing::{error, info, trace};
 use uuid::Uuid;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
+use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -223,6 +225,11 @@ impl Handler<Message> for WsChatSession {
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         // Track sent data when forwarding messages to clients
+        info!(
+            "Sending {} bytes to WebSocket client session={}",
+            msg.msg.len(),
+            self.id
+        );
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(&self.id, msg.msg.len() as u64);
         ctx.binary(msg.msg);
@@ -281,6 +288,15 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                         &msg_bytes,
                         self.nats_client.clone(),
                     );
+                } else if self.is_meeting_metadata_packet(&msg_bytes) {
+                    // Process meeting metadata packet (don't relay to other peers)
+                    info!(
+                        "Broadcasting MEETING metadata from {} to room {}",
+                        self.email, self.room
+                    );
+                    ctx.notify(Packet {
+                        data: Arc::new(msg_bytes),
+                    });
                 } else {
                     // Normal packet processing - forward to chat server
                     ctx.notify(Packet {
@@ -347,6 +363,16 @@ impl WsChatSession {
                 fut::ready(())
             })
             .wait(ctx);
+    }
+
+    fn is_meeting_metadata_packet(&self, data: &[u8]) -> bool {
+        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
+            if packet_wrapper.packet_type == PacketType::MEETING.into() {
+                return packet_wrapper.data.is_empty()
+                    || MeetingPacket::parse_from_bytes(&packet_wrapper.data).is_err();
+            }
+        }
+        false
     }
 }
 

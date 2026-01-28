@@ -327,16 +327,28 @@ impl Component for Host {
             }
             Msg::SaveChangeName => {
                 let new_name = self.pending_name.trim().to_string();
+                
+                log::info!(">>> SaveChangeName triggered, new_name='{}', valid={}, empty={}", new_name, is_valid_username(&new_name), new_name.is_empty());
+
                 if is_valid_username(&new_name) && !new_name.is_empty() {
                     save_username_to_storage(&new_name);
-                    // Force a soft reload so meeting picks up new name
-                    if let Some(win) = web_sys::window() {
-                        let _ = win.location().reload();
+
+                    log::info!(">>> Calling client.update_display_name");
+
+                    // Don't reload, change the username in the client and still maintain connection
+                    if let Err(error) = self.client.update_display_name(&new_name) {
+                        log::error!("Failed to update display name: {error}");
+                        self.change_name_error =
+                            Some("Failed to update name. Try again.".to_string());
+                        return true;
                     }
+
+                    log::info!(">>> Display name updated to: {}", new_name);
                     self.show_change_name = false;
                     self.change_name_error = None;
-                    false
-                } else {
+
+                    true
+                } else { 
                     self.change_name_error =
                         Some("Use letters, numbers, and underscore only.".to_string());
                     true
@@ -402,7 +414,7 @@ impl Component for Host {
                     true
                 } else {
                     false
-                }
+                } 
             }
             Msg::ScreenEncoderSettingsUpdated(settings) => {
                 // Only update if settings have changed

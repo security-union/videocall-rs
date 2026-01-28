@@ -178,10 +178,23 @@ impl Handler<ClientMessage> for ChatServer {
             user: _,
         } = msg;
         trace!("got message in server room {room} session {session}");
+
+        info!(
+            "ChatServer: received ClientMessage from session={} room={} size={}",
+            session,
+            room,
+            msg.data.len()
+        );
         let nc = self.nats_connection.clone();
         let subject = format!("room.{room}.{session}");
         let subject = subject.replace(' ', "_");
         let b = bytes::Bytes::from(msg.data.to_vec());
+
+        info!(
+            "Publishing packet to NATS subject: {} (size: {} bytes)",
+            subject,
+            b.len()
+        );
         let fut = async move {
             match nc.publish(subject.clone(), b).await {
                 Ok(_) => trace!("published message to {subject}"),
@@ -330,21 +343,25 @@ async fn send_meeting_info(
     }
 }
 
-// fn handle_subscription_error(e: impl std::fmt::Display, subject: &str) -> String {
-//     let err = format!("error subscribing to subject {subject}: {e}");
-//     error!("{err}");
-//     err
-// }
-
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
     session: SessionId,
 ) -> impl Fn(async_nats::Message) -> Result<(), std::io::Error> {
     move |msg| {
+        info!(
+            "NATS message received: subject={} my_filter=room.{}.{} payload_size={}",
+            msg.subject,
+            room,
+            session,
+            msg.payload.len()
+        );
         if msg.subject == format!("room.{room}.{session}").replace(' ', "_").into() {
             return Ok(());
         }
+
+        info!("Forwarding message to WebSocket session {}", session);
+
         let message = Message {
             msg: msg.payload.to_vec(),
             session: session.clone(),

@@ -134,6 +134,7 @@ pub struct VideoCallClientOptions {
 struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
+    session_id: String,
     display_name: RefCell<String>,
     on_peer_added: Callback<String>,
     on_meeting_info: Option<Callback<f64>>,
@@ -249,6 +250,7 @@ impl VideoCallClient {
                 options: InnerOptions {
                     enable_e2ee: options.enable_e2ee,
                     userid: options.userid.clone(),
+                    session_id: options.session_id.clone(),
                     display_name: RefCell::new(options.display_name.clone()),
                     on_peer_added: options.on_peer_added.clone(),
                     on_meeting_ended: options.on_meeting_ended.clone(),
@@ -809,26 +811,68 @@ impl VideoCallClient {
     }
 
     /// Update the display name and broadcast to all peers
-    ///
     pub fn update_display_name(&self, new_name: &str) -> Result<()> {
-        if let Ok(inner) = self.inner.try_borrow() {
-            *inner.options.display_name.borrow_mut() = new_name.to_string();
+        log::info!("update_display_name called with: {}", new_name);
 
-            if let Some(connection_controller) = &inner.connection_controller {
-                let packet = PacketWrapper {
-                    packet_type: PacketType::MEETING.into(),
-                    email: inner.options.userid.clone(),
-                    session_id: inner.options.userid.clone(), //am not certain
-                    display_name: new_name.to_string(),
-                    data: vec![],
-                    special_fields: Default::default(),
-                };
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                log::info!("Successfully borrowed inner");
+                *inner.options.display_name.borrow_mut() = new_name.to_string();
 
-                connection_controller.send_packet(packet)?;
+                if let Some(connection_controller) = &inner.connection_controller {
+                    let packet = PacketWrapper {
+                        packet_type: PacketType::MEETING.into(),
+                        email: inner.options.userid.clone(),
+                        session_id: inner.options.session_id.clone(),
+                        display_name: new_name.to_string(),
+                        data: vec![],
+                        special_fields: Default::default(),
+                    };
+
+                    log::info!(
+                        ">>> Sending display name update packet: session_id={}, display_name={}",
+                        inner.options.session_id,
+                        new_name
+                    );
+                    connection_controller.send_packet(packet)?;
+                } else {
+                    log::warn!("No connection_controller available!");
+                }
+
+                info!("Sent display name update: {new_name}");
             }
-
-            info!("Sent display name update: {new_name}");
+            Err(e) => {
+                log::error!("Failed to borrow inner: {:?}", e);
+                return Err(anyhow::anyhow!("Failed to borrow inner"));
+            }
         }
+
+        // if let Ok(inner) = self.inner.try_borrow() {
+        //     log::info!("Successfully borrowed inner");
+        //     *inner.options.display_name.borrow_mut() = new_name.to_string();
+
+        //     if let Some(connection_controller) = &inner.connection_controller {
+
+        //         let packet = PacketWrapper {
+        //             packet_type: PacketType::MEETING.into(),
+        //             email: inner.options.userid.clone(),
+        //             session_id: inner.options.userid.clone(), //am not certain
+        //             display_name: new_name.to_string(),
+        //             data: vec![],
+        //             special_fields: Default::default(),
+        //         };
+
+        //         log::info!(">>> Sending display name update packet: session_id={}, display_name={}",
+        //                inner.options.userid, new_name);
+        //         connection_controller.send_packet(packet)?;
+        //     }
+
+        //     else {
+        //         log::warn!("No connection_controller available!");
+        //     }
+
+        //     info!("Sent display name update: {new_name}");
+        // }
 
         Ok(())
     }
@@ -857,12 +901,14 @@ impl Inner {
             response.email.clone()
         };
 
-        debug!(
-            "<< Received {:?} from {} ({})",
+        log::info!(
+            "<<< RECEIVED packet type={:?} from email={} session_id={} display_name={}",
             response.packet_type.enum_value(),
-            session_id,
-            display_name
-        );
+            response.email, 
+            response.session_id,
+            response.display_name
+        ); 
+
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         let peer_status = if response.email == SYSTEM_USER_EMAIL {
             PeerStatus::NoChange

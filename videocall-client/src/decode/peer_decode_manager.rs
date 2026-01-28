@@ -532,10 +532,10 @@ impl PeerDecodeManager {
     ) -> Result<(), JsValue> {
         debug!("Adding peer {display_name} ({session_id})");
         self.connected_peers.insert(
-            display_name.to_owned(),
+            session_id.to_owned(),
             Peer::new(
-                self.get_video_canvas_id.emit(display_name.to_owned()),
-                self.get_screen_canvas_id.emit(display_name.to_owned()),
+                self.get_video_canvas_id.emit(session_id.to_owned()),
+                self.get_screen_canvas_id.emit(session_id.to_owned()),
                 session_id.to_owned(),
                 display_name.to_owned(),
                 aes,

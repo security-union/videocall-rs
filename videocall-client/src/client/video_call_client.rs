@@ -963,8 +963,14 @@ impl Inner {
                                 );
                                 // Future: could emit participant left event
                             }
+                            Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
+                                error!(
+                                    "Received meeting packet with unknown event type: room={}",
+                                    meeting_packet.room_id
+                                );
+                            }
                             Err(e) => {
-                                error!("Unknown MeetingEventType: {e}");
+                                error!("Failed to parse MeetingEventType: {e}");
                             }
                         }
                     }
@@ -972,6 +978,12 @@ impl Inner {
                         error!("Failed to parse MeetingPacket: {e}");
                     }
                 }
+            }
+            Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
+                error!(
+                    "Received packet with unknown packet type from {}",
+                    response.email
+                );
             }
             Err(e) => {
                 error!("Failed to parse packet type: {e}");

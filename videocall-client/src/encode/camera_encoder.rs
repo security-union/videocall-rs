@@ -51,7 +51,7 @@ use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
 use super::transform::transform_video_chunk;
 
-use crate::constants::VIDEO_CODEC;
+use crate::constants::get_video_codec_string;
 use crate::diagnostics::EncoderBitrateController;
 
 use futures::channel::mpsc::UnboundedReceiver;
@@ -303,7 +303,7 @@ impl CameraEncoder {
             let height = track_settings.get_height().expect("height is None");
 
             let video_encoder_config =
-                VideoEncoderConfig::new(VIDEO_CODEC, height as u32, width as u32);
+                VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
             video_encoder_config
                 .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
             video_encoder_config.set_latency_mode(LatencyMode::Realtime);
@@ -405,7 +405,7 @@ impl CameraEncoder {
                             current_encoder_height = frame_height;
 
                             let new_config = VideoEncoderConfig::new(
-                                VIDEO_CODEC,
+                                get_video_codec_string(),
                                 current_encoder_height,
                                 current_encoder_width,
                             );

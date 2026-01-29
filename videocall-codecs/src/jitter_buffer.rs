@@ -398,6 +398,7 @@ mod tests {
         VideoFrame {
             sequence_number: seq,
             frame_type,
+            codec: crate::frame::FrameCodec::default(),
             data: vec![0; 10],
             timestamp: 0.0,
         }

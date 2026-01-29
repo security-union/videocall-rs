@@ -16,6 +16,11 @@
  * conditions.
  */
 
+pub mod meeting;
+pub mod meeting_attendee;
+pub mod meeting_owner;
+pub mod session_participant;
+
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;
@@ -27,6 +32,7 @@ pub struct AppState {
     pub chat: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,
     pub tracker_sender: TrackerSender,
+    pub session_manager: SessionManager,
 }
 
 pub struct AppConfig {

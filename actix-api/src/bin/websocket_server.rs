@@ -42,6 +42,7 @@ use sec_api::{
     constants::VALID_ID_PATTERN,
     db::{get_pool, PostgresPool},
     db_pool,
+    meeting_api::create_meeting,
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
@@ -392,10 +393,12 @@ async fn main() -> std::io::Result<()> {
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
                 }))
+                .app_data(web::Data::new(sqlx_pool.clone()))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect)
+                .service(create_meeting)
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
@@ -407,6 +410,7 @@ async fn main() -> std::io::Result<()> {
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
                 }))
+                .app_data(web::Data::new(sqlx_pool.clone()))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),
                     oauth_auth_url: oauth_auth_url.clone(),
@@ -422,6 +426,7 @@ async fn main() -> std::io::Result<()> {
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect)
+                .service(create_meeting)
         } else {
             // OAuth configured but database disabled - skip OAuth routes
             error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");
@@ -433,10 +438,12 @@ async fn main() -> std::io::Result<()> {
                     tracker_sender: tracker_sender.clone(),
                     session_manager: session_manager.clone(),
                 }))
+                .app_data(web::Data::new(sqlx_pool.clone()))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect)
+                .service(create_meeting)
         }
     })
     .bind((

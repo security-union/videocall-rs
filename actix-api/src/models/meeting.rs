@@ -5,6 +5,40 @@ use sqlx::PgPool;
 use std::error::Error;
 use tracing::{error, info};
 
+/// Meeting state as per requirements
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "VARCHAR", rename_all = "snake_case")]
+pub enum MeetingState {
+    #[serde(rename = "idle")]
+    Idle,
+    #[serde(rename = "active")]
+    Active,
+}
+
+impl Default for MeetingState {
+    fn default() -> Self {
+        MeetingState::Idle
+    }
+}
+
+impl std::fmt::Display for MeetingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MeetingState::Idle => write!(f, "idle"),
+            MeetingState::Active => write!(f, "active"),
+        }
+    }
+}
+
+impl From<String> for MeetingState {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "active" => MeetingState::Active,
+            _ => MeetingState::Idle,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
 pub struct Meeting {
     pub id: i32,
@@ -15,6 +49,10 @@ pub struct Meeting {
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub creator_id: Option<String>,
+    pub meeting_title: Option<String>,
+    pub password_hash: Option<String>,
+    pub waiting_room_enabled: Option<bool>,
+    pub meeting_status: Option<String>,
 }
 
 impl Meeting {
@@ -199,8 +237,8 @@ impl Meeting {
         let now = Utc::now();
         let meeting = sqlx::query_as::<_, Meeting>(
             r#"
-            INSERT INTO meetings (room_id, started_at, ended_at, creator_id)
-            VALUES ($1, $2, NULL, $3)
+            INSERT INTO meetings (room_id, started_at, ended_at, creator_id, meeting_status)
+            VALUES ($1, $2, NULL, $3, 'idle')
             ON CONFLICT (room_id) DO UPDATE
             SET started_at = CASE
                 WHEN meetings.ended_at IS NOT NULL THEN EXCLUDED.started_at
@@ -212,7 +250,8 @@ impl Meeting {
                 ELSE meetings.creator_id
             END,
             updated_at = NOW()
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id,
+                      meeting_title, password_hash, waiting_room_enabled, meeting_status
             "#,
         )
         .bind(room_id)
@@ -235,7 +274,8 @@ impl Meeting {
     ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let meeting = sqlx::query_as::<_, Meeting>(
             r#"
-            SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id,
+                   meeting_title, password_hash, waiting_room_enabled, meeting_status
             FROM meetings
             WHERE room_id = $1 AND deleted_at IS NULL
             "#,
@@ -255,9 +295,10 @@ impl Meeting {
         let meeting = sqlx::query_as::<_, Meeting>(
             r#"
             UPDATE meetings
-            SET ended_at = NOW(), updated_at = NOW()
+            SET ended_at = NOW(), updated_at = NOW(), meeting_status = 'ended'
             WHERE room_id = $1 AND ended_at IS NULL
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id,
+                      meeting_title, password_hash, waiting_room_enabled, meeting_status
             "#,
         )
         .bind(room_id)
@@ -267,6 +308,55 @@ impl Meeting {
         if let Some(ref m) = meeting {
             info!("Meeting {} ended at: {:?}", room_id, m.ended_at);
         }
+        Ok(meeting)
+    }
+
+    /// Check if a meeting with the given room_id already exists
+    pub async fn exists_async(
+        pool: &PgPool,
+        room_id: &str,
+    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        let result = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*) FROM meetings WHERE room_id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(room_id)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(result > 0)
+    }
+
+    /// Create a new meeting via the Create Meeting API
+    /// This creates the meeting metadata at request time (not at start time)
+    /// The meeting starts in 'idle' state
+    pub async fn create_meeting_api(
+        pool: &PgPool,
+        room_id: &str,
+        host_id: &str,
+        password_hash: Option<&str>,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let now = Utc::now();
+        let meeting = sqlx::query_as::<_, Meeting>(
+            r#"
+            INSERT INTO meetings (room_id, started_at, creator_id, password_hash, meeting_status)
+            VALUES ($1, $2, $3, $4, 'idle')
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id,
+                      meeting_title, password_hash, waiting_room_enabled, meeting_status
+            "#,
+        )
+        .bind(room_id)
+        .bind(now)
+        .bind(host_id)
+        .bind(password_hash)
+        .fetch_one(pool)
+        .await?;
+
+        info!(
+            "Meeting created via API for room {} by host {}",
+            room_id, host_id
+        );
         Ok(meeting)
     }
 }

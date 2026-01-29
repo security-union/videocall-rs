@@ -23,6 +23,7 @@ pub mod constants;
 pub mod db;
 pub mod db_pool;
 pub mod meeting;
+pub mod meeting_api;
 pub mod messages;
 pub mod metrics;
 pub mod models;

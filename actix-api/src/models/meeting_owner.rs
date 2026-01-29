@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{db::get_connection_query};
+use crate::db::get_connection_query;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MeetingOwner {

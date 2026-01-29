@@ -100,7 +100,7 @@ impl CreateMeetingError {
 
     pub fn meeting_exists(meeting_id: &str) -> Self {
         Self {
-            error: format!("Meeting already exists: {}", meeting_id),
+            error: format!("Meeting already exists: {meeting_id}"),
             code: "MEETING_EXISTS".to_string(),
         }
     }
@@ -114,21 +114,21 @@ impl CreateMeetingError {
 
     pub fn too_many_attendees() -> Self {
         Self {
-            error: format!("Too many attendees. Maximum allowed: {}", MAX_ATTENDEES),
+            error: format!("Too many attendees. Maximum allowed: {MAX_ATTENDEES}"),
             code: "TOO_MANY_ATTENDEES".to_string(),
         }
     }
 
     pub fn invalid_attendee_id(attendee: &str) -> Self {
         Self {
-            error: format!("Invalid attendee ID format: {}", attendee),
+            error: format!("Invalid attendee ID format: {attendee}"),
             code: "INVALID_ATTENDEE_ID".to_string(),
         }
     }
 
     pub fn internal_error(msg: &str) -> Self {
         Self {
-            error: format!("Internal server error: {}", msg),
+            error: format!("Internal server error: {msg}"),
             code: "INTERNAL_ERROR".to_string(),
         }
     }
@@ -203,7 +203,9 @@ pub async fn create_meeting(
         .map(|c| c.value().to_string())
         .ok_or_else(|| {
             log_error!("Create meeting: No session cookie found");
-            error::ErrorUnauthorized(serde_json::to_string(&CreateMeetingError::authentication_error()).unwrap())
+            error::ErrorUnauthorized(
+                serde_json::to_string(&CreateMeetingError::authentication_error()).unwrap(),
+            )
         })?;
 
     // Clean the host ID (replace spaces with underscores)
@@ -224,18 +226,22 @@ pub async fn create_meeting(
             // Validate the provided meeting ID
             if !is_valid_id(&clean_id) {
                 log_error!("Create meeting: Invalid meeting ID format: {}", id);
-                return Ok(HttpResponse::BadRequest().json(CreateMeetingError::invalid_meeting_id()));
+                return Ok(
+                    HttpResponse::BadRequest().json(CreateMeetingError::invalid_meeting_id())
+                );
             }
             clean_id.to_string()
         }
-        None => generate_meeting_id()
+        None => generate_meeting_id(),
     };
 
     // Check if meeting ID already exists
     match Meeting::exists_async(&pool, &meeting_id).await {
         Ok(true) => {
             log_error!("Create meeting: Meeting already exists: {}", meeting_id);
-            return Ok(HttpResponse::Conflict().json(CreateMeetingError::meeting_exists(&meeting_id)));
+            return Ok(
+                HttpResponse::Conflict().json(CreateMeetingError::meeting_exists(&meeting_id))
+            );
         }
         Ok(false) => {}
         Err(e) => {
@@ -259,51 +265,44 @@ pub async fn create_meeting(
     }
 
     // Validate each attendee ID
-    let cleaned_attendees: Vec<String> = attendees
-        .iter()
-        .map(|a| a.replace(' ', "_"))
-        .collect();
+    let cleaned_attendees: Vec<String> = attendees.iter().map(|a| a.replace(' ', "_")).collect();
 
     for attendee in &cleaned_attendees {
         if !is_valid_id(attendee) {
             log_error!("Create meeting: Invalid attendee ID: {}", attendee);
-            return Ok(HttpResponse::BadRequest().json(CreateMeetingError::invalid_attendee_id(attendee)));
+            return Ok(
+                HttpResponse::BadRequest().json(CreateMeetingError::invalid_attendee_id(attendee))
+            );
         }
     }
 
     // Hash password if provided
     let password_hash = match &body.password {
-        Some(pw) if !pw.is_empty() => {
-            match hash_password(pw) {
-                Ok(hashed) => Some(hashed),
-                Err(e) => {
-                    log_error!("Create meeting: Failed to hash password: {}", e);
-                    return Ok(HttpResponse::InternalServerError().json(
-                        CreateMeetingError::internal_error("Failed to process password"),
-                    ));
-                }
+        Some(pw) if !pw.is_empty() => match hash_password(pw) {
+            Ok(hashed) => Some(hashed),
+            Err(e) => {
+                log_error!("Create meeting: Failed to hash password: {}", e);
+                return Ok(HttpResponse::InternalServerError().json(
+                    CreateMeetingError::internal_error("Failed to process password"),
+                ));
             }
-        }
+        },
         _ => None,
     };
 
     // Create the meeting in the database
-    let meeting = match Meeting::create_meeting_api(
-        &pool,
-        &meeting_id,
-        &host_id,
-        password_hash.as_deref(),
-    )
-    .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            log_error!("Create meeting: Failed to create meeting: {}", e);
-            return Ok(HttpResponse::InternalServerError().json(
-                CreateMeetingError::internal_error("Failed to create meeting"),
-            ));
-        }
-    };
+    let meeting =
+        match Meeting::create_meeting_api(&pool, &meeting_id, &host_id, password_hash.as_deref())
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                log_error!("Create meeting: Failed to create meeting: {}", e);
+                return Ok(HttpResponse::InternalServerError().json(
+                    CreateMeetingError::internal_error("Failed to create meeting"),
+                ));
+            }
+        };
 
     // Create the meeting owner record
     if let Err(e) = MeetingOwner::create(&meeting_id, &host_id, None) {
@@ -314,7 +313,8 @@ pub async fn create_meeting(
 
     // Add attendees to the meeting
     if !cleaned_attendees.is_empty() {
-        if let Err(e) = MeetingAttendee::add_attendees(&pool, &meeting_id, &cleaned_attendees).await {
+        if let Err(e) = MeetingAttendee::add_attendees(&pool, &meeting_id, &cleaned_attendees).await
+        {
             log_error!("Create meeting: Failed to add attendees: {}", e);
             // Note: Meeting was created, but attendees failed
             // We continue and return success with empty attendees

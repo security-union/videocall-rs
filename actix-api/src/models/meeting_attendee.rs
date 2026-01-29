@@ -75,10 +75,7 @@ impl MeetingAttendee {
             }
         }
 
-        info!(
-            "Added {} attendees to meeting {}",
-            count, meeting_id
-        );
+        info!("Added {} attendees to meeting {}", count, meeting_id);
         Ok(count)
     }
 

@@ -2,23 +2,19 @@ use crate::db::get_connection_query;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::default::Default;
 use std::error::Error;
 use tracing::{error, info};
 
 /// Meeting state as per requirements
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, sqlx::Type)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, sqlx::Type, Default)]
 #[sqlx(type_name = "VARCHAR", rename_all = "snake_case")]
 pub enum MeetingState {
     #[serde(rename = "idle")]
+    #[default]
     Idle,
     #[serde(rename = "active")]
     Active,
-}
-
-impl Default for MeetingState {
-    fn default() -> Self {
-        MeetingState::Idle
-    }
 }
 
 impl std::fmt::Display for MeetingState {

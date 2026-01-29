@@ -599,6 +599,36 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
         match serde_json::from_str::<crate::components::neteq_chart::RawNetEqStats>(trimmed) {
             Ok(raw_stat) => {
                 let stat: NetEqStats = raw_stat.into();
+
+                // Debug diagnostics: only compiled into debug builds
+                #[cfg(debug_assertions)]
+                {
+                    log::debug!(
+                        "[NetEQ Stats] RAW: buffer={}ms, target={}ms, packets_per_sec={}",
+                        stat.buffer_ms,
+                        stat.target_ms,
+                        stat.packets_per_sec
+                    );
+                    if stat.underruns > 1000 {
+                        log::warn!(
+                            "[NetEQ Stats] ⚠️ SUSPICIOUS: underruns={} (lifetime cumulative, should use windowed value!)",
+                            stat.underruns
+                        );
+                    }
+                    if stat.expand_rate > 100.0 {
+                        log::warn!(
+                            "[NetEQ Stats] ⚠️ SUSPICIOUS: expand_rate={} (>100%, likely Q14 conversion issue)",
+                            stat.expand_rate
+                        );
+                    }
+                    if stat.buffer_ms == 0 && stat.packets_per_sec > 0 {
+                        log::warn!(
+                            "[NetEQ Stats] ⚠️ SUSPICIOUS: buffer=0 but receiving packets_per_sec={}",
+                            stat.packets_per_sec
+                        );
+                    }
+                }
+
                 stats.push(stat);
             }
             Err(e) => {
@@ -610,7 +640,7 @@ fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
 
     // If that didn't work, try to parse as a single JSON object
     if stats.is_empty() {
-        log::info!("[parse_neteq_stats_history] No lines parsed successfully, trying as single JSON object");
+        log::debug!("[parse_neteq_stats_history] No lines parsed successfully, trying as single JSON object");
         match serde_json::from_str::<crate::components::neteq_chart::RawNetEqStats>(neteq_stats_str)
         {
             Ok(raw_stat) => {
@@ -655,6 +685,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
     let jitter_flush_timeout = use_mut_ref(|| Option::<Timeout>::None);
 
     let encoder_settings = use_state(|| None::<String>);
+    let expanded_chart = use_state(|| None::<AdvancedChartType>);
 
     // Subscribe/unsubscribe on open/close
     {
@@ -799,6 +830,7 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                                             } else {
                                                 ("unknown", "unknown")
                                             };
+
                                             // Update async-safe container first
                                             {
                                                 let mut stats = neteq_stats_async.borrow_mut();
@@ -1019,7 +1051,87 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
         })
     };
 
+    // Build chart zoom modal (rendered outside the sidebar so it overlays the full viewport)
+    let chart_zoom_modal = {
+        if let Some(ref chart_type) = *expanded_chart {
+            let close = {
+                let expanded_chart = expanded_chart.clone();
+                Callback::from(move |_: MouseEvent| expanded_chart.set(None))
+            };
+            let stop_prop = Callback::from(|e: MouseEvent| e.stop_propagation());
+            let (zoom_w, zoom_h) = {
+                let window = web_sys::window().unwrap();
+                let vw = window.inner_width().unwrap().as_f64().unwrap_or(1200.0);
+                let vh = window.inner_height().unwrap().as_f64().unwrap_or(800.0);
+                ((vw * 0.80) as u32, (vh * 0.70) as u32)
+            };
+            html! {
+                <div class="chart-zoom-overlay" onclick={close.clone()}>
+                    <div class="chart-zoom-modal" onclick={stop_prop}>
+                        <div class="chart-zoom-header">
+                            <h3>{chart_type.title()}</h3>
+                            <button class="close-button" onclick={close}>{"×"}</button>
+                        </div>
+                        <div class="chart-zoom-content">
+                            <NetEqAdvancedChart
+                                stats_history={neteq_stats_history.clone()}
+                                chart_type={chart_type.clone()}
+                                width={zoom_w}
+                                height={zoom_h}
+                            />
+                        </div>
+                    </div>
+                </div>
+            }
+        } else {
+            html! {}
+        }
+    };
+
+    // Build chart grid with click handlers
+    let charts_grid_html: Html = {
+        let chart_pairs = vec![
+            (AdvancedChartType::BufferVsTarget, AdvancedChartType::DecodeOperations),
+            (AdvancedChartType::QualityMetrics, AdvancedChartType::ReorderingAnalysis),
+            (AdvancedChartType::SystemPerformance, AdvancedChartType::NetworkJitter),
+        ];
+        chart_pairs.into_iter().map(|(left, right)| {
+            let on_left = {
+                let expanded_chart = expanded_chart.clone();
+                let ct = left.clone();
+                Callback::from(move |_: MouseEvent| expanded_chart.set(Some(ct.clone())))
+            };
+            let on_right = {
+                let expanded_chart = expanded_chart.clone();
+                let ct = right.clone();
+                Callback::from(move |_: MouseEvent| expanded_chart.set(Some(ct.clone())))
+            };
+            html! {
+                <div class="charts-grid">
+                    <div class="chart-container" onclick={on_left}>
+                        <NetEqAdvancedChart
+                            stats_history={neteq_stats_history.clone()}
+                            chart_type={left}
+                            width={290}
+                            height={200}
+                        />
+                    </div>
+                    <div class="chart-container" onclick={on_right}>
+                        <NetEqAdvancedChart
+                            stats_history={neteq_stats_history.clone()}
+                            chart_type={right}
+                            width={290}
+                            height={200}
+                        />
+                    </div>
+                </div>
+            }
+        }).collect::<Html>()
+    };
+
     html! {
+        <>
+        {chart_zoom_modal}
         <div id="diagnostics-sidebar" class={if props.is_open {"visible"} else {""}}>
             <div class="sidebar-header">
                 <h2>{"Call Diagnostics"}</h2>
@@ -1064,61 +1176,14 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
 
                 // NetEQ Status Display
                 <div class="diagnostics-section">
-                    <h3>{"Current Status"}</h3>
+                    <h3>{"Audio Quality (NetEQ)"}</h3>
                     <NetEqStatusDisplay latest_stats={latest_neteq_stats} />
                 </div>
 
                 // NetEQ Advanced Charts
                 if !neteq_stats_history.is_empty() {
                     <div class="diagnostics-charts">
-                        <div class="charts-grid">
-                            <div class="chart-container">
-                                <NetEqAdvancedChart
-                                    stats_history={neteq_stats_history.clone()}
-                                    chart_type={AdvancedChartType::BufferVsTarget}
-                                    width={290}
-                                    height={200}
-                                />
-                            </div>
-                            <div class="chart-container">
-                                <NetEqAdvancedChart
-                                    stats_history={neteq_stats_history.clone()}
-                                    chart_type={AdvancedChartType::DecodeOperations}
-                                    width={290}
-                                    height={200}
-                                />
-                            </div>
-                        </div>
-
-                        <div class="charts-grid">
-                            <div class="chart-container">
-                                <NetEqAdvancedChart
-                                    stats_history={neteq_stats_history.clone()}
-                                    chart_type={AdvancedChartType::QualityMetrics}
-                                    width={290}
-                                    height={200}
-                                />
-                            </div>
-                            <div class="chart-container">
-                                <NetEqAdvancedChart
-                                    stats_history={neteq_stats_history.clone()}
-                                    chart_type={AdvancedChartType::ReorderingAnalysis}
-                                    width={290}
-                                    height={200}
-                                />
-                            </div>
-                        </div>
-
-                        <div class="charts-grid">
-                            <div class="chart-container">
-                                <NetEqAdvancedChart
-                                    stats_history={neteq_stats_history.clone()}
-                                    chart_type={AdvancedChartType::SystemPerformance}
-                                    width={290}
-                                    height={200}
-                                />
-                            </div>
-                        </div>
+                        {charts_grid_html}
                     </div>
                 } else {
                     // Fallback to legacy charts if no parsed NetEQ stats
@@ -1206,5 +1271,6 @@ pub fn diagnostics(props: &DiagnosticsProps) -> Html {
                 </div>
             </div>
         </div>
+        </>
     }
 }

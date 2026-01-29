@@ -47,7 +47,7 @@ pub fn home() -> Html {
         load_username_from_storage().unwrap_or_default()
     };
 
-    // If we already have a stored username, set the Matomo user id early
+    // If we already have a stored username, set the Matomo user id early (no-op when Matomo disabled)
     use_effect_with((), {
         let uid = existing_username.clone();
         move |_| {
@@ -75,7 +75,7 @@ pub fn home() -> Html {
             }
             save_username_to_storage(&username);
             username_ctx.set(Some(username));
-            // Set Matomo user id for attribution
+            // Set Matomo user id for attribution (no-op when Matomo disabled)
             if let Some(name) = &*username_ctx {
                 matomo_logger::set_user_id(name);
             }
@@ -118,7 +118,7 @@ pub fn home() -> Html {
             let meeting_id = generate_meeting_id();
             save_username_to_storage(&username);
             username_ctx.set(Some(username));
-            // Set Matomo user id for attribution
+            // Set Matomo user id for attribution (no-op when Matomo disabled)
             if let Some(name) = &*username_ctx {
                 matomo_logger::set_user_id(name);
             }

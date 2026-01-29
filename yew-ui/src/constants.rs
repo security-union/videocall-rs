@@ -50,6 +50,10 @@ pub struct RuntimeConfig {
     pub video_bitrate_kbps: u32,
     #[serde(rename = "screenBitrateKbps")]
     pub screen_bitrate_kbps: u32,
+    #[serde(rename = "matomoBaseUrl", default)]
+    pub matomo_base_url: Option<String>,
+    #[serde(rename = "matomoSiteId", default)]
+    pub matomo_site_id: Option<u32>,
     // ui_url intentionally omitted; unused by the UI
 }
 

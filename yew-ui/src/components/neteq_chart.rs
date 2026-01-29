@@ -30,27 +30,43 @@ pub struct NetEqStats {
     pub comfort_noise_per_sec: f32,
     pub dtmf_per_sec: f32,
     pub undefined_per_sec: f32,
+    // Network jitter metrics (RFC 3550)
+    pub jitter_ms: i32,
+    pub jitter_peaks_found: u16,
 }
 
 // Convert from the raw NetEQ structure to the UI structure
 impl From<RawNetEqStats> for NetEqStats {
     fn from(raw: RawNetEqStats) -> Self {
+        // Calculate calls_per_sec as sum of all decode operations per second
+        let calls_per_sec = (raw.network.operation_counters.normal_per_sec
+            + raw.network.operation_counters.expand_per_sec
+            + raw.network.operation_counters.accelerate_per_sec
+            + raw.network.operation_counters.fast_accelerate_per_sec
+            + raw.network.operation_counters.preemptive_expand_per_sec
+            + raw.network.operation_counters.merge_per_sec
+            + raw.network.operation_counters.comfort_noise_per_sec
+            + raw.network.operation_counters.dtmf_per_sec
+            + raw.network.operation_counters.undefined_per_sec) as u64;
+
         Self {
-            timestamp: 0, // We don't have a timestamp in the raw data, use 0 or current time
+            timestamp: raw.timestamp_ms,
             buffer_ms: raw.current_buffer_size_ms,
             target_ms: raw.target_delay_ms,
             packets_awaiting_decode: raw.packets_awaiting_decode as u32,
             packets_per_sec: raw.packets_per_sec,
             expand_rate: neteq::q14::to_per_mille(raw.network.expand_rate), // Convert Q14 to per-mille (‰)
             accel_rate: neteq::q14::to_per_mille(raw.network.accelerate_rate), // Convert Q14 to per-mille (‰)
-            calls_per_sec: 0, // Not available in raw data
-            avg_frames: 0,    // Not available in raw data
-            underruns: 0,     // Not available in raw data (could map from concealment events)
+            calls_per_sec,
+            // avg_frames represents the total number of audio frames emitted from the jitter buffer
+            avg_frames: raw.lifetime.jitter_buffer_emitted_count,
+            // underruns maps to concealment_events (times the buffer ran empty and we had to expand)
+            underruns: raw.lifetime.concealment_events,
             reorder_rate: raw.network.reorder_rate_permyriad as u32,
             reordered_packets: raw.network.reordered_packets,
             max_reorder_distance: raw.network.max_reorder_distance as u32,
-            sequence_number: 0, // Not available in raw data
-            rtp_timestamp: 0,   // Not available in raw data
+            sequence_number: 0, // Not available in raw data (RTP-specific)
+            rtp_timestamp: 0,   // Not available in raw data (RTP-specific)
             normal_per_sec: raw.network.operation_counters.normal_per_sec,
             expand_per_sec: raw.network.operation_counters.expand_per_sec,
             accelerate_per_sec: raw.network.operation_counters.accelerate_per_sec,
@@ -60,6 +76,8 @@ impl From<RawNetEqStats> for NetEqStats {
             comfort_noise_per_sec: raw.network.operation_counters.comfort_noise_per_sec,
             dtmf_per_sec: raw.network.operation_counters.dtmf_per_sec,
             undefined_per_sec: raw.network.operation_counters.undefined_per_sec,
+            jitter_ms: raw.network.jitter_ms,
+            jitter_peaks_found: raw.network.jitter_peaks_found,
         }
     }
 }
@@ -116,6 +134,14 @@ pub fn base_chart(props: &BaseChartProps) -> Html {
         };
     }
 
+    // Generate legend
+    let legend_elements: Vec<Html> = config.series.iter().enumerate().map(|(i, series)| {
+        let y_pos = 15 + (i * 15) as i32;
+        html! {
+            <text x="5" y={y_pos.to_string()} fill={series.color} font-size="10">{series.label}</text>
+        }
+    }).collect();
+
     // Generate polylines for each series with REVERSED x-axis (newest data on right)
     let series_elements: Vec<Html> = config
         .series
@@ -126,12 +152,9 @@ pub fn base_chart(props: &BaseChartProps) -> Html {
                 .iter()
                 .enumerate()
                 .map(|(i, &value)| {
-                    // Data flows RIGHT to LEFT: newest data at rightmost position, oldest at leftmost
-                    // Assuming stats_history[0] = oldest, stats_history[last] = newest
                     let x = margin_left + (i as f64 / (*data_len - 1).max(1) as f64 * plot_width);
                     let y = margin_top + plot_height
                         - (value.max(0.0) / config.max_value * plot_height);
-
                     if y.is_finite() {
                         format!("{x:.1},{y:.1}")
                     } else {
@@ -141,25 +164,15 @@ pub fn base_chart(props: &BaseChartProps) -> Html {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-
             html! {
                 <polyline points={points} fill="none" stroke={series.color} stroke-width="2" />
             }
         })
         .collect();
-
-    // Generate legend
-    let legend_elements: Vec<Html> = config.series.iter().enumerate().map(|(i, series)| {
-        let y_pos = 15 + (i * 15) as i32;
-        html! {
-            <text x="5" y={y_pos.to_string()} fill={series.color} font-size="10">{series.label}</text>
-        }
-    }).collect();
-
     html! {
         <div class="neteq-advanced-chart">
             <div class="chart-title">{ config.title }</div>
-            <svg width={width.to_string()} height={height.to_string()} viewBox={format!("0 0 {width} {height}")}>
+            <svg width="100%" height="100%" viewBox={format!("0 0 {width} {height}")}>
                 // Y-axis
                 <line x1={margin_left.to_string()} y1={margin_top.to_string()} x2={margin_left.to_string()} y2={(plot_height + margin_top).to_string()} stroke="#666" stroke-width="1" />
                 // X-axis
@@ -227,13 +240,14 @@ pub enum ChartType {
     Jitter,
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Eq, Clone)]
 pub enum AdvancedChartType {
     BufferVsTarget,
     DecodeOperations,
     QualityMetrics,
     ReorderingAnalysis,
     SystemPerformance,
+    NetworkJitter,
 }
 
 impl ChartType {
@@ -253,13 +267,14 @@ impl ChartType {
 }
 
 impl AdvancedChartType {
-    fn title(&self) -> &'static str {
+    pub fn title(&self) -> &'static str {
         match self {
-            AdvancedChartType::BufferVsTarget => "Buffer Size vs Target",
-            AdvancedChartType::DecodeOperations => "Decode Operations Per Second",
-            AdvancedChartType::QualityMetrics => "Packet Count & Audio Quality",
-            AdvancedChartType::ReorderingAnalysis => "Packet Reordering Analysis",
-            AdvancedChartType::SystemPerformance => "System Performance",
+            AdvancedChartType::BufferVsTarget => "Audio Buffer Size vs Target",
+            AdvancedChartType::DecodeOperations => "Audio Decode Operations Per Second",
+            AdvancedChartType::QualityMetrics => "Audio Packet Count & Quality",
+            AdvancedChartType::ReorderingAnalysis => "Audio Packet Reordering",
+            AdvancedChartType::SystemPerformance => "Audio Processing Performance",
+            AdvancedChartType::NetworkJitter => "Audio Packet Jitter & Timing",
         }
     }
 }
@@ -307,7 +322,7 @@ pub fn neteq_chart(props: &NetEqChartProps) -> Html {
     html! {
         <div class="neteq-chart">
             <div class="chart-title">{ chart_type.label() }</div>
-            <svg width={width.to_string()} height={height.to_string()} viewBox={format!("0 0 {width} {height}")} preserveAspectRatio="none">
+            <svg width="100%" height="100%" viewBox={format!("0 0 {width} {height}")} preserveAspectRatio="none">
                 // Y-axis
                 <line x1={margin_left.to_string()} y1="5" x2={margin_left.to_string()} y2={(plot_height + 5.0).to_string()} stroke="#666" stroke-width="1" />
                 // X-axis
@@ -345,7 +360,7 @@ impl ChartConfig {
         let target_data: Vec<f64> = stats_history.iter().map(|s| s.target_ms as f64).collect();
 
         Self {
-            title: "Buffer Size vs Target",
+            title: "Audio Buffer Size vs Target",
             y_axis_label: "Buffer (ms)",
             max_value: max_buffer,
             series: vec![
@@ -405,7 +420,7 @@ impl ChartConfig {
             .collect();
 
         Self {
-            title: "Decode Operations Per Second",
+            title: "Audio Decode Operations Per Second",
             y_axis_label: "Operations/sec",
             max_value: max_ops,
             series: vec![
@@ -468,7 +483,7 @@ impl ChartConfig {
             .collect();
 
         Self {
-            title: "Packet Count & Audio Quality",
+            title: "Audio Packet Count & Quality",
             y_axis_label: "Count",
             max_value: max_packets,
             series: vec![
@@ -513,7 +528,7 @@ impl ChartConfig {
             .collect();
 
         Self {
-            title: "Packet Reordering Analysis",
+            title: "Audio Packet Reordering",
             y_axis_label: "Rate/Distance",
             max_value: max_rate.max(max_distance),
             series: vec![
@@ -555,7 +570,7 @@ impl ChartConfig {
         let frames_data: Vec<f64> = stats_history.iter().map(|s| s.avg_frames as f64).collect();
 
         Self {
-            title: "System Performance",
+            title: "Audio Processing Performance",
             y_axis_label: "Performance",
             max_value: max_calls.max(max_frames),
             series: vec![
@@ -572,6 +587,28 @@ impl ChartConfig {
                     scale_factor: 1.0,
                 },
             ],
+        }
+    }
+
+    pub fn network_jitter(stats_history: &[NetEqStats]) -> Self {
+        // RFC 3550 interarrival jitter (EWMA of transit time deviation)
+        let jitter_data: Vec<f64> = stats_history
+            .iter()
+            .map(|s| s.jitter_ms.max(0) as f64)
+            .collect();
+
+        let max_value = jitter_data.iter().cloned().fold(1.0f64, f64::max);
+
+        Self {
+            title: "Audio Packet Jitter & Timing",
+            y_axis_label: "Jitter (ms)",
+            max_value,
+            series: vec![ChartSeries {
+                data_points: jitter_data,
+                color: "#dc3545",
+                label: "RFC 3550 Jitter",
+                scale_factor: 1.0,
+            }],
         }
     }
 }
@@ -600,6 +637,7 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
         AdvancedChartType::QualityMetrics => ChartConfig::quality_metrics(stats_history),
         AdvancedChartType::ReorderingAnalysis => ChartConfig::reordering_analysis(stats_history),
         AdvancedChartType::SystemPerformance => ChartConfig::system_performance(stats_history),
+        AdvancedChartType::NetworkJitter => ChartConfig::network_jitter(stats_history),
     };
 
     html! {
@@ -610,6 +648,8 @@ pub fn neteq_advanced_chart(props: &NetEqAdvancedChartProps) -> Html {
 #[function_component(NetEqStatusDisplay)]
 pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
     let NetEqStatusDisplayProps { latest_stats } = props;
+
+    // Stats logging moved to neteq_worker.rs (every 5s; UI stats emission remains 1Hz)
 
     // Common CSS styles for both branches
     let common_styles = r#"
@@ -695,6 +735,12 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
     "#;
 
     if let Some(stats) = latest_stats {
+        // Detect stale data purely from the current stats snapshot (no state tracking needed).
+        // Don't use buffer_ms - it can retain residual data (63ms + 3 packets) after mute
+        // if the flush didn't fully complete before the stats snapshot.
+        // The reliable signals are: no packets arriving AND no decode operations happening.
+        let is_stale = stats.packets_per_sec == 0 && stats.normal_per_sec == 0.0;
+
         let buffer_class = if stats.buffer_ms == 0 {
             "status-value warning"
         } else if stats.buffer_ms >= (stats.target_ms as f32 * 0.8) as u32
@@ -717,7 +763,9 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
                 <div class="neteq-status">
                     <div class="status-grid">
                         <div class="status-item">
-                            <div class={buffer_class}>{stats.buffer_ms}</div>
+                            <div class={buffer_class}>
+                                {if is_stale { "--".to_string() } else { stats.buffer_ms.to_string() }}
+                            </div>
                             <div class="status-label">{"BUFFER (MS)"}</div>
                             <div class="status-subtitle">{"Audio data buffered for playback"}</div>
                         </div>
@@ -727,28 +775,38 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
                             <div class="status-subtitle">{"Optimal buffer size for network"}</div>
                         </div>
                         <div class="status-item">
-                            <div class="status-value">{stats.packets_awaiting_decode}</div>
+                            <div class="status-value">
+                                {if is_stale { "--".to_string() } else { stats.packets_awaiting_decode.to_string() }}
+                            </div>
                             <div class="status-label">{"PACKETS"}</div>
                             <div class="status-subtitle">{"Encoded packets awaiting decode"}</div>
                         </div>
                         <div class="status-item">
-                            <div class="status-value">{stats.packets_per_sec}</div>
+                            <div class="status-value">
+                                {if is_stale { "--".to_string() } else { stats.packets_per_sec.to_string() }}
+                            </div>
                             <div class="status-label">{"PACKETS/S"}</div>
                             <div class="status-subtitle">{"Audio packets received in the last second"}</div>
                         </div>
                         <div class="status-item">
-                            <div class={underrun_class}>{stats.underruns}</div>
-                            <div class="status-label">{"UNDERRUNS"}</div>
-                            <div class="status-subtitle">{"Times audio buffer ran empty"}</div>
+                            <div class={underrun_class}>
+                                {if is_stale { "--".to_string() } else { stats.underruns.to_string() }}
+                            </div>
+                            <div class="status-label">{"UNDERRUNS (LIFETIME)"}</div>
+                            <div class="status-subtitle">{"Total times audio buffer ran empty"}</div>
                         </div>
                         <div class="status-item">
-                            <div class="status-value">{format!("{:.1}", stats.expand_rate)}</div>
-                            <div class="status-label">{"EXPAND RATE"}</div>
+                            <div class="status-value">
+                                {if is_stale { "--".to_string() } else { format!("{:.1}", stats.expand_rate) }}
+                            </div>
+                            <div class="status-label">{"EXPAND RATE (LIFETIME)"}</div>
                             <div class="status-subtitle">{"Audio stretching when buffer low (‰)"}</div>
                         </div>
                         <div class="status-item">
-                            <div class="status-value">{format!("{:.1}", stats.accel_rate)}</div>
-                            <div class="status-label">{"ACCEL RATE"}</div>
+                            <div class="status-value">
+                                {if is_stale { "--".to_string() } else { format!("{:.1}", stats.accel_rate) }}
+                            </div>
+                            <div class="status-label">{"ACCEL RATE (LIFETIME)"}</div>
                             <div class="status-subtitle">{"Audio compression when buffer full (‰)"}</div>
                         </div>
                         <div class="status-item">
@@ -758,13 +816,27 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
                         </div>
                         <div class="status-item">
                             <div class="status-value">{stats.reordered_packets}</div>
-                            <div class="status-label">{"REORDERED PACKETS"}</div>
+                            <div class="status-label">{"REORDERED PACKETS (LIFETIME)"}</div>
                             <div class="status-subtitle">{"Total packets received out-of-order"}</div>
                         </div>
                         <div class="status-item">
                             <div class="status-value">{stats.max_reorder_distance}</div>
                             <div class="status-label">{"MAX REORDER DISTANCE"}</div>
                             <div class="status-subtitle">{"Largest gap in packet sequence"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">
+                                {if is_stale { "--".to_string() } else { format!("{}", stats.jitter_ms) }}
+                            </div>
+                            <div class="status-label">{"JITTER (MS)"}</div>
+                            <div class="status-subtitle">{"Mean deviation of packet arrival timing"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">
+                                {if is_stale { "--".to_string() } else { stats.jitter_peaks_found.to_string() }}
+                            </div>
+                            <div class="status-label">{"JITTER SPIKES"}</div>
+                            <div class="status-subtitle">{"Packets with abnormal transit delay"}</div>
                         </div>
                     </div>
                 </div>
@@ -798,17 +870,17 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
                         </div>
                         <div class="status-item">
                             <div class="status-value">{"--"}</div>
-                            <div class="status-label">{"UNDERRUNS"}</div>
-                            <div class="status-subtitle">{"Times audio buffer ran empty"}</div>
+                            <div class="status-label">{"UNDERRUNS (LIFETIME)"}</div>
+                            <div class="status-subtitle">{"Total times audio buffer ran empty"}</div>
                         </div>
                         <div class="status-item">
                             <div class="status-value">{"--"}</div>
-                            <div class="status-label">{"EXPAND RATE"}</div>
+                            <div class="status-label">{"EXPAND RATE (LIFETIME)"}</div>
                             <div class="status-subtitle">{"Audio stretching when buffer low (‰)"}</div>
                         </div>
                         <div class="status-item">
                             <div class="status-value">{"--"}</div>
-                            <div class="status-label">{"ACCEL RATE"}</div>
+                            <div class="status-label">{"ACCEL RATE (LIFETIME)"}</div>
                             <div class="status-subtitle">{"Audio compression when buffer full (‰)"}</div>
                         </div>
                         <div class="status-item">
@@ -818,13 +890,23 @@ pub fn neteq_status_display(props: &NetEqStatusDisplayProps) -> Html {
                         </div>
                         <div class="status-item">
                             <div class="status-value">{"--"}</div>
-                            <div class="status-label">{"REORDERED PACKETS"}</div>
+                            <div class="status-label">{"REORDERED PACKETS (LIFETIME)"}</div>
                             <div class="status-subtitle">{"Total packets received out-of-order"}</div>
                         </div>
                         <div class="status-item">
                             <div class="status-value">{"--"}</div>
                             <div class="status-label">{"MAX REORDER DISTANCE"}</div>
                             <div class="status-subtitle">{"Largest gap in packet sequence"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"JITTER (MS)"}</div>
+                            <div class="status-subtitle">{"Mean deviation of packet arrival timing"}</div>
+                        </div>
+                        <div class="status-item">
+                            <div class="status-value">{"--"}</div>
+                            <div class="status-label">{"JITTER SPIKES"}</div>
+                            <div class="status-subtitle">{"Packets with abnormal transit delay"}</div>
                         </div>
                     </div>
                 </div>

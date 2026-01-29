@@ -66,7 +66,7 @@ fn switch(routes: Route) -> Html {
     if let Err(e) = app_config() {
         return html! { <ConfigError message={e} /> };
     }
-    // Track SPA navigation in Matomo
+    // Track SPA navigation in Matomo (no-op when Matomo disabled)
     matomo_logger::track_page_view(&routes.to_string(), &routes.to_string());
     match routes {
         Route::Home => html! { <Home /> },
@@ -93,16 +93,29 @@ fn app_root() -> Html {
 }
 
 fn main() {
+    // Load runtime config to determine if Matomo is enabled
+    let config = app_config().ok();
+    let matomo_base_url = config.as_ref().and_then(|c| c.matomo_base_url.clone());
+    let matomo_site_id = config.as_ref().and_then(|c| c.matomo_site_id);
+
+    // Matomo is only enabled if both base_url and site_id are provided
+    let matomo_enabled = matomo_base_url.is_some() && matomo_site_id.is_some();
+
     // Initialize unified console + Matomo logging
     let _ = MatomoLogger::init(MatomoConfig {
-        base_url: Some("https://matomo.videocall.rs/".into()),
-        site_id: Some(1),
+        base_url: matomo_base_url,
+        site_id: matomo_site_id,
         console_level: if cfg!(feature = "debugAssertions") {
             log::LevelFilter::Debug
         } else {
             log::LevelFilter::Info
         },
-        matomo_level: log::LevelFilter::Warn,
+        matomo_level: if matomo_enabled {
+            log::LevelFilter::Warn
+        } else {
+            log::LevelFilter::Off
+        },
+        inject_snippet: matomo_enabled,
         ..Default::default()
     });
 

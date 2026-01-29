@@ -35,7 +35,6 @@ use crate::context::{MeetingTime, MeetingTimeCtx, VideoCallClientCtx};
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
-use serde::Deserialize;
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -365,6 +364,7 @@ impl AttendantsComponent {
         }
     }
 
+    #[allow(dead_code)]
     fn format_meeting_duration(&self) -> String {
         log::info!(
             "format_meeting_duration - meeting_start_time_server: {:?}",
@@ -373,20 +373,20 @@ impl AttendantsComponent {
         if let Some(server_start_ms) = self.meeting_start_time_server {
             let now_ms = js_sys::Date::now();
 
-            log::info!("Server start: {}, Now: {}", server_start_ms, now_ms);
+            log::info!("Server start: {server_start_ms}, Now: {now_ms}");
             let elapsed_ms = (now_ms - server_start_ms).max(0.0);
 
             let elapsed_secs = (elapsed_ms / 1000.0) as u64;
 
-            log::info!("Elapsed seconds: {}", elapsed_secs);
+            log::info!("Elapsed seconds: {elapsed_secs}");
             let hours = elapsed_secs / 3600;
             let minutes = (elapsed_secs % 3600) / 60;
             let seconds = elapsed_secs % 60;
 
             if hours > 0 {
-                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
             } else {
-                format!("{:02}:{:02}", minutes, seconds)
+                format!("{minutes:02}:{seconds:02}")
             }
         } else {
             "00:00".to_string()
@@ -404,9 +404,9 @@ impl AttendantsComponent {
             let seconds = elapsed_secs % 60;
 
             if hours > 0 {
-                format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+                format!("{hours:02}:{minutes:02}:{seconds:02}")
             } else {
-                format!("{:02}:{:02}", minutes, seconds)
+                format!("{minutes:02}:{seconds:02}")
             }
         } else {
             "00:00".to_string()

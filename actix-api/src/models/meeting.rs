@@ -62,7 +62,7 @@ impl Meeting {
     }
 
     /// Get the current duration of the meeting in milliseconds
-    pub fn current_durtion_ms(&self) -> i64 {
+    pub fn current_duration_ms(&self) -> i64 {
         match self.ended_at {
             Some(end) => (end - self.started_at).num_milliseconds(),
             None => (Utc::now() - self.started_at).num_milliseconds(),
@@ -103,6 +103,11 @@ impl Meeting {
                 updated_at: row.get("updated_at"),
                 deleted_at: row.get("deleted_at"),
                 creator_id: row.get("creator_id"),
+                meeting_title: row.get("meeting_title"),
+                password_hash: row.get("password_hash"),
+                waiting_room_enabled: row.get("waiting_room_enabled"),
+                meeting_status: Some("idle".to_string())
+
             })
         })
         .await
@@ -135,6 +140,10 @@ impl Meeting {
             updated_at: row.get("updated_at"),
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
+            meeting_title: row.get("meeting_title"),
+            password_hash: row.get("password_hash"),
+            waiting_room_enabled: row.get("waiting_room_enabled"),
+            meeting_status: Some("ended".to_string()),
         })
     }
 
@@ -166,6 +175,10 @@ impl Meeting {
                     updated_at: row.get("updated_at"),
                     deleted_at: row.get("deleted_at"),
                     creator_id: row.get("creator_id"),
+                    meeting_status: row.get("meeting_status"),
+                    meeting_title: row.get("meeting_title"),
+                    password_hash: row.get("password_hash"),
+                    waiting_room_enabled: row.get("waiting_room_enabled"),
                 }))
             }
         })
@@ -193,6 +206,10 @@ impl Meeting {
             updated_at: row.get("updated_at"),
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
+            meeting_title: row.get("meeting_title"),
+            password_hash: row.get("password_hash"),
+            waiting_room_enabled: row.get("waiting_room_enabled"),
+            meeting_status: row.get("meeting_status"),
         })
     }
 

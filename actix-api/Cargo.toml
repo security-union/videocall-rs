@@ -60,6 +60,7 @@ uuid = { version = "0.8", features = ["serde", "v4"] }
 web-transport-quinn = { workspace = true }
 chrono = { version = "0.4.42", features = ["serde", "clock"] }
 postgres-types = { version = "0.2.11", features = ["with-chrono-0_4"] }
+bcrypt = "0.18.0"
 
 [dev-dependencies]
 url = "2"

@@ -237,7 +237,7 @@ impl MeetingManager {
                     room_id: meeting.room_id.clone(),
                     started_at: meeting.started_at.to_rfc3339(),
                     ended_at: meeting.ended_at.map(|dt| dt.to_rfc3339()),
-                    duration_ms: meeting.current_durtion_ms(),
+                    duration_ms: meeting.current_duration_ms(),
                     is_active: meeting.is_active(),
                 };
 

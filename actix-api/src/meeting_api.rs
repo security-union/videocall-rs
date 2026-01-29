@@ -226,9 +226,9 @@ pub async fn create_meeting(
                 log_error!("Create meeting: Invalid meeting ID format: {}", id);
                 return Ok(HttpResponse::BadRequest().json(CreateMeetingError::invalid_meeting_id()));
             }
-            clean_id
+            clean_id.to_string()
         }
-        None => generate_meeting_id(),
+        None => generate_meeting_id()
     };
 
     // Check if meeting ID already exists
@@ -325,7 +325,7 @@ pub async fn create_meeting(
     let response = CreateMeetingResponse {
         meeting_id: meeting.room_id.clone(),
         metadata: MeetingMetadata {
-            host: host_id,
+            host: host_id.to_owned(),
             created_timestamp: meeting.created_at.timestamp(),
             state: meeting.meeting_status.unwrap_or_else(|| "idle".to_string()),
             attendees: cleaned_attendees,

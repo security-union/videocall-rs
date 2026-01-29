@@ -179,21 +179,16 @@ impl CameraEncoder {
     /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
     /// called, or if [`encoder.select(device_id)`](Self::select) has not been called.
     pub fn start(&mut self) {
-        web_sys::console::log_1(&"[CameraEncoder] start() called".into());
-
         // Check if device is selected
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
-            web_sys::console::warn_1(&"[CameraEncoder] start() returning early - no device selected".into());
             return;
         };
 
         // Reset switching flag - we're starting fresh, not switching devices
         // This prevents the loop from immediately exiting if select() was called before start()
         self.state.switching.store(false, Ordering::Release);
-
-        web_sys::console::log_1(&format!("[CameraEncoder] Starting with device: {}", device_id).into());
 
         // 1. Query the first device with a camera and a mic attached.
         // 2. setup WebCodecs, in particular
@@ -337,15 +332,9 @@ impl CameraEncoder {
             let mut current_encoder_width = width as u32;
             let mut current_encoder_height = height as u32;
 
-            // Counter for periodic detailed logging (every ~1 second at 30fps)
-            let mut log_counter = 0u32;
-
-            // Log that the encoding loop started - use console directly to ensure visibility
-            web_sys::console::log_1(&"[CameraEncoder] Encoding loop started".into());
-
             loop {
-                // On every frame, check the video element state.
-                // This handles cases where the video element is recreated or stops playing.
+                // Check the video element state and re-apply srcObject if needed.
+                // This handles cases where the video element is recreated during re-render.
                 if let Some(current_video_elem) = window()
                     .document()
                     .and_then(|d| d.get_element_by_id(&video_elem_id))
@@ -353,67 +342,28 @@ impl CameraEncoder {
                     let current_video: HtmlVideoElement =
                         current_video_elem.unchecked_into();
 
-                    let has_src = current_video.src_object().is_some();
-                    let is_paused = current_video.paused();
-                    let ready_state = current_video.ready_state();
-                    let video_width = current_video.video_width();
-                    let video_height = current_video.video_height();
-
-                    // Log video state periodically for debugging - use console directly
-                    log_counter += 1;
-                    if log_counter >= 90 {
-                        // Every ~3 seconds
-                        log_counter = 0;
-                        let msg = format!(
-                            "[CameraEncoder] Self-video state: hasSrc={}, paused={}, readyState={}, dimensions={}x{}",
-                            has_src, is_paused, ready_state, video_width, video_height
-                        );
-                        web_sys::console::log_1(&msg.into());
-                    }
-
-                    // Re-apply srcObject if missing
-                    if !has_src {
-                        web_sys::console::warn_1(
-                            &"[CameraEncoder] Video element srcObject was lost, re-applying MediaStream".into()
-                        );
+                    // Re-apply srcObject if missing (video element was recreated)
+                    if current_video.src_object().is_none() {
                         current_video.set_src_object(Some(&device));
                         current_video.set_muted(true);
                         let _ = current_video.play();
                     }
-                    // If video is paused and has source, try to play it
-                    else if is_paused {
-                        web_sys::console::warn_1(
-                            &"[CameraEncoder] Video element is paused, attempting to resume playback".into()
-                        );
+                    // If video is paused, try to play it
+                    else if current_video.paused() {
                         let _ = current_video.play();
                     }
-                    // If video has 0 dimensions but has source, something is wrong
-                    else if video_width == 0 || video_height == 0 {
-                        let msg = format!(
-                            "[CameraEncoder] Video has srcObject but 0 dimensions ({}x{}), re-applying stream",
-                            video_width, video_height
-                        );
-                        web_sys::console::warn_1(&msg.into());
+                    // If video has 0 dimensions but has source, re-apply stream
+                    else if current_video.video_width() == 0 || current_video.video_height() == 0 {
                         current_video.set_src_object(Some(&device));
                         current_video.set_muted(true);
                         let _ = current_video.play();
                     }
-                } else {
-                    let msg = format!("[CameraEncoder] Video element '{}' not found in DOM", video_elem_id);
-                    web_sys::console::warn_1(&msg.into());
                 }
 
                 if !enabled.load(Ordering::Acquire)
                     || destroy.load(Ordering::Acquire)
                     || switching.load(Ordering::Acquire)
                 {
-                    let msg = format!(
-                        "[CameraEncoder] Encoding loop exiting: enabled={}, destroy={}, switching={}",
-                        enabled.load(Ordering::Acquire),
-                        destroy.load(Ordering::Acquire),
-                        switching.load(Ordering::Acquire)
-                    );
-                    web_sys::console::warn_1(&msg.into());
                     switching.store(false, Ordering::Release);
                     let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                     video_track.stop();

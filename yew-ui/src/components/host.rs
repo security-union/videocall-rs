@@ -20,7 +20,6 @@ use crate::constants::*;
 use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
-use log::debug;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -140,8 +139,6 @@ impl Component for Host {
     type Properties = MeetingProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        web_sys::console::warn_1(&"[Host] Component CREATED - this should only happen once per meeting".into());
-
         // Get client from context
         let (client, _) = ctx
             .link()
@@ -744,7 +741,6 @@ impl Component for Host {
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {
-        web_sys::console::warn_1(&"[Host] Component DESTROYED - camera/mic/screen encoders stopping".into());
         self.camera.stop();
         self.microphone.stop();
         self.screen.stop();

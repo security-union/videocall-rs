@@ -836,6 +836,7 @@ impl Component for AttendantsComponent {
                         if media_access_granted && (users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty()) {
                             html! {
                                 <Host
+                                    key="self-video-host"
                                     share_screen={self.share_screen}
                                     mic_enabled={self.mic_enabled}
                                     video_enabled={self.video_enabled}

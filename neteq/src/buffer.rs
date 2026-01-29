@@ -221,12 +221,16 @@ impl PacketBuffer {
             stats.packet_in_order();
         }
 
+        // Capture RTP fields before moving packet into buffer
+        let rtp_timestamp = packet.header.timestamp;
+        let sample_rate = packet.sample_rate;
+        let arrival_time = packet.arrival_time;
+
         // Insert the packet
         self.buffer.insert(insert_pos, packet);
 
-        // Update statistics
-        let arrival_delay = self.calculate_arrival_delay(insert_pos);
-        stats.packet_arrived(arrival_delay);
+        // Update RFC 3550 jitter statistics
+        stats.packet_arrived(rtp_timestamp, sample_rate, arrival_time);
 
         Ok(BufferReturnCode::Ok)
     }
@@ -358,16 +362,6 @@ impl PacketBuffer {
         }
 
         false
-    }
-
-    fn calculate_arrival_delay(&self, insert_pos: usize) -> i32 {
-        // Simple arrival delay calculation based on position in buffer
-        // In a real implementation, this would be more sophisticated
-        if insert_pos == 0 {
-            0
-        } else {
-            (insert_pos as i32) * 10 // Rough estimate: 10ms per position
-        }
     }
 
     fn should_smart_flush(&self, target_level_ms: u32) -> bool {

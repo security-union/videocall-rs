@@ -214,7 +214,7 @@ pub struct NetworkStatistics {
     pub current_buffer_size_ms: u16,
     /// Target buffer size in milliseconds
     pub preferred_buffer_size_ms: u16,
-    /// Number of jitter peaks found
+    /// Number of jitter peaks found (windowed: resets on >1s gaps, e.g. mute/unmute)
     pub jitter_peaks_found: u16,
     /// Fraction of audio data inserted through expansion (Q14 format)
     pub expand_rate: u16,
@@ -224,11 +224,14 @@ pub struct NetworkStatistics {
     pub preemptive_rate: u16,
     /// Fraction of data removed through acceleration (Q14 format)
     pub accelerate_rate: u16,
-    /// Statistics for packet waiting times
+    /// Statistics for packet inter-arrival times
     pub mean_waiting_time_ms: i32,
     pub median_waiting_time_ms: i32,
     pub min_waiting_time_ms: i32,
     pub max_waiting_time_ms: i32,
+    /// RFC 3550 interarrival jitter: EWMA of transit time deviation (ms).
+    /// Windowed: resets on >1s gaps (e.g. mute/unmute transitions).
+    pub jitter_ms: i32,
     /// Packet reordering statistics
     pub reordered_packets: u32,
     pub total_packets_received: u32,
@@ -297,8 +300,13 @@ pub struct StatisticsCalculator {
     lifetime_stats: LifetimeStatistics,
     operation_stats: OperationStatistics,
     start_time: Instant,
-    waiting_times: Vec<i32>,
     _last_update: Instant,
+    /// RFC 3550 jitter state: last packet's RTP timestamp
+    last_rtp_timestamp: Option<u32>,
+    /// RFC 3550 jitter state: last packet's wall-clock arrival time
+    last_arrival_time: Option<Instant>,
+    /// RFC 3550 jitter estimate (running EWMA, in milliseconds as f64 for precision)
+    rfc3550_jitter: f64,
     /// Total output samples for rate calculations
     total_output_samples: u64,
     /// Total expanded samples for rate calculations
@@ -326,8 +334,10 @@ impl StatisticsCalculator {
             lifetime_stats: LifetimeStatistics::default(),
             operation_stats: OperationStatistics::default(),
             start_time: now,
-            waiting_times: Vec::new(),
             _last_update: now,
+            last_rtp_timestamp: None,
+            last_arrival_time: None,
+            rfc3550_jitter: 0.0,
             total_output_samples: 0,
             total_expanded_samples: 0,
             operation_counts: [0; 9],
@@ -343,17 +353,65 @@ impl StatisticsCalculator {
         self.operation_stats.current_buffer_size_ms = current_ms as u64;
     }
 
-    /// Record a packet arrival and calculate waiting time
-    pub fn packet_arrived(&mut self, arrival_delay_ms: i32) {
+    /// Record a packet arrival and compute RFC 3550 jitter.
+    ///
+    /// RFC 3550 §6.4.1 defines interarrival jitter as:
+    ///   D(i,j) = (Rj - Ri) - (Sj - Si)
+    ///   J = J + (|D(i,j)| - J) / 16
+    ///
+    /// Where R = arrival time (wall-clock), S = RTP timestamp (sender clock).
+    /// Both deltas must be in the same units; we convert to milliseconds.
+    pub fn packet_arrived(&mut self, rtp_timestamp: u32, sample_rate: u32, arrival_time: Instant) {
         self.lifetime_stats.jitter_buffer_packets_received += 1;
-        self.waiting_times.push(arrival_delay_ms);
 
-        // Keep only recent waiting times (last 100 packets)
-        if self.waiting_times.len() > 100 {
-            self.waiting_times.remove(0);
+        if let (Some(prev_ts), Some(prev_arrival)) =
+            (self.last_rtp_timestamp, self.last_arrival_time)
+        {
+            // Arrival delta in ms (wall-clock)
+            let arrival_delta_ms = arrival_time.duration_since(prev_arrival).as_millis() as f64;
+
+            // If gap > 1 second, this is a mute/unmute transition — reset jitter state.
+            if arrival_delta_ms > 1000.0 {
+                log::debug!(
+                    "[NetEQ Stats] Large gap ({:.0}ms), resetting jitter state",
+                    arrival_delta_ms
+                );
+                self.rfc3550_jitter = 0.0;
+                self.network_stats.jitter_peaks_found = 0;
+                self.last_rtp_timestamp = Some(rtp_timestamp);
+                self.last_arrival_time = Some(arrival_time);
+                return;
+            }
+
+            // RTP timestamp delta in ms (sender clock)
+            // Use wrapping_sub to handle u32 wraparound correctly.
+            let rtp_delta_samples = rtp_timestamp.wrapping_sub(prev_ts) as f64;
+            let rtp_delta_ms = rtp_delta_samples * 1000.0 / sample_rate as f64;
+
+            // D(i,j) = arrival_delta - rtp_delta  (the transit time difference)
+            let d = (arrival_delta_ms - rtp_delta_ms).abs();
+
+            // Detect jitter peaks: D(i,j) > 3× current jitter estimate AND at least 40ms.
+            // This fires only on genuinely anomalous single-packet delays.
+            if self.rfc3550_jitter > 1.0 && d > self.rfc3550_jitter * 3.0 && d >= 40.0 {
+                self.network_stats.jitter_peaks_found += 1;
+                log::debug!(
+                    "[NetEQ Stats] Jitter peak: D={:.1}ms, J={:.1}ms, peaks={}",
+                    d,
+                    self.rfc3550_jitter,
+                    self.network_stats.jitter_peaks_found
+                );
+            }
+
+            // RFC 3550 EWMA: J = J + (|D| - J) / 16
+            self.rfc3550_jitter += (d - self.rfc3550_jitter) / 16.0;
+
+            // Publish to NetworkStatistics
+            self.network_stats.jitter_ms = self.rfc3550_jitter.round() as i32;
         }
 
-        self.update_waiting_time_stats();
+        self.last_rtp_timestamp = Some(rtp_timestamp);
+        self.last_arrival_time = Some(arrival_time);
     }
 
     /// Record jitter buffer delay
@@ -415,19 +473,22 @@ impl StatisticsCalculator {
         let now = Instant::now();
 
         // Convert operation to array index
+        // Must match the indices used in update_operation_rates():
+        //   [0] = normal, [1] = merge, [2] = expand, [3] = accelerate,
+        //   [4] = fast_accelerate, [5] = preemptive_expand, [6] = comfort_noise,
+        //   [7] = dtmf, [8] = undefined
         let index = match operation {
             Operation::Normal => 0,
             Operation::Merge => 1,
-            Operation::Expand => 2,
-            Operation::ExpandStart => 3,
-            Operation::ExpandEnd => 4,
-            Operation::Accelerate => 5,
-            Operation::FastAccelerate => 6,
-            Operation::PreemptiveExpand => 7,
-            Operation::TimeStretchBuffer => 8,
-            Operation::ComfortNoise => 9,
-            Operation::Dtmf => 10,
-            Operation::Undefined => 11,
+            // Consolidate all expand variants into expand_per_sec
+            Operation::Expand | Operation::ExpandStart | Operation::ExpandEnd => 2,
+            Operation::Accelerate => 3,
+            Operation::FastAccelerate => 4,
+            Operation::PreemptiveExpand => 5,
+            // TimeStretchBuffer has no dedicated counter, count as undefined
+            Operation::TimeStretchBuffer | Operation::Undefined => 8,
+            Operation::ComfortNoise => 6,
+            Operation::Dtmf => 7,
         };
 
         // Increment counter
@@ -469,6 +530,16 @@ impl StatisticsCalculator {
             // Reset counters for next window
             self.operation_counts.fill(0);
             self.last_operation_update = now;
+        }
+    }
+
+    /// Decay operation rates to 0 if no operations recorded since last window.
+    /// Call this before reading statistics to ensure stale rates don't persist.
+    pub fn maybe_decay_stale_rates(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_operation_update) >= self.operation_window_duration {
+            // Window elapsed with no operations - update rates (will compute 0/elapsed = 0)
+            self.update_operation_rates(now);
         }
     }
 
@@ -538,26 +609,6 @@ impl StatisticsCalculator {
     pub fn reset(&mut self) {
         *self = Self::new();
     }
-
-    fn update_waiting_time_stats(&mut self) {
-        if self.waiting_times.is_empty() {
-            return;
-        }
-
-        let mut sorted_times = self.waiting_times.clone();
-        sorted_times.sort_unstable();
-
-        self.network_stats.min_waiting_time_ms = *sorted_times.first().unwrap();
-        self.network_stats.max_waiting_time_ms = *sorted_times.last().unwrap();
-
-        let sum: i32 = sorted_times.iter().sum();
-        self.network_stats.mean_waiting_time_ms = sum / sorted_times.len() as i32;
-
-        let median_idx = sorted_times.len() / 2;
-        self.network_stats.median_waiting_time_ms = sorted_times[median_idx];
-
-        self.operation_stats.last_waiting_time_ms = *self.waiting_times.last().unwrap() as u64;
-    }
 }
 
 /// Types of time-stretching operations
@@ -582,9 +633,8 @@ mod tests {
         assert_eq!(calc.network_statistics().preferred_buffer_size_ms, 120);
 
         // Test packet arrival
-        calc.packet_arrived(50);
+        calc.packet_arrived(0, 48000, Instant::now());
         assert_eq!(calc.lifetime_statistics().jitter_buffer_packets_received, 1);
-        assert_eq!(calc.network_statistics().mean_waiting_time_ms, 50);
 
         // Test concealment
         calc.concealment_event(160, false);
@@ -604,21 +654,31 @@ mod tests {
     }
 
     #[test]
-    fn test_waiting_time_statistics() {
+    fn test_rfc3550_jitter() {
         let mut calc = StatisticsCalculator::new();
+        let sample_rate = 48000_u32;
+        let samples_per_packet = 960_u32; // 20ms at 48kHz
 
-        // Add several waiting times
-        calc.packet_arrived(10);
-        calc.packet_arrived(20);
-        calc.packet_arrived(30);
-        calc.packet_arrived(15);
-        calc.packet_arrived(25);
+        // Simulate perfectly timed packets: 20ms apart, RTP timestamps advance by 960
+        let start = Instant::now();
+        for i in 0..20_u32 {
+            let rtp_ts = i * samples_per_packet;
+            // Perfect arrival: exactly 20ms × i after start
+            // (In test, Instant::now() is used, so arrivals are ~0ms apart.
+            //  The RTP delta will also be 20ms, so D≈20ms for all but first.
+            //  This tests the EWMA converges.)
+            calc.packet_arrived(rtp_ts, sample_rate, start);
+        }
 
-        let stats = calc.network_statistics();
-        assert_eq!(stats.min_waiting_time_ms, 10);
-        assert_eq!(stats.max_waiting_time_ms, 30);
-        assert_eq!(stats.mean_waiting_time_ms, 20); // (10+20+30+15+25)/5 = 20
-        assert_eq!(stats.median_waiting_time_ms, 20); // Middle value when sorted
+        assert_eq!(
+            calc.lifetime_statistics().jitter_buffer_packets_received,
+            20
+        );
+        // With identical arrival times and advancing RTP timestamps,
+        // D = |0 - 20ms| = 20ms for each packet. Jitter EWMA converges toward 20ms.
+        // After 19 iterations of J += (20 - J)/16, J ≈ 20 * (1 - (15/16)^19) ≈ 14.1ms
+        let j = calc.network_statistics().jitter_ms;
+        assert!(j > 10 && j < 20, "Expected jitter ~14ms, got {j}ms");
     }
 
     #[test]

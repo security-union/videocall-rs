@@ -117,9 +117,9 @@ impl WebNetEq {
     /// Get current NetEq statistics as a JS object.
     #[wasm_bindgen(js_name = getStatistics)]
     pub fn get_statistics(&self) -> Result<JsValue, JsValue> {
-        let neteq_ref = self.neteq.borrow();
+        let mut neteq_ref = self.neteq.borrow_mut();
         let neteq = neteq_ref
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| JsValue::from_str("NetEq not initialized. Call init() first."))?;
 
         let stats = neteq.get_statistics();

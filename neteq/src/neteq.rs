@@ -130,6 +130,9 @@ pub struct NetEqStats {
     /// Number of audio packets received per second (rolling 1s window)
     #[serde(default)]
     pub packets_per_sec: u32,
+    /// Timestamp when these statistics were captured (milliseconds since epoch)
+    #[serde(default)]
+    pub timestamp_ms: u64,
 }
 
 /// Audio frame output from NetEQ
@@ -443,8 +446,25 @@ impl NetEq {
         }
     }
 
-    /// Get current statistics
-    pub fn get_statistics(&self) -> NetEqStats {
+    /// Get current statistics.
+    ///
+    /// Takes `&mut self` because it decays stale operation rates on read.
+    /// In our WASM single-threaded context, the `RefCell<NetEq>` in `WebNetEq`
+    /// guarantees exclusive access; concurrent `borrow_mut()` cannot occur.
+    pub fn get_statistics(&mut self) -> NetEqStats {
+        // Decay stale operation rates before returning stats
+        // This ensures rates go to 0 when no operations are happening (e.g., after mute)
+        self.statistics.maybe_decay_stale_rates();
+
+        // Also decay packets_per_sec if window has elapsed with no packets
+        self.maybe_roll_packet_rate();
+
+        // Get current timestamp in milliseconds since epoch
+        let timestamp_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
         NetEqStats {
             network: self.statistics.network_statistics().clone(),
             lifetime: self.statistics.lifetime_statistics().clone(),
@@ -452,6 +472,7 @@ impl NetEq {
             target_delay_ms: self.delay_manager.target_delay_ms(),
             packets_awaiting_decode: self.packet_buffer.len(),
             packets_per_sec: self.packets_per_sec_snapshot,
+            timestamp_ms,
         }
     }
 

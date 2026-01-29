@@ -77,6 +77,7 @@ mod wasm_worker {
         static NETEQ: std::cell::RefCell<Option<WebNetEq>> = const { std::cell::RefCell::new(None) };
         static IS_MUTED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) }; // Start muted by default
         static DIAGNOSTICS_ENABLED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) }; // Diagnostics enabled by default
+        static STATS_LOG_COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
     #[wasm_bindgen(start)]
@@ -196,6 +197,40 @@ mod wasm_worker {
                 NETEQ.with(|cell| {
                     if let Some(eq) = cell.borrow().as_ref() {
                         if let Ok(js_val) = eq.get_statistics() {
+                            // Log stats every 5s for diagnostics (throttled to reduce console noise)
+                            STATS_LOG_COUNTER.with(|counter| {
+                                let c = counter.get() + 1;
+                                if c >= 5 {
+                                    counter.set(0);
+                                    let get = |obj: &JsValue, key: &str| -> f64 {
+                                        js_sys::Reflect::get(obj, &JsValue::from_str(key))
+                                            .ok()
+                                            .and_then(|v| v.as_f64())
+                                            .unwrap_or(0.0)
+                                    };
+                                    let net = js_sys::Reflect::get(&js_val, &JsValue::from_str("network")).unwrap_or(JsValue::NULL);
+                                    let ops = js_sys::Reflect::get(&net, &JsValue::from_str("operation_counters")).unwrap_or(JsValue::NULL);
+                                    log::info!(
+                                        "[NetEQ Worker] buffer={}ms target={}ms pkts/s={} queue={} | \
+                                         ops: normal={:.1}/s expand={:.1}/s accel={:.1}/s pre_expand={:.1}/s | \
+                                         jitter={}ms peaks={} reorder={}‱",
+                                        get(&js_val, "current_buffer_size_ms") as i64,
+                                        get(&js_val, "target_delay_ms") as i64,
+                                        get(&js_val, "packets_per_sec") as u32,
+                                        get(&js_val, "packets_awaiting_decode") as u32,
+                                        get(&ops, "normal_per_sec"),
+                                        get(&ops, "expand_per_sec"),
+                                        get(&ops, "accelerate_per_sec"),
+                                        get(&ops, "preemptive_expand_per_sec"),
+                                        get(&net, "jitter_ms") as i32,
+                                        get(&net, "jitter_peaks_found") as u32,
+                                        get(&net, "reorder_rate_permyriad") as u32,
+                                    );
+                                } else {
+                                    counter.set(c);
+                                }
+                            });
+
                             // Manual construction since JsValue doesn't serialize properly
                             let obj = js_sys::Object::new();
                             let _ = js_sys::Reflect::set(
@@ -228,8 +263,6 @@ mod wasm_worker {
                 static mut START_TIME: f64 = 0.0;
                 static mut LAST_PRODUCTION_TIME: f64 = 0.0;
                 static mut TOTAL_FRAMES_PRODUCED: u64 = 0;
-                static mut TIMING_ADJUSTMENTS: i32 = 0;
-                static mut LAST_TIMING_LOG: f64 = 0.0;
 
                 unsafe {
                     let now = js_sys::Date::now();
@@ -237,7 +270,13 @@ mod wasm_worker {
                     if START_TIME == 0.0 {
                         START_TIME = now;
                         LAST_PRODUCTION_TIME = now;
-                        console::log_1(&format!("🎵 NetEq: Starting audio production timer ({}ms interval)", AUDIO_PRODUCTION_INTERVAL_MS).into());
+                        console::log_1(
+                            &format!(
+                                "🎵 NetEq: Starting audio production timer ({}ms interval)",
+                                AUDIO_PRODUCTION_INTERVAL_MS
+                            )
+                            .into(),
+                        );
                         // Produce first frame immediately
                         if !is_muted {
                             NETEQ.with(|cell| {
@@ -259,47 +298,36 @@ mod wasm_worker {
                     let total_elapsed_ms = now - START_TIME;
                     let interval_since_last = now - LAST_PRODUCTION_TIME;
                     let expected_total_frames = (total_elapsed_ms / 10.0) as u64;
-                    let frames_behind = expected_total_frames.saturating_sub(TOTAL_FRAMES_PRODUCED) as i32;
-                                         // Decide whether to produce audio this cycle
-                     let should_produce = if is_muted {
-                         // When muted, keep frame count in sync but don't produce audio
-                         TOTAL_FRAMES_PRODUCED = expected_total_frames;
-                         false
-                     } else {
-                         // Produce audio if we're behind or if a full 10ms period has passed
-                         frames_behind > 0 || interval_since_last >= 10.0
-                     };
+                    let frames_behind =
+                        expected_total_frames.saturating_sub(TOTAL_FRAMES_PRODUCED) as i32;
+                    // Decide whether to produce audio this cycle
+                    let should_produce = if is_muted {
+                        // When muted, keep frame count in sync but don't produce audio
+                        TOTAL_FRAMES_PRODUCED = expected_total_frames;
+                        false
+                    } else {
+                        // Produce audio if we're behind or if a full 10ms period has passed
+                        frames_behind > 0 || interval_since_last >= 10.0
+                    };
 
-                    // Log timing statistics every 5 seconds
-                    if now - LAST_TIMING_LOG > 5000.0 {
-                        let actual_production_rate = TOTAL_FRAMES_PRODUCED as f64 / (total_elapsed_ms / 1000.0);
-                        let expected_rate = 100.0; // 100 Hz target
-                        let timing_error_ms = (TOTAL_FRAMES_PRODUCED as f64 * 10.0) - total_elapsed_ms;
-                        log::debug!(
-                            "🎯 NetEq ({}ms timer): {actual_production_rate:.1}Hz actual, {expected_rate:.1}Hz expected, {timing_error_ms:.1}ms timing error, {frames_behind} behind, muted={is_muted}",
-                            AUDIO_PRODUCTION_INTERVAL_MS
-                         );
-                        LAST_TIMING_LOG = now;
-                    }
+                    // Timing stats logged every 5s via the stats interval callback
 
                     // Produce audio if needed
                     if should_produce {
                         NETEQ.with(|cell| {
                             if let Some(eq) = cell.borrow().as_ref() {
-                                    if let Ok(pcm) = eq.get_audio() {
-                                        TOTAL_FRAMES_PRODUCED += 1;
-                                        LAST_PRODUCTION_TIME = now;
-                                        let sab = js_sys::Array::of1(&pcm.buffer());
-                                        let _ = js_sys::global()
-                                            .unchecked_into::<DedicatedWorkerGlobalScope>()
-                                            .post_message_with_transfer(&pcm, &sab);
-                                    // Track timing adjustments for debugging
-                                    if frames_behind > 1 {
-                                        TIMING_ADJUSTMENTS += 1;
-                                    }
-                                    } else {
-                                        // NetEq couldn't provide audio - this is expected sometimes
-                                        console::log_1(&"📭 NetEq: No audio available this cycle".into());
+                                if let Ok(pcm) = eq.get_audio() {
+                                    TOTAL_FRAMES_PRODUCED += 1;
+                                    LAST_PRODUCTION_TIME = now;
+                                    let sab = js_sys::Array::of1(&pcm.buffer());
+                                    let _ = js_sys::global()
+                                        .unchecked_into::<DedicatedWorkerGlobalScope>()
+                                        .post_message_with_transfer(&pcm, &sab);
+                                } else {
+                                    // NetEq couldn't provide audio - this is expected sometimes
+                                    console::log_1(
+                                        &"📭 NetEq: No audio available this cycle".into(),
+                                    );
                                 }
                             }
                         });

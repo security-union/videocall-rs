@@ -677,6 +677,11 @@ impl Component for AttendantsComponent {
                         // Screen share cancelled or stopped - reset state
                         self.share_screen = false;
                     }
+                    ScreenShareEvent::Failed(ref msg) => {
+                        // Screen share failed during setup - reset state and log error
+                        log::error!("Screen share failed: {msg}");
+                        self.share_screen = false;
+                    }
                 }
                 true
             }

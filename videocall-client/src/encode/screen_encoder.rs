@@ -62,12 +62,14 @@ const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
 /// the MediaStream directly.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareEvent {
-    /// Screen share successfully started (user selected a screen/window)
+    /// Screen share successfully started and encoding is active
     Started,
-    /// User cancelled the browser picker dialog
+    /// User cancelled the browser picker dialog (dismissed without selecting)
     Cancelled,
-    /// Screen share ended (user clicked browser's "Stop sharing" or stream ended)
+    /// Screen share ended normally (user clicked browser's "Stop sharing" or stream ended)
     Stopped,
+    /// Screen share failed due to an error after stream acquisition
+    Failed(String),
 }
 
 /// [ScreenEncoder] encodes the user's screen and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
@@ -229,10 +231,26 @@ impl ScreenEncoder {
 
             log::info!("Screen to share: {screen_to_share:?}");
 
-            // Emit Started event now that we have the stream
-            if let Some(ref callback) = on_state_change {
-                callback.emit(ScreenShareEvent::Started);
-            }
+            // Helper to clean up stream on error - stops all tracks and emits Failed event
+            let cleanup_on_error = |screen_to_share: &MediaStream,
+                                    enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+                                    on_state_change: &Option<Callback<ScreenShareEvent>>,
+                                    error_msg: String| {
+                // Stop all tracks
+                if let Some(tracks) = screen_to_share.get_tracks().dyn_ref::<Array>() {
+                    for i in 0..tracks.length() {
+                        if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
+                            track.stop();
+                        }
+                    }
+                }
+                // Reset enabled flag
+                enabled.store(false, Ordering::Release);
+                // Emit Failed event
+                if let Some(ref callback) = on_state_change {
+                    callback.emit(ScreenShareEvent::Failed(error_msg));
+                }
+            };
 
             let screen_track = Box::new(
                 screen_to_share
@@ -300,7 +318,9 @@ impl ScreenEncoder {
             let screen_encoder = match VideoEncoder::new(&screen_encoder_init) {
                 Ok(encoder) => Box::new(encoder),
                 Err(e) => {
-                    error!("Failed to create video encoder: {e:?}");
+                    let msg = format!("Failed to create video encoder: {e:?}");
+                    error!("{}", msg);
+                    cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                     return;
                 }
             };
@@ -311,20 +331,20 @@ impl ScreenEncoder {
                 .unchecked_into::<MediaStreamTrack>();
 
             // Set up onended handler to detect when user clicks browser's "Stop sharing" button
-            {
+            // Keep the closure in scope until the encoding loop ends to avoid memory leak
+            let onended_handler = {
                 let enabled_clone = enabled.clone();
                 let on_state_change_clone = on_state_change.clone();
-                let onended_handler = Closure::wrap(Box::new(move || {
+                let handler = Closure::wrap(Box::new(move || {
                     log::info!("Screen share track ended (user stopped sharing)");
                     enabled_clone.store(false, Ordering::Release);
                     if let Some(ref callback) = on_state_change_clone {
                         callback.emit(ScreenShareEvent::Stopped);
                     }
                 }) as Box<dyn FnMut()>);
-                media_track.set_onended(Some(onended_handler.as_ref().unchecked_ref()));
-                // We need to forget the closure to keep it alive for the duration of the track
-                onended_handler.forget();
-            }
+                media_track.set_onended(Some(handler.as_ref().unchecked_ref()));
+                handler
+            };
 
             let track_settings = media_track.get_settings();
 
@@ -337,7 +357,9 @@ impl ScreenEncoder {
             screen_encoder_config.set_bitrate(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
-                error!("Error configuring screen encoder: {e:?}");
+                let msg = format!("Error configuring screen encoder: {e:?}");
+                error!("{}", msg);
+                cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                 return;
             }
 
@@ -346,10 +368,17 @@ impl ScreenEncoder {
             ) {
                 Ok(processor) => processor,
                 Err(e) => {
-                    error!("Failed to create media stream track processor: {e:?}");
+                    let msg = format!("Failed to create media stream track processor: {e:?}");
+                    error!("{}", msg);
+                    cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                     return;
                 }
             };
+
+            // All setup complete - NOW emit Started event
+            if let Some(ref callback) = on_state_change {
+                callback.emit(ScreenShareEvent::Started);
+            }
 
             let screen_reader = screen_processor
                 .readable()
@@ -461,6 +490,9 @@ impl ScreenEncoder {
             }
 
             // At the end of the loop, ensure proper cleanup
+            // Clear the onended handler before dropping the closure to avoid dangling reference
+            media_track.set_onended(None);
+
             media_track.stop();
             if let Some(tracks) = screen_to_share.get_tracks().dyn_ref::<Array>() {
                 for i in 0..tracks.length() {

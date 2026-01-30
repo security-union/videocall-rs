@@ -10,7 +10,8 @@ on:
       - add-auth
     paths:
       - 'yew-ui/**'
-      - 'types/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
       - 'videocall-client/**'
       - 'videocall-codecs/**'
       - 'neteq/**'

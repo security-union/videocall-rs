@@ -91,18 +91,18 @@ Generate the config.js content for the UI component.
 This is injected as a ConfigMap and mounted into the UI container.
 */}}
 {{- define "videocall.ui.configjs" -}}
-window.CONFIG = {
-  API_BASE_URL: {{ .Values.ui.runtimeConfig.apiBaseUrl | quote }},
-  WS_URL: {{ .Values.ui.runtimeConfig.wsUrl | quote }},
-  WEB_TRANSPORT_HOST: {{ .Values.ui.runtimeConfig.webTransportHost | quote }},
-  OAUTH_ENABLED: {{ .Values.ui.runtimeConfig.oauthEnabled | quote }},
-  E2EE_ENABLED: {{ .Values.ui.runtimeConfig.e2eeEnabled | quote }},
-  WEB_TRANSPORT_ENABLED: {{ .Values.ui.runtimeConfig.webTransportEnabled | quote }},
-  USERS_ALLOWED_TO_STREAM: {{ .Values.ui.runtimeConfig.usersAllowedToStream | quote }},
-  SERVER_ELECTION_PERIOD_MS: {{ .Values.ui.runtimeConfig.serverElectionPeriodMs }},
-  AUDIO_BITRATE_KBPS: {{ .Values.ui.runtimeConfig.audioBitrateKbps }},
-  VIDEO_BITRATE_KBPS: {{ .Values.ui.runtimeConfig.videoBitrateKbps }},
-  SCREEN_BITRATE_KBPS: {{ .Values.ui.runtimeConfig.screenBitrateKbps }}
+window.__APP_CONFIG = {
+  apiBaseUrl: {{ .Values.ui.runtimeConfig.apiBaseUrl | quote }},
+  wsUrl: {{ .Values.ui.runtimeConfig.wsUrl | quote }},
+  webTransportHost: {{ .Values.ui.runtimeConfig.webTransportHost | quote }},
+  oauthEnabled: {{ .Values.ui.runtimeConfig.oauthEnabled | quote }},
+  e2eeEnabled: {{ .Values.ui.runtimeConfig.e2eeEnabled | quote }},
+  webTransportEnabled: {{ .Values.ui.runtimeConfig.webTransportEnabled | quote }},
+  usersAllowedToStream: {{ .Values.ui.runtimeConfig.usersAllowedToStream | quote }},
+  serverElectionPeriodMs: {{ .Values.ui.runtimeConfig.serverElectionPeriodMs }},
+  audioBitrateKbps: {{ .Values.ui.runtimeConfig.audioBitrateKbps }},
+  videoBitrateKbps: {{ .Values.ui.runtimeConfig.videoBitrateKbps }},
+  screenBitrateKbps: {{ .Values.ui.runtimeConfig.screenBitrateKbps }}
 };
 {{- end }}
 

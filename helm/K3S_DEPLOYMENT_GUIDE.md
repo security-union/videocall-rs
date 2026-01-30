@@ -117,7 +117,7 @@ echo "Ingress IP Address: $IPADDR"
 Ensure you validate this IP address before proceeding, reset the environment variable if necessary.  Then install NGINX:
 ```bash
 # Install NGINX Ingress Controller
-helm install ingress-nginx helm/ingress-nginx \
+helm install ingress-nginx helm-videocall-deployment/infrastructure/ingress-nginx \
   --create-namespace \
   --namespace ingress-nginx \
   --version 4.13.0 \

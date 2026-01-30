@@ -56,6 +56,20 @@ use crate::diagnostics::EncoderBitrateController;
 // Threshold for bitrate changes, represents 20% (0.2)
 const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
 
+/// Events emitted by [ScreenEncoder] to notify about screen share state changes.
+///
+/// This allows the UI to react to screen share lifecycle events without managing
+/// the MediaStream directly.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScreenShareEvent {
+    /// Screen share successfully started (user selected a screen/window)
+    Started,
+    /// User cancelled the browser picker dialog
+    Cancelled,
+    /// Screen share ended (user clicked browser's "Stop sharing" or stream ended)
+    Stopped,
+}
+
 /// [ScreenEncoder] encodes the user's screen and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
 /// See also:
@@ -68,18 +82,23 @@ pub struct ScreenEncoder {
     current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
     on_encoder_settings_update: Option<Callback<String>>,
+    on_state_change: Option<Callback<ScreenShareEvent>>,
 }
 
 impl ScreenEncoder {
     /// Construct a screen encoder:
     ///
     /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
+    /// * `bitrate_kbps` - initial bitrate in kilobits per second
+    /// * `on_encoder_settings_update` - callback for encoder settings updates (e.g., bitrate changes)
+    /// * `on_state_change` - callback for screen share state changes (started, cancelled, stopped)
     ///
     /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
     pub fn new(
         client: VideoCallClient,
         bitrate_kbps: u32,
         on_encoder_settings_update: Callback<String>,
+        on_state_change: Callback<ScreenShareEvent>,
     ) -> Self {
         Self {
             client,
@@ -87,6 +106,7 @@ impl ScreenEncoder {
             current_bitrate: Rc::new(AtomicU32::new(bitrate_kbps)),
             current_fps: Rc::new(AtomicU32::new(0)),
             on_encoder_settings_update: Some(on_encoder_settings_update),
+            on_state_change: Some(on_state_change),
         }
     }
 
@@ -174,6 +194,7 @@ impl ScreenEncoder {
         let aes = client.aes();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let on_state_change = self.on_state_change.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -187,16 +208,31 @@ impl ScreenEncoder {
                     Ok(stream) => stream.unchecked_into::<MediaStream>(),
                     Err(e) => {
                         error!("User denied screen sharing permission or error occurred: {e:?}");
+                        // Emit Cancelled event when user dismisses the picker
+                        if let Some(ref callback) = on_state_change {
+                            callback.emit(ScreenShareEvent::Cancelled);
+                        }
+                        enabled.store(false, Ordering::Release);
                         return;
                     }
                 },
                 Err(e) => {
                     error!("Failed to get display media: {e:?}");
+                    // Emit Cancelled event on error
+                    if let Some(ref callback) = on_state_change {
+                        callback.emit(ScreenShareEvent::Cancelled);
+                    }
+                    enabled.store(false, Ordering::Release);
                     return;
                 }
             };
 
             log::info!("Screen to share: {screen_to_share:?}");
+
+            // Emit Started event now that we have the stream
+            if let Some(ref callback) = on_state_change {
+                callback.emit(ScreenShareEvent::Started);
+            }
 
             let screen_track = Box::new(
                 screen_to_share
@@ -273,6 +309,23 @@ impl ScreenEncoder {
                 .as_ref()
                 .clone()
                 .unchecked_into::<MediaStreamTrack>();
+
+            // Set up onended handler to detect when user clicks browser's "Stop sharing" button
+            {
+                let enabled_clone = enabled.clone();
+                let on_state_change_clone = on_state_change.clone();
+                let onended_handler = Closure::wrap(Box::new(move || {
+                    log::info!("Screen share track ended (user stopped sharing)");
+                    enabled_clone.store(false, Ordering::Release);
+                    if let Some(ref callback) = on_state_change_clone {
+                        callback.emit(ScreenShareEvent::Stopped);
+                    }
+                }) as Box<dyn FnMut()>);
+                media_track.set_onended(Some(onended_handler.as_ref().unchecked_ref()));
+                // We need to forget the closure to keep it alive for the duration of the track
+                onended_handler.forget();
+            }
+
             let track_settings = media_track.get_settings();
 
             let width = track_settings.get_width().expect("width is None");
@@ -414,6 +467,14 @@ impl ScreenEncoder {
                     if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
                         track.stop();
                     }
+                }
+            }
+
+            // Emit Stopped event if we haven't already (onended handler might have already fired)
+            // Check enabled flag - if it's still true, onended hasn't fired yet
+            if enabled.swap(false, Ordering::AcqRel) {
+                if let Some(ref callback) = on_state_change {
+                    callback.emit(ScreenShareEvent::Stopped);
                 }
             }
         });

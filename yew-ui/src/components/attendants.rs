@@ -36,7 +36,9 @@ use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
-use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_client::{
+    MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -92,6 +94,7 @@ pub enum Msg {
     HangUp,
     ShowCopyToast(bool),
     MeetingEnded(String),
+    ScreenShareStateChange(ScreenShareEvent),
 }
 
 impl From<WsAction> for Msg {
@@ -663,6 +666,20 @@ impl Component for AttendantsComponent {
                 self.meeting_ended_message = Some(end_time);
                 true
             }
+            Msg::ScreenShareStateChange(event) => {
+                log::info!("Screen share state changed: {event:?}");
+                match event {
+                    ScreenShareEvent::Started => {
+                        // Screen share successfully started - ensure state is true
+                        self.share_screen = true;
+                    }
+                    ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
+                        // Screen share cancelled or stopped - reset state
+                        self.share_screen = false;
+                    }
+                }
+                true
+            }
         }
     }
 
@@ -950,6 +967,7 @@ impl Component for AttendantsComponent {
                                                  device_settings_open={self.device_settings_open}
                                                  on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
                                                  on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                                 on_screen_share_state={ctx.link().callback(Msg::ScreenShareStateChange)}
                                              />}
                                          } else {
                                              html! {<></>}

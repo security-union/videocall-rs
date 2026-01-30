@@ -20,9 +20,9 @@ use crate::constants::*;
 use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
-use log::{debug, info};
+use log::debug;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
-use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder};
+use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
@@ -33,7 +33,7 @@ use crate::components::{
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
 };
-use web_sys::{MediaStream, window};
+use web_sys::window;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -133,9 +133,10 @@ pub struct MeetingProps {
     /// Callback to toggle the self-video position between floating and grid
     #[prop_or_default]
     pub on_position_toggle: Callback<MouseEvent>,
-    
-    /// stream which were activated in attendants
-    pub screen_stream: Option<MediaStream>,
+
+    /// Called when screen share state changes
+    #[prop_or_default]
+    pub on_screen_share_event: Callback<ScreenShareEvent>,
 }
 
 impl Component for Host {
@@ -227,7 +228,12 @@ impl Component for Host {
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
+        let set_enabled_result = self.screen.set_enabled(ctx.props().share_screen);
+        log::info!(">>> [2/4] HOST rendered: share_screen prop={}, self.share_screen={}, set_enabled returned={}",
+            ctx.props().share_screen, self.share_screen, set_enabled_result);
+
+        if set_enabled_result && ctx.props().share_screen {
+            log::info!(">>> [2/4] HOST: enabling screen share, will send EnableScreenShare in 1s");
             self.share_screen = ctx.props().share_screen;
             let link = ctx.link().clone();
             let timeout = Timeout::new(1000, move || {
@@ -235,8 +241,11 @@ impl Component for Host {
             });
             timeout.forget();
         } else if self.share_screen != ctx.props().share_screen {
+            log::info!(">>> [2/4] HOST: share_screen changed, sending DisableScreenShare");
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::DisableScreenShare);
+        } else {
+            log::info!(">>> [2/4] HOST: no screen share state change needed");
         }
         // Mic enable/disable is controlled upstream; reflect props only
         if self.microphone.set_enabled(ctx.props().mic_enabled) {
@@ -271,14 +280,11 @@ impl Component for Host {
         log::debug!("Host update: {msg:?}");
         let should_update = match msg {
             Msg::EnableScreenShare => {
-                if let Some(stream) = ctx.props().screen_stream.clone() {
-                   self.screen.start(stream);
-                } else {
-                   log::error!("EnableScreenShare called but screen_stream is None");
-                }
+                self.screen.start(ctx.props().on_screen_share_event.clone());
                 true
             }
             Msg::DisableScreenShare => {
+                log::info!(">>> [3/4] HOST: DisableScreenShare received, calling screen.stop()");
                 self.screen.stop();
                 self.encoder_settings.screen = None;
                 ctx.props()

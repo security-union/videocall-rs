@@ -118,7 +118,7 @@ pub struct ScreenShareButtonProps {
 #[function_component(ScreenShareButton)]
 pub fn screen_share_button(props: &ScreenShareButtonProps) -> Html {
     let mut class = classes!("video-control-button", props.active.then_some("active"));
-    
+
     let onclick = if props.disabled {
         Callback::noop()
     } else {
@@ -126,7 +126,7 @@ pub fn screen_share_button(props: &ScreenShareButtonProps) -> Html {
     };
 
     if props.disabled {
-       class.push("disabled");
+        class.push("disabled");
     }
 
     html! {

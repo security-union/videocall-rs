@@ -24,6 +24,7 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
 use log::info;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -33,6 +34,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::LatencyMode;
+use web_sys::MediaDevices;
 use web_sys::MediaStream;
 use web_sys::MediaStreamTrack;
 use web_sys::MediaStreamTrackProcessor;
@@ -56,6 +58,21 @@ use crate::diagnostics::EncoderBitrateController;
 // Threshold for bitrate changes, represents 20% (0.2)
 const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
 
+/// Screen share lifecycle events.
+/// These allow the UI layer to react to screen sharing state changes
+/// while keeping all media logic encapsulated in videocall-client.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScreenShareEvent {
+    /// Browser's screen picker dialog is about to open
+    Requesting,
+    /// User has selected a screen and sharing has started
+    Started,
+    /// User cancelled the screen picker dialog or an error occurred
+    Cancelled,
+    /// Screen sharing was stopped (by browser's "Stop sharing" button or programmatically)
+    Stopped,
+}
+
 /// [ScreenEncoder] encodes the user's screen and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
 ///
 /// See also:
@@ -68,6 +85,8 @@ pub struct ScreenEncoder {
     current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
     on_encoder_settings_update: Option<Callback<String>>,
+    /// Holds the current screen share MediaStream so we can stop tracks immediately
+    current_stream: Rc<RefCell<Option<MediaStream>>>,
 }
 
 impl ScreenEncoder {
@@ -87,6 +106,7 @@ impl ScreenEncoder {
             current_bitrate: Rc::new(AtomicU32::new(bitrate_kbps)),
             current_fps: Rc::new(AtomicU32::new(0)),
             on_encoder_settings_update: Some(on_encoder_settings_update),
+            current_stream: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -149,35 +169,84 @@ impl ScreenEncoder {
     }
 
     /// Stops encoding after it has been started.
+    /// This immediately stops all media tracks, which will also dismiss
+    /// the browser's "Stop sharing" bar (with a small delay as the browser processes the stop).
     pub fn stop(&mut self) {
-        self.state.stop()
+        info!(">>> [4/4] SCREEN_ENCODER: stop() called, calling state.stop()");
+        self.state.stop();
+
+        // Immediately stop all tracks to dismiss browser's sharing indicator
+        let stream_opt = self.current_stream.borrow_mut().take();
+        if let Some(stream) = stream_opt {
+            info!(">>> [4/4] SCREEN_ENCODER: stream found, stopping tracks");
+            // Stop video tracks (screen share is video only, but we stop all just in case)
+            let video_tracks = stream.get_video_tracks();
+            info!(
+                ">>> [4/4] SCREEN_ENCODER: stopping {} video tracks",
+                video_tracks.length()
+            );
+            for i in 0..video_tracks.length() {
+                if let Ok(track) = video_tracks.get(i).dyn_into::<MediaStreamTrack>() {
+                    track.stop();
+                }
+            }
+
+            // Also stop any audio tracks if present (e.g., if sharing tab with audio)
+            let audio_tracks = stream.get_audio_tracks();
+            for i in 0..audio_tracks.length() {
+                if let Ok(track) = audio_tracks.get(i).dyn_into::<MediaStreamTrack>() {
+                    track.stop();
+                }
+            }
+        } else {
+            info!(">>> [4/4] SCREEN_ENCODER: no stream stored, nothing to stop");
+        }
     }
 
     /// Start encoding and sending the data to the client connection (if it's currently connected).
     /// The user is prompted by the browser to select which window or screen to encode.
     ///
     /// This will toggle the enabled state of the encoder.
-    pub fn start(&mut self, screen_stream: MediaStream) {
+    ///
+    /// # Arguments
+    /// * `on_event` - Callback to notify the UI layer of screen share lifecycle events
+    pub fn start(&mut self, on_event: Callback<ScreenShareEvent>) {
         let EncoderState {
             enabled,
             destroy,
             switching,
             ..
         } = self.state.clone();
-        // enable the encoder
-        // patch the destroy flag to false
-        enabled.store(true, Ordering::Release);
-        destroy.store(false, Ordering::Release);
 
-        let screen_to_share = screen_stream;
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
+        let current_stream = self.current_stream.clone();
+
+        // Notify UI that we're requesting screen share
+        on_event.emit(ScreenShareEvent::Requesting);
 
         wasm_bindgen_futures::spawn_local(async move {
-            log::info!("Screen to share: {screen_to_share:?}");
+            // Acquire the screen stream via browser's getDisplayMedia
+            let screen_to_share = match Self::get_display_media().await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!("Failed to get display media: {e:?}");
+                    on_event.emit(ScreenShareEvent::Cancelled);
+                    return;
+                }
+            };
+
+            // Store the stream so it can be stopped from outside this task
+            *current_stream.borrow_mut() = Some(screen_to_share.clone());
+
+            // Enable the encoder after successfully acquiring the stream
+            enabled.store(true, Ordering::Release);
+            destroy.store(false, Ordering::Release);
+
+            info!("Screen to share: {screen_to_share:?}");
 
             let screen_track = Box::new(
                 screen_to_share
@@ -254,6 +323,18 @@ impl ScreenEncoder {
                 .as_ref()
                 .clone()
                 .unchecked_into::<MediaStreamTrack>();
+
+            // Set up the onended handler to notify UI when browser stops sharing
+            let on_event_for_onended = on_event.clone();
+            let enabled_for_onended = enabled.clone();
+            let onended = Closure::wrap(Box::new(move || {
+                info!(">>> STOPPED EVENT #1: onended handler fired (track ended)");
+                enabled_for_onended.store(false, Ordering::Release);
+                on_event_for_onended.emit(ScreenShareEvent::Stopped);
+            }) as Box<dyn FnMut()>);
+            media_track.set_onended(Some(onended.as_ref().unchecked_ref()));
+            onended.forget(); // Memory leak, but acceptable for this use case
+
             let track_settings = media_track.get_settings();
 
             let width = track_settings.get_width().expect("width is None");
@@ -283,6 +364,9 @@ impl ScreenEncoder {
                 .readable()
                 .get_reader()
                 .unchecked_into::<ReadableStreamDefaultReader>();
+
+            // Notify UI that screen sharing has started successfully
+            on_event.emit(ScreenShareEvent::Started);
 
             let mut screen_frame_counter = 0;
             let mut current_encoder_width = width as u32;
@@ -397,6 +481,27 @@ impl ScreenEncoder {
                     }
                 }
             }
+
+            // Clear the stored stream reference
+            *current_stream.borrow_mut() = None;
+
+            // Notify UI that screen sharing has stopped (if not already notified by onended)
+            info!(">>> STOPPED EVENT #2: encoding loop exited");
+            on_event.emit(ScreenShareEvent::Stopped);
         });
+    }
+
+    /// Acquire a screen stream via the browser's getDisplayMedia API
+    async fn get_display_media() -> Result<MediaStream, JsValue> {
+        let window = window();
+        let navigator = window.navigator();
+        let media_devices: MediaDevices = navigator
+            .media_devices()
+            .map_err(|e| JsValue::from_str(&format!("Failed to get media devices: {e:?}")))?;
+
+        let promise = media_devices.get_display_media()?;
+        let stream = JsFuture::from(promise).await?;
+
+        Ok(MediaStream::from(stream))
     }
 }

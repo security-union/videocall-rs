@@ -37,22 +37,28 @@ use crate::context::{
 };
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
-use log::{error, warn, info};
+use log::{error, warn};
 use videocall_client::utils::is_ios;
-use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_client::{
+    MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use wasm_bindgen::{closure::Closure, JsValue, JsCast};
-use web_sys::*;
+use wasm_bindgen::JsValue;
+use web_sys::HtmlAudioElement;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
-use wasm_bindgen_futures::JsFuture;
-use js_sys::Object;
 
+/// Screen share state tracking.
+/// Note: The "Requesting" state is now handled internally by videocall-client's
+/// ScreenEncoder, which calls the appropriate callbacks when state changes.
 #[derive(Clone, PartialEq)]
 pub enum ScreenShareState {
-    Idle,        // nothing
-    Requesting,  // browser chooser is opened
-    Active,      // stream active
+    /// No screen sharing active
+    Idle,
+    /// Browser's screen picker dialog is open (waiting for user selection)
+    Requesting,
+    /// Screen sharing is active
+    Active,
 }
 
 #[derive(Debug)]
@@ -72,12 +78,12 @@ pub enum WsAction {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub enum MeetingAction {
-    ToggleScreenShare(MediaStream),
     ToggleMicMute,
     ToggleVideoOnOff,
+    /// User clicked the screen share button - triggers the screen share flow
     StartScreenShare,
-    ScreenShareCanceled,
-    ScreenShareStoppedByBrowser,
+    /// Screen share state changed (from videocall-client)
+    ScreenShareEvent(videocall_client::ScreenShareEvent),
 }
 
 #[derive(Debug)]
@@ -178,7 +184,6 @@ pub struct AttendantsComponent {
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
     screen_share_state: ScreenShareState,
-    screen_stream: Option<MediaStream>,
     /// When true, self-video is rendered as floating overlay (original position);
     /// when false, rendered as grid item
     self_video_floating: bool,
@@ -384,24 +389,6 @@ impl AttendantsComponent {
             }
         }
     }
-
-    async fn start_screen_share() -> Result<MediaStream, JsValue> {
-       let window = web_sys::window().unwrap();
-       let navigator = window.navigator();
-       let media_devices: MediaDevices = navigator.media_devices().unwrap();
-
- //   let mut constraints = js_sys::Object::new();
- //   js_sys::Reflect::set(
- //       &constraints,
- //       &"video".into(),
- //       &true.into(),
- //   )?;
-
-       let promise = media_devices.get_display_media()?;
-       let stream = JsFuture::from(promise).await?;
-
-       Ok(MediaStream::from(stream))
-   }
 }
 
 impl Component for AttendantsComponent {
@@ -439,7 +426,6 @@ impl Component for AttendantsComponent {
             meeting_ended_message: None,
             meeting_info_open: false,
             screen_share_state: ScreenShareState::Idle,
-            screen_stream: None,
             self_video_floating: load_self_video_position_from_storage(),
         };
         if let Err(e) = crate::constants::app_config() {
@@ -557,63 +543,36 @@ impl Component for AttendantsComponent {
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::StartScreenShare => {
-                       let link = ctx.link().clone();
-                       
-                       if self.screen_share_state == ScreenShareState::Active {
-                         link.send_message(MeetingAction::ScreenShareCanceled);
-                       } else {
-                         self.screen_share_state = ScreenShareState::Requesting;
-
-                         wasm_bindgen_futures::spawn_local(async move {
-                             match Self::start_screen_share().await {
-                                Ok(stream) => {
-                                   link.send_message(MeetingAction::ToggleScreenShare(stream));
-                                }
-                                Err(_) => {
-                                   link.send_message(MeetingAction::ScreenShareCanceled);
-                                }
-                             }
-                          });
-                       }
-                    }
-                    MeetingAction::ToggleScreenShare(stream) => {
-                       let link = ctx.link().clone();
-
-                       let track = match stream.get_video_tracks().get(0).dyn_into::<web_sys::MediaStreamTrack>() {
-                           Ok(track) => track,
-                           Err(_) => {
-                              web_sys::console::error_1(&"No video track".into());
-                              return false;
-                           }
-                       };
-
-                       let onended = Closure::wrap(Box::new(move || {
-                           link.send_message(MeetingAction::ScreenShareStoppedByBrowser);
-                       }) as Box<dyn FnMut()>);
-
-                       track.set_onended(Some(onended.as_ref().unchecked_ref()));
-                       onended.forget();
-
-                       self.screen_share_state = ScreenShareState::Active;
-                       self.screen_stream = Some(stream);
-                       self.share_screen = true;
-                    }
-                    MeetingAction::ScreenShareStoppedByBrowser => {
-                       self.screen_share_state = ScreenShareState::Idle;
-                       self.screen_stream = None;
-                       self.share_screen = false;
-                    }
-                    MeetingAction::ScreenShareCanceled => {
-                       if let Some(stream) = self.screen_stream.take() {
-                          for track in stream.get_tracks().iter() {
-                              let track: MediaStreamTrack = track.unchecked_into();
-                              track.stop(); 
-                          }
+                        // Toggle screen sharing - if active, stop it; otherwise start it
+                        if self.screen_share_state == ScreenShareState::Active {
+                            // Stop screen sharing
+                            log::info!(">>> [1/4] ATTENDANTS: StartScreenShare toggle - stopping, setting share_screen=false");
+                            self.share_screen = false;
+                            self.screen_share_state = ScreenShareState::Idle;
+                        } else {
+                            // Start screen sharing - the Host component will handle
+                            // the actual media acquisition via ScreenEncoder with callbacks
+                            log::info!(">>> [1/4] ATTENDANTS: StartScreenShare toggle - starting, setting share_screen=true");
+                            self.share_screen = true;
                         }
-
-                        self.screen_share_state = ScreenShareState::Idle;
-                        self.share_screen = false;
                     }
+                    MeetingAction::ScreenShareEvent(event) => match event {
+                        ScreenShareEvent::Requesting => {
+                            self.screen_share_state = ScreenShareState::Requesting;
+                        }
+                        ScreenShareEvent::Started => {
+                            self.screen_share_state = ScreenShareState::Active;
+                            self.share_screen = true;
+                        }
+                        ScreenShareEvent::Cancelled => {
+                            self.screen_share_state = ScreenShareState::Idle;
+                            self.share_screen = false;
+                        }
+                        ScreenShareEvent::Stopped => {
+                            self.screen_share_state = ScreenShareState::Idle;
+                            self.share_screen = false;
+                        }
+                    },
                     MeetingAction::ToggleMicMute => {
                         if !self.mic_enabled {
                             if self.media_device_access.is_granted() {
@@ -925,7 +884,7 @@ impl Component for AttendantsComponent {
                                     is_connected={self.client.is_connected()}
                                     is_floating={self.self_video_floating}
                                     on_position_toggle={ctx.link().callback(|_| UserScreenToggleAction::SelfVideoPosition)}
-                                    screen_stream={self.screen_stream.clone()}
+                                    on_screen_share_event={ctx.link().callback(MeetingAction::ScreenShareEvent)}
                                 />
                             }
                         } else {

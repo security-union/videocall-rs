@@ -181,5 +181,8 @@ pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };
-pub use encode::{create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder};
+pub use encode::{
+    create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
+    ScreenShareEvent,
+};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};

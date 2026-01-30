@@ -221,10 +221,19 @@ impl Decodable for NativeDecoder {
 
         let thread_handle = Some(thread::spawn(move || {
             let mut decoder: Box<dyn ThreadDecodable> = match codec {
-                crate::decoder::VideoCodec::VP9 => Box::new(SendableVp9Decoder(
+                crate::decoder::VideoCodec::Vp9Profile0Level10Bit8 => Box::new(SendableVp9Decoder(
                     Vp9Decoder::new().expect("Failed to create Vp9Decoder"),
                 )),
+                crate::decoder::VideoCodec::Vp8 => {
+                    // VP8 uses the same libvpx decoder
+                    Box::new(SendableVp9Decoder(
+                        Vp9Decoder::new().expect("Failed to create Vp9Decoder"),
+                    ))
+                }
                 crate::decoder::VideoCodec::Mock => Box::new(MockDecoder::new()),
+                crate::decoder::VideoCodec::Unspecified => {
+                    panic!("Cannot create decoder for unspecified codec")
+                }
             };
 
             // This is the decoder thread loop.

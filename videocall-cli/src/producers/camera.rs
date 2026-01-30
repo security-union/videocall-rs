@@ -35,7 +35,7 @@ use videocall_nokhwa::{
 };
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
+use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
 use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
 
 use super::encoder_thread::encoder_thread;
@@ -71,6 +71,7 @@ pub fn transform_video_chunk(frame: &Frame, email: &str) -> PacketWrapper {
         timestamp: since_the_epoch().as_micros() as f64,
         video_metadata: Some(VideoMetadata {
             sequence: frame.pts as u64,
+            codec: VideoCodec::VP9_PROFILE0_LEVEL10_8BIT.into(),
             ..Default::default()
         })
         .into(),

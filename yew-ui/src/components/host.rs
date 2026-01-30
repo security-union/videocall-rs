@@ -253,7 +253,8 @@ impl Component for Host {
         // TODO: use atomic bools for the encoders
         self.client.set_audio_enabled(self.mic_enabled);
         self.client.set_video_enabled(self.video_enabled);
-        self.client.set_screen_enabled(self.share_screen);
+        // Note: set_screen_enabled is now handled internally by ScreenEncoder
+        // based on actual stream state (Started/Stopped callbacks)
 
         if first_render {
             ctx.link().send_message(Msg::Start);

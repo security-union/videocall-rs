@@ -83,7 +83,7 @@ pub enum Msg {
     OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
     OnMicrophoneError(String),
-    DismissMicError,
+    DismissUserError,
     UserScreenAction(UserScreenToggleAction),
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
@@ -148,7 +148,8 @@ pub struct AttendantsComponent {
     pub device_settings_open: bool,
     pub error: Option<String>,
     pub encoder_settings: Option<String>,
-    pub mic_error: Option<String>,
+    /// Generic user-visible error message shown in a dialog
+    pub user_error: Option<String>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -386,7 +387,7 @@ impl Component for AttendantsComponent {
             device_settings_open: false,
             error: None,
             encoder_settings: None,
-            mic_error: None,
+            user_error: None,
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -509,11 +510,11 @@ impl Component for AttendantsComponent {
                 // Disable mic at the top and show UI
                 log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
-                self.mic_error = Some(err);
+                self.user_error = Some(format!("Microphone error: {err}"));
                 true
             }
-            Msg::DismissMicError => {
-                self.mic_error = None;
+            Msg::DismissUserError => {
+                self.user_error = None;
                 true
             }
             Msg::MeetingAction(action) => {
@@ -674,13 +675,14 @@ impl Component for AttendantsComponent {
                         self.share_screen = true;
                     }
                     ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
-                        // Screen share cancelled or stopped - reset state
+                        // User cancelled or stopped - just reset state (no error dialog)
                         self.share_screen = false;
                     }
                     ScreenShareEvent::Failed(ref msg) => {
-                        // Screen share failed during setup - reset state and log error
+                        // Screen share failed - reset state and show error dialog
                         log::error!("Screen share failed: {msg}");
                         self.share_screen = false;
+                        self.user_error = Some(format!("Screen share failed: {msg}"));
                     }
                 }
                 true
@@ -945,17 +947,15 @@ impl Component for AttendantsComponent {
                         }
                                     </div>
                                     {
-                                        if let Some(err) = &self.mic_error {
+                                        if let Some(err) = &self.user_error {
                                             let displayed: String = err.chars().take(200).collect();
                                             html!{
                                                 <div class="glass-backdrop">
                                                     <div class="card-apple" style="width: 380px;">
-                                                        <h4 style="margin-top:0;">{"Microphone issue"}</h4>
-                                                        <p style="color:#AEAEB2; margin-top:0.25rem;">{"We couldn't start your microphone."}</p>
+                                                        <h4 style="margin-top:0;">{"Error"}</h4>
                                                         <p style="margin-top:0.5rem;">{ displayed }</p>
                                                         <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
-                                                            <button class="btn-apple btn-secondary btn-sm" onclick={ctx.link().callback(|_| Msg::DismissMicError)}>{"Close"}</button>
-                                                            <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>{"Retry"}</button>
+                                                            <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| Msg::DismissUserError)}>{"OK"}</button>
                                                         </div>
                                                     </div>
                                                 </div>

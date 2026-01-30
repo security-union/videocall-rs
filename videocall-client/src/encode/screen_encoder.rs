@@ -64,11 +64,11 @@ const BITRATE_CHANGE_THRESHOLD: f64 = 0.2;
 pub enum ScreenShareEvent {
     /// Screen share successfully started and encoding is active
     Started,
-    /// User cancelled the browser picker dialog (dismissed without selecting)
+    /// User cancelled the browser picker dialog (no error dialog shown)
     Cancelled,
     /// Screen share ended normally (user clicked browser's "Stop sharing" or stream ended)
     Stopped,
-    /// Screen share failed due to an error after stream acquisition
+    /// Screen share failed due to an error (shows error dialog)
     Failed(String),
 }
 
@@ -192,6 +192,8 @@ impl ScreenEncoder {
         destroy.store(false, Ordering::Release);
 
         let client = self.client.clone();
+        let client_for_onended = client.clone();
+        let client_for_state = client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
         let current_bitrate = self.current_bitrate.clone();
@@ -209,20 +211,34 @@ impl ScreenEncoder {
                 Ok(promise) => match JsFuture::from(promise).await {
                     Ok(stream) => stream.unchecked_into::<MediaStream>(),
                     Err(e) => {
-                        error!("User denied screen sharing permission or error occurred: {e:?}");
-                        // Emit Cancelled event when user dismisses the picker
-                        if let Some(ref callback) = on_state_change {
-                            callback.emit(ScreenShareEvent::Cancelled);
+                        // Check if user cancelled (NotAllowedError = permission denied/cancelled)
+                        let is_user_cancel = Reflect::get(&e, &JsString::from("name"))
+                            .ok()
+                            .and_then(|v| v.as_string())
+                            .map(|name| name == "NotAllowedError")
+                            .unwrap_or(false);
+
+                        if is_user_cancel {
+                            log::info!("User cancelled screen sharing");
+                            if let Some(ref callback) = on_state_change {
+                                callback.emit(ScreenShareEvent::Cancelled);
+                            }
+                        } else {
+                            let error_msg = format!("{e:?}");
+                            error!("Screen sharing error: {error_msg}");
+                            if let Some(ref callback) = on_state_change {
+                                callback.emit(ScreenShareEvent::Failed(error_msg));
+                            }
                         }
                         enabled.store(false, Ordering::Release);
                         return;
                     }
                 },
                 Err(e) => {
-                    error!("Failed to get display media: {e:?}");
-                    // Emit Cancelled event on error
+                    let error_msg = format!("{e:?}");
+                    error!("Failed to get display media: {error_msg}");
                     if let Some(ref callback) = on_state_change {
-                        callback.emit(ScreenShareEvent::Cancelled);
+                        callback.emit(ScreenShareEvent::Failed(error_msg));
                     }
                     enabled.store(false, Ordering::Release);
                     return;
@@ -338,6 +354,7 @@ impl ScreenEncoder {
                 let handler = Closure::wrap(Box::new(move || {
                     log::info!("Screen share track ended (user stopped sharing)");
                     enabled_clone.store(false, Ordering::Release);
+                    client_for_onended.set_screen_enabled(false);
                     if let Some(ref callback) = on_state_change_clone {
                         callback.emit(ScreenShareEvent::Stopped);
                     }
@@ -375,7 +392,8 @@ impl ScreenEncoder {
                 }
             };
 
-            // All setup complete - NOW emit Started event
+            // All setup complete - NOW emit Started event and notify peers
+            client_for_state.set_screen_enabled(true);
             if let Some(ref callback) = on_state_change {
                 callback.emit(ScreenShareEvent::Started);
             }
@@ -505,6 +523,7 @@ impl ScreenEncoder {
             // Emit Stopped event if we haven't already (onended handler might have already fired)
             // Check enabled flag - if it's still true, onended hasn't fired yet
             if enabled.swap(false, Ordering::AcqRel) {
+                client_for_state.set_screen_enabled(false);
                 if let Some(ref callback) = on_state_change {
                     callback.emit(ScreenShareEvent::Stopped);
                 }

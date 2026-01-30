@@ -332,7 +332,7 @@ impl ScreenEncoder {
 
             // Set up onended handler to detect when user clicks browser's "Stop sharing" button
             // Keep the closure in scope until the encoding loop ends to avoid memory leak
-            let onended_handler = {
+            let _onended_handler = {
                 let enabled_clone = enabled.clone();
                 let on_state_change_clone = on_state_change.clone();
                 let handler = Closure::wrap(Box::new(move || {

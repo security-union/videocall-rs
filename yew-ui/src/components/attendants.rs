@@ -871,6 +871,7 @@ impl Component for AttendantsComponent {
                                     is_connected={self.client.is_connected()}
                                     is_floating={self.self_video_floating}
                                     on_position_toggle={ctx.link().callback(|_| UserScreenToggleAction::SelfVideoPosition)}
+                                    on_screen_share_state={ctx.link().callback(Msg::ScreenShareStateChange)}
                                 />
                             }
                         } else {

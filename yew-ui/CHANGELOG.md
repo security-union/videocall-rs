@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.34](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.33...videocall-ui-v1.1.34) - 2026-01-27
+
+### Added
+
+- self video is a canvas tile ([#517](https://github.com/security-union/videocall-rs/pull/517))
+
+### Other
+
+- revert feature: self video is a canvas tile ([#538](https://github.com/security-union/videocall-rs/pull/538))
+- adding feature flag for firefox support ([#536](https://github.com/security-union/videocall-rs/pull/536))
+- Fix firefox support by sending vp8 instead of vp9 ([#535](https://github.com/security-union/videocall-rs/pull/535))
+- Revert "Revert "Firefox support ([#522](https://github.com/security-union/videocall-rs/pull/522))" ([#533](https://github.com/security-union/videocall-rs/pull/533))" ([#534](https://github.com/security-union/videocall-rs/pull/534))
+- Revert "Firefox support ([#522](https://github.com/security-union/videocall-rs/pull/522))" ([#533](https://github.com/security-union/videocall-rs/pull/533))
+- Firefox support ([#522](https://github.com/security-union/videocall-rs/pull/522))
+- Meeting Ownership Project (behind feature flag) ([#503](https://github.com/security-union/videocall-rs/pull/503))
+- Add Pre push script ([#502](https://github.com/security-union/videocall-rs/pull/502))
+
 ## [1.1.33](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.32...videocall-ui-v1.1.33) - 2025-11-30
 
 ### Other

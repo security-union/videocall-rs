@@ -21,7 +21,7 @@ use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
-use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder};
+use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
 
@@ -132,6 +132,10 @@ pub struct MeetingProps {
     /// Callback to toggle the self-video position between floating and grid
     #[prop_or_default]
     pub on_position_toggle: Callback<MouseEvent>,
+
+    /// Called when screen share state changes (started, cancelled, stopped).
+    /// This allows the parent component to react to screen share lifecycle events.
+    pub on_screen_share_state: Callback<ScreenShareEvent>,
 }
 
 impl Component for Host {
@@ -169,7 +173,13 @@ impl Component for Host {
         );
 
         let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
-        let mut screen = ScreenEncoder::new(client.clone(), screen_bitrate, screen_callback);
+        let screen_state_callback = ctx.props().on_screen_share_state.clone();
+        let mut screen = ScreenEncoder::new(
+            client.clone(),
+            screen_bitrate,
+            screen_callback,
+            screen_state_callback,
+        );
 
         let (tx, rx) = mpsc::unbounded();
         client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
@@ -256,7 +266,8 @@ impl Component for Host {
         // TODO: use atomic bools for the encoders
         self.client.set_audio_enabled(self.mic_enabled);
         self.client.set_video_enabled(self.video_enabled);
-        self.client.set_screen_enabled(self.share_screen);
+        // Note: set_screen_enabled is now handled internally by ScreenEncoder
+        // based on actual stream state (Started/Stopped callbacks)
 
         if first_render {
             ctx.link().send_message(Msg::Start);

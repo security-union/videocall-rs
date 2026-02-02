@@ -39,7 +39,9 @@ use gloo_timers::callback::Timeout;
 use gloo_utils::window;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
-use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
+use videocall_client::{
+    MediaDeviceAccess, ScreenShareEvent, VideoCallClient, VideoCallClientOptions,
+};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use wasm_bindgen::JsValue;
 use web_sys::*;
@@ -85,7 +87,7 @@ pub enum Msg {
     OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
     OnMicrophoneError(String),
-    DismissMicError,
+    DismissUserError,
     UserScreenAction(UserScreenToggleAction),
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
@@ -96,6 +98,7 @@ pub enum Msg {
     HangUp,
     ShowCopyToast(bool),
     MeetingEnded(String),
+    ScreenShareStateChange(ScreenShareEvent),
 }
 
 impl From<WsAction> for Msg {
@@ -149,7 +152,8 @@ pub struct AttendantsComponent {
     pub device_settings_open: bool,
     pub error: Option<String>,
     pub encoder_settings: Option<String>,
-    pub mic_error: Option<String>,
+    /// Generic user-visible error message shown in a dialog
+    pub user_error: Option<String>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
     pending_screen_share: bool,
@@ -390,7 +394,7 @@ impl Component for AttendantsComponent {
             device_settings_open: false,
             error: None,
             encoder_settings: None,
-            mic_error: None,
+            user_error: None,
             pending_mic_enable: false,
             pending_video_enable: false,
             pending_screen_share: false,
@@ -514,11 +518,11 @@ impl Component for AttendantsComponent {
                 // Disable mic at the top and show UI
                 log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
-                self.mic_error = Some(err);
+                self.user_error = Some(format!("Microphone error: {err}"));
                 true
             }
-            Msg::DismissMicError => {
-                self.mic_error = None;
+            Msg::DismissUserError => {
+                self.user_error = None;
                 true
             }
             Msg::MeetingAction(action) => {
@@ -673,6 +677,26 @@ impl Component for AttendantsComponent {
 
             Msg::MeetingEnded(end_time) => {
                 self.meeting_ended_message = Some(end_time);
+                true
+            }
+            Msg::ScreenShareStateChange(event) => {
+                log::info!("Screen share state changed: {event:?}");
+                match event {
+                    ScreenShareEvent::Started => {
+                        // Screen share successfully started - ensure state is true
+                        self.share_screen = true;
+                    }
+                    ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
+                        // User cancelled or stopped - just reset state (no error dialog)
+                        self.share_screen = false;
+                    }
+                    ScreenShareEvent::Failed(ref msg) => {
+                        // Screen share failed - reset state and show error dialog
+                        log::error!("Screen share failed: {msg}");
+                        self.share_screen = false;
+                        self.user_error = Some(format!("Screen share failed: {msg}"));
+                    }
+                }
                 true
             }
         }
@@ -960,23 +984,39 @@ impl Component for AttendantsComponent {
                         }
                                     </div>
                                     {
-                                        if let Some(err) = &self.mic_error {
+                                        if let Some(err) = &self.user_error {
                                             let displayed: String = err.chars().take(200).collect();
                                             html!{
                                                 <div class="glass-backdrop">
                                                     <div class="card-apple" style="width: 380px;">
-                                                        <h4 style="margin-top:0;">{"Microphone issue"}</h4>
-                                                        <p style="color:#AEAEB2; margin-top:0.25rem;">{"We couldn't start your microphone."}</p>
+                                                        <h4 style="margin-top:0;">{"Error"}</h4>
                                                         <p style="margin-top:0.5rem;">{ displayed }</p>
                                                         <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:12px;">
-                                                            <button class="btn-apple btn-secondary btn-sm" onclick={ctx.link().callback(|_| Msg::DismissMicError)}>{"Close"}</button>
-                                                            <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| MeetingAction::ToggleMicMute)}>{"Retry"}</button>
+                                                            <button class="btn-apple btn-primary btn-sm" onclick={ctx.link().callback(|_| Msg::DismissUserError)}>{"OK"}</button>
                                                         </div>
                                                     </div>
                                                 </div>
                                             }
                                         } else { html!{} }
                                     }
+                                    {
+                                         if media_access_granted {
+                                             html! {<Host
+                                                 share_screen={self.share_screen}
+                                                 mic_enabled={self.mic_enabled}
+                                                 video_enabled={self.video_enabled}
+                                                 on_encoder_settings_update={on_encoder_settings_update}
+                                                 device_settings_open={self.device_settings_open}
+                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
+                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                                 on_screen_share_state={ctx.link().callback(Msg::ScreenShareStateChange)}
+                                             />}
+                                         } else {
+                                             html! {<></>}
+                                         }
+                                    }
+                                    <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
+
                                 </nav>
                             }
                         } else {

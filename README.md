@@ -24,6 +24,7 @@ An open-source, high-performance video conferencing platform built with Rust, pr
   - [Local/Docker](#localdocker-start-yewsh)
   - [Kubernetes/Helm](#kuberneteshelm-configmap-configjsyaml)
 - [Usage](#usage)
+- [Meeting Management](#meeting-management)
 - [Performance](#performance)
 - [Security](#security)
 - [Feature Flags](#feature-flags)
@@ -239,6 +240,45 @@ videocall-cli stream \
 ```
 
 For detailed information about the CLI tool and all available options, see the [videocall-cli README](videocall-cli/README.md).
+
+## Meeting Management
+
+videocall.rs includes a comprehensive meeting management system with ownership, waiting rooms, and host controls.
+
+### Key Features
+
+- **Meeting Ownership**: Each meeting has an owner (the creator) identified by their email
+- **My Meetings**: Users can view and manage all meetings they own from the home page
+- **Waiting Room**: Non-owners enter a waiting room and must be admitted by an existing participant
+- **Host Identification**: The meeting owner is visually identified with "(Host)" in the UI
+- **Soft Delete**: Owners can delete their meetings; deleted meeting IDs can be reused
+
+### Meeting Workflow
+
+1. **Create/Join**: Navigate to `/meeting/{meeting-id}` - if the meeting doesn't exist, you become the owner
+2. **Start/Join Button**: Owners see "Start Meeting", others see "Join Meeting"
+3. **Waiting Room**: Non-owners wait for admission; admitted participants can manage the waiting room
+4. **Auto-Join**: When admitted from the waiting room, participants automatically enter the meeting
+
+### Documentation
+
+For detailed information about the meeting system:
+
+- **[Meeting Ownership & Workflow](docs/MEETING_OWNERSHIP.md)** - Ownership model, lifecycle, and user workflows
+- **[Meeting API Reference](docs/MEETING_API.md)** - Complete API endpoint documentation
+
+### Enabling Meeting Management
+
+Meeting management requires the `FEATURE_MEETING_MANAGEMENT` flag:
+
+```bash
+export FEATURE_MEETING_MANAGEMENT=true
+```
+
+Or in Docker:
+```bash
+docker run -e FEATURE_MEETING_MANAGEMENT=true ...
+```
 
 ## Performance
 

@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::peer::PeerIcon;
 use yew::prelude::*;
 use yew::{html, Component, Html};
@@ -25,6 +26,8 @@ pub struct PeerListItem {}
 #[derive(Properties, Clone, PartialEq)]
 pub struct PeerListItemProps {
     pub name: String,
+    #[prop_or_default]
+    pub is_host: bool,
 }
 
 impl Component for PeerListItem {
@@ -37,13 +40,20 @@ impl Component for PeerListItem {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        let name = ctx.props().name.clone();
+        let is_host = ctx.props().is_host;
+        let title = if is_host { format!("Host: {}", name) } else { name.clone() };
+
         html! {
-            <div class="peer_item" >
+            <div class="peer_item" title={title}>
                 <div class="peer_item_icon">
                     <PeerIcon />
                 </div>
                 <div class="peer_item_text">
-                    {ctx.props().name.clone()}
+                    {name}
+                    if is_host {
+                        <CrownIcon />
+                    }
                 </div>
             </div>
         }

@@ -35,6 +35,7 @@ use actix_web_actors::ws::{handshake, WebsocketContext};
 use reqwest::header::LOCATION;
 use sec_api::{
     actors::{chat_server::ChatServer, chat_session::WsChatSession},
+    api,
     auth::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
@@ -391,7 +392,7 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::permissive();
 
         if oauth_client_id.is_empty() {
-            App::new()
+            let mut app = App::new()
                 .wrap(cors)
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
@@ -402,11 +403,19 @@ async fn main() -> std::io::Result<()> {
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
-                .service(ws_connect)
+                .service(ws_connect);
+
+            // Add API routes if database is enabled
+            if let Some(ref pool) = sqlx_pool {
+                app = app
+                    .app_data(web::Data::new(pool.clone()))
+                    .configure(api::configure_api_routes);
+            }
+            app
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
-            App::new()
+            let mut app = App::new()
                 .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
@@ -428,7 +437,15 @@ async fn main() -> std::io::Result<()> {
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
-                .service(ws_connect)
+                .service(ws_connect);
+
+            // Add API routes with sqlx pool
+            if let Some(ref sqlx_pool) = sqlx_pool {
+                app = app
+                    .app_data(web::Data::new(sqlx_pool.clone()))
+                    .configure(api::configure_api_routes);
+            }
+            app
         } else {
             // OAuth configured but database disabled - skip OAuth routes
             error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");

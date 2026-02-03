@@ -21,6 +21,7 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::components::browser_compatibility::BrowserCompatibility;
+use crate::components::meetings_list::MeetingsList;
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
 };
@@ -35,6 +36,9 @@ pub fn home() -> Html {
 
     let username_ref = use_node_ref();
     let meeting_id_ref = use_node_ref();
+
+    // Track meeting ID value for enabling/disabling the submit button
+    let meeting_id_value = use_state(String::new);
 
     // Tab state for features section
     let active_tab = use_state(|| 0);
@@ -181,28 +185,51 @@ pub fn home() -> Html {
                                 class={TEXT_INPUT_CLASSES}
                                 type="text"
                                 placeholder="Enter meeting code"
-                                ref={meeting_id_ref}
+                                ref={meeting_id_ref.clone()}
                                 required={true}
                                 pattern="^[a-zA-Z0-9_]*$"
+                                oninput={
+                                    let meeting_id_value = meeting_id_value.clone();
+                                    Callback::from(move |e: InputEvent| {
+                                        let input: HtmlInputElement = e.target_unchecked_into();
+                                        meeting_id_value.set(input.value());
+                                    })
+                                }
                             />
                             <p class="text-sm text-foreground-subtle mt-2 ml-1">{ "Characters allowed: a-z, A-Z, 0-9, and _" }</p>
                         </div>
 
-                        <div class="mt-8">
-                            <button type="submit" class="btn-apple btn-primary w-full flex items-center justify-center gap-2">
-                                <span class="text-lg">{ "Join Meeting" }</span>
-                                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M5 12h14"></path>
-                                    <path d="m12 5 7 7-7 7"></path>
-                                </svg>
-                            </button>
-                        </div>
+                        {
+                            if !meeting_id_value.is_empty() {
+                                html! {
+                                    <div class="mt-4">
+                                        <button type="submit" class="btn-apple btn-primary w-full">
+                                            <span class="text-lg">{ "Start or Join Meeting" }</span>
+                                        </button>
+                                    </div>
+                                }
+                            } else {
+                                html! {}
+                            }
+                        }
 
                         <div class="mt-2">
                             <button type="button" class="btn-apple btn-secondary w-full flex items-center justify-center gap-2" onclick={create_meeting.clone()}>
-                                <span class="text-lg">{"Create New Meeting"}</span>
+                                <span class="text-lg">{"Create a New Meeting ID"}</span>
                             </button>
                         </div>
+
+                        // Active meetings list
+                        <MeetingsList on_select_meeting={
+                            let meeting_id_ref = meeting_id_ref.clone();
+                            let meeting_id_value = meeting_id_value.clone();
+                            Callback::from(move |meeting_id: String| {
+                                if let Some(input) = meeting_id_ref.cast::<HtmlInputElement>() {
+                                    input.set_value(&meeting_id);
+                                }
+                                meeting_id_value.set(meeting_id);
+                            })
+                        } />
                     </div>
                 </form>
 

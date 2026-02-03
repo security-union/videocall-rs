@@ -49,6 +49,29 @@ pub struct MeetingTime {
 pub type MeetingTimeCtx = MeetingTime;
 
 // -----------------------------------------------------------------------------
+// Meeting Host Context
+// -----------------------------------------------------------------------------
+
+/// Holds meeting host information shared via Yew context.
+///
+/// Used to identify the meeting owner/host and display appropriate UI indicators.
+#[derive(Clone, PartialEq, Default)]
+pub struct MeetingHost {
+    /// Email/ID of the meeting host. `None` if not yet known.
+    pub host_email: Option<String>,
+}
+
+impl MeetingHost {
+    /// Check if the given email is the meeting host
+    pub fn is_host(&self, email: &str) -> bool {
+        self.host_email.as_deref() == Some(email)
+    }
+}
+
+/// Context type for meeting host - read-only access to host info.
+pub type MeetingHostCtx = MeetingHost;
+
+// -----------------------------------------------------------------------------
 // Local-storage helpers
 // -----------------------------------------------------------------------------
 

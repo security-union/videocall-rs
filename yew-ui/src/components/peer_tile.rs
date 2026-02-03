@@ -28,6 +28,9 @@ pub struct PeerTileProps {
     /// True when layout has only this peer and no screen share; affects styling
     #[prop_or(false)]
     pub full_bleed: bool,
+    /// Display name (username) of the meeting host (for displaying crown icon)
+    #[prop_or_default]
+    pub host_display_name: Option<String>,
 }
 
 pub enum Msg {
@@ -138,8 +141,11 @@ impl Component for PeerTile {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        // Get host display name from props
+        let host_display_name = ctx.props().host_display_name.as_deref();
+
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
-        generate_for_peer(&self.client, &ctx.props().peer_id, ctx.props().full_bleed)
+        generate_for_peer(&self.client, &ctx.props().peer_id, ctx.props().full_bleed, host_display_name)
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {

@@ -835,10 +835,9 @@ pub async fn list_meetings(
     // Get participant counts for each meeting
     let mut summaries = Vec::with_capacity(meetings.len());
     for meeting in meetings {
-        let participant_count = match MeetingParticipant::count_admitted(pool.get_ref(), &meeting.room_id).await {
-            Ok(c) => c,
-            Err(_) => 0,
-        };
+        let participant_count = MeetingParticipant::count_admitted(pool.get_ref(), &meeting.room_id)
+            .await
+            .unwrap_or_default();
 
         summaries.push(MeetingSummary {
             meeting_id: meeting.room_id,

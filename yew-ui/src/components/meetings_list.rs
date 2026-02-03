@@ -32,6 +32,12 @@ pub struct MeetingSummary {
     pub has_password: bool,
     pub created_at: i64,
     pub participant_count: i64,
+    /// Timestamp when the meeting started (milliseconds since epoch)
+    pub started_at: i64,
+    /// Timestamp when the meeting ended (milliseconds since epoch), None if still active
+    pub ended_at: Option<i64>,
+    /// Number of participants waiting to be admitted
+    pub waiting_count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,6 +260,8 @@ impl MeetingsList {
     fn render_meeting_item(&self, ctx: &Context<Self>, meeting: &MeetingSummary) -> Html {
         let meeting_id = meeting.meeting_id.clone();
         let navigator = ctx.link().navigator().unwrap();
+        let is_active = meeting.state == "active";
+        let is_ended = meeting.state == "ended";
 
         // Check if current user is the owner
         let is_owner = self
@@ -300,30 +308,73 @@ impl MeetingsList {
             _ => "state-ended",
         };
 
+        // Calculate duration for ended meetings
+        let duration_ms = meeting
+            .ended_at
+            .map(|ended_at| ended_at - meeting.started_at)
+            .unwrap_or(0);
+
         html! {
-            <li class="meeting-item">
+            <li class={classes!("meeting-item", if is_ended { "meeting-ended" } else { "" })}>
                 <div class="meeting-item-content" onclick={on_click}>
                     <div class="meeting-info">
                         <span class="meeting-id">{&meeting.meeting_id}</span>
                         <span class={classes!("meeting-state", state_class)}>{&meeting.state}</span>
                     </div>
                     <div class="meeting-details">
-                        {
-                            if let Some(host) = &meeting.host {
-                                html! { <span class="meeting-host">{format!("Host: {}", host)}</span> }
-                            } else {
-                                html! {}
+                        // For active meetings: show participants and waiting count
+                        if is_active {
+                            <span class="meeting-participants" title="Participants in meeting">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                                    <circle cx="9" cy="7" r="4"></circle>
+                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                                </svg>
+                                {format!("{} joined", meeting.participant_count)}
+                            </span>
+                            if meeting.waiting_count > 0 {
+                                <span class="meeting-waiting" title="Waiting to join">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <circle cx="12" cy="12" r="10"></circle>
+                                        <line x1="12" y1="8" x2="12" y2="12"></line>
+                                        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                                    </svg>
+                                    {format!("{} waiting", meeting.waiting_count)}
+                                </span>
                             }
                         }
-                        <span class="meeting-participants">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                                <circle cx="9" cy="7" r="4"></circle>
-                                <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                                <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-                            </svg>
-                            {meeting.participant_count}
-                        </span>
+                        // For ended meetings: show duration, start time, and end time
+                        if is_ended {
+                            <span class="meeting-duration" title="Total duration">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <polyline points="12 6 12 12 16 14"></polyline>
+                                </svg>
+                                {format_duration(duration_ms)}
+                            </span>
+                            <span class="meeting-time" title={format!("Started at {}", format_time(meeting.started_at))}>
+                                {format_time(meeting.started_at)}
+                            </span>
+                            <span class="meeting-time-separator">{"-"}</span>
+                            if let Some(ended_at) = meeting.ended_at {
+                                <span class="meeting-time" title={format!("Ended at {}", format_time(ended_at))}>
+                                    {format_time(ended_at)}
+                                </span>
+                            }
+                        }
+                        // For idle meetings (not yet started): show created info
+                        if !is_active && !is_ended {
+                            <span class="meeting-participants" title="Participants">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                                    <circle cx="9" cy="7" r="4"></circle>
+                                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                                </svg>
+                                {meeting.participant_count}
+                            </span>
+                        }
                         {
                             if meeting.has_password {
                                 html! {
@@ -344,7 +395,7 @@ impl MeetingsList {
                     if is_owner {
                         html! {
                             <button
-                                class="meeting-delete-btn"
+                                class={classes!("meeting-delete-btn", if is_ended { "meeting-delete-btn-ended" } else { "" })}
                                 onclick={on_delete}
                                 title="Delete meeting"
                             >
@@ -422,4 +473,37 @@ async fn delete_meeting(meeting_id: &str) -> Result<(), String> {
         404 => Err("Meeting not found".to_string()),
         status => Err(format!("Server error: {status}")),
     }
+}
+
+/// Format a duration in milliseconds to a human-readable string (e.g., "1h 23m" or "45m 12s")
+fn format_duration(duration_ms: i64) -> String {
+    let total_seconds = duration_ms / 1000;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else if minutes > 0 {
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
+/// Format a timestamp in milliseconds to a time string (e.g., "2:30 PM")
+fn format_time(timestamp_ms: i64) -> String {
+    // Convert to JavaScript Date for formatting
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(timestamp_ms as f64));
+    let hours = date.get_hours();
+    let minutes = date.get_minutes();
+    let am_pm = if hours >= 12 { "PM" } else { "AM" };
+    let hours_12 = if hours == 0 {
+        12
+    } else if hours > 12 {
+        hours - 12
+    } else {
+        hours
+    };
+    format!("{}:{:02} {}", hours_12, minutes, am_pm)
 }

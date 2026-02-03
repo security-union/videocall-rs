@@ -122,6 +122,12 @@ pub struct MeetingSummary {
     pub has_password: bool,
     pub created_at: i64,
     pub participant_count: i64,
+    /// Timestamp when the meeting started (milliseconds since epoch)
+    pub started_at: i64,
+    /// Timestamp when the meeting ended (milliseconds since epoch), None if still active
+    pub ended_at: Option<i64>,
+    /// Number of participants waiting to be admitted (only relevant for active meetings)
+    pub waiting_count: i64,
 }
 
 /// Query parameters for listing meetings
@@ -845,6 +851,10 @@ pub async fn list_meetings(
                 .await
                 .unwrap_or_default();
 
+        let waiting_count = MeetingParticipant::count_waiting(pool.get_ref(), &meeting.room_id)
+            .await
+            .unwrap_or_default();
+
         summaries.push(MeetingSummary {
             meeting_id: meeting.room_id,
             host: meeting.creator_id,
@@ -852,6 +862,9 @@ pub async fn list_meetings(
             has_password: meeting.password_hash.is_some(),
             created_at: meeting.created_at.timestamp(),
             participant_count,
+            started_at: meeting.started_at.timestamp_millis(),
+            ended_at: meeting.ended_at.map(|t| t.timestamp_millis()),
+            waiting_count,
         });
     }
 

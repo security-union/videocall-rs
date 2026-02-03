@@ -1932,6 +1932,58 @@ select {
   height: 16px;
 }
 
+/* Ended meeting delete button - red color */
+.meeting-delete-btn-ended {
+  color: rgba(220, 53, 69, 0.7);
+}
+
+.meeting-delete-btn-ended:hover {
+  background: rgba(220, 53, 69, 0.2);
+  color: #dc3545;
+}
+
+/* Ended meeting row styling */
+.meeting-item.meeting-ended {
+  background: rgba(158, 158, 158, 0.05);
+}
+
+.meeting-item.meeting-ended .meeting-id {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* Meeting duration display */
+.meeting-duration {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.meeting-duration-live {
+  color: rgba(76, 175, 80, 0.9);
+  font-weight: 500;
+}
+
+/* Meeting waiting count */
+.meeting-waiting {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  color: rgba(255, 193, 7, 0.9);
+  font-weight: 500;
+}
+
+/* Meeting time display */
+.meeting-time {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 0.75rem;
+}
+
+.meeting-time-separator {
+  color: rgba(255, 255, 255, 0.3);
+  font-size: 0.75rem;
+}
+
 /* ========================================
    Waiting Room Component
    ======================================== */

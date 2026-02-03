@@ -636,6 +636,24 @@ impl MeetingParticipant {
         Ok(count)
     }
 
+    /// Count waiting participants for a meeting
+    pub async fn count_waiting(pool: &PgPool, room_id: &str) -> Result<i64, ParticipantError> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM meeting_participants mp
+            JOIN meetings m ON mp.meeting_id = m.id
+            WHERE m.room_id = $1 AND mp.status = 'waiting' AND m.deleted_at IS NULL
+            "#,
+        )
+        .bind(room_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ParticipantError::DatabaseError(e.to_string()))?;
+
+        Ok(count)
+    }
+
     /// Get the display name for a participant by their email (user ID)
     /// This is used to identify the meeting host by their user ID rather than display name
     pub async fn get_display_name_by_email(

@@ -139,7 +139,10 @@ impl MeetingParticipant {
         .await
         .map_err(|e| ParticipantError::DatabaseError(e.to_string()))?;
 
-        info!("Host '{}' (display: {:?}) joined meeting '{}'", host_email, display_name, room_id);
+        info!(
+            "Host '{}' (display: {:?}) joined meeting '{}'",
+            host_email, display_name, room_id
+        );
         Ok(participant)
     }
 
@@ -470,10 +473,7 @@ impl MeetingParticipant {
     }
 
     /// Get all admitted participants for a meeting
-    pub async fn get_admitted(
-        pool: &PgPool,
-        room_id: &str,
-    ) -> Result<Vec<Self>, ParticipantError> {
+    pub async fn get_admitted(pool: &PgPool, room_id: &str) -> Result<Vec<Self>, ParticipantError> {
         let meeting_id = sqlx::query_scalar::<_, i32>(
             "SELECT id FROM meetings WHERE room_id = $1 AND deleted_at IS NULL",
         )
@@ -547,11 +547,13 @@ impl MeetingParticipant {
             };
 
             if should_end {
-                sqlx::query("UPDATE meetings SET state = 'ended', ended_at = NOW() WHERE room_id = $1")
-                    .bind(room_id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| ParticipantError::DatabaseError(e.to_string()))?;
+                sqlx::query(
+                    "UPDATE meetings SET state = 'ended', ended_at = NOW() WHERE room_id = $1",
+                )
+                .bind(room_id)
+                .execute(pool)
+                .await
+                .map_err(|e| ParticipantError::DatabaseError(e.to_string()))?;
 
                 if p.is_host {
                     info!("Meeting '{}' ended because host left", room_id);
@@ -617,10 +619,7 @@ impl MeetingParticipant {
     }
 
     /// Count admitted participants for a meeting
-    pub async fn count_admitted(
-        pool: &PgPool,
-        room_id: &str,
-    ) -> Result<i64, ParticipantError> {
+    pub async fn count_admitted(pool: &PgPool, room_id: &str) -> Result<i64, ParticipantError> {
         let count = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)

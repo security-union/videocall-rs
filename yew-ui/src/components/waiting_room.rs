@@ -155,7 +155,10 @@ impl Component for WaitingRoom {
 
 async fn check_status(meeting_id: &str) -> Result<ParticipantStatus, String> {
     let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/status", config.api_base_url, meeting_id);
+    let url = format!(
+        "{}/api/v1/meetings/{}/status",
+        config.api_base_url, meeting_id
+    );
 
     let response = Request::get(&url)
         .credentials(RequestCredentials::Include)

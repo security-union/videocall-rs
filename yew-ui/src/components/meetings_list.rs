@@ -17,12 +17,12 @@
  */
 
 use crate::constants::app_config;
+use crate::Route;
 use reqwasm::http::{Request, RequestCredentials};
 use serde::Deserialize;
 use wasm_bindgen::JsCast;
 use yew::prelude::*;
 use yew_router::prelude::*;
-use crate::Route;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MeetingSummary {
@@ -80,8 +80,7 @@ impl Component for MeetingsList {
         ctx.link().send_message(MeetingsListMsg::FetchMeetings);
 
         // Try to get email from cookie
-        let current_user_email = get_email_from_cookie()
-            .or_else(|| ctx.props().user_email.clone());
+        let current_user_email = get_email_from_cookie().or_else(|| ctx.props().user_email.clone());
 
         Self {
             meetings: Vec::new(),
@@ -257,7 +256,9 @@ impl MeetingsList {
         let navigator = ctx.link().navigator().unwrap();
 
         // Check if current user is the owner
-        let is_owner = self.current_user_email.as_ref()
+        let is_owner = self
+            .current_user_email
+            .as_ref()
             .map(|email| meeting.host.as_ref() == Some(email))
             .unwrap_or(false);
 
@@ -269,7 +270,9 @@ impl MeetingsList {
                 if let Some(ref callback) = on_select {
                     callback.emit(meeting_id.clone());
                 } else {
-                    navigator.push(&Route::Meeting { id: meeting_id.clone() });
+                    navigator.push(&Route::Meeting {
+                        id: meeting_id.clone(),
+                    });
                 }
             })
         };
@@ -280,7 +283,10 @@ impl MeetingsList {
             Callback::from(move |e: MouseEvent| {
                 e.stop_propagation(); // Prevent triggering the row click
                 if web_sys::window()
-                    .and_then(|w| w.confirm_with_message("Are you sure you want to delete this meeting?").ok())
+                    .and_then(|w| {
+                        w.confirm_with_message("Are you sure you want to delete this meeting?")
+                            .ok()
+                    })
                     .unwrap_or(false)
                 {
                     link.send_message(MeetingsListMsg::DeleteMeeting(meeting_id.clone()));
@@ -365,16 +371,14 @@ fn get_email_from_cookie() -> Option<String> {
         .and_then(|d| d.dyn_into::<web_sys::HtmlDocument>().ok())
         .and_then(|d| d.cookie().ok())
         .and_then(|cookies| {
-            cookies
-                .split(';')
-                .find_map(|cookie| {
-                    let cookie = cookie.trim();
-                    if cookie.starts_with("email=") {
-                        Some(cookie.trim_start_matches("email=").to_string())
-                    } else {
-                        None
-                    }
-                })
+            cookies.split(';').find_map(|cookie| {
+                let cookie = cookie.trim();
+                if cookie.starts_with("email=") {
+                    Some(cookie.trim_start_matches("email=").to_string())
+                } else {
+                    None
+                }
+            })
         })
 }
 

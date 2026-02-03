@@ -145,7 +145,12 @@ impl Component for PeerTile {
         let host_display_name = ctx.props().host_display_name.as_deref();
 
         // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
-        generate_for_peer(&self.client, &ctx.props().peer_id, ctx.props().full_bleed, host_display_name)
+        generate_for_peer(
+            &self.client,
+            &ctx.props().peer_id,
+            ctx.props().full_bleed,
+            host_display_name,
+        )
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {

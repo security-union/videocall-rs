@@ -306,7 +306,10 @@ impl Component for HostControls {
 
 async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, String> {
     let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/waiting", config.api_base_url, meeting_id);
+    let url = format!(
+        "{}/api/v1/meetings/{}/waiting",
+        config.api_base_url, meeting_id
+    );
 
     let response = Request::get(&url)
         .credentials(RequestCredentials::Include)
@@ -331,10 +334,15 @@ async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, Stri
 
 async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> {
     let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/admit", config.api_base_url, meeting_id);
+    let url = format!(
+        "{}/api/v1/meetings/{}/admit",
+        config.api_base_url, meeting_id
+    );
 
-    let body = serde_json::to_string(&AdmitRequest { email: email.to_string() })
-        .map_err(|e| format!("Failed to serialize: {e}"))?;
+    let body = serde_json::to_string(&AdmitRequest {
+        email: email.to_string(),
+    })
+    .map_err(|e| format!("Failed to serialize: {e}"))?;
 
     let response = Request::post(&url)
         .credentials(RequestCredentials::Include)
@@ -355,10 +363,15 @@ async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> 
 
 async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String> {
     let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/reject", config.api_base_url, meeting_id);
+    let url = format!(
+        "{}/api/v1/meetings/{}/reject",
+        config.api_base_url, meeting_id
+    );
 
-    let body = serde_json::to_string(&AdmitRequest { email: email.to_string() })
-        .map_err(|e| format!("Failed to serialize: {e}"))?;
+    let body = serde_json::to_string(&AdmitRequest {
+        email: email.to_string(),
+    })
+    .map_err(|e| format!("Failed to serialize: {e}"))?;
 
     let response = Request::post(&url)
         .credentials(RequestCredentials::Include)
@@ -379,7 +392,10 @@ async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String>
 
 async fn admit_all_participants(meeting_id: &str) -> Result<(), String> {
     let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/admit-all", config.api_base_url, meeting_id);
+    let url = format!(
+        "{}/api/v1/meetings/{}/admit-all",
+        config.api_base_url, meeting_id
+    );
 
     let response = Request::post(&url)
         .credentials(RequestCredentials::Include)

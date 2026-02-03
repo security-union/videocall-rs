@@ -409,9 +409,7 @@ impl Meeting {
     }
 
     /// Count all active meetings
-    pub async fn count_active_async(
-        pool: &PgPool,
-    ) -> Result<i64, Box<dyn Error + Send + Sync>> {
+    pub async fn count_active_async(pool: &PgPool) -> Result<i64, Box<dyn Error + Send + Sync>> {
         let count = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM meetings WHERE deleted_at IS NULL AND ended_at IS NULL",
         )

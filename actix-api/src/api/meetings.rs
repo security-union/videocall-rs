@@ -179,7 +179,10 @@ impl ApiError {
     pub fn meeting_not_active(meeting_id: &str) -> Self {
         Self {
             code: "MEETING_NOT_ACTIVE".to_string(),
-            message: format!("Meeting '{}' is not active. Host must join first.", meeting_id),
+            message: format!(
+                "Meeting '{}' is not active. Host must join first.",
+                meeting_id
+            ),
         }
     }
 
@@ -345,23 +348,27 @@ pub async fn get_meeting(
         }
         Err(e) => {
             error!("Database error: {}", e);
-            return HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"));
+            return HttpResponse::InternalServerError()
+                .json(ApiError::internal_error("Database error"));
         }
     };
 
     // Get participant status
-    let your_status = match MeetingParticipant::get_status(pool.get_ref(), &meeting_id, &email).await {
-        Ok(status) => status.map(ParticipantStatusResponse::from),
-        Err(e) => {
-            error!("Error getting participant status: {}", e);
-            None
-        }
-    };
+    let your_status =
+        match MeetingParticipant::get_status(pool.get_ref(), &meeting_id, &email).await {
+            Ok(status) => status.map(ParticipantStatusResponse::from),
+            Err(e) => {
+                error!("Error getting participant status: {}", e);
+                None
+            }
+        };
 
     // Look up the host's display name from their participant record (based on creator_id/email)
     // This ensures the host is identified by their user ID, not just a stored display name
     let host_display_name = if let Some(ref creator_id) = meeting.creator_id {
-        match MeetingParticipant::get_display_name_by_email(pool.get_ref(), meeting.id, creator_id).await {
+        match MeetingParticipant::get_display_name_by_email(pool.get_ref(), meeting.id, creator_id)
+            .await
+        {
             Ok(name) => name,
             Err(_) => meeting.host_display_name.clone(), // Fallback to stored value
         }
@@ -399,13 +406,21 @@ pub async fn join_meeting(
     // Extract display_name from body if provided
     let display_name = body.and_then(|b| b.display_name.clone());
 
-    info!("User '{}' (display: {:?}) requesting to join meeting '{}'", email, display_name, meeting_id);
+    info!(
+        "User '{}' (display: {:?}) requesting to join meeting '{}'",
+        email, display_name, meeting_id
+    );
 
     // Request to join
-    match MeetingParticipant::request_join(pool.get_ref(), &meeting_id, &email, display_name.as_deref()).await {
-        Ok(participant) => {
-            HttpResponse::Ok().json(ParticipantStatusResponse::from(participant))
-        }
+    match MeetingParticipant::request_join(
+        pool.get_ref(),
+        &meeting_id,
+        &email,
+        display_name.as_deref(),
+    )
+    .await
+    {
+        Ok(participant) => HttpResponse::Ok().json(ParticipantStatusResponse::from(participant)),
         Err(ParticipantError::MeetingNotFound) => {
             HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
         }
@@ -454,9 +469,7 @@ pub async fn get_waiting_room(
         Err(ParticipantError::MeetingNotFound) => {
             HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
         }
-        Err(ParticipantError::NotHost) => {
-            HttpResponse::Forbidden().json(ApiError::not_host())
-        }
+        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(ApiError::not_host()),
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
             HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
@@ -492,15 +505,11 @@ pub async fn admit_participant(
 
     // Admit participant
     match MeetingParticipant::admit(pool.get_ref(), &meeting_id, &host_email, &body.email).await {
-        Ok(participant) => {
-            HttpResponse::Ok().json(ParticipantStatusResponse::from(participant))
-        }
+        Ok(participant) => HttpResponse::Ok().json(ParticipantStatusResponse::from(participant)),
         Err(ParticipantError::MeetingNotFound) => {
             HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
         }
-        Err(ParticipantError::NotHost) => {
-            HttpResponse::Forbidden().json(ApiError::not_host())
-        }
+        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(ApiError::not_host()),
         Err(ParticipantError::NotFound) => {
             HttpResponse::NotFound().json(ApiError::participant_not_found(&body.email))
         }
@@ -558,9 +567,7 @@ pub async fn admit_all_participants(
         Err(ParticipantError::MeetingNotFound) => {
             HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
         }
-        Err(ParticipantError::NotHost) => {
-            HttpResponse::Forbidden().json(ApiError::not_host())
-        }
+        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(ApiError::not_host()),
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
             HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
@@ -596,15 +603,11 @@ pub async fn reject_participant(
 
     // Reject participant
     match MeetingParticipant::reject(pool.get_ref(), &meeting_id, &host_email, &body.email).await {
-        Ok(participant) => {
-            HttpResponse::Ok().json(ParticipantStatusResponse::from(participant))
-        }
+        Ok(participant) => HttpResponse::Ok().json(ParticipantStatusResponse::from(participant)),
         Err(ParticipantError::MeetingNotFound) => {
             HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
         }
-        Err(ParticipantError::NotHost) => {
-            HttpResponse::Forbidden().json(ApiError::not_host())
-        }
+        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(ApiError::not_host()),
         Err(ParticipantError::NotFound) => {
             HttpResponse::NotFound().json(ApiError::participant_not_found(&body.email))
         }
@@ -640,12 +643,10 @@ pub async fn get_my_status(
         Ok(Some(participant)) => {
             HttpResponse::Ok().json(ParticipantStatusResponse::from(participant))
         }
-        Ok(None) => {
-            HttpResponse::NotFound().json(ApiError {
-                code: "NOT_IN_MEETING".to_string(),
-                message: "You have not requested to join this meeting".to_string(),
-            })
-        }
+        Ok(None) => HttpResponse::NotFound().json(ApiError {
+            code: "NOT_IN_MEETING".to_string(),
+            message: "You have not requested to join this meeting".to_string(),
+        }),
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
             HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
@@ -680,12 +681,10 @@ pub async fn leave_meeting(
         Ok(Some(participant)) => {
             HttpResponse::Ok().json(ParticipantStatusResponse::from(participant))
         }
-        Ok(None) => {
-            HttpResponse::NotFound().json(ApiError {
-                code: "NOT_IN_MEETING".to_string(),
-                message: "You are not in this meeting".to_string(),
-            })
-        }
+        Ok(None) => HttpResponse::NotFound().json(ApiError {
+            code: "NOT_IN_MEETING".to_string(),
+            message: "You are not in this meeting".to_string(),
+        }),
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
             HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
@@ -752,7 +751,10 @@ pub async fn delete_meeting(
         }
     };
 
-    info!("User '{}' attempting to delete meeting '{}'", email, meeting_id);
+    info!(
+        "User '{}' attempting to delete meeting '{}'",
+        email, meeting_id
+    );
 
     // Get meeting and verify ownership
     let meeting = match Meeting::get_by_room_id_async(pool.get_ref(), &meeting_id).await {
@@ -762,7 +764,8 @@ pub async fn delete_meeting(
         }
         Err(e) => {
             error!("Database error: {}", e);
-            return HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"));
+            return HttpResponse::InternalServerError()
+                .json(ApiError::internal_error("Database error"));
         }
     };
 
@@ -819,7 +822,8 @@ pub async fn list_meetings(
         Ok(m) => m,
         Err(e) => {
             error!("Database error listing meetings: {}", e);
-            return HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"));
+            return HttpResponse::InternalServerError()
+                .json(ApiError::internal_error("Database error"));
         }
     };
 
@@ -828,16 +832,18 @@ pub async fn list_meetings(
         Ok(c) => c,
         Err(e) => {
             error!("Database error counting meetings: {}", e);
-            return HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"));
+            return HttpResponse::InternalServerError()
+                .json(ApiError::internal_error("Database error"));
         }
     };
 
     // Get participant counts for each meeting
     let mut summaries = Vec::with_capacity(meetings.len());
     for meeting in meetings {
-        let participant_count = MeetingParticipant::count_admitted(pool.get_ref(), &meeting.room_id)
-            .await
-            .unwrap_or_default();
+        let participant_count =
+            MeetingParticipant::count_admitted(pool.get_ref(), &meeting.room_id)
+                .await
+                .unwrap_or_default();
 
         summaries.push(MeetingSummary {
             meeting_id: meeting.room_id,

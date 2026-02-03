@@ -27,53 +27,53 @@ pub fn configure_api_routes(cfg: &mut web::ServiceConfig) {
             .service(
                 web::resource("/meetings")
                     .route(web::get().to(meetings::list_meetings))
-                    .route(web::post().to(meetings::create_meeting))
+                    .route(web::post().to(meetings::create_meeting)),
             )
             // Get meeting info or delete meeting
             .service(
                 web::resource("/meetings/{meeting_id}")
                     .route(web::get().to(meetings::get_meeting))
-                    .route(web::delete().to(meetings::delete_meeting))
+                    .route(web::delete().to(meetings::delete_meeting)),
             )
             // Join meeting (enter wait room)
             .service(
                 web::resource("/meetings/{meeting_id}/join")
-                    .route(web::post().to(meetings::join_meeting))
+                    .route(web::post().to(meetings::join_meeting)),
             )
             // Get waiting room participants (host only)
             .service(
                 web::resource("/meetings/{meeting_id}/waiting")
-                    .route(web::get().to(meetings::get_waiting_room))
+                    .route(web::get().to(meetings::get_waiting_room)),
             )
             // Admit participant (host only)
             .service(
                 web::resource("/meetings/{meeting_id}/admit")
-                    .route(web::post().to(meetings::admit_participant))
+                    .route(web::post().to(meetings::admit_participant)),
             )
             // Admit all waiting participants (host only)
             .service(
                 web::resource("/meetings/{meeting_id}/admit-all")
-                    .route(web::post().to(meetings::admit_all_participants))
+                    .route(web::post().to(meetings::admit_all_participants)),
             )
             // Reject participant (host only)
             .service(
                 web::resource("/meetings/{meeting_id}/reject")
-                    .route(web::post().to(meetings::reject_participant))
+                    .route(web::post().to(meetings::reject_participant)),
             )
             // Get my status in meeting
             .service(
                 web::resource("/meetings/{meeting_id}/status")
-                    .route(web::get().to(meetings::get_my_status))
+                    .route(web::get().to(meetings::get_my_status)),
             )
             // Leave meeting
             .service(
                 web::resource("/meetings/{meeting_id}/leave")
-                    .route(web::post().to(meetings::leave_meeting))
+                    .route(web::post().to(meetings::leave_meeting)),
             )
             // Get all admitted participants
             .service(
                 web::resource("/meetings/{meeting_id}/participants")
-                    .route(web::get().to(meetings::get_participants))
-            )
+                    .route(web::get().to(meetings::get_participants)),
+            ),
     );
 }

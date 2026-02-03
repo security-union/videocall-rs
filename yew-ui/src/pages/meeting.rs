@@ -4,7 +4,7 @@ use crate::constants::{e2ee_enabled, webtransport_enabled};
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
 };
-use crate::meeting_api::{join_meeting, JoinMeetingResponse, JoinError};
+use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
 use web_sys::window;
 use web_sys::{HtmlInputElement, KeyboardEvent};
 use yew::prelude::*;
@@ -24,7 +24,10 @@ pub enum MeetingStatus {
     /// In the waiting room, pending host admission
     Waiting,
     /// Admitted to the meeting
-    Admitted { is_host: bool, host_display_name: Option<String> },
+    Admitted {
+        is_host: bool,
+        host_display_name: Option<String>,
+    },
     /// Rejected by the host
     Rejected,
     /// Error occurred
@@ -181,7 +184,11 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
             wasm_bindgen_futures::spawn_local(async move {
                 match join_meeting(&meeting_id, Some(&display_name)).await {
                     Ok(response) => {
-                        log::info!("Join meeting success: status={}, is_host={}", response.status, response.is_host);
+                        log::info!(
+                            "Join meeting success: status={}, is_host={}",
+                            response.status,
+                            response.is_host
+                        );
 
                         // Store the current user's email from the response
                         current_user_email.set(Some(response.email.clone()));
@@ -215,7 +222,10 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 meeting_status.set(MeetingStatus::Rejected);
                             }
                             _ => {
-                                meeting_status.set(MeetingStatus::Error(format!("Unknown status: {}", response.status)));
+                                meeting_status.set(MeetingStatus::Error(format!(
+                                    "Unknown status: {}",
+                                    response.status
+                                )));
                             }
                         }
                     }
@@ -241,10 +251,11 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
 
             wasm_bindgen_futures::spawn_local(async move {
                 // Get the host display name
-                let determined_host_display_name = match crate::meeting_api::get_meeting_info(&meeting_id).await {
-                    Ok(info) => info.host_display_name,
-                    Err(_) => None,
-                };
+                let determined_host_display_name =
+                    match crate::meeting_api::get_meeting_info(&meeting_id).await {
+                        Ok(info) => info.host_display_name,
+                        Err(_) => None,
+                    };
                 host_display_name.set(determined_host_display_name.clone());
 
                 meeting_status.set(MeetingStatus::Admitted {

@@ -1087,4 +1087,10 @@ impl Component for AttendantsComponent {
             </ContextProvider<MeetingTimeCtx>>
         }
     }
+
+    fn destroy(&mut self, _ctx: &Context<Self>) {
+        // Stop all encoders when meeting ends
+        self.media_encoder_ctx.stop_all();
+        log::info!("AttendantsComponent destroyed, encoders stopped");
+    }
 }

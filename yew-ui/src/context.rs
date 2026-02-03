@@ -8,7 +8,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use videocall_client::{CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder, VideoCallClient};
-use web_sys::MediaStream;
 use yew::prelude::*;
 
 /// Type alias used throughout the app when accessing the username context.
@@ -32,11 +31,6 @@ pub struct MediaEncoderInner {
     pub camera: Option<CameraEncoder>,
     pub microphone: Option<Box<dyn MicrophoneEncoderTrait>>,
     pub screen: Option<ScreenEncoder>,
-    /// Current camera stream for UI attachment
-    pub camera_stream: Option<MediaStream>,
-    /// Subscribers for camera stream changes
-    camera_stream_subscribers: Vec<(usize, Callback<Option<MediaStream>>)>,
-    next_subscriber_id: usize,
 }
 
 impl MediaEncoderInner {
@@ -45,9 +39,6 @@ impl MediaEncoderInner {
             camera: None,
             microphone: None,
             screen: None,
-            camera_stream: None,
-            camera_stream_subscribers: Vec::new(),
-            next_subscriber_id: 0,
         }
     }
 }
@@ -119,55 +110,13 @@ impl MediaEncoderCtx {
         self.inner.borrow_mut().screen.as_mut().map(f)
     }
 
-    /// Subscribe to camera stream changes. Returns subscription ID for unsubscribing.
-    pub fn subscribe_camera_stream(&self, callback: Callback<Option<MediaStream>>) -> usize {
-        let mut inner = self.inner.borrow_mut();
-        let id = inner.next_subscriber_id;
-        inner.next_subscriber_id += 1;
-        inner.camera_stream_subscribers.push((id, callback.clone()));
-
-        // Immediately emit current state
-        let current_stream = inner.camera_stream.clone();
-        drop(inner); // Release borrow before callback
-        callback.emit(current_stream);
-
-        id
-    }
-
-    /// Unsubscribe from camera stream changes
-    pub fn unsubscribe_camera_stream(&self, id: usize) {
-        self.inner
-            .borrow_mut()
-            .camera_stream_subscribers
-            .retain(|(sub_id, _)| *sub_id != id);
-    }
-
-    /// Set the camera stream and notify all subscribers
-    pub fn set_camera_stream(&self, stream: Option<MediaStream>) {
-        let subscribers: Vec<_> = {
-            let mut inner = self.inner.borrow_mut();
-            inner.camera_stream = stream.clone();
-            inner.camera_stream_subscribers.clone()
-        };
-
-        // Notify subscribers outside of borrow
-        for (_, callback) in subscribers {
-            callback.emit(stream.clone());
-        }
-    }
-
-    /// Get current camera stream
-    pub fn get_camera_stream(&self) -> Option<MediaStream> {
-        self.inner.borrow().camera_stream.clone()
-    }
-
     /// Check if encoders are initialized
     pub fn is_initialized(&self) -> bool {
         let inner = self.inner.borrow();
         inner.camera.is_some() && inner.microphone.is_some() && inner.screen.is_some()
     }
 
-    /// Stop all encoders
+    /// Stop all encoders - call when meeting ends
     pub fn stop_all(&self) {
         let mut inner = self.inner.borrow_mut();
         if let Some(ref mut camera) = inner.camera {

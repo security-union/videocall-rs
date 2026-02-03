@@ -79,7 +79,7 @@ impl Meeting {
             "
                 INSERT INTO meetings (room_id, started_at, ended_at, creator_id)
                 VALUES ($1, $2, NULL, $3)
-                ON CONFLICT ON CONSTRAINT idx_meetings_room_id_unique_active DO UPDATE
+                ON CONFLICT (room_id) WHERE deleted_at IS NULL DO UPDATE
                 SET started_at = EXCLUDED.started_at, updated_at = NOW()
                 RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id",
                 &[&room_id, &started_at, &creator_id],
@@ -246,7 +246,7 @@ impl Meeting {
             r#"
             INSERT INTO meetings (room_id, started_at, ended_at, creator_id)
             VALUES ($1, $2, NULL, $3)
-            ON CONFLICT ON CONSTRAINT idx_meetings_room_id_unique_active DO UPDATE
+            ON CONFLICT (room_id) WHERE deleted_at IS NULL DO UPDATE
             SET started_at = CASE
                 WHEN meetings.ended_at IS NOT NULL THEN EXCLUDED.started_at
                 ELSE meetings.started_at

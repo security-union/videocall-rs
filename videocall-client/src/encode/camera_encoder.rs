@@ -333,33 +333,6 @@ impl CameraEncoder {
             let mut current_encoder_height = height as u32;
 
             loop {
-                // Check the video element state and re-apply srcObject if needed.
-                // This handles cases where the video element is recreated during re-render.
-                if let Some(current_video_elem) = window()
-                    .document()
-                    .and_then(|d| d.get_element_by_id(&video_elem_id))
-                {
-                    let current_video: HtmlVideoElement =
-                        current_video_elem.unchecked_into();
-
-                    // Re-apply srcObject if missing (video element was recreated)
-                    if current_video.src_object().is_none() {
-                        current_video.set_src_object(Some(&device));
-                        current_video.set_muted(true);
-                        let _ = current_video.play();
-                    }
-                    // If video is paused, try to play it
-                    else if current_video.paused() {
-                        let _ = current_video.play();
-                    }
-                    // If video has 0 dimensions but has source, re-apply stream
-                    else if current_video.video_width() == 0 || current_video.video_height() == 0 {
-                        current_video.set_src_object(Some(&device));
-                        current_video.set_muted(true);
-                        let _ = current_video.play();
-                    }
-                }
-
                 if !enabled.load(Ordering::Acquire)
                     || destroy.load(Ordering::Acquire)
                     || switching.load(Ordering::Acquire)

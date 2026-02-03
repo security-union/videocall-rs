@@ -32,8 +32,8 @@ use crate::constants::{
     server_election_period_ms, users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{
-    load_self_video_position_from_storage, save_self_video_position_to_storage, MeetingTime,
-    MeetingTimeCtx, VideoCallClientCtx,
+    load_self_video_position_from_storage, save_self_video_position_to_storage, MediaEncoderCtx,
+    MeetingTime, MeetingTimeCtx, VideoCallClientCtx,
 };
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
@@ -172,6 +172,8 @@ pub struct AttendantsComponent {
     /// When true, self-video is rendered as floating overlay (original position);
     /// when false, rendered as grid item
     self_video_floating: bool,
+    /// Context holding media encoders - survives Host component recreation
+    media_encoder_ctx: MediaEncoderCtx,
 }
 
 impl AttendantsComponent {
@@ -411,6 +413,7 @@ impl Component for AttendantsComponent {
             meeting_ended_message: None,
             meeting_info_open: false,
             self_video_floating: load_self_video_position_from_storage(),
+            media_encoder_ctx: MediaEncoderCtx::new(),
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -772,6 +775,7 @@ impl Component for AttendantsComponent {
         if !self.meeting_joined {
             return html! {
                 <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
+                <ContextProvider<MediaEncoderCtx> context={self.media_encoder_ctx.clone()}>
                     <div id="main-container" class="meeting-page">
                         <BrowserCompatibility/>
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
@@ -836,6 +840,7 @@ impl Component for AttendantsComponent {
                         </button>
                     </div>
                     </div>
+                </ContextProvider<MediaEncoderCtx>>
                 </ContextProvider<VideoCallClientCtx>>
             };
         }
@@ -849,6 +854,7 @@ impl Component for AttendantsComponent {
         html! {
             <ContextProvider<MeetingTimeCtx> context={meeting_time}>
             <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
+            <ContextProvider<MediaEncoderCtx> context={self.media_encoder_ctx.clone()}>
                 <div id="main-container" class="meeting-page">
                     <BrowserCompatibility/>
                 <div id="grid-container"
@@ -1000,24 +1006,6 @@ impl Component for AttendantsComponent {
                                             }
                                         } else { html!{} }
                                     }
-                                    {
-                                         if media_access_granted {
-                                             html! {<Host
-                                                 share_screen={self.share_screen}
-                                                 mic_enabled={self.mic_enabled}
-                                                 video_enabled={self.video_enabled}
-                                                 on_encoder_settings_update={on_encoder_settings_update}
-                                                 device_settings_open={self.device_settings_open}
-                                                 on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
-                                                 on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
-                                                 on_screen_share_state={ctx.link().callback(Msg::ScreenShareStateChange)}
-                                             />}
-                                         } else {
-                                             html! {<></>}
-                                         }
-                                    }
-                                    <div class={classes!("connection-led", if self.client.is_connected() { "connected" } else { "connecting" })} title={if self.client.is_connected() { "Connected" } else { "Connecting" }}></div>
-
                                 </nav>
                             }
                         } else {
@@ -1094,6 +1082,7 @@ impl Component for AttendantsComponent {
                     } else { html!{} }
                 }
                 </div>
+            </ContextProvider<MediaEncoderCtx>>
             </ContextProvider<VideoCallClientCtx>>
             </ContextProvider<MeetingTimeCtx>>
         }

@@ -20,7 +20,7 @@ use crate::constants::*;
 use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
-use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
+use videocall_client::create_microphone_encoder;
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use yew::prelude::*;
@@ -30,7 +30,8 @@ use crate::components::{
     icons::crop::CropIcon, icons::push_pin::PushPinIcon,
 };
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
+    is_valid_username, load_username_from_storage, save_username_to_storage, MediaEncoderCtx,
+    VideoCallClientCtx,
 };
 use web_sys::window;
 
@@ -62,9 +63,8 @@ pub enum Msg {
 
 pub struct Host {
     client: videocall_client::VideoCallClient,
-    pub camera: CameraEncoder,
-    pub microphone: Box<dyn MicrophoneEncoderTrait>,
-    pub screen: ScreenEncoder,
+    /// Media encoders context - survives Host recreation
+    media_encoder_ctx: MediaEncoderCtx,
     pub media_devices: MediaDeviceList,
     pub share_screen: bool,
     pub mic_enabled: bool,
@@ -149,49 +149,67 @@ impl Component for Host {
             .context::<VideoCallClientCtx>(Callback::noop())
             .expect("VideoCallClient context missing");
 
-        // Create 3 callbacks for the 3 encoders
-        let camera_callback = ctx.link().callback(Msg::CameraEncoderSettingsUpdated);
-        let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
-        let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
+        // Get media encoder context - this survives Host recreation
+        let (media_encoder_ctx, _) = ctx
+            .link()
+            .context::<MediaEncoderCtx>(Callback::noop())
+            .expect("MediaEncoderCtx context missing");
 
-        let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
-        let mut camera = CameraEncoder::new(
-            client.clone(),
-            VIDEO_ELEMENT_ID,
-            video_bitrate,
-            camera_callback,
-        );
+        // Initialize encoders in context if not already initialized
+        if !media_encoder_ctx.is_initialized() {
+            log::info!("Host: Initializing encoders in context");
 
-        // Use the factory function to create the appropriate microphone encoder
-        let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
-        let microphone_error_cb = ctx.link().callback(Msg::MicrophoneError);
-        let mut microphone = create_microphone_encoder(
-            client.clone(),
-            audio_bitrate,
-            microphone_callback,
-            microphone_error_cb.clone(),
-        );
+            // Create 3 callbacks for the 3 encoders
+            let camera_callback = ctx.link().callback(Msg::CameraEncoderSettingsUpdated);
+            let microphone_callback = ctx.link().callback(Msg::MicrophoneEncoderSettingsUpdated);
+            let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
 
-        let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
-        let screen_state_callback = ctx.props().on_screen_share_state.clone();
-        let mut screen = ScreenEncoder::new(
-            client.clone(),
-            screen_bitrate,
-            screen_callback,
-            screen_state_callback,
-        );
+            let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
+            let mut camera = CameraEncoder::new(
+                client.clone(),
+                VIDEO_ELEMENT_ID,
+                video_bitrate,
+                camera_callback,
+            );
 
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
-        camera.set_encoder_control(rx);
+            // Use the factory function to create the appropriate microphone encoder
+            let audio_bitrate = audio_bitrate_kbps().unwrap_or(65);
+            let microphone_error_cb = ctx.link().callback(Msg::MicrophoneError);
+            let mut microphone = create_microphone_encoder(
+                client.clone(),
+                audio_bitrate,
+                microphone_callback,
+                microphone_error_cb.clone(),
+            );
 
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
-        microphone.set_encoder_control(rx);
+            let screen_bitrate = screen_bitrate_kbps().unwrap_or(1000);
+            let screen_state_callback = ctx.props().on_screen_share_state.clone();
+            let mut screen = ScreenEncoder::new(
+                client.clone(),
+                screen_bitrate,
+                screen_callback,
+                screen_state_callback,
+            );
 
-        let (tx, rx) = mpsc::unbounded();
-        client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
-        screen.set_encoder_control(rx);
+            let (tx, rx) = mpsc::unbounded();
+            client.subscribe_diagnostics(tx.clone(), MediaType::VIDEO);
+            camera.set_encoder_control(rx);
+
+            let (tx, rx) = mpsc::unbounded();
+            client.subscribe_diagnostics(tx.clone(), MediaType::AUDIO);
+            microphone.set_encoder_control(rx);
+
+            let (tx, rx) = mpsc::unbounded();
+            client.subscribe_diagnostics(tx.clone(), MediaType::SCREEN);
+            screen.set_encoder_control(rx);
+
+            // Store encoders in context
+            media_encoder_ctx.set_camera(camera);
+            media_encoder_ctx.set_microphone(microphone);
+            media_encoder_ctx.set_screen(screen);
+        } else {
+            log::info!("Host: Encoders already initialized in context, reusing");
+        }
 
         // Create and configure MediaDeviceList
         let mut media_devices = MediaDeviceList::new();
@@ -214,9 +232,7 @@ impl Component for Host {
 
         Self {
             client,
-            camera,
-            microphone,
-            screen,
+            media_encoder_ctx,
             media_devices,
             share_screen: ctx.props().share_screen,
             mic_enabled: ctx.props().mic_enabled,
@@ -233,7 +249,12 @@ impl Component for Host {
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if self.screen.set_enabled(ctx.props().share_screen) && ctx.props().share_screen {
+        // Screen share
+        let screen_enabled_changed = self
+            .media_encoder_ctx
+            .with_screen(|screen| screen.set_enabled(ctx.props().share_screen))
+            .unwrap_or(false);
+        if screen_enabled_changed && ctx.props().share_screen {
             self.share_screen = ctx.props().share_screen;
             let link = ctx.link().clone();
             let timeout = Timeout::new(1000, move || {
@@ -244,8 +265,13 @@ impl Component for Host {
             self.share_screen = ctx.props().share_screen;
             ctx.link().send_message(Msg::DisableScreenShare);
         }
+
         // Mic enable/disable is controlled upstream; reflect props only
-        if self.microphone.set_enabled(ctx.props().mic_enabled) {
+        let mic_enabled_changed = self
+            .media_encoder_ctx
+            .with_microphone(|mic| mic.set_enabled(ctx.props().mic_enabled))
+            .unwrap_or(false);
+        if mic_enabled_changed {
             self.mic_enabled = ctx.props().mic_enabled;
             ctx.link()
                 .send_message(Msg::EnableMicrophone(ctx.props().mic_enabled));
@@ -253,7 +279,13 @@ impl Component for Host {
             self.mic_enabled = ctx.props().mic_enabled;
             ctx.link().send_message(Msg::DisableMicrophone)
         }
-        if self.camera.set_enabled(ctx.props().video_enabled) {
+
+        // Camera
+        let camera_enabled_changed = self
+            .media_encoder_ctx
+            .with_camera(|camera| camera.set_enabled(ctx.props().video_enabled))
+            .unwrap_or(false);
+        if camera_enabled_changed {
             self.video_enabled = ctx.props().video_enabled;
             ctx.link()
                 .send_message(Msg::EnableVideo(ctx.props().video_enabled));
@@ -263,7 +295,6 @@ impl Component for Host {
         }
 
         // Update videocallclient with the encoder settings
-        // TODO: use atomic bools for the encoders
         self.client.set_audio_enabled(self.mic_enabled);
         self.client.set_video_enabled(self.video_enabled);
         // Note: set_screen_enabled is now handled internally by ScreenEncoder
@@ -278,11 +309,11 @@ impl Component for Host {
         log::debug!("Host update: {msg:?}");
         let should_update = match msg {
             Msg::EnableScreenShare => {
-                self.screen.start();
+                self.media_encoder_ctx.with_screen(|screen| screen.start());
                 true
             }
             Msg::DisableScreenShare => {
-                self.screen.stop();
+                self.media_encoder_ctx.with_screen(|screen| screen.stop());
                 self.encoder_settings.screen = None;
                 ctx.props()
                     .on_encoder_settings_update
@@ -294,11 +325,11 @@ impl Component for Host {
                 if !should_enable {
                     return true;
                 }
-                self.microphone.start();
+                self.media_encoder_ctx.with_microphone(|mic| mic.start());
                 true
             }
             Msg::DisableMicrophone => {
-                self.microphone.stop();
+                self.media_encoder_ctx.with_microphone(|mic| mic.stop());
                 self.encoder_settings.microphone = None;
                 ctx.props()
                     .on_encoder_settings_update
@@ -308,7 +339,7 @@ impl Component for Host {
             Msg::MicrophoneError(err) => {
                 log::error!("Microphone error: {err}");
                 // Cancel encoder
-                self.microphone.stop();
+                self.media_encoder_ctx.with_microphone(|mic| mic.stop());
                 // Propagate upstream so the parent can disable mic and show UI
                 ctx.props().on_microphone_error.emit(err);
                 true
@@ -317,11 +348,11 @@ impl Component for Host {
                 if !should_enable {
                     return true;
                 }
-                self.camera.start();
+                self.media_encoder_ctx.with_camera(|camera| camera.start());
                 true
             }
             Msg::DisableVideo => {
-                self.camera.stop();
+                self.media_encoder_ctx.with_camera(|camera| camera.stop());
                 self.encoder_settings.camera = None;
                 ctx.props()
                     .on_encoder_settings_update
@@ -370,7 +401,11 @@ impl Component for Host {
                 log::info!("Audio device changed: {audio}");
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_inputs.select(&audio.device_id);
-                if self.microphone.select(audio.device_id.clone()) {
+                let device_changed = self
+                    .media_encoder_ctx
+                    .with_microphone(|mic| mic.select(audio.device_id.clone()))
+                    .unwrap_or(false);
+                if device_changed {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
                         link.send_message(Msg::EnableMicrophone(true));
@@ -383,7 +418,11 @@ impl Component for Host {
                 log::info!("Video device changed: {video}");
                 // Update the MediaDeviceList selection
                 self.media_devices.video_inputs.select(&video.device_id);
-                if self.camera.select(video.device_id.clone()) {
+                let device_changed = self
+                    .media_encoder_ctx
+                    .with_camera(|camera| camera.select(video.device_id.clone()))
+                    .unwrap_or(false);
+                if device_changed {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
                         link.send_message(Msg::EnableVideo(true));
@@ -752,9 +791,10 @@ impl Component for Host {
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {
-        self.camera.stop();
-        self.microphone.stop();
-        self.screen.stop();
+        // DO NOT stop encoders here - they live in MediaEncoderCtx and should
+        // survive Host recreation. The encoders will be stopped when the
+        // AttendantsComponent is destroyed (end of meeting).
+        log::info!("Host component destroyed, encoders preserved in context");
     }
 }
 

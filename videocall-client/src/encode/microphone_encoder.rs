@@ -176,6 +176,11 @@ impl MicrophoneEncoder {
         if self.state.is_enabled() && self.codec.is_instantiated() {
             return;
         }
+
+        // Reset switching flag - we're starting fresh, not switching devices
+        // This prevents the loop from immediately exiting if select() was called before start()
+        self.state.switching.store(false, Ordering::Release);
+
         let aes = client.aes();
         let on_error = self.on_error.clone();
         let EncoderState {

@@ -20,7 +20,6 @@ use crate::constants::*;
 use crate::types::DeviceInfo;
 use futures::channel::mpsc;
 use gloo_timers::callback::Timeout;
-use log::debug;
 use videocall_client::{create_microphone_encoder, MicrophoneEncoderTrait};
 use videocall_client::{CameraEncoder, MediaDeviceList, ScreenEncoder, ScreenShareEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -28,10 +27,12 @@ use yew::prelude::*;
 
 use crate::components::{
     device_selector::DeviceSelector, device_settings_modal::DeviceSettingsModal,
+    icons::crop::CropIcon, icons::push_pin::PushPinIcon,
 };
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, VideoCallClientCtx,
 };
+use web_sys::window;
 
 const VIDEO_ELEMENT_ID: &str = "webcam";
 
@@ -119,6 +120,18 @@ pub struct MeetingProps {
     /// The parent should disable the mic and optionally display an error.
     #[prop_or_default]
     pub on_microphone_error: Callback<String>,
+
+    /// Whether the client is connected to the server
+    #[prop_or_default]
+    pub is_connected: bool,
+
+    /// Whether the self-video is in floating position (true) or grid position (false)
+    #[prop_or_default]
+    pub is_floating: bool,
+
+    /// Callback to toggle the self-video position between floating and grid
+    #[prop_or_default]
+    pub on_position_toggle: Callback<MouseEvent>,
 
     /// Called when screen share state changes (started, cancelled, stopped).
     /// This allows the parent component to react to screen share lifecycle events.
@@ -479,66 +492,198 @@ impl Component for Host {
         let selected_camera_id = self.media_devices.video_inputs.selected();
         let selected_speaker_id = self.media_devices.audio_outputs.selected();
 
+        // Get username from storage for display
+        let username = load_username_from_storage().unwrap_or_else(|| "You".to_string());
+
+        // Determine container class based on floating state
+        let container_class = if ctx.props().is_floating {
+            "self-tile-floating"
+        } else {
+            "grid-item self-tile"
+        };
+
         html! {
             <>
-                {
-                    if ctx.props().video_enabled {
-                        html! {
-                            <div class="host-video-wrapper" style="position:relative;">
-                                <video class="self-camera" autoplay=true id={VIDEO_ELEMENT_ID} playsinline={true} controls={false}></video>
-                                <button class="change-name-fab" title="Change name"
-                                    onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
-                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-                                </button>
-                            </div>
+                // Self tile - rendered as grid item or floating overlay based on is_floating prop
+                <div class={container_class} id="self-video-div">
+                    <div class={classes!("canvas-container", if ctx.props().video_enabled { "video-on" } else { "" })}>
+                        // Video element - ALWAYS present in DOM for CameraEncoder, hidden via CSS when video is off
+                        <video
+                            class={classes!("self-camera", "uncropped", if !ctx.props().video_enabled { "video-hidden" } else { "" })}
+                            autoplay=true
+                            id={VIDEO_ELEMENT_ID}
+                            playsinline={true}
+                            controls={false}
+                        ></video>
+
+                        // Placeholder shown when video is off
+                        {
+                            if !ctx.props().video_enabled {
+                                html! {
+                                    <div class="placeholder-content">
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
+                                            <line x1="1" y1="1" x2="23" y2="23"></line>
+                                        </svg>
+                                        <span class="placeholder-text">{"Camera Off"}</span>
+                                    </div>
+                                }
+                            } else {
+                                html! {}
+                            }
                         }
-                    } else {
-                        html! {
-                            <div class="" style="padding:1rem; display:flex; align-items:center; justify-content:center; border-radius: 1rem; position:relative;">
-                                <div class="placeholder-content">
-                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                        <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10"></path>
-                                        <line x1="1" y1="1" x2="23" y2="23"></line>
-                                    </svg>
-                                    <span class="placeholder-text">{"Camera Off"}</span>
+
+                        // Floating name chip with LED when floating
+                        {
+                            if ctx.props().is_floating {
+                                html! {
+                                    <div class="floating-name-wrapper">
+                                        <div class={classes!("connection-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
+                                            title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
+                                        </div>
+                                        <h4 class="floating-name" title={username.clone()} dir={"auto"}>{username.clone()}{" (You)"}</h4>
+                                    </div>
+                                }
+                            } else {
+                                html! {
+                                    <h4 class="floating-name" title={username.clone()} dir={"auto"}>{username}{" (You)"}</h4>
+                                }
+                            }
+                        }
+
+                        // Audio indicator (showing mic status)
+                        <div class="audio-indicator">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                {
+                                    if ctx.props().mic_enabled {
+                                        html! {
+                                            <>
+                                                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                                                <line x1="12" y1="19" x2="12" y2="23"></line>
+                                                <line x1="8" y1="23" x2="16" y2="23"></line>
+                                            </>
+                                        }
+                                    } else {
+                                        html! {
+                                            <>
+                                                <line x1="1" y1="1" x2="23" y2="23"></line>
+                                                <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"></path>
+                                                <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"></path>
+                                                <line x1="12" y1="19" x2="12" y2="23"></line>
+                                                <line x1="8" y1="23" x2="16" y2="23"></line>
+                                            </>
+                                        }
+                                    }
+                                }
+                            </svg>
+                        </div>
+
+                        // Crop button (hover-only, like peer tiles)
+                        <button
+                            onclick={Callback::from(|_| toggle_video_crop(VIDEO_ELEMENT_ID))}
+                            class="crop-icon"
+                        >
+                            <CropIcon/>
+                        </button>
+
+                        // Pin button (hover-only, like peer tiles)
+                        <button
+                            onclick={Callback::from(|_| toggle_pinned_div("self-video-div"))}
+                            class="pin-icon"
+                        >
+                            <PushPinIcon/>
+                        </button>
+
+                        // Position toggle button (hover-only) - switches between grid and floating
+                        <button
+                            onclick={ctx.props().on_position_toggle.clone()}
+                            class="position-toggle-icon"
+                            title={if ctx.props().is_floating { "Move to grid" } else { "Move to corner" }}
+                        >
+                            {
+                                if ctx.props().is_floating {
+                                    // Grid icon - when floating, click to go back to grid
+                                    html! {
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <rect x="3" y="3" width="7" height="7"></rect>
+                                            <rect x="14" y="3" width="7" height="7"></rect>
+                                            <rect x="14" y="14" width="7" height="7"></rect>
+                                            <rect x="3" y="14" width="7" height="7"></rect>
+                                        </svg>
+                                    }
+                                } else {
+                                    // Picture-in-picture / corner icon - when in grid, click to float
+                                    html! {
+                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <rect x="2" y="2" width="20" height="14" rx="2"></rect>
+                                            <rect x="12" y="10" width="8" height="8" rx="1" fill="currentColor" opacity="0.3"></rect>
+                                        </svg>
+                                    }
+                                }
+                            }
+                        </button>
+
+                        // Edit name button (hover-only, positioned like pin/crop icons)
+                        <button class="edit-name-icon" title="Change name"
+                            onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M12 20h9"></path>
+                                <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"></path>
+                            </svg>
+                        </button>
+
+                        // Device selector icons - inside canvas-container when in grid mode (hover-only)
+                        {
+                            if !ctx.props().is_floating {
+                                html! {
+                                    <div class="self-tile-device-selectors">
+                                        <div class={classes!("connection-led", if ctx.props().is_connected { "connected" } else { "connecting" })}
+                                            title={if ctx.props().is_connected { "Connected" } else { "Connecting..." }}>
+                                        </div>
+                                        <DeviceSelector
+                                            microphones={microphones.clone()}
+                                            cameras={cameras.clone()}
+                                            speakers={speakers.clone()}
+                                            selected_microphone_id={selected_microphone_id.clone()}
+                                            selected_camera_id={selected_camera_id.clone()}
+                                            selected_speaker_id={selected_speaker_id.clone()}
+                                            on_microphone_select={mic_callback.clone()}
+                                            on_camera_select={cam_callback.clone()}
+                                            on_speaker_select={speaker_callback.clone()}
+                                        />
+                                    </div>
+                                }
+                            } else {
+                                html! {}
+                            }
+                        }
+                    </div>
+                    // Device selectors - outside canvas-container when floating (always visible below video)
+                    {
+                        if ctx.props().is_floating {
+                            html! {
+                                <div class="self-tile-device-selectors floating-selectors">
+                                    <DeviceSelector
+                                        microphones={microphones.clone()}
+                                        cameras={cameras.clone()}
+                                        speakers={speakers.clone()}
+                                        selected_microphone_id={selected_microphone_id.clone()}
+                                        selected_camera_id={selected_camera_id.clone()}
+                                        selected_speaker_id={selected_speaker_id.clone()}
+                                        on_microphone_select={mic_callback.clone()}
+                                        on_camera_select={cam_callback.clone()}
+                                        on_speaker_select={speaker_callback.clone()}
+                                    />
                                 </div>
-                                <button class="change-name-fab" title="Change name"
-                                    onclick={ctx.link().callback(|_| Msg::ToggleChangeNameModal)}>
-                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-                                </button>
-                            </div>
+                            }
+                        } else {
+                            html! {}
                         }
                     }
-                }
-
-                // Device Settings Menu Button (positioned outside the host video)
-                <button
-                    class="device-settings-menu-button btn-apple btn-secondary"
-                    onclick={ctx.props().on_device_settings_toggle.clone()}
-                    title="Device Settings"
-                >
-                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <circle cx="12" cy="12" r="3"></circle>
-                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-                    </svg>
-                </button>
-
-                // Desktop Device Selector (hidden on mobile)
-                <div class="desktop-device-selector">
-                    <DeviceSelector
-                        microphones={microphones.clone()}
-                        cameras={cameras.clone()}
-                        speakers={speakers.clone()}
-                        selected_microphone_id={selected_microphone_id.clone()}
-                        selected_camera_id={selected_camera_id.clone()}
-                        selected_speaker_id={selected_speaker_id.clone()}
-                        on_microphone_select={mic_callback.clone()}
-                        on_camera_select={cam_callback.clone()}
-                        on_speaker_select={speaker_callback.clone()}
-                    />
                 </div>
 
-                // Mobile Device Settings Modal
+                // Mobile Device Settings Modal (keep for mobile support)
                 <DeviceSettingsModal
                     microphones={microphones}
                     cameras={cameras}
@@ -607,7 +752,6 @@ impl Component for Host {
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {
-        debug!("destroying");
         self.camera.stop();
         self.microphone.stop();
         self.screen.stop();
@@ -646,5 +790,37 @@ impl Host {
         };
 
         DeviceInfo::new(device_id.to_string(), device_name)
+    }
+}
+
+/// Toggle pinned state for the self-video div
+fn toggle_pinned_div(div_id: &str) {
+    if let Some(div) = window()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.get_element_by_id(div_id))
+    {
+        if !div.class_list().contains("grid-item-pinned") {
+            let _ = div.class_list().add_1("grid-item-pinned");
+        } else {
+            let _ = div.class_list().remove_1("grid-item-pinned");
+        }
+    }
+}
+
+/// Toggle crop mode for the video element
+fn toggle_video_crop(video_id: &str) {
+    if let Some(video) = window()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.get_element_by_id(video_id))
+    {
+        let class_list = video.class_list();
+        let is_cropped = class_list.contains("cropped");
+        if is_cropped {
+            let _ = class_list.remove_1("cropped");
+            let _ = class_list.add_1("uncropped");
+        } else {
+            let _ = class_list.remove_1("uncropped");
+            let _ = class_list.add_1("cropped");
+        }
     }
 }

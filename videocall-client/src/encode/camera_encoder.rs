@@ -179,6 +179,17 @@ impl CameraEncoder {
     /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
     /// called, or if [`encoder.select(device_id)`](Self::select) has not been called.
     pub fn start(&mut self) {
+        // Check if device is selected
+        let device_id = if let Some(vid) = &self.state.selected {
+            vid.to_string()
+        } else {
+            return;
+        };
+
+        // Reset switching flag - we're starting fresh, not switching devices
+        // This prevents the loop from immediately exiting if select() was called before start()
+        self.state.switching.store(false, Ordering::Release);
+
         // 1. Query the first device with a camera and a mic attached.
         // 2. setup WebCodecs, in particular
         // 3. send encoded video frames and raw audio to the server.
@@ -230,11 +241,6 @@ impl CameraEncoder {
                 client.send_packet(packet);
                 sequence_number += 1;
             })
-        };
-        let device_id = if let Some(vid) = &self.state.selected {
-            vid.to_string()
-        } else {
-            return;
         };
 
         wasm_bindgen_futures::spawn_local(async move {
@@ -327,6 +333,33 @@ impl CameraEncoder {
             let mut current_encoder_height = height as u32;
 
             loop {
+                // Check the video element state and re-apply srcObject if needed.
+                // This handles cases where the video element is recreated during re-render.
+                if let Some(current_video_elem) = window()
+                    .document()
+                    .and_then(|d| d.get_element_by_id(&video_elem_id))
+                {
+                    let current_video: HtmlVideoElement =
+                        current_video_elem.unchecked_into();
+
+                    // Re-apply srcObject if missing (video element was recreated)
+                    if current_video.src_object().is_none() {
+                        current_video.set_src_object(Some(&device));
+                        current_video.set_muted(true);
+                        let _ = current_video.play();
+                    }
+                    // If video is paused, try to play it
+                    else if current_video.paused() {
+                        let _ = current_video.play();
+                    }
+                    // If video has 0 dimensions but has source, re-apply stream
+                    else if current_video.video_width() == 0 || current_video.video_height() == 0 {
+                        current_video.set_src_object(Some(&device));
+                        current_video.set_muted(true);
+                        let _ = current_video.play();
+                    }
+                }
+
                 if !enabled.load(Ordering::Acquire)
                     || destroy.load(Ordering::Acquire)
                     || switching.load(Ordering::Acquire)

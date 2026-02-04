@@ -19,4 +19,5 @@
 pub mod chat_server;
 pub mod chat_session;
 pub mod packet_handler;
+pub mod session_logic;
 pub mod wt_chat_session;

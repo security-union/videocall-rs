@@ -350,22 +350,50 @@ async fn start_webtransport_server() {
 
 ## Final Architecture
 
-### Transport Abstraction Complete
-
-The session logic has been fully abstracted from the transport:
+### Clean Separation of Concerns
 
 ```
-                    ┌─────────────────────────────────┐
-                    │         SessionLogic            │
-                    │   (transport-agnostic logic)    │
-                    └────────────────┬────────────────┘
-                                     │
-                    ┌────────────────┴────────────────┐
-                    ▼                                 ▼
-          ┌─────────────────┐               ┌─────────────────┐
-          │  WsChatSession  │               │  WtChatSession  │
-          │  (thin adapter) │               │  (thin adapter) │
-          └─────────────────┘               └─────────────────┘
+actors/
+  chat_server.rs           # Room management, NATS routing
+  session_logic.rs         # Shared business logic (226 lines)
+  packet_handler.rs        # Packet classification (103 lines)
+  transports/
+    mod.rs                 # Transport exports
+    ws_chat_session.rs     # WebSocket adapter (~270 lines code)
+    wt_chat_session.rs     # WebTransport adapter (~320 lines)
+```
+
+### The Abstraction
+
+```
+                    ┌─────────────────────────────────────┐
+                    │           SessionLogic              │
+                    │    (transport-agnostic logic)       │
+                    │  ─────────────────────────────────  │
+                    │  • handle_inbound() → InboundAction │
+                    │  • handle_outbound() → bytes        │
+                    │  • track_connection_start/end()     │
+                    │  • on_stopping()                    │
+                    │  • build_meeting_started/ended()    │
+                    └──────────────────┬──────────────────┘
+                                       │ owns
+                      ┌────────────────┴────────────────┐
+                      ▼                                 ▼
+            ┌─────────────────┐               ┌─────────────────┐
+            │  WsChatSession  │               │  WtChatSession  │
+            │  (thin adapter) │               │  (thin adapter) │
+            │  ─────────────  │               │  ─────────────  │
+            │  ctx.binary()   │               │  tx.send()      │
+            └────────┬────────┘               └────────┬────────┘
+                     │                                  │
+                     └──────────────┬───────────────────┘
+                                    ▼
+                      ┌─────────────────────────────────┐
+                      │          ChatServer             │
+                      │  • Room membership              │
+                      │  • NATS subscriptions           │
+                      │  • Message routing              │
+                      └─────────────────────────────────┘
 ```
 
 ### Shared Modules
@@ -373,7 +401,7 @@ The session logic has been fully abstracted from the transport:
 | Module | Lines | Purpose |
 |--------|-------|---------|
 | `session_logic.rs` | 226 | All business logic |
-| `packet_handler.rs` | 103 | Packet classification |
+| `packet_handler.rs` | 103 | Packet classification (`PacketKind` enum) |
 
 ### Adding a New Feature
 
@@ -383,17 +411,170 @@ impl SessionLogic {
     pub fn new_feature(&self) { ... }
 }
 
-// 2. Both transports get it automatically
+// 2. Both transports get it automatically!
+// (Call self.logic.new_feature() if transport-specific handling needed)
 ```
 
-### Remaining Transport Differences (By Design)
+---
+
+## Adding a New Transport
+
+To add a new transport (e.g., QUIC raw, WebRTC DataChannel, TCP):
+
+### Step 1: Create the Transport Adapter
+
+Create `actors/transports/new_transport_session.rs`:
+
+```rust
+use crate::actors::session_logic::{InboundAction, SessionLogic};
+
+pub struct NewTransportSession {
+    /// Shared business logic - gets EVERYTHING for free
+    logic: SessionLogic,
+    
+    /// Transport-specific I/O
+    outbound_tx: mpsc::Sender<Bytes>,  // or your transport's channel
+}
+
+impl NewTransportSession {
+    pub fn new(
+        addr: Addr<ChatServer>,
+        room: String,
+        email: String,
+        outbound_tx: mpsc::Sender<Bytes>,
+        nats_client: async_nats::client::Client,
+        tracker_sender: TrackerSender,
+        session_manager: SessionManager,
+    ) -> Self {
+        // SessionLogic::new() handles ID generation, logging, etc.
+        let logic = SessionLogic::new(
+            addr, room, email, nats_client, tracker_sender, session_manager,
+        );
+        Self { logic, outbound_tx }
+    }
+}
+```
+
+### Step 2: Implement the Actor Trait
+
+```rust
+impl Actor for NewTransportSession {
+    type Context = Context<Self>;  // or your custom context
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        // 1. Track connection (shared)
+        self.logic.track_connection_start("new_transport");
+
+        // 2. Start session via SessionManager (shared)
+        let session_manager = self.logic.session_manager.clone();
+        let room = self.logic.room.clone();
+        let email = self.logic.email.clone();
+
+        ctx.wait(
+            async move { session_manager.start_session(&room, &email).await }
+                .into_actor(self)
+                .map(|result, act, ctx| {
+                    match result {
+                        Ok(result) => {
+                            // Build packet (shared), send (transport-specific)
+                            let bytes = act.logic.build_meeting_started(
+                                result.start_time_ms,
+                                &result.creator_id,
+                            );
+                            act.send(bytes);  // Your transport's send
+                        }
+                        Err(e) => {
+                            let bytes = act.logic.build_meeting_ended(&format!("Error: {e}"));
+                            act.send(bytes);
+                            ctx.stop();
+                        }
+                    }
+                }),
+        );
+
+        // 3. Register with ChatServer (shared pattern)
+        // 4. Join room (shared pattern)
+    }
+
+    fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        // Cleanup is ONE LINE - all logic is shared
+        self.logic.on_stopping();
+        Running::Stop
+    }
+}
+```
+
+### Step 3: Handle Inbound Data
+
+```rust
+impl Handler<YourInboundMessage> for NewTransportSession {
+    type Result = ();
+
+    fn handle(&mut self, msg: YourInboundMessage, ctx: &mut Self::Context) {
+        // Delegate to shared logic - it handles RTT, health, classification
+        match self.logic.handle_inbound(&msg.data) {
+            InboundAction::Echo(bytes) => {
+                self.send(bytes.to_vec());  // Your transport's send
+            }
+            InboundAction::Forward(bytes) => {
+                ctx.notify(Packet { data: bytes });
+            }
+            InboundAction::Processed | InboundAction::KeepAlive => {
+                // Already handled by SessionLogic
+            }
+        }
+    }
+}
+```
+
+### Step 4: Handle Outbound from ChatServer
+
+```rust
+impl Handler<Message> for NewTransportSession {
+    type Result = ();
+
+    fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+        // Shared logic tracks metrics, returns bytes to send
+        let bytes = self.logic.handle_outbound(&msg);
+        self.send(bytes);  // Your transport's send
+    }
+}
+```
+
+### Step 5: Export from `transports/mod.rs`
+
+```rust
+pub mod new_transport_session;
+pub use new_transport_session::NewTransportSession;
+```
+
+### What You Get for Free
+
+| Feature | You Write | Provided by SessionLogic |
+|---------|-----------|--------------------------|
+| Session ID generation | - | ✅ |
+| Connection tracking | - | ✅ |
+| RTT packet echo | - | ✅ |
+| Health packet processing | - | ✅ |
+| Packet classification | - | ✅ |
+| Metrics tracking | - | ✅ |
+| Meeting lifecycle (start/end) | - | ✅ |
+| ChatServer integration | - | ✅ |
+| Cleanup on disconnect | - | ✅ |
+| **Transport I/O** | ✅ | - |
+| **Keep-alive mechanism** | ✅ | - |
+
+---
+
+## Remaining Transport Differences (By Design)
 
 | Aspect | WebSocket | WebTransport | Reason |
 |--------|-----------|--------------|--------|
 | I/O Model | `WebsocketContext` | `mpsc` channels | Different protocols |
 | Keep-alive | WS ping/pong frames | Custom datagram ping | Protocol-specific |
+| Binary send | `ctx.binary(bytes)` | `tx.send(WtOutbound)` | API differences |
 
 ### Not Recommended to Consolidate
 
-- **Transport I/O**: Fundamentally different - WebSocket uses actix-web-actors, WebTransport uses quinn
+- **Transport I/O**: Fundamentally different APIs (actix-web-actors vs quinn)
 - **Single binary**: Separate binaries work well for horizontal scaling via NATS

@@ -22,12 +22,29 @@ use crate::frame::FrameBuffer;
 use serde::{Deserialize, Serialize};
 
 /// An enumeration of the supported video codecs.
-#[derive(Debug, Clone, Copy)]
+/// Names include profile/level details for scalability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
-    /// VP9 codec, using libvpx.
-    VP9,
+    /// Unspecified codec - skip decoding.
+    Unspecified,
+    /// VP8 codec - no profile variants.
+    Vp8,
+    /// VP9 Profile 0, Level 1.0, 8-bit (vp09.00.10.08).
+    Vp9Profile0Level10Bit8,
     /// A mock decoder that does nothing, for testing and simulation.
     Mock,
+}
+
+impl VideoCodec {
+    /// Returns the WebCodecs codec string for this codec, or None for Unspecified.
+    pub fn as_webcodecs_str(&self) -> Option<&'static str> {
+        match self {
+            VideoCodec::Unspecified => None,
+            VideoCodec::Vp8 => Some("vp8"),
+            VideoCodec::Vp9Profile0Level10Bit8 => Some("vp09.00.10.08"),
+            VideoCodec::Mock => Some("vp8"), // Fallback for testing
+        }
+    }
 }
 
 /// Represents a fully decoded frame, ready for rendering.

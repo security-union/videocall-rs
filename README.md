@@ -27,6 +27,7 @@ An open-source, high-performance video conferencing platform built with Rust, pr
 - [Performance](#performance)
 - [Security](#security)
 - [Feature Flags](#feature-flags)
+- [API Documentation](#api-documentation)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Project Structure](#project-structure)
@@ -308,6 +309,12 @@ The following values are recognized as enabling a flag (case-insensitive):
 - `yes`
 
 Any other value (or unset variable) is treated as `false`.
+
+## API Documentation
+
+| API | Description | Documentation |
+|-----|-------------|---------------|
+| Create Meeting | Create meetings with custom IDs, attendees, and passwords | [Meeting API](docs/meeting-api.md) |
 
 ## Roadmap
 

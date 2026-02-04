@@ -79,6 +79,11 @@ pub struct WtInbound {
     pub source: WtInboundSource,
 }
 
+/// Signal to stop the session (sent when I/O tasks end)
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+pub struct StopSession;
+
 /// WebTransport Chat Session Actor
 ///
 /// Handles an individual WebTransport connection, mirroring `WsChatSession`.
@@ -341,6 +346,19 @@ impl Handler<Packet> for WtChatSession {
             room: self.room.clone(),
             msg,
         });
+    }
+}
+
+/// Handle stop signal - stops the actor
+impl Handler<StopSession> for WtChatSession {
+    type Result = ();
+
+    fn handle(&mut self, _msg: StopSession, ctx: &mut Self::Context) -> Self::Result {
+        info!(
+            "Received stop signal for WebTransport session {} in room {}",
+            self.id, self.room
+        );
+        ctx.stop();
     }
 }
 

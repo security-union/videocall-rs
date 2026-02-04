@@ -327,10 +327,10 @@ async fn handle_webtransport_session(
                 #[cfg(test)]
                 let username_for_test = username_clone.clone();
                 tokio::spawn(async move {
+                    #[cfg(test)]
+                    let _ = &username_for_test; // Silence unused warning
                     match uni_stream.read_to_end(usize::MAX).await {
                         Ok(buf) => {
-                            #[cfg(test)]
-                            increment_test_packet_counter_for_user(&username_for_test);
                             let _ = actor_addr.try_send(WtInbound {
                                 data: Bytes::from(buf),
                                 source: WtInboundSource::UniStream,
@@ -364,6 +364,8 @@ async fn handle_webtransport_session(
     // Writer task: receives from outbound channel, writes to quinn Session
     {
         let session = session.clone();
+        #[cfg_attr(not(test), allow(unused_variables))]
+        let username_for_writer = username.to_string();
         join_set.spawn(async move {
             while let Some(msg) = outbound_rx.recv().await {
                 match msg {
@@ -373,6 +375,9 @@ async fn handle_webtransport_session(
                                 error!("Error writing to UniStream: {}", e);
                                 break;
                             }
+                            // Track packets being sent TO this client (for test verification)
+                            #[cfg(test)]
+                            increment_test_packet_counter_for_user(&username_for_writer);
                         }
                         Err(e) => {
                             error!("Error opening UniStream: {}", e);
@@ -395,7 +400,10 @@ async fn handle_webtransport_session(
     join_set.join_next().await;
     join_set.shutdown().await;
 
-    // Actor will handle cleanup via its stopping() method
+    // Signal actor to stop - this will trigger its stopping() method
+    // which sends Disconnect to ChatServer
+    actor_addr.do_send(crate::actors::wt_chat_session::StopSession);
+
     warn!("Finished handling WebTransport session for {username} in {lobby_id}");
     Ok(())
 }
@@ -829,6 +837,10 @@ mod tests {
 
         // Keep connections alive
         start_keep_alive_tasks(&session_a, &session_b, &session_c).await;
+
+        // Wait a bit for all NATS system messages to propagate
+        // (e.g., Charlie's MEETING_STARTED broadcast to Alice who's in the same room)
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // ========== PHASE 1: CROSS-LOBBY ISOLATION TEST ==========
         println!("\n--- Phase 1: Testing Cross-Lobby Isolation ---");

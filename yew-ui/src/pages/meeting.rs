@@ -4,7 +4,8 @@ use crate::constants::{e2ee_enabled, webtransport_enabled};
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
 };
-use crate::meeting_api::{join_meeting, JoinError, JoinMeetingResponse};
+use crate::meeting_api::{get_meeting_info, join_meeting, JoinError};
+use gloo_timers::callback::Interval;
 use web_sys::window;
 use web_sys::{HtmlInputElement, KeyboardEvent};
 use yew::prelude::*;
@@ -21,6 +22,8 @@ pub enum MeetingStatus {
     NotJoined,
     /// Joining in progress
     Joining,
+    /// Waiting for the host to start the meeting
+    WaitingForMeeting,
     /// In the waiting room, pending host admission
     Waiting,
     /// Admitted to the meeting
@@ -132,6 +135,106 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         });
     }
 
+    // Poll for meeting activation when in WaitingForMeeting state
+    {
+        let meeting_id = props.id.clone();
+        let meeting_status = meeting_status.clone();
+        let host_display_name = host_display_name.clone();
+        let current_user_email = current_user_email.clone();
+        let came_from_waiting_room = came_from_waiting_room.clone();
+        let input_value_state = input_value_state.clone();
+        let current_status = (*meeting_status).clone();
+
+        use_effect_with(current_status.clone(), move |status| {
+            let interval: Option<Interval> = if *status == MeetingStatus::WaitingForMeeting {
+                let meeting_id = meeting_id.clone();
+                let meeting_status = meeting_status.clone();
+                let host_display_name = host_display_name.clone();
+                let current_user_email = current_user_email.clone();
+                let came_from_waiting_room = came_from_waiting_room.clone();
+                let display_name = (*input_value_state).clone();
+
+                // Poll every 2 seconds to check if meeting becomes active
+                Some(Interval::new(2000, move || {
+                    let meeting_id = meeting_id.clone();
+                    let meeting_status = meeting_status.clone();
+                    let host_display_name = host_display_name.clone();
+                    let current_user_email = current_user_email.clone();
+                    let came_from_waiting_room = came_from_waiting_room.clone();
+                    let display_name = display_name.clone();
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        // Check if meeting is now active
+                        match get_meeting_info(&meeting_id).await {
+                            Ok(info) => {
+                                log::info!("Meeting state check: {}", info.state);
+                                // Meeting is active when state is "active" (not "idle" or "ended")
+                                if info.state == "active" {
+                                    log::info!("Meeting is now active! Attempting to join...");
+                                    // Try to join again
+                                    match join_meeting(&meeting_id, Some(&display_name)).await {
+                                        Ok(response) => {
+                                            log::info!(
+                                                "Join after meeting active: status={}, is_host={}",
+                                                response.status,
+                                                response.is_host
+                                            );
+                                            current_user_email.set(Some(response.email.clone()));
+
+                                            let determined_host_display_name = info.host_display_name.clone();
+                                            host_display_name.set(determined_host_display_name.clone());
+
+                                            match response.status.as_str() {
+                                                "admitted" => {
+                                                    meeting_status.set(MeetingStatus::Admitted {
+                                                        is_host: response.is_host,
+                                                        host_display_name: determined_host_display_name,
+                                                    });
+                                                }
+                                                "waiting" => {
+                                                    came_from_waiting_room.set(true);
+                                                    meeting_status.set(MeetingStatus::Waiting);
+                                                }
+                                                "rejected" => {
+                                                    meeting_status.set(MeetingStatus::Rejected);
+                                                }
+                                                _ => {
+                                                    meeting_status.set(MeetingStatus::Error(format!(
+                                                        "Unknown status: {}",
+                                                        response.status
+                                                    )));
+                                                }
+                                            }
+                                        }
+                                        Err(JoinError::MeetingNotActive) => {
+                                            // Still not active, keep waiting
+                                            log::info!("Meeting still not accepting joins, continuing to wait");
+                                        }
+                                        Err(e) => {
+                                            log::error!("Error joining meeting: {}", e);
+                                            meeting_status.set(MeetingStatus::Error(e.to_string()));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Error checking meeting status: {}", e);
+                                // Don't transition to error state, just keep polling
+                            }
+                        }
+                    });
+                }))
+            } else {
+                None
+            };
+
+            // Return cleanup function
+            move || {
+                drop(interval);
+            }
+        });
+    }
+
     // Logout handler
     let on_logout = {
         let navigator = navigator.clone();
@@ -228,6 +331,10 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 )));
                             }
                         }
+                    }
+                    Err(JoinError::MeetingNotActive) => {
+                        log::info!("Meeting not active yet, waiting for host to start");
+                        meeting_status.set(MeetingStatus::WaitingForMeeting);
                     }
                     Err(e) => {
                         log::error!("Join meeting error: {}", e);
@@ -414,7 +521,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         }
                     }
 
-                    // User is waiting
+                    // User is waiting in the waiting room
                     (Some(_), MeetingStatus::Waiting) => {
                         html! {
                             <WaitingRoom
@@ -423,6 +530,31 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 on_rejected={on_rejected}
                                 on_cancel={on_cancel_waiting}
                             />
+                        }
+                    }
+
+                    // Waiting for host to start the meeting
+                    (Some(_), MeetingStatus::WaitingForMeeting) => {
+                        html! {
+                            <div class="waiting-container">
+                                <div class="waiting-card card-apple">
+                                    <div class="loading-spinner" style="width: 48px; height: 48px; margin-bottom: 1.5rem;"></div>
+                                    <h2>{"Waiting for meeting to start"}</h2>
+                                    <p style="color: #666; margin-bottom: 1.5rem;">
+                                        {"The host hasn't started this meeting yet. You'll automatically join once the meeting begins."}
+                                    </p>
+                                    <button
+                                        class="btn-apple btn-secondary"
+                                        onclick={Callback::from(move |_| {
+                                            if let Some(window) = web_sys::window() {
+                                                let _ = window.location().set_href("/");
+                                            }
+                                        })}
+                                    >
+                                        {"Leave"}
+                                    </button>
+                                </div>
+                            </div>
                         }
                     }
 

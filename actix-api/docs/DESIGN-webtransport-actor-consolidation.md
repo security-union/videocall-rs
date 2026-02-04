@@ -350,38 +350,37 @@ async fn start_webtransport_server() {
 
 ## Future Considerations
 
-### Remaining Code Duplication
+### Completed Consolidation
 
-| Duplication | WsChatSession | WtChatSession | Consolidation |
-|-------------|---------------|---------------|---------------|
-| `is_rtt_packet()` | Line 93 | Line 136 | Extract to shared module |
-| RTT echo logic | `StreamHandler` | `Handler<WtInbound>` | Extract to helper fn |
-| Health packet processing | Line 282 | Line 322 | Already uses shared `health_processor` |
-| `KEEP_ALIVE_PING` | N/A | Line 56 | WebSocket uses WS ping frames |
+The following duplications have been consolidated into `src/actors/packet_handler.rs`:
 
-### Recommended Next Steps
+| Item | Status | Implementation |
+|------|--------|----------------|
+| `is_rtt_packet()` | ✅ Consolidated | `packet_handler::is_rtt_packet()` |
+| Packet classification | ✅ Consolidated | `packet_handler::classify_packet()` → `PacketKind` enum |
+| Health packet check | ✅ Uses shared | `health_processor::is_health_packet_bytes()` |
 
-1. **Create `src/actors/session_helpers.rs`**:
-   ```rust
-   pub fn is_rtt_packet(data: &[u8]) -> bool { ... }
-   pub fn should_echo_rtt(data: &[u8]) -> Option<Vec<u8>> { ... }
-   ```
+Both session actors now use the same pattern:
 
-2. **Both session actors use shared helpers**:
-   ```rust
-   use crate::actors::session_helpers::{is_rtt_packet, should_echo_rtt};
-   ```
+```rust
+use crate::actors::packet_handler::{classify_packet, PacketKind};
 
-3. **Consider `SessionBehavior` trait** if more behavior can be generalized:
-   ```rust
-   trait SessionBehavior {
-       fn handle_packet(&mut self, data: &[u8]) -> PacketAction;
-   }
-   enum PacketAction { Echo(Vec<u8>), Forward, HealthProcess, Ignore }
-   ```
+match classify_packet(&data) {
+    PacketKind::Rtt => { /* echo back to sender */ }
+    PacketKind::Health => { /* process diagnostics */ }
+    PacketKind::Data => { /* forward to ChatServer */ }
+}
+```
+
+### Remaining Differences (By Design)
+
+| Aspect | WebSocket | WebTransport | Reason |
+|--------|-----------|--------------|--------|
+| I/O Model | `WebsocketContext` | `mpsc` channels | Different underlying protocols |
+| Keep-alive | WS ping/pong frames | Custom datagram ping | Protocol-specific |
+| `KEEP_ALIVE_PING` | N/A | Defined in `WtChatSession` | WebTransport-specific |
 
 ### Not Recommended to Consolidate
 
-- **Transport I/O**: WebSocket uses `WebsocketContext`, WebTransport uses channels - fundamentally different
-- **Keep-alive**: WebSocket uses WS ping/pong frames, WebTransport uses custom datagrams
-- **Single binary**: Adds complexity, horizontal scaling works well with separate binaries
+- **Transport I/O**: Fundamentally different - WebSocket uses actix-web-actors, WebTransport uses quinn
+- **Single binary**: Separate binaries work well for horizontal scaling via NATS

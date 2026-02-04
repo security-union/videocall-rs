@@ -368,17 +368,25 @@ impl Component for Host {
             }
             Msg::VideoDeviceChanged(video) => {
                 log::info!("Video device changed: {video}");
-                // Update the MediaDeviceList selection
+
                 self.media_devices.video_inputs.select(&video.device_id);
-                if self.camera.select(video.device_id.clone()) {
-                    let link = ctx.link().clone();
-                    let timeout = Timeout::new(1000, move || {
-                        link.send_message(Msg::EnableVideo(true));
-                    });
-                    timeout.forget();
+
+                let was_enabled = ctx.props().video_enabled;
+
+                if was_enabled {
+                    self.camera.stop();
                 }
-                true // Need to re-render to update device selector displays
+
+                self.camera.select(video.device_id.clone());
+
+                if was_enabled {
+                    self.camera.set_enabled(true);
+                    self.camera.start();
+                }
+
+                true
             }
+
             Msg::SpeakerDeviceChanged(speaker) => {
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_outputs.select(&speaker.device_id);

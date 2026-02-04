@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 use videocall_types::SYSTEM_USER_EMAIL;
 
-use super::chat_session::SessionId;
+use super::session_logic::SessionId;
 
 /// Internal message to clean up active_subs when a spawned join task fails.
 /// This fixes a race condition where start_session could fail inside the spawned task,

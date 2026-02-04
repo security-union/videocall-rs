@@ -34,7 +34,7 @@ use actix_web::{
 use actix_web_actors::ws::{handshake, WebsocketContext};
 use reqwest::header::LOCATION;
 use sec_api::{
-    actors::{chat_server::ChatServer, chat_session::WsChatSession},
+    actors::{chat_server::ChatServer, transports::ws_chat_session::WsChatSession},
     api,
     auth::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,

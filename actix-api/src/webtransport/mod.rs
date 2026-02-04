@@ -838,9 +838,15 @@ mod tests {
         // Keep connections alive
         start_keep_alive_tasks(&session_a, &session_b, &session_c).await;
 
-        // Wait a bit for all NATS system messages to propagate
-        // (e.g., Charlie's MEETING_STARTED broadcast to Alice who's in the same room)
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for Alice to receive Charlie's MEETING_STARTED broadcast
+        // (Alice and Charlie are in the same room, so Alice gets notified when Charlie joins)
+        wait_for_condition_bool(
+            || async move { get_test_packet_counter_for_user(user_a) >= 2 },
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("Alice should receive Charlie's MEETING_STARTED");
 
         // ========== PHASE 1: CROSS-LOBBY ISOLATION TEST ==========
         println!("\n--- Phase 1: Testing Cross-Lobby Isolation ---");

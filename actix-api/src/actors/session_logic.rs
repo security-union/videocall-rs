@@ -33,7 +33,7 @@ use crate::server_diagnostics::{
 use crate::session_manager::SessionManager;
 use actix::Addr;
 use std::sync::Arc;
-use tracing::{error, info, trace};
+use tracing::{info, trace};
 use uuid::Uuid;
 
 pub type SessionId = String;
@@ -51,12 +51,6 @@ pub enum InboundAction {
     Processed,
     /// Keep-alive ping, no action needed
     KeepAlive,
-}
-
-/// Result of starting a session
-pub struct SessionStartResult {
-    pub start_time_ms: u64,
-    pub creator_id: String,
 }
 
 /// Shared session logic, transport-agnostic.
@@ -114,24 +108,6 @@ impl SessionLogic {
             self.room.clone(),
             transport.to_string(),
         );
-    }
-
-    /// Start the session via SessionManager
-    pub async fn start_session(&self) -> Result<SessionStartResult, String> {
-        match self
-            .session_manager
-            .start_session(&self.room, &self.email)
-            .await
-        {
-            Ok(result) => Ok(SessionStartResult {
-                start_time_ms: result.start_time_ms,
-                creator_id: result.creator_id,
-            }),
-            Err(e) => {
-                error!("failed to start session: {}", e);
-                Err(e.to_string())
-            }
-        }
     }
 
     /// Build MEETING_STARTED packet

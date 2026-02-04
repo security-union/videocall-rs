@@ -204,6 +204,8 @@ pub async fn start(
     );
 
     // Accept new WebTransport connections
+    // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
+    // actor requires the actix LocalSet context for spawn_local.
     while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
         let chat_server = chat_server.clone();
@@ -211,7 +213,7 @@ pub async fn start(
         let pool = pool.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
-        tokio::spawn(async move {
+        actix_rt::spawn(async move {
             if let Err(err) = run_webtransport_connection_from_request(
                 request,
                 chat_server,
@@ -404,6 +406,7 @@ async fn handle_webtransport_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protobuf::Message as ProtobufMessage;
     use rustls::crypto::CryptoProvider;
     use std::time::Duration;
     use videocall_types::protos::media_packet::media_packet::MediaType as VcMediaType;
@@ -455,10 +458,13 @@ mod tests {
         let (_, tracker_sender, tracker_receiver) =
             ServerDiagnostics::new_with_channel(nats_client.clone());
 
+        // Clone nats_client for use in both spawned tasks
+        let nats_client_for_tracker = nats_client.clone();
+
         // Start tracker message loop
-        tokio::spawn(async move {
+        actix_rt::spawn(async move {
             let connection_tracker =
-                std::sync::Arc::new(ServerDiagnostics::new(nats_client.clone()));
+                std::sync::Arc::new(ServerDiagnostics::new(nats_client_for_tracker));
             connection_tracker.run_message_loop(tracker_receiver).await;
         });
 
@@ -480,7 +486,7 @@ mod tests {
             },
         };
 
-        tokio::spawn(async move {
+        actix_rt::spawn(async move {
             if let Err(e) = webtransport::start(
                 opt,
                 chat_server,
@@ -627,7 +633,7 @@ mod tests {
         .map(|_| ())
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[actix_rt::test]
     async fn test_relay_packet_webtransport_between_two_clients() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -751,7 +757,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[actix_rt::test]
     async fn test_lobby_isolation() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -1074,7 +1080,7 @@ mod tests {
     // Tests: meeting creation, participant join/leave, meeting end
     // ==========================================================================
 
-    #[tokio::test(flavor = "current_thread")]
+    #[actix_rt::test]
     #[serial_test::serial]
     async fn test_meeting_lifecycle_webtransport() {
         let _ = tracing_subscriber::fmt()

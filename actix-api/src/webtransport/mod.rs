@@ -16,23 +16,21 @@
  * conditions.
  */
 
-use crate::client_diagnostics::health_processor;
+use crate::actors::chat_server::ChatServer;
+use crate::actors::wt_chat_session::{WtChatSession, WtInbound, WtInboundSource, WtOutbound};
 use crate::constants::VALID_ID_PATTERN;
-use crate::db_pool;
-use crate::server_diagnostics::{
-    send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
-};
-use crate::session_manager::{SessionEndResult, SessionManager};
+use crate::server_diagnostics::TrackerSender;
+use crate::session_manager::SessionManager;
+use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
-use async_nats::Subject;
-use futures::StreamExt;
-use protobuf::Message;
+use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sqlx::PgPool;
 use std::io::Read;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
-use tracing::{debug, error, info, trace, trace_span, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, trace_span, warn};
 
 lazy_static::lazy_static! {
     static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = std::env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
@@ -89,12 +87,7 @@ fn reset_test_packet_counters() {
     counters_map.clear();
 }
 
-use videocall_types::feature_flags::FeatureFlags;
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
-use web_transport_quinn::{quinn, Session, SessionError};
+use web_transport_quinn::{quinn, Session};
 
 /// Videocall WebTransport API
 ///
@@ -107,19 +100,7 @@ pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", 
 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 
-const KEEP_ALIVE_PING: &[u8] = b"ping";
-
-/// Check if the binary data is an RTT packet that should be echoed back
-fn is_rtt_packet(data: &[u8]) -> bool {
-    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-        if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-            if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                return media_packet.media_type == MediaType::RTT.into();
-            }
-        }
-    }
-    false
-}
+// Note: is_rtt_packet and KEEP_ALIVE_PING are now handled by WtChatSession actor
 
 #[derive(Debug)]
 pub struct WebTransportOpt {
@@ -162,7 +143,23 @@ fn get_key_and_cert_chain<'a>(
     Ok((key, chain))
 }
 
-pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error>> {
+/// Start the WebTransport server
+///
+/// # Arguments
+/// * `opt` - WebTransport server options (listen address, certs)
+/// * `chat_server` - Address of the ChatServer actor
+/// * `nats_client` - NATS client for health packet processing
+/// * `pool` - Optional database pool
+/// * `tracker_sender` - Server diagnostics tracker
+/// * `session_manager` - Session lifecycle manager
+pub async fn start(
+    opt: WebTransportOpt,
+    chat_server: Addr<ChatServer>,
+    nats_client: async_nats::client::Client,
+    pool: Option<PgPool>,
+    tracker_sender: TrackerSender,
+    session_manager: SessionManager,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
     let (key, certs) = get_key_and_cert_chain(opt.certs)?;
@@ -206,44 +203,24 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
         opt.listen, *QUIC_MAX_IDLE_TIMEOUT_SECS, *QUIC_KEEP_ALIVE_INTERVAL_SECS
     );
 
-    let nc =
-        async_nats::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
-            .await
-            .unwrap();
-
-    // Create database pool only if enabled
-    let pool = if FeatureFlags::database_enabled() {
-        Some(
-            db_pool::create_pool()
-                .await
-                .expect("Failed to create database pool"),
-        )
-    } else {
-        warn!("DATABASE_ENABLED=false, database features will be disabled");
-        None
-    };
-
-    // Create connection tracker with message channel
-    let (connection_tracker, tracker_sender, tracker_receiver) =
-        ServerDiagnostics::new_with_channel(nc.clone());
-
-    // Start the connection tracker message processing task
-    let connection_tracker = std::sync::Arc::new(connection_tracker);
-    let tracker_task = connection_tracker.clone();
-    tokio::spawn(async move {
-        tracker_task.run_message_loop(tracker_receiver).await;
-    });
-
-    // 2. Accept new WebTransport connections using 0.7.3 API
+    // Accept new WebTransport connections
     while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
-        let nc = nc.clone();
+        let chat_server = chat_server.clone();
+        let nats_client = nats_client.clone();
         let pool = pool.clone();
         let tracker_sender = tracker_sender.clone();
+        let session_manager = session_manager.clone();
         tokio::spawn(async move {
-            // Handle WebTransport request directly using 0.7.3 API
-            if let Err(err) =
-                run_webtransport_connection_from_request(request, nc, pool, tracker_sender).await
+            if let Err(err) = run_webtransport_connection_from_request(
+                request,
+                chat_server,
+                nats_client,
+                pool,
+                tracker_sender,
+                session_manager,
+            )
+            .await
             {
                 error!("Failed to handle WebTransport connection: {err:?}");
             }
@@ -255,9 +232,11 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
-    nc: async_nats::client::Client,
-    pool: Option<PgPool>,
+    chat_server: Addr<ChatServer>,
+    nats_client: async_nats::client::Client,
+    _pool: Option<PgPool>,
     tracker_sender: TrackerSender,
+    session_manager: SessionManager,
 ) -> anyhow::Result<()> {
     warn!("received WebTransport request: {}", request.url());
     let url = request.url();
@@ -286,192 +265,74 @@ async fn run_webtransport_connection_from_request(
     let session = request.ok().await.context("failed to accept session")?;
     debug!("accepted session");
 
-    // Run the session
-    if let Err(err) =
-        handle_webtransport_session(session, &username, &lobby_id, nc, pool, tracker_sender).await
+    // Run the session with actor
+    if let Err(err) = handle_webtransport_session(
+        session,
+        &username,
+        &lobby_id,
+        chat_server,
+        nats_client,
+        tracker_sender,
+        session_manager,
+    )
+    .await
     {
         info!("closing session: {}", err);
     }
     Ok(())
 }
 
-#[tracing::instrument(level = "trace", skip(session, pool))]
+/// Handle a WebTransport session using the WtChatSession actor
+#[tracing::instrument(
+    level = "trace",
+    skip(session, chat_server, nats_client, tracker_sender, session_manager)
+)]
 async fn handle_webtransport_session(
     session: Session,
     username: &str,
     lobby_id: &str,
-    nc: async_nats::client::Client,
-    pool: Option<PgPool>,
+    chat_server: Addr<ChatServer>,
+    nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
+    session_manager: SessionManager,
 ) -> anyhow::Result<()> {
-    let session_manager = SessionManager::new(pool.clone());
-    // Generate unique session ID for this WebTransport connection
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // Create channel for actor → WebTransport I/O
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<WtOutbound>(256);
+
+    // Start the WtChatSession actor
+    let actor = WtChatSession::new(
+        chat_server,
+        lobby_id.to_string(),
+        username.to_string(),
+        outbound_tx,
+        nats_client,
+        tracker_sender,
+        session_manager,
+    );
+    let actor_addr = actor.start();
 
     let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
-    // Create shutdown channel to signal connection errors
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    // IMPORTANT: Subscribe to NATS FIRST, before sending MEETING_STARTED.
-    // This ensures that when the client receives MEETING_STARTED, the server
-    // is already subscribed and ready to relay packets. This eliminates the
-    // race condition where packets could be lost if sent before subscription.
-    let subject = format!("room.{lobby_id}.*").replace(' ', "_");
-    let specific_subject: Subject = format!("room.{lobby_id}.{username}")
-        .replace(' ', "_")
-        .into();
-    let mut sub = match nc
-        .queue_subscribe(subject.clone(), specific_subject.to_string())
-        .await
-    {
-        Ok(sub) => {
-            debug!("Subscribed to subject {subject}");
-            sub
-        }
-        Err(e) => {
-            let err = format!("error subscribing to subject {subject}: {e}");
-            error!("{err}");
-            return Err(anyhow!(err));
-        }
-    };
-
-    // NOW send MEETING_STARTED - client can safely start sending packets
-    // because NATS subscription is ready
-    handle_send_connection_started(
-        &tracker_sender,
-        session_id.clone(),
-        username.to_string(),
-        &session_manager,
-        lobby_id,
-        &session,
-    )
-    .await;
-
-    let specific_subject_clone = specific_subject.clone();
-
-    // NATS receive task
+    // UniStream reader task: reads from quinn Session, sends WtInbound to actor
     {
         let session = session.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_nats = tracker_sender.clone();
-        let shutdown_tx_nats = shutdown_tx.clone();
+        let actor_addr = actor_addr.clone();
         #[cfg_attr(not(test), allow(unused_variables))]
         let username_clone = username.to_string();
         join_set.spawn(async move {
-            let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
-            loop {
-                tokio::select! {
-                    msg = sub.next() => {
-                        match msg {
-                            Some(msg) => {
-                                if msg.subject == specific_subject_clone {
-                                    continue;
-                                }
-
-                                #[cfg(test)]
-                                increment_test_packet_counter_for_user(&username_clone);
-                                let session_id_clone = session_id_clone.clone();
-                                let payload_size = msg.payload.len() as u64;
-                                let tracker_sender_inner = tracker_sender_nats.clone();
-                                let session = session.clone();
-                                let shutdown_tx_inner = shutdown_tx_nats.clone();
-                                tokio::spawn(async move {
-                                    let stream = session.open_uni().await;
-                                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
-                                    match stream {
-                                        Ok(mut uni_stream) => {
-                                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                                error!("Error writing to unidirectional stream: {}", e);
-                                            } else {
-                                                // Track data sent
-                                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
-                                            }
-                                        }
-                                        Err(SessionError::ConnectionError(e)) => {
-                                            error!("Connection error: {}", e);
-                                            let _ = shutdown_tx_inner.send(()).await;
-                                        }
-                                        Err(SessionError::WebTransportError(e)) => {
-                                            error!("WebTransport error: {}", e);
-                                        }
-                                        Err(e) => {
-                                            error!("Error opening unidirectional stream: {}", e);
-                                        }
-                                    }
-                                });
-                            }
-                            None => {
-                                info!("NATS subscription ended");
-                                break;
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        info!("Received shutdown signal, stopping NATS receive task");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    // WebTransport unidirectional receive task
-    {
-        let session = session.clone();
-        let nc = nc.clone();
-        let specific_subject = specific_subject.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_wt = tracker_sender.clone();
-        join_set.spawn(async move {
             while let Ok(mut uni_stream) = session.accept_uni().await {
-                let nc = nc.clone();
-                let specific_subject = specific_subject.clone();
-                let session_clone = session.clone();
-                let session_id_clone = session_id_clone.clone();
-                let tracker_sender_inner = tracker_sender_wt.clone();
+                let actor_addr = actor_addr.clone();
+                #[cfg(test)]
+                let username_for_test = username_clone.clone();
                 tokio::spawn(async move {
-                    let data_tracker = DataTracker::new(tracker_sender_inner);
-                    let result = uni_stream.read_to_end(usize::MAX).await;
-                    match result {
+                    match uni_stream.read_to_end(usize::MAX).await {
                         Ok(buf) => {
-                            let buf_size = buf.len() as u64;
-                            // Track data received
-                            data_tracker.track_received(&session_id_clone, buf_size);
-
-                            // Check if this is an RTT packet that should be echoed back
-                            if is_rtt_packet(&buf) {
-                                trace!("Echoing RTT packet back via WebTransport");
-                                match session_clone.open_uni().await {
-                                    Ok(mut echo_stream) => {
-                                        if let Err(e) = echo_stream.write_all(&buf).await {
-                                            error!("Error echoing RTT packet: {}", e);
-                                        } else {
-                                            // Track data sent for echo
-                                            data_tracker.track_sent(&session_id_clone, buf_size);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Error opening echo stream: {}", e);
-                                    }
-                                }
-                            } else if health_processor::is_health_packet_bytes(&buf) {
-                                // Process health packet for diagnostics (don't relay)
-                                debug!("WT-SERVER: Received health packet via unidirectional stream (size: {} bytes) - processing locally", buf.len());
-                                health_processor::process_health_packet_bytes(&buf, nc.clone());
-                            } else {
-                                // Normal packet processing - publish to NATS
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        nc.publish(specific_subject.clone(), buf.into()).await
-                                    {
-                                        error!(
-                                            "Error publishing to subject {}: {}",
-                                            &specific_subject, e
-                                        );
-                                    }
-                                });
-                            }
+                            #[cfg(test)]
+                            increment_test_packet_counter_for_user(&username_for_test);
+                            let _ = actor_addr.try_send(WtInbound {
+                                data: Bytes::from(buf),
+                                source: WtInboundSource::UniStream,
+                            });
                         }
                         Err(e) => {
                             error!("Error reading from unidirectional stream: {}", e);
@@ -479,150 +340,66 @@ async fn handle_webtransport_session(
                     }
                 });
             }
-            info!("WebTransport unidirectional receive task ended");
+            info!("WebTransport UniStream reader task ended");
         });
     }
 
-    // Clone nc for use after join_set finishes
-    let nc_for_end = nc.clone();
-
-    // WebTransport datagram receive task
+    // Datagram reader task: reads datagrams from quinn Session, sends WtInbound to actor
     {
         let session = session.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_wt_datagram = tracker_sender.clone();
+        let actor_addr = actor_addr.clone();
         join_set.spawn(async move {
-            let data_tracker = DataTracker::new(tracker_sender_wt_datagram);
             while let Ok(buf) = session.read_datagram().await {
-                let buf_size = buf.len() as u64;
-                // Track data received
-                data_tracker.track_received(&session_id_clone, buf_size);
+                let _ = actor_addr.try_send(WtInbound {
+                    data: buf,
+                    source: WtInboundSource::Datagram,
+                });
+            }
+            info!("WebTransport Datagram reader task ended");
+        });
+    }
 
-                // Check if this is an RTT packet that should be echoed back
-                if is_rtt_packet(&buf) {
-                    debug!("Echoing RTT datagram back via WebTransport");
-                    if let Err(e) = session.send_datagram(buf.clone()) {
-                        error!("Error echoing RTT datagram: {}", e);
-                    } else {
-                        // Track data sent for echo
-                        data_tracker.track_sent(&session_id_clone, buf_size);
-                    }
-                } else if health_processor::is_health_packet_bytes(&buf) {
-                    // Process health packet for diagnostics (don't relay)
-                    health_processor::process_health_packet_bytes(&buf, nc.clone());
-                } else if buf.as_ref() == KEEP_ALIVE_PING {
-                    // Keep-alive packet - don't relay, just ignore
-                } else {
-                    // Normal datagram processing - publish to NATS
-                    let nc = nc.clone();
-                    if let Err(e) = nc.publish(specific_subject.clone(), buf).await {
-                        error!("Error publishing to subject {}: {}", specific_subject, e);
+    // Writer task: receives from outbound channel, writes to quinn Session
+    {
+        let session = session.clone();
+        join_set.spawn(async move {
+            while let Some(msg) = outbound_rx.recv().await {
+                match msg {
+                    WtOutbound::UniStream(data) => match session.open_uni().await {
+                        Ok(mut stream) => {
+                            if let Err(e) = stream.write_all(&data).await {
+                                error!("Error writing to UniStream: {}", e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error opening UniStream: {}", e);
+                            break;
+                        }
+                    },
+                    WtOutbound::Datagram(data) => {
+                        if let Err(e) = session.send_datagram(data) {
+                            error!("Error sending datagram: {}", e);
+                            // Don't break on datagram errors - they're unreliable
+                        }
                     }
                 }
             }
-            info!("WebTransport datagram receive task ended");
+            info!("WebTransport Writer task ended");
         });
     }
 
+    // Wait for any task to finish (indicates session end)
     join_set.join_next().await;
     join_set.shutdown().await;
 
-    // Track connection end and handle meeting lifecycle
-    handle_send_connection_ended(
-        &tracker_sender,
-        session_id.clone(),
-        &session_manager,
-        lobby_id,
-        username,
-        &nc_for_end,
-    )
-    .await;
-
-    warn!("Finished handling session: {session_id} (username: {username}, lobby: {lobby_id})");
+    // Actor will handle cleanup via its stopping() method
+    warn!("Finished handling WebTransport session for {username} in {lobby_id}");
     Ok(())
 }
 
-pub async fn handle_send_connection_started(
-    tracker_sender: &TrackerSender,
-    session_id: String,
-    user_id: String,
-    session_manager: &SessionManager,
-    lobby_id: &str,
-    session: &Session,
-) {
-    send_connection_started(
-        tracker_sender,
-        session_id.clone(),
-        user_id.clone(),
-        lobby_id.to_string(),
-        "webtransport".to_string(),
-    );
-
-    // Start session (handles meeting creation if first participant)
-    match session_manager.start_session(lobby_id, &user_id).await {
-        Ok(result) => {
-            // Send MEETING_STARTED packet to client (protobuf)
-            // Use result.creator_id to ensure correct host is identified (not the joining user)
-            let bytes = SessionManager::build_meeting_started_packet(
-                lobby_id,
-                result.start_time_ms,
-                &result.creator_id,
-            );
-            match session.open_uni().await {
-                Ok(mut stream) => {
-                    if let Err(e) = stream.write_all(&bytes).await {
-                        error!("Error sending MEETING_STARTED: {}", e);
-                    }
-                }
-                Err(e) => error!("Error opening stream for MEETING_STARTED: {}", e),
-            }
-        }
-        Err(e) => {
-            error!("Failed to start session: {}", e);
-            // Send error to client and close connection
-            let error_msg = format!("Session rejected: {e}");
-            let error_bytes = SessionManager::build_meeting_ended_packet(lobby_id, &error_msg);
-            if let Ok(mut stream) = session.open_uni().await {
-                let _ = stream.write_all(&error_bytes).await;
-            }
-            // Close the session - user is rejected
-            session.close(1u32, b"Session rejected");
-        }
-    }
-}
-
-pub async fn handle_send_connection_ended(
-    tracker_sender: &TrackerSender,
-    session_id: String,
-    session_manager: &SessionManager,
-    lobby_id: &str,
-    user_id: &str,
-    nc: &async_nats::client::Client,
-) {
-    send_connection_ended(tracker_sender, session_id.clone());
-
-    // End session (handles meeting end logic based on participant count and host status)
-    match session_manager.end_session(lobby_id, user_id).await {
-        Ok(SessionEndResult::HostEndedMeeting) => {
-            // Notify all participants that host ended the meeting (protobuf)
-            let bytes = SessionManager::build_meeting_ended_packet(
-                lobby_id,
-                "The host has ended the meeting",
-            );
-            let subject = format!("room.{}.system", lobby_id.replace(' ', "_"));
-            if let Err(e) = nc.publish(subject, bytes.into()).await {
-                error!("Error publishing MEETING_ENDED: {}", e);
-            }
-        }
-        Ok(SessionEndResult::LastParticipantLeft) => {
-            info!("Meeting ended - last participant left");
-        }
-        Ok(SessionEndResult::MeetingContinues { remaining_count }) => {
-            info!("Session ended, {} participants remaining", remaining_count);
-        }
-        Err(e) => error!("Error ending session: {}", e),
-    }
-}
+// Note: handle_send_connection_started and handle_send_connection_ended are now
+// handled by the WtChatSession actor internally via ChatServer coordination.
 
 #[cfg(test)]
 mod tests {
@@ -634,12 +411,56 @@ mod tests {
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType as VcPacketType;
     use videocall_types::protos::packet_wrapper::PacketWrapper as VcPacketWrapper;
 
+    const KEEP_ALIVE_PING: &[u8] = b"ping";
+
     async fn start_webtransport_server() -> tokio::task::JoinHandle<()> {
         if let Err(e) = CryptoProvider::install_default(rustls::crypto::ring::default_provider()) {
             error!("Error installing crypto provider: {e:?}");
         }
+        use crate::actors::chat_server::ChatServer;
+        use crate::db_pool;
+        use crate::server_diagnostics::ServerDiagnostics;
+        use crate::session_manager::SessionManager;
         use crate::webtransport::{self, Certs};
+        use actix::Actor;
         use std::net::ToSocketAddrs;
+        use videocall_types::feature_flags::FeatureFlags;
+
+        // Connect to NATS
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        // Create database pool only if enabled
+        let pool = if FeatureFlags::database_enabled() {
+            Some(
+                db_pool::create_pool()
+                    .await
+                    .expect("Failed to create database pool"),
+            )
+        } else {
+            None
+        };
+
+        // Start ChatServer actor
+        let chat_server = ChatServer::new(nats_client.clone(), pool.clone())
+            .await
+            .start();
+
+        // Create SessionManager
+        let session_manager = SessionManager::new(pool.clone());
+
+        // Create connection tracker
+        let (_, tracker_sender, tracker_receiver) =
+            ServerDiagnostics::new_with_channel(nats_client.clone());
+
+        // Start tracker message loop
+        tokio::spawn(async move {
+            let connection_tracker =
+                std::sync::Arc::new(ServerDiagnostics::new(nats_client.clone()));
+            connection_tracker.run_message_loop(tracker_receiver).await;
+        });
 
         // Start WebTransport server
         let opt = webtransport::WebTransportOpt {
@@ -660,7 +481,16 @@ mod tests {
         };
 
         tokio::spawn(async move {
-            if let Err(e) = webtransport::start(opt).await {
+            if let Err(e) = webtransport::start(
+                opt,
+                chat_server,
+                nats_client,
+                pool,
+                tracker_sender,
+                session_manager,
+            )
+            .await
+            {
                 eprintln!("WebTransport server error: {e}");
             }
         })

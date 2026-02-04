@@ -32,7 +32,7 @@ use js_sys::Boolean;
 use js_sys::Uint8Array;
 use protobuf::Message;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::{
@@ -94,6 +94,7 @@ pub struct MicrophoneEncoder {
     _on_encoder_settings_update: Option<Callback<String>>,
     codec: AudioWorkletCodec,
     on_error: Option<Callback<String>>,
+    is_speaking: Rc<AtomicBool>,
 }
 
 impl MicrophoneEncoder {
@@ -109,6 +110,7 @@ impl MicrophoneEncoder {
             _on_encoder_settings_update: Some(on_encoder_settings_update),
             codec: AudioWorkletCodec::default(),
             on_error: Some(on_error),
+            is_speaking: Rc::new(AtomicBool::new(false)),
         }
     }
 
@@ -192,12 +194,16 @@ impl MicrophoneEncoder {
         let audio_output_handler = {
             log::info!("Starting Microphone audio encoder");
             let mut sequence_number = 0;
+            let is_speaking = self.is_speaking.clone();
+            let client_for_vad = client.clone();
 
             Box::new(move |chunk: MessageEvent| {
                 // Check if encoder should stop
                 if destroy_for_handler.load(Ordering::Acquire)
                     || !enabled_for_handler.load(Ordering::Acquire)
                 {
+                    is_speaking.store(false, Ordering::Relaxed);
+                    client_for_vad.set_speaking(false);
                     log::debug!(
                         "Audio handler stopping: destroy={}, enabled={}",
                         destroy_for_handler.load(Ordering::Acquire),
@@ -219,11 +225,18 @@ impl MicrophoneEncoder {
 
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
+                    let packet_size = data.length();
+                    let speaking = packet_size > 150;
+                    log::info!("🔴 VAD: packet_size={}, speaking={}", packet_size, speaking);
+
+                    is_speaking.store(speaking, Ordering::Relaxed);
+                    client_for_vad.set_speaking(speaking);
+
                     let packet: PacketWrapper =
                         transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
                     client.send_packet(packet);
                     sequence_number += 1;
-                    log::debug!("Sent audio frame with sequence: {sequence_number}");
+                    log::debug!("Sent audio frame with sequence: {sequence_number}, size: {packet_size}, speaking: {speaking}");
                 } else {
                     log::error!("Received non-MessageEvent: {chunk:?}");
                 }

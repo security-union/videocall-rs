@@ -39,9 +39,11 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
     let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
+    let is_speaking = client.is_speaking_for_peer(key);
+    log::info!("🟢 UI2222: peer {} is_speaking={}", key, is_speaking);
 
-    let border_style = if is_audio_enabled_for_peer {
-        "border: 3px solid #00ff41; box-shadow: 0 0 15px rgba(0, 255, 65, 0.5); border-radius: 8px; transition: all 0.2s;"
+    let border_style = if is_speaking {
+        "border: 3px solid green; border-radius: 8px; transition: all 0.2s;"
     } else {
         ""
     };

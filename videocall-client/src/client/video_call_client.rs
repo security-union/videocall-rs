@@ -119,6 +119,7 @@ pub struct VideoCallClientOptions {
 
     /// Callback triggered when the meeting ends (optional)
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
+    pub on_speaking_changed: Option<Callback<bool>>,
 }
 
 #[derive(Debug)]
@@ -388,6 +389,7 @@ impl VideoCallClient {
                 })
             },
             election_period_ms,
+            on_speaking_changed: self.options.on_speaking_changed.clone(),
         };
 
         let connection_controller = ConnectionController::new(manager_options, self.aes.clone())?;
@@ -545,6 +547,13 @@ impl VideoCallClient {
             if let Some(peer) = inner.peer_decode_manager.get(key) {
                 return peer.audio_enabled;
             }
+        }
+        false
+    }
+
+    pub fn is_speaking_for_peer(&self, key: &String) -> bool {
+        if let Ok(inner) = self.inner.try_borrow() {
+            return inner.peer_decode_manager.is_peer_speaking(key);
         }
         false
     }
@@ -1037,8 +1046,8 @@ impl Inner {
             iv: self.aes.iv.to_vec(),
             ..Default::default()
         }
-        .write_to_bytes()
-        .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
+            .write_to_bytes()
+            .map_err(|e| anyhow!("Failed to serialize aes packet: {e}"))
     }
 
     fn encrypt_aes_packet(&self, aes_packet: &[u8], pub_key: &RsaPublicKey) -> Result<Vec<u8>> {

@@ -32,6 +32,7 @@ pub struct PeerTileProps {
 
 pub enum Msg {
     Diagnostics(DiagEvent),
+    ForceRerender
 }
 
 pub struct PeerTile {
@@ -40,6 +41,7 @@ pub struct PeerTile {
     video_enabled: bool,
     screen_enabled: bool,
     abort_handle: Option<AbortHandle>,
+    _rerender_interval: Option<gloo_timers::callback::Interval>,
 }
 
 impl Component for PeerTile {
@@ -53,12 +55,18 @@ impl Component for PeerTile {
             .context::<VideoCallClientCtx>(Callback::noop())
             .expect("VideoCallClient context missing");
 
+        let link = ctx.link().clone();
+        let rerender_interval = gloo_timers::callback::Interval::new(200, move || {
+            link.send_message(Msg::ForceRerender);
+        });
+
         Self {
             client,
             audio_enabled: false,
             video_enabled: false,
             screen_enabled: false,
             abort_handle: None,
+            _rerender_interval: Some(rerender_interval),
         }
     }
 
@@ -134,6 +142,7 @@ impl Component for PeerTile {
                 }
                 changed
             }
+            Msg::ForceRerender => true,
         }
     }
 

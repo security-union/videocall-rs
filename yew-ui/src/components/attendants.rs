@@ -84,9 +84,11 @@ pub enum Msg {
     OnPeerAdded(String),
     OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
+    OnSpeakingChanged(bool),
     OnMicrophoneError(String),
     DismissMicError,
     UserScreenAction(UserScreenToggleAction),
+    ForceRerender,
     #[cfg(feature = "fake-peers")]
     AddFakePeer,
     #[cfg(feature = "fake-peers")]
@@ -165,9 +167,8 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
-    /// When true, self-video is rendered as floating overlay (original position);
-    /// when false, rendered as grid item
     self_video_floating: bool,
+    _rerender_interval: Option<gloo_timers::callback::Interval>,
 }
 
 impl AttendantsComponent {
@@ -277,6 +278,7 @@ impl AttendantsComponent {
                     link.send_message(Msg::MeetingEnded(message));
                 })
             }),
+            on_speaking_changed: None,
         };
 
         VideoCallClient::new(opts)
@@ -379,6 +381,12 @@ impl Component for AttendantsComponent {
     fn create(ctx: &Context<Self>) -> Self {
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
+
+        let link = ctx.link().clone();
+        let rerender_interval = gloo_timers::callback::Interval::new(200, move || {
+            link.send_message(Msg::ForceRerender);
+        });
+
         let mut self_ = Self {
             client,
             media_device_access,
@@ -407,6 +415,7 @@ impl Component for AttendantsComponent {
             meeting_ended_message: None,
             meeting_info_open: false,
             self_video_floating: load_self_video_position_from_storage(),
+            _rerender_interval: Some(rerender_interval),
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -425,6 +434,13 @@ impl Component for AttendantsComponent {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         log::debug!("YEW-UI: AttendantsComponent update: {msg:?}");
         match msg {
+            Msg::ForceRerender => {
+                true
+            }
+            Msg::OnSpeakingChanged(_speaking) => {
+                log::info!("🟢 Speaking state changed, triggering re-render");
+                true
+            }
             Msg::WsAction(action) => match action {
                 WsAction::Connect => {
                     if self.client.is_connected() {

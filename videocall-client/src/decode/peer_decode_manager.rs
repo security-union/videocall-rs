@@ -87,6 +87,7 @@ pub struct Peer {
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub screen_enabled: bool,
+    pub is_speaking: bool,
     context_initialized: bool,
 }
 
@@ -128,6 +129,7 @@ impl Peer {
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
+            is_speaking: false,
             context_initialized: false,
         })
     }
@@ -292,7 +294,7 @@ impl Peer {
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
-
+                    self.is_speaking = metadata.is_speaking;
                     // Flush video decoder when video is turned off
                     if video_turned_off {
                         self.video.flush();
@@ -569,5 +571,12 @@ impl PeerDecodeManager {
         );
         SharedAudioContext::update_speaker_device(speaker_device_id)?;
         Ok(())
+    }
+
+    pub fn is_peer_speaking(&self, key: &String) -> bool {
+        if let Some(peer) = self.connected_peers.get(key) {
+            return peer.is_speaking;
+        }
+        false
     }
 }

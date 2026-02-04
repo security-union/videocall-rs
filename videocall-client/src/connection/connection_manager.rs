@@ -94,6 +94,7 @@ pub struct ConnectionManagerOptions {
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
     pub election_period_ms: u64,
+    pub on_speaking_changed: Option<Callback<bool>>,
 }
 
 #[derive(Debug)]
@@ -105,7 +106,7 @@ pub struct ConnectionManager {
     rtt_reporter: Option<Interval>,
     rtt_probe_timer: Option<Interval>,
     election_timer: Option<Interval>,
-    rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>, // (id, packet, reception_time)
+    rtt_responses: Rc<RefCell<Vec<(String, MediaPacket, f64)>>>,
     options: ConnectionManagerOptions,
     aes: Rc<Aes128State>,
 }
@@ -188,7 +189,11 @@ impl ConnectionManager {
             };
 
             match Connection::connect(false, connect_options, self.aes.clone()) {
-                Ok(connection) => {
+                Ok(mut connection) => {
+                    if let Some(callback) = &self.options.on_speaking_changed {
+                        connection.set_on_speaking_changed(callback.clone());
+                    }
+
                     self.connections.insert(conn_id.clone(), connection);
                     self.rtt_measurements.insert(
                         conn_id.clone(),
@@ -225,7 +230,11 @@ impl ConnectionManager {
             };
 
             match Connection::connect(true, connect_options, self.aes.clone()) {
-                Ok(connection) => {
+                Ok(mut connection) => {
+                    if let Some(callback) = &self.options.on_speaking_changed {
+                        connection.set_on_speaking_changed(callback.clone());
+                    }
+
                     self.connections.insert(conn_id.clone(), connection);
                     self.rtt_measurements.insert(
                         conn_id.clone(),

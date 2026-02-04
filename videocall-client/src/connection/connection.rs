@@ -51,6 +51,9 @@ pub struct Connection {
     video_enabled: Rc<AtomicBool>,
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
+    is_speaking: Rc<AtomicBool>,
+    last_speaking_time: Rc<Cell<f64>>,
+    on_speaking_changed: Option<Callback<bool>>,
     url: String,
 }
 
@@ -96,11 +99,18 @@ impl Connection {
             audio_enabled: Rc::new(AtomicBool::new(false)),
             video_enabled: Rc::new(AtomicBool::new(false)),
             screen_enabled: Rc::new(AtomicBool::new(false)),
+            is_speaking: Rc::new(AtomicBool::new(false)),
+            last_speaking_time: Rc::new(Cell::new(0.0)),
+            on_speaking_changed: None,
             url,
         };
         connection.start_heartbeat(userid);
 
         Ok(connection)
+    }
+
+    pub fn set_on_speaking_changed(&mut self, callback: Callback<bool>) {
+        self.on_speaking_changed = Some(callback);
     }
 
     pub fn is_connected(&self) -> bool {
@@ -114,11 +124,24 @@ impl Connection {
         let video_enabled = Rc::clone(&self.video_enabled);
         let audio_enabled = Rc::clone(&self.audio_enabled);
         let screen_enabled = Rc::clone(&self.screen_enabled);
+        let is_speaking = Rc::clone(&self.is_speaking);
+        let last_speaking_time = Rc::clone(&self.last_speaking_time);
+        let on_speaking_changed = self.on_speaking_changed.clone();
+
         self.heartbeat = Some(Interval::new(1000, move || {
+            let now = js_sys::Date::now();
+            let time_since_speaking = now - last_speaking_time.get();
+            let is_speaking_val = time_since_speaking < 200.0;
+
+            if let Some(ref callback) = on_speaking_changed {
+                callback.emit(is_speaking_val);
+            }
+
             let heartbeat_metadata = HeartbeatMetadata {
                 video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
                 audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
                 screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                is_speaking: is_speaking_val,
                 ..Default::default()
             };
 
@@ -173,6 +196,13 @@ impl Connection {
         log::debug!("Setting screen enabled to {enabled}");
         self.screen_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_speaking(&self, speaking: bool) {
+        if speaking {
+            self.last_speaking_time.set(js_sys::Date::now());
+        }
+        self.is_speaking.store(speaking, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

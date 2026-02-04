@@ -16,16 +16,16 @@
  * conditions.
  */
 
+mod bridge;
+
 use crate::actors::chat_server::ChatServer;
-use crate::actors::transports::wt_chat_session::{
-    WtChatSession, WtInbound, WtInboundSource, WtOutbound,
-};
+use crate::actors::transports::wt_chat_session::{WtChatSession, WtOutbound};
 use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
+use bridge::WebTransportBridge;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use sqlx::PgPool;
 use std::io::Read;
@@ -301,7 +301,7 @@ async fn handle_webtransport_session(
     session_manager: SessionManager,
 ) -> anyhow::Result<()> {
     // Create channel for actor → WebTransport I/O
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<WtOutbound>(256);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
 
     // Start the WtChatSession actor
     let actor = WtChatSession::new(
@@ -315,95 +315,28 @@ async fn handle_webtransport_session(
     );
     let actor_addr = actor.start();
 
-    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // Create bridge (with test callback if in test mode)
+    #[cfg(test)]
+    let on_packet_sent = {
+        let username_for_callback = username.to_string();
+        Some(
+            Box::new(move || increment_test_packet_counter_for_user(&username_for_callback))
+                as bridge::PacketSentCallback,
+        )
+    };
+    #[cfg(not(test))]
+    let on_packet_sent: Option<bridge::PacketSentCallback> = None;
 
-    // UniStream reader task: reads from quinn Session, sends WtInbound to actor
-    {
-        let session = session.clone();
-        let actor_addr = actor_addr.clone();
-        #[cfg_attr(not(test), allow(unused_variables))]
-        let username_clone = username.to_string();
-        join_set.spawn(async move {
-            while let Ok(mut uni_stream) = session.accept_uni().await {
-                let actor_addr = actor_addr.clone();
-                #[cfg(test)]
-                let username_for_test = username_clone.clone();
-                tokio::spawn(async move {
-                    #[cfg(test)]
-                    let _ = &username_for_test; // Silence unused warning
-                    match uni_stream.read_to_end(usize::MAX).await {
-                        Ok(buf) => {
-                            let _ = actor_addr.try_send(WtInbound {
-                                data: Bytes::from(buf),
-                                source: WtInboundSource::UniStream,
-                            });
-                        }
-                        Err(e) => {
-                            error!("Error reading from unidirectional stream: {}", e);
-                        }
-                    }
-                });
-            }
-            info!("WebTransport UniStream reader task ended");
-        });
-    }
+    let mut bridge = WebTransportBridge::new_with_callback(
+        session,
+        actor_addr.clone(),
+        outbound_rx,
+        on_packet_sent,
+    );
+    bridge.wait_for_disconnect().await;
+    bridge.shutdown().await;
 
-    // Datagram reader task: reads datagrams from quinn Session, sends WtInbound to actor
-    {
-        let session = session.clone();
-        let actor_addr = actor_addr.clone();
-        join_set.spawn(async move {
-            while let Ok(buf) = session.read_datagram().await {
-                let _ = actor_addr.try_send(WtInbound {
-                    data: buf,
-                    source: WtInboundSource::Datagram,
-                });
-            }
-            info!("WebTransport Datagram reader task ended");
-        });
-    }
-
-    // Writer task: receives from outbound channel, writes to quinn Session
-    {
-        let session = session.clone();
-        #[cfg_attr(not(test), allow(unused_variables))]
-        let username_for_writer = username.to_string();
-        join_set.spawn(async move {
-            while let Some(msg) = outbound_rx.recv().await {
-                match msg {
-                    WtOutbound::UniStream(data) => match session.open_uni().await {
-                        Ok(mut stream) => {
-                            if let Err(e) = stream.write_all(&data).await {
-                                error!("Error writing to UniStream: {}", e);
-                                break;
-                            }
-                            // Track packets being sent TO this client (for test verification)
-                            #[cfg(test)]
-                            increment_test_packet_counter_for_user(&username_for_writer);
-                        }
-                        Err(e) => {
-                            error!("Error opening UniStream: {}", e);
-                            break;
-                        }
-                    },
-                    WtOutbound::Datagram(data) => {
-                        if let Err(e) = session.send_datagram(data) {
-                            error!("Error sending datagram: {}", e);
-                            // Don't break on datagram errors - they're unreliable
-                        }
-                    }
-                }
-            }
-            info!("WebTransport Writer task ended");
-        });
-    }
-
-    // Wait for any task to finish (indicates session end)
-    join_set.join_next().await;
-    join_set.shutdown().await;
-
-    // Signal actor to stop - this will trigger its stopping() method
-    // which sends Disconnect to ChatServer
+    // Signal actor to stop
     actor_addr.do_send(crate::actors::transports::wt_chat_session::StopSession);
 
     warn!("Finished handling WebTransport session for {username} in {lobby_id}");

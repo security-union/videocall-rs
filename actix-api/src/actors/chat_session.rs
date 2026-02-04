@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::actors::packet_handler::{classify_packet, PacketKind};
 use crate::client_diagnostics::health_processor;
 use crate::messages::server::{ClientMessage, Leave, Packet};
 use crate::messages::session::Message;
@@ -37,13 +38,8 @@ use actix::{
 };
 use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use protobuf::Message as ProtobufMessage;
 use tracing::{error, info, trace};
 use uuid::Uuid;
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub type RoomId = String;
 pub type Email = String;
@@ -87,18 +83,6 @@ impl WsChatSession {
             tracker_sender,
             session_manager,
         }
-    }
-
-    /// Check if the binary data is an RTT packet that should be echoed back
-    fn is_rtt_packet(&self, data: &[u8]) -> bool {
-        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-            if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                    return media_packet.media_type == MediaType::RTT.into();
-                }
-            }
-        }
-        false
     }
 
     fn heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
@@ -268,24 +252,26 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
                 let data_tracker = DataTracker::new(self.tracker_sender.clone());
                 data_tracker.track_received(&self.id, msg_bytes.len() as u64);
 
-                // Check if this is an RTT packet that should be echoed back
-                if self.is_rtt_packet(&msg_bytes) {
-                    trace!("Echoing RTT packet back to sender: {}", self.email);
-                    // Track sent data for echo
-                    let data_tracker = DataTracker::new(self.tracker_sender.clone());
-                    data_tracker.track_sent(&self.id, msg_bytes.len() as u64);
-                    ctx.binary(msg_bytes);
-                } else if health_processor::is_health_packet_bytes(&msg_bytes) {
-                    // Process health packet for diagnostics (don't relay to other peers)
-                    health_processor::process_health_packet_bytes(
-                        &msg_bytes,
-                        self.nats_client.clone(),
-                    );
-                } else {
-                    // Normal packet processing - forward to chat server
-                    ctx.notify(Packet {
-                        data: Arc::new(msg_bytes),
-                    });
+                // Classify and handle packet using shared logic
+                match classify_packet(&msg_bytes) {
+                    PacketKind::Rtt => {
+                        trace!("Echoing RTT packet back to sender: {}", self.email);
+                        let data_tracker = DataTracker::new(self.tracker_sender.clone());
+                        data_tracker.track_sent(&self.id, msg_bytes.len() as u64);
+                        ctx.binary(msg_bytes);
+                    }
+                    PacketKind::Health => {
+                        health_processor::process_health_packet_bytes(
+                            &msg_bytes,
+                            self.nats_client.clone(),
+                        );
+                    }
+                    PacketKind::Data => {
+                        // Forward to ChatServer for room routing
+                        ctx.notify(Packet {
+                            data: Arc::new(msg_bytes),
+                        });
+                    }
                 }
             }
             ws::Message::Ping(msg) => {

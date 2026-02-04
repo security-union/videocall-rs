@@ -23,6 +23,7 @@
 //! `WebsocketContext` since WebTransport uses quinn's async Session API.
 
 use crate::actors::chat_server::ChatServer;
+use crate::actors::packet_handler::{classify_packet, PacketKind};
 use crate::client_diagnostics::health_processor;
 use crate::constants::CLIENT_TIMEOUT;
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
@@ -36,16 +37,11 @@ use actix::{
     Handler, Message as ActixMessage, Running, WrapFuture,
 };
 use bytes::Bytes;
-use protobuf::Message as ProtobufMessage;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::chat_session::{Email, RoomId, SessionId};
 
@@ -130,18 +126,6 @@ impl WtChatSession {
             tracker_sender,
             session_manager,
         }
-    }
-
-    /// Check if the binary data is an RTT packet that should be echoed back
-    fn is_rtt_packet(data: &[u8]) -> bool {
-        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-            if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                    return media_packet.media_type == MediaType::RTT.into();
-                }
-            }
-        }
-        false
     }
 
     /// Start heartbeat check
@@ -294,39 +278,37 @@ impl Handler<WtInbound> for WtChatSession {
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_received(&self.id, msg.data.len() as u64);
 
-        // Handle keep-alive ping (datagram only)
+        // Handle keep-alive ping (datagram only, WebTransport-specific)
         if msg.source == WtInboundSource::Datagram && msg.data.as_ref() == KEEP_ALIVE_PING {
             trace!("Received keep-alive ping for session {}", self.id);
             return;
         }
 
-        // Check if this is an RTT packet that should be echoed back
-        if Self::is_rtt_packet(&msg.data) {
-            trace!("Echoing RTT packet back to sender: {}", self.email);
-            // Track sent data for echo
-            let data_tracker = DataTracker::new(self.tracker_sender.clone());
-            data_tracker.track_sent(&self.id, msg.data.len() as u64);
+        // Classify and handle packet using shared logic
+        match classify_packet(&msg.data) {
+            PacketKind::Rtt => {
+                trace!("Echoing RTT packet back to sender: {}", self.email);
+                let data_tracker = DataTracker::new(self.tracker_sender.clone());
+                data_tracker.track_sent(&self.id, msg.data.len() as u64);
 
-            // Echo via the same channel it arrived on
-            let outbound = match msg.source {
-                WtInboundSource::UniStream => WtOutbound::UniStream(msg.data),
-                WtInboundSource::Datagram => WtOutbound::Datagram(msg.data),
-            };
-            self.send_outbound(outbound);
-            return;
+                // Echo via the same channel it arrived on
+                let outbound = match msg.source {
+                    WtInboundSource::UniStream => WtOutbound::UniStream(msg.data),
+                    WtInboundSource::Datagram => WtOutbound::Datagram(msg.data),
+                };
+                self.send_outbound(outbound);
+            }
+            PacketKind::Health => {
+                trace!("Processing health packet for session {}", self.id);
+                health_processor::process_health_packet_bytes(&msg.data, self.nats_client.clone());
+            }
+            PacketKind::Data => {
+                // Forward to ChatServer for room routing
+                ctx.notify(Packet {
+                    data: Arc::new(msg.data.to_vec()),
+                });
+            }
         }
-
-        // Check if this is a health packet
-        if health_processor::is_health_packet_bytes(&msg.data) {
-            trace!("Processing health packet for session {}", self.id);
-            health_processor::process_health_packet_bytes(&msg.data, self.nats_client.clone());
-            return;
-        }
-
-        // Normal packet - forward to ChatServer
-        ctx.notify(Packet {
-            data: Arc::new(msg.data.to_vec()),
-        });
     }
 }
 

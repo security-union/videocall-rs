@@ -487,8 +487,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "JoinRoom with valid user should return Ok, got: {:?}",
-            result
+            "JoinRoom with valid user should return Ok, got: {result:?}"
         );
     }
 

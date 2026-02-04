@@ -69,6 +69,12 @@ Create `WtChatSession` actor that mirrors `WsChatSession`:
 ### New File: `actors/wt_chat_session.rs`
 
 ```rust
+/// Outbound message with transport type
+pub enum WtOutbound {
+    UniStream(Bytes),  // Reliable, ordered (most packets)
+    Datagram(Bytes),   // Unreliable, low-latency (RTT echo, keep-alive)
+}
+
 pub struct WtChatSession {
     pub id: SessionId,
     pub room: RoomId,
@@ -76,9 +82,8 @@ pub struct WtChatSession {
     pub addr: Addr<ChatServer>,
     pub heartbeat: Instant,
     
-    // Channels to send data back to WebTransport session
-    pub unistream_tx: mpsc::Sender<Bytes>,  // Reliable, ordered (most packets)
-    pub datagram_tx: mpsc::Sender<Bytes>,   // Unreliable, low-latency (RTT echo)
+    // Single outbound channel - enum specifies transport type
+    pub outbound_tx: mpsc::Sender<WtOutbound>,
     
     pub tracker_sender: TrackerSender,
     pub session_manager: SessionManager,
@@ -173,12 +178,16 @@ We spawn **two reader tasks** that feed into the actor, and **one writer task** 
 │           │   - Forward to ChatSvr │                                │
 │           └────────────┬───────────┘                                │
 │                        │                                            │
-│                        │ outbound_tx channel                        │
+│                        │ outbound_tx: Sender<WtOutbound>            │
 │                        ▼                                            │
 │           ┌────────────────────────┐                                │
-│           │   UniStream Writer     │                                │
-│           │   session.open_uni()   │                                │
-│           │   stream.write_all()   │                                │
+│           │      Writer Task       │                                │
+│           │  match msg {           │                                │
+│           │    UniStream(d) =>     │                                │
+│           │      open_uni()        │                                │
+│           │    Datagram(d) =>      │                                │
+│           │      send_datagram()   │                                │
+│           │  }                     │                                │
 │           └────────────────────────┘                                │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
@@ -186,35 +195,31 @@ We spawn **two reader tasks** that feed into the actor, and **one writer task** 
 
 #### Outbound Path Decision: UniStream vs Datagram
 
-Currently, outbound messages from NATS always go via **UniStream** (reliable). The actor will maintain this behavior:
+The `WtOutbound` enum specifies which transport to use:
 
 ```rust
 impl Handler<Message> for WtChatSession {
     fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
-        // Always send via UniStream (reliable) - matches current behavior
-        let _ = self.outbound_tx.try_send(msg.msg.into());
+        // NATS messages always via UniStream (reliable)
+        let _ = self.outbound_tx.try_send(WtOutbound::UniStream(msg.msg.into()));
     }
 }
 ```
 
 #### RTT Echo Path
 
-RTT packets need special handling - they should echo back via the **same channel** they arrived on:
+RTT packets echo back via the **same channel** they arrived on:
 
 ```rust
 impl Handler<WtInbound> for WtChatSession {
     fn handle(&mut self, msg: WtInbound, _ctx: &mut Self::Context) {
         if is_rtt_packet(&msg.data) {
-            match msg.source {
-                WtInboundSource::UniStream => {
-                    // Echo via UniStream
-                    let _ = self.outbound_tx.try_send(msg.data);
-                }
-                WtInboundSource::Datagram => {
-                    // Echo via Datagram - need separate channel
-                    let _ = self.datagram_tx.try_send(msg.data);
-                }
-            }
+            // Echo via same channel it arrived on
+            let outbound = match msg.source {
+                WtInboundSource::UniStream => WtOutbound::UniStream(msg.data),
+                WtInboundSource::Datagram => WtOutbound::Datagram(msg.data),
+            };
+            let _ = self.outbound_tx.try_send(outbound);
             return;
         }
         // ... handle other packets
@@ -222,9 +227,25 @@ impl Handler<WtInbound> for WtChatSession {
 }
 ```
 
-This means `WtChatSession` needs **two outbound channels**:
-- `outbound_tx: mpsc::Sender<Bytes>` - for UniStream writes
-- `datagram_tx: mpsc::Sender<Bytes>` - for Datagram writes
+#### Writer Task
+
+Single writer task handles both transport types:
+
+```rust
+// Writer task
+while let Some(msg) = outbound_rx.recv().await {
+    match msg {
+        WtOutbound::UniStream(data) => {
+            if let Ok(mut stream) = session.open_uni().await {
+                let _ = stream.write_all(&data).await;
+            }
+        }
+        WtOutbound::Datagram(data) => {
+            let _ = session.send_datagram(data);
+        }
+    }
+}
+```
 
 #### Keep-Alive Handling
 

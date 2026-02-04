@@ -76,11 +76,13 @@ pub struct WtChatSession {
     pub addr: Addr<ChatServer>,
     pub heartbeat: Instant,
     
-    // Channel to send data back to WebTransport session
-    pub outbound_tx: mpsc::Sender<Bytes>,
+    // Channels to send data back to WebTransport session
+    pub unistream_tx: mpsc::Sender<Bytes>,  // Reliable, ordered (most packets)
+    pub datagram_tx: mpsc::Sender<Bytes>,   // Unreliable, low-latency (RTT echo)
     
     pub tracker_sender: TrackerSender,
     pub session_manager: SessionManager,
+    pub nats_client: async_nats::client::Client,  // For health packet processing
 }
 
 impl Actor for WtChatSession {
@@ -110,13 +112,129 @@ impl Actor for WtChatSession {
 [Quinn Session] ←─write── [Task] ←──channel─── [WtChatSession Actor]
 ```
 
-### New Message Type
+### New Message Types
 
 ```rust
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct WtInbound {
     pub data: Bytes,
+    pub source: WtInboundSource,
+}
+
+#[derive(Debug, Clone)]
+pub enum WtInboundSource {
+    UniStream,
+    Datagram,
+}
+```
+
+### WebTransport I/O: UniStreams and Datagrams
+
+WebTransport has two distinct channels for data, unlike WebSocket's single bidirectional stream:
+
+| Channel | Reliability | Ordering | Use Case |
+|---------|-------------|----------|----------|
+| **UniStreams** | Reliable | Ordered | Most packets (media, control) |
+| **Datagrams** | Unreliable | Unordered | Low-latency data, keep-alive |
+
+#### Current Implementation (in `webtransport/mod.rs`)
+
+```rust
+// Three concurrent tasks per session:
+// 1. NATS receive → write to UniStream
+// 2. UniStream receive → process/publish to NATS
+// 3. Datagram receive → process/publish to NATS
+```
+
+#### New Implementation with Actors
+
+We spawn **two reader tasks** that feed into the actor, and **one writer task** that drains the outbound channel:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Quinn Session                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────────┐              ┌──────────────────┐             │
+│  │ UniStream Reader │              │ Datagram Reader  │             │
+│  │ session.accept_  │              │ session.read_    │             │
+│  │ uni().await      │              │ datagram().await │             │
+│  └────────┬─────────┘              └────────┬─────────┘             │
+│           │                                 │                       │
+│           │ WtInbound(UniStream)            │ WtInbound(Datagram)   │
+│           └────────────┬────────────────────┘                       │
+│                        ▼                                            │
+│           ┌────────────────────────┐                                │
+│           │   WtChatSession Actor  │                                │
+│           │   - Handle inbound     │                                │
+│           │   - RTT echo           │                                │
+│           │   - Health packets     │                                │
+│           │   - Forward to ChatSvr │                                │
+│           └────────────┬───────────┘                                │
+│                        │                                            │
+│                        │ outbound_tx channel                        │
+│                        ▼                                            │
+│           ┌────────────────────────┐                                │
+│           │   UniStream Writer     │                                │
+│           │   session.open_uni()   │                                │
+│           │   stream.write_all()   │                                │
+│           └────────────────────────┘                                │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Outbound Path Decision: UniStream vs Datagram
+
+Currently, outbound messages from NATS always go via **UniStream** (reliable). The actor will maintain this behavior:
+
+```rust
+impl Handler<Message> for WtChatSession {
+    fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+        // Always send via UniStream (reliable) - matches current behavior
+        let _ = self.outbound_tx.try_send(msg.msg.into());
+    }
+}
+```
+
+#### RTT Echo Path
+
+RTT packets need special handling - they should echo back via the **same channel** they arrived on:
+
+```rust
+impl Handler<WtInbound> for WtChatSession {
+    fn handle(&mut self, msg: WtInbound, _ctx: &mut Self::Context) {
+        if is_rtt_packet(&msg.data) {
+            match msg.source {
+                WtInboundSource::UniStream => {
+                    // Echo via UniStream
+                    let _ = self.outbound_tx.try_send(msg.data);
+                }
+                WtInboundSource::Datagram => {
+                    // Echo via Datagram - need separate channel
+                    let _ = self.datagram_tx.try_send(msg.data);
+                }
+            }
+            return;
+        }
+        // ... handle other packets
+    }
+}
+```
+
+This means `WtChatSession` needs **two outbound channels**:
+- `outbound_tx: mpsc::Sender<Bytes>` - for UniStream writes
+- `datagram_tx: mpsc::Sender<Bytes>` - for Datagram writes
+
+#### Keep-Alive Handling
+
+Datagram keep-alive pings (`b"ping"`) are handled locally and not forwarded:
+
+```rust
+if msg.source == WtInboundSource::Datagram && msg.data.as_ref() == b"ping" {
+    // Keep-alive - just update heartbeat, don't forward
+    self.heartbeat = Instant::now();
+    return;
 }
 ```
 

@@ -52,7 +52,7 @@ pub struct CreateMeetingRequest {
 }
 
 /// Meeting metadata schema as per requirements
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MeetingMetadata {
     /// Host user ID
     pub host: String,
@@ -61,7 +61,7 @@ pub struct MeetingMetadata {
     #[serde(rename = "createdTimestamp")]
     pub created_timestamp: i64,
 
-    /// Meeting state: idle or active
+    /// Meeting state: not_started, active, or ended
     pub state: String,
 
     /// Optional list of attendee IDs
@@ -73,7 +73,7 @@ pub struct MeetingMetadata {
 }
 
 /// Successful response for creating a meeting
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMeetingResponse {
     /// The meeting ID (either provided or system-generated)
     #[serde(rename = "meetingId")]
@@ -84,7 +84,7 @@ pub struct CreateMeetingResponse {
 }
 
 /// Error response for create meeting API
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMeetingError {
     pub error: String,
     pub code: String,
@@ -180,7 +180,7 @@ fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
 ///   "metadata": {
 ///     "host": "host-user-id",
 ///     "createdTimestamp": 1234567890,
-///     "state": "idle",
+///     "state": "not_started",
 ///     "attendees": ["user1", "user2"],
 ///     "hasPassword": true
 ///   }
@@ -290,35 +290,63 @@ pub async fn create_meeting(
         _ => None,
     };
 
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            log_error!("Create meeting: Failed to start transaction: {}", e);
+            return Ok(HttpResponse::InternalServerError().json(
+                CreateMeetingError::internal_error("Failed to start transaction"),
+            ));
+        }
+    };
+
     // Create the meeting in the database
-    let meeting =
-        match Meeting::create_meeting_api(&pool, &meeting_id, &host_id, password_hash.as_deref())
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                log_error!("Create meeting: Failed to create meeting: {}", e);
-                return Ok(HttpResponse::InternalServerError().json(
-                    CreateMeetingError::internal_error("Failed to create meeting"),
-                ));
-            }
-        };
+    let meeting_result =
+        Meeting::create_meeting_api(&mut *tx, &meeting_id, &host_id, password_hash.as_deref())
+            .await;
+    let meeting = match meeting_result {
+        Ok(m) => m,
+        Err(e) => {
+            log_error!("Create meeting: Failed to create meeting: {}", e);
+            let _ = tx.rollback().await;
+            return Ok(HttpResponse::InternalServerError().json(
+                CreateMeetingError::internal_error("Failed to create meeting"),
+            ));
+        }
+    };
 
     // Create the meeting owner record
-    if let Err(e) = MeetingOwner::create(&meeting_id, &host_id, None) {
+    let owner_result = MeetingOwner::create(&mut *tx, &meeting_id, &host_id, None).await;
+    if let Err(e) = owner_result {
         log_error!("Create meeting: Failed to create meeting owner: {}", e);
-        // Note: The meeting was created, but owner record failed
-        // We continue anyway as the creator_id is in the meeting record
+        let _ = tx.rollback().await;
+        return Ok(
+            HttpResponse::InternalServerError().json(CreateMeetingError::internal_error(
+                "Failed to create meeting owner",
+            )),
+        );
     }
 
     // Add attendees to the meeting
     if !cleaned_attendees.is_empty() {
-        if let Err(e) = MeetingAttendee::add_attendees(&pool, &meeting_id, &cleaned_attendees).await
+        if let Err(e) =
+            MeetingAttendee::add_attendees(&mut *tx, &meeting_id, &cleaned_attendees).await
         {
             log_error!("Create meeting: Failed to add attendees: {}", e);
-            // Note: Meeting was created, but attendees failed
-            // We continue and return success with empty attendees
+            let _ = tx.rollback().await;
+            return Ok(HttpResponse::InternalServerError().json(
+                CreateMeetingError::internal_error("Failed to add attendees"),
+            ));
         }
+    }
+
+    if let Err(e) = tx.commit().await {
+        log_error!("Create meeting: Failed to commit transaction: {}", e);
+        return Ok(
+            HttpResponse::InternalServerError().json(CreateMeetingError::internal_error(
+                "Failed to commit transaction",
+            )),
+        );
     }
 
     // Build the response
@@ -327,7 +355,9 @@ pub async fn create_meeting(
         metadata: MeetingMetadata {
             host: host_id.to_owned(),
             created_timestamp: meeting.created_at.timestamp(),
-            state: meeting.meeting_status.unwrap_or_else(|| "idle".to_string()),
+            state: meeting
+                .meeting_status
+                .unwrap_or_else(|| "not_started".to_string()),
             attendees: cleaned_attendees,
             has_password: password_hash.is_some(),
         },
@@ -339,4 +369,422 @@ pub async fn create_meeting(
     );
 
     Ok(HttpResponse::Created().json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{test, web, App};
+    use serial_test::serial;
+    use sqlx::PgPool;
+
+    async fn get_test_pool() -> PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+        PgPool::connect(&database_url)
+            .await
+            .expect("Failed to connect to test database")
+    }
+
+    async fn cleanup_test_meeting(pool: &PgPool, meeting_id: &str) {
+        let _ = sqlx::query("DELETE FROM meeting_attendees WHERE meeting_id = $1")
+            .bind(meeting_id)
+            .execute(pool)
+            .await;
+
+        let _ = sqlx::query("DELETE FROM meeting_owners WHERE meeting_id = $1")
+            .bind(meeting_id)
+            .execute(pool)
+            .await;
+
+        let _ = sqlx::query("DELETE FROM meetings WHERE room_id = $1")
+            .bind(meeting_id)
+            .execute(pool)
+            .await;
+    }
+
+    fn setup_meeting_mgmt_enabled() {
+        FeatureFlags::set_meeting_management_override(true);
+    }
+
+    fn teardown_meeting_mgmt() {
+        FeatureFlags::clear_meeting_management_override();
+    }
+
+    #[tokio::test]
+    async fn test_is_valid_id_valid_alphanumeric() {
+        assert!(is_valid_id("validid123"));
+        assert!(is_valid_id("ValidID123"));
+        assert!(is_valid_id("valid_id_123"));
+        assert!(is_valid_id("valid-id-123"));
+        assert!(is_valid_id("valid_id-123"));
+    }
+
+    #[tokio::test]
+    async fn test_is_valid_id_invalid_characters() {
+        assert!(!is_valid_id("invalid id")); // space
+        assert!(!is_valid_id("invalid@id")); // @
+        assert!(!is_valid_id("invalid!id")); // !
+        assert!(!is_valid_id("invalid#id")); // #
+        assert!(!is_valid_id("")); // empty
+    }
+
+    #[tokio::test]
+    async fn test_generate_meeting_id_is_uuid() {
+        let id = generate_meeting_id();
+        // UUID v4 format: 8-4-4-4-12 hex chars
+        assert_eq!(id.len(), 36);
+        assert!(id.contains('-'));
+    }
+
+    #[tokio::test]
+    async fn test_hash_password_produces_bcrypt_hash() {
+        let password = "test_password";
+        let hash = hash_password(password).unwrap();
+
+        assert!(hash.starts_with("$2"));
+        assert!(hash.len() > 50);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_success_with_custom_id() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+        let meeting_id = "test-meeting-custom-id";
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": meeting_id,
+                "attendees": ["user1", "user2"],
+                "password": "secret123"
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201);
+
+        let body: CreateMeetingResponse = test::read_body_json(resp).await;
+        assert_eq!(body.meeting_id, meeting_id);
+        assert_eq!(body.metadata.host, "host_user");
+        assert_eq!(body.metadata.state, "not_started");
+        assert_eq!(body.metadata.attendees.len(), 2);
+        assert!(body.metadata.has_password);
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_success_with_generated_id() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({}))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201);
+
+        let body: CreateMeetingResponse = test::read_body_json(resp).await;
+        assert_eq!(body.meeting_id.len(), 36);
+        assert_eq!(body.meeting_id.len(), 36);
+        assert!(!body.metadata.has_password);
+        assert!(body.metadata.attendees.is_empty());
+
+        cleanup_test_meeting(&pool, &body.meeting_id).await;
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_without_password() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+        let meeting_id = "test-meeting-no-password";
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": meeting_id
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201);
+
+        let body: CreateMeetingResponse = test::read_body_json(resp).await;
+        assert!(!body.metadata.has_password);
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_unauthorized_no_cookie() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .set_json(serde_json::json!({
+                "meetingId": "test-meeting"
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401);
+
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_duplicate_id_returns_conflict() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+        let meeting_id = "test-meeting-duplicate";
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req1 = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": meeting_id
+            }))
+            .to_request();
+
+        let resp1 = test::call_service(&app, req1).await;
+        assert_eq!(resp1.status(), 201);
+
+        let req2 = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": meeting_id
+            }))
+            .to_request();
+
+        let resp2 = test::call_service(&app, req2).await;
+        assert_eq!(resp2.status(), 409);
+
+        let body: CreateMeetingError = test::read_body_json(resp2).await;
+        assert_eq!(body.code, "MEETING_EXISTS");
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_invalid_meeting_id() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": "invalid@meeting#id!"
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400);
+
+        let body: CreateMeetingError = test::read_body_json(resp).await;
+        assert_eq!(body.code, "INVALID_MEETING_ID");
+
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_invalid_attendee_id() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": "valid-meeting-id",
+                "attendees": ["valid_user", "invalid@user!"]
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400);
+
+        let body: CreateMeetingError = test::read_body_json(resp).await;
+        assert_eq!(body.code, "INVALID_ATTENDEE_ID");
+
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_feature_disabled() {
+        teardown_meeting_mgmt();
+        FeatureFlags::set_meeting_management_override(false);
+
+        let pool = get_test_pool().await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": "test-meeting"
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 503);
+
+        let body: CreateMeetingError = test::read_body_json(resp).await;
+        assert_eq!(body.code, "FEATURE_DISABLED");
+
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_spaces_converted_to_underscores() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+        let meeting_id = "test_meeting_spaces";
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        // Meeting ID with spaces should be converted to underscores
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": "test meeting spaces",
+                "attendees": ["user one", "user two"]
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201);
+
+        let body: CreateMeetingResponse = test::read_body_json(resp).await;
+        assert_eq!(body.meeting_id, "test_meeting_spaces");
+        assert!(body.metadata.attendees.contains(&"user_one".to_string()));
+        assert!(body.metadata.attendees.contains(&"user_two".to_string()));
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+        teardown_meeting_mgmt();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_metadata_state_is_not_started() {
+        setup_meeting_mgmt_enabled();
+        let pool = get_test_pool().await;
+        let meeting_id = "test-meeting-state-check";
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .service(create_meeting),
+        )
+        .await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/meetings")
+            .cookie(actix_web::cookie::Cookie::new("email", "host_user"))
+            .set_json(serde_json::json!({
+                "meetingId": meeting_id
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201);
+
+        let body: CreateMeetingResponse = test::read_body_json(resp).await;
+        assert_eq!(body.metadata.state, "not_started");
+
+        cleanup_test_meeting(&pool, meeting_id).await;
+        teardown_meeting_mgmt();
+    }
 }

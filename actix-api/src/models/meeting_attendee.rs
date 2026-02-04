@@ -38,11 +38,14 @@ pub struct MeetingAttendee {
 impl MeetingAttendee {
     /// Add multiple attendees to a meeting
     /// Returns the number of attendees added
-    pub async fn add_attendees(
-        pool: &PgPool,
+    pub async fn add_attendees<'e, E>(
+        executor: E,
         meeting_id: &str,
         user_ids: &[String],
-    ) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    ) -> Result<usize, Box<dyn Error + Send + Sync>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         if user_ids.is_empty() {
             return Ok(0);
         }
@@ -56,24 +59,18 @@ impl MeetingAttendee {
             .into());
         }
 
-        let mut count = 0;
-        for user_id in user_ids {
-            let result = sqlx::query(
-                r#"
-                INSERT INTO meeting_attendees (meeting_id, user_id)
-                VALUES ($1, $2)
-                ON CONFLICT (meeting_id, user_id) DO NOTHING
-                "#,
-            )
-            .bind(meeting_id)
-            .bind(user_id)
-            .execute(pool)
-            .await?;
+        let mut query_builder =
+            sqlx::QueryBuilder::new("INSERT INTO meeting_attendees (meeting_id, user_id) ");
 
-            if result.rows_affected() > 0 {
-                count += 1;
-            }
-        }
+        query_builder.push_values(user_ids.iter(), |mut b, user_id| {
+            b.push_bind(meeting_id).push_bind(user_id);
+        });
+
+        query_builder.push(" ON CONFLICT (meeting_id, user_id) DO NOTHING");
+
+        let result = query_builder.build().execute(executor).await?;
+
+        let count = result.rows_affected() as usize;
 
         info!("Added {} attendees to meeting {}", count, meeting_id);
         Ok(count)

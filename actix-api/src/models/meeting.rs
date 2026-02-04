@@ -251,7 +251,7 @@ impl Meeting {
         let meeting = sqlx::query_as::<_, Meeting>(
             r#"
             INSERT INTO meetings (room_id, started_at, ended_at, creator_id, meeting_status)
-            VALUES ($1, $2, NULL, $3, 'idle')
+            VALUES ($1, $2, NULL, $3, 'not_started')
             ON CONFLICT (room_id) DO UPDATE
             SET started_at = CASE
                 WHEN meetings.ended_at IS NOT NULL THEN EXCLUDED.started_at
@@ -343,18 +343,21 @@ impl Meeting {
 
     /// Create a new meeting via the Create Meeting API
     /// This creates the meeting metadata at request time (not at start time)
-    /// The meeting starts in 'idle' state
-    pub async fn create_meeting_api(
-        pool: &PgPool,
+    /// The meeting starts in 'not_started' state
+    pub async fn create_meeting_api<'e, E>(
+        executor: E,
         room_id: &str,
         host_id: &str,
         password_hash: Option<&str>,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Self, Box<dyn Error + Send + Sync>>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
         let now = Utc::now();
         let meeting = sqlx::query_as::<_, Meeting>(
             r#"
             INSERT INTO meetings (room_id, started_at, creator_id, password_hash, meeting_status)
-            VALUES ($1, $2, $3, $4, 'idle')
+            VALUES ($1, $2, $3, $4, 'not_started')
             RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id,
                       meeting_title, password_hash, waiting_room_enabled, meeting_status
             "#,
@@ -363,7 +366,7 @@ impl Meeting {
         .bind(now)
         .bind(host_id)
         .bind(password_hash)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         info!(

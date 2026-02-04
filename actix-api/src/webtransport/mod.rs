@@ -17,7 +17,9 @@
  */
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::wt_chat_session::{WtChatSession, WtInbound, WtInboundSource, WtOutbound};
+use crate::actors::transports::wt_chat_session::{
+    WtChatSession, WtInbound, WtInboundSource, WtOutbound,
+};
 use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -402,7 +404,7 @@ async fn handle_webtransport_session(
 
     // Signal actor to stop - this will trigger its stopping() method
     // which sends Disconnect to ChatServer
-    actor_addr.do_send(crate::actors::wt_chat_session::StopSession);
+    actor_addr.do_send(crate::actors::transports::wt_chat_session::StopSession);
 
     warn!("Finished handling WebTransport session for {username} in {lobby_id}");
     Ok(())

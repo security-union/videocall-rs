@@ -115,19 +115,50 @@ impl WtChatSession {
         }
     }
 
-    /// Send outbound message via the channel
-    fn send(&self, data: Vec<u8>) {
-        if let Err(e) = self
+    /// Send outbound message via the channel.
+    /// Returns false if the channel is closed (connection dead).
+    fn send(&self, data: Vec<u8>) -> bool {
+        match self
             .outbound_tx
             .try_send(WtOutbound::UniStream(data.into()))
         {
-            error!("Failed to send outbound message: {}", e);
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!(
+                    "Outbound channel closed for session {}, connection dead",
+                    self.logic.id
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                error!(
+                    "Outbound channel full for session {}, dropping message",
+                    self.logic.id
+                );
+                true // Channel still open, just full
+            }
         }
+    }
+
+    /// Check if the outbound channel is closed
+    fn is_connection_dead(&self) -> bool {
+        self.outbound_tx.is_closed()
     }
 
     /// Start heartbeat check (WebTransport-specific timing)
     fn start_heartbeat(&self, ctx: &mut Context<Self>) {
         ctx.run_interval(WT_HEARTBEAT_INTERVAL, |act, ctx| {
+            // Check if connection is dead (channel closed)
+            if act.is_connection_dead() {
+                warn!(
+                    "WebTransport connection dead (channel closed), stopping session {}",
+                    act.logic.id
+                );
+                ctx.stop();
+                return;
+            }
+
+            // Check heartbeat timeout
             if actix::clock::Instant::now().duration_since(act.heartbeat) > CLIENT_TIMEOUT {
                 warn!(
                     "WebTransport client heartbeat failed, disconnecting session {}",
@@ -212,9 +243,12 @@ impl Actor for WtChatSession {
 impl Handler<Message> for WtChatSession {
     type Result = ();
 
-    fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
         let bytes = self.logic.handle_outbound(&msg);
-        self.send(bytes);
+        if !self.send(bytes) {
+            // Channel closed - connection is dead, stop the actor
+            ctx.stop();
+        }
     }
 }
 
@@ -244,8 +278,21 @@ impl Handler<WtInbound> for WtChatSession {
                         WtOutbound::Datagram(Bytes::from(data.as_ref().clone()))
                     }
                 };
-                if let Err(e) = self.outbound_tx.try_send(outbound) {
-                    error!("Failed to echo RTT packet: {}", e);
+                match self.outbound_tx.try_send(outbound) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(
+                            "Outbound channel closed while echoing RTT for session {}",
+                            self.logic.id
+                        );
+                        ctx.stop();
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        error!(
+                            "Outbound channel full, dropping RTT echo for session {}",
+                            self.logic.id
+                        );
+                    }
                 }
             }
             InboundAction::Forward(data) => {

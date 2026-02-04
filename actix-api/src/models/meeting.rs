@@ -257,7 +257,8 @@ impl Meeting {
                 ELSE meetings.creator_id
             END,
             updated_at = NOW()
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
+                      creator_id, password_hash, state, attendees, host_display_name
             "#,
         )
         .bind(room_id)
@@ -303,7 +304,8 @@ impl Meeting {
             UPDATE meetings
             SET ended_at = NOW(), updated_at = NOW()
             WHERE room_id = $1 AND ended_at IS NULL
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
+                      creator_id, password_hash, state, attendees, host_display_name
             "#,
         )
         .bind(room_id)
@@ -362,7 +364,7 @@ impl Meeting {
             INSERT INTO meetings (room_id, started_at, creator_id, password_hash, state, attendees)
             VALUES ($1, $2, $3, $4, 'idle', $5)
             RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
-                      creator_id, password_hash, state, attendees
+                      creator_id, password_hash, state, attendees, host_display_name
             "#,
         )
         .bind(room_id)

@@ -350,6 +350,38 @@ async fn start_webtransport_server() {
 
 ## Future Considerations
 
-- Extract more common code between `WsChatSession` and `WtChatSession`
-- Consider trait-based abstraction for transport-agnostic session handling
-- Potential single-binary option if operational benefits emerge
+### Remaining Code Duplication
+
+| Duplication | WsChatSession | WtChatSession | Consolidation |
+|-------------|---------------|---------------|---------------|
+| `is_rtt_packet()` | Line 93 | Line 136 | Extract to shared module |
+| RTT echo logic | `StreamHandler` | `Handler<WtInbound>` | Extract to helper fn |
+| Health packet processing | Line 282 | Line 322 | Already uses shared `health_processor` |
+| `KEEP_ALIVE_PING` | N/A | Line 56 | WebSocket uses WS ping frames |
+
+### Recommended Next Steps
+
+1. **Create `src/actors/session_helpers.rs`**:
+   ```rust
+   pub fn is_rtt_packet(data: &[u8]) -> bool { ... }
+   pub fn should_echo_rtt(data: &[u8]) -> Option<Vec<u8>> { ... }
+   ```
+
+2. **Both session actors use shared helpers**:
+   ```rust
+   use crate::actors::session_helpers::{is_rtt_packet, should_echo_rtt};
+   ```
+
+3. **Consider `SessionBehavior` trait** if more behavior can be generalized:
+   ```rust
+   trait SessionBehavior {
+       fn handle_packet(&mut self, data: &[u8]) -> PacketAction;
+   }
+   enum PacketAction { Echo(Vec<u8>), Forward, HealthProcess, Ignore }
+   ```
+
+### Not Recommended to Consolidate
+
+- **Transport I/O**: WebSocket uses `WebsocketContext`, WebTransport uses channels - fundamentally different
+- **Keep-alive**: WebSocket uses WS ping/pong frames, WebTransport uses custom datagrams
+- **Single binary**: Adds complexity, horizontal scaling works well with separate binaries

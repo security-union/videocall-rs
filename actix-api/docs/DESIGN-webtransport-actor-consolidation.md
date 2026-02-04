@@ -348,37 +348,50 @@ async fn start_webtransport_server() {
 3. `WtChatSession` mirrors `WsChatSession` structure
 4. No duplicate session lifecycle code
 
-## Future Considerations
+## Final Architecture
 
-### Completed Consolidation
+### Transport Abstraction Complete
 
-The following duplications have been consolidated into `src/actors/packet_handler.rs`:
+The session logic has been fully abstracted from the transport:
 
-| Item | Status | Implementation |
-|------|--------|----------------|
-| `is_rtt_packet()` | ✅ Consolidated | `packet_handler::is_rtt_packet()` |
-| Packet classification | ✅ Consolidated | `packet_handler::classify_packet()` → `PacketKind` enum |
-| Health packet check | ✅ Uses shared | `health_processor::is_health_packet_bytes()` |
-
-Both session actors now use the same pattern:
-
-```rust
-use crate::actors::packet_handler::{classify_packet, PacketKind};
-
-match classify_packet(&data) {
-    PacketKind::Rtt => { /* echo back to sender */ }
-    PacketKind::Health => { /* process diagnostics */ }
-    PacketKind::Data => { /* forward to ChatServer */ }
-}
+```
+                    ┌─────────────────────────────────┐
+                    │         SessionLogic            │
+                    │   (transport-agnostic logic)    │
+                    └────────────────┬────────────────┘
+                                     │
+                    ┌────────────────┴────────────────┐
+                    ▼                                 ▼
+          ┌─────────────────┐               ┌─────────────────┐
+          │  WsChatSession  │               │  WtChatSession  │
+          │  (thin adapter) │               │  (thin adapter) │
+          └─────────────────┘               └─────────────────┘
 ```
 
-### Remaining Differences (By Design)
+### Shared Modules
+
+| Module | Lines | Purpose |
+|--------|-------|---------|
+| `session_logic.rs` | 226 | All business logic |
+| `packet_handler.rs` | 103 | Packet classification |
+
+### Adding a New Feature
+
+```rust
+// 1. Add to SessionLogic (once)
+impl SessionLogic {
+    pub fn new_feature(&self) { ... }
+}
+
+// 2. Both transports get it automatically
+```
+
+### Remaining Transport Differences (By Design)
 
 | Aspect | WebSocket | WebTransport | Reason |
 |--------|-----------|--------------|--------|
-| I/O Model | `WebsocketContext` | `mpsc` channels | Different underlying protocols |
+| I/O Model | `WebsocketContext` | `mpsc` channels | Different protocols |
 | Keep-alive | WS ping/pong frames | Custom datagram ping | Protocol-specific |
-| `KEEP_ALIVE_PING` | N/A | Defined in `WtChatSession` | WebTransport-specific |
 
 ### Not Recommended to Consolidate
 

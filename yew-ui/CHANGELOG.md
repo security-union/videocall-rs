@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.35](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.34...videocall-ui-v1.1.35) - 2026-02-04
+
+### Other
+
+- Add screen share state callback to videocall-client ([#546](https://github.com/security-union/videocall-rs/pull/546))
+
 ## [1.1.34](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.33...videocall-ui-v1.1.34) - 2026-01-27
 
 ### Added

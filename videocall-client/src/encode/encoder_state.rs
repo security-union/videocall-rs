@@ -18,7 +18,8 @@
 
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc,Mutex};
+use web_sys::MediaStream;
 
 //
 // EncoderState struct contains state variables that are common among the encoders, and the logic
@@ -31,6 +32,7 @@ pub struct EncoderState {
     pub(super) enabled: Arc<AtomicBool>,
     pub(super) selected: Option<String>,
     pub(super) switching: Arc<AtomicBool>,
+    pub(super) screen_stream: Arc<Mutex<Option<MediaStream>>>,
 }
 
 impl EncoderState {
@@ -40,6 +42,7 @@ impl EncoderState {
             enabled: Arc::new(AtomicBool::new(false)),
             selected: None,
             switching: Arc::new(AtomicBool::new(false)),
+            screen_stream: Arc::new(Mutex::new(None)),
         }
     }
 

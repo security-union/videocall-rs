@@ -45,6 +45,13 @@ use web_sys::*;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
 
+#[derive(Clone, PartialEq)]
+pub enum ScreenShareState {
+    Idle,        // nothing
+    Requesting,  // browser chooser is opened
+    Active,      // stream active
+}
+
 #[derive(Debug)]
 pub enum WsAction {
     Connect,
@@ -165,6 +172,7 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    screen_share_state:ScreenShareState,
 }
 
 impl AttendantsComponent {
@@ -403,6 +411,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            screen_share_state: ScreenShareState::Idle,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -521,13 +530,10 @@ impl Component for AttendantsComponent {
                 match action {
                     MeetingAction::ToggleScreenShare => {
                         if !self.share_screen {
-                            if self.media_device_access.is_granted() {
-                                self.share_screen = true;
-                            } else {
-                                self.pending_screen_share = true;
-                                ctx.link().send_message(WsAction::RequestMediaPermissions);
-                            }
+                            self.screen_share_state = ScreenShareState::Requesting;
+                            self.share_screen = true;
                         } else {
+                            self.screen_share_state = ScreenShareState::Idle;
                             self.share_screen = false;
                         }
                     }
@@ -672,15 +678,18 @@ impl Component for AttendantsComponent {
                 match event {
                     ScreenShareEvent::Started => {
                         // Screen share successfully started - ensure state is true
+                        self.screen_share_state = ScreenShareState::Active;
                         self.share_screen = true;
                     }
                     ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
                         // User cancelled or stopped - just reset state (no error dialog)
+                        self.screen_share_state = ScreenShareState::Idle;
                         self.share_screen = false;
                     }
                     ScreenShareEvent::Failed(ref msg) => {
                         // Screen share failed - reset state and show error dialog
                         log::error!("Screen share failed: {msg}");
+                        self.screen_share_state = ScreenShareState::Idle;
                         self.share_screen = false;
                         self.user_error = Some(format!("Screen share failed: {msg}"));
                     }
@@ -907,9 +916,12 @@ impl Component for AttendantsComponent {
                                             // Hide screen share button on Safari/iOS devices
                                             {
                                                 if !is_ios() {
+                                                    let is_active = matches!(self.screen_share_state, ScreenShareState::Active);
+                                                    let is_disabled = matches!(self.screen_share_state, ScreenShareState::Requesting);
                                                     html! {
                                                         <ScreenShareButton
-                                                            active={self.share_screen}
+                                                            active={is_active}
+                                                            disabled={is_disabled}
                                                             onclick={ctx.link().callback(|_| MeetingAction::ToggleScreenShare)}
                                                         />
                                                     }

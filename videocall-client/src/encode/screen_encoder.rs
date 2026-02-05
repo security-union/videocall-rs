@@ -170,9 +170,39 @@ impl ScreenEncoder {
         self.state.set_enabled(value)
     }
 
-    /// Stops encoding after it has been started.
+    /// Stops encoding and MediaStream after it has been started.
     pub fn stop(&mut self) {
-        self.state.stop()
+        let EncoderState {
+            enabled,
+            destroy,
+            screen_stream,
+            ..
+        } = self.state.clone();
+
+        enabled.store(false, Ordering::Release);
+        destroy.store(true, Ordering::Release);
+
+        let client = self.client.clone();
+        let client_for_state = client.clone();
+        let on_state_change = self.on_state_change.clone();
+        client_for_state.set_screen_enabled(false);
+        if let Some(ref callback) = on_state_change {
+            callback.emit(ScreenShareEvent::Stopped);
+        }
+
+        let stream = {
+            screen_stream.lock().unwrap().take()
+        };
+
+        if let Some(stream) = stream {
+           for i in 0..stream.get_tracks().length() {
+               let track = stream
+               .get_tracks()
+               .get(i)
+               .unchecked_into::<web_sys::MediaStreamTrack>();
+               track.stop();
+            }
+        }
     }
 
     /// Start encoding and sending the data to the client connection (if it's currently connected).
@@ -199,6 +229,7 @@ impl ScreenEncoder {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let on_state_change = self.on_state_change.clone();
+        let screen_stream = self.state.screen_stream.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -246,6 +277,11 @@ impl ScreenEncoder {
             };
 
             log::info!("Screen to share: {screen_to_share:?}");
+
+            screen_stream
+               .lock()
+               .unwrap()
+               .replace(screen_to_share.clone());
 
             // Helper to clean up stream on error - stops all tracks and emits Failed event
             let cleanup_on_error = |screen_to_share: &MediaStream,

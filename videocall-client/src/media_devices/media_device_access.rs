@@ -73,8 +73,8 @@ impl MediaDeviceAccess {
     ///
     /// This function returns immediately.  Eventually, either the [`on_granted`](Self::on_granted)
     /// or [`on_denied`](Self::on_denied) callback will be called.
-    pub fn request(&self) {
-        let future = Self::request_permissions();
+    pub fn request(&self, mic_enabled: bool, video_enabled: bool) {
+        let future = Self::request_permissions(mic_enabled, video_enabled);
         let on_granted = self.on_granted.clone();
         let on_denied = self.on_denied.clone();
         let granted = Arc::clone(&self.granted);
@@ -89,21 +89,29 @@ impl MediaDeviceAccess {
         });
     }
 
-    async fn request_permissions() -> anyhow::Result<(), JsValue> {
+    async fn request_permissions(mic_enabled: bool, video_enabled: bool) -> anyhow::Result<(), JsValue> {
         let navigator = window().navigator();
         let media_devices = navigator.media_devices()?;
 
         let constraints = MediaStreamConstraints::new();
+        
+        if mic_enabled {
+           // Request access to the microphone
+           constraints.set_audio(&JsValue::from_bool(true));
 
-        // Request access to the microphone
-        constraints.set_audio(&JsValue::from_bool(true));
+           let promise = media_devices.get_user_media_with_constraints(&constraints)?;
 
-        // Request access to the camera
-        constraints.set_video(&JsValue::from_bool(true));
+           JsFuture::from(promise).await?;
+        }
 
-        let promise = media_devices.get_user_media_with_constraints(&constraints)?;
+        if video_enabled {
+           // Request access to the camera
+           constraints.set_video(&JsValue::from_bool(true));
 
-        JsFuture::from(promise).await?;
+           let promise = media_devices.get_user_media_with_constraints(&constraints)?;
+
+           JsFuture::from(promise).await?;
+        }
 
         Ok(())
     }

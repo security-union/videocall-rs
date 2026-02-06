@@ -43,7 +43,7 @@ impl Component for PeerListItem {
         let name = ctx.props().name.clone();
         let is_host = ctx.props().is_host;
         let title = if is_host {
-            format!("Host: {}", name)
+            format!("Host: {name}")
         } else {
             name.clone()
         };

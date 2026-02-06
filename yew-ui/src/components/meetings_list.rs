@@ -30,6 +30,7 @@ pub struct MeetingSummary {
     pub host: Option<String>,
     pub state: String,
     pub has_password: bool,
+    #[allow(dead_code)]
     pub created_at: i64,
     pub participant_count: i64,
     /// Timestamp when the meeting started (milliseconds since epoch)
@@ -44,7 +45,9 @@ pub struct MeetingSummary {
 pub struct ListMeetingsResponse {
     pub meetings: Vec<MeetingSummary>,
     pub total: i64,
+    #[allow(dead_code)]
     pub limit: i64,
+    #[allow(dead_code)]
     pub offset: i64,
 }
 
@@ -483,11 +486,11 @@ fn format_duration(duration_ms: i64) -> String {
     let seconds = total_seconds % 60;
 
     if hours > 0 {
-        format!("{}h {}m", hours, minutes)
+        format!("{hours}h {minutes}m")
     } else if minutes > 0 {
-        format!("{}m {}s", minutes, seconds)
+        format!("{minutes}m {seconds}s")
     } else {
-        format!("{}s", seconds)
+        format!("{seconds}s")
     }
 }
 
@@ -505,5 +508,5 @@ fn format_time(timestamp_ms: i64) -> String {
     } else {
         hours
     };
-    format!("{}:{:02} {}", hours_12, minutes, am_pm)
+    format!("{hours_12}:{minutes:02} {am_pm}")
 }

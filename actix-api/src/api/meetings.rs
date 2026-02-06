@@ -154,41 +154,35 @@ impl ApiError {
     pub fn invalid_meeting_id(detail: &str) -> Self {
         Self {
             code: "INVALID_MEETING_ID".to_string(),
-            message: format!("Invalid meeting ID: {}", detail),
+            message: format!("Invalid meeting ID: {detail}"),
         }
     }
 
     pub fn too_many_attendees(count: usize) -> Self {
         Self {
             code: "TOO_MANY_ATTENDEES".to_string(),
-            message: format!(
-                "Too many attendees: {} provided, maximum is {}",
-                count, MAX_ATTENDEES
-            ),
+            message: format!("Too many attendees: {count} provided, maximum is {MAX_ATTENDEES}"),
         }
     }
 
     pub fn meeting_exists(meeting_id: &str) -> Self {
         Self {
             code: "MEETING_EXISTS".to_string(),
-            message: format!("Meeting with ID '{}' already exists", meeting_id),
+            message: format!("Meeting with ID '{meeting_id}' already exists"),
         }
     }
 
     pub fn meeting_not_found(meeting_id: &str) -> Self {
         Self {
             code: "MEETING_NOT_FOUND".to_string(),
-            message: format!("Meeting '{}' not found", meeting_id),
+            message: format!("Meeting '{meeting_id}' not found"),
         }
     }
 
     pub fn meeting_not_active(meeting_id: &str) -> Self {
         Self {
             code: "MEETING_NOT_ACTIVE".to_string(),
-            message: format!(
-                "Meeting '{}' is not active. Host must join first.",
-                meeting_id
-            ),
+            message: format!("Meeting '{meeting_id}' is not active. Host must join first."),
         }
     }
 
@@ -202,14 +196,14 @@ impl ApiError {
     pub fn participant_not_found(email: &str) -> Self {
         Self {
             code: "PARTICIPANT_NOT_FOUND".to_string(),
-            message: format!("Participant '{}' not found in waiting room", email),
+            message: format!("Participant '{email}' not found in waiting room"),
         }
     }
 
     pub fn internal_error(detail: &str) -> Self {
         Self {
             code: "INTERNAL_ERROR".to_string(),
-            message: format!("Internal server error: {}", detail),
+            message: format!("Internal server error: {detail}"),
         }
     }
 }
@@ -231,10 +225,7 @@ fn validate_meeting_id(meeting_id: &str) -> Result<(), String> {
     }
     let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
     if !re.is_match(meeting_id) {
-        return Err(format!(
-            "Meeting ID must match pattern: {}",
-            VALID_ID_PATTERN
-        ));
+        return Err(format!("Meeting ID must match pattern: {VALID_ID_PATTERN}"));
     }
     Ok(())
 }
@@ -1013,7 +1004,10 @@ mod tests {
         assert_eq!(resp.status(), 201, "Expected 201 Created");
 
         let body: CreateMeetingResponse = test::read_body_json(resp).await;
-        assert!(!body.meeting_id.is_empty(), "Meeting ID should be generated");
+        assert!(
+            !body.meeting_id.is_empty(),
+            "Meeting ID should be generated"
+        );
         assert_eq!(body.meeting_id.len(), 12, "Generated ID should be 12 chars");
 
         // Cleanup
@@ -1087,7 +1081,7 @@ mod tests {
         let app = create_test_app(pool.clone()).await;
 
         // Create 101 attendees (over the limit)
-        let attendees: Vec<String> = (0..101).map(|i| format!("user{}@example.com", i)).collect();
+        let attendees: Vec<String> = (0..101).map(|i| format!("user{i}@example.com")).collect();
 
         let req = test::TestRequest::post()
             .uri("/api/v1/meetings")
@@ -1129,7 +1123,7 @@ mod tests {
 
         // Get meeting
         let req = test::TestRequest::get()
-            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
 
@@ -1176,7 +1170,6 @@ mod tests {
         assert_eq!(resp.status(), 401, "Expected 401 Unauthorized");
     }
 
-    
     #[tokio::test]
     #[serial]
     async fn test_join_meeting_host_activates() {
@@ -1196,7 +1189,7 @@ mod tests {
 
         // Host joins (should activate meeting)
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .set_json(serde_json::json!({ "display_name": "Host User" }))
             .to_request();
@@ -1210,7 +1203,7 @@ mod tests {
 
         // Verify meeting is now active
         let req = test::TestRequest::get()
-            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
 
@@ -1239,14 +1232,14 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         // Attendee joins (should be in waiting room)
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "attendee@example.com"))
             .set_json(serde_json::json!({ "display_name": "Attendee" }))
             .to_request();
@@ -1280,7 +1273,7 @@ mod tests {
 
         // Non-host tries to join inactive meeting
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "attendee@example.com"))
             .to_request();
 
@@ -1311,21 +1304,21 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         // Add attendee to waiting room
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "attendee@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         // Host gets waiting room
         let req = test::TestRequest::get()
-            .uri(&format!("/api/v1/meetings/{}/waiting", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/waiting"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
 
@@ -1358,20 +1351,20 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "attendee@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         // Host admits attendee
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/admit", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/admit"))
             .cookie(Cookie::new("email", "host@example.com"))
             .set_json(serde_json::json!({ "email": "attendee@example.com" }))
             .to_request();
@@ -1404,14 +1397,14 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         // Try to admit non-existent participant
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/admit", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/admit"))
             .cookie(Cookie::new("email", "host@example.com"))
             .set_json(serde_json::json!({ "email": "nonexistent@example.com" }))
             .to_request();
@@ -1440,20 +1433,20 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "attendee@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         // Host rejects attendee
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/reject", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/reject"))
             .cookie(Cookie::new("email", "host@example.com"))
             .set_json(serde_json::json!({ "email": "attendee@example.com" }))
             .to_request();
@@ -1485,7 +1478,7 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
@@ -1493,15 +1486,15 @@ mod tests {
         // Add multiple attendees
         for i in 1..=3 {
             let req = test::TestRequest::post()
-                .uri(&format!("/api/v1/meetings/{}/join", room_id))
-                .cookie(Cookie::new("email", format!("attendee{}@example.com", i)))
+                .uri(&format!("/api/v1/meetings/{room_id}/join"))
+                .cookie(Cookie::new("email", format!("attendee{i}@example.com")))
                 .to_request();
             let _ = test::call_service(&app, req).await;
         }
 
         // Host admits all
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/admit-all", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/admit-all"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
 
@@ -1533,19 +1526,19 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "attendee@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/admit", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/admit"))
             .cookie(Cookie::new("email", "host@example.com"))
             .set_json(serde_json::json!({ "email": "attendee@example.com" }))
             .to_request();
@@ -1553,7 +1546,7 @@ mod tests {
 
         // Attendee leaves
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/leave", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/leave"))
             .cookie(Cookie::new("email", "attendee@example.com"))
             .to_request();
 
@@ -1617,7 +1610,7 @@ mod tests {
 
         // Owner deletes meeting
         let req = test::TestRequest::delete()
-            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
 
@@ -1626,7 +1619,7 @@ mod tests {
 
         // Verify meeting is deleted (soft delete - will return 404)
         let req = test::TestRequest::get()
-            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
 
@@ -1655,7 +1648,7 @@ mod tests {
 
         // Non-owner tries to delete
         let req = test::TestRequest::delete()
-            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}"))
             .cookie(Cookie::new("email", "other@example.com"))
             .to_request();
 
@@ -1683,19 +1676,19 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "attendee@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/admit", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/admit"))
             .cookie(Cookie::new("email", "host@example.com"))
             .set_json(serde_json::json!({ "email": "attendee@example.com" }))
             .to_request();
@@ -1703,7 +1696,7 @@ mod tests {
 
         // Get participants
         let req = test::TestRequest::get()
-            .uri(&format!("/api/v1/meetings/{}/participants", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/participants"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
 
@@ -1734,14 +1727,14 @@ mod tests {
         let _ = test::call_service(&app, req).await;
 
         let req = test::TestRequest::post()
-            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/join"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
         let _ = test::call_service(&app, req).await;
 
         // Get my status
         let req = test::TestRequest::get()
-            .uri(&format!("/api/v1/meetings/{}/status", room_id))
+            .uri(&format!("/api/v1/meetings/{room_id}/status"))
             .cookie(Cookie::new("email", "host@example.com"))
             .to_request();
 

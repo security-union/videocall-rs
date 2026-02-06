@@ -38,8 +38,8 @@ impl fmt::Display for CreateMeetingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CreateMeetingError::MeetingExists => write!(f, "Meeting already exists"),
-            CreateMeetingError::DatabaseError(e) => write!(f, "Database error: {}", e),
-            CreateMeetingError::HashError(e) => write!(f, "Hash error: {}", e),
+            CreateMeetingError::DatabaseError(e) => write!(f, "Database error: {e}"),
+            CreateMeetingError::HashError(e) => write!(f, "Hash error: {e}"),
         }
     }
 }

@@ -35,6 +35,7 @@ pub struct WaitingParticipant {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WaitingRoomResponse {
+    #[allow(dead_code)]
     pub meeting_id: String,
     pub waiting: Vec<WaitingParticipant>,
 }
@@ -133,7 +134,7 @@ impl Component for HostControls {
                 true
             }
             HostControlsMsg::FetchError(error) => {
-                log::warn!("Failed to fetch waiting room: {}", error);
+                log::warn!("Failed to fetch waiting room: {error}");
                 self.error = Some(error);
                 true
             }

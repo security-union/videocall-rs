@@ -181,14 +181,17 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                             );
                                             current_user_email.set(Some(response.email.clone()));
 
-                                            let determined_host_display_name = info.host_display_name.clone();
-                                            host_display_name.set(determined_host_display_name.clone());
+                                            let determined_host_display_name =
+                                                info.host_display_name.clone();
+                                            host_display_name
+                                                .set(determined_host_display_name.clone());
 
                                             match response.status.as_str() {
                                                 "admitted" => {
                                                     meeting_status.set(MeetingStatus::Admitted {
                                                         is_host: response.is_host,
-                                                        host_display_name: determined_host_display_name,
+                                                        host_display_name:
+                                                            determined_host_display_name,
                                                     });
                                                 }
                                                 "waiting" => {
@@ -199,10 +202,12 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                                     meeting_status.set(MeetingStatus::Rejected);
                                                 }
                                                 _ => {
-                                                    meeting_status.set(MeetingStatus::Error(format!(
-                                                        "Unknown status: {}",
-                                                        response.status
-                                                    )));
+                                                    meeting_status.set(MeetingStatus::Error(
+                                                        format!(
+                                                            "Unknown status: {}",
+                                                            response.status
+                                                        ),
+                                                    ));
                                                 }
                                             }
                                         }
@@ -211,14 +216,14 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                             log::info!("Meeting still not accepting joins, continuing to wait");
                                         }
                                         Err(e) => {
-                                            log::error!("Error joining meeting: {}", e);
+                                            log::error!("Error joining meeting: {e}");
                                             meeting_status.set(MeetingStatus::Error(e.to_string()));
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
-                                log::warn!("Error checking meeting status: {}", e);
+                                log::warn!("Error checking meeting status: {e}");
                                 // Don't transition to error state, just keep polling
                             }
                         }
@@ -337,7 +342,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                         meeting_status.set(MeetingStatus::WaitingForMeeting);
                     }
                     Err(e) => {
-                        log::error!("Join meeting error: {}", e);
+                        log::error!("Join meeting error: {e}");
                         meeting_status.set(MeetingStatus::Error(e.to_string()));
                     }
                 }
@@ -496,7 +501,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     };
 
     let current_meeting_status = (*meeting_status).clone();
-    let current_host_display_name = (*host_display_name).clone();
+    // let current_host_display_name = (*host_display_name).clone();
     let should_auto_join = *came_from_waiting_room;
 
     html! {

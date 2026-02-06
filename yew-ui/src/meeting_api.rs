@@ -61,8 +61,8 @@ impl std::fmt::Display for JoinError {
             JoinError::MeetingNotActive => {
                 write!(f, "Meeting is not active. The host must join first.")
             }
-            JoinError::NetworkError(e) => write!(f, "Network error: {}", e),
-            JoinError::ServerError(code, msg) => write!(f, "Server error ({}): {}", code, msg),
+            JoinError::NetworkError(e) => write!(f, "Network error: {e}"),
+            JoinError::ServerError(code, msg) => write!(f, "Server error ({code}): {msg}"),
         }
     }
 }
@@ -73,17 +73,13 @@ pub async fn join_meeting(
     meeting_id: &str,
     display_name: Option<&str>,
 ) -> Result<JoinMeetingResponse, JoinError> {
-    let config = app_config().map_err(|e| JoinError::NetworkError(e))?;
+    let config = app_config().map_err(JoinError::NetworkError)?;
     let url = format!(
         "{}/api/v1/meetings/{}/join",
         config.api_base_url, meeting_id
     );
 
-    log::info!(
-        "Joining meeting via API: {} (display_name: {:?})",
-        url,
-        display_name
-    );
+    log::info!("Joining meeting via API: {url} (display_name: {display_name:?})");
 
     let body = JoinMeetingRequest {
         display_name: display_name.map(|s| s.to_string()),
@@ -100,7 +96,7 @@ pub async fn join_meeting(
         .map_err(|e| JoinError::NetworkError(format!("{e}")))?;
 
     let status = response.status();
-    log::info!("Join meeting response status: {}", status);
+    log::info!("Join meeting response status: {status}");
 
     match status {
         200 => {
@@ -134,7 +130,7 @@ pub async fn join_meeting(
 
 /// Get meeting info including host email
 pub async fn get_meeting_info(meeting_id: &str) -> Result<MeetingInfo, JoinError> {
-    let config = app_config().map_err(|e| JoinError::NetworkError(e))?;
+    let config = app_config().map_err(JoinError::NetworkError)?;
     let url = format!("{}/api/v1/meetings/{}", config.api_base_url, meeting_id);
 
     let response = Request::get(&url)
@@ -162,7 +158,7 @@ pub async fn get_meeting_info(meeting_id: &str) -> Result<MeetingInfo, JoinError
 
 /// Check participant status in a meeting
 pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinError> {
-    let config = app_config().map_err(|e| JoinError::NetworkError(e))?;
+    let config = app_config().map_err(JoinError::NetworkError)?;
     let url = format!(
         "{}/api/v1/meetings/{}/status",
         config.api_base_url, meeting_id
@@ -193,13 +189,13 @@ pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinE
 
 /// Leave a meeting - updates participant status to 'left' in database
 pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
-    let config = app_config().map_err(|e| JoinError::NetworkError(e))?;
+    let config = app_config().map_err(JoinError::NetworkError)?;
     let url = format!(
         "{}/api/v1/meetings/{}/leave",
         config.api_base_url, meeting_id
     );
 
-    log::info!("Leaving meeting via API: {}", url);
+    log::info!("Leaving meeting via API: {url}");
 
     let response = Request::post(&url)
         .credentials(RequestCredentials::Include)
@@ -209,13 +205,13 @@ pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
 
     match response.status() {
         200 => {
-            log::info!("Successfully left meeting {}", meeting_id);
+            log::info!("Successfully left meeting {meeting_id}");
             Ok(())
         }
         401 => Err(JoinError::NotAuthenticated),
         404 => {
             // Not in meeting is fine - just means we weren't tracked
-            log::warn!("Not in meeting {} when trying to leave", meeting_id);
+            log::warn!("Not in meeting {meeting_id} when trying to leave");
             Ok(())
         }
         status => {

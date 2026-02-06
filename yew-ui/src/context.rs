@@ -63,12 +63,14 @@ pub struct MeetingHost {
 
 impl MeetingHost {
     /// Check if the given email is the meeting host
+    #[allow(dead_code)]
     pub fn is_host(&self, email: &str) -> bool {
         self.host_email.as_deref() == Some(email)
     }
 }
 
 /// Context type for meeting host - read-only access to host info.
+#[allow(dead_code)]
 pub type MeetingHostCtx = MeetingHost;
 
 // -----------------------------------------------------------------------------

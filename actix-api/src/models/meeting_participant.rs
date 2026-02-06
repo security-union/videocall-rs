@@ -78,7 +78,7 @@ impl fmt::Display for ParticipantError {
             ParticipantError::MeetingNotFound => write!(f, "Meeting not found"),
             ParticipantError::MeetingNotActive => write!(f, "Meeting is not active"),
             ParticipantError::AlreadyJoined => write!(f, "Already joined this meeting"),
-            ParticipantError::DatabaseError(e) => write!(f, "Database error: {}", e),
+            ParticipantError::DatabaseError(e) => write!(f, "Database error: {e}"),
         }
     }
 }
@@ -272,10 +272,9 @@ impl MeetingParticipant {
             &format!(
                 r#"
             INSERT INTO meeting_participants (meeting_id, email, status, is_host, admitted_at, display_name)
-            VALUES ($1, $2, $3, $4, {}, $5)
+            VALUES ($1, $2, $3, $4, {admitted_at}, $5)
             RETURNING id, meeting_id, email, status, is_host, is_required, joined_at, admitted_at, left_at, created_at, updated_at, display_name
-            "#,
-                admitted_at
+            "#
             ),
         )
         .bind(meeting_id)

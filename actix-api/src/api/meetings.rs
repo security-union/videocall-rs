@@ -35,7 +35,7 @@ pub struct CreateMeetingRequest {
     pub password: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMeetingResponse {
     pub meeting_id: String,
     pub host: String,
@@ -45,14 +45,14 @@ pub struct CreateMeetingResponse {
     pub has_password: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ApiError {
     pub code: String,
     pub message: String,
 }
 
 /// Response for participant status
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ParticipantStatusResponse {
     pub email: String,
     pub status: String,
@@ -74,7 +74,7 @@ impl From<MeetingParticipant> for ParticipantStatusResponse {
 }
 
 /// Response for waiting room list
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WaitingRoomResponse {
     pub meeting_id: String,
     pub waiting: Vec<ParticipantStatusResponse>,
@@ -94,7 +94,7 @@ pub struct JoinMeetingRequest {
 }
 
 /// Response for meeting info (for attendees)
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MeetingInfoResponse {
     pub meeting_id: String,
     pub state: String,
@@ -105,7 +105,7 @@ pub struct MeetingInfoResponse {
 }
 
 /// Response for listing meetings
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListMeetingsResponse {
     pub meetings: Vec<MeetingSummary>,
     pub total: i64,
@@ -114,7 +114,7 @@ pub struct ListMeetingsResponse {
 }
 
 /// Summary of a meeting for listing
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MeetingSummary {
     pub meeting_id: String,
     pub host: Option<String>,
@@ -531,7 +531,7 @@ pub async fn admit_participant(
 }
 
 /// Response for admit all
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AdmitAllResponse {
     pub admitted_count: usize,
     pub admitted: Vec<ParticipantStatusResponse>,
@@ -874,4 +874,885 @@ pub async fn list_meetings(
         limit,
         offset,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{cookie::Cookie, test, App};
+    use serial_test::serial;
+
+    /// Get a test database pool from DATABASE_URL
+    async fn get_test_pool() -> PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
+        PgPool::connect(&database_url)
+            .await
+            .expect("Failed to connect to test database")
+    }
+
+    /// Clean up test data - deletes meeting and related records
+    async fn cleanup_test_data(pool: &PgPool, room_id: &str) {
+        // Delete participants first (FK constraint)
+        let _ = sqlx::query(
+            "DELETE FROM meeting_participants WHERE meeting_id IN (SELECT id FROM meetings WHERE room_id = $1)",
+        )
+        .bind(room_id)
+        .execute(pool)
+        .await;
+
+        // Delete meeting
+        let _ = sqlx::query("DELETE FROM meetings WHERE room_id = $1")
+            .bind(room_id)
+            .execute(pool)
+            .await;
+    }
+
+    /// Create a test app with all meeting routes
+    async fn create_test_app(
+        pool: PgPool,
+    ) -> impl actix_web::dev::Service<
+        actix_http::Request,
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+    > {
+        test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool))
+                .route("/api/v1/meetings", web::post().to(create_meeting))
+                .route("/api/v1/meetings", web::get().to(list_meetings))
+                .route("/api/v1/meetings/{meeting_id}", web::get().to(get_meeting))
+                .route(
+                    "/api/v1/meetings/{meeting_id}",
+                    web::delete().to(delete_meeting),
+                )
+                .route(
+                    "/api/v1/meetings/{meeting_id}/join",
+                    web::post().to(join_meeting),
+                )
+                .route(
+                    "/api/v1/meetings/{meeting_id}/waiting",
+                    web::get().to(get_waiting_room),
+                )
+                .route(
+                    "/api/v1/meetings/{meeting_id}/admit",
+                    web::post().to(admit_participant),
+                )
+                .route(
+                    "/api/v1/meetings/{meeting_id}/admit-all",
+                    web::post().to(admit_all_participants),
+                )
+                .route(
+                    "/api/v1/meetings/{meeting_id}/reject",
+                    web::post().to(reject_participant),
+                )
+                .route(
+                    "/api/v1/meetings/{meeting_id}/status",
+                    web::get().to(get_my_status),
+                )
+                .route(
+                    "/api/v1/meetings/{meeting_id}/leave",
+                    web::post().to(leave_meeting),
+                )
+                .route(
+                    "/api/v1/meetings/{meeting_id}/participants",
+                    web::get().to(get_participants),
+                ),
+        )
+        .await
+    }
+
+    //  CREATE MEETING TESTS
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-create-meeting-success";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({
+                "meeting_id": room_id,
+                "attendees": ["user1@example.com", "user2@example.com"],
+                "password": "secret123"
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201, "Expected 201 Created");
+
+        let body: CreateMeetingResponse = test::read_body_json(resp).await;
+        assert_eq!(body.meeting_id, room_id);
+        assert_eq!(body.host, "host@example.com");
+        assert!(body.has_password);
+        assert_eq!(body.attendees.len(), 2);
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_generates_id() {
+        let pool = get_test_pool().await;
+        let app = create_test_app(pool.clone()).await;
+
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({
+                "attendees": []
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201, "Expected 201 Created");
+
+        let body: CreateMeetingResponse = test::read_body_json(resp).await;
+        assert!(!body.meeting_id.is_empty(), "Meeting ID should be generated");
+        assert_eq!(body.meeting_id.len(), 12, "Generated ID should be 12 chars");
+
+        // Cleanup
+        cleanup_test_data(&pool, &body.meeting_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_unauthorized() {
+        let pool = get_test_pool().await;
+        let app = create_test_app(pool.clone()).await;
+
+        // No email cookie
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .set_json(serde_json::json!({
+                "meeting_id": "unauthorized-meeting"
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401, "Expected 401 Unauthorized");
+
+        let body: ApiError = test::read_body_json(resp).await;
+        assert_eq!(body.code, "UNAUTHORIZED");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_duplicate_id() {
+        let pool = get_test_pool().await;
+        let room_id = "test-duplicate-meeting";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create first meeting
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({
+                "meeting_id": room_id
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 201);
+
+        // Try to create duplicate
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({
+                "meeting_id": room_id
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 409, "Expected 409 Conflict");
+
+        let body: ApiError = test::read_body_json(resp).await;
+        assert_eq!(body.code, "MEETING_EXISTS");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_meeting_too_many_attendees() {
+        let pool = get_test_pool().await;
+        let app = create_test_app(pool.clone()).await;
+
+        // Create 101 attendees (over the limit)
+        let attendees: Vec<String> = (0..101).map(|i| format!("user{}@example.com", i)).collect();
+
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({
+                "meeting_id": "too-many-attendees",
+                "attendees": attendees
+            }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400, "Expected 400 Bad Request");
+
+        let body: ApiError = test::read_body_json(resp).await;
+        assert_eq!(body.code, "TOO_MANY_ATTENDEES");
+    }
+
+    //  GET MEETING TESTS
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_meeting_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-get-meeting";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create meeting first
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({
+                "meeting_id": room_id,
+                "password": "secret"
+            }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Get meeting
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: MeetingInfoResponse = test::read_body_json(resp).await;
+        assert_eq!(body.meeting_id, room_id);
+        assert_eq!(body.host, "host@example.com");
+        assert!(body.has_password);
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_meeting_not_found() {
+        let pool = get_test_pool().await;
+        let app = create_test_app(pool.clone()).await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/v1/meetings/nonexistent-meeting")
+            .cookie(Cookie::new("email", "user@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 404, "Expected 404 Not Found");
+
+        let body: ApiError = test::read_body_json(resp).await;
+        assert_eq!(body.code, "MEETING_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_meeting_unauthorized() {
+        let pool = get_test_pool().await;
+        let app = create_test_app(pool.clone()).await;
+
+        let req = test::TestRequest::get()
+            .uri("/api/v1/meetings/some-meeting")
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 401, "Expected 401 Unauthorized");
+    }
+
+    
+    #[tokio::test]
+    #[serial]
+    async fn test_join_meeting_host_activates() {
+        let pool = get_test_pool().await;
+        let room_id = "test-host-join";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create meeting
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Host joins (should activate meeting)
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "display_name": "Host User" }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: ParticipantStatusResponse = test::read_body_json(resp).await;
+        assert_eq!(body.status, "admitted");
+        assert!(body.is_host);
+
+        // Verify meeting is now active
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        let body: MeetingInfoResponse = test::read_body_json(resp).await;
+        assert_eq!(body.state, "active");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_join_meeting_attendee_waits() {
+        let pool = get_test_pool().await;
+        let room_id = "test-attendee-wait";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create and activate meeting (host joins)
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Attendee joins (should be in waiting room)
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "attendee@example.com"))
+            .set_json(serde_json::json!({ "display_name": "Attendee" }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: ParticipantStatusResponse = test::read_body_json(resp).await;
+        assert_eq!(body.status, "waiting");
+        assert!(!body.is_host);
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_join_meeting_not_active() {
+        let pool = get_test_pool().await;
+        let room_id = "test-join-not-active";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create meeting but don't have host join
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Non-host tries to join inactive meeting
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "attendee@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 400, "Expected 400 Bad Request");
+
+        let body: ApiError = test::read_body_json(resp).await;
+        assert_eq!(body.code, "MEETING_NOT_ACTIVE");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_waiting_room_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-waiting-room";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create and activate meeting
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Add attendee to waiting room
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "attendee@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Host gets waiting room
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/meetings/{}/waiting", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: WaitingRoomResponse = test::read_body_json(resp).await;
+        assert_eq!(body.meeting_id, room_id);
+        assert_eq!(body.waiting.len(), 1);
+        assert_eq!(body.waiting[0].email, "attendee@example.com");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_admit_participant_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-admit-participant";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Setup: Create meeting, host joins, attendee waits
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "attendee@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Host admits attendee
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/admit", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "email": "attendee@example.com" }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: ParticipantStatusResponse = test::read_body_json(resp).await;
+        assert_eq!(body.status, "admitted");
+        assert!(body.admitted_at.is_some());
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_admit_participant_not_found() {
+        let pool = get_test_pool().await;
+        let room_id = "test-admit-not-found";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Setup: Create meeting, host joins
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Try to admit non-existent participant
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/admit", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "email": "nonexistent@example.com" }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 404, "Expected 404 Not Found");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_reject_participant_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-reject-participant";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Setup: Create meeting, host joins, attendee waits
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "attendee@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Host rejects attendee
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/reject", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "email": "attendee@example.com" }))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: ParticipantStatusResponse = test::read_body_json(resp).await;
+        assert_eq!(body.status, "rejected");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_admit_all_participants() {
+        let pool = get_test_pool().await;
+        let room_id = "test-admit-all";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Setup: Create meeting, host joins, multiple attendees wait
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Add multiple attendees
+        for i in 1..=3 {
+            let req = test::TestRequest::post()
+                .uri(&format!("/api/v1/meetings/{}/join", room_id))
+                .cookie(Cookie::new("email", format!("attendee{}@example.com", i)))
+                .to_request();
+            let _ = test::call_service(&app, req).await;
+        }
+
+        // Host admits all
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/admit-all", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: AdmitAllResponse = test::read_body_json(resp).await;
+        assert_eq!(body.admitted_count, 3);
+        assert_eq!(body.admitted.len(), 3);
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_leave_meeting_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-leave-meeting";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Setup: Create meeting, host joins, attendee joins and is admitted
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "attendee@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/admit", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "email": "attendee@example.com" }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Attendee leaves
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/leave", room_id))
+            .cookie(Cookie::new("email", "attendee@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: ParticipantStatusResponse = test::read_body_json(resp).await;
+        assert_eq!(body.status, "left");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_list_meetings_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-list-meetings";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create a meeting
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // List meetings
+        let req = test::TestRequest::get()
+            .uri("/api/v1/meetings?limit=10&offset=0")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: ListMeetingsResponse = test::read_body_json(resp).await;
+        assert!(body.meetings.iter().any(|m| m.meeting_id == room_id));
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_delete_meeting_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-delete-meeting";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create a meeting
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Owner deletes meeting
+        let req = test::TestRequest::delete()
+            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        // Verify meeting is deleted (soft delete - will return 404)
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 404, "Expected 404 after deletion");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_delete_meeting_not_owner() {
+        let pool = get_test_pool().await;
+        let room_id = "test-delete-not-owner";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Create a meeting as host
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Non-owner tries to delete
+        let req = test::TestRequest::delete()
+            .uri(&format!("/api/v1/meetings/{}", room_id))
+            .cookie(Cookie::new("email", "other@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 403, "Expected 403 Forbidden");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_participants_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-get-participants";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Setup: Create meeting, host joins, attendee joins and is admitted
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "attendee@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/admit", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "email": "attendee@example.com" }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Get participants
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/meetings/{}/participants", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: Vec<ParticipantStatusResponse> = test::read_body_json(resp).await;
+        assert_eq!(body.len(), 2); // Host + admitted attendee
+
+        cleanup_test_data(&pool, room_id).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_my_status_success() {
+        let pool = get_test_pool().await;
+        let room_id = "test-get-my-status";
+        cleanup_test_data(&pool, room_id).await;
+
+        let app = create_test_app(pool.clone()).await;
+
+        // Setup: Create meeting, host joins
+        let req = test::TestRequest::post()
+            .uri("/api/v1/meetings")
+            .cookie(Cookie::new("email", "host@example.com"))
+            .set_json(serde_json::json!({ "meeting_id": room_id }))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        let req = test::TestRequest::post()
+            .uri(&format!("/api/v1/meetings/{}/join", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+        let _ = test::call_service(&app, req).await;
+
+        // Get my status
+        let req = test::TestRequest::get()
+            .uri(&format!("/api/v1/meetings/{}/status", room_id))
+            .cookie(Cookie::new("email", "host@example.com"))
+            .to_request();
+
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200, "Expected 200 OK");
+
+        let body: ParticipantStatusResponse = test::read_body_json(resp).await;
+        assert_eq!(body.email, "host@example.com");
+        assert!(body.is_host);
+        assert_eq!(body.status, "admitted");
+
+        cleanup_test_data(&pool, room_id).await;
+    }
 }

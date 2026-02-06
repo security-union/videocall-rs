@@ -52,8 +52,10 @@ services:
       nats:
         condition: service_started
     command: >
-      bash -lc '
+      bash -c '
         set -euo pipefail
+        source /usr/local/cargo/env || true
+        export PATH="/usr/local/cargo/bin:$PATH"
         echo "=== RUNNING DATABASE MIGRATIONS ==="
         cd /app/dbmate && dbmate wait && dbmate up
         cd /app/actix-api

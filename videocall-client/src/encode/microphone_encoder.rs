@@ -75,7 +75,7 @@ pub fn transform_audio_chunk(
             sequence,
             ..Default::default()
         })
-        .into(),
+            .into(),
         ..Default::default()
     };
     let data = media_packet.write_to_bytes().unwrap();
@@ -95,6 +95,7 @@ pub struct MicrophoneEncoder {
     codec: AudioWorkletCodec,
     on_error: Option<Callback<String>>,
     is_speaking: Rc<AtomicBool>,
+    last_speaking_state: Rc<AtomicBool>,
 }
 
 impl MicrophoneEncoder {
@@ -111,6 +112,7 @@ impl MicrophoneEncoder {
             codec: AudioWorkletCodec::default(),
             on_error: Some(on_error),
             is_speaking: Rc::new(AtomicBool::new(false)),
+            last_speaking_state: Rc::new(AtomicBool::new(false)),
         }
     }
 
@@ -195,6 +197,7 @@ impl MicrophoneEncoder {
             log::info!("Starting Microphone audio encoder");
             let mut sequence_number = 0;
             let is_speaking = self.is_speaking.clone();
+            let last_speaking_state = self.last_speaking_state.clone();
             let client_for_vad = client.clone();
 
             Box::new(move |chunk: MessageEvent| {
@@ -226,10 +229,21 @@ impl MicrophoneEncoder {
                 let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
                 if let Ok(data) = data.dyn_into::<Uint8Array>() {
                     let packet_size = data.length();
-                    let speaking = packet_size > 150;
-                    log::info!("🔴 VAD: packet_size={}, speaking={}", packet_size, speaking);
+
+                    // Hysteresis-based VAD: Different thresholds for on/off
+                    let last_speaking = last_speaking_state.load(Ordering::Relaxed);
+                    let speaking = if last_speaking {
+                        // Already speaking - lower threshold to stay on (prevents flickering)
+                        packet_size > 50
+                    } else {
+                        // Not speaking - higher threshold to start (filters out noise)
+                        packet_size > 120
+                    };
+
+                    log::info!("🔴 VAD: packet_size={}, last_speaking={}, speaking={}", packet_size, last_speaking, speaking);
 
                     is_speaking.store(speaking, Ordering::Relaxed);
+                    last_speaking_state.store(speaking, Ordering::Relaxed);
                     client_for_vad.set_speaking(speaking);
 
                     let packet: PacketWrapper =

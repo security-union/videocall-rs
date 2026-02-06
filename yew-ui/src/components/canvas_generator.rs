@@ -28,9 +28,7 @@ use web_sys::{window, HtmlCanvasElement};
 use yew::prelude::*;
 use yew::{html, Html};
 
-/// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
-/// the video tile will occupy the full grid area.
-pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: bool) -> Html {
+pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: bool, is_speaking: bool) -> Html {
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
         return html! {};
@@ -39,11 +37,10 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
     let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
-    let is_speaking = client.is_speaking_for_peer(key);
-    log::info!("🟢 UI2222: peer {} is_speaking={}", key, is_speaking);
+    log::info!("🟢 UI8: peer {} is_speaking={}", key, is_speaking);
 
     let border_style = if is_speaking {
-        "border: 3px solid green; border-radius: 8px; transition: all 0.2s;"
+        "border: 3px solid orange; border-radius: 8px; transition: all 0.2s;"
     } else {
         ""
     };

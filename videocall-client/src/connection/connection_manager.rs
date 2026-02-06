@@ -818,6 +818,15 @@ impl ConnectionManager {
         Err(anyhow!("No active connection available"))
     }
 
+    /// Set speaking on active connection
+    pub fn set_speaking(&self, speaking: bool) {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            if let Some(connection) = self.connections.get(active_id) {
+                connection.set_speaking(speaking);
+            }
+        }
+    }
+
     /// Check if manager has an active connection
     pub fn is_connected(&self) -> bool {
         self.active_connection_id.borrow().is_some()

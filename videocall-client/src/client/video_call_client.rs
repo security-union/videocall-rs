@@ -48,76 +48,29 @@ use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
-/// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoCallClientOptions {
-    /// `true` to use end-to-end encription; `false` to send data unencrypted
     pub enable_e2ee: bool,
-
-    /// `true` to use webtransport, `false` to use websocket
     pub enable_webtransport: bool,
-
-    /// Callback will be called as `callback(peer_userid)` when a new peer is added
     pub on_peer_added: Callback<String>,
-
-    /// Callback will be called as `callback(peer_userid, media_type)` immediately after the first frame of a given peer & media type is decoded
     pub on_peer_first_frame: Callback<(String, MediaType)>,
-
-    /// Optional callback called as `callback(peer_userid)` when a peer is removed (e.g., heartbeat lost)
     pub on_peer_removed: Option<Callback<String>>,
-
-    /// Callback will be called as `callback(peer_userid)` and must return the DOM id of the
-    /// `HtmlCanvasElement` into which the peer video should be rendered
     pub get_peer_video_canvas_id: Callback<String, String>,
-
-    /// Callback will be called as `callback(peer_userid)` and must return the DOM id of the
-    /// `HtmlCanvasElement` into which the peer screen image should be rendered
     pub get_peer_screen_canvas_id: Callback<String, String>,
-
-    /// The current client's userid.  This userid will appear as this client's `peer_userid` in the
-    /// remote peers' clients.
     pub userid: String,
-
-    /// The meeting ID that this client is joining
     pub meeting_id: String,
-
-    /// The urls to which WebSocket connections should be made (comma-separated)
     pub websocket_urls: Vec<String>,
-
-    /// The urls to which WebTransport connections should be made (comma-separated)
     pub webtransport_urls: Vec<String>,
-
-    /// Callback will be called as `callback(())` after a new connection is made
     pub on_connected: Callback<()>,
-
-    /// Callback will be called as `callback(())` if a connection gets dropped
     pub on_connection_lost: Callback<JsValue>,
-
-    /// `true` to enable diagnostics collection; `false` to disable
     pub enable_diagnostics: bool,
-
-    /// How often to send diagnostics updates in milliseconds (default: 1000)
     pub diagnostics_update_interval_ms: Option<u64>,
-
-    /// `true` to enable health reporting to server; `false` to disable
     pub enable_health_reporting: bool,
-
-    /// How often to send health packets in milliseconds (default: 5000)
     pub health_reporting_interval_ms: Option<u64>,
-
-    /// Callback for encoder settings
     pub on_encoder_settings_update: Option<Callback<String>>,
-
-    /// RTT testing period in milliseconds (default: 3000ms)
     pub rtt_testing_period_ms: u64,
-
-    /// Interval between RTT probes in milliseconds (default: 200ms)
     pub rtt_probe_interval_ms: Option<u64>,
-
-    /// Callback triggered when meeting info is received (optional)
     pub on_meeting_info: Option<Callback<f64>>,
-
-    /// Callback triggered when the meeting ends (optional)
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
     pub on_speaking_changed: Option<Callback<bool>>,
 }
@@ -144,12 +97,6 @@ struct Inner {
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
 }
 
-/// The client struct for a video call connection.
-///
-/// To use it, first construct the struct using [new(options)][Self::new].  Then when/if desired,
-/// create the connection using [connect()][Self::connect].  Once connected, decoding of media from
-/// remote peers will start immediately.
-///
 #[derive(Clone, Debug)]
 pub struct VideoCallClient {
     options: VideoCallClientOptions,
@@ -165,18 +112,12 @@ impl PartialEq for VideoCallClient {
 }
 
 impl VideoCallClient {
-    /// Constructor for the client struct.
-    ///
-    /// See [VideoCallClientOptions] for description of the options.
-    ///
     pub fn new(options: VideoCallClientOptions) -> Self {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
 
-        // Create diagnostics manager if enabled
         let diagnostics = if options.enable_diagnostics {
             let diagnostics = Rc::new(DiagnosticManager::new(options.userid.clone()));
 
-            // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 let mut diag = DiagnosticManager::new(options.userid.clone());
                 diag.set_reporting_interval(interval);
@@ -190,11 +131,9 @@ impl VideoCallClient {
             None
         };
 
-        // Create sender diagnostics manager if diagnostics are enabled
         let sender_diagnostics = if options.enable_diagnostics {
             let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.userid.clone()));
 
-            // Set update interval if provided
             if let Some(interval) = options.diagnostics_update_interval_ms {
                 sender_diagnostics.set_reporting_interval(interval);
             }
@@ -204,7 +143,6 @@ impl VideoCallClient {
             None
         };
 
-        // Create health reporter if enabled
         let health_reporter = if options.enable_health_reporting {
             let session_id = format!(
                 "session_{}",
@@ -220,10 +158,8 @@ impl VideoCallClient {
                 options.health_reporting_interval_ms.unwrap_or(5000),
             );
 
-            // Set the meeting ID
             reporter.set_meeting_id(options.meeting_id.clone());
 
-            // Set health reporting interval if provided
             if let Some(interval) = options.health_reporting_interval_ms {
                 reporter.set_health_interval(interval);
             }
@@ -262,7 +198,6 @@ impl VideoCallClient {
             _diagnostics: diagnostics.clone(),
         };
 
-        // Set up the packet forwarding from DiagnosticManager to VideoCallClient
         if let Some(diagnostics) = &diagnostics {
             let client_clone = client.clone();
             diagnostics.set_packet_handler(Callback::from(move |packet| {
@@ -270,7 +205,6 @@ impl VideoCallClient {
             }));
         }
 
-        // Set up health reporter with packet sending callback
         if let Some(health_reporter) = &health_reporter {
             if let Ok(mut reporter) = health_reporter.try_borrow_mut() {
                 let client_clone = client.clone();
@@ -278,10 +212,8 @@ impl VideoCallClient {
                     client_clone.send_packet(packet);
                 }));
 
-                // Start real diagnostics subscription (not mock channels)
                 reporter.start_diagnostics_subscription();
 
-                // Start health reporting
                 reporter.start_health_reporting();
                 debug!("Health reporting started with real diagnostics subscription");
             }
@@ -290,26 +222,12 @@ impl VideoCallClient {
         client
     }
 
-    /// Initiates a connection to a videocall server with RTT testing.
-    ///
-    /// Tests all provided servers by measuring round-trip time (RTT) and connects to the server
-    /// with the lowest average RTT. The testing period and probe interval can be configured
-    /// via the options.
-    ///
-    /// Note that this method's success means only that it succesfully *attempted* initiation of the
-    /// connection.  The connection cannot actually be considered to have been succesful until the
-    /// [`options.on_connected`](VideoCallClientOptions::on_connected) callback has been invoked.
-    ///
-    /// If the connection does not succeed, the
-    /// [`options.on_connection_lost`](VideoCallClientOptions::on_connection_lost) callback will be
-    /// invoked.
-    ///
     pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
         let websocket_count = self.options.websocket_urls.len();
         let webtransport_count = if self.options.enable_webtransport {
             self.options.webtransport_urls.len()
         } else {
-            0 // Don't count WebTransport URLs if WebTransport is disabled
+            0
         };
         let total_servers = websocket_count + webtransport_count;
 
@@ -325,13 +243,12 @@ impl VideoCallClient {
 
         info!("RTT testing period: {election_period_ms}ms");
 
-        // Create ConnectionManager which will handle all the RTT testing
         let manager_options = ConnectionManagerOptions {
             websocket_urls: self.options.websocket_urls.clone(),
             webtransport_urls: if self.options.enable_webtransport {
                 self.options.webtransport_urls.clone()
             } else {
-                Vec::new() // Empty if WebTransport is disabled
+                Vec::new()
             },
             userid: self.options.userid.clone(),
             on_inbound_media: {
@@ -339,7 +256,6 @@ impl VideoCallClient {
                 Callback::from(move |packet| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
-                            // Process the packet
                             inner.on_inbound_media(packet);
                         }
                     }
@@ -365,7 +281,6 @@ impl VideoCallClient {
                             on_connection_lost.emit(JsValue::from_str(&error));
                         }
                         _ => {
-                            // Other states don't trigger callbacks
                         }
                     }
                 })
@@ -401,21 +316,7 @@ impl VideoCallClient {
         Ok(())
     }
 
-    /// Initiates a connection to a videocall server with automatic RTT-based server selection.
-    ///
-    /// This method automatically tests all provided servers and connects to the one with the lowest RTT.
-    /// For single server deployments, it connects immediately without testing.
-    ///
-    /// Note that this method's success means only that it succesfully *attempted* initiation of the
-    /// connection.  The connection cannot actually be considered to have been succesful until the
-    /// [`options.on_connected`](VideoCallClientOptions::on_connected) callback has been invoked.
-    ///
-    /// If the connection does not succeed, the
-    /// [`options.on_connection_lost`](VideoCallClientOptions::on_connection_lost) callback will be
-    /// invoked.
-    ///
     pub fn connect(&mut self) -> anyhow::Result<()> {
-        // Always use RTT testing - it handles single server case efficiently
         info!("Connecting with RTT testing");
         self.connect_with_rtt_testing()
     }
@@ -466,7 +367,6 @@ impl VideoCallClient {
         }
     }
 
-    /// Returns `true` if the client is currently connected to a server.
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -476,15 +376,8 @@ impl VideoCallClient {
         false
     }
 
-    /// Disconnect from the current server.
     pub fn disconnect(&self) -> anyhow::Result<()> {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            // if let Some(health_reporter) = &inner.health_reporter {
-            //     if let Ok(reporter) = health_reporter.try_borrow_mut() {
-            //         reporter.stop_health_reporting();
-            //     }
-            // }
-
             if let Some(connection_controller) = &mut inner.connection_controller {
                 let _ = connection_controller.disconnect();
             }
@@ -500,7 +393,6 @@ impl VideoCallClient {
         }
     }
 
-    /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.
     pub fn sorted_peer_keys(&self) -> Vec<String> {
         match self.inner.try_borrow() {
             Ok(inner) => inner.peer_decode_manager.sorted_keys().to_vec(),
@@ -508,13 +400,6 @@ impl VideoCallClient {
         }
     }
 
-    /// Hacky function that returns true if the given peer has yet to send a frame of screen share.
-    ///
-    /// No reason for this function to exist, it should be deducible from the
-    /// [`options.on_peer_first_frame(key, MediaType::Screen)`](VideoCallClientOptions::on_peer_first_frame)
-    /// callback.   Or if polling is really necessary, instead of being hardwired for screen, it'd
-    /// be more elegant to at least pass a `MediaType`.
-    ///
     pub fn is_awaiting_peer_screen_frame(&self, key: &String) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(peer) = inner.peer_decode_manager.get(key) {
@@ -562,12 +447,10 @@ impl VideoCallClient {
         self.aes.clone()
     }
 
-    /// Returns a reference to a copy of [`options.userid`](VideoCallClientOptions::userid)
     pub fn userid(&self) -> &String {
         &self.options.userid
     }
 
-    /// Get current connection state from ConnectionController
     pub fn get_connection_state(&self) -> Option<ConnectionState> {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -577,7 +460,6 @@ impl VideoCallClient {
         None
     }
 
-    /// Get RTT measurements from ConnectionController (for debugging)
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -594,46 +476,26 @@ impl VideoCallClient {
         None
     }
 
-    /// Send RTT probes manually (for testing)
     pub fn send_rtt_probes(&self) -> anyhow::Result<()> {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(_connection_controller) = &inner.connection_controller {
-                // RTT probes are now handled automatically by ConnectionController timers
                 return Ok(());
             }
         }
         Err(anyhow!("No connection controller available"))
     }
 
-    /// Check and complete election if testing period is over
     pub fn check_election_completion(&self) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(_connection_controller) = &inner.connection_controller {
-                // Election completion is now handled automatically by ConnectionController timers
             }
         }
     }
 
-    /// Get diagnostics information for all peers
-    ///
-    /// Returns a formatted string with FPS stats for all peers if diagnostics are enabled,
-    /// or None if diagnostics are disabled.
     pub fn get_diagnostics(&self) -> Option<String> {
         self.inner.borrow().peer_decode_manager.get_all_fps_stats()
     }
 
-    /// Set the canvas element for a peer's video rendering
-    ///
-    /// This method allows you to pass a canvas reference directly instead of relying on DOM queries.
-    /// Should be called when the canvas element is mounted in the UI.
-    ///
-    /// # Arguments
-    /// * `peer_id` - The ID of the peer
-    /// * `canvas` - The HtmlCanvasElement to render video frames to
-    ///
-    /// # Returns
-    /// * `Ok(())` if successful
-    /// * `Err(JsValue)` if the peer doesn't exist or canvas setup fails
     pub fn set_peer_video_canvas(
         &self,
         peer_id: &str,
@@ -648,18 +510,6 @@ impl VideoCallClient {
         }
     }
 
-    /// Set the canvas element for a peer's screen share rendering
-    ///
-    /// This method allows you to pass a canvas reference directly instead of relying on DOM queries.
-    /// Should be called when the canvas element is mounted in the UI.
-    ///
-    /// # Arguments
-    /// * `peer_id` - The ID of the peer
-    /// * `canvas` - The HtmlCanvasElement to render screen frames to
-    ///
-    /// # Returns
-    /// * `Ok(())` if successful
-    /// * `Err(JsValue)` if the peer doesn't exist or canvas setup fails
     pub fn set_peer_screen_canvas(
         &self,
         peer_id: &str,
@@ -674,10 +524,6 @@ impl VideoCallClient {
         }
     }
 
-    /// Get the FPS for a specific peer and media type
-    ///
-    /// Returns the current frames per second for the specified peer and media type,
-    /// or 0.0 if diagnostics are disabled or the peer doesn't exist.
     pub fn get_peer_fps(&self, peer_id: &str, media_type: MediaType) -> f64 {
         self.inner
             .borrow()
@@ -685,7 +531,6 @@ impl VideoCallClient {
             .get_fps(peer_id, media_type)
     }
 
-    /// Send a diagnostic packet to the server
     pub fn send_diagnostic_packet(&self, packet: DiagnosticsPacket) {
         let wrapper = PacketWrapper {
             packet_type: PacketType::DIAGNOSTICS.into(),
@@ -708,15 +553,10 @@ impl VideoCallClient {
         }
     }
 
-    /// Subscribe to the global diagnostics broadcast system
-    ///
-    /// Returns a receiver that will receive all diagnostic events from across the system.
-    /// This is the new preferred way to access diagnostics data using the MPMC broadcast pattern.
     pub fn subscribe_global_diagnostics(&self) -> async_broadcast::Receiver<DiagEvent> {
         subscribe_global_diagnostics()
     }
 
-    /// Remove a peer from health tracking
     pub fn remove_peer_health(&self, peer_id: &str) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(health_reporter) = &inner.health_reporter {
@@ -786,10 +626,18 @@ impl VideoCallClient {
         }
     }
 
-    /// Updates the speaker device for all connected peers
-    ///
-    /// This will recreate all audio decoders to use the specified speaker device.
-    /// Pass None to use the default system speaker.
+    pub fn set_speaking(&self, speaking: bool) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(connection_controller) = &inner.connection_controller {
+                connection_controller.set_speaking(speaking);
+            }
+        }
+
+        if let Some(callback) = &self.options.on_speaking_changed {
+            callback.emit(speaking);
+        }
+    }
+
     pub fn update_speaker_device(&self, speaker_device_id: Option<String>) -> Result<(), JsValue> {
         match self.inner.try_borrow_mut() {
             Ok(mut inner) => inner
@@ -812,7 +660,6 @@ impl Inner {
             response.packet_type.enum_value(),
             response.email
         );
-        // Skip creating peers for system messages (meeting info, meeting started/ended)
         let peer_status = if response.email == SYSTEM_USER_EMAIL {
             PeerStatus::NoChange
         } else {
@@ -862,7 +709,6 @@ impl Inner {
                     Ok(data) => {
                         debug!(">> {} sending AES key", self.options.userid);
 
-                        // Send AES key packet via ConnectionController
                         if let Some(connection_controller) = &self.connection_controller {
                             let packet = PacketWrapper {
                                 packet_type: PacketType::AES_KEY.into(),
@@ -886,8 +732,6 @@ impl Inner {
             Ok(PacketType::MEDIA) => {
                 let email = response.email.clone();
 
-                // RTT responses are now handled directly by the ConnectionManager via individual connection callbacks
-                // No need to process them here anymore
                 if let Err(e) = self
                     .peer_decode_manager
                     .decode(response, &self.options.userid)
@@ -904,13 +748,10 @@ impl Inner {
                 }
             }
             Ok(PacketType::CONNECTION) => {
-                // CONNECTION packets are used for other purposes now
-                // Meeting info is sent via MEETING packet type with protobuf
                 let data_str = String::from_utf8_lossy(&response.data);
                 debug!("Received CONNECTION packet: {data_str}");
             }
             Ok(PacketType::DIAGNOSTICS) => {
-                // Parse and handle the diagnostics packet
                 if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
                 {
                     debug!("Received diagnostics packet: {diagnostics_packet:?}");
@@ -922,15 +763,12 @@ impl Inner {
                 }
             }
             Ok(PacketType::HEALTH) => {
-                // Health packets are sent from client to server for monitoring
-                // Clients should not receive health packets, so we ignore them
                 debug!(
                     "Received unexpected health packet from {}, ignoring",
                     response.email
                 );
             }
             Ok(PacketType::MEETING) => {
-                // Parse MeetingPacket protobuf
                 match MeetingPacket::parse_from_bytes(&response.data) {
                     Ok(meeting_packet) => {
                         match meeting_packet.event_type.enum_value() {
@@ -963,14 +801,12 @@ impl Inner {
                                     "Received PARTICIPANT_JOINED: room={}, count={}",
                                     meeting_packet.room_id, meeting_packet.participant_count
                                 );
-                                // Future: could emit participant joined event
                             }
                             Ok(MeetingEventType::PARTICIPANT_LEFT) => {
                                 info!(
                                     "Received PARTICIPANT_LEFT: room={}, count={}",
                                     meeting_packet.room_id, meeting_packet.participant_count
                                 );
-                                // Future: could emit participant left event
                             }
                             Err(e) => {
                                 error!("Unknown MeetingEventType: {e}");
@@ -1013,7 +849,6 @@ impl Inner {
                     Ok(data) => {
                         debug!(">> {userid} sending public key");
 
-                        // Send RSA public key packet via ConnectionController
                         if let Some(connection_controller) = &self.connection_controller {
                             let packet = PacketWrapper {
                                 packet_type: PacketType::RSA_PUB_KEY.into(),

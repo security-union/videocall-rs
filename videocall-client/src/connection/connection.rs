@@ -52,8 +52,8 @@ pub struct Connection {
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
     is_speaking: Rc<AtomicBool>,
-    last_speaking_time: Rc<Cell<f64>>,
     on_speaking_changed: Option<Callback<bool>>,
+    userid: String,
     url: String,
 }
 
@@ -100,8 +100,8 @@ impl Connection {
             video_enabled: Rc::new(AtomicBool::new(false)),
             screen_enabled: Rc::new(AtomicBool::new(false)),
             is_speaking: Rc::new(AtomicBool::new(false)),
-            last_speaking_time: Rc::new(Cell::new(0.0)),
             on_speaking_changed: None,
+            userid: userid.clone(),
             url,
         };
         connection.start_heartbeat(userid);
@@ -125,23 +125,13 @@ impl Connection {
         let audio_enabled = Rc::clone(&self.audio_enabled);
         let screen_enabled = Rc::clone(&self.screen_enabled);
         let is_speaking = Rc::clone(&self.is_speaking);
-        let last_speaking_time = Rc::clone(&self.last_speaking_time);
-        let on_speaking_changed = self.on_speaking_changed.clone();
 
         self.heartbeat = Some(Interval::new(1000, move || {
-            let now = js_sys::Date::now();
-            let time_since_speaking = now - last_speaking_time.get();
-            let is_speaking_val = time_since_speaking < 200.0;
-
-            if let Some(ref callback) = on_speaking_changed {
-                callback.emit(is_speaking_val);
-            }
-
             let heartbeat_metadata = HeartbeatMetadata {
                 video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
                 audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
                 screen_enabled: screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
-                is_speaking: is_speaking_val,
+                is_speaking: is_speaking.load(std::sync::atomic::Ordering::Relaxed),
                 ..Default::default()
             };
 
@@ -180,6 +170,36 @@ impl Connection {
         }
     }
 
+    fn send_immediate_heartbeat(&self) {
+        if let Status::Connected = self.status.get() {
+            let heartbeat_metadata = HeartbeatMetadata {
+                video_enabled: self.video_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                audio_enabled: self.audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                screen_enabled: self.screen_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                is_speaking: self.is_speaking.load(std::sync::atomic::Ordering::Relaxed),
+                ..Default::default()
+            };
+
+            let packet = MediaPacket {
+                media_type: MediaType::HEARTBEAT.into(),
+                email: self.userid.clone(),
+                timestamp: js_sys::Date::now(),
+                heartbeat_metadata: Some(heartbeat_metadata).into(),
+                ..Default::default()
+            };
+
+            if let Ok(data) = self.aes.encrypt(&packet.write_to_bytes().unwrap()) {
+                let packet = PacketWrapper {
+                    data,
+                    email: self.userid.clone(),
+                    packet_type: PacketType::MEDIA.into(),
+                    ..Default::default()
+                };
+                self.task.send_packet(packet);
+            }
+        }
+    }
+
     pub fn set_video_enabled(&self, enabled: bool) {
         log::debug!("Setting video enabled to {enabled}");
         self.video_enabled
@@ -199,10 +219,8 @@ impl Connection {
     }
 
     pub fn set_speaking(&self, speaking: bool) {
-        if speaking {
-            self.last_speaking_time.set(js_sys::Date::now());
-        }
         self.is_speaking.store(speaking, std::sync::atomic::Ordering::Relaxed);
+        self.send_immediate_heartbeat();
     }
 }
 

@@ -162,13 +162,13 @@ pub struct AttendantsComponent {
     force_desktop_grid_on_mobile: bool,
     simulation_info_message: Option<String>,
     show_copy_toast: bool,
-    pub meeting_start_time_server: Option<f64>, //Server-provided meeting start timestamp - the actual meeting time
-    pub call_start_time: Option<f64>,           // Track when the call started for a user
+    pub meeting_start_time_server: Option<f64>,
+    pub call_start_time: Option<f64>,
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
     self_video_floating: bool,
-    _rerender_interval: Option<gloo_timers::callback::Interval>,
+    local_speaking: bool,
 }
 
 impl AttendantsComponent {
@@ -269,16 +269,18 @@ impl AttendantsComponent {
                 let link = ctx.link().clone();
                 Callback::from(move |(end_time_ms, message): (f64, String)| {
                     log::info!("Meeting ended at Unix timestamp: {end_time_ms}");
-                    // link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
-                    //     end_time_ms as u64,
-                    // )));
                     link.send_message(Msg::WsAction(WsAction::MeetingInfoReceived(
                         end_time_ms as u64,
                     )));
                     link.send_message(Msg::MeetingEnded(message));
                 })
             }),
-            on_speaking_changed: None,
+            on_speaking_changed: Some({
+                let link = ctx.link().clone();
+                Callback::from(move |speaking: bool| {
+                    link.send_message(Msg::OnSpeakingChanged(speaking));
+                })
+            }),
         };
 
         VideoCallClient::new(opts)
@@ -327,7 +329,7 @@ impl AttendantsComponent {
 
     #[cfg(not(feature = "fake-peers"))]
     fn view_fake_peer_buttons(&self, _ctx: &Context<Self>, _add_fake_peer_disabled: bool) -> Html {
-        html! {} // Empty html when feature is not enabled
+        html! {}
     }
 
     #[cfg(feature = "fake-peers")]
@@ -357,13 +359,13 @@ impl AttendantsComponent {
 
     #[cfg(not(feature = "fake-peers"))]
     fn view_grid_toggle(&self, _ctx: &Context<Self>) -> Html {
-        html! {} // Empty html when feature is not enabled
+        html! {}
     }
 
     fn play_user_joined() {
         if let Some(_window) = web_sys::window() {
             if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
-                audio.set_volume(0.4); // Set moderate volume
+                audio.set_volume(0.4);
                 if let Err(e) = audio.play() {
                     log::warn!("Failed to play notification sound: {e:?}");
                 }
@@ -381,11 +383,6 @@ impl Component for AttendantsComponent {
     fn create(ctx: &Context<Self>) -> Self {
         let client = Self::create_video_call_client(ctx);
         let media_device_access = Self::create_media_device_access(ctx);
-
-        let link = ctx.link().clone();
-        let rerender_interval = gloo_timers::callback::Interval::new(200, move || {
-            link.send_message(Msg::ForceRerender);
-        });
 
         let mut self_ = Self {
             client,
@@ -415,7 +412,7 @@ impl Component for AttendantsComponent {
             meeting_ended_message: None,
             meeting_info_open: false,
             self_video_floating: load_self_video_position_from_storage(),
-            _rerender_interval: Some(rerender_interval),
+            local_speaking: false,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -427,7 +424,6 @@ impl Component for AttendantsComponent {
 
     fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
         if first_render {
-            // Don't auto-connect anymore
         }
     }
 
@@ -437,8 +433,9 @@ impl Component for AttendantsComponent {
             Msg::ForceRerender => {
                 true
             }
-            Msg::OnSpeakingChanged(_speaking) => {
-                log::info!("🟢 Speaking state changed, triggering re-render");
+            Msg::OnSpeakingChanged(speaking) => {
+                log::info!("🟢 LOCAL Speaking state changed to: {}", speaking);
+                self.local_speaking = speaking;
                 true
             }
             Msg::WsAction(action) => match action {
@@ -497,7 +494,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::MediaPermissionsError(error) => {
                     self.error = Some(error);
-                    self.meeting_joined = false; // Stay on join screen if permissions denied
+                    self.meeting_joined = false;
                     true
                 }
                 WsAction::EncoderSettingsUpdated(settings) => {
@@ -516,18 +513,15 @@ impl Component for AttendantsComponent {
             },
             Msg::OnPeerAdded(email) => {
                 log::info!("New user joined: {email}");
-                // Play notification sound when a new user joins the call
                 Self::play_user_joined();
 
                 true
             }
             Msg::OnPeerRemoved(_peer_id) => {
-                // Trigger a re-render; tiles are rebuilt from current client peer list
                 true
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
             Msg::OnMicrophoneError(err) => {
-                // Disable mic at the top and show UI
                 log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
                 self.mic_error = Some(err);
@@ -603,7 +597,6 @@ impl Component for AttendantsComponent {
                     UserScreenToggleAction::MeetingInfo => {
                         self.meeting_info_open = !self.meeting_info_open;
                         if self.meeting_info_open {
-                            //  self.peer_list_open = false;
                             self.diagnostics_open = false;
                             self.device_settings_open = false;
                         }
@@ -640,7 +633,7 @@ impl Component for AttendantsComponent {
                     self.simulation_info_message =
                         Some(format!("Maximum participants ({}) reached.", CANVAS_LIMIT));
                 }
-                true // Re-render to update button state or display message
+                true
             }
             #[cfg(feature = "fake-peers")]
             Msg::ToggleForceDesktopGrid => {
@@ -655,7 +648,7 @@ impl Component for AttendantsComponent {
                     Timeout::new(1640, move || {
                         link.send_message(Msg::ShowCopyToast(false));
                     })
-                    .forget();
+                        .forget();
                 }
                 true
             }
@@ -682,7 +675,7 @@ impl Component for AttendantsComponent {
                 Timeout::new(500, move || {
                     let _ = window().location().set_href("/");
                 })
-                .forget();
+                    .forget();
 
                 true
             }
@@ -707,10 +700,8 @@ impl Component for AttendantsComponent {
         display_peers_vec.extend(self.fake_peer_ids.iter().cloned());
 
         let num_display_peers = display_peers_vec.len();
-        // Cap the number of peers used for styling at CANVAS_LIMIT
         let num_peers_for_styling = num_display_peers.min(CANVAS_LIMIT);
 
-        // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
         let rows: Vec<Html> = display_peers_vec
@@ -718,16 +709,14 @@ impl Component for AttendantsComponent {
             .take(CANVAS_LIMIT)
             .enumerate()
             .map(|(i, peer_id)| {
-                // Only apply full_bleed if we have exactly 1 peer AND no self-tile (media not granted)
-                // When media is granted, self-tile is shown so we have 2+ tiles
                 let full_bleed = display_peers_vec.len() == 1
                     && !self.client.is_screen_share_enabled_for_peer(peer_id)
                     && !media_access_granted;
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} /> }
+                let is_speaking = self.client.is_speaking_for_peer(peer_id);
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} is_speaking={is_speaking} /> }
             })
             .collect();
 
-        // Always let the grid take the whole stage; overlays should not shrink the grid
         let container_style = format!(
             "position: absolute; inset: 0; width: 100%; height: 100%; --num-peers: {};",
             num_peers_for_styling.max(1)
@@ -735,15 +724,12 @@ impl Component for AttendantsComponent {
 
         let on_encoder_settings_update = ctx.link().callback(WsAction::EncoderSettingsUpdated);
 
-        // Compute meeting link for invitation overlay
         let meeting_link = {
             let origin_result = window().location().origin();
-            // If obtaining origin fails, fallback to empty string
             let origin = origin_result.unwrap_or_else(|_| "".to_string());
             format!("{}/meeting/{}", origin, ctx.props().id)
         };
 
-        // Callback to copy and trigger toast via component state
         let copy_meeting_link = {
             let meeting_link = meeting_link.clone();
             let link = ctx.link().clone();
@@ -760,14 +746,12 @@ impl Component for AttendantsComponent {
             grid_container_classes.push("force-desktop-grid");
         }
 
-        // Show Join Meeting button if user hasn't joined yet
         if !self.meeting_joined {
             return html! {
                 <ContextProvider<VideoCallClientCtx> context={self.client.clone()}>
                     <div id="main-container" class="meeting-page">
                         <BrowserCompatibility/>
                     <div id="join-meeting-container" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;">
-                        // Logout dropdown (top-right corner)
                         {
                             if let (Some(name), Some(email), Some(on_logout)) = (&ctx.props().user_name, &ctx.props().user_email, &ctx.props().on_logout) {
                                 html! {
@@ -832,7 +816,6 @@ impl Component for AttendantsComponent {
             };
         }
 
-        // Create MeetingTime for context - child components (MeetingInfo) read from this
         let meeting_time = MeetingTime {
             call_start_time: self.call_start_time,
             meeting_start_time: self.meeting_start_time_server,
@@ -847,7 +830,6 @@ impl Component for AttendantsComponent {
                     class={grid_container_classes}
                     data-peers={(num_peers_for_styling + if media_access_granted && !self.self_video_floating { 1 } else { 0 }).to_string()}
                     style={container_style}>
-                    // Self-tile (Host component) rendered as grid item or floating based on state
                     {
                         if media_access_granted && (users_allowed_to_stream().unwrap_or_default().iter().any(|host| host == &email) || users_allowed_to_stream().unwrap_or_default().is_empty()) {
                             html! {
@@ -870,7 +852,7 @@ impl Component for AttendantsComponent {
                     }
                     { rows }
 
-                    { // Invitation overlay when there are no connected peers
+                    {
                         if num_display_peers == 0 {
                             html! {
                                 <div id="invite-overlay" class="card-apple" style="position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 90%; max-width: 420px; z-index: 0; text-align: center;">
@@ -932,7 +914,6 @@ impl Component for AttendantsComponent {
                                                 enabled={self.video_enabled}
                                                 onclick={ctx.link().callback(|_| MeetingAction::ToggleVideoOnOff)}
                                             />
-                                            // Hide screen share button on Safari/iOS devices
                                             {
                                                 if !is_ios() {
                                                     html! {

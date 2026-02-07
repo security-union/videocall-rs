@@ -24,9 +24,9 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
 use log::info;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -89,7 +89,7 @@ pub struct ScreenEncoder {
     /// Holds the active MediaStream so `stop()` can synchronously kill all tracks.
     /// Only used by the screen encoder -- this is screen-specific state, not generic encoder state.
     /// I do not like this but so far it is reliable.
-    screen_stream: Arc<Mutex<Option<MediaStream>>>,
+    screen_stream: Rc<RefCell<Option<MediaStream>>>,
 }
 
 impl ScreenEncoder {
@@ -114,7 +114,7 @@ impl ScreenEncoder {
             current_fps: Rc::new(AtomicU32::new(0)),
             on_encoder_settings_update: Some(on_encoder_settings_update),
             on_state_change: Some(on_state_change),
-            screen_stream: Arc::new(Mutex::new(None)),
+            screen_stream: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -194,7 +194,7 @@ impl ScreenEncoder {
         // Synchronously stop all tracks from the stored stream so the browser
         // releases the screen-capture indicator immediately.
         // SAFETY: In WASM's single-threaded environment this lock can never be contended.
-        let stream = self.screen_stream.lock().unwrap().take();
+        let stream = self.screen_stream.borrow_mut().take();
         if let Some(stream) = stream {
             for i in 0..stream.get_tracks().length() {
                 let track = stream
@@ -279,10 +279,7 @@ impl ScreenEncoder {
 
             log::info!("Screen to share: {screen_to_share:?}");
 
-            screen_stream
-                .lock()
-                .unwrap()
-                .replace(screen_to_share.clone());
+            screen_stream.borrow_mut().replace(screen_to_share.clone());
 
             // Helper to clean up stream on error - stops all tracks and emits Failed event
             let cleanup_on_error = |screen_to_share: &MediaStream,

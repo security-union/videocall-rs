@@ -45,11 +45,22 @@ use web_sys::*;
 use yew::prelude::*;
 use yew::{html, Component, Context, Html};
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
-    Idle,        // nothing
-    Requesting,  // browser chooser is opened
-    Active,      // stream active
+    /// No screen share in progress.
+    Idle,
+    /// User clicked the button; browser picker is open, awaiting selection.
+    Requesting,
+    /// A screen is actively being shared and encoded.
+    Active,
+}
+
+impl ScreenShareState {
+    /// Returns `true` when the encoder should be running (Requesting or Active).
+    /// Use this to derive the boolean prop that `Host` needs.
+    pub fn is_sharing(&self) -> bool {
+        !matches!(self, ScreenShareState::Idle)
+    }
 }
 
 #[derive(Debug)]
@@ -147,7 +158,7 @@ pub struct AttendantsComponentProps {
 pub struct AttendantsComponent {
     pub client: VideoCallClient,
     pub media_device_access: MediaDeviceAccess,
-    pub share_screen: bool,
+    pub screen_share_state: ScreenShareState,
     pub mic_enabled: bool,
     pub video_enabled: bool,
     pub peer_list_open: bool,
@@ -159,7 +170,6 @@ pub struct AttendantsComponent {
     pub user_error: Option<String>,
     pending_mic_enable: bool,
     pending_video_enable: bool,
-    pending_screen_share: bool,
     pub meeting_joined: bool,
     fake_peer_ids: Vec<String>,
     #[cfg(feature = "fake-peers")]
@@ -172,7 +182,6 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
-    screen_share_state:ScreenShareState,
 }
 
 impl AttendantsComponent {
@@ -387,7 +396,7 @@ impl Component for AttendantsComponent {
         let mut self_ = Self {
             client,
             media_device_access,
-            share_screen: false,
+            screen_share_state: ScreenShareState::Idle,
             mic_enabled: false,
             video_enabled: false,
             peer_list_open: false,
@@ -398,7 +407,6 @@ impl Component for AttendantsComponent {
             user_error: None,
             pending_mic_enable: false,
             pending_video_enable: false,
-            pending_screen_share: false,
             meeting_joined: false,
             fake_peer_ids: Vec::new(),
             #[cfg(feature = "fake-peers")]
@@ -411,7 +419,6 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
-            screen_share_state: ScreenShareState::Idle,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -476,11 +483,6 @@ impl Component for AttendantsComponent {
                         self.pending_video_enable = false;
                     }
 
-                    if self.pending_screen_share {
-                        self.share_screen = true;
-                        self.pending_screen_share = false;
-                    }
-
                     ctx.link().send_message(WsAction::Connect);
                     true
                 }
@@ -529,12 +531,14 @@ impl Component for AttendantsComponent {
             Msg::MeetingAction(action) => {
                 match action {
                     MeetingAction::ToggleScreenShare => {
-                        if !self.share_screen {
+                        // No getUserMedia permission check needed here: getDisplayMedia()
+                        // has its own browser-native permission prompt, independent of
+                        // camera/mic permissions.
+                        // https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getDisplayMedia
+                        if matches!(self.screen_share_state, ScreenShareState::Idle) {
                             self.screen_share_state = ScreenShareState::Requesting;
-                            self.share_screen = true;
                         } else {
                             self.screen_share_state = ScreenShareState::Idle;
-                            self.share_screen = false;
                         }
                     }
                     MeetingAction::ToggleMicMute => {
@@ -677,20 +681,14 @@ impl Component for AttendantsComponent {
                 log::info!("Screen share state changed: {event:?}");
                 match event {
                     ScreenShareEvent::Started => {
-                        // Screen share successfully started - ensure state is true
                         self.screen_share_state = ScreenShareState::Active;
-                        self.share_screen = true;
                     }
                     ScreenShareEvent::Cancelled | ScreenShareEvent::Stopped => {
-                        // User cancelled or stopped - just reset state (no error dialog)
                         self.screen_share_state = ScreenShareState::Idle;
-                        self.share_screen = false;
                     }
                     ScreenShareEvent::Failed(ref msg) => {
-                        // Screen share failed - reset state and show error dialog
                         log::error!("Screen share failed: {msg}");
                         self.screen_share_state = ScreenShareState::Idle;
-                        self.share_screen = false;
                         self.user_error = Some(format!("Screen share failed: {msg}"));
                     }
                 }
@@ -977,7 +975,7 @@ impl Component for AttendantsComponent {
                                     {
                                          if media_access_granted {
                                              html! {<Host
-                                                 share_screen={self.share_screen}
+                                                 share_screen={self.screen_share_state.is_sharing()}
                                                  mic_enabled={self.mic_enabled}
                                                  video_enabled={self.video_enabled}
                                                  on_encoder_settings_update={on_encoder_settings_update}
@@ -1062,7 +1060,7 @@ impl Component for AttendantsComponent {
                                 on_close={close_diagnostics}
                                 video_enabled={self.video_enabled}
                                 mic_enabled={self.mic_enabled}
-                                share_screen={self.share_screen}
+                                share_screen={self.screen_share_state.is_sharing()}
                             />
                         }
                     } else { html!{} }

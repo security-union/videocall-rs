@@ -125,7 +125,9 @@ pub fn screen_share_button(props: &ScreenShareButtonProps) -> Html {
         props.onclick.clone()
     };
 
-    if props.disabled { class.push("disabled"); }
+    if props.disabled {
+        class.push("disabled");
+    }
     html! {
         <button {class} disabled={props.disabled} onclick={onclick}>
             {

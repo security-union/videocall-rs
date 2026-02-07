@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.1](https://github.com/security-union/videocall-rs/compare/videocall-client-v3.0.0...videocall-client-v3.0.1) - 2026-02-07
+
+### Other
+
+- Fix/ci cargo registry cache ([#559](https://github.com/security-union/videocall-rs/pull/559))
+
 ## [3.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v2.0.0...videocall-client-v3.0.0) - 2026-02-04
 
 ### Other

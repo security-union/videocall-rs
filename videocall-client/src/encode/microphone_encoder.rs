@@ -51,6 +51,8 @@ use web_sys::MediaStreamConstraints;
 use web_sys::MediaStreamTrack;
 use web_sys::MessageEvent;
 use web_time::SystemTime;
+
+#[cfg(feature = "yew-compat")]
 use yew::Callback;
 
 pub fn transform_audio_chunk(
@@ -88,6 +90,7 @@ pub fn transform_audio_chunk(
     }
 }
 
+#[cfg(feature = "yew-compat")]
 pub struct MicrophoneEncoder {
     client: VideoCallClient,
     state: EncoderState,
@@ -96,6 +99,16 @@ pub struct MicrophoneEncoder {
     on_error: Option<Callback<String>>,
 }
 
+#[cfg(not(feature = "yew-compat"))]
+pub struct MicrophoneEncoder {
+    client: VideoCallClient,
+    state: EncoderState,
+    _on_encoder_settings_update: Option<Rc<dyn Fn(String)>>,
+    codec: AudioWorkletCodec,
+    on_error: Option<Rc<dyn Fn(String)>>,
+}
+
+#[cfg(feature = "yew-compat")]
 impl MicrophoneEncoder {
     pub fn new(
         client: VideoCallClient,
@@ -120,28 +133,20 @@ impl MicrophoneEncoder {
         &mut self,
         mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
     ) {
-        // Consume the diagnostics receiver in an async task to prevent "receiver is gone" errors
-        // For Microphone encoder, we'll just consume the packets without processing them for now
-        // since Microphone encoder doesn't support dynamic bitrate control yet
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(_packet) = diagnostics_receiver.next().await {
                 // TODO: Implement bitrate control for Microphone encoder if needed
-                // For now, just consume the packets to prevent the "receiver is gone" error
             }
         });
     }
 
-    // delegates to self.state
     pub fn set_enabled(&mut self, value: bool) -> bool {
         let is_changed = self.state.set_enabled(value);
         if is_changed {
             if value {
                 let _ = self.codec.start();
             } else {
-                // First stop the codec to prevent new audio frames
                 let _ = self.codec.stop();
-                // The monitoring loop in start() will detect the enabled flag change
-                // and stop the microphone capture within 100ms
             };
         }
         is_changed
@@ -150,6 +155,7 @@ impl MicrophoneEncoder {
     pub fn select(&mut self, device: String) -> bool {
         self.state.select(device)
     }
+
     pub fn stop(&mut self) {
         self.state.stop();
         self.codec.destroy();
@@ -164,7 +170,6 @@ impl MicrophoneEncoder {
             return;
         };
 
-        // Don't start if not enabled - this is the key fix
         if !self.state.is_enabled() {
             log::debug!("Microphone encoder start() called but encoder is not enabled");
             return;
@@ -185,7 +190,6 @@ impl MicrophoneEncoder {
             ..
         } = self.state.clone();
 
-        // Clone atomic values for use in different closures
         let destroy_for_handler = destroy.clone();
         let enabled_for_handler = enabled.clone();
 
@@ -194,24 +198,15 @@ impl MicrophoneEncoder {
             let mut sequence_number = 0;
 
             Box::new(move |chunk: MessageEvent| {
-                // Check if encoder should stop
                 if destroy_for_handler.load(Ordering::Acquire)
                     || !enabled_for_handler.load(Ordering::Acquire)
                 {
-                    log::debug!(
-                        "Audio handler stopping: destroy={}, enabled={}",
-                        destroy_for_handler.load(Ordering::Acquire),
-                        enabled_for_handler.load(Ordering::Acquire)
-                    );
                     return;
                 }
 
-                // Check if this is an actual audio frame message (not control messages)
                 if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
                     if let Some(msg_str) = message_type.as_string() {
                         if msg_str != "page" {
-                            // This is a control message (ready, done, flushed), not an audio frame
-                            log::debug!("Received control message: {msg_str}");
                             return;
                         }
                     }
@@ -223,9 +218,6 @@ impl MicrophoneEncoder {
                         transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
                     client.send_packet(packet);
                     sequence_number += 1;
-                    log::debug!("Sent audio frame with sequence: {sequence_number}");
-                } else {
-                    log::error!("Received non-MessageEvent: {chunk:?}");
                 }
             })
         };
@@ -276,8 +268,6 @@ impl MicrophoneEncoder {
 
             let track_settings = audio_track.get_settings();
 
-            // Sample Rate hasn't been added to the web_sys crate
-            // Firefox doesn't report sampleRate in MediaTrackSettings, so we need a fallback
             let input_rate: u32 = match js_sys::Reflect::get(
                 &track_settings,
                 &JsValue::from_str("sampleRate"),
@@ -285,7 +275,6 @@ impl MicrophoneEncoder {
                 Ok(v) => match v.as_f64() {
                     Some(f) => f as u32,
                     None => {
-                        // Firefox fallback: create a temporary AudioContext to get system sample rate
                         log::info!("sampleRate not in track settings (Firefox), using AudioContext default");
                         match AudioContext::new() {
                             Ok(temp_ctx) => {
@@ -314,7 +303,6 @@ impl MicrophoneEncoder {
 
             log::info!("Microphone input sample rate: {input_rate} Hz");
 
-            // Use the microphone's sample rate for the AudioContext to avoid Firefox sample rate mismatch
             let options = AudioContextOptions::new();
             options.set_sample_rate(input_rate as f32);
 
@@ -355,7 +343,7 @@ impl MicrophoneEncoder {
 
             let _ = codec.send_message(&CodecMessages::Init {
                 options: Some(EncoderInitOptions {
-                    encoder_frame_size: Some(20), // 20ms frames for 50Hz rate
+                    encoder_frame_size: Some(20),
                     original_sample_rate: Some(input_rate),
                     encoder_bit_rate: Some(50_000_u32),
                     encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
@@ -394,8 +382,319 @@ impl MicrophoneEncoder {
                 return;
             }
 
-            // Monitor for stop conditions and clean up when needed
-            let check_interval = 100; // Check every 100ms
+            let check_interval = 100;
+            let destroy_check = destroy.clone();
+            let enabled_check = enabled.clone();
+            let switching_check = switching.clone();
+            loop {
+                let delay_promise = js_sys::Promise::new(&mut |resolve, _| {
+                    web_sys::window()
+                        .unwrap()
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &resolve,
+                            check_interval,
+                        )
+                        .unwrap();
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(delay_promise).await;
+
+                if destroy_check.load(Ordering::Acquire)
+                    || !enabled_check.load(Ordering::Acquire)
+                    || switching_check.load(Ordering::Acquire)
+                {
+                    log::info!("Stopping Microphone audio encoder");
+                    switching_check.store(false, Ordering::Release);
+                    audio_track.stop();
+                    if let Err(e) = context.close() {
+                        log::error!("Error closing AudioContext: {e:?}");
+                    }
+                    codec.destroy();
+                    log::info!("Microphone audio encoder stopped and cleaned up");
+                    break;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(not(feature = "yew-compat"))]
+impl MicrophoneEncoder {
+    pub fn new(
+        client: VideoCallClient,
+        _bitrate_kbps: u32,
+        on_encoder_settings_update: Box<dyn Fn(String)>,
+        on_error: Box<dyn Fn(String)>,
+    ) -> Self {
+        Self {
+            client,
+            state: EncoderState::new(),
+            _on_encoder_settings_update: Some(Rc::from(on_encoder_settings_update)),
+            codec: AudioWorkletCodec::default(),
+            on_error: Some(Rc::from(on_error)),
+        }
+    }
+
+    pub fn set_error_callback_fn(&mut self, on_error: Box<dyn Fn(String)>) {
+        self.on_error = Some(Rc::from(on_error));
+    }
+
+    pub fn set_encoder_control(
+        &mut self,
+        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
+    ) {
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(_packet) = diagnostics_receiver.next().await {
+                // TODO: Implement bitrate control for Microphone encoder if needed
+            }
+        });
+    }
+
+    pub fn set_enabled(&mut self, value: bool) -> bool {
+        let is_changed = self.state.set_enabled(value);
+        if is_changed {
+            if value {
+                let _ = self.codec.start();
+            } else {
+                let _ = self.codec.stop();
+            };
+        }
+        is_changed
+    }
+
+    pub fn select(&mut self, device: String) -> bool {
+        self.state.select(device)
+    }
+
+    pub fn stop(&mut self) {
+        self.state.stop();
+        self.codec.destroy();
+    }
+
+    pub fn start(&mut self) {
+        let user_id = self.client.userid().clone();
+        let client = self.client.clone();
+        let device_id = if let Some(mic) = &self.state.selected {
+            mic.to_string()
+        } else {
+            return;
+        };
+
+        if !self.state.is_enabled() {
+            log::debug!("Microphone encoder start() called but encoder is not enabled");
+            return;
+        }
+
+        if self.state.switching.load(Ordering::Acquire) && self.codec.is_instantiated() {
+            self.stop();
+        }
+        if self.state.is_enabled() && self.codec.is_instantiated() {
+            return;
+        }
+        let aes = client.aes();
+        let on_error = self.on_error.clone();
+        let EncoderState {
+            destroy,
+            enabled,
+            switching,
+            ..
+        } = self.state.clone();
+
+        let destroy_for_handler = destroy.clone();
+        let enabled_for_handler = enabled.clone();
+
+        let audio_output_handler = {
+            log::info!("Starting Microphone audio encoder");
+            let mut sequence_number = 0;
+
+            Box::new(move |chunk: MessageEvent| {
+                if destroy_for_handler.load(Ordering::Acquire)
+                    || !enabled_for_handler.load(Ordering::Acquire)
+                {
+                    return;
+                }
+
+                if let Ok(message_type) = js_sys::Reflect::get(&chunk.data(), &"message".into()) {
+                    if let Some(msg_str) = message_type.as_string() {
+                        if msg_str != "page" {
+                            return;
+                        }
+                    }
+                }
+
+                let data = js_sys::Reflect::get(&chunk.data(), &"page".into()).unwrap();
+                if let Ok(data) = data.dyn_into::<Uint8Array>() {
+                    let packet: PacketWrapper =
+                        transform_audio_chunk(&data, &user_id, sequence_number, aes.clone());
+                    client.send_packet(packet);
+                    sequence_number += 1;
+                }
+            })
+        };
+
+        let codec = self.codec.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let navigator = window().navigator();
+            let media_devices = match navigator.media_devices() {
+                Ok(md) => md,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb(format!("Failed to access media devices: {e:?}"));
+                    }
+                    return;
+                }
+            };
+            let constraints = MediaStreamConstraints::new();
+            let media_info = web_sys::MediaTrackConstraints::new();
+            media_info.set_device_id(&device_id.into());
+
+            constraints.set_audio(&media_info.into());
+            constraints.set_video(&Boolean::from(false));
+            let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb(format!("Microphone access failed: {e:?}"));
+                    }
+                    return;
+                }
+            };
+            let device = match JsFuture::from(devices_query).await {
+                Ok(ok) => ok.unchecked_into::<MediaStream>(),
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb(format!("Failed to get microphone stream: {e:?}"));
+                    }
+                    return;
+                }
+            };
+
+            let audio_track = Box::new(
+                device
+                    .get_audio_tracks()
+                    .find(&mut |_: JsValue, _: u32, _: Array| true)
+                    .unchecked_into::<MediaStreamTrack>(),
+            );
+
+            let track_settings = audio_track.get_settings();
+
+            // Sample Rate hasn't been added to the web_sys crate
+            // Firefox doesn't report sampleRate in MediaTrackSettings, so we need a fallback
+            let input_rate: u32 = match js_sys::Reflect::get(
+                &track_settings,
+                &JsValue::from_str("sampleRate"),
+            ) {
+                Ok(v) => match v.as_f64() {
+                    Some(f) => f as u32,
+                    None => {
+                        // Firefox fallback: create a temporary AudioContext to get system sample rate
+                        log::info!("sampleRate not in track settings (Firefox), using AudioContext default");
+                        match AudioContext::new() {
+                            Ok(temp_ctx) => {
+                                let rate = temp_ctx.sample_rate() as u32;
+                                let _ = temp_ctx.close();
+                                rate
+                            }
+                            Err(e) => {
+                                if let Some(cb) = &on_error {
+                                    cb(format!(
+                                        "Could not determine microphone sample rate: {e:?}"
+                                    ));
+                                }
+                                return;
+                            }
+                        }
+                    }
+                },
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb(format!("Failed reading microphone settings: {e:?}"));
+                    }
+                    return;
+                }
+            };
+
+            log::info!("Microphone input sample rate: {input_rate} Hz");
+
+            let options = AudioContextOptions::new();
+            options.set_sample_rate(input_rate as f32);
+
+            let context = match AudioContext::new_with_context_options(&options) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb(format!("Failed to create audio context: {e:?}"));
+                    }
+                    return;
+                }
+            };
+            log::info!("Created AudioContext with sample rate: {input_rate} Hz");
+
+            let worklet = match codec
+                .create_node(
+                    &context,
+                    "/encoderWorker.min.js",
+                    "encoder-worklet",
+                    AUDIO_CHANNELS,
+                )
+                .await
+            {
+                Ok(node) => node,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb(format!("Failed to initialize audio encoder: {e:?}"));
+                    }
+                    let _ = context.close();
+                    return;
+                }
+            };
+
+            let output_handler =
+                Closure::wrap(audio_output_handler as Box<dyn FnMut(MessageEvent)>);
+            codec.set_onmessage(output_handler.as_ref().unchecked_ref());
+            output_handler.forget();
+
+            let _ = codec.send_message(&CodecMessages::Init {
+                options: Some(EncoderInitOptions {
+                    encoder_frame_size: Some(20),
+                    original_sample_rate: Some(input_rate),
+                    encoder_bit_rate: Some(50_000_u32),
+                    encoder_sample_rate: Some(AUDIO_SAMPLE_RATE),
+                    ..Default::default()
+                }),
+            });
+
+            let source_node = match context.create_media_stream_source(&device) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb(format!("Failed to create media source: {e:?}"));
+                    }
+                    let _ = context.close();
+                    return;
+                }
+            };
+            let gain_node = match context.create_gain() {
+                Ok(g) => g,
+                Err(e) => {
+                    if let Some(cb) = &on_error {
+                        cb(format!("Failed to create gain node: {e:?}"));
+                    }
+                    let _ = context.close();
+                    return;
+                }
+            };
+            if let Err(e) = source_node
+                .connect_with_audio_node(&gain_node)
+                .and_then(|n| n.connect_with_audio_node(&worklet))
+            {
+                if let Some(cb) = &on_error {
+                    cb(format!("Failed to connect audio graph: {e:?}"));
+                }
+                let _ = context.close();
+                return;
+            }
+
+            let check_interval = 100;
             let destroy_check = destroy.clone();
             let enabled_check = enabled.clone();
             let switching_check = switching.clone();

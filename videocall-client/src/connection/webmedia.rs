@@ -25,8 +25,11 @@ use log::error;
 use protobuf::Message;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsValue;
+
+#[cfg(feature = "yew-compat")]
 use yew::prelude::Callback;
 
+#[cfg(feature = "yew-compat")]
 #[derive(Clone)]
 pub struct ConnectOptions {
     pub userid: String,
@@ -36,6 +39,21 @@ pub struct ConnectOptions {
     pub on_connected: Callback<()>,
     pub on_connection_lost: Callback<JsValue>,
     pub peer_monitor: Callback<()>,
+}
+
+#[cfg(not(feature = "yew-compat"))]
+use std::rc::Rc;
+
+#[cfg(not(feature = "yew-compat"))]
+#[derive(Clone)]
+pub struct ConnectOptions {
+    pub userid: String,
+    pub websocket_url: String,
+    pub webtransport_url: String,
+    pub on_inbound_media: Rc<dyn Fn(PacketWrapper)>,
+    pub on_connected: Rc<dyn Fn(())>,
+    pub on_connection_lost: Rc<dyn Fn(JsValue)>,
+    pub peer_monitor: Rc<dyn Fn(())>,
 }
 
 pub(super) trait WebMedia<TASK> {

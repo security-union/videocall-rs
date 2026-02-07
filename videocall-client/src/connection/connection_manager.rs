@@ -16,6 +16,10 @@
  * conditions.
  */
 
+// ConnectionManager is only available with yew-compat feature since it uses Connection
+// which depends on yew-websocket and yew-webtransport.
+#![cfg(feature = "yew-compat")]
+
 use super::connection::Connection;
 use super::webmedia::ConnectOptions;
 use crate::crypto::aes::Aes128State;
@@ -32,6 +36,9 @@ use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::JsValue;
+
+// Yew callbacks - only available with yew-compat feature
+#[cfg(feature = "yew-compat")]
 use yew::prelude::Callback;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +92,8 @@ pub enum ElectionState {
     },
 }
 
+/// ConnectionManagerOptions for Yew-compat mode
+#[cfg(feature = "yew-compat")]
 #[derive(Clone, Debug)]
 pub struct ConnectionManagerOptions {
     pub websocket_urls: Vec<String>,
@@ -94,6 +103,55 @@ pub struct ConnectionManagerOptions {
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
     pub election_period_ms: u64,
+}
+
+/// ConnectionManagerOptions for framework-agnostic mode
+#[cfg(not(feature = "yew-compat"))]
+#[derive(Clone)]
+pub struct ConnectionManagerOptions {
+    pub websocket_urls: Vec<String>,
+    pub webtransport_urls: Vec<String>,
+    pub userid: String,
+    pub on_inbound_media: Rc<dyn Fn(PacketWrapper)>,
+    pub on_state_changed: Rc<dyn Fn(ConnectionState)>,
+    pub peer_monitor: Rc<dyn Fn(())>,
+    pub election_period_ms: u64,
+}
+
+#[cfg(not(feature = "yew-compat"))]
+impl std::fmt::Debug for ConnectionManagerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionManagerOptions")
+            .field("websocket_urls", &self.websocket_urls)
+            .field("webtransport_urls", &self.webtransport_urls)
+            .field("userid", &self.userid)
+            .field("election_period_ms", &self.election_period_ms)
+            .finish()
+    }
+}
+
+#[cfg(not(feature = "yew-compat"))]
+impl ConnectionManagerOptions {
+    /// Create a new ConnectionManagerOptions with framework-agnostic closures
+    pub fn new_agnostic(
+        websocket_urls: Vec<String>,
+        webtransport_urls: Vec<String>,
+        userid: String,
+        on_inbound_media: Box<dyn Fn(PacketWrapper)>,
+        on_state_changed: Box<dyn Fn(ConnectionState)>,
+        peer_monitor: Box<dyn Fn(())>,
+        election_period_ms: u64,
+    ) -> Self {
+        Self {
+            websocket_urls,
+            webtransport_urls,
+            userid,
+            on_inbound_media: Rc::from(on_inbound_media),
+            on_state_changed: Rc::from(on_state_changed),
+            peer_monitor: Rc::from(peer_monitor),
+            election_period_ms,
+        }
+    }
 }
 
 #[derive(Debug)]

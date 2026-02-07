@@ -18,7 +18,10 @@
 
 //
 // This submodule implements our WebMedia trait for WebSocketTask.
+// Only available with yew-compat feature since it uses yew-websocket.
 //
+#![cfg(feature = "yew-compat")]
+
 use super::webmedia::{ConnectOptions, WebMedia};
 use log::debug;
 use wasm_bindgen::JsValue;

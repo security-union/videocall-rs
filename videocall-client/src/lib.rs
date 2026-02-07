@@ -178,6 +178,12 @@ pub mod health_reporter;
 mod media_devices;
 pub mod utils;
 mod wrappers;
+
+// New framework-agnostic modules
+mod canvas_provider;
+mod event_bus;
+mod events;
+
 pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
@@ -187,3 +193,10 @@ pub use encode::{
     ScreenShareEvent,
 };
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};
+
+// Framework-agnostic event system exports
+pub use canvas_provider::{
+    create_canvas_provider, CanvasIdProvider, DefaultCanvasIdProvider, DirectCanvasIdProvider,
+};
+pub use event_bus::{emit_client_event, global_client_sender, subscribe_client_events};
+pub use events::ClientEvent;

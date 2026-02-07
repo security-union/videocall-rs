@@ -45,6 +45,8 @@ use web_sys::VideoEncoderEncodeOptions;
 use web_sys::VideoEncoderInit;
 use web_sys::VideoFrame;
 use web_sys::VideoTrack;
+
+#[cfg(feature = "yew-compat")]
 use yew::Callback;
 
 use super::super::client::VideoCallClient;
@@ -69,6 +71,7 @@ const BITRATE_CHANGE_THRESHOLD: f64 = 0.20;
 /// * [MicrophoneEncoder](crate::MicrophoneEncoder)
 /// * [ScreenEncoder](crate::ScreenEncoder)
 ///
+#[cfg(feature = "yew-compat")]
 pub struct CameraEncoder {
     client: VideoCallClient,
     video_elem_id: String,
@@ -78,6 +81,17 @@ pub struct CameraEncoder {
     on_encoder_settings_update: Callback<String>,
 }
 
+#[cfg(not(feature = "yew-compat"))]
+pub struct CameraEncoder {
+    client: VideoCallClient,
+    video_elem_id: String,
+    state: EncoderState,
+    current_bitrate: Rc<AtomicU32>,
+    current_fps: Rc<AtomicU32>,
+    on_encoder_settings_update: Rc<dyn Fn(String)>,
+}
+
+#[cfg(feature = "yew-compat")]
 impl CameraEncoder {
     /// Construct a camera encoder, with arguments:
     ///
@@ -140,7 +154,63 @@ impl CameraEncoder {
             }
         });
     }
+}
 
+#[cfg(not(feature = "yew-compat"))]
+impl CameraEncoder {
+    /// Construct a camera encoder (framework-agnostic version)
+    pub fn new(
+        client: VideoCallClient,
+        video_elem_id: &str,
+        initial_bitrate: u32,
+        on_encoder_settings_update: Box<dyn Fn(String)>,
+    ) -> Self {
+        Self {
+            client,
+            video_elem_id: video_elem_id.to_string(),
+            state: EncoderState::new(),
+            current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
+            current_fps: Rc::new(AtomicU32::new(0)),
+            on_encoder_settings_update: Rc::from(on_encoder_settings_update),
+        }
+    }
+
+    pub fn set_encoder_control(
+        &mut self,
+        mut diagnostics_receiver: UnboundedReceiver<DiagnosticsPacket>,
+    ) {
+        let current_bitrate = self.current_bitrate.clone();
+        let current_fps = self.current_fps.clone();
+        let on_encoder_settings_update = self.on_encoder_settings_update.clone();
+        let enabled = self.state.enabled.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut encoder_control = EncoderBitrateController::new(
+                current_bitrate.load(Ordering::Relaxed),
+                current_fps.clone(),
+            );
+            while let Some(event) = diagnostics_receiver.next().await {
+                let output_wasted = encoder_control.process_diagnostics_packet(event);
+                if let Some(bitrate) = output_wasted {
+                    if enabled.load(Ordering::Acquire) {
+                        let current = current_bitrate.load(Ordering::Relaxed) as f64;
+                        let new = bitrate;
+                        let percent_change = (new - current).abs() / current;
+
+                        if percent_change > BITRATE_CHANGE_THRESHOLD {
+                            on_encoder_settings_update(format!("Bitrate: {bitrate:.2} kbps"));
+                            current_bitrate.store(bitrate as u32, Ordering::Relaxed);
+                        }
+                    } else {
+                        on_encoder_settings_update("Disabled".to_string());
+                    }
+                }
+            }
+        });
+    }
+}
+
+// Common methods for both yew-compat and non-yew-compat modes
+impl CameraEncoder {
     /// Gets the current encoder output frame rate
     pub fn get_current_fps(&self) -> u32 {
         self.current_fps.load(Ordering::Relaxed)

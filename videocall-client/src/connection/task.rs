@@ -21,6 +21,10 @@
 //
 // Handles rollover of connection from WebTransport to WebSocket
 //
+// Only available with yew-compat feature since it uses yew-websocket and yew-webtransport.
+//
+#![cfg(feature = "yew-compat")]
+
 use log::{debug, error};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use yew_websocket::websocket::WebSocketTask;

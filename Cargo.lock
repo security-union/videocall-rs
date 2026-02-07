@@ -7119,6 +7119,7 @@ dependencies = [
  "js-sys",
  "log",
  "neteq",
+ "once_cell",
  "pidgeon",
  "prost",
  "protobuf 3.7.1",

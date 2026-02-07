@@ -21,6 +21,10 @@
 // Sets up all the stream handling to support the callbacks on_connected, on_connection_lost, and
 // on_inbound_media
 //
+// Only available with yew-compat feature since it uses yew-webtransport.
+//
+#![cfg(feature = "yew-compat")]
+
 use super::webmedia::{ConnectOptions, WebMedia};
 use js_sys::Boolean;
 use js_sys::JsString;

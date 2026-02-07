@@ -371,7 +371,7 @@ impl ScreenEncoder {
                 Ok(encoder) => Box::new(encoder),
                 Err(e) => {
                     let msg = format!("Failed to create video encoder: {e:?}");
-                    error!("{}", msg);
+                    error!("{msg}");
                     cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                     return;
                 }
@@ -411,7 +411,7 @@ impl ScreenEncoder {
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
                 let msg = format!("Error configuring screen encoder: {e:?}");
-                error!("{}", msg);
+                error!("{msg}");
                 cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                 return;
             }
@@ -422,7 +422,7 @@ impl ScreenEncoder {
                 Ok(processor) => processor,
                 Err(e) => {
                     let msg = format!("Failed to create media stream track processor: {e:?}");
-                    error!("{}", msg);
+                    error!("{msg}");
                     cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                     return;
                 }

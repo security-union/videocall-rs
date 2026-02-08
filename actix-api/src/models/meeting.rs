@@ -1,8 +1,14 @@
 use crate::db::get_connection_query;
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
+    Argon2,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 use std::error::Error;
+use std::fmt;
 use tracing::{error, info};
 
 #[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow)]
@@ -15,7 +21,30 @@ pub struct Meeting {
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
     pub creator_id: Option<String>,
+    pub password_hash: Option<String>,
+    pub state: Option<String>,
+    pub attendees: Option<JsonValue>,
+    pub host_display_name: Option<String>,
 }
+
+#[derive(Debug)]
+pub enum CreateMeetingError {
+    MeetingExists,
+    DatabaseError(String),
+    HashError(String),
+}
+
+impl fmt::Display for CreateMeetingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CreateMeetingError::MeetingExists => write!(f, "Meeting already exists"),
+            CreateMeetingError::DatabaseError(e) => write!(f, "Database error: {e}"),
+            CreateMeetingError::HashError(e) => write!(f, "Hash error: {e}"),
+        }
+    }
+}
+
+impl Error for CreateMeetingError {}
 
 impl Meeting {
     /// Get the start time of the meeting in milliseconds
@@ -48,10 +77,10 @@ impl Meeting {
             let mut conn = get_connection_query()?;
             let row = conn.query_one(
             "
-                INSERT INTO meetings (room_id, started_at, ended_at, creator_id) 
-                VALUES ($1, $2, NULL, $3) 
-                ON CONFLICT (room_id) DO UPDATE 
-                SET started_at = EXCLUDED.started_at, updated_at = NOW() 
+                INSERT INTO meetings (room_id, started_at, ended_at, creator_id)
+                VALUES ($1, $2, NULL, $3)
+                ON CONFLICT (room_id) WHERE deleted_at IS NULL DO UPDATE
+                SET started_at = EXCLUDED.started_at, updated_at = NOW()
                 RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id",
                 &[&room_id, &started_at, &creator_id],
             )?;
@@ -65,6 +94,10 @@ impl Meeting {
                 updated_at: row.get("updated_at"),
                 deleted_at: row.get("deleted_at"),
                 creator_id: row.get("creator_id"),
+                password_hash: None,
+                state: None,
+                attendees: None,
+                host_display_name: None,
             })
         })
         .await
@@ -97,6 +130,10 @@ impl Meeting {
             updated_at: row.get("updated_at"),
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
+            password_hash: None,
+            state: None,
+            attendees: None,
+            host_display_name: None,
         })
     }
 
@@ -128,6 +165,10 @@ impl Meeting {
                     updated_at: row.get("updated_at"),
                     deleted_at: row.get("deleted_at"),
                     creator_id: row.get("creator_id"),
+                    password_hash: None,
+                    state: None,
+                    attendees: None,
+                    host_display_name: None,
                 }))
             }
         })
@@ -155,6 +196,10 @@ impl Meeting {
             updated_at: row.get("updated_at"),
             deleted_at: row.get("deleted_at"),
             creator_id: row.get("creator_id"),
+            password_hash: None,
+            state: None,
+            attendees: None,
+            host_display_name: None,
         })
     }
 
@@ -201,7 +246,7 @@ impl Meeting {
             r#"
             INSERT INTO meetings (room_id, started_at, ended_at, creator_id)
             VALUES ($1, $2, NULL, $3)
-            ON CONFLICT (room_id) DO UPDATE
+            ON CONFLICT (room_id) WHERE deleted_at IS NULL DO UPDATE
             SET started_at = CASE
                 WHEN meetings.ended_at IS NOT NULL THEN EXCLUDED.started_at
                 ELSE meetings.started_at
@@ -212,7 +257,8 @@ impl Meeting {
                 ELSE meetings.creator_id
             END,
             updated_at = NOW()
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
+                      creator_id, password_hash, state, attendees, host_display_name
             "#,
         )
         .bind(room_id)
@@ -235,7 +281,8 @@ impl Meeting {
     ) -> Result<Option<Self>, Box<dyn Error + Send + Sync>> {
         let meeting = sqlx::query_as::<_, Meeting>(
             r#"
-            SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
+                   creator_id, password_hash, state, attendees, host_display_name
             FROM meetings
             WHERE room_id = $1 AND deleted_at IS NULL
             "#,
@@ -257,7 +304,8 @@ impl Meeting {
             UPDATE meetings
             SET ended_at = NOW(), updated_at = NOW()
             WHERE room_id = $1 AND ended_at IS NULL
-            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at, creator_id
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
+                      creator_id, password_hash, state, attendees, host_display_name
             "#,
         )
         .bind(room_id)
@@ -268,5 +316,149 @@ impl Meeting {
             info!("Meeting {} ended at: {:?}", room_id, m.ended_at);
         }
         Ok(meeting)
+    }
+
+    /// Create a meeting via the API - checks for duplicates before insert
+    /// This is different from create_async which uses upsert semantics
+    pub async fn create_meeting_api(
+        pool: &PgPool,
+        room_id: &str,
+        creator_id: &str,
+        attendees: &[String],
+        password: Option<&str>,
+    ) -> Result<Self, CreateMeetingError> {
+        // Hash password if provided
+        let password_hash = match password {
+            Some(pwd) if !pwd.is_empty() => {
+                let salt = SaltString::generate(&mut OsRng);
+                let argon2 = Argon2::default();
+                let hash = argon2
+                    .hash_password(pwd.as_bytes(), &salt)
+                    .map_err(|e| CreateMeetingError::HashError(e.to_string()))?;
+                Some(hash.to_string())
+            }
+            _ => None,
+        };
+
+        let attendees_json = serde_json::to_value(attendees)
+            .map_err(|e| CreateMeetingError::DatabaseError(e.to_string()))?;
+
+        let now = Utc::now();
+
+        // First check if meeting exists (not deleted)
+        let existing = sqlx::query_scalar::<_, i32>(
+            "SELECT id FROM meetings WHERE room_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(room_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| CreateMeetingError::DatabaseError(e.to_string()))?;
+
+        if existing.is_some() {
+            return Err(CreateMeetingError::MeetingExists);
+        }
+
+        // Insert new meeting
+        let meeting = sqlx::query_as::<_, Meeting>(
+            r#"
+            INSERT INTO meetings (room_id, started_at, creator_id, password_hash, state, attendees)
+            VALUES ($1, $2, $3, $4, 'idle', $5)
+            RETURNING id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
+                      creator_id, password_hash, state, attendees, host_display_name
+            "#,
+        )
+        .bind(room_id)
+        .bind(now)
+        .bind(creator_id)
+        .bind(&password_hash)
+        .bind(&attendees_json)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| CreateMeetingError::DatabaseError(e.to_string()))?;
+
+        info!(
+            "Meeting '{}' created via API by '{}' (has_password: {})",
+            room_id,
+            creator_id,
+            password_hash.is_some()
+        );
+
+        Ok(meeting)
+    }
+
+    /// List all active meetings (not deleted, not ended)
+    pub async fn list_active_async(
+        pool: &PgPool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Self>, Box<dyn Error + Send + Sync>> {
+        let meetings = sqlx::query_as::<_, Meeting>(
+            r#"
+            SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
+                   creator_id, password_hash, state, attendees, host_display_name
+            FROM meetings
+            WHERE deleted_at IS NULL AND ended_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(meetings)
+    }
+
+    /// Count all active meetings
+    pub async fn count_active_async(pool: &PgPool) -> Result<i64, Box<dyn Error + Send + Sync>> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM meetings WHERE deleted_at IS NULL AND ended_at IS NULL",
+        )
+        .fetch_one(pool)
+        .await?;
+
+        Ok(count)
+    }
+
+    /// List meetings owned by a specific user (excludes deleted, includes ended)
+    pub async fn list_by_owner_async(
+        pool: &PgPool,
+        owner_email: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Self>, Box<dyn Error + Send + Sync>> {
+        let meetings = sqlx::query_as::<_, Meeting>(
+            r#"
+            SELECT id, room_id, started_at, ended_at, created_at, updated_at, deleted_at,
+                   creator_id, password_hash, state, attendees, host_display_name
+            FROM meetings
+            WHERE deleted_at IS NULL AND creator_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(owner_email)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(meetings)
+    }
+
+    /// Count meetings owned by a specific user (excludes deleted, includes ended)
+    pub async fn count_by_owner_async(
+        pool: &PgPool,
+        owner_email: &str,
+    ) -> Result<i64, Box<dyn Error + Send + Sync>> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM meetings WHERE deleted_at IS NULL AND creator_id = $1",
+        )
+        .bind(owner_email)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(count)
     }
 }

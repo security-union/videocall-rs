@@ -370,8 +370,11 @@ impl Component for Host {
             }
             Msg::VideoDeviceChanged(video) => {
                 log::info!("Video device changed: {video}");
-                // Update the MediaDeviceList selection
                 self.media_devices.video_inputs.select(&video.device_id);
+                // select() sets switching=true while enabled, causing the old
+                // encoding loop to exit on its next iteration. The 1-second
+                // timeout gives the old loop time to detect the flag and clean
+                // up before we restart.
                 if self.camera.select(video.device_id.clone()) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
@@ -379,8 +382,9 @@ impl Component for Host {
                     });
                     timeout.forget();
                 }
-                true // Need to re-render to update device selector displays
+                true
             }
+
             Msg::SpeakerDeviceChanged(speaker) => {
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_outputs.select(&speaker.device_id);

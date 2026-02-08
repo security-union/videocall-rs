@@ -1,6 +1,6 @@
 # Based on https://github.com/actions-rs/meta/blob/master/recipes/quickstart.md
 
-on: 
+on:
   pull_request:
     paths:
       - 'actix-api/**'
@@ -11,33 +11,19 @@ on:
       - 'neteq/**'
       - 'videocall-client/**'
 name: check backend
-  
+
 jobs:
   test:
     name: cargo tests_run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      # Cache Docker layers
-      - name: Cache Docker layers
-        uses: actions/cache@v3
-        with:
-          path: /tmp/.docker
-          key: ${{ runner.os }}-docker-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-docker-
-
-      # Cache Rust build artifacts
-      - name: Cache Cargo Registry
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - name: Clean up Docker resources
+        run: docker system prune -f --volumes
 
       - run: make tests_run
+
+      - name: Teardown
+        if: always()
+        run: make tests_down

@@ -122,7 +122,7 @@ impl MediaDevicesProvider for MockMediaDevicesProvider {
 ///
 pub struct SelectableDevices {
     devices: Rc<RefCell<Vec<MediaDeviceInfo>>>,
-    selected: Option<String>,
+    selected: Rc<RefCell<Option<String>>>,
 
     /// Callback that will be called as `callback(device_id)` whenever [`select(device_id)`](Self::select) is called with a valid `device_id`
     pub on_selected: Callback<String>,
@@ -132,7 +132,7 @@ impl SelectableDevices {
     fn new() -> Self {
         Self {
             devices: Rc::new(RefCell::new(Vec::new())),
-            selected: None,
+            selected: Rc::new(RefCell::new(None)),
             on_selected: Callback::noop(),
         }
     }
@@ -154,7 +154,7 @@ impl SelectableDevices {
         let devices = self.devices.borrow();
         for device in devices.iter() {
             if device.device_id() == device_id {
-                self.selected = Some(device_id.to_string());
+                *self.selected.borrow_mut() = Some(device_id.to_string());
                 self.on_selected.emit(device_id.to_string());
             }
         }
@@ -172,7 +172,7 @@ impl SelectableDevices {
 
     /// Returns the `device_id` of the currently selected device, or "" if there are no devices.
     pub fn selected(&self) -> String {
-        match &self.selected {
+        match &*self.selected.borrow() {
             Some(selected) => selected.to_string(),
             // device 0 is the default selection
             None => {
@@ -184,13 +184,18 @@ impl SelectableDevices {
             }
         }
     }
+
+    /// Returns a clone of the selected Rc for sharing with closures
+    pub(crate) fn selected_rc(&self) -> Rc<RefCell<Option<String>>> {
+        Rc::clone(&self.selected)
+    }
 }
 
 impl Clone for SelectableDevices {
     fn clone(&self) -> Self {
         Self {
             devices: Rc::clone(&self.devices),
-            selected: self.selected.clone(),
+            selected: Rc::clone(&self.selected),
             on_selected: self.on_selected.clone(),
         }
     }
@@ -286,6 +291,10 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
         let audio_input_devices = Rc::clone(&self.audio_inputs.devices);
         let video_input_devices = Rc::clone(&self.video_inputs.devices);
         let audio_output_devices = Rc::clone(&self.audio_outputs.devices);
+        // Share the actual selection state with the closure
+        let audio_input_selected = self.audio_inputs.selected_rc();
+        let video_input_selected = self.video_inputs.selected_rc();
+        let audio_output_selected = self.audio_outputs.selected_rc();
 
         // Create a closure that will call our refresh logic
         let closure = Closure::wrap(Box::new(move |_event: Event| {
@@ -299,33 +308,21 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
             let on_audio_output_selected_clone = on_audio_output_selected.clone();
             let provider_promise = provider_clone.enumerate_devices();
 
-            // Store current selections to preserve them if possible
-            let current_audio_selection = {
-                let devices = audio_input_devices.borrow();
-                if let Some(first) = devices.first() {
-                    first.device_id()
-                } else {
-                    String::new()
-                }
-            };
+            // Read the ACTUAL selected device IDs (not just the first device)
+            let current_audio_selection = audio_input_selected
+                .borrow()
+                .clone()
+                .unwrap_or_default();
 
-            let current_video_selection = {
-                let devices = video_input_devices.borrow();
-                if let Some(first) = devices.first() {
-                    first.device_id()
-                } else {
-                    String::new()
-                }
-            };
+            let current_video_selection = video_input_selected
+                .borrow()
+                .clone()
+                .unwrap_or_default();
 
-            let current_audio_output_selection = {
-                let devices = audio_output_devices.borrow();
-                if let Some(first) = devices.first() {
-                    first.device_id()
-                } else {
-                    String::new()
-                }
-            };
+            let current_audio_output_selection = audio_output_selected
+                .borrow()
+                .clone()
+                .unwrap_or_default();
 
             wasm_bindgen_futures::spawn_local(async move {
                 let future = JsFuture::from(provider_promise);

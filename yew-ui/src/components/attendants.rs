@@ -101,6 +101,7 @@ pub enum Msg {
     OnPeerRemoved(String),
     OnFirstFrame((String, MediaType)),
     OnMicrophoneError(String),
+    OnCameraError(String),
     DismissUserError,
     UserScreenAction(UserScreenToggleAction),
     #[cfg(feature = "fake-peers")]
@@ -522,6 +523,12 @@ impl Component for AttendantsComponent {
                 log::error!("Microphone error (full): {err}");
                 self.mic_enabled = false;
                 self.user_error = Some(format!("Microphone error: {err}"));
+                true
+            }
+            Msg::OnCameraError(err) => {
+                log::error!("Camera error (full): {err}");
+                self.video_enabled = false;
+                self.user_error = Some(format!("Camera error: {err}"));
                 true
             }
             Msg::DismissUserError => {
@@ -982,6 +989,7 @@ impl Component for AttendantsComponent {
                                                  device_settings_open={self.device_settings_open}
                                                  on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
                                                  on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
+                                                 on_camera_error={ctx.link().callback(Msg::OnCameraError)}
                                                  on_screen_share_state={ctx.link().callback(Msg::ScreenShareStateChange)}
                                              />}
                                          } else {

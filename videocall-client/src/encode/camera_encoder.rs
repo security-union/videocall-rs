@@ -78,6 +78,7 @@ pub struct CameraEncoder {
     current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
     on_encoder_settings_update: Callback<String>,
+    on_error: Option<Callback<String>>,
 }
 
 impl CameraEncoder {
@@ -98,6 +99,7 @@ impl CameraEncoder {
         video_elem_id: &str,
         initial_bitrate: u32,
         on_encoder_settings_update: Callback<String>,
+        on_error: Callback<String>,
     ) -> Self {
         Self {
             client,
@@ -106,6 +108,7 @@ impl CameraEncoder {
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
             current_fps: Rc::new(AtomicU32::new(0)),
             on_encoder_settings_update,
+            on_error: Some(on_error),
         }
     }
 
@@ -235,6 +238,7 @@ impl CameraEncoder {
         } else {
             return;
         };
+        let on_error = self.on_error.clone();
 
         log::info!(
             "CameraEncoder::start(): using video device_id = {}",
@@ -264,10 +268,14 @@ impl CameraEncoder {
                 sleep(Duration::from_millis(50)).await;
                 attempt += 1;
                 if attempt > 20 {
-                    error!(
-                        "CameraEncoder: <video id='{}'> not found in DOM after 1 second",
+                    let msg = format!(
+                        "Camera error: video element '{}' not found in DOM after 1 second",
                         video_elem_id
                     );
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
                     return;
                 }
             };
@@ -275,7 +283,11 @@ impl CameraEncoder {
             let media_devices = match navigator.media_devices() {
                 Ok(d) => d,
                 Err(e) => {
-                    error!("navigator.mediaDevices() failed: {:?}", e);
+                    let msg = format!("Failed to access media devices: {e:?}");
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
                     return;
                 }
             };
@@ -300,7 +312,11 @@ impl CameraEncoder {
             let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
                 Ok(p) => p,
                 Err(e) => {
-                    error!("get_user_media_with_constraints() threw: {:?}", e);
+                    let msg = format!("Camera access failed: {e:?}");
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
                     return;
                 }
             };
@@ -308,7 +324,11 @@ impl CameraEncoder {
             let device = match JsFuture::from(devices_query).await {
                 Ok(s) => s.unchecked_into::<MediaStream>(),
                 Err(e) => {
-                    error!("getUserMedia promise rejected: {:?}", e);
+                    let msg = format!("Failed to get camera stream: {e:?}");
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
                     return;
                 }
             };
@@ -357,7 +377,11 @@ impl CameraEncoder {
             let video_encoder = match VideoEncoder::new(&video_encoder_init) {
                 Ok(enc) => Box::new(enc),
                 Err(e) => {
-                    error!("Failed to create VideoEncoder: {e:?}");
+                    let msg = format!("Failed to create video encoder: {e:?}");
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
                     return;
                 }
             };

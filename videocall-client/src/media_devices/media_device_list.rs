@@ -185,17 +185,13 @@ impl SelectableDevices {
         }
     }
 
-    /// Returns a clone of the selected Rc for sharing with closures
-    pub(crate) fn selected_rc(&self) -> Rc<RefCell<Option<String>>> {
-        Rc::clone(&self.selected)
-    }
 }
 
 impl Clone for SelectableDevices {
     fn clone(&self) -> Self {
         Self {
-            devices: Rc::clone(&self.devices),
-            selected: Rc::clone(&self.selected),
+            devices: self.devices.clone(),
+            selected: self.selected.clone(),
             on_selected: self.on_selected.clone(),
         }
     }
@@ -288,24 +284,28 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
         let on_audio_selected = self.audio_inputs.on_selected.clone();
         let on_video_selected = self.video_inputs.on_selected.clone();
         let on_audio_output_selected = self.audio_outputs.on_selected.clone();
-        let audio_input_devices = Rc::clone(&self.audio_inputs.devices);
-        let video_input_devices = Rc::clone(&self.video_inputs.devices);
-        let audio_output_devices = Rc::clone(&self.audio_outputs.devices);
-        // Share the actual selection state with the closure
-        let audio_input_selected = self.audio_inputs.selected_rc();
-        let video_input_selected = self.video_inputs.selected_rc();
-        let audio_output_selected = self.audio_outputs.selected_rc();
+        let audio_input_devices = self.audio_inputs.devices.clone();
+        let video_input_devices = self.video_inputs.devices.clone();
+        let audio_output_devices = self.audio_outputs.devices.clone();
+        // Share the actual selection state with the closure so we can
+        // read the real selected device and update it if a device disappears.
+        let audio_input_selected = self.audio_inputs.selected.clone();
+        let video_input_selected = self.video_inputs.selected.clone();
+        let audio_output_selected = self.audio_outputs.selected.clone();
 
         // Create a closure that will call our refresh logic
         let closure = Closure::wrap(Box::new(move |_event: Event| {
             // Clone everything we need to move into the async block
-            let audio_input_devices_clone = Rc::clone(&audio_input_devices);
-            let video_input_devices_clone = Rc::clone(&video_input_devices);
-            let audio_output_devices_clone = Rc::clone(&audio_output_devices);
+            let audio_input_devices_clone = audio_input_devices.clone();
+            let video_input_devices_clone = video_input_devices.clone();
+            let audio_output_devices_clone = audio_output_devices.clone();
             let on_devices_changed_clone = on_devices_changed.clone();
             let on_audio_selected_clone = on_audio_selected.clone();
             let on_video_selected_clone = on_video_selected.clone();
             let on_audio_output_selected_clone = on_audio_output_selected.clone();
+            let audio_input_selected_for_write = audio_input_selected.clone();
+            let video_input_selected_for_write = video_input_selected.clone();
+            let audio_output_selected_for_write = audio_output_selected.clone();
             let provider_promise = provider_clone.enumerate_devices();
 
             // Read the ACTUAL selected device IDs (not just the first device)
@@ -412,22 +412,30 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
                     on_devices_changed_clone.emit(());
                 }
 
-                // Re-select the previously selected device if it still exists, otherwise select first device
+                // If the selected device disappeared, update the selection to the
+                // first available device. We must write directly to the shared Rc
+                // because on_selected callbacks are not wired up in the host.
                 if !audio_device_still_exists {
                     if let Some(device) = audio_devices.first() {
-                        on_audio_selected_clone.emit(device.device_id());
+                        let new_id = device.device_id();
+                        *audio_input_selected_for_write.borrow_mut() = Some(new_id.clone());
+                        on_audio_selected_clone.emit(new_id);
                     }
                 }
 
                 if !video_device_still_exists {
                     if let Some(device) = video_devices.first() {
-                        on_video_selected_clone.emit(device.device_id());
+                        let new_id = device.device_id();
+                        *video_input_selected_for_write.borrow_mut() = Some(new_id.clone());
+                        on_video_selected_clone.emit(new_id);
                     }
                 }
 
                 if !audio_output_device_still_exists {
                     if let Some(device) = audio_output_device_list.first() {
-                        on_audio_output_selected_clone.emit(device.device_id());
+                        let new_id = device.device_id();
+                        *audio_output_selected_for_write.borrow_mut() = Some(new_id.clone());
+                        on_audio_output_selected_clone.emit(new_id);
                     }
                 }
             });
@@ -465,9 +473,9 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
         let on_audio_selected = self.audio_inputs.on_selected.clone();
         let on_video_selected = self.video_inputs.on_selected.clone();
         let on_audio_output_selected = self.audio_outputs.on_selected.clone();
-        let audio_input_devices = Rc::clone(&self.audio_inputs.devices);
-        let video_input_devices = Rc::clone(&self.video_inputs.devices);
-        let audio_output_devices = Rc::clone(&self.audio_outputs.devices);
+        let audio_input_devices = self.audio_inputs.devices.clone();
+        let video_input_devices = self.video_inputs.devices.clone();
+        let audio_output_devices = self.audio_outputs.devices.clone();
 
         let provider_promise = self.provider.enumerate_devices();
 

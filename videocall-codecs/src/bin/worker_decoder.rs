@@ -87,8 +87,7 @@ impl WebDecoder {
         if decoder_ref.is_some() && *codec_ref != Some(codec) {
             console::log_1(
                 &format!(
-                    "[WORKER] Codec changed from {:?} to {:?}, reconfiguring decoder",
-                    codec_ref, codec
+                    "[WORKER] Codec changed from {codec_ref:?} to {codec:?}, reconfiguring decoder"
                 )
                 .into(),
             );
@@ -126,7 +125,7 @@ impl WebDecoder {
             VideoDecoder::new(&init).map_err(|e| format!("Failed to create decoder: {e:?}"))?;
 
         // Configure with the codec from the incoming frame
-        console::log_1(&format!("[WORKER] Configuring decoder with codec: {}", codec_str).into());
+        console::log_1(&format!("[WORKER] Configuring decoder with codec: {codec_str}").into());
         let config = VideoDecoderConfig::new(codec_str);
         decoder
             .configure(&config)
@@ -138,11 +137,7 @@ impl WebDecoder {
         *decoder_ref = Some(decoder);
         *codec_ref = Some(codec);
         console::log_1(
-            &format!(
-                "[WORKER] WebCodecs decoder initialized with codec: {:?}",
-                codec
-            )
-            .into(),
+            &format!("[WORKER] WebCodecs decoder initialized with codec: {codec:?}").into(),
         );
         Ok(())
     }

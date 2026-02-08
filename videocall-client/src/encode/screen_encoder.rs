@@ -24,6 +24,7 @@ use js_sys::JsString;
 use js_sys::Reflect;
 use log::error;
 use log::info;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
@@ -85,6 +86,10 @@ pub struct ScreenEncoder {
     current_fps: Rc<AtomicU32>,
     on_encoder_settings_update: Option<Callback<String>>,
     on_state_change: Option<Callback<ScreenShareEvent>>,
+    /// Holds the active MediaStream so `stop()` can synchronously kill all tracks.
+    /// Only used by the screen encoder -- this is screen-specific state, not generic encoder state.
+    /// I do not like this but so far it is reliable.
+    screen_stream: Rc<RefCell<Option<MediaStream>>>,
 }
 
 impl ScreenEncoder {
@@ -109,6 +114,7 @@ impl ScreenEncoder {
             current_fps: Rc::new(AtomicU32::new(0)),
             on_encoder_settings_update: Some(on_encoder_settings_update),
             on_state_change: Some(on_state_change),
+            screen_stream: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -170,9 +176,34 @@ impl ScreenEncoder {
         self.state.set_enabled(value)
     }
 
-    /// Stops encoding after it has been started.
+    /// Stops encoding and MediaStream after it has been started.
+    ///
+    /// This is the authoritative cleanup path when the UI triggers a stop.
+    /// It sets the encoder flags, notifies the client at the protocol level,
+    /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
-        self.state.stop()
+        // Signal the encoding loop to exit
+        self.state.stop();
+
+        // Notify the client that screen sharing is disabled at the protocol level.
+        // This must happen here because self.state.stop() sets enabled=false,
+        // which causes the encoding loop's end-of-loop cleanup to skip its own
+        // set_screen_enabled(false) call (the enabled.swap guard returns false).
+        self.client.set_screen_enabled(false);
+
+        // Synchronously stop all tracks from the stored stream so the browser
+        // releases the screen-capture indicator immediately.
+        // SAFETY: In WASM's single-threaded environment this lock can never be contended.
+        let stream = self.screen_stream.borrow_mut().take();
+        if let Some(stream) = stream {
+            for i in 0..stream.get_tracks().length() {
+                let track = stream
+                    .get_tracks()
+                    .get(i)
+                    .unchecked_into::<web_sys::MediaStreamTrack>();
+                track.stop();
+            }
+        }
     }
 
     /// Start encoding and sending the data to the client connection (if it's currently connected).
@@ -199,6 +230,7 @@ impl ScreenEncoder {
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
         let on_state_change = self.on_state_change.clone();
+        let screen_stream = self.screen_stream.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
@@ -246,6 +278,8 @@ impl ScreenEncoder {
             };
 
             log::info!("Screen to share: {screen_to_share:?}");
+
+            screen_stream.borrow_mut().replace(screen_to_share.clone());
 
             // Helper to clean up stream on error - stops all tracks and emits Failed event
             let cleanup_on_error = |screen_to_share: &MediaStream,
@@ -335,7 +369,7 @@ impl ScreenEncoder {
                 Ok(encoder) => Box::new(encoder),
                 Err(e) => {
                     let msg = format!("Failed to create video encoder: {e:?}");
-                    error!("{}", msg);
+                    error!("{msg}");
                     cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                     return;
                 }
@@ -375,7 +409,7 @@ impl ScreenEncoder {
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
                 let msg = format!("Error configuring screen encoder: {e:?}");
-                error!("{}", msg);
+                error!("{msg}");
                 cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                 return;
             }
@@ -386,7 +420,7 @@ impl ScreenEncoder {
                 Ok(processor) => processor,
                 Err(e) => {
                     let msg = format!("Failed to create media stream track processor: {e:?}");
-                    error!("{}", msg);
+                    error!("{msg}");
                     cleanup_on_error(&screen_to_share, &enabled, &on_state_change, msg);
                     return;
                 }

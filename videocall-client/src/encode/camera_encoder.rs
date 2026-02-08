@@ -303,7 +303,7 @@ impl CameraEncoder {
             )
             .unwrap();
 
-            log::info!("CameraEncoder: deviceId.exact = {}", device_id);
+            log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
             media_info.set_device_id(&exact.into());
 
             constraints.set_video(&media_info.into());
@@ -431,6 +431,7 @@ impl CameraEncoder {
                     switching.store(false, Ordering::Release);
                     let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                     video_track.stop();
+                    log::info!("CameraEncoder: stopped");
                     if let Err(e) = video_encoder.close() {
                         error!("Error closing video encoder: {e:?}");
                     }

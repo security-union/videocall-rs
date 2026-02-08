@@ -370,22 +370,18 @@ impl Component for Host {
             }
             Msg::VideoDeviceChanged(video) => {
                 log::info!("Video device changed: {video}");
-
                 self.media_devices.video_inputs.select(&video.device_id);
-
-                let was_enabled = ctx.props().video_enabled;
-
-                if was_enabled {
-                    self.camera.stop();
+                // select() sets switching=true while enabled, causing the old
+                // encoding loop to exit on its next iteration. The 1-second
+                // timeout gives the old loop time to detect the flag and clean
+                // up before we restart.
+                if self.camera.select(video.device_id.clone()) {
+                    let link = ctx.link().clone();
+                    let timeout = Timeout::new(1000, move || {
+                        link.send_message(Msg::EnableVideo(true));
+                    });
+                    timeout.forget();
                 }
-
-                self.camera.select(video.device_id.clone());
-
-                if was_enabled {
-                    self.camera.set_enabled(true);
-                    self.camera.start();
-                }
-
                 true
             }
 

@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use gloo_timers::future::sleep;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
@@ -25,6 +26,7 @@ use log::error;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -46,8 +48,6 @@ use web_sys::VideoEncoderInit;
 use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 use yew::Callback;
-use gloo_timers::future::sleep;
-use std::time::Duration;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
@@ -189,10 +189,7 @@ impl CameraEncoder {
         let aes = client.aes();
         let video_elem_id = self.video_elem_id.clone();
         let EncoderState {
-            destroy,
-            enabled,
-            switching,
-            ..
+            enabled, switching, ..
         } = self.state.clone();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
@@ -239,10 +236,12 @@ impl CameraEncoder {
             return;
         };
 
-        log::info!("CameraEncoder::start(): using video device_id = {}", device_id);
+        log::info!(
+            "CameraEncoder::start(): using video device_id = {}",
+            device_id
+        );
 
         wasm_bindgen_futures::spawn_local(async move {
-
             let navigator = window().navigator();
 
             // Wait for <video id="{video_elem_id}"> to be mounted in the DOM
@@ -252,7 +251,11 @@ impl CameraEncoder {
                 if let Some(doc) = window().document() {
                     if let Some(elem) = doc.get_element_by_id(&video_elem_id) {
                         if let Ok(video_elem) = elem.dyn_into::<HtmlVideoElement>() {
-                            log::info!("CameraEncoder: found <video id='{}'> after {} attempts", video_elem_id, attempt);
+                            log::info!(
+                                "CameraEncoder: found <video id='{}'> after {} attempts",
+                                video_elem_id,
+                                attempt
+                            );
                             break video_elem;
                         }
                     }
@@ -261,7 +264,10 @@ impl CameraEncoder {
                 sleep(Duration::from_millis(50)).await;
                 attempt += 1;
                 if attempt > 20 {
-                    error!("CameraEncoder: <video id='{}'> not found in DOM after 1 second", video_elem_id);
+                    error!(
+                        "CameraEncoder: <video id='{}'> not found in DOM after 1 second",
+                        video_elem_id
+                    );
                     return;
                 }
             };
@@ -282,7 +288,8 @@ impl CameraEncoder {
                 &exact,
                 &JsValue::from_str("exact"),
                 &JsValue::from_str(&device_id),
-            ).unwrap();
+            )
+            .unwrap();
 
             log::info!("CameraEncoder: deviceId.exact = {}", device_id);
             media_info.set_device_id(&exact.into());
@@ -321,7 +328,10 @@ impl CameraEncoder {
             if let Err(e) = video_element.play() {
                 error!("VIDEO PLAY ERROR: {:?}", e);
             } else {
-                log::info!("VIDEO PLAY started successfully on element {}", video_elem_id);
+                log::info!(
+                    "VIDEO PLAY started successfully on element {}",
+                    video_elem_id
+                );
             }
 
             let video_track = Box::new(
@@ -363,7 +373,7 @@ impl CameraEncoder {
             let height = track_settings.get_height().expect("height is None");
 
             let video_encoder_config =
-                VideoEncoderConfig::new(get_video_codec_string(), width as u32, height as u32);
+                VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
             video_encoder_config
                 .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
             video_encoder_config.set_latency_mode(LatencyMode::Realtime);
@@ -393,10 +403,7 @@ impl CameraEncoder {
             let mut current_encoder_height = height as u32;
 
             loop {
-                if !enabled.load(Ordering::Acquire)
-                    || destroy.load(Ordering::Acquire)
-                    || switching.load(Ordering::Acquire)
-                {
+                if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
                     switching.store(false, Ordering::Release);
                     let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                     video_track.stop();
@@ -439,8 +446,8 @@ impl CameraEncoder {
 
                             let new_config = VideoEncoderConfig::new(
                                 get_video_codec_string(),
-                                current_encoder_width,
                                 current_encoder_height,
+                                current_encoder_width,
                             );
                             new_config.set_bitrate(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);

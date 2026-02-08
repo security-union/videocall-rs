@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct EncoderState {
-    pub(super) destroy: Arc<AtomicBool>,
     pub(super) enabled: Arc<AtomicBool>,
     pub(super) selected: Option<String>,
     pub(super) switching: Arc<AtomicBool>,
@@ -36,7 +35,6 @@ pub struct EncoderState {
 impl EncoderState {
     pub fn new() -> Self {
         Self {
-            destroy: Arc::new(AtomicBool::new(false)),
             enabled: Arc::new(AtomicBool::new(false)),
             selected: None,
             switching: Arc::new(AtomicBool::new(false)),

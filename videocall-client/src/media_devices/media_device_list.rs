@@ -184,7 +184,6 @@ impl SelectableDevices {
             }
         }
     }
-
 }
 
 impl Clone for SelectableDevices {
@@ -309,20 +308,12 @@ impl<P: MediaDevicesProvider + Clone> MediaDeviceList<P> {
             let provider_promise = provider_clone.enumerate_devices();
 
             // Read the ACTUAL selected device IDs (not just the first device)
-            let current_audio_selection = audio_input_selected
-                .borrow()
-                .clone()
-                .unwrap_or_default();
+            let current_audio_selection = audio_input_selected.borrow().clone().unwrap_or_default();
 
-            let current_video_selection = video_input_selected
-                .borrow()
-                .clone()
-                .unwrap_or_default();
+            let current_video_selection = video_input_selected.borrow().clone().unwrap_or_default();
 
-            let current_audio_output_selection = audio_output_selected
-                .borrow()
-                .clone()
-                .unwrap_or_default();
+            let current_audio_output_selection =
+                audio_output_selected.borrow().clone().unwrap_or_default();
 
             wasm_bindgen_futures::spawn_local(async move {
                 let future = JsFuture::from(provider_promise);

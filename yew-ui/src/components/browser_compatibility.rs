@@ -64,7 +64,7 @@ impl BrowserCompatibility {
         // Check Firefox feature flag - block Firefox unless explicitly enabled
         if Self::is_firefox() {
             let ff_enabled = firefox_enabled().unwrap_or(false);
-            log::info!("Firefox detected, firefoxEnabled={}", ff_enabled);
+            log::info!("Firefox detected, firefoxEnabled={ff_enabled}");
             if !ff_enabled {
                 return Some(
                     "Hey friend! 👋 Firefox support is currently experimental and disabled. \

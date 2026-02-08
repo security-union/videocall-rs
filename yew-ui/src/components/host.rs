@@ -57,6 +57,7 @@ pub enum Msg {
     SaveChangeName,
     CancelChangeName,
     MicrophoneError(String),
+    CameraError(String),
 }
 
 pub struct Host {
@@ -120,6 +121,11 @@ pub struct MeetingProps {
     #[prop_or_default]
     pub on_microphone_error: Callback<String>,
 
+    /// Called when the camera encoder reports an unrecoverable error.
+    /// The parent should disable the camera and optionally display an error.
+    #[prop_or_default]
+    pub on_camera_error: Callback<String>,
+
     /// Called when screen share state changes (started, cancelled, stopped).
     /// This allows the parent component to react to screen share lifecycle events.
     pub on_screen_share_state: Callback<ScreenShareEvent>,
@@ -142,11 +148,13 @@ impl Component for Host {
         let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
 
         let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
+        let camera_error_cb = ctx.link().callback(Msg::CameraError);
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
             video_bitrate,
             camera_callback,
+            camera_error_cb,
         );
 
         // Use the factory function to create the appropriate microphone encoder
@@ -302,6 +310,12 @@ impl Component for Host {
                 ctx.props().on_microphone_error.emit(err);
                 true
             }
+            Msg::CameraError(err) => {
+                log::error!("Camera error: {err}");
+                self.camera.stop();
+                ctx.props().on_camera_error.emit(err);
+                true
+            }
             Msg::EnableVideo(should_enable) => {
                 if !should_enable {
                     return true;
@@ -370,8 +384,11 @@ impl Component for Host {
             }
             Msg::VideoDeviceChanged(video) => {
                 log::info!("Video device changed: {video}");
-                // Update the MediaDeviceList selection
                 self.media_devices.video_inputs.select(&video.device_id);
+                // select() sets switching=true while enabled, causing the old
+                // encoding loop to exit on its next iteration. The 1-second
+                // timeout gives the old loop time to detect the flag and clean
+                // up before we restart.
                 if self.camera.select(video.device_id.clone()) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
@@ -379,8 +396,9 @@ impl Component for Host {
                     });
                     timeout.forget();
                 }
-                true // Need to re-render to update device selector displays
+                true
             }
+
             Msg::SpeakerDeviceChanged(speaker) => {
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_outputs.select(&speaker.device_id);

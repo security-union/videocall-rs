@@ -46,6 +46,8 @@ use web_sys::VideoEncoderInit;
 use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 use yew::Callback;
+use gloo_timers::future::sleep;
+use std::time::Duration;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;
@@ -237,32 +239,90 @@ impl CameraEncoder {
             return;
         };
 
-        wasm_bindgen_futures::spawn_local(async move {
-            let navigator = window().navigator();
-            let video_element = window()
-                .document()
-                .unwrap()
-                .get_element_by_id(&video_elem_id)
-                .unwrap()
-                .unchecked_into::<HtmlVideoElement>();
+        log::info!("CameraEncoder::start(): using video device_id = {}", device_id);
 
-            let media_devices = navigator.media_devices().unwrap();
+        wasm_bindgen_futures::spawn_local(async move {
+
+            let navigator = window().navigator();
+
+            // Wait for <video id="{video_elem_id}"> to be mounted in the DOM
+            // Yew renders components asynchronously
+            let mut attempt = 0;
+            let video_element = loop {
+                if let Some(doc) = window().document() {
+                    if let Some(elem) = doc.get_element_by_id(&video_elem_id) {
+                        if let Ok(video_elem) = elem.dyn_into::<HtmlVideoElement>() {
+                            log::info!("CameraEncoder: found <video id='{}'> after {} attempts", video_elem_id, attempt);
+                            break video_elem;
+                        }
+                    }
+                }
+                // Sleep a bit and retry
+                sleep(Duration::from_millis(50)).await;
+                attempt += 1;
+                if attempt > 20 {
+                    error!("CameraEncoder: <video id='{}'> not found in DOM after 1 second", video_elem_id);
+                    return;
+                }
+            };
+
+            let media_devices = match navigator.media_devices() {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("navigator.mediaDevices() failed: {:?}", e);
+                    return;
+                }
+            };
             let constraints = MediaStreamConstraints::new();
             let media_info = web_sys::MediaTrackConstraints::new();
-            media_info.set_device_id(&device_id.into());
+
+            // Force exact deviceId match (avoids partial/ideal matching surprises).
+            let exact = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &exact,
+                &JsValue::from_str("exact"),
+                &JsValue::from_str(&device_id),
+            ).unwrap();
+
+            log::info!("CameraEncoder: deviceId.exact = {}", device_id);
+            media_info.set_device_id(&exact.into());
 
             constraints.set_video(&media_info.into());
             constraints.set_audio(&Boolean::from(false));
 
-            let devices_query = media_devices
-                .get_user_media_with_constraints(&constraints)
-                .unwrap();
-            let device = JsFuture::from(devices_query)
-                .await
-                .unwrap()
-                .unchecked_into::<MediaStream>();
-            video_element.set_src_object(Some(&device));
+            let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("get_user_media_with_constraints() threw: {:?}", e);
+                    return;
+                }
+            };
+
+            let device = match JsFuture::from(devices_query).await {
+                Ok(s) => s.unchecked_into::<MediaStream>(),
+                Err(e) => {
+                    error!("getUserMedia promise rejected: {:?}", e);
+                    return;
+                }
+            };
+
+            log::info!(
+                "CameraEncoder: getUserMedia OK, stream id={:?}, tracks={}",
+                device.id(),
+                device.get_tracks().length()
+            );
+            // Configure the local preview element
+            // Muted must be set before calling play() to avoid autoplay restrictions
             video_element.set_muted(true);
+            video_element.set_attribute("playsinline", "true").unwrap();
+            video_element.set_src_object(None);
+            video_element.set_src_object(Some(&device));
+
+            if let Err(e) = video_element.play() {
+                error!("VIDEO PLAY ERROR: {:?}", e);
+            } else {
+                log::info!("VIDEO PLAY started successfully on element {}", video_elem_id);
+            }
 
             let video_track = Box::new(
                 device
@@ -284,7 +344,13 @@ impl CameraEncoder {
                 video_output_handler.as_ref().unchecked_ref(),
             );
 
-            let video_encoder = Box::new(VideoEncoder::new(&video_encoder_init).unwrap());
+            let video_encoder = match VideoEncoder::new(&video_encoder_init) {
+                Ok(enc) => Box::new(enc),
+                Err(e) => {
+                    error!("Failed to create VideoEncoder: {e:?}");
+                    return;
+                }
+            };
 
             // Get track settings to get actual width and height
             let media_track = video_track
@@ -297,7 +363,7 @@ impl CameraEncoder {
             let height = track_settings.get_height().expect("height is None");
 
             let video_encoder_config =
-                VideoEncoderConfig::new(get_video_codec_string(), height as u32, width as u32);
+                VideoEncoderConfig::new(get_video_codec_string(), width as u32, height as u32);
             video_encoder_config
                 .set_bitrate(current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0);
             video_encoder_config.set_latency_mode(LatencyMode::Realtime);
@@ -373,8 +439,8 @@ impl CameraEncoder {
 
                             let new_config = VideoEncoderConfig::new(
                                 get_video_codec_string(),
-                                current_encoder_height,
                                 current_encoder_width,
+                                current_encoder_height,
                             );
                             new_config.set_bitrate(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);

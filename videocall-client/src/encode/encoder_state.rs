@@ -68,7 +68,7 @@ impl EncoderState {
     }
 
     pub fn stop(&mut self) {
-        self.destroy.store(true, Ordering::Release);
         self.enabled.store(false, Ordering::Release);
+        self.switching.store(false, Ordering::Release);
     }
 }

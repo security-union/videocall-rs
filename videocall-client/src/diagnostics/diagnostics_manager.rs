@@ -30,6 +30,9 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::window;
+
+// Yew callbacks - only available with yew-compat feature
+#[cfg(feature = "yew-compat")]
 use yew::Callback;
 
 use videocall_types::protos::diagnostics_packet::{AudioMetrics, DiagnosticsPacket, VideoMetrics};
@@ -38,7 +41,7 @@ use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
 // Basic structure for diagnostics events
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum DiagnosticEvent {
     FrameReceived {
         peer_id: String,
@@ -46,10 +49,41 @@ pub enum DiagnosticEvent {
         frame_size: u64, // Size of the frame in bytes
     },
     RequestStats,
+    #[cfg(feature = "yew-compat")]
     SetStatsCallback(Callback<String>),
     SetReportingInterval(u64),
     HeartbeatTick, // New event for heartbeat
+    #[cfg(feature = "yew-compat")]
     SetPacketHandler(Callback<DiagnosticsPacket>),
+    /// Framework-agnostic packet handler using Arc for thread-safety
+    SetPacketHandlerFn(Arc<dyn Fn(DiagnosticsPacket) + Send + Sync>),
+}
+
+impl std::fmt::Debug for DiagnosticEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiagnosticEvent::FrameReceived {
+                peer_id,
+                media_type,
+                frame_size,
+            } => f
+                .debug_struct("FrameReceived")
+                .field("peer_id", peer_id)
+                .field("media_type", media_type)
+                .field("frame_size", frame_size)
+                .finish(),
+            DiagnosticEvent::RequestStats => write!(f, "RequestStats"),
+            #[cfg(feature = "yew-compat")]
+            DiagnosticEvent::SetStatsCallback(_) => write!(f, "SetStatsCallback(...)"),
+            DiagnosticEvent::SetReportingInterval(interval) => {
+                write!(f, "SetReportingInterval({interval})")
+            }
+            DiagnosticEvent::HeartbeatTick => write!(f, "HeartbeatTick"),
+            #[cfg(feature = "yew-compat")]
+            DiagnosticEvent::SetPacketHandler(_) => write!(f, "SetPacketHandler(...)"),
+            DiagnosticEvent::SetPacketHandlerFn(_) => write!(f, "SetPacketHandlerFn(...)"),
+        }
+    }
 }
 
 // Stats for a peer's decoder
@@ -207,10 +241,14 @@ unsafe impl Send for DiagnosticManager {}
 struct DiagnosticWorker {
     // Track FPS per peer and per media type (audio, video, screen)
     fps_trackers: HashMap<String, HashMap<MediaType, FpsTracker>>,
+    #[cfg(feature = "yew-compat")]
     on_stats_update: Option<Callback<String>>,
     last_report_time: f64, // timestamp in ms
     report_interval_ms: u64,
+    #[cfg(feature = "yew-compat")]
     packet_handler: Option<Callback<DiagnosticsPacket>>,
+    /// Framework-agnostic packet handler
+    packet_handler_fn: Option<Arc<dyn Fn(DiagnosticsPacket) + Send + Sync>>,
     receiver: Receiver<DiagnosticEvent>,
     userid: String,
 }
@@ -232,8 +270,11 @@ impl DiagnosticManager {
         // Spawn the worker to process events
         let worker = DiagnosticWorker {
             fps_trackers: HashMap::new(),
+            #[cfg(feature = "yew-compat")]
             on_stats_update: None,
+            #[cfg(feature = "yew-compat")]
             packet_handler: None,
+            packet_handler_fn: None,
             last_report_time: Date::now(),
             report_interval_ms: 500,
             receiver,
@@ -285,7 +326,8 @@ impl DiagnosticManager {
         }));
     }
 
-    // Set the callback for UI updates
+    // Set the callback for UI updates (Yew-compat only)
+    #[cfg(feature = "yew-compat")]
     pub fn set_stats_callback(&self, callback: Callback<String>) {
         if let Err(e) = self
             .sender
@@ -296,7 +338,8 @@ impl DiagnosticManager {
         }
     }
 
-    // Set the callback for when a diagnostic packet is received
+    // Set the callback for when a diagnostic packet is received (Yew-compat only)
+    #[cfg(feature = "yew-compat")]
     pub fn set_packet_handler(&self, callback: Callback<DiagnosticsPacket>) {
         if let Err(e) = self
             .sender
@@ -304,6 +347,17 @@ impl DiagnosticManager {
             .try_send(DiagnosticEvent::SetPacketHandler(callback))
         {
             error!("Failed to set packet handler: {e}");
+        }
+    }
+
+    /// Set a framework-agnostic packet handler function
+    pub fn set_packet_handler_fn(&self, handler: Box<dyn Fn(DiagnosticsPacket) + Send + Sync>) {
+        if let Err(e) = self
+            .sender
+            .clone()
+            .try_send(DiagnosticEvent::SetPacketHandlerFn(Arc::from(handler)))
+        {
+            error!("Failed to set packet handler fn: {e}");
         }
     }
 
@@ -399,6 +453,7 @@ impl DiagnosticWorker {
 
                 tracker.track_frame_with_size(frame_size);
             }
+            #[cfg(feature = "yew-compat")]
             DiagnosticEvent::SetStatsCallback(callback) => {
                 self.on_stats_update = Some(callback);
             }
@@ -418,8 +473,12 @@ impl DiagnosticWorker {
 
                 self.send_diagnostic_packets();
             }
+            #[cfg(feature = "yew-compat")]
             DiagnosticEvent::SetPacketHandler(callback) => {
                 self.packet_handler = Some(callback);
+            }
+            DiagnosticEvent::SetPacketHandlerFn(handler) => {
+                self.packet_handler_fn = Some(handler);
             }
         }
     }
@@ -463,8 +522,16 @@ impl DiagnosticWorker {
                 };
                 let _ = global_sender().try_broadcast(video_event);
 
-                // Only create and send protobuf packets if packet handler is set (legacy system)
-                if let Some(handler) = &self.packet_handler {
+                // Only create and send protobuf packets if packet handler is set
+                // Check Yew callback first, then fall back to function-based handler
+                #[cfg(feature = "yew-compat")]
+                let has_yew_handler = self.packet_handler.is_some();
+                #[cfg(not(feature = "yew-compat"))]
+                let has_yew_handler = false;
+
+                let has_fn_handler = self.packet_handler_fn.is_some();
+
+                if has_yew_handler || has_fn_handler {
                     let mut packet = DiagnosticsPacket::new();
                     packet.target_id = self.userid.clone();
                     packet.sender_id = peer_id.clone();
@@ -488,7 +555,17 @@ impl DiagnosticWorker {
                         "Sending diagnostic packet to {}: {:?} FPS: {:.2} Bitrate: {:.1} kbit/s",
                         peer_id, media_type, tracker.fps, tracker.current_bitrate
                     );
-                    handler.emit(packet);
+
+                    // Use Yew callback if available
+                    #[cfg(feature = "yew-compat")]
+                    if let Some(handler) = &self.packet_handler {
+                        handler.emit(packet.clone());
+                    }
+
+                    // Also use function-based handler if available
+                    if let Some(handler_fn) = &self.packet_handler_fn {
+                        handler_fn(packet);
+                    }
                 }
             }
         }
@@ -500,11 +577,10 @@ impl DiagnosticWorker {
         let elapsed_ms = now - self.last_report_time;
 
         if elapsed_ms >= self.report_interval_ms as f64 {
-            // Time to report
-            let stats_string = self.get_fps_stats_string();
-
-            // Report stats to UI if callback is set
+            // Time to report - only generate string if callback is set
+            #[cfg(feature = "yew-compat")]
             if let Some(callback) = &self.on_stats_update {
+                let stats_string = self.get_fps_stats_string();
                 callback.emit(stats_string);
             }
 
@@ -578,9 +654,11 @@ impl DiagnosticWorker {
 #[derive(Debug, Clone)]
 pub enum SenderDiagnosticEvent {
     DiagnosticPacketReceived(DiagnosticsPacket),
+    #[cfg(feature = "yew-compat")]
     SetStatsCallback(Callback<String>),
     SetReportingInterval(u64),
     HeartbeatTick,
+    #[cfg(feature = "yew-compat")]
     AddEncoderCallback(Callback<DiagnosticsPacket>),
     AddSenderChannel(UnboundedSender<DiagnosticsPacket>, MediaType),
 }
@@ -635,7 +713,9 @@ pub struct SenderDiagnosticManager {
 
 struct SenderDiagnosticWorker {
     stream_stats: HashMap<String, HashMap<MediaType, StreamStats>>, // peer_id -> media_type -> stats
+    #[cfg(feature = "yew-compat")]
     on_stats_update: Option<Callback<String>>,
+    #[cfg(feature = "yew-compat")]
     encoder_callbacks: Vec<Callback<DiagnosticsPacket>>,
     sender_channels: Vec<(UnboundedSender<DiagnosticsPacket>, MediaType)>,
     last_report_time: f64,
@@ -650,7 +730,9 @@ impl SenderDiagnosticManager {
 
         let worker = SenderDiagnosticWorker {
             stream_stats: HashMap::new(),
+            #[cfg(feature = "yew-compat")]
             on_stats_update: None,
+            #[cfg(feature = "yew-compat")]
             encoder_callbacks: Vec::new(),
             sender_channels: Vec::new(),
             last_report_time: Date::now(),
@@ -699,6 +781,7 @@ impl SenderDiagnosticManager {
         }));
     }
 
+    #[cfg(feature = "yew-compat")]
     pub fn set_stats_callback(&self, callback: Callback<String>) {
         if let Err(e) = self
             .sender
@@ -709,6 +792,7 @@ impl SenderDiagnosticManager {
         }
     }
 
+    #[cfg(feature = "yew-compat")]
     pub fn add_encoder_callback(&self, callback: Callback<DiagnosticsPacket>) {
         if let Err(e) = self
             .sender
@@ -807,6 +891,7 @@ impl SenderDiagnosticWorker {
                     }
                 }
             }
+            #[cfg(feature = "yew-compat")]
             SenderDiagnosticEvent::SetStatsCallback(callback) => {
                 self.on_stats_update = Some(callback);
             }
@@ -816,6 +901,7 @@ impl SenderDiagnosticWorker {
             SenderDiagnosticEvent::HeartbeatTick => {
                 self.maybe_report_stats_to_ui();
             }
+            #[cfg(feature = "yew-compat")]
             SenderDiagnosticEvent::AddEncoderCallback(callback) => {
                 // Add the callback to the list of callbacks
                 self.encoder_callbacks.push(callback);
@@ -831,10 +917,16 @@ impl SenderDiagnosticWorker {
         let elapsed_ms = now - self.last_report_time;
 
         if elapsed_ms >= self.report_interval_ms as f64 {
-            let stats_string = self.get_stats_string();
-
-            if let Some(callback) = &self.on_stats_update {
-                callback.emit(stats_string);
+            #[cfg(feature = "yew-compat")]
+            {
+                // Check if callback exists and get stats string first
+                let should_emit = self.on_stats_update.is_some();
+                if should_emit {
+                    let stats_string = self.get_stats_string();
+                    if let Some(callback) = &self.on_stats_update {
+                        callback.emit(stats_string);
+                    }
+                }
             }
 
             self.last_report_time = now;

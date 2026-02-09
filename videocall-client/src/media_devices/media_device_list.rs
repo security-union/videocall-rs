@@ -575,27 +575,22 @@ impl<P: MediaDevicesProvider + Clone> Clone for MediaDeviceList<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use js_sys::Function;
     use std::cell::RefCell;
     use std::rc::Rc;
     use wasm_bindgen::JsValue;
     use wasm_bindgen_test::*;
 
-    // Helper to create mock device for tests
+    // Helper to create mock device for tests.
+    //
+    // `web_sys::MediaDeviceInfo` accessors use *structural* getters
+    // (`Reflect::get`), so plain properties on a `js_sys::Object` are
+    // all that's needed — no function overrides required.
     fn create_mock_device(id: &str, kind: MediaDeviceKind, label: &str) -> MediaDeviceInfo {
         let device = js_sys::Object::new();
         js_sys::Reflect::set(&device, &"deviceId".into(), &id.into()).unwrap();
         js_sys::Reflect::set(&device, &"kind".into(), &kind.into()).unwrap();
         js_sys::Reflect::set(&device, &"label".into(), &label.into()).unwrap();
         js_sys::Reflect::set(&device, &"groupId".into(), &"group1".into()).unwrap();
-
-        // Add the required MediaDeviceInfo methods
-        let device_id_fn = Function::new_with_args("", "return this.deviceId;");
-        js_sys::Reflect::set(&device, &"deviceId".into(), &device_id_fn).unwrap();
-
-        let kind_fn = Function::new_with_args("", "return this.kind;");
-        js_sys::Reflect::set(&device, &"kind".into(), &kind_fn).unwrap();
-
         device.unchecked_into::<MediaDeviceInfo>()
     }
 
@@ -658,79 +653,218 @@ mod tests {
         assert_eq!(*selected_audio_output.borrow(), "");
     }
 
-    // Test with mock provider
+    /// Yield to the microtask queue so that `spawn_local` futures complete.
+    ///
+    /// A single yield is not enough because `spawn_local` starts on one
+    /// microtask tick and then its inner `JsFuture::from(promise).await`
+    /// needs another tick to deliver the result.  Three iterations gives
+    /// a comfortable margin (similar to Jest's `flushPromises()`).
+    async fn flush() {
+        for _ in 0..3 {
+            wasm_bindgen_futures::JsFuture::from(Promise::resolve(&JsValue::NULL))
+                .await
+                .unwrap();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Load + initial selection
+    // -----------------------------------------------------------------------
+
     #[wasm_bindgen_test]
-    async fn test_with_mock_provider() {
-        // Create mock devices
-        let audio1 = create_mock_device("audio1", MediaDeviceKind::Audioinput, "Mic 1");
-        let video1 = create_mock_device("video1", MediaDeviceKind::Videoinput, "Camera 1");
-        let audio_output1 =
-            create_mock_device("audio_output1", MediaDeviceKind::Audiooutput, "Speaker 1");
+    async fn test_load_populates_device_lists_and_selects_first() {
+        let audio1 = create_mock_device("mic-1", MediaDeviceKind::Audioinput, "Mic 1");
+        let video1 = create_mock_device("cam-1", MediaDeviceKind::Videoinput, "Camera 1");
+        let spk1 = create_mock_device("spk-1", MediaDeviceKind::Audiooutput, "Speaker 1");
+        let provider =
+            MockMediaDevicesProvider::new(vec![audio1.clone(), video1.clone(), spk1.clone()]);
+        let mut mdl = MediaDeviceList::with_provider(provider);
 
-        // Create a mock provider with initial devices
-        let mock_provider = MockMediaDevicesProvider::new(vec![
-            audio1.clone(),
-            video1.clone(),
-            audio_output1.clone(),
-        ]);
+        let loaded = Rc::new(RefCell::new(false));
+        let loaded_c = loaded.clone();
+        mdl.on_loaded = Callback::from(move |_| *loaded_c.borrow_mut() = true);
 
-        // Create MediaDeviceList with mock provider
-        let mut media_device_list = MediaDeviceList::with_provider(mock_provider.clone());
+        let sel_audio = Rc::new(RefCell::new(String::new()));
+        let sel_audio_c = sel_audio.clone();
+        mdl.audio_inputs.on_selected = Callback::from(move |id| *sel_audio_c.borrow_mut() = id);
 
-        // Track when on_loaded is called
-        let loaded_called = Rc::new(RefCell::new(false));
-        let loaded_called_clone = loaded_called.clone();
+        let sel_video = Rc::new(RefCell::new(String::new()));
+        let sel_video_c = sel_video.clone();
+        mdl.video_inputs.on_selected = Callback::from(move |id| *sel_video_c.borrow_mut() = id);
 
-        media_device_list.on_loaded = Callback::from(move |_| {
-            *loaded_called_clone.borrow_mut() = true;
-        });
+        let sel_spk = Rc::new(RefCell::new(String::new()));
+        let sel_spk_c = sel_spk.clone();
+        mdl.audio_outputs.on_selected = Callback::from(move |id| *sel_spk_c.borrow_mut() = id);
 
-        // Track when devices change
-        let devices_changed_called = Rc::new(RefCell::new(false));
-        let devices_changed_called_clone = devices_changed_called.clone();
+        mdl.load();
+        flush().await;
 
-        media_device_list.on_devices_changed = Callback::from(move |_| {
-            *devices_changed_called_clone.borrow_mut() = true;
-        });
+        assert!(*loaded.borrow(), "on_loaded should have been called");
+        assert_eq!(mdl.audio_inputs.devices().len(), 1);
+        assert_eq!(mdl.video_inputs.devices().len(), 1);
+        assert_eq!(mdl.audio_outputs.devices().len(), 1);
+        assert_eq!(*sel_audio.borrow(), "mic-1");
+        assert_eq!(*sel_video.borrow(), "cam-1");
+        assert_eq!(*sel_spk.borrow(), "spk-1");
+    }
 
-        // Track audio device selection
-        let selected_audio = Rc::new(RefCell::new(String::new()));
-        let selected_audio_clone = selected_audio.clone();
+    // -----------------------------------------------------------------------
+    // Switch device
+    // -----------------------------------------------------------------------
 
-        media_device_list.audio_inputs.on_selected = Callback::from(move |device_id| {
-            *selected_audio_clone.borrow_mut() = device_id;
-        });
+    #[wasm_bindgen_test]
+    async fn test_switch_device_fires_on_selected() {
+        let mic1 = create_mock_device("mic-1", MediaDeviceKind::Audioinput, "Mic 1");
+        let mic2 = create_mock_device("mic-2", MediaDeviceKind::Audioinput, "Mic 2");
+        let provider = MockMediaDevicesProvider::new(vec![mic1.clone(), mic2.clone()]);
+        let mut mdl = MediaDeviceList::with_provider(provider);
 
-        // Track video device selection
-        let selected_video = Rc::new(RefCell::new(String::new()));
-        let selected_video_clone = selected_video.clone();
+        let sel = Rc::new(RefCell::new(String::new()));
+        let sel_c = sel.clone();
+        mdl.audio_inputs.on_selected = Callback::from(move |id| *sel_c.borrow_mut() = id);
 
-        media_device_list.video_inputs.on_selected = Callback::from(move |device_id| {
-            *selected_video_clone.borrow_mut() = device_id;
-        });
+        mdl.load();
+        flush().await;
 
-        // Track audio output device selection
-        let selected_audio_output = Rc::new(RefCell::new(String::new()));
-        let selected_audio_output_clone = selected_audio_output.clone();
+        // First device auto-selected on load
+        assert_eq!(*sel.borrow(), "mic-1");
 
-        media_device_list.audio_outputs.on_selected = Callback::from(move |device_id| {
-            *selected_audio_output_clone.borrow_mut() = device_id;
-        });
+        // Switch to second device
+        mdl.audio_inputs.select("mic-2");
+        assert_eq!(*sel.borrow(), "mic-2");
+        assert_eq!(mdl.audio_inputs.selected(), "mic-2");
+    }
 
-        // Initial load
-        media_device_list.load();
+    // -----------------------------------------------------------------------
+    // Hot-plug: device added
+    // -----------------------------------------------------------------------
 
-        // We would wait for the Promise to resolve, but in tests we can just
-        // use a simple delay since the mock Promise resolves synchronously
-        wasm_bindgen_futures::JsFuture::from(Promise::new(&mut |resolve, _| {
-            let _ = resolve.call0(&JsValue::NULL);
-        }))
-        .await
-        .unwrap();
+    #[wasm_bindgen_test]
+    async fn test_hot_plug_device_added() {
+        let mic1 = create_mock_device("mic-1", MediaDeviceKind::Audioinput, "Mic 1");
+        let provider = MockMediaDevicesProvider::new(vec![mic1.clone()]);
+        let mut mdl = MediaDeviceList::with_provider(provider.clone());
 
-        // Basic test structure - in a real test we would check that:
-        // - loaded_called is true
-        // - Selected devices match our mock devices
-        // - After a device change event, on_devices_changed was called
+        let changed = Rc::new(RefCell::new(false));
+        let changed_c = changed.clone();
+        mdl.on_devices_changed = Callback::from(move |_| *changed_c.borrow_mut() = true);
+        mdl.audio_inputs.on_selected = Callback::noop();
+        mdl.video_inputs.on_selected = Callback::noop();
+        mdl.audio_outputs.on_selected = Callback::noop();
+
+        mdl.load();
+        flush().await;
+
+        assert_eq!(mdl.audio_inputs.devices().len(), 1);
+
+        // Simulate plugging in a second microphone
+        let mic2 = create_mock_device("mic-2", MediaDeviceKind::Audioinput, "Mic 2");
+        provider.simulate_device_change(vec![mic1.clone(), mic2.clone()]);
+        flush().await;
+
+        assert!(*changed.borrow(), "on_devices_changed should fire");
+        assert_eq!(mdl.audio_inputs.devices().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Hot-plug: device removed
+    // -----------------------------------------------------------------------
+
+    #[wasm_bindgen_test]
+    async fn test_hot_plug_device_removed() {
+        let mic1 = create_mock_device("mic-1", MediaDeviceKind::Audioinput, "Mic 1");
+        let mic2 = create_mock_device("mic-2", MediaDeviceKind::Audioinput, "Mic 2");
+        let provider = MockMediaDevicesProvider::new(vec![mic1.clone(), mic2.clone()]);
+        let mut mdl = MediaDeviceList::with_provider(provider.clone());
+
+        let changed = Rc::new(RefCell::new(false));
+        let changed_c = changed.clone();
+        mdl.on_devices_changed = Callback::from(move |_| *changed_c.borrow_mut() = true);
+        mdl.audio_inputs.on_selected = Callback::noop();
+        mdl.video_inputs.on_selected = Callback::noop();
+        mdl.audio_outputs.on_selected = Callback::noop();
+
+        mdl.load();
+        flush().await;
+
+        assert_eq!(mdl.audio_inputs.devices().len(), 2);
+
+        // Simulate unplugging mic-2
+        provider.simulate_device_change(vec![mic1.clone()]);
+        flush().await;
+
+        assert!(*changed.borrow(), "on_devices_changed should fire");
+        assert_eq!(mdl.audio_inputs.devices().len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Selected device disappears → falls back to first
+    // -----------------------------------------------------------------------
+
+    #[wasm_bindgen_test]
+    async fn test_selected_device_disappears_falls_back() {
+        let mic1 = create_mock_device("mic-1", MediaDeviceKind::Audioinput, "Mic 1");
+        let mic2 = create_mock_device("mic-2", MediaDeviceKind::Audioinput, "Mic 2");
+        let provider = MockMediaDevicesProvider::new(vec![mic1.clone(), mic2.clone()]);
+        let mut mdl = MediaDeviceList::with_provider(provider.clone());
+
+        let sel = Rc::new(RefCell::new(String::new()));
+        let sel_c = sel.clone();
+        mdl.audio_inputs.on_selected = Callback::from(move |id| *sel_c.borrow_mut() = id);
+        mdl.video_inputs.on_selected = Callback::noop();
+        mdl.audio_outputs.on_selected = Callback::noop();
+
+        mdl.load();
+        flush().await;
+
+        // Select the second mic
+        mdl.audio_inputs.select("mic-2");
+        assert_eq!(*sel.borrow(), "mic-2");
+
+        // Now mic-2 disappears
+        provider.simulate_device_change(vec![mic1.clone()]);
+        flush().await;
+
+        // Should fall back to mic-1
+        assert_eq!(
+            *sel.borrow(),
+            "mic-1",
+            "selection should fall back to first device when selected device disappears"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Selected device persists when unrelated device added
+    // -----------------------------------------------------------------------
+
+    #[wasm_bindgen_test]
+    async fn test_selected_device_persists_through_change() {
+        let mic1 = create_mock_device("mic-1", MediaDeviceKind::Audioinput, "Mic 1");
+        let mic2 = create_mock_device("mic-2", MediaDeviceKind::Audioinput, "Mic 2");
+        let provider = MockMediaDevicesProvider::new(vec![mic1.clone(), mic2.clone()]);
+        let mut mdl = MediaDeviceList::with_provider(provider.clone());
+
+        let sel = Rc::new(RefCell::new(String::new()));
+        let sel_c = sel.clone();
+        mdl.audio_inputs.on_selected = Callback::from(move |id| *sel_c.borrow_mut() = id);
+        mdl.video_inputs.on_selected = Callback::noop();
+        mdl.audio_outputs.on_selected = Callback::noop();
+
+        mdl.load();
+        flush().await;
+
+        mdl.audio_inputs.select("mic-2");
+        assert_eq!(*sel.borrow(), "mic-2");
+
+        // Plug in a third mic — mic-2 should stay selected
+        let mic3 = create_mock_device("mic-3", MediaDeviceKind::Audioinput, "Mic 3");
+        provider.simulate_device_change(vec![mic1, mic2, mic3]);
+        flush().await;
+
+        assert_eq!(
+            mdl.audio_inputs.selected(),
+            "mic-2",
+            "selected device should persist when an unrelated device is added"
+        );
     }
 }

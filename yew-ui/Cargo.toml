@@ -10,7 +10,13 @@ keywords = ["quic", "webtransport", "zoom", "webrtc", "yew"]
 categories = ["network-programming", "multimedia", "web-programming"]
 readme = "../README.md"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "videocall_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "videocall-ui"
+path = "src/main.rs"
 
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
@@ -55,6 +61,27 @@ features = [
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.37"
+wasm-bindgen-futures = { workspace = true }
+gloo-utils = "0.1"
+web-sys = { version = "0.3.72", features = [
+    "HtmlElement",
+    "HtmlButtonElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlOptionElement",
+    "HtmlOptionsCollection",
+    "DomTokenList",
+    "Element",
+    "Node",
+    "NodeList",
+    "Document",
+    "MediaDevices",
+    "MediaDeviceInfo",
+    "MediaDeviceKind",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "Navigator",
+] }
 
 [features]
 default = []

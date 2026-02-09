@@ -64,19 +64,43 @@ Tests are organised into a three-layer pyramid:
 | **2 — Component** | Individual Yew components with mock data | `yew-ui/tests/device_selector.rs`, `yew-ui/tests/video_control_buttons.rs` | `wasm-bindgen-test` (headless Chrome) |
 | **3 — Integration** | Full browser API → component rendering | `yew-ui/tests/device_integration.rs` | `wasm-bindgen-test` (headless Chrome with fake devices) |
 
+## Prerequisites
+
+### Option A: Docker (no local deps)
+
+Just Docker. Run `make yew-tests-docker` and you're done.
+
+### Option B: Native
+
+- **Chrome** — any recent version
+- **chromedriver** — must match your Chrome major version
+  - macOS: `brew install chromedriver`
+  - Linux: `sudo apt-get install chromium-chromedriver`
+  - Or download from https://googlechromelabs.github.io/chrome-for-testing/
+- **wasm-bindgen-cli** — must match the version in `Cargo.lock` (currently
+  `0.2.106`): `cargo install wasm-bindgen-cli --version 0.2.106 --locked`
+- **wasm32-unknown-unknown target**: `rustup target add wasm32-unknown-unknown`
+
 ## Quick start
 
-### Native (requires Chrome + chromedriver)
-
 ```bash
-make yew-tests              # headless
-make yew-tests HEADED=1     # with visible browser window
-```
+# Native — headless
+make yew-tests
 
-### Docker (zero local deps)
+# Native — visible browser (useful for debugging)
+make yew-tests HEADED=1
 
-```bash
+# Docker — zero local deps
 make yew-tests-docker
+
+# Run a single test file
+cd yew-ui && CHROMEDRIVER=$(which chromedriver) \
+  cargo test --target wasm32-unknown-unknown --test device_selector
+
+# Run a single test by name
+cd yew-ui && CHROMEDRIVER=$(which chromedriver) \
+  cargo test --target wasm32-unknown-unknown --test device_selector \
+  -- device_selector_preselects_correct_device
 ```
 
 ## Shared test harness
@@ -108,19 +132,43 @@ make yew-tests-docker
    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
    ```
 
-3. **Write an async test:**
+   The `cfg` guard ensures the test only compiles for the WASM browser target
+   (not native or WASI). The `run_in_browser` macro tells `wasm-bindgen-test`
+   to launch a real browser instead of running in Node.js.
+
+3. **Write a test.** Most components need props, so you'll typically create a
+   thin wrapper component that forwards the data you want to control:
 
    ```rust
    #[wasm_bindgen_test]
-   async fn my_component_renders_correctly() {
+   async fn my_component_shows_label() {
+       // 1. Define a wrapper that passes props to the component under test
+       #[derive(Properties, PartialEq)]
+       struct Props { label: String }
+
+       #[function_component(Wrapper)]
+       fn wrapper(props: &Props) -> Html {
+           html! { <MyComponent label={props.label.clone()} /> }
+       }
+
+       // 2. Mount and render
        let mount = create_mount_point();
-       yew::Renderer::<MyComponent>::with_root(mount.clone()).render();
+       yew::Renderer::<Wrapper>::with_root_and_props(
+           mount.clone(),
+           Props { label: "Hello".into() },
+       ).render();
+
+       // 3. Yield once so Yew's scheduler flushes the first render.
+       //    Duration::ZERO is enough for synchronous components.
+       //    If your component does async work in use_effect, you may need
+       //    sleep(Duration::from_millis(50)).await instead.
        sleep(Duration::ZERO).await;
 
-       // Assert on the rendered DOM
-       let el = mount.query_selector(".my-class").unwrap().unwrap();
-       assert_eq!(el.text_content().unwrap(), "expected text");
+       // 4. Query the DOM and assert
+       let el = mount.query_selector(".my-label").unwrap().unwrap();
+       assert_eq!(el.text_content().unwrap(), "Hello");
 
+       // 5. Clean up so subsequent tests start with a fresh DOM
        cleanup(&mount);
    }
    ```
@@ -145,10 +193,24 @@ have no effect on production builds.
 
 ## Mock vs real devices
 
-- **Mock devices** (`create_mock_device`) are used in Layer 2 component tests
-  where you need precise control over device count, labels, and IDs.
-- **Real fake devices** (`enumerate_fake_devices`) are used in Layer 3
-  integration tests to verify the full pipeline from browser API to rendered UI.
+| Use case | Tool | When to pick it |
+|----------|------|-----------------|
+| Control exact device count, IDs, labels | `create_mock_device` / `mock_mic` / etc. | Component tests — you need 0, 3, or 5 devices, or specific empty labels |
+| Verify the full browser API pipeline | `enumerate_fake_devices` | Integration tests — proving that real `MediaDeviceInfo` objects render correctly |
+
+If your test cares about *what the component does with specific input*, use
+mocks. If it cares about *whether the browser API → component pipeline works
+end-to-end*, use real fake devices.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Error: failed to spawn "" binary` | `CHROMEDRIVER` env var not set or chromedriver not in PATH | Use `make yew-tests` (auto-detects) or set `CHROMEDRIVER=/path/to/chromedriver` |
+| `error: the wasm32-unknown-unknown target is not installed` | Missing WASM target | `rustup target add wasm32-unknown-unknown` |
+| `it looks like the Rust project used to create this wasm file was linked against version of wasm-bindgen that uses a different bindgen format` | `wasm-bindgen-cli` version doesn't match `Cargo.lock` | `cargo install wasm-bindgen-cli --version 0.2.106 --locked` |
+| Test hangs or times out | Component does async work that never resolves | Increase the `sleep` duration or check for missing `.await` in the component |
+| `SessionNotCreated: Could not start a new session` | chromedriver version doesn't match Chrome | Install a chromedriver that matches your Chrome major version |
 
 ## CI
 

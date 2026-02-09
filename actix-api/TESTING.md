@@ -8,6 +8,12 @@ All tests live inside the source files as `#[cfg(test)]` modules — there is no
 separate `tests/` directory. Tests run against real PostgreSQL and NATS
 instances provided by Docker Compose.
 
+## Prerequisites
+
+- **Docker** and **Docker Compose** (v2)
+
+That's it. The test runner, database, and message broker all run in containers.
+
 ## Test inventory
 
 | File | Count | What it covers |
@@ -33,6 +39,18 @@ make tests_down
 make tests_build
 ```
 
+`make tests_run` does two things in sequence: first it brings up the Docker
+Compose stack (`postgres`, `nats`, `rust-tests`), then it runs the `rust-tests`
+service which applies database migrations and executes `cargo test`.
+
+To run a **single test** you can override the command:
+
+```bash
+docker compose -f docker/docker-compose.integration.yaml run --rm rust-tests \
+  bash -c "cd /app/dbmate && dbmate wait && dbmate up && \
+           cd /app/actix-api && cargo test test_meeting_creation -- --nocapture --test-threads=1"
+```
+
 ## Infrastructure
 
 Tests are orchestrated by `docker/docker-compose.integration.yaml`, which
@@ -44,14 +62,14 @@ provides three services:
 | `nats` | `nats:2.10-alpine` | Message broker with JetStream enabled |
 | `rust-tests` | Built from `docker/Dockerfile.actix` | Test runner container |
 
-The `rust-tests` container:
+The `rust-tests` container mounts the repo at `/app` and runs:
 
-1. Mounts the entire repo at `/app`
-2. Runs `dbmate wait && dbmate up` to apply database migrations
-3. Runs `cargo clippy -- -D warnings` (lint check)
-4. Runs `cargo fmt --check` (formatting check)
-5. Runs `cargo machete` (unused dependency check)
-6. Runs `cargo test -p videocall-api -- --nocapture --test-threads=1`
+1. `dbmate wait && dbmate up` — waits for PostgreSQL, applies migrations
+2. `cargo test -p videocall-api -- --nocapture --test-threads=1`
+
+Note: `make tests_run` (from the Makefile) additionally runs `cargo clippy`,
+`cargo fmt --check`, and `cargo machete` before tests. The docker-compose
+command in the yaml file runs only the test step.
 
 Tests execute single-threaded (`--test-threads=1`) because they share a
 database and use `#[serial_test::serial]` to prevent race conditions.
@@ -60,14 +78,19 @@ database and use `#[serial_test::serial]` to prevent race conditions.
 
 ### Database cleanup
 
-Tests that touch the database include cleanup helpers:
+Tests that touch the database clean up at the start and end using a helper like
+this (from `src/webtransport/mod.rs`):
 
 ```rust
-async fn cleanup_room(pool: &PgPool, room: &str) {
-    sqlx::query("DELETE FROM session_participants WHERE meeting_id IN (SELECT id FROM meetings WHERE room_id = $1)")
-        .bind(room).execute(pool).await.ok();
-    sqlx::query("DELETE FROM meetings WHERE room_id = $1")
-        .bind(room).execute(pool).await.ok();
+async fn cleanup_room(pool: &sqlx::PgPool, room_id: &str) {
+    let _ = sqlx::query("DELETE FROM session_participants WHERE room_id = $1")
+        .bind(room_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM meetings WHERE room_id = $1")
+        .bind(room_id)
+        .execute(pool)
+        .await;
 }
 ```
 
@@ -107,6 +130,6 @@ calls `make tests_run` and always tears down with `make tests_down`.
 1. Add a `#[cfg(test)]` module at the bottom of the source file being tested.
 2. Use `#[serial_test::serial]` if the test touches the database or shared
    state.
-3. Create unique room/user IDs to avoid collisions.
+3. Create unique room/user IDs to avoid collisions with other tests.
 4. Clean up database rows at the start and end of the test.
 5. Run `make tests_run` to verify.

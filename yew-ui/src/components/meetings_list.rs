@@ -17,7 +17,7 @@
  */
 
 use crate::constants::app_config;
-use crate::Route;
+use crate::routing::Route;
 use reqwasm::http::{Request, RequestCredentials};
 use serde::Deserialize;
 use wasm_bindgen::JsCast;

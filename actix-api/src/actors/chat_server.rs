@@ -18,7 +18,7 @@
 
 use crate::{
     messages::{
-        server::{ClientMessage, Connect, Disconnect, JoinRoom, Leave},
+        server::{ActivateConnection, ClientMessage, Connect, Disconnect, JoinRoom, Leave},
         session::Message,
     },
     models::build_subject_and_queue,
@@ -34,6 +34,8 @@ use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 use videocall_types::SYSTEM_USER_EMAIL;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
+use protobuf::Message as ProtobufMessage;
 
 use super::session_logic::SessionId;
 
@@ -51,6 +53,7 @@ pub struct ChatServer {
     sessions: HashMap<SessionId, Recipient<Message>>,
     active_subs: HashMap<SessionId, JoinHandle<()>>,
     session_manager: SessionManager,
+    connection_states: HashMap<SessionId, super::session_logic::ConnectionState>,
 }
 
 impl ChatServer {
@@ -60,6 +63,7 @@ impl ChatServer {
             active_subs: HashMap::new(),
             sessions: HashMap::new(),
             session_manager: SessionManager::new(pool),
+            connection_states: HashMap::new(),
         }
     }
 
@@ -130,7 +134,8 @@ impl Handler<Connect> for ChatServer {
 
     fn handle(&mut self, msg: Connect, _ctx: &mut Self::Context) -> Self::Result {
         let Connect { id, addr } = msg;
-        self.sessions.insert(id, addr);
+        self.sessions.insert(id.clone(), addr);
+        self.connection_states.insert(id, super::session_logic::ConnectionState::Testing);
     }
 }
 
@@ -148,6 +153,7 @@ impl Handler<Disconnect> for ChatServer {
     ) -> Self::Result {
         self.leave_rooms(&session, Some(&room), Some(&user_id));
         let _ = self.sessions.remove(&session);
+        let _ = self.connection_states.remove(&session);
     }
 }
 
@@ -167,6 +173,23 @@ impl Handler<Leave> for ChatServer {
     }
 }
 
+impl Handler<ActivateConnection> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: ActivateConnection, _ctx: &mut Self::Context) -> Self::Result {
+        let ActivateConnection { session } = msg;
+        if let Some(state) = self.connection_states.get_mut(&session) {
+            if *state == super::session_logic::ConnectionState::Testing {
+                *state = super::session_logic::ConnectionState::Active;
+                info!("Session {} activated (Testing -> Active)", session);
+            }
+        } else {
+            self.connection_states.insert(session.clone(), super::session_logic::ConnectionState::Active);
+            info!("Session {} activated (state was missing, created as Active)", session);
+        }
+    }
+}
+
 impl Handler<ClientMessage> for ChatServer {
     type Result = ();
 
@@ -178,10 +201,37 @@ impl Handler<ClientMessage> for ChatServer {
             user: _,
         } = msg;
         trace!("got message in server room {room} session {session}");
+        
+        // Check connection state - only publish to NATS if Active
+        let connection_state = self.connection_states.get(&session)
+            .copied()
+            .unwrap_or(super::session_logic::ConnectionState::Testing);
+        
+        if connection_state != super::session_logic::ConnectionState::Active {
+            trace!("Skipping NATS publish for session {} in Testing state", session);
+            return; // Don't publish during Testing state
+        }
+        
         let nc = self.nats_connection.clone();
         let subject = format!("room.{room}.{session}");
         let subject = subject.replace(' ', "_");
-        let b = bytes::Bytes::from(msg.data.to_vec());
+
+        let packet_bytes = if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
+            if packet_wrapper.session_id.is_empty() {
+                packet_wrapper.session_id = session.clone();
+            }
+            match packet_wrapper.write_to_bytes() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("Failed to serialize PacketWrapper with session_id: {}", e);
+                    msg.data.to_vec() 
+                }
+            }
+        } else {
+            msg.data.to_vec()
+        };
+        
+        let b = bytes::Bytes::from(packet_bytes);
         let fut = async move {
             match nc.publish(subject.clone(), b).await {
                 Ok(_) => trace!("published message to {subject}"),
@@ -219,6 +269,7 @@ impl Handler<JoinRoom> for ChatServer {
         let session_manager = self.session_manager.clone();
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
+        let session_id = session.clone();
         let nc = self.nats_connection.clone();
 
         let (subject, queue) = build_subject_and_queue(&room, session.as_str());
@@ -239,18 +290,19 @@ impl Handler<JoinRoom> for ChatServer {
         let handle = tokio::spawn(async move {
             // Start session using SessionManager - await result before subscribing
             match session_manager
-                .start_session(&room_clone, &user_id_clone)
+                .start_session(&room_clone, &user_id_clone, &session_id)
                 .await
             {
                 Ok(result) => {
                     info!(
-                        "Session started for room {} (first: {}) at {} by creator {}",
+                        "Session started for room {} (first: {}) at {} by creator {} (session {})",
                         room_clone,
                         result.is_first_participant,
                         result.start_time_ms,
-                        result.creator_id
+                        result.creator_id,
+                        session_id,
                     );
-                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id)
+                    send_meeting_info(&nc, &room_clone, result.start_time_ms, &result.creator_id, &result.session_id)
                         .await;
                 }
                 Err(e) => {
@@ -317,11 +369,12 @@ async fn send_meeting_info(
     room: &str,
     start_time_ms: u64,
     creator_id: &str,
+    session_id: &str,
 ) {
     // Use SessionManager's packet builder to create a proper MEETING packet with protobuf
     // This ensures WebSocket clients receive the same format as WebTransport clients
     let packet_bytes =
-        SessionManager::build_meeting_started_packet(room, start_time_ms, creator_id);
+        SessionManager::build_meeting_started_packet(room, start_time_ms, creator_id, session_id);
 
     let subject = format!("room.{}.system", room.replace(' ', "_"));
     match nc.publish(subject.clone(), packet_bytes.into()).await {

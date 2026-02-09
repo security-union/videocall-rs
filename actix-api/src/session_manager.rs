@@ -57,6 +57,7 @@ pub struct SessionStartResult {
     pub is_first_participant: bool,
     /// The user_id of the meeting creator/host
     pub creator_id: String,
+    pub session_id: String,
 }
 
 /// Result of ending a session
@@ -93,6 +94,7 @@ impl SessionManager {
         &self,
         room_id: &str,
         user_id: &str,
+        id: &str,
     ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
         // Reject reserved system email (always enforced)
         if user_id == SYSTEM_USER_EMAIL {
@@ -109,6 +111,7 @@ impl SessionManager {
                 start_time_ms: now_ms,
                 is_first_participant: true,
                 creator_id: user_id.to_string(),
+                session_id: id.to_string(),
             });
         }
 
@@ -125,6 +128,7 @@ impl SessionManager {
                     start_time_ms: now_ms,
                     is_first_participant: true,
                     creator_id: user_id.to_string(),
+                    session_id: id.to_string(),
                 });
             }
         };
@@ -138,8 +142,8 @@ impl SessionManager {
         // Get or create meeting
         let (start_time_ms, creator_id) = if is_first_participant {
             info!(
-                "First participant {} joined room {}, starting meeting",
-                user_id, room_id
+                "First participant {} joined room {}, starting meeting with session_id {}",
+                user_id, room_id, id
             );
             let meeting = Meeting::create_async(pool, room_id, Some(user_id)).await?;
             (
@@ -169,6 +173,7 @@ impl SessionManager {
             start_time_ms,
             is_first_participant,
             creator_id,
+            session_id: id.to_string(),
         })
     }
 
@@ -283,18 +288,21 @@ impl SessionManager {
         room_id: &str,
         start_time_ms: u64,
         creator_id: &str,
+        session_id: &str,
     ) -> Vec<u8> {
         let meeting_packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_STARTED.into(),
             room_id: room_id.to_string(),
             start_time_ms,
             creator_id: creator_id.to_string(),
+            session_id: session_id.to_string(),
             ..Default::default()
         };
 
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEETING.into(),
             email: SYSTEM_USER_EMAIL.to_string(),
+            session_id: session_id.to_string(),
             data: meeting_packet.write_to_bytes().unwrap_or_default(),
             ..Default::default()
         };
@@ -386,7 +394,7 @@ mod tests {
         assert_eq!(manager.get_participant_count(room_id).await, 0);
 
         // First user (alice) joins - this should create the meeting
-        let result = manager.start_session(room_id, "alice").await.unwrap();
+        let result = manager.start_session(room_id, "alice", "").await.unwrap();
 
         // Verify participant count is now 1
         assert_eq!(manager.get_participant_count(room_id).await, 1);
@@ -428,12 +436,12 @@ mod tests {
         cleanup_test_room(&pool, room_id).await;
 
         // Alice creates the meeting
-        let alice_result = manager.start_session(room_id, "alice").await.unwrap();
+        let alice_result = manager.start_session(room_id, "alice", "alice-session-1").await.unwrap();
         assert_eq!(manager.get_participant_count(room_id).await, 1);
         assert!(alice_result.is_first_participant);
 
         // Bob joins the existing meeting
-        let bob_result = manager.start_session(room_id, "bob").await.unwrap();
+        let bob_result = manager.start_session(room_id, "bob", "bob-session-2").await.unwrap();
         assert_eq!(manager.get_participant_count(room_id).await, 2);
         assert!(
             !bob_result.is_first_participant,
@@ -441,7 +449,7 @@ mod tests {
         );
 
         // Charlie joins too
-        let charlie_result = manager.start_session(room_id, "charlie").await.unwrap();
+        let charlie_result = manager.start_session(room_id, "charlie", "charlie-session-3").await.unwrap();
         assert_eq!(manager.get_participant_count(room_id).await, 3);
         assert!(
             !charlie_result.is_first_participant,
@@ -479,7 +487,7 @@ mod tests {
         cleanup_test_room(&pool, room_id).await;
 
         // Alice creates the meeting - she should be the creator
-        let alice_result = manager.start_session(room_id, "alice").await.unwrap();
+        let alice_result = manager.start_session(room_id, "alice", "alice-session-1").await.unwrap();
         assert!(alice_result.is_first_participant);
         assert_eq!(
             alice_result.creator_id, "alice",
@@ -487,7 +495,7 @@ mod tests {
         );
 
         // Bob joins - he should get Alice's ID as the creator, NOT his own
-        let bob_result = manager.start_session(room_id, "bob").await.unwrap();
+        let bob_result = manager.start_session(room_id, "bob", "bob-session-2").await.unwrap();
         assert!(!bob_result.is_first_participant);
         assert_eq!(
             bob_result.creator_id, "alice",
@@ -495,7 +503,7 @@ mod tests {
         );
 
         // Charlie joins - he should also get Alice's ID as the creator
-        let charlie_result = manager.start_session(room_id, "charlie").await.unwrap();
+        let charlie_result = manager.start_session(room_id, "charlie", "charlie-session-3").await.unwrap();
         assert!(!charlie_result.is_first_participant);
         assert_eq!(
             charlie_result.creator_id, "alice",
@@ -531,9 +539,9 @@ mod tests {
         cleanup_test_room(&pool, room_id).await;
 
         // Setup: 3 users join
-        let _ = manager.start_session(room_id, "alice").await.unwrap();
-        let _ = manager.start_session(room_id, "bob").await.unwrap();
-        let _ = manager.start_session(room_id, "charlie").await.unwrap();
+        let _ = manager.start_session(room_id, "alice", "alice-session-1").await.unwrap();
+        let _ = manager.start_session(room_id, "bob", "bob-session-2").await.unwrap();
+        let _ = manager.start_session(room_id, "charlie", "charlie-session-3").await.unwrap();
         assert_eq!(manager.get_participant_count(room_id).await, 3);
 
         // Charlie leaves - meeting continues
@@ -589,9 +597,9 @@ mod tests {
         cleanup_test_room(&pool, room_id).await;
 
         // Alice creates and is host
-        let _ = manager.start_session(room_id, "alice").await.unwrap();
-        let _ = manager.start_session(room_id, "bob").await.unwrap();
-        let _ = manager.start_session(room_id, "charlie").await.unwrap();
+        let _ = manager.start_session(room_id, "alice", "alice-session-1").await.unwrap();
+        let _ = manager.start_session(room_id, "bob", "bob-session-2").await.unwrap();
+        let _ = manager.start_session(room_id, "charlie", "charlie-session-3").await.unwrap();
         assert_eq!(manager.get_participant_count(room_id).await, 3);
 
         // Verify alice is host
@@ -633,10 +641,10 @@ mod tests {
         cleanup_test_room(&pool, "room-c-iso").await;
 
         // Users join different rooms
-        let _ = manager.start_session("room-a-iso", "alice").await.unwrap();
-        let _ = manager.start_session("room-b-iso", "bob").await.unwrap();
+        let _ = manager.start_session("room-a-iso", "alice", "alice-session-1").await.unwrap();
+        let _ = manager.start_session("room-b-iso", "bob", "bob-session-2").await.unwrap();
         let _ = manager
-            .start_session("room-a-iso", "charlie")
+            .start_session("room-a-iso", "charlie", "charlie-session-3")
             .await
             .unwrap();
 
@@ -670,7 +678,7 @@ mod tests {
 
         // Test MEETING_STARTED packet
         let meeting_started =
-            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice");
+            SessionManager::build_meeting_started_packet("my-room", 1234567890, "alice", "session-123");
         let wrapper = PacketWrapper::parse_from_bytes(&meeting_started).unwrap();
         assert_eq!(
             wrapper.packet_type,
@@ -706,7 +714,7 @@ mod tests {
         cleanup_test_room(&pool, room_id).await;
 
         // Attempt to join with reserved system email should fail
-        let result = manager.start_session(room_id, SYSTEM_USER_EMAIL).await;
+        let result = manager.start_session(room_id, SYSTEM_USER_EMAIL, "system-session").await;
         assert!(result.is_err(), "Should reject reserved system email");
 
         let err = result.unwrap_err();
@@ -743,7 +751,7 @@ mod tests {
         FeatureFlags::set_meeting_management_override(false);
 
         // start_session should return defaults without touching DB
-        let result = manager.start_session(room_id, "alice").await.unwrap();
+        let result = manager.start_session(room_id, "alice", "alice-session-1").await.unwrap();
 
         // Should return a valid start time (current time)
         assert!(result.start_time_ms > 0, "Should have a start time");
@@ -812,7 +820,7 @@ mod tests {
         FeatureFlags::set_meeting_management_override(true);
 
         // start_session should create DB records
-        let result = manager.start_session(room_id, "alice").await.unwrap();
+        let result = manager.start_session(room_id, "alice", "alice-session-1").await.unwrap();
         assert!(result.is_first_participant);
         assert!(result.start_time_ms > 0);
 
@@ -856,7 +864,7 @@ mod tests {
 
         // First create a meeting with FF on
         FeatureFlags::set_meeting_management_override(true);
-        let _ = manager.start_session(room_id, "alice").await.unwrap();
+        let _ = manager.start_session(room_id, "alice", "alice-session-1").await.unwrap();
         assert!(
             manager.is_host(room_id, "alice").await,
             "Alice should be host"

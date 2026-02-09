@@ -24,7 +24,7 @@
 use crate::actors::chat_server::ChatServer;
 use crate::actors::session_logic::{InboundAction, SessionLogic};
 use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
-use crate::messages::server::{ClientMessage, Leave, Packet};
+use crate::messages::server::{ActivateConnection, ClientMessage, Leave, Packet};
 use crate::messages::session::Message;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
@@ -102,9 +102,10 @@ impl Actor for WsChatSession {
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
         let email = self.logic.email.clone();
+        let session_id = self.logic.id.clone();
 
         ctx.wait(
-            async move { session_manager.start_session(&room, &email).await }
+            async move { session_manager.start_session(&room, &email, &session_id).await }
                 .into_actor(self)
                 .map(|result, act, ctx| match result {
                     Ok(result) => {
@@ -130,6 +131,13 @@ impl Actor for WsChatSession {
 
         // Start heartbeat
         self.start_heartbeat(ctx);
+
+        let addr = self.logic.addr.clone();
+        let session_id = self.logic.id.clone();
+        ctx.run_later(std::time::Duration::from_secs(5), move |_act, _ctx| {
+            let _ = addr.try_send(ActivateConnection { session: session_id.clone() });
+            info!("Auto-activating session {} after 5 seconds", session_id);
+        });
 
         // Register with ChatServer
         let addr = ctx.address();

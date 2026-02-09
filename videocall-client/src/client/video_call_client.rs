@@ -16,12 +16,19 @@
  * conditions.
  */
 
+// Connection types - only available with yew-compat feature (requires yew-websocket/yew-webtransport)
+#[cfg(feature = "yew-compat")]
 use super::super::connection::{ConnectionController, ConnectionManagerOptions, ConnectionState};
 use super::super::decode::{PeerDecodeManager, PeerStatus};
+// Canvas provider imports - only needed for non-yew-compat mode
+#[cfg(not(feature = "yew-compat"))]
+use crate::canvas_provider::{CanvasIdProvider, DirectCanvasIdProvider};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
 use crate::decode::peer_decode_manager::PeerDecodeError;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
+use crate::event_bus::emit_client_event;
+use crate::events::ClientEvent;
 use crate::health_reporter::HealthReporter;
 use anyhow::{anyhow, Result};
 use futures::channel::mpsc::UnboundedSender;
@@ -46,9 +53,19 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
 use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
+
+// Yew callbacks - only available with yew-compat feature
+#[cfg(feature = "yew-compat")]
 use yew::prelude::Callback;
 
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
+///
+/// This struct supports two modes of operation:
+/// 1. **Event Bus Mode** (framework-agnostic): Subscribe to events via `subscribe_client_events()`
+/// 2. **Callback Mode** (Yew-compatible): Use Yew `Callback`s for event handling (requires `yew-compat` feature)
+///
+/// Both modes can be used simultaneously - events are emitted to both the event bus and callbacks.
+#[cfg(feature = "yew-compat")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VideoCallClientOptions {
     /// `true` to use end-to-end encription; `false` to send data unencrypted
@@ -121,6 +138,95 @@ pub struct VideoCallClientOptions {
     pub on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
+/// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
+///
+/// This is the framework-agnostic version without Yew callbacks.
+/// Subscribe to events via `subscribe_client_events()`.
+#[cfg(not(feature = "yew-compat"))]
+#[derive(Clone, Debug)]
+pub struct VideoCallClientOptions {
+    /// `true` to use end-to-end encription; `false` to send data unencrypted
+    pub enable_e2ee: bool,
+
+    /// `true` to use webtransport, `false` to use websocket
+    pub enable_webtransport: bool,
+
+    /// Canvas ID provider for peer video/screen rendering.
+    /// Use `DirectCanvasIdProvider` for default behavior or implement `CanvasIdProvider` trait.
+    pub canvas_id_provider: Rc<dyn CanvasIdProvider>,
+
+    /// The current client's userid.  This userid will appear as this client's `peer_userid` in the
+    /// remote peers' clients.
+    pub userid: String,
+
+    /// The meeting ID that this client is joining
+    pub meeting_id: String,
+
+    /// The urls to which WebSocket connections should be made (comma-separated)
+    pub websocket_urls: Vec<String>,
+
+    /// The urls to which WebTransport connections should be made (comma-separated)
+    pub webtransport_urls: Vec<String>,
+
+    /// `true` to enable diagnostics collection; `false` to disable
+    pub enable_diagnostics: bool,
+
+    /// How often to send diagnostics updates in milliseconds (default: 1000)
+    pub diagnostics_update_interval_ms: Option<u64>,
+
+    /// `true` to enable health reporting to server; `false` to disable
+    pub enable_health_reporting: bool,
+
+    /// How often to send health packets in milliseconds (default: 5000)
+    pub health_reporting_interval_ms: Option<u64>,
+
+    /// RTT testing period in milliseconds (default: 3000ms)
+    pub rtt_testing_period_ms: u64,
+
+    /// Interval between RTT probes in milliseconds (default: 200ms)
+    pub rtt_probe_interval_ms: Option<u64>,
+}
+
+#[cfg(not(feature = "yew-compat"))]
+impl PartialEq for VideoCallClientOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.enable_e2ee == other.enable_e2ee
+            && self.enable_webtransport == other.enable_webtransport
+            && self.userid == other.userid
+            && self.meeting_id == other.meeting_id
+            && self.websocket_urls == other.websocket_urls
+            && self.webtransport_urls == other.webtransport_urls
+            && self.enable_diagnostics == other.enable_diagnostics
+            && self.diagnostics_update_interval_ms == other.diagnostics_update_interval_ms
+            && self.enable_health_reporting == other.enable_health_reporting
+            && self.health_reporting_interval_ms == other.health_reporting_interval_ms
+            && self.rtt_testing_period_ms == other.rtt_testing_period_ms
+            && self.rtt_probe_interval_ms == other.rtt_probe_interval_ms
+    }
+}
+
+#[cfg(not(feature = "yew-compat"))]
+impl Default for VideoCallClientOptions {
+    fn default() -> Self {
+        Self {
+            enable_e2ee: false,
+            enable_webtransport: true,
+            canvas_id_provider: Rc::new(DirectCanvasIdProvider),
+            userid: String::new(),
+            meeting_id: String::new(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            enable_diagnostics: true,
+            diagnostics_update_interval_ms: Some(1000),
+            enable_health_reporting: true,
+            health_reporting_interval_ms: Some(5000),
+            rtt_testing_period_ms: 3000,
+            rtt_probe_interval_ms: Some(200),
+        }
+    }
+}
+
+#[cfg(feature = "yew-compat")]
 #[derive(Debug)]
 struct InnerOptions {
     enable_e2ee: bool,
@@ -130,11 +236,32 @@ struct InnerOptions {
     on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
+#[cfg(not(feature = "yew-compat"))]
+#[derive(Debug)]
+struct InnerOptions {
+    enable_e2ee: bool,
+    userid: String,
+}
+
+#[cfg(feature = "yew-compat")]
 #[derive(Debug)]
 struct Inner {
     options: InnerOptions,
     connection_controller: Option<ConnectionController>,
     connection_state: ConnectionState,
+    aes: Rc<Aes128State>,
+    rsa: Rc<RsaWrapper>,
+    peer_decode_manager: PeerDecodeManager,
+    _diagnostics: Option<Rc<DiagnosticManager>>,
+    sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
+    health_reporter: Option<Rc<RefCell<HealthReporter>>>,
+}
+
+// Non-yew-compat Inner struct - connection functionality is not available
+#[cfg(not(feature = "yew-compat"))]
+#[derive(Debug)]
+struct Inner {
+    options: InnerOptions,
     aes: Rc<Aes128State>,
     rsa: Rc<RsaWrapper>,
     peer_decode_manager: PeerDecodeManager,
@@ -168,6 +295,7 @@ impl VideoCallClient {
     ///
     /// See [VideoCallClientOptions] for description of the options.
     ///
+    #[cfg(feature = "yew-compat")]
     pub fn new(options: VideoCallClientOptions) -> Self {
         let aes = Rc::new(Aes128State::new(options.enable_e2ee));
 
@@ -289,20 +417,116 @@ impl VideoCallClient {
         client
     }
 
-    /// Initiates a connection to a videocall server with RTT testing.
+    /// Constructor for the client struct (framework-agnostic version).
     ///
-    /// Tests all provided servers by measuring round-trip time (RTT) and connects to the server
-    /// with the lowest average RTT. The testing period and probe interval can be configured
-    /// via the options.
+    /// See [VideoCallClientOptions] for description of the options.
+    /// Subscribe to events via `subscribe_client_events()`.
+    ///
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn new(options: VideoCallClientOptions) -> Self {
+        let aes = Rc::new(Aes128State::new(options.enable_e2ee));
+
+        // Create diagnostics manager if enabled
+        let diagnostics = if options.enable_diagnostics {
+            let diagnostics = Rc::new(DiagnosticManager::new(options.userid.clone()));
+
+            // Set update interval if provided
+            if let Some(interval) = options.diagnostics_update_interval_ms {
+                let mut diag = DiagnosticManager::new(options.userid.clone());
+                diag.set_reporting_interval(interval);
+                let diagnostics = Rc::new(diag);
+
+                Some(diagnostics)
+            } else {
+                Some(diagnostics)
+            }
+        } else {
+            None
+        };
+
+        // Create sender diagnostics manager if diagnostics are enabled
+        let sender_diagnostics = if options.enable_diagnostics {
+            let sender_diagnostics = Rc::new(SenderDiagnosticManager::new(options.userid.clone()));
+
+            // Set update interval if provided
+            if let Some(interval) = options.diagnostics_update_interval_ms {
+                sender_diagnostics.set_reporting_interval(interval);
+            }
+
+            Some(sender_diagnostics)
+        } else {
+            None
+        };
+
+        // Create health reporter if enabled
+        let health_reporter = if options.enable_health_reporting {
+            let session_id = format!(
+                "session_{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            );
+
+            let mut reporter = HealthReporter::new(
+                session_id,
+                options.userid.clone(),
+                options.health_reporting_interval_ms.unwrap_or(5000),
+            );
+
+            // Set the meeting ID
+            reporter.set_meeting_id(options.meeting_id.clone());
+
+            // Set health reporting interval if provided
+            if let Some(interval) = options.health_reporting_interval_ms {
+                reporter.set_health_interval(interval);
+            }
+
+            Some(Rc::new(RefCell::new(reporter)))
+        } else {
+            None
+        };
+
+        let client = Self {
+            options: options.clone(),
+            inner: Rc::new(RefCell::new(Inner {
+                options: InnerOptions {
+                    enable_e2ee: options.enable_e2ee,
+                    userid: options.userid.clone(),
+                },
+                aes: aes.clone(),
+                rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
+                peer_decode_manager: Self::create_peer_decoder_manager(
+                    &options,
+                    diagnostics.clone(),
+                ),
+                _diagnostics: diagnostics.clone(),
+                sender_diagnostics: sender_diagnostics.clone(),
+                health_reporter: health_reporter.clone(),
+            })),
+            aes,
+            _diagnostics: diagnostics.clone(),
+        };
+
+        // Note: In non-yew-compat mode, we don't set up packet forwarding since
+        // send_packet is a no-op (connection functionality requires yew-compat feature).
+        // Diagnostics are still collected and can be accessed via the event bus.
+
+        client
+    }
+
+    /// Initiates a connection to a videocall server with RTT testing (not available without yew-compat).
+    ///
+    /// Returns an error since WebSocket/WebTransport support requires the yew-compat feature.
     ///
     /// Note that this method's success means only that it succesfully *attempted* initiation of the
     /// connection.  The connection cannot actually be considered to have been succesful until the
-    /// [`options.on_connected`](VideoCallClientOptions::on_connected) callback has been invoked.
+    /// `ClientEvent::Connected` event is emitted (or `options.on_connected` callback is invoked
+    /// when using yew-compat feature).
     ///
-    /// If the connection does not succeed, the
-    /// [`options.on_connection_lost`](VideoCallClientOptions::on_connection_lost) callback will be
-    /// invoked.
+    /// If the connection does not succeed, the `ClientEvent::ConnectionLost` event will be emitted.
     ///
+    #[cfg(feature = "yew-compat")]
     pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
         let websocket_count = self.options.websocket_urls.len();
         let webtransport_count = if self.options.enable_webtransport {
@@ -358,10 +582,16 @@ impl VideoCallClient {
 
                     match state {
                         ConnectionState::Connected { .. } => {
+                            // Emit to event bus
+                            emit_client_event(ClientEvent::Connected);
+                            // Call Yew callback
                             on_connected.emit(());
                         }
-                        ConnectionState::Failed { error, .. } => {
-                            on_connection_lost.emit(JsValue::from_str(&error));
+                        ConnectionState::Failed { ref error, .. } => {
+                            // Emit to event bus
+                            emit_client_event(ClientEvent::ConnectionLost(error.clone()));
+                            // Call Yew callback
+                            on_connection_lost.emit(JsValue::from_str(error));
                         }
                         _ => {
                             // Other states don't trigger callbacks
@@ -399,6 +629,24 @@ impl VideoCallClient {
         Ok(())
     }
 
+    /// Initiates a connection to a videocall server with RTT testing (framework-agnostic version).
+    ///
+    /// **Note**: Connection functionality requires the `yew-compat` feature since it depends on
+    /// yew-websocket and yew-webtransport. Without this feature, this method returns an error.
+    ///
+    /// To use connection functionality, enable the `yew-compat` feature in your Cargo.toml:
+    /// ```toml
+    /// videocall-client = { version = "...", features = ["yew-compat"] }
+    /// ```
+    ///
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn connect_with_rtt_testing(&mut self) -> anyhow::Result<()> {
+        Err(anyhow!(
+            "Connection functionality requires the 'yew-compat' feature. \
+             Enable it in Cargo.toml: videocall-client = {{ features = [\"yew-compat\"] }}"
+        ))
+    }
+
     /// Initiates a connection to a videocall server with automatic RTT-based server selection.
     ///
     /// This method automatically tests all provided servers and connects to the one with the lowest RTT.
@@ -418,6 +666,7 @@ impl VideoCallClient {
         self.connect_with_rtt_testing()
     }
 
+    #[cfg(feature = "yew-compat")]
     fn create_peer_decoder_manager(
         opts: &VideoCallClientOptions,
         diagnostics: Option<Rc<DiagnosticManager>>,
@@ -446,6 +695,24 @@ impl VideoCallClient {
         }
     }
 
+    #[cfg(not(feature = "yew-compat"))]
+    fn create_peer_decoder_manager(
+        opts: &VideoCallClientOptions,
+        diagnostics: Option<Rc<DiagnosticManager>>,
+    ) -> PeerDecodeManager {
+        let canvas_provider = opts.canvas_id_provider.clone();
+        match diagnostics {
+            Some(diagnostics) => {
+                PeerDecodeManager::new_with_canvas_provider_and_diagnostics(
+                    canvas_provider,
+                    diagnostics,
+                )
+            }
+            None => PeerDecodeManager::new_with_canvas_provider(canvas_provider),
+        }
+    }
+
+    #[cfg(feature = "yew-compat")]
     pub(crate) fn send_packet(&self, media: PacketWrapper) {
         let packet_type = media.packet_type.enum_value();
         match self.inner.try_borrow() {
@@ -464,7 +731,14 @@ impl VideoCallClient {
         }
     }
 
+    #[cfg(not(feature = "yew-compat"))]
+    pub(crate) fn send_packet(&self, media: PacketWrapper) {
+        let packet_type = media.packet_type.enum_value();
+        debug!("send_packet called in non-yew-compat mode for {packet_type:?} - packet dropped (no connection support)");
+    }
+
     /// Returns `true` if the client is currently connected to a server.
+    #[cfg(feature = "yew-compat")]
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -474,15 +748,17 @@ impl VideoCallClient {
         false
     }
 
+    /// Returns `true` if the client is currently connected to a server.
+    /// Note: Without yew-compat feature, connection is not supported.
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn is_connected(&self) -> bool {
+        false
+    }
+
     /// Disconnect from the current server.
+    #[cfg(feature = "yew-compat")]
     pub fn disconnect(&self) -> anyhow::Result<()> {
         if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            // if let Some(health_reporter) = &inner.health_reporter {
-            //     if let Ok(reporter) = health_reporter.try_borrow_mut() {
-            //         reporter.stop_health_reporting();
-            //     }
-            // }
-
             if let Some(connection_controller) = &mut inner.connection_controller {
                 let _ = connection_controller.disconnect();
             }
@@ -496,6 +772,13 @@ impl VideoCallClient {
         } else {
             Err(anyhow::anyhow!("Unable to borrow inner"))
         }
+    }
+
+    /// Disconnect from the current server.
+    /// Note: Without yew-compat feature, connection is not supported.
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn disconnect(&self) -> anyhow::Result<()> {
+        Ok(()) // No-op in non-yew-compat mode
     }
 
     /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.
@@ -559,6 +842,7 @@ impl VideoCallClient {
     }
 
     /// Get current connection state from ConnectionController
+    #[cfg(feature = "yew-compat")]
     pub fn get_connection_state(&self) -> Option<ConnectionState> {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -569,6 +853,7 @@ impl VideoCallClient {
     }
 
     /// Get RTT measurements from ConnectionController (for debugging)
+    #[cfg(feature = "yew-compat")]
     pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -585,7 +870,14 @@ impl VideoCallClient {
         None
     }
 
+    /// Get RTT measurements (not available without yew-compat feature)
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn get_rtt_measurements(&self) -> Option<HashMap<String, f64>> {
+        None
+    }
+
     /// Send RTT probes manually (for testing)
+    #[cfg(feature = "yew-compat")]
     pub fn send_rtt_probes(&self) -> anyhow::Result<()> {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(_connection_controller) = &inner.connection_controller {
@@ -596,13 +888,26 @@ impl VideoCallClient {
         Err(anyhow!("No connection controller available"))
     }
 
+    /// Send RTT probes (not available without yew-compat feature)
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn send_rtt_probes(&self) -> anyhow::Result<()> {
+        Err(anyhow!("RTT probes require the 'yew-compat' feature"))
+    }
+
     /// Check and complete election if testing period is over
+    #[cfg(feature = "yew-compat")]
     pub fn check_election_completion(&self) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(_connection_controller) = &inner.connection_controller {
                 // Election completion is now handled automatically by ConnectionController timers
             }
         }
+    }
+
+    /// Check and complete election (no-op without yew-compat feature)
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn check_election_completion(&self) {
+        // No-op in non-yew-compat mode
     }
 
     /// Get diagnostics information for all peers
@@ -719,6 +1024,7 @@ impl VideoCallClient {
         }
     }
 
+    #[cfg(feature = "yew-compat")]
     pub fn set_video_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -740,6 +1046,19 @@ impl VideoCallClient {
         }
     }
 
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn set_video_enabled(&self, enabled: bool) {
+        debug!("set_video_enabled({enabled}) called in non-yew-compat mode - no-op");
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(hrb) = hr.try_borrow() {
+                    hrb.set_reporting_video_enabled(enabled);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "yew-compat")]
     pub fn set_audio_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -761,6 +1080,19 @@ impl VideoCallClient {
         }
     }
 
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        debug!("set_audio_enabled({enabled}) called in non-yew-compat mode - no-op");
+        if let Ok(inner) = self.inner.try_borrow() {
+            if let Some(hr) = &inner.health_reporter {
+                if let Ok(hrb) = hr.try_borrow() {
+                    hrb.set_reporting_audio_enabled(enabled);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "yew-compat")]
     pub fn set_screen_enabled(&self, enabled: bool) {
         if let Ok(inner) = self.inner.try_borrow() {
             if let Some(connection_controller) = &inner.connection_controller {
@@ -775,6 +1107,11 @@ impl VideoCallClient {
         } else {
             error!("Unable to borrow inner for set_screen_enabled({enabled})");
         }
+    }
+
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn set_screen_enabled(&self, _enabled: bool) {
+        debug!("set_screen_enabled called in non-yew-compat mode - no-op");
     }
 
     /// Updates the speaker device for all connected peers
@@ -797,6 +1134,7 @@ impl VideoCallClient {
 }
 
 impl Inner {
+    #[cfg(feature = "yew-compat")]
     fn on_inbound_media(&mut self, response: PacketWrapper) {
         debug!(
             "<< Received {:?} from {}",
@@ -932,8 +1270,12 @@ impl Inner {
                                     meeting_packet.start_time_ms,
                                     meeting_packet.creator_id
                                 );
+                                let start_time = meeting_packet.start_time_ms as f64;
+                                // Emit to event bus
+                                emit_client_event(ClientEvent::MeetingInfo(start_time));
+                                // Call Yew callback
                                 if let Some(callback) = &self.options.on_meeting_info {
-                                    callback.emit(meeting_packet.start_time_ms as f64);
+                                    callback.emit(start_time);
                                 }
                             }
                             Ok(MeetingEventType::MEETING_ENDED) => {
@@ -941,12 +1283,19 @@ impl Inner {
                                     "Received MEETING_ENDED: room={}, message={}",
                                     meeting_packet.room_id, meeting_packet.message
                                 );
+                                let end_time_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as f64)
+                                    .unwrap_or(0.0);
+                                let message = meeting_packet.message.clone();
+                                // Emit to event bus
+                                emit_client_event(ClientEvent::MeetingEnded {
+                                    end_time_ms,
+                                    message: message.clone(),
+                                });
+                                // Call Yew callback
                                 if let Some(callback) = &self.options.on_meeting_ended {
-                                    let end_time_ms = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as f64)
-                                        .unwrap_or(0.0);
-                                    callback.emit((end_time_ms, meeting_packet.message));
+                                    callback.emit((end_time_ms, message));
                                 }
                             }
                             Ok(MeetingEventType::PARTICIPANT_JOINED) => {
@@ -991,7 +1340,189 @@ impl Inner {
         }
         if let PeerStatus::Added(peer_userid) = peer_status {
             if peer_userid != self.options.userid {
+                // Emit to event bus
+                emit_client_event(ClientEvent::PeerAdded(peer_userid.clone()));
+                // Call Yew callback
                 self.options.on_peer_added.emit(peer_userid);
+                self.send_public_key();
+            } else {
+                log::debug!("Rejecting packet from same user: {peer_userid}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "yew-compat"))]
+    fn on_inbound_media(&mut self, response: PacketWrapper) {
+        debug!(
+            "<< Received {:?} from {}",
+            response.packet_type.enum_value(),
+            response.email
+        );
+        // Skip creating peers for system messages (meeting info, meeting started/ended)
+        let peer_status = if response.email == SYSTEM_USER_EMAIL {
+            PeerStatus::NoChange
+        } else {
+            self.peer_decode_manager.ensure_peer(&response.email)
+        };
+        match response.packet_type.enum_value() {
+            Ok(PacketType::AES_KEY) => {
+                if !self.options.enable_e2ee {
+                    return;
+                }
+                if let Ok(bytes) = self.rsa.decrypt(&response.data) {
+                    debug!("Decrypted AES_KEY from {}", response.email);
+                    match AesPacket::parse_from_bytes(&bytes) {
+                        Ok(aes_packet) => {
+                            if let Err(e) = self.peer_decode_manager.set_peer_aes(
+                                &response.email,
+                                Aes128State::from_vecs(
+                                    aes_packet.key,
+                                    aes_packet.iv,
+                                    self.options.enable_e2ee,
+                                ),
+                            ) {
+                                error!("Failed to set peer aes: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to parse aes packet: {e}");
+                        }
+                    }
+                }
+            }
+            Ok(PacketType::RSA_PUB_KEY) => {
+                if !self.options.enable_e2ee {
+                    return;
+                }
+                let encrypted_aes_packet = parse_rsa_packet(&response.data)
+                    .and_then(parse_public_key)
+                    .and_then(|pub_key| {
+                        self.serialize_aes_packet()
+                            .map(|aes_packet| (aes_packet, pub_key))
+                    })
+                    .and_then(|(aes_packet, pub_key)| {
+                        self.encrypt_aes_packet(&aes_packet, &pub_key)
+                    });
+
+                match encrypted_aes_packet {
+                    Ok(_data) => {
+                        debug!(">> {} would send AES key (no connection in non-yew-compat mode)", self.options.userid);
+                        // Note: Cannot send packets without yew-compat feature
+                    }
+                    Err(e) => {
+                        error!("Failed to prepare AES_KEY for peer: {e}");
+                    }
+                }
+            }
+            Ok(PacketType::MEDIA) => {
+                let email = response.email.clone();
+
+                if let Err(e) = self
+                    .peer_decode_manager
+                    .decode(response, &self.options.userid)
+                {
+                    error!("error decoding packet: {e}");
+                    match e {
+                        PeerDecodeError::SameUserPacket(email) => {
+                            debug!("Rejecting packet from same user: {email}");
+                        }
+                        _ => {
+                            self.peer_decode_manager.delete_peer(&email);
+                        }
+                    }
+                }
+            }
+            Ok(PacketType::CONNECTION) => {
+                let data_str = String::from_utf8_lossy(&response.data);
+                debug!("Received CONNECTION packet: {data_str}");
+            }
+            Ok(PacketType::DIAGNOSTICS) => {
+                if let Ok(diagnostics_packet) = DiagnosticsPacket::parse_from_bytes(&response.data)
+                {
+                    debug!("Received diagnostics packet: {diagnostics_packet:?}");
+                    if let Some(sender_diagnostics) = &self.sender_diagnostics {
+                        sender_diagnostics.handle_diagnostic_packet(diagnostics_packet);
+                    }
+                } else {
+                    error!("Failed to parse diagnostics packet");
+                }
+            }
+            Ok(PacketType::HEALTH) => {
+                debug!(
+                    "Received unexpected health packet from {}, ignoring",
+                    response.email
+                );
+            }
+            Ok(PacketType::MEETING) => {
+                match MeetingPacket::parse_from_bytes(&response.data) {
+                    Ok(meeting_packet) => {
+                        match meeting_packet.event_type.enum_value() {
+                            Ok(MeetingEventType::MEETING_STARTED) => {
+                                info!(
+                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
+                                    meeting_packet.room_id,
+                                    meeting_packet.start_time_ms,
+                                    meeting_packet.creator_id
+                                );
+                                emit_client_event(ClientEvent::MeetingInfo(
+                                    meeting_packet.start_time_ms as f64,
+                                ));
+                            }
+                            Ok(MeetingEventType::MEETING_ENDED) => {
+                                info!(
+                                    "Received MEETING_ENDED: room={}, message={}",
+                                    meeting_packet.room_id, meeting_packet.message
+                                );
+                                let end_time_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as f64)
+                                    .unwrap_or(0.0);
+                                emit_client_event(ClientEvent::MeetingEnded {
+                                    end_time_ms,
+                                    message: meeting_packet.message,
+                                });
+                            }
+                            Ok(MeetingEventType::PARTICIPANT_JOINED) => {
+                                info!(
+                                    "Received PARTICIPANT_JOINED: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
+                                );
+                            }
+                            Ok(MeetingEventType::PARTICIPANT_LEFT) => {
+                                info!(
+                                    "Received PARTICIPANT_LEFT: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
+                                );
+                            }
+                            Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
+                                error!(
+                                    "Received meeting packet with unknown event type: room={}",
+                                    meeting_packet.room_id
+                                );
+                            }
+                            Err(e) => {
+                                error!("Failed to parse MeetingEventType: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse MeetingPacket: {e}");
+                    }
+                }
+            }
+            Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
+                error!(
+                    "Received packet with unknown packet type from {}",
+                    response.email
+                );
+            }
+            Err(e) => {
+                error!("Failed to parse packet type: {e}");
+            }
+        }
+        if let PeerStatus::Added(peer_userid) = peer_status {
+            if peer_userid != self.options.userid {
+                emit_client_event(ClientEvent::PeerAdded(peer_userid));
                 self.send_public_key();
             } else {
                 log::debug!("Rejecting packet from same user: {peer_userid}");
@@ -1013,24 +1544,9 @@ impl Inner {
                     ..Default::default()
                 };
                 match packet.write_to_bytes() {
-                    Ok(data) => {
-                        debug!(">> {userid} sending public key");
-
-                        // Send RSA public key packet via ConnectionController
-                        if let Some(connection_controller) = &self.connection_controller {
-                            let packet = PacketWrapper {
-                                packet_type: PacketType::RSA_PUB_KEY.into(),
-                                email: userid,
-                                data,
-                                ..Default::default()
-                            };
-
-                            if let Err(e) = connection_controller.send_packet(packet) {
-                                error!("Failed to send RSA public key packet: {e}");
-                            }
-                        } else {
-                            error!("No connection controller available for RSA public key");
-                        }
+                    Ok(_data) => {
+                        debug!(">> {userid} would send public key (no connection in non-yew-compat mode)");
+                        // Note: Cannot send packets without yew-compat feature
                     }
                     Err(e) => {
                         error!("Failed to serialize rsa packet: {e}");

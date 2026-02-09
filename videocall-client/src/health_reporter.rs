@@ -22,6 +22,9 @@ use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+// Arc is used for framework-agnostic closures
+#[cfg(not(feature = "yew-compat"))]
+use std::sync::Arc;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use videocall_types::protos::health_packet::{
     HealthPacket as PbHealthPacket, NetEqNetwork as PbNetEqNetwork,
@@ -32,6 +35,9 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen_futures::spawn_local;
 use web_time::{SystemTime, UNIX_EPOCH};
+
+// Yew callbacks - only available with yew-compat feature
+#[cfg(feature = "yew-compat")]
 use yew::prelude::Callback;
 
 /// Health data cached for a specific peer
@@ -87,19 +93,33 @@ impl PeerHealthData {
 }
 
 /// Health reporter that collects diagnostics and sends health packets
-#[derive(Debug)]
 pub struct HealthReporter {
     session_id: String,
     meeting_id: String, // Add meeting_id field
     reporting_peer: String,
     peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>>,
+    #[cfg(feature = "yew-compat")]
     send_packet_callback: Option<Callback<PacketWrapper>>,
+    /// Framework-agnostic packet sender function
+    #[cfg(not(feature = "yew-compat"))]
+    send_packet_fn: Option<Rc<dyn Fn(PacketWrapper)>>,
     health_interval_ms: u64,
     reporting_audio_enabled: Rc<RefCell<bool>>,
     reporting_video_enabled: Rc<RefCell<bool>>,
     active_server_url: Rc<RefCell<Option<String>>>,
     active_server_type: Rc<RefCell<Option<String>>>,
     active_server_rtt_ms: Rc<RefCell<Option<f64>>>,
+}
+
+impl std::fmt::Debug for HealthReporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HealthReporter")
+            .field("session_id", &self.session_id)
+            .field("meeting_id", &self.meeting_id)
+            .field("reporting_peer", &self.reporting_peer)
+            .field("health_interval_ms", &self.health_interval_ms)
+            .finish()
+    }
 }
 
 impl HealthReporter {
@@ -110,7 +130,10 @@ impl HealthReporter {
             meeting_id: "".to_string(), // Will be set later
             reporting_peer,
             peer_health_data: Rc::new(RefCell::new(HashMap::new())),
+            #[cfg(feature = "yew-compat")]
             send_packet_callback: None,
+            #[cfg(not(feature = "yew-compat"))]
+            send_packet_fn: None,
             health_interval_ms,
             reporting_audio_enabled: Rc::new(RefCell::new(false)),
             reporting_video_enabled: Rc::new(RefCell::new(false)),
@@ -139,9 +162,16 @@ impl HealthReporter {
         }
     }
 
-    /// Set the callback for sending packets
+    /// Set the callback for sending packets (Yew-compat only)
+    #[cfg(feature = "yew-compat")]
     pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>) {
         self.send_packet_callback = Some(callback);
+    }
+
+    /// Set the function for sending packets (framework-agnostic)
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn set_send_packet_fn(&mut self, send_fn: Box<dyn Fn(PacketWrapper)>) {
+        self.send_packet_fn = Some(Rc::from(send_fn));
     }
 
     /// Set health reporting interval
@@ -424,7 +454,8 @@ impl HealthReporter {
         }
     }
 
-    /// Start periodic health reporting
+    /// Start periodic health reporting (Yew-compat version)
+    #[cfg(feature = "yew-compat")]
     pub fn start_health_reporting(&self) {
         if self.send_packet_callback.is_none() {
             warn!("Cannot start health reporting: no send packet callback set");
@@ -479,6 +510,73 @@ impl HealthReporter {
 
                         if let Some(packet) = health_packet {
                             send_callback.emit(packet);
+                            debug!("Sent health packet for session: {session_id}");
+                        }
+                    }
+                } else {
+                    debug!("HealthReporter dropped, stopping health reporting");
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Start periodic health reporting (framework-agnostic version)
+    #[cfg(not(feature = "yew-compat"))]
+    pub fn start_health_reporting(&self) {
+        if self.send_packet_fn.is_none() {
+            warn!("Cannot start health reporting: no send packet function set");
+            return;
+        }
+
+        let peer_health_data = Rc::downgrade(&self.peer_health_data);
+        let session_id = self.session_id.clone();
+        let meeting_id = self.meeting_id.clone();
+        let reporting_peer = self.reporting_peer.clone();
+        let send_fn = self.send_packet_fn.clone().unwrap();
+        let interval_ms = self.health_interval_ms;
+        let audio_enabled = Rc::downgrade(&self.reporting_audio_enabled);
+        let video_enabled = Rc::downgrade(&self.reporting_video_enabled);
+        let active_server_url = Rc::downgrade(&self.active_server_url);
+        let active_server_type = Rc::downgrade(&self.active_server_type);
+        let active_server_rtt_ms = Rc::downgrade(&self.active_server_rtt_ms);
+
+        spawn_local(async move {
+            debug!("Started health reporting with interval: {interval_ms}ms");
+
+            loop {
+                // Wait for the interval
+                gloo_timers::future::TimeoutFuture::new(interval_ms as u32).await;
+
+                if let Some(peer_health_data) = Weak::upgrade(&peer_health_data) {
+                    if let Ok(health_map) = peer_health_data.try_borrow() {
+                        let self_audio_enabled = Weak::upgrade(&audio_enabled)
+                            .and_then(|ae| ae.try_borrow().ok().map(|v| *v))
+                            .unwrap_or(false);
+                        let self_video_enabled = Weak::upgrade(&video_enabled)
+                            .and_then(|ve| ve.try_borrow().ok().map(|v| *v))
+                            .unwrap_or(false);
+                        // Snapshot active connection info for this tick
+                        let active_url = Weak::upgrade(&active_server_url)
+                            .and_then(|rc| rc.try_borrow().ok().and_then(|v| v.clone()));
+                        let active_type = Weak::upgrade(&active_server_type)
+                            .and_then(|rc| rc.try_borrow().ok().and_then(|v| v.clone()));
+                        let active_rtt = Weak::upgrade(&active_server_rtt_ms)
+                            .and_then(|rc| rc.try_borrow().ok().and_then(|v| *v));
+                        let health_packet = Self::create_health_packet(
+                            &session_id,
+                            &meeting_id,
+                            &reporting_peer,
+                            &health_map,
+                            self_audio_enabled,
+                            self_video_enabled,
+                            active_url,
+                            active_type,
+                            active_rtt,
+                        );
+
+                        if let Some(packet) = health_packet {
+                            send_fn(packet);
                             debug!("Sent health packet for session: {session_id}");
                         }
                     }

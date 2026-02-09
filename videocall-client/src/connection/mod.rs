@@ -16,15 +16,25 @@
  * conditions.
  */
 
+mod webmedia;
+
+// Yew-compat feature gates all connection-related modules that depend on yew-websocket/yew-webtransport
+#[cfg(feature = "yew-compat")]
 #[allow(clippy::module_inception)]
 mod connection;
+#[cfg(feature = "yew-compat")]
 mod connection_controller;
+#[cfg(feature = "yew-compat")]
 mod connection_manager;
+#[cfg(feature = "yew-compat")]
 mod task;
-mod webmedia;
+#[cfg(feature = "yew-compat")]
 mod websocket;
+#[cfg(feature = "yew-compat")]
 mod webtransport;
 
+#[cfg(feature = "yew-compat")]
 pub use connection_controller::ConnectionController;
+#[cfg(feature = "yew-compat")]
 pub use connection_manager::{ConnectionManagerOptions, ConnectionState};
 pub use webmedia::ConnectOptions;

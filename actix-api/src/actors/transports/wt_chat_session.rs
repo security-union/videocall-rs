@@ -185,9 +185,10 @@ impl Actor for WtChatSession {
         let session_manager = self.logic.session_manager.clone();
         let room = self.logic.room.clone();
         let email = self.logic.email.clone();
+        let session_id = self.logic.id.clone();
 
         ctx.wait(
-            async move { session_manager.start_session(&room, &email).await }
+            async move { session_manager.start_session(&room, &email, &session_id).await }
                 .into_actor(self)
                 .map(|result, act, ctx| match result {
                     Ok(result) => {
@@ -209,6 +210,13 @@ impl Actor for WtChatSession {
 
         // Start heartbeat
         self.start_heartbeat(ctx);
+
+       let addr = self.logic.addr.clone();
+        let session_id = self.logic.id.clone();
+        ctx.run_later(std::time::Duration::from_secs(5), move |_act, _ctx| {
+            let _ = addr.try_send(crate::messages::server::ActivateConnection { session: session_id.clone() });
+            info!("Auto-activating session {} after 5 seconds", session_id);
+        });
 
         // Register with ChatServer
         let addr = ctx.address();

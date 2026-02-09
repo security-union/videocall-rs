@@ -269,9 +269,9 @@ impl ConnectionManager {
             // Handle RTT responses internally
             if packet.email == userid {
                 let reception_time = js_sys::Date::now();
-                if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
-                    if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
-                        if media_packet.media_type == MediaType::RTT.into() {
+            if let Ok(decrypted_data) = aes.decrypt(&packet.data) {
+                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&decrypted_data) {
+                    if media_packet.media_type == MediaType::RTT.into() {
                             debug!(
                                 "RTT response received on connection {} at {}, sent at {}",
                                 connection_id, reception_time, media_packet.timestamp
@@ -293,11 +293,7 @@ impl ConnectionManager {
             }
 
             // Forward all non-RTT packets to the main handler
-            if packet.email != userid {
-                on_inbound_media.emit(packet);
-            } else {
-                debug!("Rejecting packet from same user: {}", packet.email);
-            }
+            on_inbound_media.emit(packet);
         })
     }
 
@@ -446,6 +442,12 @@ impl ConnectionManager {
                     connection_id: connection_id.clone(),
                     elected_at: js_sys::Date::now(),
                 };
+                
+                // Start heartbeat only on the elected connection
+                if let Some(connection) = self.connections.get_mut(&connection_id) {
+                    connection.start_heartbeat(self.options.userid.clone());
+                    info!("Started heartbeat on elected connection {}", connection_id);
+                }
 
                 // Close unused connections
                 self.close_unused_connections();

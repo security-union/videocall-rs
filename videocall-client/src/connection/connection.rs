@@ -25,7 +25,7 @@ use super::ConnectOptions;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use protobuf::Message;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -51,6 +51,7 @@ pub struct Connection {
     video_enabled: Rc<AtomicBool>,
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
+    session_id: Rc<RefCell<Option<String>>>,
     url: String,
 }
 
@@ -61,7 +62,6 @@ impl Connection {
         aes: Rc<Aes128State>,
     ) -> anyhow::Result<Self> {
         let mut new_options = options.clone();
-        let userid = new_options.userid.clone();
         let status = Rc::new(Cell::new(Status::Connecting));
 
         let url = if webtransport {
@@ -85,7 +85,7 @@ impl Connection {
         let monitor = new_options.peer_monitor.clone();
         let task = Task::connect(webtransport, new_options)?;
 
-        let mut connection = Self {
+        let connection = Self {
             task: Rc::new(task),
             heartbeat: None,
             heartbeat_monitor: Some(Interval::new(5000, move || {
@@ -96,9 +96,9 @@ impl Connection {
             audio_enabled: Rc::new(AtomicBool::new(false)),
             video_enabled: Rc::new(AtomicBool::new(false)),
             screen_enabled: Rc::new(AtomicBool::new(false)),
+            session_id: Rc::new(RefCell::new(None)),
             url,
         };
-        connection.start_heartbeat(userid);
 
         Ok(connection)
     }
@@ -107,13 +107,14 @@ impl Connection {
         matches!(self.status.get(), Status::Connected)
     }
 
-    fn start_heartbeat(&mut self, userid: String) {
+    pub fn start_heartbeat(&mut self, userid: String) {
         let task = Rc::clone(&self.task);
         let status = Rc::clone(&self.status);
         let aes = Rc::clone(&self.aes);
         let video_enabled = Rc::clone(&self.video_enabled);
         let audio_enabled = Rc::clone(&self.audio_enabled);
         let screen_enabled = Rc::clone(&self.screen_enabled);
+        let session_id = Rc::clone(&self.session_id);
         self.heartbeat = Some(Interval::new(1000, move || {
             let heartbeat_metadata = HeartbeatMetadata {
                 video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
@@ -129,15 +130,21 @@ impl Connection {
                 heartbeat_metadata: Some(heartbeat_metadata).into(),
                 ..Default::default()
             };
+            
             let data = aes.encrypt(&packet.write_to_bytes().unwrap()).unwrap();
-            let packet = PacketWrapper {
+            let mut packet_wrapper = PacketWrapper {
                 data,
                 email: userid.clone(),
                 packet_type: PacketType::MEDIA.into(),
                 ..Default::default()
             };
+            
+            if let Some(sid) = session_id.borrow().as_ref() {
+                packet_wrapper.session_id = sid.clone();
+            }
+            
             if let Status::Connected = status.get() {
-                task.send_packet(packet);
+                task.send_packet(packet_wrapper);
             }
         }));
     }

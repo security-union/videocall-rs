@@ -20,5 +20,6 @@ message MeetingPacket {
   string message = 4;
   string creator_id = 5;
   int64 participant_count = 6;
+  string session_id = 7;
 }
 

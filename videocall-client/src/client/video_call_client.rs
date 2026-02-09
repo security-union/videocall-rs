@@ -141,6 +141,7 @@ struct Inner {
     _diagnostics: Option<Rc<DiagnosticManager>>,
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
+    own_session_id: Option<String>,
 }
 
 /// The client struct for a video call connection.
@@ -247,6 +248,7 @@ impl VideoCallClient {
                     error: "Not connected".to_string(),
                     last_known_server: None,
                 },
+                own_session_id: None,
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
                 peer_decode_manager: Self::create_peer_decoder_manager(
@@ -503,6 +505,16 @@ impl VideoCallClient {
         match self.inner.try_borrow() {
             Ok(inner) => inner.peer_decode_manager.sorted_keys().to_vec(),
             Err(_) => Vec::<String>::new(),
+        }
+    }
+
+    pub fn get_peer_email(&self, session_id: &str) -> Option<String> {
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                inner.peer_decode_manager.get(&session_id.to_string())
+                    .map(|peer| peer.email.clone())
+           },
+            Err(_) => None,
         }
     }
 
@@ -799,15 +811,16 @@ impl VideoCallClient {
 impl Inner {
     fn on_inbound_media(&mut self, response: PacketWrapper) {
         debug!(
-            "<< Received {:?} from {}",
+            "<< Received {:?} from {} (session: {})",
             response.packet_type.enum_value(),
-            response.email
+            response.email,
+            response.session_id
         );
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         let peer_status = if response.email == SYSTEM_USER_EMAIL {
-            PeerStatus::NoChange
+           PeerStatus::NoChange
         } else {
-            self.peer_decode_manager.ensure_peer(&response.email)
+            self.peer_decode_manager.ensure_peer(&response.session_id, &response.email)
         };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
@@ -819,7 +832,7 @@ impl Inner {
                     match AesPacket::parse_from_bytes(&bytes) {
                         Ok(aes_packet) => {
                             if let Err(e) = self.peer_decode_manager.set_peer_aes(
-                                &response.email,
+                                &response.session_id,
                                 Aes128State::from_vecs(
                                     aes_packet.key,
                                     aes_packet.iv,
@@ -875,7 +888,7 @@ impl Inner {
                 }
             }
             Ok(PacketType::MEDIA) => {
-                let email = response.email.clone();
+                let peer_session_id = response.session_id.clone();
 
                 // RTT responses are now handled directly by the ConnectionManager via individual connection callbacks
                 // No need to process them here anymore
@@ -885,11 +898,11 @@ impl Inner {
                 {
                     error!("error decoding packet: {e}");
                     match e {
-                        PeerDecodeError::SameUserPacket(email) => {
-                            debug!("Rejecting packet from same user: {email}");
+                        PeerDecodeError::SameUserPacket(session_id) => {
+                            debug!("Rejecting packet from same user: {session_id}");
                         }
                         _ => {
-                            self.peer_decode_manager.delete_peer(&email);
+                            self.peer_decode_manager.delete_peer(&peer_session_id);
                         }
                     }
                 }
@@ -927,11 +940,16 @@ impl Inner {
                         match meeting_packet.event_type.enum_value() {
                             Ok(MeetingEventType::MEETING_STARTED) => {
                                 info!(
-                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
+                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}, session_id = {}",
                                     meeting_packet.room_id,
                                     meeting_packet.start_time_ms,
-                                    meeting_packet.creator_id
+                                    meeting_packet.creator_id,
+                                    meeting_packet.session_id,
                                 );
+                                // Store own session_id for use in outgoing packets
+                                self.own_session_id = Some(meeting_packet.session_id.clone());
+                            
+                                
                                 if let Some(callback) = &self.options.on_meeting_info {
                                     callback.emit(meeting_packet.start_time_ms as f64);
                                 }
@@ -950,16 +968,16 @@ impl Inner {
                                 }
                             }
                             Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                                info!(
-                                    "Received PARTICIPANT_JOINED: room={}, count={}",
-                                    meeting_packet.room_id, meeting_packet.participant_count
+                                debug!(
+                                    "Received PARTICIPANT_JOINED: room={}, count={}, session_id = {}",
+                                    meeting_packet.room_id, meeting_packet.participant_count,meeting_packet.session_id
                                 );
                                 // Future: could emit participant joined event
                             }
                             Ok(MeetingEventType::PARTICIPANT_LEFT) => {
                                 info!(
-                                    "Received PARTICIPANT_LEFT: room={}, count={}",
-                                    meeting_packet.room_id, meeting_packet.participant_count
+                                    "Received PARTICIPANT_LEFT: room={}, count={}, session_id = {}",
+                                    meeting_packet.room_id, meeting_packet.participant_count,meeting_packet.session_id
                                 );
                                 // Future: could emit participant left event
                             }

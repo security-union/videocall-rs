@@ -153,10 +153,8 @@ pub fn create_microphone_encoder(
     on_encoder_settings_update: Box<dyn Fn(String)>,
     on_error: Box<dyn Fn(String)>,
 ) -> Box<dyn MicrophoneEncoderTrait> {
-    Box::new(MicrophoneEncoder::new(
-        client,
-        bitrate_kbps,
-        on_encoder_settings_update,
-        on_error,
-    ))
+    let mut encoder = MicrophoneEncoder::new(client, bitrate_kbps);
+    encoder.set_encoder_settings_callback_fn(on_encoder_settings_update);
+    encoder.set_error_callback_fn(on_error);
+    Box::new(encoder)
 }

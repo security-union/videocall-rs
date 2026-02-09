@@ -111,15 +111,25 @@ pub fn camera_button(props: &CameraButtonProps) -> Html {
 #[derive(Properties, PartialEq)]
 pub struct ScreenShareButtonProps {
     pub active: bool,
+    pub disabled: bool,
     pub onclick: Callback<MouseEvent>,
 }
 
 #[function_component(ScreenShareButton)]
 pub fn screen_share_button(props: &ScreenShareButtonProps) -> Html {
-    let class = classes!("video-control-button", props.active.then_some("active"));
+    let mut class = classes!("video-control-button", props.active.then_some("active"));
 
+    let onclick = if props.disabled {
+        Callback::noop()
+    } else {
+        props.onclick.clone()
+    };
+
+    if props.disabled {
+        class.push("disabled");
+    }
     html! {
-        <button {class} onclick={props.onclick.clone()}>
+        <button {class} disabled={props.disabled} onclick={onclick}>
             {
                 if props.active {
                     html! {

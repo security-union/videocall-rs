@@ -1,7 +1,17 @@
 # yew-ui Testing Guide
 
-This document describes how to write and run component tests for the `yew-ui`
-crate.
+This document describes how to write and run **component and integration tests**
+for the `yew-ui` crate. All tests in this layer run inside a single headless
+Chrome instance via `wasm-bindgen-test`. They validate component rendering, DOM
+output, and browser API integration (e.g. media devices, runtime config).
+
+> **Scope note:** This testing infrastructure covers component-level and
+> single-browser integration tests only. Multi-browser end-to-end tests (e.g.
+> two participants joining the same meeting and verifying video tiles appear)
+> require a browser automation framework like **Playwright** with the full
+> backend stack running. That work is **TBD** — see
+> [Future: Multi-browser E2E tests](#future-multi-browser-e2e-tests) at the
+> bottom of this document.
 
 ## Why we test this way
 
@@ -56,13 +66,14 @@ physical hardware.
 
 ## Overview
 
-Tests are organised into a three-layer pyramid:
+Tests are organised into a three-layer pyramid (all single-browser):
 
 | Layer | Scope | Where | Runs In |
 |-------|-------|-------|---------|
 | **1 — Unit** | `MediaDeviceList` + `MockMediaDevicesProvider` | `videocall-client/src/media_devices/media_device_list.rs` | `wasm-bindgen-test` (headless Chrome) |
 | **2 — Component** | Individual Yew components with mock data | `yew-ui/tests/device_selector.rs`, `yew-ui/tests/video_control_buttons.rs` | `wasm-bindgen-test` (headless Chrome) |
-| **3 — Integration** | Full browser API → component rendering | `yew-ui/tests/device_integration.rs` | `wasm-bindgen-test` (headless Chrome with fake devices) |
+| **3 — Integration** | Full browser API → component rendering; app startup with runtime config | `yew-ui/tests/device_integration.rs`, `yew-ui/tests/home_integration.rs` | `wasm-bindgen-test` (headless Chrome with fake devices / injected config) |
+| **4 — E2E** *(TBD)* | Multi-browser, multi-participant meeting flows | *Not yet implemented* — planned with Playwright | Playwright + full backend stack |
 
 ## Prerequisites
 
@@ -220,3 +231,29 @@ The CI job runs natively on `ubuntu-latest` — it installs `chromedriver` via
 and `wasm-bindgen-cli`, then runs
 `CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown`.
 No Docker is involved in CI for UI tests.
+
+## Future: Multi-browser E2E tests
+
+The tests described above all run inside a **single** browser tab. They validate
+that components render correctly and interact with browser APIs, but they cannot
+test multi-participant scenarios such as:
+
+- Two users joining the same meeting and seeing each other's video tiles
+- Screen sharing appearing in a remote participant's view
+- Connection/disconnection flows between peers
+
+These scenarios require an **external test orchestrator** that controls multiple
+browser contexts while the full backend stack (actix-api + NATS + PostgreSQL)
+is running. The recommended approach is:
+
+1. **Playwright** (TypeScript or Python) — supports multiple `BrowserContext`
+   objects in a single test, has built-in WebRTC/media mocking, and runs
+   headlessly in CI.
+2. A `docker-compose` profile that boots the complete stack (backend + `trunk
+   serve` for the UI).
+3. Playwright tests navigate each browser context to the served UI, join a
+   meeting room, and assert on cross-browser state (video tiles, connection
+   indicators, etc.).
+
+This work is **not yet implemented**. When it is, it will live in a separate
+directory (e.g. `e2e/`) with its own `package.json` and Playwright config.

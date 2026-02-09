@@ -22,12 +22,13 @@ mod components;
 mod constants;
 mod context;
 mod pages;
+mod routing;
 mod types;
 
 use crate::constants::app_config;
+use crate::routing::Route;
 
 use components::config_error::ConfigError;
-use enum_display::EnumDisplay;
 use matomo_logger::{MatomoConfig, MatomoLogger};
 use pages::home::Home;
 use yew::prelude::*;
@@ -42,25 +43,6 @@ use pages::meeting::MeetingPage;
 /// This module contains the main entry point for the Videocall UI.
 /// It is responsible for rendering the main application and handling routing.
 /// We use yew-router to handle routing.
-///
-
-#[derive(Clone, Routable, PartialEq, Debug, EnumDisplay)]
-enum Route {
-    #[at("/")]
-    Home,
-    #[at("/login")]
-    Login,
-    #[at("/meeting/:id")]
-    Meeting { id: String },
-    #[at("/meeting/:id/:webtransport_enabled")]
-    Meeting2 {
-        id: String,
-        webtransport_enabled: String,
-    },
-    #[not_found]
-    #[at("/404")]
-    NotFound,
-}
 
 fn switch(routes: Route) -> Html {
     if let Err(e) = app_config() {

@@ -66,6 +66,7 @@ gloo-utils = "0.1"
 web-sys = { version = "0.3.72", features = [
     "HtmlElement",
     "HtmlButtonElement",
+    "HtmlInputElement",
     "HtmlSelectElement",
     "HtmlOptionElement",
     "HtmlOptionsCollection",

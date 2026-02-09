@@ -38,6 +38,42 @@ pub fn cleanup(mount: &web_sys::Element) {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime config injection (integration tests)
+// ---------------------------------------------------------------------------
+
+/// Inject a `window.__APP_CONFIG` object with OAuth disabled and all
+/// required `RuntimeConfig` fields.  Call this before rendering any
+/// component that reads the runtime config (e.g. `Home`, `AppRoot`).
+pub fn inject_app_config() {
+    let config = js_sys::Object::new();
+    let set = |key: &str, val: &wasm_bindgen::JsValue| {
+        js_sys::Reflect::set(&config, &key.into(), val).unwrap();
+    };
+    set("apiBaseUrl", &"http://test:8080".into());
+    set("wsUrl", &"ws://test:8080".into());
+    set("webTransportHost", &"https://test:4433".into());
+    set("oauthEnabled", &"false".into());
+    set("e2eeEnabled", &"false".into());
+    set("webTransportEnabled", &"false".into());
+    set("firefoxEnabled", &"false".into());
+    set("usersAllowedToStream", &"".into());
+    set("serverElectionPeriodMs", &wasm_bindgen::JsValue::from(2000));
+    set("audioBitrateKbps", &wasm_bindgen::JsValue::from(65));
+    set("videoBitrateKbps", &wasm_bindgen::JsValue::from(100));
+    set("screenBitrateKbps", &wasm_bindgen::JsValue::from(100));
+
+    let frozen = js_sys::Object::freeze(&config);
+    let window = gloo_utils::window();
+    js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+}
+
+/// Remove `window.__APP_CONFIG` so tests don't leak state.
+pub fn remove_app_config() {
+    let window = gloo_utils::window();
+    let _ = js_sys::Reflect::delete_property(&window.into(), &"__APP_CONFIG".into());
+}
+
+// ---------------------------------------------------------------------------
 // Mock device construction (Layer 2 tests)
 // ---------------------------------------------------------------------------
 

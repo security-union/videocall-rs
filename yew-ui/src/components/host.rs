@@ -57,6 +57,7 @@ pub enum Msg {
     SaveChangeName,
     CancelChangeName,
     MicrophoneError(String),
+    CameraError(String),
 }
 
 pub struct Host {
@@ -120,6 +121,11 @@ pub struct MeetingProps {
     #[prop_or_default]
     pub on_microphone_error: Callback<String>,
 
+    /// Called when the camera encoder reports an unrecoverable error.
+    /// The parent should disable the camera and optionally display an error.
+    #[prop_or_default]
+    pub on_camera_error: Callback<String>,
+
     /// Called when screen share state changes (started, cancelled, stopped).
     /// This allows the parent component to react to screen share lifecycle events.
     pub on_screen_share_state: Callback<ScreenShareEvent>,
@@ -142,11 +148,13 @@ impl Component for Host {
         let screen_callback = ctx.link().callback(Msg::ScreenEncoderSettingsUpdated);
 
         let video_bitrate = video_bitrate_kbps().unwrap_or(1000);
+        let camera_error_cb = ctx.link().callback(Msg::CameraError);
         let mut camera = CameraEncoder::new(
             client.clone(),
             VIDEO_ELEMENT_ID,
             video_bitrate,
             camera_callback,
+            camera_error_cb,
         );
 
         // Use the factory function to create the appropriate microphone encoder
@@ -253,8 +261,10 @@ impl Component for Host {
         // TODO: use atomic bools for the encoders
         self.client.set_audio_enabled(self.mic_enabled);
         self.client.set_video_enabled(self.video_enabled);
-        // Note: set_screen_enabled is now handled internally by ScreenEncoder
-        // based on actual stream state (Started/Stopped callbacks)
+        // Note: set_screen_enabled is handled by ScreenEncoder internally:
+        // - start() calls set_screen_enabled(true) after the stream is set up
+        // - stop() calls set_screen_enabled(false) synchronously
+        // - the onended handler calls set_screen_enabled(false) when the browser stops sharing
 
         if first_render {
             ctx.link().send_message(Msg::Start);
@@ -298,6 +308,12 @@ impl Component for Host {
                 self.microphone.stop();
                 // Propagate upstream so the parent can disable mic and show UI
                 ctx.props().on_microphone_error.emit(err);
+                true
+            }
+            Msg::CameraError(err) => {
+                log::error!("Camera error: {err}");
+                self.camera.stop();
+                ctx.props().on_camera_error.emit(err);
                 true
             }
             Msg::EnableVideo(should_enable) => {
@@ -368,8 +384,11 @@ impl Component for Host {
             }
             Msg::VideoDeviceChanged(video) => {
                 log::info!("Video device changed: {video}");
-                // Update the MediaDeviceList selection
                 self.media_devices.video_inputs.select(&video.device_id);
+                // select() sets switching=true while enabled, causing the old
+                // encoding loop to exit on its next iteration. The 1-second
+                // timeout gives the old loop time to detect the flag and clean
+                // up before we restart.
                 if self.camera.select(video.device_id.clone()) {
                     let link = ctx.link().clone();
                     let timeout = Timeout::new(1000, move || {
@@ -377,8 +396,9 @@ impl Component for Host {
                     });
                     timeout.forget();
                 }
-                true // Need to re-render to update device selector displays
+                true
             }
+
             Msg::SpeakerDeviceChanged(speaker) => {
                 // Update the MediaDeviceList selection
                 self.media_devices.audio_outputs.select(&speaker.device_id);

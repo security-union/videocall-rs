@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use gloo_timers::future::sleep;
 use gloo_utils::window;
 use js_sys::Array;
 use js_sys::Boolean;
@@ -25,6 +26,7 @@ use log::error;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use wasm_bindgen::prelude::Closure;
@@ -76,6 +78,7 @@ pub struct CameraEncoder {
     current_bitrate: Rc<AtomicU32>,
     current_fps: Rc<AtomicU32>,
     on_encoder_settings_update: Callback<String>,
+    on_error: Option<Callback<String>>,
 }
 
 impl CameraEncoder {
@@ -96,6 +99,7 @@ impl CameraEncoder {
         video_elem_id: &str,
         initial_bitrate: u32,
         on_encoder_settings_update: Callback<String>,
+        on_error: Callback<String>,
     ) -> Self {
         Self {
             client,
@@ -104,6 +108,7 @@ impl CameraEncoder {
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
             current_fps: Rc::new(AtomicU32::new(0)),
             on_encoder_settings_update,
+            on_error: Some(on_error),
         }
     }
 
@@ -187,10 +192,7 @@ impl CameraEncoder {
         let aes = client.aes();
         let video_elem_id = self.video_elem_id.clone();
         let EncoderState {
-            destroy,
-            enabled,
-            switching,
-            ..
+            enabled, switching, ..
         } = self.state.clone();
         let current_bitrate = self.current_bitrate.clone();
         let current_fps = self.current_fps.clone();
@@ -236,33 +238,121 @@ impl CameraEncoder {
         } else {
             return;
         };
+        let on_error = self.on_error.clone();
+
+        log::info!(
+            "CameraEncoder::start(): using video device_id = {}",
+            device_id
+        );
 
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
-            let video_element = window()
-                .document()
-                .unwrap()
-                .get_element_by_id(&video_elem_id)
-                .unwrap()
-                .unchecked_into::<HtmlVideoElement>();
 
-            let media_devices = navigator.media_devices().unwrap();
+            // Wait for <video id="{video_elem_id}"> to be mounted in the DOM
+            // Yew renders components asynchronously
+            let mut attempt = 0;
+            let video_element = loop {
+                if let Some(doc) = window().document() {
+                    if let Some(elem) = doc.get_element_by_id(&video_elem_id) {
+                        if let Ok(video_elem) = elem.dyn_into::<HtmlVideoElement>() {
+                            log::info!(
+                                "CameraEncoder: found <video id='{}'> after {} attempts",
+                                video_elem_id,
+                                attempt
+                            );
+                            break video_elem;
+                        }
+                    }
+                }
+                // Sleep a bit and retry
+                sleep(Duration::from_millis(50)).await;
+                attempt += 1;
+                if attempt > 20 {
+                    let msg = format!(
+                        "Camera error: video element '{}' not found in DOM after 1 second",
+                        video_elem_id
+                    );
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
+                    return;
+                }
+            };
+
+            let media_devices = match navigator.media_devices() {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!("Failed to access media devices: {e:?}");
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
+                    return;
+                }
+            };
             let constraints = MediaStreamConstraints::new();
             let media_info = web_sys::MediaTrackConstraints::new();
-            media_info.set_device_id(&device_id.into());
+
+            // Force exact deviceId match (avoids partial/ideal matching surprises).
+            let exact = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &exact,
+                &JsValue::from_str("exact"),
+                &JsValue::from_str(&device_id),
+            )
+            .unwrap();
+
+            log::debug!("CameraEncoder: deviceId.exact = {}", device_id);
+            media_info.set_device_id(&exact.into());
 
             constraints.set_video(&media_info.into());
             constraints.set_audio(&Boolean::from(false));
 
-            let devices_query = media_devices
-                .get_user_media_with_constraints(&constraints)
-                .unwrap();
-            let device = JsFuture::from(devices_query)
-                .await
-                .unwrap()
-                .unchecked_into::<MediaStream>();
-            video_element.set_src_object(Some(&device));
+            let devices_query = match media_devices.get_user_media_with_constraints(&constraints) {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = format!("Camera access failed: {e:?}");
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
+                    return;
+                }
+            };
+
+            let device = match JsFuture::from(devices_query).await {
+                Ok(s) => s.unchecked_into::<MediaStream>(),
+                Err(e) => {
+                    let msg = format!("Failed to get camera stream: {e:?}");
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
+                    return;
+                }
+            };
+
+            log::info!(
+                "CameraEncoder: getUserMedia OK, stream id={:?}, tracks={}",
+                device.id(),
+                device.get_tracks().length()
+            );
+            // Configure the local preview element
+            // Muted must be set before calling play() to avoid autoplay restrictions
             video_element.set_muted(true);
+            video_element.set_attribute("playsinline", "true").unwrap();
+            video_element.set_src_object(None);
+            video_element.set_src_object(Some(&device));
+
+            if let Err(e) = video_element.play() {
+                error!("VIDEO PLAY ERROR: {:?}", e);
+            } else {
+                log::info!(
+                    "VIDEO PLAY started successfully on element {}",
+                    video_elem_id
+                );
+            }
 
             let video_track = Box::new(
                 device
@@ -284,7 +374,17 @@ impl CameraEncoder {
                 video_output_handler.as_ref().unchecked_ref(),
             );
 
-            let video_encoder = Box::new(VideoEncoder::new(&video_encoder_init).unwrap());
+            let video_encoder = match VideoEncoder::new(&video_encoder_init) {
+                Ok(enc) => Box::new(enc),
+                Err(e) => {
+                    let msg = format!("Failed to create video encoder: {e:?}");
+                    error!("{msg}");
+                    if let Some(cb) = &on_error {
+                        cb.emit(msg);
+                    }
+                    return;
+                }
+            };
 
             // Get track settings to get actual width and height
             let media_track = video_track
@@ -327,13 +427,11 @@ impl CameraEncoder {
             let mut current_encoder_height = height as u32;
 
             loop {
-                if !enabled.load(Ordering::Acquire)
-                    || destroy.load(Ordering::Acquire)
-                    || switching.load(Ordering::Acquire)
-                {
+                if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
                     switching.store(false, Ordering::Release);
                     let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                     video_track.stop();
+                    log::info!("CameraEncoder: stopped");
                     if let Err(e) = video_encoder.close() {
                         error!("Error closing video encoder: {e:?}");
                     }

@@ -97,7 +97,8 @@
 //!     client.clone(),
 //!     "video-element",
 //!     1000000, // 1 Mbps initial bitrate
-//!     Callback::noop()
+//!     Callback::noop(),
+//!     Callback::noop() // on_error callback for camera errors
 //! );
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),

@@ -24,7 +24,7 @@ use crate::components::browser_compatibility::BrowserCompatibility;
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
 };
-use crate::Route;
+use crate::routing::Route;
 use web_time::SystemTime;
 
 const TEXT_INPUT_CLASSES: &str = "input-apple";

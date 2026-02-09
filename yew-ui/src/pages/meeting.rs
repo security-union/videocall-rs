@@ -10,7 +10,7 @@ use yew_router::prelude::*;
 
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
 use crate::constants::oauth_enabled;
-use crate::Route;
+use crate::routing::Route;
 
 #[derive(Properties, PartialEq, Clone)]
 pub struct MeetingPageProps {

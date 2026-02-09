@@ -14,18 +14,6 @@ instances provided by Docker Compose.
 
 That's it. The test runner, database, and message broker all run in containers.
 
-## Test inventory
-
-| File | Count | What it covers |
-|------|-------|----------------|
-| `src/session_manager.rs` | 24 | Meeting creation, multi-user join/leave, host controls, feature flag on/off, system email rejection |
-| `src/bin/metrics_server.rs` | 17 | Session tracking, health metrics export, stale session cleanup, concurrent access, RTT/NetEQ metrics |
-| `src/webtransport/mod.rs` | 6 | Full meeting lifecycle over WebTransport (connect, join, leave, meeting end) |
-| `src/actors/packet_handler.rs` | 4 | Packet classification — empty, garbage, and RTT detection |
-| `src/actors/chat_server.rs` | 4 | Room join/rejection, system email validation |
-| `src/actors/transports/ws_chat_session.rs` | 2 | Meeting lifecycle over WebSocket connections |
-| `src/actors/session_logic.rs` | 1 | Action debug formatting |
-
 ## Quick start
 
 ```bash

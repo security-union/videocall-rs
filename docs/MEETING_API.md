@@ -636,3 +636,64 @@ curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/leave \
 | joined_at | TIMESTAMPTZ | When joined/entered wait room |
 | admitted_at | TIMESTAMPTZ | When admitted by host |
 | left_at | TIMESTAMPTZ | When left the meeting |
+
+---
+
+## Testing
+
+The Meeting API has a comprehensive integration test suite that tests all endpoints against a real PostgreSQL database.
+
+### Running Tests
+
+```bash
+# Run all backend tests (requires Docker)
+make tests_run
+
+# Tear down test containers
+make tests_down
+
+# Run a specific test
+docker compose -f docker/docker-compose.integration.yaml run --rm rust-tests \
+  bash -c "cd /app/dbmate && dbmate wait && dbmate up && \
+           cd /app/actix-api && cargo test test_create_meeting -- --nocapture --test-threads=1"
+```
+
+### Test Coverage
+
+The test suite includes 22 integration tests covering all API endpoints:
+
+| Endpoint | Tests |
+|----------|-------|
+| `POST /api/v1/meetings` | Create meeting success, auto-generate ID, unauthorized, duplicate ID, too many attendees |
+| `GET /api/v1/meetings/{id}` | Get meeting success, not found, unauthorized |
+| `GET /api/v1/meetings` | List meetings with pagination |
+| `DELETE /api/v1/meetings/{id}` | Delete success, not owner (403) |
+| `POST /api/v1/meetings/{id}/join` | Host activates meeting, attendee waits, meeting not active |
+| `GET /api/v1/meetings/{id}/waiting` | Get waiting room success |
+| `POST /api/v1/meetings/{id}/admit` | Admit success, participant not found |
+| `POST /api/v1/meetings/{id}/admit-all` | Admit all waiting participants |
+| `POST /api/v1/meetings/{id}/reject` | Reject participant success |
+| `GET /api/v1/meetings/{id}/status` | Get my status success |
+| `POST /api/v1/meetings/{id}/leave` | Leave meeting success |
+| `GET /api/v1/meetings/{id}/participants` | Get participants success |
+
+### Test Infrastructure
+
+Tests run in Docker containers orchestrated by `docker/docker-compose.integration.yaml`:
+
+| Service | Image | Purpose |
+|---------|-------|---------|
+| `postgres` | `postgres:12` | Test database |
+| `nats` | `nats:2.10-alpine` | Message broker |
+| `rust-tests` | Built from `Dockerfile.actix` | Test runner |
+
+### CI/CD
+
+Tests run automatically on pull requests that modify:
+- `actix-api/**` - API source code
+- `dbmate/**` - Database migrations
+- `videocall-types/**` - Shared types
+- `protobuf/**` - Protocol buffers
+- `docker/**` - Docker configuration
+
+See `.github/workflows/cargo-test.yaml` for the full workflow configuration.

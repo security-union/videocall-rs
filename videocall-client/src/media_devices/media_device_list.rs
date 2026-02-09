@@ -654,10 +654,17 @@ mod tests {
     }
 
     /// Yield to the microtask queue so that `spawn_local` futures complete.
+    ///
+    /// A single yield is not enough because `spawn_local` starts on one
+    /// microtask tick and then its inner `JsFuture::from(promise).await`
+    /// needs another tick to deliver the result.  Three iterations gives
+    /// a comfortable margin (similar to Jest's `flushPromises()`).
     async fn flush() {
-        wasm_bindgen_futures::JsFuture::from(Promise::resolve(&JsValue::NULL))
-            .await
-            .unwrap();
+        for _ in 0..3 {
+            wasm_bindgen_futures::JsFuture::from(Promise::resolve(&JsValue::NULL))
+                .await
+                .unwrap();
+        }
     }
 
     // -----------------------------------------------------------------------

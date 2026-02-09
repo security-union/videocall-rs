@@ -43,7 +43,6 @@ use pages::meeting::MeetingPage;
 /// This module contains the main entry point for the Videocall UI.
 /// It is responsible for rendering the main application and handling routing.
 /// We use yew-router to handle routing.
-
 fn switch(routes: Route) -> Html {
     if let Err(e) = app_config() {
         return html! { <ConfigError message={e} /> };

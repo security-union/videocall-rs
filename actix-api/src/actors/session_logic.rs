@@ -197,6 +197,6 @@ mod tests {
     #[test]
     fn test_inbound_action_debug() {
         let action = InboundAction::KeepAlive;
-        assert_eq!(format!("{:?}", action), "KeepAlive");
+        assert_eq!(format!("{action:?}"), "KeepAlive");
     }
 }

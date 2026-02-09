@@ -21,6 +21,8 @@ use yew::platform::time::sleep;
 use yew::prelude::*;
 use yew_router::prelude::*;
 
+use videocall_ui::components::config_error::ConfigError;
+use videocall_ui::constants::app_config;
 use videocall_ui::context::UsernameCtx;
 use videocall_ui::pages::home::Home;
 
@@ -31,13 +33,19 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
 // so we always render Home regardless of the test-runner's URL path.
 // ---------------------------------------------------------------------------
 
+/// Renders `Home` or `ConfigError` — same logic as the real `switch()`
+/// function in `main.rs`, just without the full router.
 #[function_component(HomeTestWrapper)]
 fn home_test_wrapper() -> Html {
     let username_state = use_state(|| None::<String>);
+    let inner = match app_config() {
+        Ok(_) => html! { <Home /> },
+        Err(e) => html! { <ConfigError message={e} /> },
+    };
     html! {
         <ContextProvider<UsernameCtx> context={username_state.clone()}>
             <BrowserRouter>
-                <Home />
+                { inner }
             </BrowserRouter>
         </ContextProvider<UsernameCtx>>
     }
@@ -86,17 +94,30 @@ async fn home_page_renders_with_oauth_disabled() {
 }
 
 #[wasm_bindgen_test]
-async fn home_page_renders_without_config() {
-    // No __APP_CONFIG injected — verify the component doesn't panic.
+async fn missing_config_shows_error_not_home() {
     remove_app_config();
 
     let mount = create_mount_point();
     yew::Renderer::<HomeTestWrapper>::with_root(mount.clone()).render();
     sleep(Duration::ZERO).await;
 
+    // ConfigError should be visible — same as the real app.
+    let error = mount.query_selector(".error-container").unwrap();
     assert!(
-        mount.query_selector(".hero-container").unwrap().is_some(),
-        "Home should still render its container even without config"
+        error.is_some(),
+        "ConfigError should be shown when __APP_CONFIG is missing"
+    );
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("__APP_CONFIG"),
+        "Error message should mention the missing config"
+    );
+
+    // Home should NOT have rendered.
+    assert!(
+        mount.query_selector(".hero-container").unwrap().is_none(),
+        "Home page should not render when config is missing"
     );
 
     cleanup(&mount);

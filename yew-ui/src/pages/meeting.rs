@@ -13,7 +13,7 @@ use yew_router::prelude::*;
 
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
 use crate::constants::oauth_enabled;
-use crate::Route;
+use crate::routing::Route;
 
 /// Meeting participant status from the API
 #[derive(Clone, PartialEq, Debug)]

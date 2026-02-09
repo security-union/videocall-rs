@@ -212,15 +212,10 @@ impl ScreenEncoder {
     /// This will toggle the enabled state of the encoder.
     pub fn start(&mut self) {
         let EncoderState {
-            enabled,
-            destroy,
-            switching,
-            ..
+            enabled, switching, ..
         } = self.state.clone();
         // enable the encoder
-        // patch the destroy flag to false
         enabled.store(true, Ordering::Release);
-        destroy.store(false, Ordering::Release);
 
         let client = self.client.clone();
         let client_for_onended = client.clone();
@@ -443,10 +438,7 @@ impl ScreenEncoder {
 
             loop {
                 // Check if we should stop encoding
-                if destroy.load(Ordering::Acquire)
-                    || !enabled.load(Ordering::Acquire)
-                    || switching.load(Ordering::Acquire)
-                {
+                if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
                     switching.store(false, Ordering::Release);
                     media_track.stop();
                     if let Err(e) = screen_encoder.close() {

@@ -15,8 +15,11 @@
 
 #![cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 
+mod support;
+
 use std::time::Duration;
 
+use support::{cleanup, create_mount_point};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
 use yew::platform::time::sleep;
@@ -27,27 +30,6 @@ use videocall_ui::components::video_control_buttons::{
 };
 
 wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Create a fresh mount-point div, attach it to the document body, and return it.
-fn create_mount_point() -> web_sys::Element {
-    let document = gloo_utils::document();
-    let div = document.create_element("div").unwrap();
-    document.body().unwrap().append_child(&div).unwrap();
-    div
-}
-
-/// Remove the mount-point from the body so subsequent tests start clean.
-fn cleanup(mount: &web_sys::Element) {
-    gloo_utils::document()
-        .body()
-        .unwrap()
-        .remove_child(mount)
-        .ok();
-}
 
 // ---------------------------------------------------------------------------
 // MicButton tests

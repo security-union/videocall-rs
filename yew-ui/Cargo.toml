@@ -61,14 +61,25 @@ features = [
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.37"
+wasm-bindgen-futures = { workspace = true }
 gloo-utils = "0.1"
 web-sys = { version = "0.3.72", features = [
     "HtmlElement",
     "HtmlButtonElement",
+    "HtmlSelectElement",
+    "HtmlOptionElement",
+    "HtmlOptionsCollection",
     "DomTokenList",
     "Element",
     "Node",
+    "NodeList",
     "Document",
+    "MediaDevices",
+    "MediaDeviceInfo",
+    "MediaDeviceKind",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "Navigator",
 ] }
 
 [features]

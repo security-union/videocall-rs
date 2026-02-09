@@ -37,7 +37,7 @@ use videocall_types::SYSTEM_USER_EMAIL;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use protobuf::Message as ProtobufMessage;
 
-use super::session_logic::SessionId;
+use super::session_logic::{SessionId, ConnectionState};
 
 /// Internal message to clean up active_subs when a spawned join task fails.
 /// This fixes a race condition where start_session could fail inside the spawned task,
@@ -53,7 +53,7 @@ pub struct ChatServer {
     sessions: HashMap<SessionId, Recipient<Message>>,
     active_subs: HashMap<SessionId, JoinHandle<()>>,
     session_manager: SessionManager,
-    connection_states: HashMap<SessionId, super::session_logic::ConnectionState>,
+    connection_states: HashMap<SessionId, ConnectionState>,
 }
 
 impl ChatServer {
@@ -135,7 +135,7 @@ impl Handler<Connect> for ChatServer {
     fn handle(&mut self, msg: Connect, _ctx: &mut Self::Context) -> Self::Result {
         let Connect { id, addr } = msg;
         self.sessions.insert(id.clone(), addr);
-        self.connection_states.insert(id, super::session_logic::ConnectionState::Testing);
+        self.connection_states.insert(id, ConnectionState::Testing);
     }
 }
 
@@ -179,12 +179,12 @@ impl Handler<ActivateConnection> for ChatServer {
     fn handle(&mut self, msg: ActivateConnection, _ctx: &mut Self::Context) -> Self::Result {
         let ActivateConnection { session } = msg;
         if let Some(state) = self.connection_states.get_mut(&session) {
-            if *state == super::session_logic::ConnectionState::Testing {
-                *state = super::session_logic::ConnectionState::Active;
+            if *state == ConnectionState::Testing {
+                *state = ConnectionState::Active;
                 info!("Session {} activated (Testing -> Active)", session);
             }
         } else {
-            self.connection_states.insert(session.clone(), super::session_logic::ConnectionState::Active);
+            self.connection_states.insert(session.clone(), ConnectionState::Active);
             info!("Session {} activated (state was missing, created as Active)", session);
         }
     }
@@ -205,9 +205,9 @@ impl Handler<ClientMessage> for ChatServer {
         // Check connection state - only publish to NATS if Active
         let connection_state = self.connection_states.get(&session)
             .copied()
-            .unwrap_or(super::session_logic::ConnectionState::Testing);
+            .unwrap_or(ConnectionState::Testing);
         
-        if connection_state != super::session_logic::ConnectionState::Active {
+        if connection_state != ConnectionState::Active {
             trace!("Skipping NATS publish for session {} in Testing state", session);
             return; // Don't publish during Testing state
         }

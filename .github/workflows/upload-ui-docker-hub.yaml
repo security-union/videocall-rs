@@ -17,7 +17,6 @@ on:
       - Dockerfile.yew
       - nginx.conf
       - docker/start-yew.sh
-  workflow_dispatch:
 
 jobs:
   push_to_registry:

@@ -37,7 +37,7 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
     let is_video_enabled_for_peer = client.is_video_enabled_for_peer(key);
     let is_audio_enabled_for_peer = client.is_audio_enabled_for_peer(key);
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
-    log::info!("🟢 UI10: peer {} is_speaking={}", key, is_speaking);
+    log::info!("🟢 UItest1: peer {} is_speaking={}", key, is_speaking);
 
     let border_style = if is_speaking {
         "border: 3px solid orange; border-radius: 8px; transition: all 0.2s;"

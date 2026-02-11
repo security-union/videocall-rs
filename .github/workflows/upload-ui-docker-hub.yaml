@@ -1,9 +1,7 @@
 name: Publish UI to Docker image
 
 on:
-  # pull_request:
-  #   paths:
-  #     - '*'
+  workflow_dispatch:
   push:
     branches:
       - main

@@ -1,6 +1,7 @@
 name: Publish Meeting API to Docker image
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main

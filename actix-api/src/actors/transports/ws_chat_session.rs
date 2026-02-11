@@ -286,13 +286,12 @@ impl WsChatSession {
 }
 
 // ==========================================================================
-// Meeting Lifecycle Integration Test (WebSocket)
+// Session Lifecycle Integration Test (WebSocket)
 // ==========================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::actors::chat_server::ChatServer;
-    use crate::models::meeting::Meeting;
     use crate::models::session_participant::SessionParticipant;
     use crate::server_diagnostics::ServerDiagnostics;
     use crate::session_manager::SessionManager;
@@ -316,10 +315,6 @@ mod tests {
 
     async fn cleanup_room(pool: &PgPool, room_id: &str) {
         let _ = sqlx::query("DELETE FROM session_participants WHERE room_id = $1")
-            .bind(room_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM meetings WHERE room_id = $1")
             .bind(room_id)
             .execute(pool)
             .await;
@@ -482,7 +477,7 @@ mod tests {
     }
 
     async fn test_meeting_lifecycle_ws_impl() -> anyhow::Result<()> {
-        println!("=== STARTING MEETING LIFECYCLE TEST (WebSocket) ===");
+        println!("=== STARTING SESSION LIFECYCLE TEST (WebSocket) ===");
 
         let pool = get_test_pool().await;
         let room_id = "ws-meeting-lifecycle-test";
@@ -497,7 +492,7 @@ mod tests {
         wait_for_server_ready(port).await;
         println!("✓ Server ready");
 
-        // ========== STEP 1: First user connects - meeting should be created ==========
+        // ========== STEP 1: First user connects ==========
         println!("\n--- Step 1: Alice connects (first participant) ---");
 
         let mut ws_alice = connect_ws_client(port, room_id, "alice")
@@ -506,7 +501,6 @@ mod tests {
         wait_for_meeting_started(&mut ws_alice, Duration::from_secs(5)).await?;
         println!("✓ Alice connected and received MEETING_STARTED");
 
-        // Verify: 1 participant, meeting exists
         let count = SessionParticipant::count_active(&pool, room_id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -515,15 +509,6 @@ mod tests {
             "Should have 1 active participant after Alice joins"
         );
         println!("✓ Participant count: {count}");
-
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert!(meeting.is_some(), "Meeting should exist");
-        let meeting = meeting.unwrap();
-        assert_eq!(meeting.creator_id, Some("alice".to_string()));
-        assert!(meeting.ended_at.is_none());
-        println!("✓ Meeting created with creator=alice");
 
         // ========== STEP 2: Second user connects ==========
         println!("\n--- Step 2: Bob connects (second participant) ---");
@@ -568,14 +553,6 @@ mod tests {
         assert_eq!(count, 2, "Should have 2 active participants");
         println!("✓ Participant count: {count}");
 
-        // Meeting should still be active
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert!(meeting.ended_at.is_none(), "Meeting should still be active");
-        println!("✓ Meeting still active");
-
         // ========== STEP 5: Bob disconnects ==========
         println!("\n--- Step 5: Bob disconnects ---");
 
@@ -589,8 +566,8 @@ mod tests {
         assert_eq!(count, 1, "Should have 1 active participant");
         println!("✓ Participant count: {count}");
 
-        // ========== STEP 6: Alice (host/last) disconnects - meeting ends ==========
-        println!("\n--- Step 6: Alice (host) disconnects - meeting should end ---");
+        // ========== STEP 6: Alice (last) disconnects ==========
+        println!("\n--- Step 6: Alice disconnects - session ends ---");
 
         drop(ws_alice);
         wait_for_participant_count(&pool, room_id, 0, Duration::from_secs(5)).await?;
@@ -602,18 +579,10 @@ mod tests {
         assert_eq!(count, 0, "Should have 0 active participants");
         println!("✓ Participant count: {count}");
 
-        // Meeting should be ended
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert!(meeting.ended_at.is_some(), "Meeting should be ended");
-        println!("✓ Meeting ended at {:?}", meeting.ended_at);
-
         // ========== CLEANUP ==========
         cleanup_room(&pool, room_id).await;
 
-        println!("\n=== MEETING LIFECYCLE TEST PASSED (WebSocket) ===");
+        println!("\n=== SESSION LIFECYCLE TEST PASSED (WebSocket) ===");
         Ok(())
     }
 }

@@ -1061,10 +1061,9 @@ mod tests {
     }
 
     async fn test_meeting_lifecycle_impl() -> anyhow::Result<()> {
-        use crate::models::meeting::Meeting;
         use crate::models::session_participant::SessionParticipant;
 
-        println!("=== STARTING MEETING LIFECYCLE TEST (WebTransport) ===");
+        println!("=== STARTING SESSION LIFECYCLE TEST (WebTransport) ===");
 
         // Get database pool for verification queries
         let database_url =
@@ -1080,7 +1079,7 @@ mod tests {
         wait_for_server_ready().await;
         println!("✓ Server ready");
 
-        // ========== STEP 1: First user connects - meeting should be created ==========
+        // ========== STEP 1: First user connects ==========
         println!("\n--- Step 1: Alice connects (first participant) ---");
 
         let session_alice = connect_client("alice", room_id)
@@ -1091,7 +1090,6 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("✓ Alice connected");
 
-        // Verify: 1 participant, meeting exists
         let count = SessionParticipant::count_active(&pool, room_id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1101,24 +1099,7 @@ mod tests {
         );
         println!("✓ Participant count: {count}");
 
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert!(
-            meeting.is_some(),
-            "Meeting should exist after first participant joins"
-        );
-        let meeting = meeting.unwrap();
-        assert_eq!(
-            meeting.creator_id,
-            Some("alice".to_string()),
-            "Alice should be the meeting creator"
-        );
-        assert!(meeting.ended_at.is_none(), "Meeting should not be ended");
-        let start_time = meeting.start_time_unix_ms();
-        println!("✓ Meeting created with creator=alice, start_time={start_time}");
-
-        // ========== STEP 2: Second user connects - participant count increases ==========
+        // ========== STEP 2: Second user connects ==========
         println!("\n--- Step 2: Bob connects (second participant) ---");
 
         let session_bob = connect_client("bob", room_id).await.expect("connect bob");
@@ -1127,7 +1108,6 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("✓ Bob connected");
 
-        // Verify: 2 participants
         let count = SessionParticipant::count_active(&pool, room_id)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1136,18 +1116,6 @@ mod tests {
             "Should have 2 active participants after Bob joins"
         );
         println!("✓ Participant count: {count}");
-
-        // Meeting should have same start time
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert_eq!(
-            meeting.start_time_unix_ms(),
-            start_time,
-            "Meeting start time should not change when others join"
-        );
-        println!("✓ Meeting start time unchanged");
 
         // ========== STEP 3: Third user connects ==========
         println!("\n--- Step 3: Charlie connects (third participant) ---");
@@ -1169,10 +1137,8 @@ mod tests {
         // ========== STEP 4: Charlie disconnects - count drops ==========
         println!("\n--- Step 4: Charlie disconnects ---");
 
-        // Explicitly close the session to trigger immediate disconnect
         session_charlie.close(0u32, b"test disconnect");
         drop(session_charlie);
-        // Wait for disconnect to be processed
         wait_for_participant_count(&pool, room_id, 2, Duration::from_secs(5)).await?;
         println!("✓ Charlie disconnected");
 
@@ -1184,14 +1150,6 @@ mod tests {
             "Should have 2 active participants after Charlie leaves"
         );
         println!("✓ Participant count: {count}");
-
-        // Meeting should still be active
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert!(meeting.ended_at.is_none(), "Meeting should still be active");
-        println!("✓ Meeting still active");
 
         // ========== STEP 5: Bob disconnects - count drops ==========
         println!("\n--- Step 5: Bob disconnects ---");
@@ -1210,19 +1168,8 @@ mod tests {
         );
         println!("✓ Participant count: {count}");
 
-        // Meeting should still be active (Alice is still there)
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert!(
-            meeting.ended_at.is_none(),
-            "Meeting should still be active with Alice"
-        );
-        println!("✓ Meeting still active");
-
-        // ========== STEP 6: Alice (host/last) disconnects - meeting ends ==========
-        println!("\n--- Step 6: Alice (host) disconnects - meeting should end ---");
+        // ========== STEP 6: Alice (last) disconnects ==========
+        println!("\n--- Step 6: Alice disconnects - session ends ---");
 
         session_alice.close(0u32, b"test disconnect");
         drop(session_alice);
@@ -1235,30 +1182,15 @@ mod tests {
         assert_eq!(count, 0, "Should have 0 active participants");
         println!("✓ Participant count: {count}");
 
-        // Meeting should be ended
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert!(
-            meeting.ended_at.is_some(),
-            "Meeting should be ended when last participant leaves"
-        );
-        println!("✓ Meeting ended at {:?}", meeting.ended_at);
-
         // ========== CLEANUP ==========
         cleanup_room(&pool, room_id).await;
 
-        println!("\n=== MEETING LIFECYCLE TEST PASSED (WebTransport) ===");
+        println!("\n=== SESSION LIFECYCLE TEST PASSED (WebTransport) ===");
         Ok(())
     }
 
     async fn cleanup_room(pool: &sqlx::PgPool, room_id: &str) {
         let _ = sqlx::query("DELETE FROM session_participants WHERE room_id = $1")
-            .bind(room_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM meetings WHERE room_id = $1")
             .bind(room_id)
             .execute(pool)
             .await;

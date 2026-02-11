@@ -16,8 +16,6 @@
  * conditions.
  */
 
-pub mod meeting;
-pub mod meeting_participant;
 pub mod session_participant;
 
 use actix::Addr;

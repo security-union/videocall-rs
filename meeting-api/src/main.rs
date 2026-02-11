@@ -40,13 +40,20 @@ async fn main() {
 
     tracing::info!("Connected to PostgreSQL");
 
-    // CORS: mirror the request Origin so that credentials (HttpOnly session
-    // cookie) work across origins in development.  In production the API is
-    // typically behind a reverse proxy on the same domain.
+    // CORS: In production set `CORS_ALLOWED_ORIGIN` to the exact frontend
+    // origin (e.g. "https://app.videocall.rs").  When unset, the server
+    // mirrors the request origin which is convenient for development but
+    // **insecure** in production (any site can make credentialed requests).
     //
     // `allow_credentials(true)` requires explicit methods and headers (not *).
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::mirror_request())
+        .allow_origin(match &config.cors_allowed_origin {
+            Some(origin) => {
+                let hv: http::HeaderValue = origin.parse().expect("invalid CORS_ALLOWED_ORIGIN");
+                AllowOrigin::exact(hv)
+            }
+            None => AllowOrigin::mirror_request(),
+        })
         .allow_methods([
             http::Method::GET,
             http::Method::POST,

@@ -76,6 +76,10 @@ The session JWT contains these claims:
 
 > **Note**: The session JWT authenticates requests to the Meeting Backend only. To connect to the Media Server, clients must present a separate **room access token** (JWT) issued by the Meeting Backend when a participant is admitted to a meeting.
 
+### CORS
+
+The Meeting Backend supports cross-origin requests with credentials. Set `CORS_ALLOWED_ORIGIN` to the exact frontend origin in production (e.g. `https://app.videocall.rs`). When unset, the server mirrors the request `Origin` for development convenience. See [Meeting Ownership & Architecture](MEETING_OWNERSHIP.md#cors-and-deployment-topology) for deployment recommendations.
+
 ## Room Access Token
 
 The room access token is a signed JWT (HMAC-SHA256) that authorizes a client to connect to the Media Server for a specific room. See [Meeting Ownership & Architecture](MEETING_OWNERSHIP.md#room-access-token) for the full token specification.
@@ -964,47 +968,3 @@ make tests_down
 2. `cargo clippy -- -D warnings` (workspace-wide)
 3. `cargo machete` (unused dependency check)
 4. Docker integration tests (both `meeting-api` and `videocall-api` against PostgreSQL)
-
-### Test Coverage
-
-The test suite includes **101 tests** across both crates:
-
-#### Meeting Backend (49+ tests: 30 unit + 25 integration)
-
-| Category | Tests |
-|----------|-------|
-| **Meeting CRUD** | Create meeting success, auto-generate ID, duplicate ID, too many attendees, get meeting success, not found, list meetings with pagination, delete success, not owner (403) |
-| **Participant Flow** | Host joins and activates + receives token, attendee waits, meeting not active, leave success, get status success, get participants |
-| **Waiting Room** | Get waiting room, admit success, admit not found, admit all, reject |
-| **Session Auth (AuthUser)** | Valid session cookie, valid Bearer token, missing credentials (401), invalid JWT (401), expired JWT (401), wrong secret (401), cookie precedence over Bearer, session cookie among multiple cookies |
-| **Session Token** | Round-trip, wrong secret fails, expired fails, iat is set |
-| **Room Token Generation** | Round-trip validation, issuer correctness, expiration TTL, room_join flag |
-| **Error Responses** | 401/403/404/409 codes, engineering_error field |
-| **Ad-hoc Join** | Auto-creates meeting, issued token is valid JWT |
-| **Meeting ID Validation** | Alphanumeric, hyphens, underscores, rejects special chars, rejects empty/too-long, generated IDs are unique and valid |
-
-#### Media Server (52 tests: 44 unit + 8 JWT integration)
-
-| Category | Tests |
-|----------|-------|
-| **JWT Validation (unit)** | decode_room_token: valid/expired/wrong secret/room_join=false/garbage. validate_room_token (deprecated): valid/room mismatch/identity mismatch |
-| **JWT Integration (WebSocket)** | Token endpoint (`/lobby?token=`): valid connects, expired rejected, room_join=false rejected, invalid signature rejected, garbage rejected, identity extracted from JWT. Deprecated endpoint (`/lobby/{email}/{room}`): FF=off allows, FF=on returns 410 Gone |
-| **Session Management** | Start/end session, system email rejection, protobuf packet builders |
-| **Chat Server** | Join room success, system email rejection, join without session, cleanup retry |
-| **WebSocket Lifecycle** | End-to-end meeting lifecycle over WebSocket |
-| **WebTransport** | Meeting lifecycle, relay between two clients, lobby isolation |
-| **Metrics** | 19 tests covering metrics export, session tracking, health packets, cleanup |
-| **Packet Handling** | Packet classification, RTT detection |
-
-### CI/CD
-
-Tests run automatically on pull requests that modify:
-- `actix-api/**` - Media Server source code
-- `meeting-api/**` - Meeting Backend source code
-- `dbmate/**` - Database migrations
-- `videocall-types/**` - Shared types (media/transport)
-- `videocall-meeting-types/**` - Shared types (meeting API)
-- `protobuf/**` - Protocol buffers
-- `docker/**` - Docker configuration
-
-See `.github/workflows/cargo-test.yaml` for the full workflow configuration.

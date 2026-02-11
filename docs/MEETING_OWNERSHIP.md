@@ -146,7 +146,41 @@ The system uses two separate JWTs with different purposes and delivery mechanism
 
 - `HttpOnly` -- JavaScript cannot read the cookie, preventing XSS token theft
 - `Secure` -- Cookie is only sent over HTTPS (configurable via `COOKIE_SECURE=false` for local dev)
-- `SameSite=Lax` -- Cookie is sent on top-level navigations (so meeting links from Slack/email work) but not on cross-site AJAX
+- `SameSite=Lax` -- Cookie is sent on top-level navigations (so meeting links from Slack/email work) but not on cross-site sub-requests
+
+### CORS and Deployment Topology
+
+The Meeting Backend enforces CORS on all responses. The behavior depends on the `CORS_ALLOWED_ORIGIN` environment variable:
+
+| Environment | `CORS_ALLOWED_ORIGIN` | Behavior |
+|---|---|---|
+| **Production** | `https://app.videocall.rs` | Only the specified origin can make credentialed requests |
+| **Development** | unset / empty | Mirrors the request `Origin` header (any origin accepted) |
+
+**Production deployment recommendations:**
+
+- **Same registrable domain** (e.g. `app.videocall.rs` + `api.videocall.rs`): Set `COOKIE_DOMAIN=.videocall.rs` so the session cookie is sent to both subdomains. `SameSite=Lax` works because both subdomains share the same eTLD+1.
+- **Reverse proxy** (e.g. `videocall.rs/` for frontend, `videocall.rs/api/` proxied to meeting-api): No CORS needed at all -- same origin. `SameSite=Lax` just works.
+- **Different domains** (e.g. `videocall-app.com` + `videocall-api.com`): **Not recommended.** `SameSite=Lax` cookies will not be sent on cross-site `fetch()` requests. Would require `SameSite=None; Secure` which opens CSRF surface.
+
+### Meeting Backend Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | Yes | -- | PostgreSQL connection string |
+| `JWT_SECRET` | Yes | -- | Shared HMAC-SHA256 secret (must match Media Server) |
+| `LISTEN_ADDR` | No | `0.0.0.0:8081` | HTTP bind address |
+| `TOKEN_TTL_SECS` | No | `600` | Room access token lifetime (seconds) |
+| `SESSION_TTL_SECS` | No | `315360000` (~10y) | Session JWT lifetime (seconds) |
+| `COOKIE_DOMAIN` | No | -- | Cookie `Domain` attribute (e.g. `.videocall.rs`) |
+| `COOKIE_SECURE` | No | `true` | Set `false` for local HTTP development |
+| `CORS_ALLOWED_ORIGIN` | No | -- | Production: exact frontend origin. Unset for dev. |
+| `OAUTH_CLIENT_ID` | No | -- | Google OAuth client ID (disables OAuth if unset) |
+| `OAUTH_SECRET` | Cond. | -- | Google OAuth client secret (required if `OAUTH_CLIENT_ID` set) |
+| `OAUTH_REDIRECT_URL` | Cond. | -- | OAuth callback URL (required if `OAUTH_CLIENT_ID` set) |
+| `OAUTH_AUTH_URL` | No | Google default | OAuth authorization endpoint |
+| `OAUTH_TOKEN_URL` | No | Google default | OAuth token endpoint |
+| `AFTER_LOGIN_URL` | No | `/` | Redirect target after successful OAuth login |
 
 ---
 

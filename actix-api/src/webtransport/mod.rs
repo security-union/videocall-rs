@@ -542,6 +542,25 @@ mod tests {
         Ok(client.connect(url).await?)
     }
 
+    /// Connect via the token-based endpoint: GET /lobby?token=<JWT>
+    async fn connect_client_with_token(
+        token: &str,
+    ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let url_str = format!(
+            "{}/lobby?token={}",
+            base.trim_end_matches('/'),
+            urlencoding::encode(token)
+        );
+        let url = url::Url::parse(&url_str)?;
+
+        let client = unsafe {
+            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
+        };
+        Ok(client.connect(url).await?)
+    }
+
     async fn send_packet(session: &web_transport_quinn::Session, bytes: Vec<u8>) {
         let mut s = session.open_uni().await.expect("open uni");
         s.write_all(&bytes).await.expect("write packet");
@@ -1157,5 +1176,193 @@ mod tests {
         sqlx::PgPool::connect(&database_url)
             .await
             .expect("Failed to connect to test database")
+    }
+
+    // =====================================================================
+    // JWT token-based WebTransport tests
+    // =====================================================================
+
+    const JWT_SECRET: &str = "test-secret-for-integration-tests";
+    const TOKEN_TTL_SECS: i64 = 600;
+
+    /// Set up env and start the real WT server for JWT tests.
+    async fn setup_jwt_wt() {
+        std::env::set_var("JWT_SECRET", JWT_SECRET);
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+        let _handle = start_webtransport_server().await;
+        wait_for_server_ready().await;
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_valid_token_connects() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "alice@test.com",
+            "wt-jwt-room-1",
+            true,
+            "Alice",
+        )
+        .expect("generate token");
+
+        let session = connect_client_with_token(&token)
+            .await
+            .expect("valid token should connect via WebTransport");
+        wait_for_session_ready(&session, "alice")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_expired_token_rejected() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            -120,
+            "alice@test.com",
+            "wt-jwt-room-2",
+            false,
+            "Alice",
+        )
+        .expect("generate token");
+
+        let result = connect_client_with_token(&token).await;
+        assert!(
+            result.is_err(),
+            "expired token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_wrong_secret_rejected() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            "completely-different-secret",
+            TOKEN_TTL_SECS,
+            "alice@test.com",
+            "wt-jwt-room-3",
+            false,
+            "Alice",
+        )
+        .expect("generate token");
+
+        let result = connect_client_with_token(&token).await;
+        assert!(
+            result.is_err(),
+            "wrong-secret token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_garbage_token_rejected() {
+        setup_jwt_wt().await;
+
+        let result = connect_client_with_token("not.a.real.jwt").await;
+        assert!(
+            result.is_err(),
+            "garbage token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_token_identity_extracted() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "bob@example.com",
+            "wt-special-room",
+            false,
+            "Bob",
+        )
+        .expect("generate token");
+
+        let session = connect_client_with_token(&token)
+            .await
+            .expect("token with identity should connect");
+        wait_for_session_ready(&session, "bob")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_deprecated_endpoint_works_ff_off() {
+        setup_jwt_wt().await;
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let session = connect_client("alice", "wt-jwt-room-6")
+            .await
+            .expect("deprecated endpoint with FF=off should work");
+        wait_for_session_ready(&session, "alice")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_deprecated_endpoint_rejected_ff_on() {
+        setup_jwt_wt().await;
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+
+        let result = connect_client("alice", "wt-jwt-room-7").await;
+        assert!(
+            result.is_err(),
+            "deprecated endpoint with FF=on should be rejected"
+        );
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_host_and_attendee_tokens_both_connect() {
+        setup_jwt_wt().await;
+
+        let room = "wt-standup";
+
+        let host_token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "host@co.com",
+            room,
+            true,
+            "Host",
+        )
+        .expect("generate host token");
+
+        let attendee_token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "attendee@co.com",
+            room,
+            false,
+            "Attendee",
+        )
+        .expect("generate attendee token");
+
+        let host = connect_client_with_token(&host_token)
+            .await
+            .expect("host token should connect");
+        wait_for_session_ready(&host, "host")
+            .await
+            .expect("host should receive MEETING_STARTED");
+
+        let attendee = connect_client_with_token(&attendee_token)
+            .await
+            .expect("attendee token should connect");
+        wait_for_session_ready(&attendee, "attendee")
+            .await
+            .expect("attendee should receive MEETING_STARTED");
+
+        host.close(0u32, b"done");
+        attendee.close(0u32, b"done");
     }
 }

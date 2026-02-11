@@ -35,6 +35,9 @@ pub struct Config {
     /// Whether to set the `Secure` flag on cookies (default: true).
     /// Set `COOKIE_SECURE=false` for local development over HTTP.
     pub cookie_secure: bool,
+    /// Explicit CORS allowed origin for production (e.g. "https://app.videocall.rs").
+    /// When `None`, the server mirrors the request origin (development only).
+    pub cors_allowed_origin: Option<String>,
 }
 
 /// Google OAuth configuration.
@@ -61,6 +64,7 @@ impl Config {
     /// - `COOKIE_DOMAIN`
     /// - OAuth: `OAUTH_CLIENT_ID`, `OAUTH_SECRET`, `OAUTH_REDIRECT_URL`,
     ///   `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `AFTER_LOGIN_URL`
+    /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"`)
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("DATABASE_URL")
             .map_err(|_| "DATABASE_URL environment variable is required")?;
@@ -80,6 +84,9 @@ impl Config {
         let cookie_secure = env::var("COOKIE_SECURE")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
+        let cors_allowed_origin = env::var("CORS_ALLOWED_ORIGIN")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
@@ -111,6 +118,7 @@ impl Config {
             oauth,
             cookie_domain,
             cookie_secure,
+            cors_allowed_origin,
         })
     }
 }

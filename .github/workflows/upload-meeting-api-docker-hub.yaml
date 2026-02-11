@@ -33,7 +33,7 @@ jobs:
 
       - name: Extract branch name
         id: extract_branch
-        run: echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> "$GITHUB_OUTPUT"
+        run: echo "branch=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's/\//-/g')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Meeting API Docker image
         uses: docker/build-push-action@v5

@@ -22,7 +22,6 @@ pub mod auth;
 pub mod client_diagnostics;
 pub mod constants;
 pub mod db;
-pub mod db_pool;
 pub mod messages;
 pub mod metrics;
 pub mod models;

@@ -42,13 +42,12 @@ use sec_api::{
     },
     constants::VALID_ID_PATTERN,
     db::{get_pool, PostgresPool},
-    db_pool,
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
 };
-use tracing::{debug, error, info, warn};
-use videocall_types::{feature_flags::FeatureFlags, truthy};
+use tracing::{debug, error, info};
+use videocall_types::truthy;
 
 const SCOPE: &str = "email profile";
 
@@ -343,24 +342,10 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to NATS");
 
-    // Create sqlx pool for session management only if database is enabled
-    let sqlx_pool = if FeatureFlags::database_enabled() {
-        Some(
-            db_pool::create_pool()
-                .await
-                .expect("Failed to create database pool"),
-        )
-    } else {
-        warn!("DATABASE_ENABLED=false, database features will be disabled");
-        None
-    };
+    let chat = ChatServer::new(nats_client.clone()).await.start();
 
-    let chat = ChatServer::new(nats_client.clone(), sqlx_pool.clone())
-        .await
-        .start();
-
-    // Create SessionManager with the pool
-    let session_manager = SessionManager::new(sqlx_pool.clone());
+    // Create SessionManager
+    let session_manager = SessionManager::new();
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
@@ -392,7 +377,7 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::permissive();
 
         if oauth_client_id.is_empty() {
-            let mut app = App::new()
+            App::new()
                 .wrap(cors)
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
@@ -403,19 +388,12 @@ async fn main() -> std::io::Result<()> {
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
-                .service(ws_connect);
-
-            // Add API routes if database is enabled
-            if let Some(ref pool) = sqlx_pool {
-                app = app
-                    .app_data(web::Data::new(pool.clone()))
-                    .configure(api::configure_api_routes);
-            }
-            app
+                .service(ws_connect)
+                .configure(api::configure_api_routes)
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
-            let mut app = App::new()
+            App::new()
                 .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
@@ -437,15 +415,8 @@ async fn main() -> std::io::Result<()> {
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
-                .service(ws_connect);
-
-            // Add API routes with sqlx pool
-            if let Some(ref sqlx_pool) = sqlx_pool {
-                app = app
-                    .app_data(web::Data::new(sqlx_pool.clone()))
-                    .configure(api::configure_api_routes);
-            }
-            app
+                .service(ws_connect)
+                .configure(api::configure_api_routes)
         } else {
             // OAuth configured but database disabled - skip OAuth routes
             error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");

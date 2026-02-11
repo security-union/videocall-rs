@@ -292,7 +292,6 @@ impl WsChatSession {
 mod tests {
     use super::*;
     use crate::actors::chat_server::ChatServer;
-    use crate::models::session_participant::SessionParticipant;
     use crate::server_diagnostics::ServerDiagnostics;
     use crate::session_manager::SessionManager;
     use actix::Actor;
@@ -301,36 +300,28 @@ mod tests {
     use futures_util::StreamExt;
     use protobuf::Message as ProtoMessage;
     use serial_test::serial;
-    use sqlx::PgPool;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
 
-    async fn get_test_pool() -> PgPool {
+    /// Test helper: create a database pool for future JWT flow integration tests.
+    #[allow(dead_code)]
+    async fn get_test_pool() -> sqlx::PgPool {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
-        PgPool::connect(&database_url)
+        sqlx::PgPool::connect(&database_url)
             .await
             .expect("Failed to connect to test database")
     }
 
-    async fn cleanup_room(pool: &PgPool, room_id: &str) {
-        let _ = sqlx::query("DELETE FROM session_participants WHERE room_id = $1")
-            .bind(room_id)
-            .execute(pool)
-            .await;
-    }
-
     /// Start WebSocket server for testing
-    async fn start_websocket_server(pool: PgPool, port: u16) {
+    async fn start_websocket_server(port: u16) {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        let chat = ChatServer::new(nats_client.clone(), Some(pool.clone()))
-            .await
-            .start();
-        let session_manager = SessionManager::new(Some(pool));
+        let chat = ChatServer::new(nats_client.clone()).await.start();
+        let session_manager = SessionManager::new();
 
         let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
 
@@ -436,25 +427,6 @@ mod tests {
         anyhow::bail!("Timeout waiting for MEETING_STARTED")
     }
 
-    async fn wait_for_participant_count(
-        pool: &PgPool,
-        room_id: &str,
-        expected: i64,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
-            let count = SessionParticipant::count_active(pool, room_id)
-                .await
-                .unwrap_or(-1);
-            if count == expected {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        anyhow::bail!("Timeout waiting for participant count to be {expected}")
-    }
-
     #[actix_rt::test]
     #[serial]
     async fn test_meeting_lifecycle_websocket() {
@@ -479,14 +451,11 @@ mod tests {
     async fn test_meeting_lifecycle_ws_impl() -> anyhow::Result<()> {
         println!("=== STARTING SESSION LIFECYCLE TEST (WebSocket) ===");
 
-        let pool = get_test_pool().await;
         let room_id = "ws-meeting-lifecycle-test";
         let port = 18080; // Use a unique port for testing
 
-        cleanup_room(&pool, room_id).await;
-
         println!("Starting WebSocket server on port {port}...");
-        start_websocket_server(pool.clone(), port).await;
+        start_websocket_server(port).await;
 
         // Wait for server to be ready
         wait_for_server_ready(port).await;
@@ -501,15 +470,6 @@ mod tests {
         wait_for_meeting_started(&mut ws_alice, Duration::from_secs(5)).await?;
         println!("✓ Alice connected and received MEETING_STARTED");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 1,
-            "Should have 1 active participant after Alice joins"
-        );
-        println!("✓ Participant count: {count}");
-
         // ========== STEP 2: Second user connects ==========
         println!("\n--- Step 2: Bob connects (second participant) ---");
 
@@ -517,13 +477,7 @@ mod tests {
             .await
             .expect("connect bob");
         wait_for_meeting_started(&mut ws_bob, Duration::from_secs(5)).await?;
-        println!("✓ Bob connected");
-
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 2, "Should have 2 active participants");
-        println!("✓ Participant count: {count}");
+        println!("✓ Bob connected and received MEETING_STARTED");
 
         // ========== STEP 3: Third user connects ==========
         println!("\n--- Step 3: Charlie connects (third participant) ---");
@@ -532,55 +486,25 @@ mod tests {
             .await
             .expect("connect charlie");
         wait_for_meeting_started(&mut ws_charlie, Duration::from_secs(5)).await?;
-        println!("✓ Charlie connected");
+        println!("✓ Charlie connected and received MEETING_STARTED");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 3, "Should have 3 active participants");
-        println!("✓ Participant count: {count}");
-
-        // ========== STEP 4: Charlie disconnects - count drops ==========
+        // ========== STEP 4: Charlie disconnects ==========
         println!("\n--- Step 4: Charlie disconnects ---");
-
         drop(ws_charlie);
-        wait_for_participant_count(&pool, room_id, 2, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Charlie disconnected");
-
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 2, "Should have 2 active participants");
-        println!("✓ Participant count: {count}");
 
         // ========== STEP 5: Bob disconnects ==========
         println!("\n--- Step 5: Bob disconnects ---");
-
         drop(ws_bob);
-        wait_for_participant_count(&pool, room_id, 1, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Bob disconnected");
-
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 1, "Should have 1 active participant");
-        println!("✓ Participant count: {count}");
 
         // ========== STEP 6: Alice (last) disconnects ==========
         println!("\n--- Step 6: Alice disconnects - session ends ---");
-
         drop(ws_alice);
-        wait_for_participant_count(&pool, room_id, 0, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Alice disconnected");
-
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 0, "Should have 0 active participants");
-        println!("✓ Participant count: {count}");
-
-        // ========== CLEANUP ==========
-        cleanup_room(&pool, room_id).await;
 
         println!("\n=== SESSION LIFECYCLE TEST PASSED (WebSocket) ===");
         Ok(())

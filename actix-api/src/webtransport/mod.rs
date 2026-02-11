@@ -27,7 +27,6 @@ use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
 use bridge::WebTransportBridge;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use sqlx::PgPool;
 use std::io::Read;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
@@ -158,7 +157,6 @@ pub async fn start(
     opt: WebTransportOpt,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
-    pool: Option<PgPool>,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -212,7 +210,6 @@ pub async fn start(
         trace_span!("New connection being attempted");
         let chat_server = chat_server.clone();
         let nats_client = nats_client.clone();
-        let pool = pool.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
         actix_rt::spawn(async move {
@@ -220,7 +217,6 @@ pub async fn start(
                 request,
                 chat_server,
                 nats_client,
-                pool,
                 tracker_sender,
                 session_manager,
             )
@@ -238,7 +234,6 @@ async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
-    _pool: Option<PgPool>,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
 ) -> anyhow::Result<()> {
@@ -364,13 +359,11 @@ mod tests {
             error!("Error installing crypto provider: {e:?}");
         }
         use crate::actors::chat_server::ChatServer;
-        use crate::db_pool;
         use crate::server_diagnostics::ServerDiagnostics;
         use crate::session_manager::SessionManager;
         use crate::webtransport::{self, Certs};
         use actix::Actor;
         use std::net::ToSocketAddrs;
-        use videocall_types::feature_flags::FeatureFlags;
 
         // Connect to NATS
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
@@ -378,24 +371,11 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        // Create database pool only if enabled
-        let pool = if FeatureFlags::database_enabled() {
-            Some(
-                db_pool::create_pool()
-                    .await
-                    .expect("Failed to create database pool"),
-            )
-        } else {
-            None
-        };
-
         // Start ChatServer actor
-        let chat_server = ChatServer::new(nats_client.clone(), pool.clone())
-            .await
-            .start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         // Create SessionManager
-        let session_manager = SessionManager::new(pool.clone());
+        let session_manager = SessionManager::new();
 
         // Create connection tracker
         let (_, tracker_sender, tracker_receiver) =
@@ -434,7 +414,6 @@ mod tests {
                 opt,
                 chat_server,
                 nats_client,
-                pool,
                 tracker_sender,
                 session_manager,
             )
@@ -1061,18 +1040,9 @@ mod tests {
     }
 
     async fn test_meeting_lifecycle_impl() -> anyhow::Result<()> {
-        use crate::models::session_participant::SessionParticipant;
-
         println!("=== STARTING SESSION LIFECYCLE TEST (WebTransport) ===");
 
-        // Get database pool for verification queries
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for this test");
-        let pool = sqlx::PgPool::connect(&database_url).await?;
-
-        // Clean up any stale test data
         let room_id = "wt-meeting-lifecycle-test";
-        cleanup_room(&pool, room_id).await;
 
         println!("Starting WebTransport server...");
         let _wt_handle = start_webtransport_server().await;
@@ -1090,15 +1060,6 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("✓ Alice connected");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 1,
-            "Should have 1 active participant after Alice joins"
-        );
-        println!("✓ Participant count: {count}");
-
         // ========== STEP 2: Second user connects ==========
         println!("\n--- Step 2: Bob connects (second participant) ---");
 
@@ -1107,15 +1068,6 @@ mod tests {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("✓ Bob connected");
-
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 2,
-            "Should have 2 active participants after Bob joins"
-        );
-        println!("✓ Participant count: {count}");
 
         // ========== STEP 3: Third user connects ==========
         println!("\n--- Step 3: Charlie connects (third participant) ---");
@@ -1128,98 +1080,38 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("✓ Charlie connected");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 3, "Should have 3 active participants");
-        println!("✓ Participant count: {count}");
-
-        // ========== STEP 4: Charlie disconnects - count drops ==========
+        // ========== STEP 4: Charlie disconnects ==========
         println!("\n--- Step 4: Charlie disconnects ---");
-
         session_charlie.close(0u32, b"test disconnect");
         drop(session_charlie);
-        wait_for_participant_count(&pool, room_id, 2, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Charlie disconnected");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 2,
-            "Should have 2 active participants after Charlie leaves"
-        );
-        println!("✓ Participant count: {count}");
-
-        // ========== STEP 5: Bob disconnects - count drops ==========
+        // ========== STEP 5: Bob disconnects ==========
         println!("\n--- Step 5: Bob disconnects ---");
-
         session_bob.close(0u32, b"test disconnect");
         drop(session_bob);
-        wait_for_participant_count(&pool, room_id, 1, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Bob disconnected");
-
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 1,
-            "Should have 1 active participant after Bob leaves"
-        );
-        println!("✓ Participant count: {count}");
 
         // ========== STEP 6: Alice (last) disconnects ==========
         println!("\n--- Step 6: Alice disconnects - session ends ---");
-
         session_alice.close(0u32, b"test disconnect");
         drop(session_alice);
-        wait_for_participant_count(&pool, room_id, 0, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Alice disconnected");
-
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 0, "Should have 0 active participants");
-        println!("✓ Participant count: {count}");
-
-        // ========== CLEANUP ==========
-        cleanup_room(&pool, room_id).await;
 
         println!("\n=== SESSION LIFECYCLE TEST PASSED (WebTransport) ===");
         Ok(())
     }
 
-    async fn cleanup_room(pool: &sqlx::PgPool, room_id: &str) {
-        let _ = sqlx::query("DELETE FROM session_participants WHERE room_id = $1")
-            .bind(room_id)
-            .execute(pool)
-            .await;
-    }
-
-    async fn wait_for_participant_count(
-        pool: &sqlx::PgPool,
-        room_id: &str,
-        expected: i64,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        use crate::models::session_participant::SessionParticipant;
-        let room = room_id.to_string();
-        let pool = pool.clone();
-        wait_for_condition_bool(
-            || {
-                let pool = pool.clone();
-                let room = room.clone();
-                async move {
-                    SessionParticipant::count_active(&pool, &room)
-                        .await
-                        .unwrap_or(-1)
-                        == expected
-                }
-            },
-            timeout,
-            Duration::from_millis(100),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!(e))
+    /// Test helper: create a database pool for future JWT flow integration tests.
+    #[allow(dead_code)]
+    async fn get_test_pool() -> sqlx::PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for this test");
+        sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("Failed to connect to test database")
     }
 }

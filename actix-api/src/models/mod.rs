@@ -16,8 +16,6 @@
  * conditions.
  */
 
-pub mod session_participant;
-
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;

@@ -20,14 +20,12 @@ use std::net::ToSocketAddrs;
 
 use actix::Actor;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use sec_api::actors::chat_server::ChatServer;
-use sec_api::db_pool;
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
 use sec_api::webtransport::{self, Certs};
-use videocall_types::feature_flags::FeatureFlags;
 
 async fn health_responder() -> impl Responder {
     HttpResponse::Ok().body("Ok")
@@ -53,26 +51,12 @@ async fn main() {
         .expect("Failed to connect to NATS");
     info!("Connected to NATS at {}", nats_url);
 
-    // Create database pool only if enabled
-    let pool = if FeatureFlags::database_enabled() {
-        Some(
-            db_pool::create_pool()
-                .await
-                .expect("Failed to create database pool"),
-        )
-    } else {
-        warn!("DATABASE_ENABLED=false, database features will be disabled");
-        None
-    };
-
     // Start ChatServer actor
-    let chat_server = ChatServer::new(nats_client.clone(), pool.clone())
-        .await
-        .start();
+    let chat_server = ChatServer::new(nats_client.clone()).await.start();
     info!("ChatServer actor started");
 
     // Create SessionManager
-    let session_manager = SessionManager::new(pool.clone());
+    let session_manager = SessionManager::new();
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
@@ -136,7 +120,6 @@ async fn main() {
             opt,
             chat_server,
             nats_client,
-            pool,
             tracker_sender,
             session_manager,
         )

@@ -6,7 +6,7 @@ rustlemania-websocket:
   replicaCount: 1
 
   image:
-    repository: securityunion/rustlemania-api
+    repository: securityunion/videocall-media-server
     pullPolicy: Always
     tag: latest
 

@@ -27,6 +27,12 @@ changelog_update = true
 git_release_enable = true
 
 [[package]]
+name = "videocall-meeting-types"
+publish = true
+changelog_update = true
+git_release_enable = true
+
+[[package]]
 name = "bot"
 publish = true
 changelog_update = true
@@ -35,6 +41,13 @@ release = true
 
 [[package]]
 name = "videocall-api"
+publish = false
+changelog_update = false
+git_release_enable = false
+release = false
+
+[[package]]
+name = "meeting-api"
 publish = false
 changelog_update = false
 git_release_enable = false

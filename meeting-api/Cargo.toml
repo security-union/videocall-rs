@@ -1,0 +1,45 @@
+[package]
+name = "meeting-api"
+version = "0.1.0"
+edition = "2021"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+license = "MIT OR Apache-2.0"
+authors = ["Dario Lencina <dario@securityunion.dev>"]
+description = "Meeting Backend API server (Axum) for videocall.rs"
+
+[lib]
+name = "meeting_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "meeting-api"
+path = "src/main.rs"
+
+[dependencies]
+videocall-meeting-types = { path = "../videocall-meeting-types" }
+
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "json"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+jsonwebtoken = "9"
+argon2 = "0.5"
+regex = "1"
+rand = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+oauth2 = "4"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+serial_test = "3"

@@ -1,10 +1,12 @@
-# Meeting Ownership and Workflow
+# Meeting Ownership and Architecture
 
-This document describes the meeting ownership model, lifecycle, and user workflows in videocall.rs.
+This document describes the system architecture, meeting ownership model, token-based access control, and user workflows in videocall.rs.
 
 ## Table of Contents
 
-- [Overview](#overview)
+- [Shared Types Crate](#shared-types-crate)
+- [System Architecture](#system-architecture)
+- [Room Access Token](#room-access-token)
 - [Meeting Ownership](#meeting-ownership)
 - [Meeting Lifecycle](#meeting-lifecycle)
 - [User Interface Workflows](#user-interface-workflows)
@@ -15,15 +17,171 @@ This document describes the meeting ownership model, lifecycle, and user workflo
 
 ---
 
-## Overview
+## Shared Types Crate
 
-videocall.rs implements a meeting ownership model where:
+The `videocall-meeting-types` crate defines all API types shared between the Meeting Backend and its consumers. It is framework-agnostic -- no actix-web, no database dependencies.
 
-- **Every meeting has an owner** (the user who created it)
-- **The owner is identified by their email address** (from OAuth authentication)
-- **Ownership persists** even after the meeting ends
-- **Only owners can delete their meetings**
-- **The "My Meetings" list shows only meetings owned by the current user**
+**Key types**:
+
+- `APIResponse<A>` -- Generic envelope: `{ "success": bool, "result": A }`. Every endpoint uses this.
+- `APIError` -- Error payload with `code`, `message`, and optional `engineering_error` for debugging.
+- `RoomAccessTokenClaims` -- JWT claims struct for room access tokens (used by both the Meeting Backend to sign and the Media Server to validate).
+- Request types (`CreateMeetingRequest`, `JoinMeetingRequest`, `AdmitRequest`, `ListMeetingsQuery`).
+- Response types (`CreateMeetingResponse`, `MeetingInfoResponse`, `ParticipantStatusResponse`, `WaitingRoomResponse`, `AdmitAllResponse`, `DeleteMeetingResponse`, `ListMeetingsResponse`, `MeetingSummary`).
+
+The Meeting Backend depends on this crate for serialization. The Media Server depends on it only for `RoomAccessTokenClaims` (to validate JWT tokens). Clients and integration tests depend on it for both request and response types.
+
+---
+
+## System Architecture
+
+videocall.rs is composed of two independent services that communicate through a shared JWT secret:
+
+```
+┌──────────────────────────────────┐   ┌──────────────────────────────────┐
+│       Meeting Backend            │   │         Media Server             │
+│       (Port 8081)                │   │         (Port 8080)              │
+│                                  │   │                                  │
+│  ┌────────────┐  ┌────────────┐  │   │  ┌────────────┐  ┌───────────┐  │
+│  │ OAuth      │  │ REST API   │  │   │  │ WebSocket  │  │ WebTrans- │  │
+│  │ Login      │  │ /api/v1/   │  │   │  │ Endpoint   │  │ port      │  │
+│  └────────────┘  └─────┬──────┘  │   │  └─────┬──────┘  └─────┬─────┘  │
+│                        │         │   │        │                │        │
+│  ┌─────────────────────┴──────┐  │   │  ┌─────┴────────────────┴─────┐  │
+│  │ Meeting Management         │  │   │  │ JWT Validator               │  │
+│  │ - CRUD, waiting room       │  │   │  │ - Verify signature          │  │
+│  │ - Admission decisions      │  │   │  │ - Extract room + identity   │  │
+│  │ - Participant state        │  │   │  │ - Reject invalid tokens     │  │
+│  └─────────────┬──────────────┘  │   │  └────────────────────────────┘  │
+│                │                 │   │                                  │
+│  ┌─────────────┴──────────────┐  │   │  ┌────────────────────────────┐  │
+│  │ JWT Token Generator        │  │   │  │ NATS Pub/Sub               │  │
+│  │ - Signs room access tokens │  │   │  │ - Media relay              │  │
+│  └────────────────────────────┘  │   │  └────────────────────────────┘  │
+│                                  │   │                                  │
+│  ┌────────────────────────────┐  │   │                                  │
+│  │ PostgreSQL                 │  │   │                                  │
+│  │ - meetings                 │  │   │                                  │
+│  │ - meeting_participants     │  │   │                                  │
+│  └────────────────────────────┘  │   │                                  │
+└──────────────────────────────────┘   └──────────────────────────────────┘
+         │                                         ▲
+         │          Shared JWT Secret               │
+         └─────────────────────────────────────────┘
+```
+
+### Service Responsibilities
+
+**Meeting Backend** (separate binary, its own process and port):
+- Handles OAuth login and user authentication (email cookie)
+- Manages all meeting CRUD operations (create, list, get, delete)
+- Manages the waiting room, admission, and participant state
+- Issues signed **room access tokens** (JWTs) when a participant is admitted
+- Owns the `meetings` and `meeting_participants` database tables
+- Is the **single source of truth** for meeting state and participant status
+
+**Media Server** (existing WebSocket/WebTransport server):
+- Handles real-time audio/video/data transport
+- Validates room access tokens on every connection attempt
+- Extracts identity, room, and permissions from the JWT claims
+- **Rejects connections without a valid, signed token**
+- Does not create, manage, or track meetings -- it is stateless with respect to meeting lifecycle
+- Relays media via NATS pub/sub
+
+### Why Two Services?
+
+Separating the Meeting Backend from the Media Server provides:
+
+- **Enforced access control**: A client cannot connect to a media session without first going through the Meeting Backend's admission flow. There is no way to bypass the waiting room.
+- **Single source of truth**: All meeting state lives in the Meeting Backend's database. The Media Server does not maintain its own parallel participant tracking.
+- **Independent scaling**: The Meeting Backend (REST API + database) and Media Server (real-time transport) have different scaling characteristics and can be scaled independently.
+- **Clean separation of concerns**: Business logic (meetings, ownership, admission) is fully separated from transport logic (media relay, codecs, NATS).
+
+---
+
+## Room Access Token
+
+The room access token is a signed JWT that bridges the Meeting Backend and the Media Server. It is the **only way** to connect to a media session.
+
+### Token Flow
+
+```
+ Client                  Meeting Backend              Media Server
+   │                          │                            │
+   │  1. POST /join           │                            │
+   │  (cookie auth)           │                            │
+   │ ────────────────────────>│                            │
+   │                          │                            │
+   │  2. APIResponse:         │                            │
+   │  {success: true,         │                            │
+   │   result.status:         │                            │
+   │     "waiting"}           │                            │
+   │ <────────────────────────│                            │
+   │                          │                            │
+   │  3. GET /status (poll)   │                            │
+   │ ────────────────────────>│                            │
+   │                          │                            │
+   │  4. APIResponse:         │                            │
+   │  {success: true,         │                            │
+   │   result.status:         │                            │
+   │     "admitted",          │                            │
+   │   result.room_token:     │                            │
+   │     "ey.."}              │                            │
+   │ <────────────────────────│                            │
+   │                          │                            │
+   │  5. Connect with token   │                            │
+   │ ─────────────────────────────────────────────────────>│
+   │                          │                            │
+   │                          │       6. Validate JWT      │
+   │                          │       (RoomAccessToken-    │
+   │                          │        Claims)             │
+   │                          │                            │
+   │  7. Connection accepted  │                            │
+   │ <─────────────────────────────────────────────────────│
+```
+
+### Token Structure
+
+The room access token is a standard JWT signed with a shared secret (HMAC-SHA256). Its payload contains:
+
+> **Rust type**: `RoomAccessTokenClaims` (defined in `videocall-meeting-types::token`)
+
+```json
+{
+  "sub": "user@example.com",
+  "room": "standup-2024",
+  "room_join": true,
+  "is_host": true,
+  "display_name": "Alice",
+  "exp": 1707004800,
+  "iss": "videocall-meeting-backend"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sub` | string | Participant's email (unique identity) |
+| `room` | string | The room/meeting ID the participant is authorized to join |
+| `room_join` | boolean | Must be `true` for the Media Server to accept the connection |
+| `is_host` | boolean | Whether this participant is the meeting host |
+| `display_name` | string | Participant's chosen display name for this meeting |
+| `exp` | integer | Expiration timestamp (Unix seconds). Token is rejected after this time. |
+| `iss` | string | Issuer identifier (`videocall-meeting-backend`). Constant: `RoomAccessTokenClaims::ISSUER` |
+
+### Token Lifecycle
+
+- **Issued**: When a participant's status becomes `admitted` (hosts are auto-admitted on join)
+- **Delivered**: Included in the response to `POST /join` (for hosts) or `GET /status` (for admitted attendees)
+- **Used**: Client presents the token when connecting to the Media Server
+- **Expires**: After a configurable TTL (e.g., 10 minutes). Expiration applies only to the initial connection; active sessions are not disconnected when the token expires.
+- **Not reusable across meetings**: Each token is scoped to a specific room
+
+### Connection Endpoint
+
+The Media Server connection endpoint changes from path-based identity to token-based identity:
+
+- **Old**: `GET /lobby/{email}/{room}` -- unauthenticated, anyone can connect
+- **New**: `GET /lobby?token=<JWT>` -- Media Server validates signature, extracts room and identity from claims, rejects invalid or expired tokens
 
 ---
 
@@ -42,7 +200,7 @@ videocall.rs implements a meeting ownership model where:
 
 ### Owner vs Host Display Name
 
-There's an important distinction between:
+There is an important distinction between:
 
 - **Owner (creator_id)**: The email address of the user who owns the meeting (permanent, used for authorization)
 - **Host Display Name**: The display name shown in the UI for the host (dynamic, looked up from participants)
@@ -58,41 +216,41 @@ The host display name is resolved by looking up the owner's email in the `meetin
 | State | Description |
 |-------|-------------|
 | `idle` | Meeting created but owner hasn't joined yet |
-| `active` | Owner has joined, meeting is in progress |
-| `ended` | Meeting has ended (all participants left) |
+| `active` | Owner has joined and been issued a room token; meeting is in progress |
+| `ended` | Meeting has ended (all participants left or host left) |
 
 ### State Transitions
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│   [Create Meeting]                                          │
-│         │                                                   │
-│         ▼                                                   │
-│      ┌──────┐                                               │
-│      │ idle │ ◄─────────────────────────────────────┐       │
-│      └──┬───┘                                       │       │
-│         │                                           │       │
-│         │ [Owner joins]                             │       │
-│         ▼                                           │       │
-│     ┌────────┐                                      │       │
-│     │ active │ ◄───────────────────────┐            │       │
-│     └───┬────┘                         │            │       │
-│         │                              │            │       │
-│         │ [All participants leave]     │ [Rejoin]   │       │
-│         ▼                              │            │       │
-│     ┌───────┐                          │            │       │
-│     │ ended │ ─────────────────────────┘            │       │
-│     └───┬───┘                                       │       │
-│         │                                           │       │
-│         │ [Owner deletes]                           │       │
-│         ▼                                           │       │
-│     ┌─────────┐                                     │       │
-│     │ deleted │ (soft delete: deleted_at set)       │       │
-│     └─────────┘                                     │       │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+  [Create Meeting]
+        │
+        ▼
+     ┌──────┐
+     │ idle │
+     └──┬───┘
+        │
+        │ [Owner joins via REST API]
+        │ [Room access token issued]
+        ▼
+    ┌────────┐
+    │ active │ ◄───────────────────┐
+    └───┬────┘                     │
+        │                         │
+        │ [All participants      │ [Owner rejoins,
+        │  leave / host leaves]  │  new token issued]
+        ▼                         │
+    ┌───────┐                     │
+    │ ended │ ────────────────────┘
+    └───┬───┘
+        │
+        │ [Owner deletes]
+        ▼
+    ┌─────────┐
+    │ deleted │ (soft delete: deleted_at set)
+    └─────────┘
 ```
+
+The key transition is from `idle` to `active`: this is when the host's room access token is issued. The meeting only becomes joinable by attendees after the host has activated it. Attendees who are admitted also receive their own room access tokens, which is what allows them to connect to the Media Server.
 
 ### Soft Delete vs Hard Delete
 
@@ -109,22 +267,26 @@ Meetings use **soft deletion**:
 
 1. Owner navigates to a meeting URL (e.g., `/meeting/my-standup`)
 2. Owner enters their display name
-3. Owner clicks **"Start Meeting"** (button shows "Start" for owners)
-4. Meeting is created (if new) or activated (if existing)
-5. Owner enters the meeting room
+3. Owner clicks **"Start Meeting"**
+4. Meeting is created (if new) or activated (if existing idle/ended meeting)
+5. Meeting Backend returns a **room access token**
+6. Client connects to the Media Server using the token
+7. Owner enters the meeting room
 
 ### Participant Joining a Meeting
 
 1. Participant navigates to meeting URL
 2. Participant enters their display name
-3. Participant clicks **"Join Meeting"** (button shows "Join" for non-owners)
+3. Participant clicks **"Join Meeting"**
 4. If meeting is active:
-   - Participant enters the waiting room
+   - Participant enters the waiting room (status: `waiting`)
+   - UI polls `GET /status` until status changes
    - Host admits or rejects participant
-   - If admitted, participant auto-joins the meeting
+   - If admitted, response includes a **room access token**
+   - Client auto-connects to the Media Server using the token
 5. If meeting doesn't exist:
    - Meeting is created with participant as owner
-   - Participant becomes the host
+   - Participant becomes the host and receives a room access token immediately
 
 ### Owner Deleting a Meeting
 
@@ -178,9 +340,9 @@ The host is identified in the UI with:
 
 ### How Host Display Name is Resolved
 
-1. Meeting stores `creator_id` (owner's email)
-2. When fetching meeting info, the system looks up the owner's display name from `meeting_participants`
-3. This display name is used to show the "(Host)" indicator in the UI
+1. The room access token contains the `is_host` and `display_name` claims
+2. The Media Server makes these available to connected clients
+3. The UI uses `is_host` to show the "(Host)" indicator
 
 ### Visual Indicators
 
@@ -198,8 +360,9 @@ The host is identified in the UI with:
 
 The waiting room provides controlled access to meetings:
 - Non-owners enter the waiting room when joining an active meeting
-- Admitted participants can manage the waiting room (not just the host)
+- The host (or any admitted participant) can manage the waiting room
 - Participants poll for status changes while waiting
+- **No room access token is issued until a participant is admitted**, so there is no way to bypass the waiting room and connect to the Media Server directly
 
 ### Participant Management
 
@@ -209,26 +372,31 @@ Any admitted participant can:
 - Admit all waiting participants at once
 - Reject participants
 
-### Auto-Join Behavior
+### Admission and Token Issuance
 
 When a participant is admitted from the waiting room:
-1. Their status changes to "admitted"
-2. The UI detects this via polling
-3. The participant automatically joins the meeting (no "Join" button click needed)
+1. Their status changes to `admitted` in the database
+2. A room access token (`RoomAccessTokenClaims`) is generated and signed for them
+3. The UI detects the status change via polling (`GET /status`)
+4. The poll response is an `APIResponse<ParticipantStatusResponse>` with `room_token` populated
+5. The client connects to the Media Server using the token
+6. The participant enters the meeting automatically
 
 ### API Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
 | `GET /meetings/{id}/waiting` | List waiting participants |
-| `POST /meetings/{id}/admit` | Admit one participant |
-| `POST /meetings/{id}/admit-all` | Admit all waiting |
+| `POST /meetings/{id}/admit` | Admit one participant (token generated for them) |
+| `POST /meetings/{id}/admit-all` | Admit all waiting (tokens generated for each) |
 | `POST /meetings/{id}/reject` | Reject a participant |
-| `GET /meetings/{id}/status` | Check your own status (for polling) |
+| `GET /meetings/{id}/status` | Check your own status; includes `room_token` when admitted |
 
 ---
 
 ## Database Schema
+
+All meeting and participant state is owned by the Meeting Backend. The Media Server does not read or write to these tables.
 
 ### meetings Table
 
@@ -243,8 +411,11 @@ When a participant is admitted from the waiting room:
 | ended_at | TIMESTAMPTZ | When meeting ended |
 | deleted_at | TIMESTAMPTZ | Soft delete timestamp |
 | host_display_name | VARCHAR(255) | Cached host display name |
+| attendees | JSONB | Pre-registered attendee emails |
 
 ### meeting_participants Table
+
+This is the **single source of truth** for participant state. The `session_participants` table from the legacy system is eliminated.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -276,5 +447,5 @@ CREATE INDEX idx_meetings_state ON meetings(state);
 
 ## Related Documentation
 
-- [Meeting API Documentation](MEETING_API.md) - Detailed API endpoint reference
-- [Architecture Document](../ARCHITECTURE.md) - System architecture overview
+- [Meeting API Documentation](MEETING_API.md) - Detailed API endpoint reference with request/response examples
+- `videocall-meeting-types` crate (`videocall-meeting-types/src/`) - Rust source of truth for all API types

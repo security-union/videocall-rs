@@ -8,6 +8,7 @@ on:
     branches:
       - main
       - add-auth
+      - feature/meeting-backend-api
     paths:
       - 'actix-api/**'
       - 'videocall-types/**'
@@ -46,5 +47,5 @@ jobs:
           file: Dockerfile.actix
           push: true
           tags: |
-            securityunion/rustlemania-api:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
-            securityunion/rustlemania-api:latest
+            securityunion/videocall-media-server:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/videocall-media-server:latest

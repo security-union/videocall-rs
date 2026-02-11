@@ -8,6 +8,7 @@ on:
     branches:
       - main
       - add-auth
+      - feature/meeting-backend-api
     paths:
       - 'yew-ui/**'
       - 'videocall-types/**'
@@ -50,5 +51,5 @@ jobs:
           file: Dockerfile.yew
           push: true
           tags: |
-            securityunion/rustlemania-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
-            securityunion/rustlemania-ui:latest
+            securityunion/videocall-web-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/videocall-web-ui:latest

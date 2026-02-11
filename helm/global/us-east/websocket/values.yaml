@@ -6,7 +6,7 @@ rustlemania-websocket:
   replicaCount: 1  # Higher replicas for primary region
 
   image:
-    repository: securityunion/rustlemania-api
+    repository: securityunion/videocall-media-server
     pullPolicy: Always
     tag: latest
 
@@ -42,27 +42,11 @@ rustlemania-websocket:
       value: "5"
     - name: TOKIO_WORKER_THREADS
       value: "2"  # Optimal for 2400m CPU (I/O bound WebSocket operations)
-    # OAuth Configuration (from secret)
-    - name: OAUTH_CLIENT_ID
+    - name: JWT_SECRET
       valueFrom:
         secretKeyRef:
-          name: google-oauth-credentials
-          key: client-id
-    - name: OAUTH_CLIENT_SECRET
-      valueFrom:
-        secretKeyRef:
-          name: google-oauth-credentials
-          key: client-secret
-    - name: OAUTH_AUTH_URL
-      value: "https://accounts.google.com/o/oauth2/v2/auth"
-    - name: OAUTH_TOKEN_URL
-      value: "https://oauth2.googleapis.com/token"
-    - name: OAUTH_REDIRECT_URL
-      value: "https://api.videocall.rs/login/callback"
-    - name: UI_ENDPOINT
-      value: "https://app.videocall.rs"
-    - name: COOKIE_DOMAIN
-      value: ".videocall.rs"
+          name: jwt-secret
+          key: secret
 
 
   resources:
@@ -93,22 +77,11 @@ rustlemania-websocket:
               name: websocket-us-east
               port:
                 number: 8080
-      - host: api.videocall.rs
-        paths:
-          - path: /
-            pathType: Prefix
-            service:
-              name: websocket-us-east
-              port:
-                number: 8080
     tls:
       - secretName: websocket-us-east-tls
         hosts:
           - websocket-us-east.webtransport.video
           - webtransport-us-east.webtransport.video
-      - secretName: api-videocall-rs-tls
-        hosts:
-          - api.videocall.rs
 
   autoscaling:
     enabled: false

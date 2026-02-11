@@ -18,8 +18,8 @@ services:
       - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
       - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
       - ENABLE_OAUTH=${ENABLE_OAUTH:-false}
-      - API_BASE_URL=${API_BASE_URL:-http://localhost:8080}
-      - LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8081}
+      - LOGIN_URL=http://localhost:8081/login
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
       - RUST_BACKTRACE=1
       - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
@@ -69,6 +69,44 @@ services:
     ports:
       - "4600:4600"
   
+  meeting-api:
+    build:
+      dockerfile: ../docker/Dockerfile.actix
+      context: ../docker
+    working_dir: /app/meeting-api
+    command: bash -c "/app/dbmate/startup.sh && cargo watch -x \"run --bin meeting-api\""
+    environment:
+      - LISTEN_ADDR=0.0.0.0:8081
+      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
+      - TOKEN_TTL_SECS=${TOKEN_TTL_SECS:-600}
+      - SESSION_TTL_SECS=${SESSION_TTL_SECS:-315360000}
+      - COOKIE_SECURE=false
+      - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
+      - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-}
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
+      - OAUTH_SECRET=${OAUTH_CLIENT_SECRET:-}
+      - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:8081/login/callback}
+      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-https://accounts.google.com/o/oauth2/v2/auth}
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-https://oauth2.googleapis.com/token}
+      - AFTER_LOGIN_URL=${AFTER_LOGIN_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
+      - RUST_LOG=debug
+      - CARGO_TARGET_DIR=/app/meeting-api/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+    ports:
+      - "8081:8081"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - rustlemania-meeting-api-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-meeting-api-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-meeting-api-cargo-target-cache:/usr/local/cargo/target
+      - rustlemania-meeting-api-cache:/app/meeting-api/target
+    depends_on:
+      - postgres
+
   websocket-api:
     build:
       dockerfile: ../docker/Dockerfile.actix
@@ -98,6 +136,7 @@ services:
       - ACTIX_UI_BACKEND_URL="" # needed for UI CI tests
       - WEBTRANSPORT_HOST="" # needed for UI CI tests
       - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
     ports:
       - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
     volumes:
@@ -192,6 +231,7 @@ services:
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
       - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
     ports:
       - "4433:4433/udp"
     volumes:
@@ -294,6 +334,10 @@ services:
   
 
 volumes:
+  rustlemania-meeting-api-cargo-registry-cache:
+  rustlemania-meeting-api-cargo-git-cache:
+  rustlemania-meeting-api-cargo-target-cache:
+  rustlemania-meeting-api-cache:
   rustlemania-actix-web-cargo-registry-cache:
   rustlemania-actix-web-cargo-git-cache:
   rustlemania-actix-web-cargo-target-cache:

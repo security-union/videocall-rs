@@ -17,15 +17,16 @@
  */
 
 pub mod actors;
+pub mod api;
 pub mod auth;
 pub mod client_diagnostics;
 pub mod constants;
 pub mod db;
-pub mod db_pool;
-pub mod meeting;
+pub mod lobby;
 pub mod messages;
 pub mod metrics;
 pub mod models;
 pub mod server_diagnostics;
 pub mod session_manager;
+pub mod token_validator;
 pub mod webtransport;

@@ -24,7 +24,7 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::{FeatureFlags, SYSTEM_USER_EMAIL};
+use videocall_types::SYSTEM_USER_EMAIL;
 
 /// Error type for session management operations
 #[derive(Debug, Clone, PartialEq)]
@@ -78,8 +78,9 @@ impl SessionManager {
 
     /// Called when a user connects to a room.
     ///
-    /// When `FEATURE_MEETING_MANAGEMENT` is enabled, JWT validation will be required.
-    /// When disabled (default), any user can connect without a token.
+    /// JWT validation happens at the handler level (ws_connect / WebTransport)
+    /// before this method is called. By the time we get here the token has
+    /// already been verified.
     ///
     /// # Errors
     /// Returns `SessionError::ReservedUserEmail` if user_id matches the system email.
@@ -96,16 +97,6 @@ impl SessionManager {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-
-        if FeatureFlags::meeting_management_enabled() {
-            // TODO: Validate JWT room access token from meeting-api.
-            // The token should contain room_id, user email, and role.
-            // For now, allow connection but log that JWT validation is pending.
-            info!(
-                "Meeting management enabled but JWT validation not yet implemented for {} in room {}",
-                user_id, room_id
-            );
-        }
 
         info!("Session started for {} in room {}", user_id, room_id);
 

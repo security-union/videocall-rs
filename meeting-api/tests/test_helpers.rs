@@ -19,12 +19,13 @@ use axum::http;
 use axum::response::Response;
 use axum::Router;
 use http_body_util::BodyExt;
-use meeting_api::{routes, state::AppState};
+use meeting_api::{routes, state::AppState, token::generate_session_token};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 
-const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
+pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
+const TEST_SESSION_TTL: i64 = 3600;
 
 /// Connect to the test database using `DATABASE_URL`.
 pub async fn get_test_pool() -> PgPool {
@@ -56,18 +57,25 @@ pub fn build_app(pool: PgPool) -> Router {
         db: pool,
         jwt_secret: TEST_JWT_SECRET.to_string(),
         token_ttl_secs: TEST_TOKEN_TTL,
+        session_ttl_secs: TEST_SESSION_TTL,
         oauth: None,
         cookie_domain: None,
+        cookie_secure: false,
     };
     routes::router().with_state(state)
 }
 
-/// Build an HTTP request with the `Cookie: email=<email>` header.
+/// Build an HTTP request with a signed session JWT in the `Cookie: session=<jwt>` header.
+///
+/// This replaces the old `Cookie: email=<email>` pattern. The JWT is signed
+/// with [`TEST_JWT_SECRET`] and contains the email in the `sub` claim.
 pub fn request_with_cookie(method: &str, uri: &str, email: &str) -> http::request::Builder {
+    let session_jwt = generate_session_token(TEST_JWT_SECRET, email, email, TEST_SESSION_TTL)
+        .expect("signing session JWT for test should not fail");
     http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("Cookie", format!("email={email}"))
+        .header("Cookie", format!("session={session_jwt}"))
 }
 
 /// Consume a response body and deserialize JSON into `T`.

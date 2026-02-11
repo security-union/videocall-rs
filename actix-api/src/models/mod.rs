@@ -22,6 +22,7 @@ use crate::actors::chat_server::ChatServer;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 
+#[derive(Clone)]
 pub struct AppState {
     pub chat: Addr<ChatServer>,
     pub nats_client: async_nats::client::Client,

@@ -16,7 +16,7 @@ The meeting flow:
 4. **Host** admits or rejects attendees
 5. **Admitted attendees** receive a **room access token** via status polling
 6. **Clients connect** to the Media Server using their room access token
-7. The Media Server **rejects** any connection without a valid, signed token
+7. The Media Server **rejects** any connection without a valid, signed token (when `FEATURE_MEETING_MANAGEMENT=true`)
 
 ## Shared Types Crate
 
@@ -48,13 +48,33 @@ All success and error examples below show the full envelope.
 
 ## Authentication
 
-All endpoints require authentication via the `email` cookie, which is set after OAuth login with Google.
+All endpoints require a **signed session JWT**, issued by the Meeting Backend after a successful OAuth login. The session token can be delivered in two ways:
+
+1. **HttpOnly cookie** (web browsers): After OAuth login, the server sets `Set-Cookie: session=<JWT>; HttpOnly; Secure; SameSite=Lax`. The browser sends it automatically with every request. JavaScript cannot read it, which prevents XSS token theft.
+
+2. **Authorization header** (non-browser clients): `Authorization: Bearer <session_jwt>`. Use this for CLI tools, mobile apps, or API testing.
 
 ```bash
--H "Cookie: email=user@example.com"
+# Option 1: Cookie (set automatically by the browser after OAuth login)
+-H "Cookie: session=<session_jwt>"
+
+# Option 2: Bearer header (for curl, mobile, CLI)
+-H "Authorization: Bearer <session_jwt>"
 ```
 
-> **Note**: The email cookie authenticates requests to the Meeting Backend only. To connect to the Media Server, clients must present a signed room access token (JWT) issued by the Meeting Backend.
+### Session JWT Claims
+
+The session JWT contains these claims:
+
+| Claim | Description |
+|-------|-------------|
+| `sub` | User email (identity principal) |
+| `name` | Display name |
+| `exp` | Expiration (Unix timestamp) |
+| `iat` | Issued-at (Unix timestamp) |
+| `iss` | `"videocall-meeting-backend"` |
+
+> **Note**: The session JWT authenticates requests to the Meeting Backend only. To connect to the Media Server, clients must present a separate **room access token** (JWT) issued by the Meeting Backend when a participant is admitted to a meeting.
 
 ## Room Access Token
 
@@ -146,7 +166,7 @@ GET /api/v1/meetings
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 
 **Error example (401):**
 ```json
@@ -154,7 +174,7 @@ GET /api/v1/meetings
   "success": false,
   "result": {
     "code": "UNAUTHORIZED",
-    "message": "Authentication required. Please provide email cookie."
+    "message": "Authentication required."
   }
 }
 ```
@@ -205,7 +225,7 @@ POST /api/v1/meetings
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 400 | `INVALID_MEETING_ID` | Invalid ID format |
 | 400 | `TOO_MANY_ATTENDEES` | More than 100 attendees |
 | 409 | `MEETING_EXISTS` | Meeting ID already taken |
@@ -260,7 +280,7 @@ GET /api/v1/meetings/{meeting_id}
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
 ---
@@ -293,7 +313,7 @@ DELETE /api/v1/meetings/{meeting_id}
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 403 | `NOT_OWNER` | Not the meeting owner |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
@@ -358,7 +378,7 @@ The `room_token` is only present when `status` is `"admitted"`. Attendees in the
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 400 | `MEETING_NOT_ACTIVE` | Meeting exists but host hasn't joined yet |
 
 > **Note:** If the meeting doesn't exist, it is created automatically with the joining user as the host.
@@ -409,7 +429,7 @@ GET /api/v1/meetings/{meeting_id}/waiting
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
@@ -454,7 +474,7 @@ The admitted participant picks up their `room_token` on their next `GET /status`
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
 | 404 | `PARTICIPANT_NOT_FOUND` | Participant not in waiting room |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
@@ -505,7 +525,7 @@ POST /api/v1/meetings/{meeting_id}/admit-all
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
@@ -548,7 +568,7 @@ POST /api/v1/meetings/{meeting_id}/reject
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 403 | `NOT_HOST` | Requester is not an admitted participant |
 | 404 | `PARTICIPANT_NOT_FOUND` | Participant not in waiting room |
 
@@ -602,7 +622,7 @@ The client should use the `room_token` to connect to the Media Server immediatel
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 404 | `NOT_IN_MEETING` | Haven't requested to join |
 
 ---
@@ -639,7 +659,7 @@ POST /api/v1/meetings/{meeting_id}/leave
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 404 | `NOT_IN_MEETING` | Not a participant in this meeting |
 
 ---
@@ -687,27 +707,41 @@ GET /api/v1/meetings/{meeting_id}/participants
 
 | Status | Code | Description |
 |--------|------|-------------|
-| 401 | `UNAUTHORIZED` | No email cookie |
+| 401 | `UNAUTHORIZED` | Invalid or missing session |
 | 404 | `MEETING_NOT_FOUND` | Meeting does not exist |
 
 ---
 
 ## Connecting to the Media Server
 
-After receiving a `room_token`, the client connects to the Media Server:
+After receiving a `room_token`, the client connects to the Media Server using the **token-based endpoint**:
 
 ```
 GET /lobby?token=<room_access_token>
 ```
 
-The Media Server:
-1. Validates the JWT signature using the shared secret
-2. Checks the `exp` claim (rejects expired tokens)
-3. Extracts `sub` (identity), `room` (room ID), `is_host`, and `display_name`
-4. Establishes the WebSocket or WebTransport connection
-5. **Rejects the connection** if the token is missing, invalid, or expired
+- **WebSocket**: `ws://host:8080/lobby?token=<JWT>`
+- **WebTransport**: `https://host:4433/lobby?token=<JWT>`
 
-> **Important**: The `/lobby` endpoint no longer accepts email and room as path parameters. The token is the only way to identify the user and authorize room access.
+The identity (email) and room are extracted from the JWT claims (`sub` and `room`). There are no email or room parameters in the URL -- the **token is the sole source of truth**.
+
+The Media Server:
+1. Validates the JWT signature using the shared `JWT_SECRET`
+2. Checks the `exp` claim (rejects expired tokens)
+3. Verifies `room_join == true`
+4. Extracts `sub` (identity), `room` (room ID), `is_host`, and `display_name`
+5. Establishes the WebSocket or WebTransport connection
+6. **Rejects the connection** if the token is missing, invalid, or expired
+
+### Deprecated Endpoint
+
+The legacy path-based endpoint is still available for backward compatibility:
+
+```
+GET /lobby/{email}/{room}
+```
+
+This endpoint is **deprecated** and only works when `FEATURE_MEETING_MANAGEMENT=false`. When meeting management is enabled, it returns **HTTP 410 Gone**. Clients should migrate to the token-based endpoint above.
 
 ---
 
@@ -728,7 +762,7 @@ sequenceDiagram
     MB-->>U: success: true, result.status: admitted, result.room_token: "ey..."
 
     U->>MS: GET /lobby?token=ey...
-    Note over MS: Validate JWT, extract room + identity
+    Note over MS: Decode JWT, extract room + identity from claims
     MS-->>U: WebSocket connection established
 ```
 
@@ -798,11 +832,15 @@ sequenceDiagram
 ```bash
 # Meeting Backend runs on port 8081
 # Media Server runs on port 8080
+#
+# SESSION_TOKEN is a signed session JWT obtained after OAuth login.
+# In a browser, this is stored as an HttpOnly cookie and sent automatically.
+# For curl testing, use the Authorization header.
 
 # 1. Host creates meeting
 curl -X POST http://localhost:8081/api/v1/meetings \
   -H "Content-Type: application/json" \
-  -H "Cookie: email=host@example.com" \
+  -H "Authorization: Bearer $SESSION_TOKEN" \
   -d '{"meeting_id": "standup-2024"}'
 
 # Response:
@@ -811,20 +849,20 @@ curl -X POST http://localhost:8081/api/v1/meetings \
 
 # 2. Host joins meeting (activates it, receives room token)
 curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
-  -H "Cookie: email=host@example.com"
+  -H "Authorization: Bearer $SESSION_TOKEN"
 
 # Response:
 # {"success":true,"result":{"email":"host@example.com","display_name":null,
 #   "status":"admitted","is_host":true,"joined_at":1706918400,
 #   "admitted_at":1706918400,"room_token":"eyJhbGciOiJIUzI1NiIs..."}}
 
-# 3. Host connects to Media Server with the token
+# 3. Host connects to Media Server with the room token
 #    (In practice, the client UI does this automatically)
 #    WebSocket: ws://localhost:8080/lobby?token=eyJhbGciOiJIUzI1NiIs...
 
-# 4. Attendee tries to join
+# 4. Attendee tries to join (using their own session token)
 curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
-  -H "Cookie: email=alice@example.com" \
+  -H "Authorization: Bearer $ALICE_SESSION_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"display_name": "Alice"}'
 
@@ -835,7 +873,7 @@ curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
 
 # 5. Host checks waiting room
 curl http://localhost:8081/api/v1/meetings/standup-2024/waiting \
-  -H "Cookie: email=host@example.com"
+  -H "Authorization: Bearer $SESSION_TOKEN"
 
 # Response:
 # {"success":true,"result":{"meeting_id":"standup-2024",
@@ -844,28 +882,28 @@ curl http://localhost:8081/api/v1/meetings/standup-2024/waiting \
 # 6. Host admits Alice
 curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/admit \
   -H "Content-Type: application/json" \
-  -H "Cookie: email=host@example.com" \
+  -H "Authorization: Bearer $SESSION_TOKEN" \
   -d '{"email": "alice@example.com"}'
 
-# 7. Alice polls and receives her token
+# 7. Alice polls and receives her room token
 curl http://localhost:8081/api/v1/meetings/standup-2024/status \
-  -H "Cookie: email=alice@example.com"
+  -H "Authorization: Bearer $ALICE_SESSION_TOKEN"
 
 # Response:
 # {"success":true,"result":{"email":"alice@example.com","display_name":"Alice",
 #   "status":"admitted","is_host":false,"joined_at":1706918500,
 #   "admitted_at":1706918600,"room_token":"eyJhbGciOiJIUzI1NiIs..."}}
 
-# 8. Alice connects to Media Server with her token
+# 8. Alice connects to Media Server with her room token
 #    WebSocket: ws://localhost:8080/lobby?token=eyJhbGciOiJIUzI1NiIs...
 
 # 9. When done, participants leave
 curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/leave \
-  -H "Cookie: email=alice@example.com"
+  -H "Authorization: Bearer $ALICE_SESSION_TOKEN"
 
 # 10. Host leaves (ends the meeting)
 curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/leave \
-  -H "Cookie: email=host@example.com"
+  -H "Authorization: Bearer $SESSION_TOKEN"
 ```
 
 ---
@@ -909,46 +947,60 @@ Single source of truth for participant state. Replaces the legacy `session_parti
 
 ## Testing
 
-The Meeting API has a comprehensive integration test suite that tests all endpoints against a real PostgreSQL database.
+Both the Meeting Backend and the Media Server have comprehensive test suites. All tests run via a single entry point.
 
 ### Running Tests
 
 ```bash
-# Run all backend tests (requires Docker)
+# Run all backend tests (requires Docker for integration tests)
 make tests_run
 
 # Tear down test containers
 make tests_down
-
-# Run a specific test
-docker compose -f docker/docker-compose.integration.yaml run --rm rust-tests \
-  bash -c "cd /app/dbmate && dbmate wait && dbmate up && \
-           cd /app/actix-api && cargo test test_create_meeting -- --nocapture --test-threads=1"
 ```
+
+`make tests_run` performs the following in order:
+1. `cargo fmt --check` (workspace-wide)
+2. `cargo clippy -- -D warnings` (workspace-wide)
+3. `cargo machete` (unused dependency check)
+4. Docker integration tests (both `meeting-api` and `videocall-api` against PostgreSQL)
 
 ### Test Coverage
 
-The test suite includes 22 integration tests covering all API endpoints:
+The test suite includes **101 tests** across both crates:
 
-| Endpoint | Tests |
+#### Meeting Backend (49+ tests: 30 unit + 25 integration)
+
+| Category | Tests |
 |----------|-------|
-| `POST /api/v1/meetings` | Create meeting success, auto-generate ID, unauthorized, duplicate ID, too many attendees |
-| `GET /api/v1/meetings/{id}` | Get meeting success, not found, unauthorized |
-| `GET /api/v1/meetings` | List meetings with pagination |
-| `DELETE /api/v1/meetings/{id}` | Delete success, not owner (403) |
-| `POST /api/v1/meetings/{id}/join` | Host activates meeting + receives token, attendee waits, meeting not active |
-| `GET /api/v1/meetings/{id}/waiting` | Get waiting room success |
-| `POST /api/v1/meetings/{id}/admit` | Admit success, participant not found |
-| `POST /api/v1/meetings/{id}/admit-all` | Admit all waiting participants |
-| `POST /api/v1/meetings/{id}/reject` | Reject participant success |
-| `GET /api/v1/meetings/{id}/status` | Get my status success, token returned on admission |
-| `POST /api/v1/meetings/{id}/leave` | Leave meeting success |
-| `GET /api/v1/meetings/{id}/participants` | Get participants success |
+| **Meeting CRUD** | Create meeting success, auto-generate ID, duplicate ID, too many attendees, get meeting success, not found, list meetings with pagination, delete success, not owner (403) |
+| **Participant Flow** | Host joins and activates + receives token, attendee waits, meeting not active, leave success, get status success, get participants |
+| **Waiting Room** | Get waiting room, admit success, admit not found, admit all, reject |
+| **Session Auth (AuthUser)** | Valid session cookie, valid Bearer token, missing credentials (401), invalid JWT (401), expired JWT (401), wrong secret (401), cookie precedence over Bearer, session cookie among multiple cookies |
+| **Session Token** | Round-trip, wrong secret fails, expired fails, iat is set |
+| **Room Token Generation** | Round-trip validation, issuer correctness, expiration TTL, room_join flag |
+| **Error Responses** | 401/403/404/409 codes, engineering_error field |
+| **Ad-hoc Join** | Auto-creates meeting, issued token is valid JWT |
+| **Meeting ID Validation** | Alphanumeric, hyphens, underscores, rejects special chars, rejects empty/too-long, generated IDs are unique and valid |
+
+#### Media Server (52 tests: 44 unit + 8 JWT integration)
+
+| Category | Tests |
+|----------|-------|
+| **JWT Validation (unit)** | decode_room_token: valid/expired/wrong secret/room_join=false/garbage. validate_room_token (deprecated): valid/room mismatch/identity mismatch |
+| **JWT Integration (WebSocket)** | Token endpoint (`/lobby?token=`): valid connects, expired rejected, room_join=false rejected, invalid signature rejected, garbage rejected, identity extracted from JWT. Deprecated endpoint (`/lobby/{email}/{room}`): FF=off allows, FF=on returns 410 Gone |
+| **Session Management** | Start/end session, system email rejection, protobuf packet builders |
+| **Chat Server** | Join room success, system email rejection, join without session, cleanup retry |
+| **WebSocket Lifecycle** | End-to-end meeting lifecycle over WebSocket |
+| **WebTransport** | Meeting lifecycle, relay between two clients, lobby isolation |
+| **Metrics** | 19 tests covering metrics export, session tracking, health packets, cleanup |
+| **Packet Handling** | Packet classification, RTT detection |
 
 ### CI/CD
 
 Tests run automatically on pull requests that modify:
-- `actix-api/**` - API source code
+- `actix-api/**` - Media Server source code
+- `meeting-api/**` - Meeting Backend source code
 - `dbmate/**` - Database migrations
 - `videocall-types/**` - Shared types (media/transport)
 - `videocall-meeting-types/**` - Shared types (meeting API)

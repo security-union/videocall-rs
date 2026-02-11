@@ -24,12 +24,17 @@ pub struct Config {
     pub database_url: String,
     /// Shared secret used to sign room access tokens (HMAC-SHA256).
     pub jwt_secret: String,
-    /// Token time-to-live in seconds (default: 600 = 10 minutes).
+    /// Room access token time-to-live in seconds (default: 600 = 10 minutes).
     pub token_ttl_secs: i64,
+    /// Session JWT time-to-live in seconds (default: 315360000 = ~10 years).
+    pub session_ttl_secs: i64,
     /// OAuth configuration. `None` if `OAUTH_CLIENT_ID` is unset or empty.
     pub oauth: Option<OAuthConfig>,
     /// Cookie domain (optional, e.g. ".example.com").
     pub cookie_domain: Option<String>,
+    /// Whether to set the `Secure` flag on cookies (default: true).
+    /// Set `COOKIE_SECURE=false` for local development over HTTP.
+    pub cookie_secure: bool,
 }
 
 /// Google OAuth configuration.
@@ -67,7 +72,14 @@ impl Config {
             .unwrap_or_else(|_| "600".to_string())
             .parse::<i64>()
             .map_err(|_| "TOKEN_TTL_SECS must be a valid integer")?;
+        let session_ttl_secs = env::var("SESSION_TTL_SECS")
+            .unwrap_or_else(|_| "315360000".to_string()) // ~10 years
+            .parse::<i64>()
+            .map_err(|_| "SESSION_TTL_SECS must be a valid integer")?;
         let cookie_domain = env::var("COOKIE_DOMAIN").ok().filter(|s| !s.is_empty());
+        let cookie_secure = env::var("COOKIE_SECURE")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
 
         let oauth = env::var("OAUTH_CLIENT_ID")
             .ok()
@@ -95,8 +107,10 @@ impl Config {
             database_url,
             jwt_secret,
             token_ttl_secs,
+            session_ttl_secs,
             oauth,
             cookie_domain,
+            cookie_secure,
         })
     }
 }

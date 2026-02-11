@@ -23,6 +23,7 @@ use crate::actors::transports::wt_chat_session::{WtChatSession, WtOutbound};
 use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
+use crate::token_validator;
 use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
 use bridge::WebTransportBridge;
@@ -238,27 +239,64 @@ async fn run_webtransport_connection_from_request(
     session_manager: SessionManager,
 ) -> anyhow::Result<()> {
     warn!("received WebTransport request: {}", request.url());
-    let url = request.url();
-
-    let uri = url;
+    let uri = request.url();
     let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
     let parts = path.split('/').collect::<Vec<&str>>();
     // filter out the empty strings
-    let parts = parts.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+    let parts: Vec<_> = parts.iter().filter(|s| !s.is_empty()).collect();
     info!("Parts {:?}", parts);
-    if parts.len() != 3 {
-        return Err(anyhow!("Invalid path wrong length"));
-    } else if parts[0] != &"lobby" {
-        return Err(anyhow!("Invalid path wrong prefix"));
+
+    // First part must be "lobby"
+    if parts.is_empty() || parts[0] != &"lobby" {
+        return Err(anyhow!("Invalid path: must start with /lobby"));
     }
 
-    let username = parts[1].replace(' ', "_");
-    let lobby_id = parts[2].replace(' ', "_");
-    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-    if !re.is_match(&username) && !re.is_match(&lobby_id) {
-        return Err(anyhow!("Invalid path input chars"));
-    }
+    // Extract ?token= from query string
+    let token = uri
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, val)| val.into_owned());
+
+    // Determine username and room from either the JWT or URL path params.
+    let (username, lobby_id) = if let Some(ref tok) = token {
+        // Token-based flow: identity and room come from the JWT claims.
+        let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+        if jwt_secret.is_empty() {
+            return Err(anyhow!("JWT_SECRET not set"));
+        }
+        let claims = token_validator::decode_room_token(&jwt_secret, tok)
+            .map_err(|e| anyhow!("token validation failed: {e}"))?;
+        info!(
+            "WT token-based connection: email={}, room={}",
+            claims.sub, claims.room
+        );
+        (claims.sub, claims.room)
+    } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
+        // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
+        if parts.len() != 3 {
+            return Err(anyhow!(
+                "Invalid path: expected /lobby/{{email}}/{{room}} (deprecated) or /lobby?token=<JWT>"
+            ));
+        }
+        let username = parts[1].replace(' ', "_");
+        let lobby_id = parts[2].replace(' ', "_");
+        let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
+        if !re.is_match(&username) || !re.is_match(&lobby_id) {
+            return Err(anyhow!("Invalid path input chars"));
+        }
+        info!(
+            "WT deprecated path-based connection: email={}, room={}",
+            username, lobby_id
+        );
+        (username, lobby_id)
+    } else {
+        // FF=on but no token provided
+        info!("WT connection rejected: no token provided and meeting management is enabled");
+        return Err(anyhow!(
+            "room access token is required. Use /lobby?token=<JWT>"
+        ));
+    };
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
@@ -563,11 +601,17 @@ mod tests {
             .with_writer(std::io::stderr)
             .try_init();
 
+        // FF=off: this test verifies packet relay without JWT.
+        // JWT validation is tested separately in jwt_integration_tests.rs.
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
         // Wrap entire test with 15 second timeout
         let test_result = tokio::time::timeout(Duration::from_secs(15), async {
             test_relay_packet_impl().await
         })
         .await;
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
 
         match test_result {
             Ok(Ok(())) => println!("Test completed successfully"),
@@ -1021,15 +1065,15 @@ mod tests {
             .with_writer(std::io::stderr)
             .try_init();
 
-        // Enable meeting management for this test
-        videocall_types::FeatureFlags::set_meeting_management_override(true);
+        // FF=off: this test verifies basic session lifecycle without JWT.
+        // JWT validation is tested separately in jwt_integration_tests.rs.
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
 
         let test_result = tokio::time::timeout(Duration::from_secs(30), async {
             test_meeting_lifecycle_impl().await
         })
         .await;
 
-        // Clean up feature flag
         videocall_types::FeatureFlags::clear_meeting_management_override();
 
         match test_result {

@@ -12,6 +12,10 @@
  */
 
 //! OAuth route handlers: login, callback, session, profile, logout.
+//!
+//! After a successful OAuth login the callback issues a **signed session JWT**
+//! inside an `HttpOnly; Secure; SameSite=Lax` cookie named `session`.
+//! JavaScript cannot read the cookie; the browser sends it automatically.
 
 use axum::{
     extract::{Query, State},
@@ -22,13 +26,44 @@ use axum::{
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
 
+use crate::auth::AuthUser;
 use crate::db::oauth as db_oauth;
 use crate::error::AppError;
 use crate::oauth;
 use crate::state::AppState;
+use crate::token;
 
-/// Cookie max-age in seconds (~10 years, matching the existing behavior).
-const COOKIE_MAX_AGE_SECS: i64 = 87600 * 3600;
+// ---------------------------------------------------------------------------
+// Cookie helpers
+// ---------------------------------------------------------------------------
+
+/// Build a `Set-Cookie` header value for the session JWT.
+fn build_session_cookie(jwt: &str, ttl_secs: i64, domain: Option<&str>, secure: bool) -> String {
+    let mut cookie = format!("session={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_secs}");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    if let Some(d) = domain {
+        cookie.push_str(&format!("; Domain={d}"));
+    }
+    cookie
+}
+
+/// Build a `Set-Cookie` header that clears the `session` cookie.
+fn build_clear_session_cookie(domain: Option<&str>, secure: bool) -> String {
+    let mut cookie = "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    if let Some(d) = domain {
+        cookie.push_str(&format!("; Domain={d}"));
+    }
+    cookie
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct LoginQuery {
@@ -42,25 +77,10 @@ pub struct CallbackQuery {
     pub code: String,
 }
 
-fn build_set_cookie(name: &str, value: &str, domain: Option<&str>) -> String {
-    let mut cookie = format!("{name}={value}; Path=/; SameSite=Lax; Max-Age={COOKIE_MAX_AGE_SECS}");
-    if let Some(d) = domain {
-        cookie.push_str(&format!("; Domain={d}"));
-    }
-    cookie
-}
-
-fn build_clear_cookie(name: &str, domain: Option<&str>) -> String {
-    let mut cookie = format!("{name}=; Path=/; Max-Age=0");
-    if let Some(d) = domain {
-        cookie.push_str(&format!("; Domain={d}"));
-    }
-    cookie
-}
-
 /// GET /login?returnTo=<url>
 ///
-/// Initiates the OAuth flow: generates PKCE + CSRF, stores in DB, redirects to Google.
+/// Initiates the OAuth flow: generates PKCE + CSRF, stores in DB, redirects to
+/// the identity provider.
 pub async fn login(
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
@@ -95,7 +115,8 @@ pub async fn login(
 
 /// GET /login/callback?state=...&code=...
 ///
-/// Handles the OAuth callback: exchanges code for tokens, sets session cookies, redirects.
+/// Handles the OAuth callback: exchanges the authorization code for tokens,
+/// creates a signed session JWT, and sets it as an `HttpOnly` cookie.
 pub async fn callback(
     State(state): State<AppState>,
     Query(query): Query<CallbackQuery>,
@@ -137,13 +158,24 @@ pub async fn callback(
     )
     .await?;
 
+    // --- Issue signed session JWT inside an HttpOnly cookie ---
+    let session_jwt = token::generate_session_token(
+        &state.jwt_secret,
+        &claims.email,
+        &claims.name,
+        state.session_ttl_secs,
+    )?;
+
     let redirect_url = oauth_req
         .return_to
         .unwrap_or_else(|| oauth_cfg.after_login_url.clone());
 
-    let domain = state.cookie_domain.as_deref();
-    let email_cookie = build_set_cookie("email", &claims.email, domain);
-    let name_cookie = build_set_cookie("name", &claims.name, domain);
+    let session_cookie = build_session_cookie(
+        &session_jwt,
+        state.session_ttl_secs,
+        state.cookie_domain.as_deref(),
+        state.cookie_secure,
+    );
 
     tracing::info!(
         "OAuth login successful for {} ({}), redirecting to {}",
@@ -153,79 +185,76 @@ pub async fn callback(
     );
 
     let mut response = Redirect::to(&redirect_url).into_response();
-    let headers = response.headers_mut();
-    headers.append(
+    response.headers_mut().append(
         header::SET_COOKIE,
-        HeaderValue::from_str(&email_cookie).unwrap(),
-    );
-    headers.append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&name_cookie).unwrap(),
+        HeaderValue::from_str(&session_cookie).unwrap(),
     );
     Ok(response)
 }
 
-/// GET /session -- returns 200 if email cookie is present, 401 otherwise.
-pub async fn check_session(headers: axum::http::HeaderMap) -> Result<StatusCode, StatusCode> {
-    let has_session = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .map(|c| {
-            c.split(';').any(|p| {
-                let p = p.trim();
-                p.starts_with("email=") && p.len() > "email=".len()
-            })
-        })
-        .unwrap_or(false);
-
-    if has_session {
-        Ok(StatusCode::OK)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
+/// GET /session -- returns 200 if the session JWT is valid, 401 otherwise.
+///
+/// The `AuthUser` extractor validates the session JWT from the `session`
+/// cookie (or `Authorization: Bearer` header).
+pub async fn check_session(AuthUser(_email): AuthUser) -> StatusCode {
+    StatusCode::OK
 }
 
-/// GET /profile -- returns { "email": "...", "name": "..." } from cookies.
+/// GET /profile -- returns `{ "email": "...", "name": "..." }` from the
+/// session JWT claims.
+///
+/// Because the session JWT embeds both email and display name, this endpoint
+/// does not need a database query.
 pub async fn get_profile(
+    State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let cookies = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let email = extract_cookie_value(cookies, "email").ok_or(StatusCode::UNAUTHORIZED)?;
-    let name = extract_cookie_value(cookies, "name").unwrap_or_else(|| email.clone());
-
-    Ok(Json(serde_json::json!({ "email": email, "name": name })))
+    let token = extract_session_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let claims = token::decode_session_token(&state.jwt_secret, &token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    Ok(Json(
+        serde_json::json!({ "email": claims.sub, "name": claims.name }),
+    ))
 }
 
-/// GET /logout -- clears session cookies.
+/// GET /logout -- clears the session cookie.
 pub async fn logout(State(state): State<AppState>) -> Response {
-    let domain = state.cookie_domain.as_deref();
-    let email_clear = build_clear_cookie("email", domain);
-    let name_clear = build_clear_cookie("name", domain);
-
+    let clear = build_clear_session_cookie(state.cookie_domain.as_deref(), state.cookie_secure);
     let mut response = StatusCode::OK.into_response();
-    let headers = response.headers_mut();
-    headers.append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&email_clear).unwrap(),
-    );
-    headers.append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&name_clear).unwrap(),
-    );
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, HeaderValue::from_str(&clear).unwrap());
     response
 }
 
-fn extract_cookie_value(cookies: &str, name: &str) -> Option<String> {
-    let prefix = format!("{name}=");
-    for pair in cookies.split(';') {
-        let pair = pair.trim();
-        if let Some(value) = pair.strip_prefix(&prefix) {
-            if !value.is_empty() {
-                return Some(value.to_string());
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the raw session JWT from either the `session` cookie or the
+/// `Authorization: Bearer` header.
+fn extract_session_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    // 1. Try the `session` cookie.
+    if let Some(cookie_header) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for pair in cookie_header.split(';') {
+            let pair = pair.trim();
+            if let Some(value) = pair.strip_prefix("session=") {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    // 2. Fall back to `Authorization: Bearer <token>`.
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(token) = auth.strip_prefix("Bearer ") {
+            let token = token.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
             }
         }
     }

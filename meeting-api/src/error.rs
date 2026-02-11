@@ -39,6 +39,13 @@ impl AppError {
         Self::new(StatusCode::UNAUTHORIZED, APIError::unauthorized())
     }
 
+    pub fn unauthorized_msg(detail: &str) -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            APIError::unauthorized_with_detail(detail),
+        )
+    }
+
     pub fn invalid_meeting_id(detail: &str) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,

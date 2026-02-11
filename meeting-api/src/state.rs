@@ -23,12 +23,16 @@ pub struct AppState {
     pub db: PgPool,
     /// JWT signing secret (shared with the Media Server).
     pub jwt_secret: String,
-    /// Token time-to-live in seconds.
+    /// Room access token time-to-live in seconds.
     pub token_ttl_secs: i64,
+    /// Session JWT time-to-live in seconds.
+    pub session_ttl_secs: i64,
     /// OAuth configuration. `None` disables OAuth endpoints.
     pub oauth: Option<OAuthConfig>,
     /// Cookie domain (e.g. ".example.com"), or `None` for default.
     pub cookie_domain: Option<String>,
+    /// Whether to set the `Secure` flag on cookies.
+    pub cookie_secure: bool,
 }
 
 impl AppState {
@@ -37,8 +41,10 @@ impl AppState {
             db,
             jwt_secret: config.jwt_secret.clone(),
             token_ttl_secs: config.token_ttl_secs,
+            session_ttl_secs: config.session_ttl_secs,
             oauth: config.oauth.clone(),
             cookie_domain: config.cookie_domain.clone(),
+            cookie_secure: config.cookie_secure,
         }
     }
 }

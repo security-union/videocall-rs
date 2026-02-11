@@ -73,7 +73,7 @@ videocall.rs is composed of two independent services that communicate through a 
 ### Service Responsibilities
 
 **Meeting Backend** (separate binary, its own process and port):
-- Handles OAuth login and user authentication (email cookie)
+- Handles OAuth login and user authentication (signed session JWT in HttpOnly cookie or Bearer header)
 - Manages all meeting CRUD operations (create, list, get, delete)
 - Manages the waiting room, admission, and participant state
 - Issues signed **room access tokens** (JWTs) when a participant is admitted
@@ -82,26 +82,77 @@ videocall.rs is composed of two independent services that communicate through a 
 
 **Media Server** (existing WebSocket/WebTransport server):
 - Handles real-time audio/video/data transport
-- Validates room access tokens on every connection attempt
+- When `FEATURE_MEETING_MANAGEMENT=true`, validates room access tokens on every connection attempt
 - Extracts identity, room, and permissions from the JWT claims
-- **Rejects connections without a valid, signed token**
+- **Rejects connections without a valid, signed token** (when meeting management is enabled)
+- When `FEATURE_MEETING_MANAGEMENT=false` (default), allows connections without a token for backward compatibility
 - Does not create, manage, or track meetings -- it is stateless with respect to meeting lifecycle
 - Relays media via NATS pub/sub
+
+### Feature Flag
+
+JWT validation on the Media Server is gated behind the `FEATURE_MEETING_MANAGEMENT` environment variable:
+
+| Value | Behavior |
+|-------|----------|
+| `true` | JWT validation is **enforced**. Connections without a valid token are rejected. |
+| `false` (default) | JWT validation is **disabled**. Connections are accepted without a token (backward compatible). |
+
+This allows the meeting management system to be deployed incrementally. Once the UI is updated to obtain and present tokens, the feature flag can be flipped to `true` to enforce token-based access.
 
 ### Why Two Services?
 
 Separating the Meeting Backend from the Media Server provides:
 
-- **Enforced access control**: A client cannot connect to a media session without first going through the Meeting Backend's admission flow. There is no way to bypass the waiting room.
+- **Enforced access control**: When meeting management is enabled, a client cannot connect to a media session without first going through the Meeting Backend's admission flow. There is no way to bypass the waiting room.
 - **Single source of truth**: All meeting state lives in the Meeting Backend's database. The Media Server does not maintain its own parallel participant tracking.
 - **Independent scaling**: The Meeting Backend (REST API + database) and Media Server (real-time transport) have different scaling characteristics and can be scaled independently.
 - **Clean separation of concerns**: Business logic (meetings, ownership, admission) is fully separated from transport logic (media relay, codecs, NATS).
 
 ---
 
+## Session Authentication
+
+The Meeting Backend authenticates API requests using a **signed session JWT** (HMAC-SHA256). This replaces the legacy plaintext email cookie with a cryptographically verified token.
+
+### Two Token Types
+
+The system uses two separate JWTs with different purposes and delivery mechanisms:
+
+| Token | Purpose | Delivery | Lifetime | HttpOnly |
+|-------|---------|----------|----------|----------|
+| **Session JWT** | Authenticates user to the Meeting Backend | `Set-Cookie` (HttpOnly, Secure, SameSite=Lax) or `Authorization: Bearer` | Configurable (default: long-lived) | Yes (cookie) |
+| **Room Access JWT** | Authorizes room join on the Media Server | JSON response body | Configurable TTL (short) | N/A |
+
+### Session JWT Claims
+
+| Claim | Description |
+|-------|-------------|
+| `sub` | User email (identity principal) |
+| `name` | Display name |
+| `exp` | Expiration (Unix timestamp) |
+| `iat` | Issued-at (Unix timestamp) |
+| `iss` | `"videocall-meeting-backend"` |
+
+### Session Token Flow
+
+1. User completes OAuth login with Google
+2. Meeting Backend issues a signed session JWT and sets it as an `HttpOnly; Secure; SameSite=Lax` cookie
+3. The browser sends the cookie automatically with every request to the Meeting Backend
+4. JavaScript cannot read the cookie (XSS protection)
+5. Non-browser clients can use `Authorization: Bearer <session_jwt>` instead
+
+### Cookie Properties
+
+- `HttpOnly` -- JavaScript cannot read the cookie, preventing XSS token theft
+- `Secure` -- Cookie is only sent over HTTPS (configurable via `COOKIE_SECURE=false` for local dev)
+- `SameSite=Lax` -- Cookie is sent on top-level navigations (so meeting links from Slack/email work) but not on cross-site AJAX
+
+---
+
 ## Room Access Token
 
-The room access token is a signed JWT that bridges the Meeting Backend and the Media Server. It is the **only way** to connect to a media session.
+The room access token is a signed JWT that bridges the Meeting Backend and the Media Server. When meeting management is enabled, it is the **only way** to connect to a media session.
 
 ### Token Flow
 
@@ -109,7 +160,7 @@ The room access token is a signed JWT that bridges the Meeting Backend and the M
  Client                  Meeting Backend              Media Server
    │                          │                            │
    │  1. POST /join           │                            │
-   │  (cookie auth)           │                            │
+   │  (session JWT auth)      │                            │
    │ ────────────────────────>│                            │
    │                          │                            │
    │  2. APIResponse:         │                            │
@@ -178,10 +229,37 @@ The room access token is a standard JWT signed with a shared secret (HMAC-SHA256
 
 ### Connection Endpoint
 
-The Media Server connection endpoint changes from path-based identity to token-based identity:
+The Media Server has two connection endpoints:
 
-- **Old**: `GET /lobby/{email}/{room}` -- unauthenticated, anyone can connect
-- **New**: `GET /lobby?token=<JWT>` -- Media Server validates signature, extracts room and identity from claims, rejects invalid or expired tokens
+**Primary (token-based)**:
+```
+GET /lobby?token=<JWT>
+```
+
+- **WebSocket**: `ws://host:8080/lobby?token=<JWT>`
+- **WebTransport**: `https://host:4433/lobby?token=<JWT>`
+
+The identity (email) and room are extracted from the JWT claims (`sub` and `room`). There are no email or room parameters in the URL. The token is the sole source of truth.
+
+The Media Server validates:
+1. JWT signature (HMAC-SHA256 with shared `JWT_SECRET`)
+2. Expiration (`exp` claim)
+3. `room_join == true`
+4. Issuer matches `videocall-meeting-backend`
+
+Invalid, expired, or unauthorized tokens are rejected with HTTP 401.
+
+**Deprecated (path-based, unauthenticated)**:
+```
+GET /lobby/{email}/{room}
+```
+
+> **Deprecated**: This endpoint exists only for backward compatibility when `FEATURE_MEETING_MANAGEMENT=false`. When `FEATURE_MEETING_MANAGEMENT=true`, it returns **HTTP 410 Gone**. Clients should migrate to the token-based endpoint.
+
+- **WebSocket**: `ws://host:8080/lobby/{email}/{room}`
+- **WebTransport**: `https://host:4433/lobby/{email}/{room}`
+
+No authentication is performed. The email and room are taken directly from the URL path.
 
 ---
 

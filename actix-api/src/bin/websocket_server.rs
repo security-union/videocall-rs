@@ -16,32 +16,25 @@
  * conditions.
  */
 
-use actix::{prelude::Stream, Actor, StreamHandler};
+use actix::Actor;
 use actix_cors::Cors;
-use actix_http::{
-    error::PayloadError,
-    ws::{Codec, Message, ProtocolError},
-};
 use actix_web::{
     cookie::{
         time::{Duration, OffsetDateTime},
         Cookie, SameSite,
     },
-    error, get,
-    web::{self, Bytes},
-    App, Error, HttpRequest, HttpResponse, HttpServer,
+    error, get, web, App, Error, HttpRequest, HttpResponse, HttpServer,
 };
-use actix_web_actors::ws::{handshake, WebsocketContext};
 use reqwest::header::LOCATION;
 use sec_api::{
-    actors::{chat_server::ChatServer, transports::ws_chat_session::WsChatSession},
+    actors::chat_server::ChatServer,
     api,
     auth::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
-    constants::VALID_ID_PATTERN,
     db::{get_pool, PostgresPool},
+    lobby::{ws_connect, ws_connect_authenticated},
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
@@ -270,61 +263,6 @@ async fn logout() -> Result<HttpResponse, Error> {
     Ok(response.finish())
 }
 
-fn start_with_codec<A, S>(
-    actor: A,
-    req: &HttpRequest,
-    stream: S,
-    codec: Codec,
-) -> Result<HttpResponse, Error>
-where
-    A: Actor<Context = WebsocketContext<A>> + StreamHandler<Result<Message, ProtocolError>>,
-    S: Stream<Item = Result<Bytes, PayloadError>> + 'static,
-{
-    let mut res = handshake(req)?;
-    Ok(res.streaming(WebsocketContext::with_codec(actor, stream, codec)))
-}
-
-#[get("/lobby/{email}/{room}")]
-pub async fn ws_connect(
-    session: web::Path<(String, String)>,
-    req: HttpRequest,
-    stream: web::Payload,
-    state: web::Data<AppState>,
-) -> Result<HttpResponse, Error> {
-    let (email, room) = session.into_inner();
-
-    // Validate email and room using the same pattern as WebTransport
-    let email_clean = email.replace(' ', "_");
-    let room_clean = room.replace(' ', "_");
-    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-    if !re.is_match(&email_clean) || !re.is_match(&room_clean) {
-        error!(
-            "Invalid email or room format: email={}, room={}",
-            email, room
-        );
-        return Ok(HttpResponse::BadRequest().body("Invalid email or room format"));
-    }
-
-    debug!(
-        "socket connected for email={}, room={}",
-        email_clean, room_clean
-    );
-    let chat = state.chat.clone();
-    let nats_client = state.nats_client.clone();
-    let tracker_sender = state.tracker_sender.clone();
-    let session_manager = state.session_manager.clone();
-    let actor = WsChatSession::new(
-        chat,
-        room_clean,
-        email_clean,
-        nats_client,
-        tracker_sender,
-        session_manager,
-    );
-    let codec = Codec::new().max_size(1_000_000);
-    start_with_codec(actor, &req, stream, codec)
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -388,6 +326,7 @@ async fn main() -> std::io::Result<()> {
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
+                .service(ws_connect_authenticated)
                 .service(ws_connect)
                 .configure(api::configure_api_routes)
         } else if db_enabled {
@@ -415,6 +354,7 @@ async fn main() -> std::io::Result<()> {
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
+                .service(ws_connect_authenticated)
                 .service(ws_connect)
                 .configure(api::configure_api_routes)
         } else {
@@ -431,6 +371,7 @@ async fn main() -> std::io::Result<()> {
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
+                .service(ws_connect_authenticated)
                 .service(ws_connect)
         }
     })

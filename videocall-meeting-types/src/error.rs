@@ -41,8 +41,16 @@ impl APIError {
     pub fn unauthorized() -> Self {
         Self {
             code: "UNAUTHORIZED".to_string(),
-            message: "Authentication required. Please provide email cookie.".to_string(),
+            message: "Authentication required.".to_string(),
             engineering_error: None,
+        }
+    }
+
+    pub fn unauthorized_with_detail(detail: &str) -> Self {
+        Self {
+            code: "UNAUTHORIZED".to_string(),
+            message: "Authentication required.".to_string(),
+            engineering_error: Some(detail.to_string()),
         }
     }
 

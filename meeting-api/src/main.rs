@@ -16,11 +16,12 @@
 //! A standalone Axum service that manages meetings, waiting rooms,
 //! and issues JWT room access tokens for the Media Server.
 
+use axum::http;
 use meeting_api::config::Config;
 use meeting_api::routes;
 use meeting_api::state::AppState;
 use sqlx::postgres::PgPoolOptions;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -39,10 +40,27 @@ async fn main() {
 
     tracing::info!("Connected to PostgreSQL");
 
+    // CORS: mirror the request Origin so that credentials (HttpOnly session
+    // cookie) work across origins in development.  In production the API is
+    // typically behind a reverse proxy on the same domain.
+    //
+    // `allow_credentials(true)` requires explicit methods and headers (not *).
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_methods([
+            http::Method::GET,
+            http::Method::POST,
+            http::Method::PUT,
+            http::Method::DELETE,
+            http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            http::header::CONTENT_TYPE,
+            http::header::AUTHORIZATION,
+            http::header::COOKIE,
+            http::header::ACCEPT,
+        ])
+        .allow_credentials(true);
 
     let state = AppState::new(pool, &config);
     let app = routes::router().layer(cors).with_state(state);

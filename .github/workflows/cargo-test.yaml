@@ -27,10 +27,8 @@ jobs:
           # Stop any running containers from previous runs
           docker compose -f docker/docker-compose.integration.yaml down -v 2>/dev/null || true
           docker system prune -f --volumes
-          # Remove named volumes that may have corrupted cargo registry cache
-          docker volume rm -f docker_rustlemania-it-tests-registry docker_rustlemania-it-tests-git docker_rustlemania-it-tests-target docker_rustlemania-it-tests-cache 2>/dev/null || true
-          # List remaining volumes for debugging
-          docker volume ls
+          # Remove target volume if corrupted
+          docker volume rm -f docker_rustlemania-it-tests-target 2>/dev/null || true
 
       - name: Run tests
         run: make tests_run

@@ -43,10 +43,12 @@ services:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-it-tests-registry:/usr/local/cargo/registry
-      - rustlemania-it-tests-git:/usr/local/cargo/git
-      - rustlemania-it-tests-target:/usr/local/cargo/target
-      - rustlemania-it-tests-cache:/app/actix-api/target
+      # Use tmpfs for cargo registry to avoid "File exists" errors from volume/image layer conflicts
+      - type: tmpfs
+        target: /usr/local/cargo/registry
+      - type: tmpfs
+        target: /usr/local/cargo/git
+      - rustlemania-it-tests-target:/app/actix-api/target
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,11 +59,6 @@ services:
         set -euo pipefail
         source /usr/local/cargo/env || true
         export PATH="/usr/local/cargo/bin:$PATH"
-
-        # Clean cargo registry to prevent "File exists" errors from image layer conflicts
-        echo "=== CLEANING CARGO REGISTRY ==="
-        rm -rf /usr/local/cargo/registry/src/* 2>/dev/null || true
-        rm -rf /usr/local/cargo/registry/cache/* 2>/dev/null || true
 
         echo "=== RUNNING DATABASE MIGRATIONS ==="
         cd /app/dbmate && dbmate wait && dbmate up
@@ -74,9 +71,6 @@ services:
       '
 
 volumes:
-  rustlemania-it-tests-registry:
-  rustlemania-it-tests-git:
   rustlemania-it-tests-target:
-  rustlemania-it-tests-cache:
 
 

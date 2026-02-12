@@ -33,7 +33,7 @@ use sec_api::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
-db::{get_database_url, get_pool, PostgresPool},
+    db::{get_database_url, get_pool, PostgresPool},
     lobby::{ws_connect, ws_connect_authenticated},
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,

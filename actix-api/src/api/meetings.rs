@@ -121,7 +121,10 @@ pub async fn create_meeting(
 
     // 3. Validate attendees count
     if body.attendees.len() > MAX_ATTENDEES {
-        return HttpResponse::BadRequest().json(APIError::too_many_attendees(body.attendees.len(), MAX_ATTENDEES));
+        return HttpResponse::BadRequest().json(APIError::too_many_attendees(
+            body.attendees.len(),
+            MAX_ATTENDEES,
+        ));
     }
 
     // 4. Create meeting in database

@@ -7,6 +7,9 @@ description = "A secure API for the videocall project"
 keywords = ["webtransport", "quic", "webrtc", "videocall", "http3"]
 categories = ["network-programming", "multimedia"]
 
+[package.metadata.cargo-machete]
+ignored = ["postgres-types"]
+
 [features]
 default = []
 

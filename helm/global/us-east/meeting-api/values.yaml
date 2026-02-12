@@ -37,18 +37,26 @@ meeting-api:
       value: ".videocall.rs"
     - name: CORS_ALLOWED_ORIGIN
       value: "https://app.videocall.rs"
+    # --- OAuth / OIDC ---
     - name: OAUTH_CLIENT_ID
       valueFrom:
         secretKeyRef:
-          name: google-oauth-credentials
+          name: oauth-credentials
           key: client-id
+          optional: true
     - name: OAUTH_SECRET
       valueFrom:
         secretKeyRef:
-          name: google-oauth-credentials
+          name: oauth-credentials
           key: client-secret
+          optional: true
+    # Discovery will auto-populate auth/token/jwks URLs based on OAUTH_ISSUER
+    - name: OAUTH_ISSUER
+      value: "https://accounts.google.com"
     - name: OAUTH_REDIRECT_URL
       value: "https://api.videocall.rs/login/callback"
+    - name: OAUTH_SCOPES
+      value: "openid email profile"
     - name: AFTER_LOGIN_URL
       value: "https://app.videocall.rs"
 

@@ -48,17 +48,13 @@ pub fn login() -> Html {
                 // Sign in box
                 <div class="flex flex-col items-center">
 
-                    // Google Sign-in button (image)
+                    // OAuth Sign-in button
                     <button
                         onclick={login}
                         class="transition-transform hover:scale-[1.02] active:scale-[0.98]"
-                        style="background: none; border: none; padding: 0; cursor: pointer;"
+                        style="background: #0a84ff; border: none; padding: 12px 32px; cursor: pointer; border-radius: 8px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 1rem; font-weight: 500; color: #ffffff; letter-spacing: 0.01em;"
                     >
-                        <img
-                            src="/assets/btn_google.png"
-                            alt="Sign in with Google"
-                            class="h-[46px] w-auto"
-                        />
+                        {"Sign in"}
                     </button>
 
                     <p style="margin-top: 2rem; text-align: center; font-size: 0.75rem; color: #86868b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">

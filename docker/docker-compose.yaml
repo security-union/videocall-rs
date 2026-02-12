@@ -84,11 +84,22 @@ services:
       - COOKIE_SECURE=false
       - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
       - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-}
+      # --- OAuth / OIDC provider configuration ---
+      # Google:
+      #   OAUTH_ISSUER=https://accounts.google.com
+      #   OAUTH_SECRET=<required>
+      # Okta:
+      #   OAUTH_ISSUER=https://your-org.okta.com
+      #   OAUTH_SECRET=              # leave empty for public client
       - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
       - OAUTH_SECRET=${OAUTH_CLIENT_SECRET:-}
       - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:8081/login/callback}
-      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-https://accounts.google.com/o/oauth2/v2/auth}
-      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-https://oauth2.googleapis.com/token}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-}
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-}
+      - OAUTH_JWKS_URL=${OAUTH_JWKS_URL:-}
+      - OAUTH_USERINFO_URL=${OAUTH_USERINFO_URL:-}
+      - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
       - AFTER_LOGIN_URL=${AFTER_LOGIN_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
       - RUST_LOG=debug
       - CARGO_TARGET_DIR=/app/meeting-api/target

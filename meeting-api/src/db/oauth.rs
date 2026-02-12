@@ -23,26 +23,30 @@ pub struct OAuthRequestRow {
     pub pkce_verifier: Option<String>,
     pub csrf_state: Option<String>,
     pub return_to: Option<String>,
+    pub nonce: Option<String>,
 }
 
-/// Store a new OAuth request (PKCE + CSRF state) for later retrieval in the callback.
+/// Store a new OAuth request (PKCE + CSRF state + optional nonce) for later
+/// retrieval in the callback.
 pub async fn store_oauth_request(
     pool: &PgPool,
     pkce_challenge: &str,
     pkce_verifier: &str,
     csrf_state: &str,
     return_to: Option<&str>,
+    nonce: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO oauth_requests (pkce_challenge, pkce_verifier, csrf_state, return_to)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO oauth_requests (pkce_challenge, pkce_verifier, csrf_state, return_to, nonce)
+        VALUES ($1, $2, $3, $4, $5)
         "#,
     )
     .bind(pkce_challenge)
     .bind(pkce_verifier)
     .bind(csrf_state)
     .bind(return_to)
+    .bind(nonce)
     .execute(pool)
     .await?;
     Ok(())
@@ -54,7 +58,7 @@ pub async fn fetch_oauth_request(
     csrf_state: &str,
 ) -> Result<Option<OAuthRequestRow>, sqlx::Error> {
     sqlx::query_as::<_, OAuthRequestRow>(
-        "SELECT pkce_challenge, pkce_verifier, csrf_state, return_to FROM oauth_requests WHERE csrf_state = $1",
+        "SELECT pkce_challenge, pkce_verifier, csrf_state, return_to, nonce FROM oauth_requests WHERE csrf_state = $1",
     )
     .bind(csrf_state)
     .fetch_optional(pool)

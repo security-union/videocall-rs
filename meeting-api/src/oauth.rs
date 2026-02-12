@@ -437,6 +437,10 @@ pub async fn exchange_code_for_claims(
     let claims = if let Some(jwks) = jwks {
         verify_and_decode_id_token(jwks, id_token, client_id, issuer, expected_nonce).await?
     } else {
+        tracing::warn!(
+            "JWKS not configured — ID token signature, issuer, audience, and nonce are NOT verified. \
+             Set OAUTH_JWKS_URL or OAUTH_ISSUER to enable verification."
+        );
         decode_id_token_claims_unverified(id_token)?
     };
 

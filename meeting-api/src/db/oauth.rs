@@ -53,12 +53,13 @@ pub async fn store_oauth_request(
 }
 
 /// Fetch and consume an OAuth request by CSRF state.
+/// The row is atomically deleted so that each state token can only be used once.
 pub async fn fetch_oauth_request(
     pool: &PgPool,
     csrf_state: &str,
 ) -> Result<Option<OAuthRequestRow>, sqlx::Error> {
     sqlx::query_as::<_, OAuthRequestRow>(
-        "SELECT pkce_challenge, pkce_verifier, csrf_state, return_to, nonce FROM oauth_requests WHERE csrf_state = $1",
+        "DELETE FROM oauth_requests WHERE csrf_state = $1 RETURNING pkce_challenge, pkce_verifier, csrf_state, return_to, nonce",
     )
     .bind(csrf_state)
     .fetch_optional(pool)

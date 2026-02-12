@@ -96,12 +96,18 @@ pub async fn login(
     // Generate a nonce for OIDC ID token binding (reuse oauth2's crypto RNG).
     let nonce = CsrfToken::new_random();
 
+    // Sanitize return_to: only allow relative paths to prevent open redirect.
+    let return_to = query.return_to.as_deref().filter(|u| {
+        let u = u.trim();
+        u.starts_with('/') && !u.starts_with("//")
+    });
+
     db_oauth::store_oauth_request(
         &state.db,
         pkce_challenge.as_str(),
         pkce_verifier.secret(),
         csrf_token.secret(),
-        query.return_to.as_deref(),
+        return_to,
         Some(nonce.secret()),
     )
     .await?;
@@ -228,7 +234,8 @@ pub async fn callback(
     let mut response = Redirect::to(&redirect_url).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
-        HeaderValue::from_str(&session_cookie).unwrap(),
+        HeaderValue::from_str(&session_cookie)
+            .map_err(|_| AppError::internal("failed to build session cookie header"))?,
     );
     Ok(response)
 }
@@ -259,13 +266,15 @@ pub async fn get_profile(
 }
 
 /// GET /logout -- clears the session cookie.
-pub async fn logout(State(state): State<AppState>) -> Response {
+pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError> {
     let clear = build_clear_session_cookie(state.cookie_domain.as_deref(), state.cookie_secure);
     let mut response = StatusCode::OK.into_response();
-    response
-        .headers_mut()
-        .append(header::SET_COOKIE, HeaderValue::from_str(&clear).unwrap());
-    response
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear)
+            .map_err(|_| AppError::internal("failed to build clear cookie header"))?,
+    );
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------

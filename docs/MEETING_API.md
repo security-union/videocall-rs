@@ -905,14 +905,14 @@ curl http://localhost:8080/api/v1/meetings/standup-2024/waiting \
 #   "waiting":[{"email":"alice@example.com","display_name":"Alice",...}]}}
 
 # 6. Host admits Alice
-curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/admit \
+curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/admit \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H "Cookie: email=host@example.com" \
   -d '{"email": "alice@example.com"}'
 
 # 7. Alice polls and receives her room token
-curl http://localhost:8081/api/v1/meetings/standup-2024/status \
-  -H "Authorization: Bearer $ALICE_SESSION_TOKEN"
+curl http://localhost:8080/api/v1/meetings/standup-2024/status \
+  -H "Cookie: email=alice@example.com"
 
 # Response:
 # {"success":true,"result":{"email":"alice@example.com","display_name":"Alice",
@@ -923,12 +923,12 @@ curl http://localhost:8081/api/v1/meetings/standup-2024/status \
 #    WebSocket: ws://localhost:8080/lobby?token=eyJhbGciOiJIUzI1NiIs...
 
 # 9. When done, participants leave
-curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/leave \
-  -H "Authorization: Bearer $ALICE_SESSION_TOKEN"
+curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/leave \
+  -H "Cookie: email=alice@example.com"
 
 # 10. Host leaves (ends the meeting)
-curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/leave \
-  -H "Authorization: Bearer $SESSION_TOKEN"
+curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/leave \
+  -H "Cookie: email=host@example.com"
 ```
 
 ---

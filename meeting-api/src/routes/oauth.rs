@@ -213,9 +213,16 @@ pub async fn callback(
         state.session_ttl_secs,
     )?;
 
-    let redirect_url = oauth_req
-        .return_to
-        .unwrap_or_else(|| oauth_cfg.after_login_url.clone());
+    let redirect_url = match oauth_req.return_to {
+        // return_to is a relative path (e.g. "/meeting/1") — prepend the
+        // frontend base URL so the redirect lands on the app, not the API.
+        Some(path) => format!(
+            "{}{}",
+            oauth_cfg.after_login_url.trim_end_matches('/'),
+            path
+        ),
+        None => oauth_cfg.after_login_url.clone(),
+    };
 
     let session_cookie = build_session_cookie(
         &session_jwt,

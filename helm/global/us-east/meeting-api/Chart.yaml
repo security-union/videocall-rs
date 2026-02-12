@@ -1,0 +1,9 @@
+apiVersion: v2
+name: meeting-api-us-east
+version: 0.1.0
+description: Meeting API server for US East region
+
+dependencies:
+  - name: meeting-api
+    version: 0.1.0
+    repository: file://../../../meeting-api

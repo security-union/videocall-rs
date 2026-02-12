@@ -1,0 +1,80 @@
+# Default values for meeting-api.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+image:
+  repository: securityunion/videocall-meeting-api
+  pullPolicy: Always
+  tag: latest
+env:
+  - name: RUST_LOG
+    value: info
+  - name: LISTEN_ADDR
+    value: "0.0.0.0:8081"
+  - name: DATABASE_URL
+    value: "postgres://user:pass@localhost/videocall"
+  - name: JWT_SECRET
+    value: "change-me"
+  - name: TOKEN_TTL_SECS
+    value: "86400"
+  - name: SESSION_TTL_SECS
+    value: "315360000"
+  - name: COOKIE_SECURE
+    value: "true"
+  - name: COOKIE_DOMAIN
+    value: ".videocall.rs"
+  - name: CORS_ALLOWED_ORIGIN
+    value: "https://app.videocall.rs"
+  - name: OAUTH_CLIENT_ID
+    value: "change-me"
+  - name: OAUTH_SECRET
+    value: "change-me"
+  - name: OAUTH_REDIRECT_URL
+    value: "https://api.videocall.rs/login/callback"
+  - name: AFTER_LOGIN_URL
+    value: "https://app.videocall.rs"
+resources:
+  limits:
+    cpu: "200m"
+    memory: "256Mi"
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  port: 8081
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: api.videocall.rs
+      paths:
+        - path: /
+          pathType: Prefix
+          service:
+            name: meeting-api
+            port:
+              number: 8081
+  tls:
+    - secretName: meeting-api-tls
+      hosts:
+        - api.videocall.rs

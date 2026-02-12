@@ -38,6 +38,7 @@ services:
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
+      - JWT_SECRET=test-secret-for-integration-tests
     volumes:
       - type: bind
         source: ../
@@ -57,9 +58,11 @@ services:
         echo "=== RUNNING DATABASE MIGRATIONS ==="
         cd /app/dbmate && dbmate wait && dbmate up
         cd /app/actix-api
-        echo "=== STARTING CARGO TEST ==="
+        echo "=== TESTING videocall-api ==="
         cargo test -p videocall-api -- --nocapture --test-threads=1
-        echo "=== CARGO TEST FINISHED WITH EXIT CODE: $? ==="
+        echo "=== TESTING meeting-api ==="
+        cargo test -p meeting-api -- --nocapture --test-threads=1
+        echo "=== ALL TESTS FINISHED ==="
       '
 
 volumes:

@@ -699,6 +699,8 @@ pub struct HeartbeatMetadata {
     pub audio_enabled: bool,
     // @@protoc_insertion_point(field:HeartbeatMetadata.screen_enabled)
     pub screen_enabled: bool,
+    // @@protoc_insertion_point(field:HeartbeatMetadata.is_speaking)
+    pub is_speaking: bool,
     // special fields
     // @@protoc_insertion_point(special_field:HeartbeatMetadata.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -716,7 +718,7 @@ impl HeartbeatMetadata {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(3);
+        let mut fields = ::std::vec::Vec::with_capacity(4);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "video_enabled",
@@ -732,6 +734,11 @@ impl HeartbeatMetadata {
             "screen_enabled",
             |m: &HeartbeatMetadata| { &m.screen_enabled },
             |m: &mut HeartbeatMetadata| { &mut m.screen_enabled },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
+            "is_speaking",
+            |m: &HeartbeatMetadata| { &m.is_speaking },
+            |m: &mut HeartbeatMetadata| { &mut m.is_speaking },
         ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HeartbeatMetadata>(
             "HeartbeatMetadata",
@@ -760,6 +767,9 @@ impl ::protobuf::Message for HeartbeatMetadata {
                 24 => {
                     self.screen_enabled = is.read_bool()?;
                 },
+                32 => {
+                    self.is_speaking = is.read_bool()?;
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -781,6 +791,9 @@ impl ::protobuf::Message for HeartbeatMetadata {
         if self.screen_enabled != false {
             my_size += 1 + 1;
         }
+        if self.is_speaking != false {
+            my_size += 1 + 1;
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -795,6 +808,9 @@ impl ::protobuf::Message for HeartbeatMetadata {
         }
         if self.screen_enabled != false {
             os.write_bool(3, self.screen_enabled)?;
+        }
+        if self.is_speaking != false {
+            os.write_bool(4, self.is_speaking)?;
         }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
@@ -816,6 +832,7 @@ impl ::protobuf::Message for HeartbeatMetadata {
         self.video_enabled = false;
         self.audio_enabled = false;
         self.screen_enabled = false;
+        self.is_speaking = false;
         self.special_fields.clear();
     }
 
@@ -824,6 +841,7 @@ impl ::protobuf::Message for HeartbeatMetadata {
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
+            is_speaking: false,
             special_fields: ::protobuf::SpecialFields::new(),
         };
         &instance

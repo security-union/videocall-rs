@@ -25,9 +25,10 @@ use yew::prelude::*;
 #[derive(Properties, Debug, PartialEq, Clone)]
 pub struct PeerTileProps {
     pub peer_id: String,
-    /// True when layout has only this peer and no screen share; affects styling
     #[prop_or(false)]
     pub full_bleed: bool,
+    #[prop_or(false)]
+    pub is_speaking: bool,
 }
 
 pub enum Msg {
@@ -39,7 +40,7 @@ pub struct PeerTile {
     audio_enabled: bool,
     video_enabled: bool,
     screen_enabled: bool,
-    speaking: bool,
+    is_speaking: bool,
     abort_handle: Option<AbortHandle>,
 }
 
@@ -48,7 +49,6 @@ impl Component for PeerTile {
     type Properties = PeerTileProps;
 
     fn create(ctx: &Context<Self>) -> Self {
-        // Query context ONCE on creation and cache it
         let (client, _) = ctx
             .link()
             .context::<VideoCallClientCtx>(Callback::noop())
@@ -59,21 +59,20 @@ impl Component for PeerTile {
             audio_enabled: false,
             video_enabled: false,
             screen_enabled: false,
-            speaking: false,
+            is_speaking: false,
             abort_handle: None,
         }
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         if first_render {
-            // Initialize from client snapshot to avoid waiting for first diagnostic
             self.audio_enabled = self.client.is_audio_enabled_for_peer(&ctx.props().peer_id);
             self.video_enabled = self.client.is_video_enabled_for_peer(&ctx.props().peer_id);
             self.screen_enabled = self
                 .client
                 .is_screen_share_enabled_for_peer(&ctx.props().peer_id);
+            self.is_speaking = self.client.is_speaking_for_peer(&ctx.props().peer_id);
 
-            // Subscribe to global diagnostics for peer_status updates
             let link = ctx.link().clone();
             let (abort_handle, abort_reg) = AbortHandle::new_pair();
             let fut = async move {
@@ -100,6 +99,7 @@ impl Component for PeerTile {
                         let mut audio_enabled: Option<bool> = None;
                         let mut video_enabled: Option<bool> = None;
                         let mut screen_enabled: Option<bool> = None;
+                        let mut is_speaking: Option<bool> = None;
                         for m in &evt.metrics {
                             match (m.name, &m.value) {
                                 ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
@@ -111,6 +111,9 @@ impl Component for PeerTile {
                                 }
                                 ("screen_enabled", MetricValue::U64(v)) => {
                                     screen_enabled = Some(*v != 0)
+                                }
+                                ("is_speaking", MetricValue::U64(v)) => {
+                                    is_speaking = Some(*v != 0)
                                 }
                                 _ => {}
                             }
@@ -139,6 +142,12 @@ impl Component for PeerTile {
                                 changed = true;
                             }
                         }
+                        if let Some(s) = is_speaking {
+                            if s != self.is_speaking {
+                                self.is_speaking = s;
+                                changed = true;
+                            }
+                        }
                         changed
                     }
                     "peer_speaking" => {
@@ -158,8 +167,8 @@ impl Component for PeerTile {
                         }
 
                         if let Some(s) = speaking {
-                            if s != self.speaking {
-                                self.speaking = s;
+                            if s != self.is_speaking {
+                                self.is_speaking = s;
                                 return true;
                             }
                         }
@@ -172,12 +181,11 @@ impl Component for PeerTile {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        // Delegate rendering to the existing canvas generator so DOM structure and CSS remain consistent
         generate_for_peer(
             &self.client,
             &ctx.props().peer_id,
             ctx.props().full_bleed,
-            self.speaking,
+            self.is_speaking,
         )
     }
 

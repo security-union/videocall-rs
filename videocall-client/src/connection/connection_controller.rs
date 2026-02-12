@@ -150,7 +150,12 @@ impl ConnectionController {
         inner.connection_manager.set_screen_enabled(enabled)
     }
 
-    /// Check if manager has an active connection
+    pub fn set_speaking(&self, speaking: bool) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.connection_manager.set_speaking(speaking);
+        }
+    }
+
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {
             inner.connection_manager.is_connected()
@@ -246,6 +251,7 @@ mod tests {
             on_state_changed: state_capture.callback(),
             peer_monitor: Callback::from(|_| {}),
             election_period_ms: 1000,
+            on_speaking_changed: None,
         }
     }
 

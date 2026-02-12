@@ -29,12 +29,12 @@ use yew::prelude::*;
 use yew::{html, Html};
 
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
-/// the video tile will occupy the full grid area. The `speaking` parameter indicates voice activity.
+/// the video tile will occupy the full grid area. The `is_speaking` parameter indicates voice activity.
 pub fn generate_for_peer(
     client: &VideoCallClient,
     key: &String,
     full_bleed: bool,
-    speaking: bool,
+    is_speaking: bool,
 ) -> Html {
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
@@ -46,7 +46,7 @@ pub fn generate_for_peer(
     let is_screen_share_enabled_for_peer = client.is_screen_share_enabled_for_peer(key);
 
     // Use speaking state for the glowing border animation
-    let speaking_class = if speaking { "speaking-tile" } else { "" };
+    let speaking_class = if is_speaking { "speaking-tile" } else { "" };
 
     // Full-bleed single peer (no screen share)
     if full_bleed && !is_screen_share_enabled_for_peer {

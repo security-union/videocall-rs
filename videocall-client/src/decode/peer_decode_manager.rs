@@ -87,6 +87,7 @@ pub struct Peer {
     pub video_enabled: bool,
     pub audio_enabled: bool,
     pub screen_enabled: bool,
+    pub is_speaking: bool,
     context_initialized: bool,
 }
 
@@ -128,6 +129,7 @@ impl Peer {
             video_enabled: false,
             audio_enabled: false,
             screen_enabled: false,
+            is_speaking: false,
             context_initialized: false,
         })
     }
@@ -144,32 +146,32 @@ impl Peer {
         ),
         JsValue,
     > {
-        // Create decoders without canvas (will be set later via set_canvas)
-        // We still keep the canvas IDs for backward compatibility with existing code
-        let video_decoder = VideoPeerDecoder::new(None)?;
-        let screen_decoder = VideoPeerDecoder::new(None)?;
+    // Create decoders without canvas (will be set later via set_canvas)
+    // We still keep the canvas IDs for backward compatibility with existing code
+    let video_decoder = VideoPeerDecoder::new(None)?;
+    let screen_decoder = VideoPeerDecoder::new(None)?;
 
-        // Attempt to set canvas immediately if available in DOM
-        if let Some(window) = web_sys::window() {
-            if let Some(document) = window.document() {
-                if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
-                    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-                        let _ = video_decoder.set_canvas(canvas);
-                    }
-                }
-                if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
-                    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-                        let _ = screen_decoder.set_canvas(canvas);
-                    }
-                }
-            }
-        }
+    // Attempt to set canvas immediately if available in DOM
+    if let Some(window) = web_sys::window() {
+    if let Some(document) = window.document() {
+    if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
+    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+    let _ = video_decoder.set_canvas(canvas);
+    }
+    }
+    if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
+    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+    let _ = screen_decoder.set_canvas(canvas);
+    }
+    }
+    }
+    }
 
-        Ok((
-            create_audio_peer_decoder(None, peer_id.to_string())?,
-            video_decoder,
-            screen_decoder,
-        ))
+    Ok((
+    create_audio_peer_decoder(None, peer_id.to_string())?,
+    video_decoder,
+    screen_decoder,
+    ))
     }
 
     fn reset(&mut self) -> Result<(), JsValue> {
@@ -275,7 +277,7 @@ impl Peer {
 
                     // Set mute state on audio decoder when audio state changes (before updating state)
                     if audio_state_changed {
-                        log::info!("[MUTE DEBUG] Audio state changed for peer {} - audio_enabled: {} -> {}", 
+                        log::info!("[MUTE DEBUG] Audio state changed for peer {} - audio_enabled: {} -> {}",
                                                          self.email, self.audio_enabled, metadata.audio_enabled);
                         self.audio.set_muted(!metadata.audio_enabled);
                         debug!(
@@ -292,6 +294,19 @@ impl Peer {
                     self.video_enabled = metadata.video_enabled;
                     self.audio_enabled = metadata.audio_enabled;
                     self.screen_enabled = metadata.screen_enabled;
+                    self.is_speaking = metadata.is_speaking;
+
+                    // Broadcast is_speaking change via diagnostics
+                    let speaking_evt = DiagEvent {
+                        subsystem: "peer_status",
+                        stream_id: None,
+                        ts_ms: now_ms(),
+                        metrics: vec![
+                            metric!("to_peer", self.email.clone()),
+                            metric!("is_speaking", if metadata.is_speaking { 1u64 } else { 0u64 }),
+                        ],
+                    };
+                    let _ = global_sender().try_broadcast(speaking_evt);
 
                     // Flush video decoder when video is turned off
                     if video_turned_off {
@@ -569,5 +584,12 @@ impl PeerDecodeManager {
         );
         SharedAudioContext::update_speaker_device(speaker_device_id)?;
         Ok(())
+    }
+
+    pub fn is_peer_speaking(&self, key: &String) -> bool {
+        if let Some(peer) = self.connected_peers.get(key) {
+            return peer.is_speaking;
+        }
+        false
     }
 }

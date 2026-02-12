@@ -54,6 +54,11 @@ enum WorkerResponse {
     },
 }
 
+/// Threshold for voice activity detection (RMS level)
+/// Values typically range from 0.0 to 1.0 for normalized audio
+/// 0.01 is quite sensitive, 0.05 filters out most background noise
+const VAD_THRESHOLD: f32 = 0.02;
+
 /// Audio decoder that sends packets to a NetEq worker and plays the returned PCM via WebAudio.
 #[derive(Debug)]
 pub struct NetEqAudioPeerDecoder {
@@ -66,6 +71,9 @@ pub struct NetEqAudioPeerDecoder {
     // Message queueing system
     pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
     worker_ready: Rc<RefCell<bool>>,
+
+    // Voice activity detection state
+    speaking: Rc<RefCell<bool>>,
 }
 
 impl NetEqAudioPeerDecoder {
@@ -137,13 +145,52 @@ impl NetEqAudioPeerDecoder {
         Ok((audio_context, pcm_player))
     }
 
+    /// Calculate RMS (Root Mean Square) of audio samples for voice activity detection
+    fn calculate_rms(pcm: &Float32Array) -> f32 {
+        let length = pcm.length() as usize;
+        if length == 0 {
+            return 0.0;
+        }
+
+        let mut sum_squares: f32 = 0.0;
+        for i in 0..length {
+            let sample = pcm.get_index(i as u32);
+            sum_squares += sample * sample;
+        }
+
+        (sum_squares / length as f32).sqrt()
+    }
+
     /// Handle PCM audio data from NetEq worker
     fn handle_pcm_data(
         pcm: Float32Array,
         pcm_player: Rc<RefCell<Option<AudioWorkletNode>>>,
         audio_context: &AudioContext,
         speaker_device_id: Option<String>,
+        peer_id: String,
+        speaking: Rc<RefCell<bool>>,
     ) {
+        // Calculate RMS for voice activity detection
+        let rms = Self::calculate_rms(&pcm);
+        let is_speaking = rms > VAD_THRESHOLD;
+
+        // Check if speaking state changed
+        let prev_speaking = *speaking.borrow();
+        if is_speaking != prev_speaking {
+            *speaking.borrow_mut() = is_speaking;
+
+            // Emit diagnostics event for speaking state change
+            let _ = global_sender().try_broadcast(DiagEvent {
+                subsystem: "peer_speaking",
+                stream_id: Some(format!("speaking->{peer_id}")),
+                ts_ms: now_ms(),
+                metrics: vec![
+                    metric!("to_peer", peer_id.clone()),
+                    metric!("speaking", if is_speaking { 1u64 } else { 0u64 }),
+                ],
+            });
+        }
+
         // Ensure AudioContext is running
         if let Err(e) = audio_context.resume() {
             web_sys::console::warn_1(
@@ -337,18 +384,21 @@ impl NetEqAudioPeerDecoder {
         worker_ready: Rc<RefCell<bool>>,
         pending_messages: Rc<RefCell<VecDeque<WorkerMsg>>>,
         worker: Worker,
+        speaking: Rc<RefCell<bool>>,
     ) -> Closure<dyn FnMut(MessageEvent)> {
         Closure::wrap(Box::new(move |event: MessageEvent| {
             let data = event.data();
 
             if data.is_instance_of::<Float32Array>() {
-                // High-performance PCM path (unchanged)
+                // High-performance PCM path with voice activity detection
                 let pcm = Float32Array::from(data);
                 Self::handle_pcm_data(
                     pcm,
                     pcm_player.clone(),
                     &audio_context,
                     speaker_device_id.clone(),
+                    peer_id.clone(),
+                    speaking.clone(),
                 );
             } else if data.is_object() {
                 // Try to parse as WorkerResponse first
@@ -431,6 +481,9 @@ impl NetEqAudioPeerDecoder {
             // Message queueing system
             pending_messages: Rc::new(RefCell::new(VecDeque::new())),
             worker_ready: Rc::new(RefCell::new(false)),
+
+            // Voice activity detection state
+            speaking: Rc::new(RefCell::new(false)),
         };
 
         // Set up worker message handling with decoder's queue references
@@ -442,6 +495,7 @@ impl NetEqAudioPeerDecoder {
             decoder.worker_ready.clone(),
             decoder.pending_messages.clone(),
             worker.clone(),
+            decoder.speaking.clone(),
         );
 
         worker.set_onmessage(Some(on_message_closure.as_ref().unchecked_ref()));

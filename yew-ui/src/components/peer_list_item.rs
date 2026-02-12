@@ -28,6 +28,8 @@ pub struct PeerListItemProps {
     pub name: String,
     #[prop_or(true)]
     pub muted: bool,
+    #[prop_or(false)]
+    pub speaking: bool,
 }
 
 impl Component for PeerListItem {
@@ -40,6 +42,11 @@ impl Component for PeerListItem {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
+        let mic_class = if ctx.props().speaking {
+            "peer_item_mic speaking"
+        } else {
+            "peer_item_mic"
+        };
         html! {
             <div class="peer_item" >
                 <div class="peer_item_icon">
@@ -48,7 +55,7 @@ impl Component for PeerListItem {
                 <div class="peer_item_text">
                     {ctx.props().name.clone()}
                 </div>
-                <div class="peer_item_mic">
+                <div class={mic_class}>
                     <MicIcon muted={ctx.props().muted} />
                 </div>
             </div>

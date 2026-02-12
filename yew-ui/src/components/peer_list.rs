@@ -30,6 +30,7 @@ pub struct PeerList {
     search_query: String,
     show_context_menu: bool,
     peer_audio_states: HashMap<String, bool>,
+    peer_speaking_states: HashMap<String, bool>,
     abort_handle: Option<AbortHandle>,
 }
 
@@ -69,6 +70,7 @@ impl Component for PeerList {
             search_query: String::new(),
             show_context_menu: false,
             peer_audio_states: ctx.props().peer_audio_states.clone(),
+            peer_speaking_states: HashMap::new(),
             abort_handle: None,
         }
     }
@@ -103,28 +105,53 @@ impl Component for PeerList {
                 true
             }
             PeerListMsg::Diagnostics(evt) => {
-                if evt.subsystem != "peer_status" {
-                    return false;
-                }
-                // Parse peer_status metrics
-                let mut to_peer: Option<String> = None;
-                let mut audio_enabled: Option<bool> = None;
-                for m in &evt.metrics {
-                    match (m.name, &m.value) {
-                        ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
-                        ("audio_enabled", MetricValue::U64(v)) => audio_enabled = Some(*v != 0),
-                        _ => {}
-                    }
-                }
+                match evt.subsystem {
+                    "peer_status" => {
+                        // Parse peer_status metrics for audio enabled state
+                        let mut to_peer: Option<String> = None;
+                        let mut audio_enabled: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("audio_enabled", MetricValue::U64(v)) => {
+                                    audio_enabled = Some(*v != 0)
+                                }
+                                _ => {}
+                            }
+                        }
 
-                if let (Some(peer), Some(audio)) = (to_peer, audio_enabled) {
-                    let current = self.peer_audio_states.get(&peer).copied();
-                    if current != Some(audio) {
-                        self.peer_audio_states.insert(peer, audio);
-                        return true;
+                        if let (Some(peer), Some(audio)) = (to_peer, audio_enabled) {
+                            let current = self.peer_audio_states.get(&peer).copied();
+                            if current != Some(audio) {
+                                self.peer_audio_states.insert(peer, audio);
+                                return true;
+                            }
+                        }
+                        false
                     }
+                    "peer_speaking" => {
+                        // Parse peer_speaking metrics for voice activity
+                        let mut to_peer: Option<String> = None;
+                        let mut speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
+
+                        if let (Some(peer), Some(is_speaking)) = (to_peer, speaking) {
+                            let current = self.peer_speaking_states.get(&peer).copied();
+                            if current != Some(is_speaking) {
+                                self.peer_speaking_states.insert(peer, is_speaking);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
                 }
-                false
             }
         }
     }
@@ -255,12 +282,13 @@ impl Component for PeerList {
                         <div class="peer-list">
                             <ul>
                                 // show self as the first item with actual username
-                                <li><PeerListItem name={display_name.clone()} muted={ctx.props().self_muted} /></li>
+                                <li><PeerListItem name={display_name.clone()} muted={ctx.props().self_muted} speaking={false} /></li>
 
                                 { for filtered_peers.iter().map(|peer| {
                                     let muted = !self.peer_audio_states.get(peer).copied().unwrap_or(false);
+                                    let speaking = self.peer_speaking_states.get(peer).copied().unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={peer.clone()} muted={muted} /></li>
+                                        <li><PeerListItem name={peer.clone()} muted={muted} speaking={speaking} /></li>
                                     }
                                 })}
                             </ul>

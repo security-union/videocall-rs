@@ -160,11 +160,27 @@ h3 {
   width: 20px;
   height: 20px;
   color: #888;
+  transition: all 0.2s ease;
 }
 
 .peer_item_mic svg {
   width: 100%;
   height: 100%;
+}
+
+.peer_item_mic.speaking {
+  color: #00ff41;
+  filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  animation: mic-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes mic-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 6px rgba(0, 255, 65, 0.8));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px rgba(0, 255, 65, 1));
+  }
 }
 
 #grid-container {

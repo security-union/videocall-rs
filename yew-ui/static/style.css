@@ -155,6 +155,18 @@ h3 {
   padding: 0 10px;
 }
 
+.peer_item_mic {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  color: #888;
+}
+
+.peer_item_mic svg {
+  width: 100%;
+  height: 100%;
+}
+
 #grid-container {
   /* Basic grid setup */
   display: grid;

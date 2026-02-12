@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use yew::prelude::*;
 use yew::{html, Component, Html};
@@ -25,6 +26,8 @@ pub struct PeerListItem {}
 #[derive(Properties, Clone, PartialEq)]
 pub struct PeerListItemProps {
     pub name: String,
+    #[prop_or(true)]
+    pub muted: bool,
 }
 
 impl Component for PeerListItem {
@@ -44,6 +47,9 @@ impl Component for PeerListItem {
                 </div>
                 <div class="peer_item_text">
                     {ctx.props().name.clone()}
+                </div>
+                <div class="peer_item_mic">
+                    <MicIcon muted={ctx.props().muted} />
                 </div>
             </div>
         }

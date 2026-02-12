@@ -37,6 +37,7 @@ use crate::context::{
 };
 use gloo_timers::callback::Timeout;
 use gloo_utils::window;
+use std::collections::HashMap;
 use log::{error, warn};
 use videocall_client::utils::is_ios;
 use videocall_client::{MediaDeviceAccess, VideoCallClient, VideoCallClientOptions};
@@ -990,10 +991,16 @@ impl Component for AttendantsComponent {
                     {
                         if self.peer_list_open {
                             let toggle_meeting_info = ctx.link().callback(|_| UserScreenToggleAction::MeetingInfo);
+                            let peer_audio_states: HashMap<String, bool> = display_peers_vec
+                                .iter()
+                                .map(|peer| (peer.clone(), self.client.is_audio_enabled_for_peer(peer)))
+                                .collect();
                             html! {
                                 <PeerList
                                     peers={display_peers_vec.clone()}
                                     onclose={toggle_peer_list}
+                                    peer_audio_states={peer_audio_states}
+                                    self_muted={!self.mic_enabled}
                                     show_meeting_info={self.meeting_info_open}
                                     room_id={ctx.props().id.clone()}
                                     num_participants={num_display_peers}

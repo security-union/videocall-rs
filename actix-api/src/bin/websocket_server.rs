@@ -33,7 +33,7 @@ use sec_api::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
-    db::{get_database_url, get_pool, PostgresPool},
+db::{get_database_url, get_pool, PostgresPool},
     lobby::{ws_connect, ws_connect_authenticated},
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
@@ -342,7 +342,7 @@ async fn main() -> std::io::Result<()> {
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect_authenticated)
-                .service(ws_connect);
+.service(ws_connect);
 
             // Add API routes if database is enabled
             if let Some(ref pool) = sqlx_pool {
@@ -377,7 +377,7 @@ async fn main() -> std::io::Result<()> {
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect_authenticated)
-                .service(ws_connect);
+.service(ws_connect);
 
             // Add API routes with sqlx pool
             if let Some(ref pool) = sqlx_pool {

@@ -17,7 +17,6 @@
  */
 
 use actix_web::{web, HttpRequest, HttpResponse};
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::{error, info};
 
@@ -25,185 +24,29 @@ use crate::constants::VALID_ID_PATTERN;
 use crate::models::meeting::{CreateMeetingError, Meeting};
 use crate::models::meeting_participant::{MeetingParticipant, ParticipantError};
 
+// Import shared types from videocall-meeting-types crate
+pub use videocall_meeting_types::error::APIError;
+pub use videocall_meeting_types::requests::{
+    AdmitRequest, CreateMeetingRequest, JoinMeetingRequest, ListMeetingsQuery,
+};
+pub use videocall_meeting_types::responses::{
+    AdmitAllResponse, CreateMeetingResponse, ListMeetingsResponse, MeetingInfoResponse,
+    MeetingSummary, ParticipantStatusResponse, WaitingRoomResponse,
+};
+
 const MAX_ATTENDEES: usize = 100;
 
-#[derive(Debug, Deserialize)]
-pub struct CreateMeetingRequest {
-    pub meeting_id: Option<String>,
-    #[serde(default)]
-    pub attendees: Vec<String>,
-    pub password: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CreateMeetingResponse {
-    pub meeting_id: String,
-    pub host: String,
-    pub created_timestamp: i64,
-    pub state: String,
-    pub attendees: Vec<String>,
-    pub has_password: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ApiError {
-    pub code: String,
-    pub message: String,
-}
-
-/// Response for participant status
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ParticipantStatusResponse {
-    pub email: String,
-    pub status: String,
-    pub is_host: bool,
-    pub joined_at: i64,
-    pub admitted_at: Option<i64>,
-}
-
+/// Convert MeetingParticipant to ParticipantStatusResponse
 impl From<MeetingParticipant> for ParticipantStatusResponse {
     fn from(p: MeetingParticipant) -> Self {
         Self {
             email: p.email,
+            display_name: p.display_name,
             status: p.status,
             is_host: p.is_host,
             joined_at: p.joined_at.timestamp(),
             admitted_at: p.admitted_at.map(|t| t.timestamp()),
-        }
-    }
-}
-
-/// Response for waiting room list
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WaitingRoomResponse {
-    pub meeting_id: String,
-    pub waiting: Vec<ParticipantStatusResponse>,
-}
-
-/// Request to admit/reject a participant
-#[derive(Debug, Deserialize)]
-pub struct AdmitRequest {
-    pub email: String,
-}
-
-/// Request body for joining a meeting
-#[derive(Debug, Deserialize)]
-pub struct JoinMeetingRequest {
-    #[serde(default)]
-    pub display_name: Option<String>,
-}
-
-/// Response for meeting info (for attendees)
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MeetingInfoResponse {
-    pub meeting_id: String,
-    pub state: String,
-    pub host: String,
-    pub host_display_name: Option<String>,
-    pub has_password: bool,
-    pub your_status: Option<ParticipantStatusResponse>,
-}
-
-/// Response for listing meetings
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ListMeetingsResponse {
-    pub meetings: Vec<MeetingSummary>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// Summary of a meeting for listing
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MeetingSummary {
-    pub meeting_id: String,
-    pub host: Option<String>,
-    pub state: String,
-    pub has_password: bool,
-    pub created_at: i64,
-    pub participant_count: i64,
-    /// Timestamp when the meeting started (milliseconds since epoch)
-    pub started_at: i64,
-    /// Timestamp when the meeting ended (milliseconds since epoch), None if still active
-    pub ended_at: Option<i64>,
-    /// Number of participants waiting to be admitted (only relevant for active meetings)
-    pub waiting_count: i64,
-}
-
-/// Query parameters for listing meetings
-#[derive(Debug, Deserialize)]
-pub struct ListMeetingsQuery {
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
-fn default_limit() -> i64 {
-    20
-}
-
-impl ApiError {
-    pub fn unauthorized() -> Self {
-        Self {
-            code: "UNAUTHORIZED".to_string(),
-            message: "Authentication required. Please provide email cookie.".to_string(),
-        }
-    }
-
-    pub fn invalid_meeting_id(detail: &str) -> Self {
-        Self {
-            code: "INVALID_MEETING_ID".to_string(),
-            message: format!("Invalid meeting ID: {detail}"),
-        }
-    }
-
-    pub fn too_many_attendees(count: usize) -> Self {
-        Self {
-            code: "TOO_MANY_ATTENDEES".to_string(),
-            message: format!("Too many attendees: {count} provided, maximum is {MAX_ATTENDEES}"),
-        }
-    }
-
-    pub fn meeting_exists(meeting_id: &str) -> Self {
-        Self {
-            code: "MEETING_EXISTS".to_string(),
-            message: format!("Meeting with ID '{meeting_id}' already exists"),
-        }
-    }
-
-    pub fn meeting_not_found(meeting_id: &str) -> Self {
-        Self {
-            code: "MEETING_NOT_FOUND".to_string(),
-            message: format!("Meeting '{meeting_id}' not found"),
-        }
-    }
-
-    pub fn meeting_not_active(meeting_id: &str) -> Self {
-        Self {
-            code: "MEETING_NOT_ACTIVE".to_string(),
-            message: format!("Meeting '{meeting_id}' is not active. Host must join first."),
-        }
-    }
-
-    pub fn not_host() -> Self {
-        Self {
-            code: "NOT_HOST".to_string(),
-            message: "Only the meeting host can perform this action".to_string(),
-        }
-    }
-
-    pub fn participant_not_found(email: &str) -> Self {
-        Self {
-            code: "PARTICIPANT_NOT_FOUND".to_string(),
-            message: format!("Participant '{email}' not found in waiting room"),
-        }
-    }
-
-    pub fn internal_error(detail: &str) -> Self {
-        Self {
-            code: "INTERNAL_ERROR".to_string(),
-            message: format!("Internal server error: {detail}"),
+            room_token: None, // Token is set separately when needed
         }
     }
 }
@@ -258,7 +101,7 @@ pub async fn create_meeting(
         Some(email) => email,
         None => {
             info!("Unauthorized meeting creation attempt - no email cookie");
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -269,7 +112,7 @@ pub async fn create_meeting(
         Some(id) => {
             let clean_id = id.replace(' ', "_");
             if let Err(e) = validate_meeting_id(&clean_id) {
-                return HttpResponse::BadRequest().json(ApiError::invalid_meeting_id(&e));
+                return HttpResponse::BadRequest().json(APIError::invalid_meeting_id(&e));
             }
             clean_id
         }
@@ -278,7 +121,7 @@ pub async fn create_meeting(
 
     // 3. Validate attendees count
     if body.attendees.len() > MAX_ATTENDEES {
-        return HttpResponse::BadRequest().json(ApiError::too_many_attendees(body.attendees.len()));
+        return HttpResponse::BadRequest().json(APIError::too_many_attendees(body.attendees.len(), MAX_ATTENDEES));
     }
 
     // 4. Create meeting in database
@@ -297,7 +140,7 @@ pub async fn create_meeting(
             HttpResponse::Created().json(CreateMeetingResponse {
                 meeting_id: meeting.room_id,
                 host: meeting.creator_id.unwrap_or_default(),
-                created_timestamp: meeting.created_at.timestamp(),
+                created_at: meeting.created_at.timestamp(),
                 state: meeting.state.unwrap_or_else(|| "idle".to_string()),
                 attendees: meeting
                     .attendees
@@ -308,15 +151,15 @@ pub async fn create_meeting(
         }
         Err(CreateMeetingError::MeetingExists) => {
             info!("Meeting '{}' already exists", meeting_id);
-            HttpResponse::Conflict().json(ApiError::meeting_exists(&meeting_id))
+            HttpResponse::Conflict().json(APIError::meeting_exists(&meeting_id))
         }
         Err(CreateMeetingError::DatabaseError(e)) => {
             error!("Database error creating meeting: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(CreateMeetingError::HashError(e)) => {
             error!("Password hashing error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Hashing error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Hashing error"))
         }
     }
 }
@@ -333,7 +176,7 @@ pub async fn get_meeting(
     let email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -341,12 +184,12 @@ pub async fn get_meeting(
     let meeting = match Meeting::get_by_room_id_async(pool.get_ref(), &meeting_id).await {
         Ok(Some(m)) => m,
         Ok(None) => {
-            return HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id));
+            return HttpResponse::NotFound().json(APIError::meeting_not_found(&meeting_id));
         }
         Err(e) => {
             error!("Database error: {}", e);
             return HttpResponse::InternalServerError()
-                .json(ApiError::internal_error("Database error"));
+                .json(APIError::internal_error("Database error"));
         }
     };
 
@@ -396,7 +239,7 @@ pub async fn join_meeting(
     let email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -419,18 +262,18 @@ pub async fn join_meeting(
     {
         Ok(participant) => HttpResponse::Ok().json(ParticipantStatusResponse::from(participant)),
         Err(ParticipantError::MeetingNotFound) => {
-            HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
+            HttpResponse::NotFound().json(APIError::meeting_not_found(&meeting_id))
         }
         Err(ParticipantError::MeetingNotActive) => {
-            HttpResponse::BadRequest().json(ApiError::meeting_not_active(&meeting_id))
+            HttpResponse::BadRequest().json(APIError::meeting_not_active(&meeting_id))
         }
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(e) => {
             error!("Error joining meeting: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error(&e.to_string()))
+            HttpResponse::InternalServerError().json(APIError::internal_error(&e.to_string()))
         }
     }
 }
@@ -447,7 +290,7 @@ pub async fn get_waiting_room(
     let email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -464,16 +307,16 @@ pub async fn get_waiting_room(
             })
         }
         Err(ParticipantError::MeetingNotFound) => {
-            HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
+            HttpResponse::NotFound().json(APIError::meeting_not_found(&meeting_id))
         }
-        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(ApiError::not_host()),
+        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(APIError::not_host()),
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(e) => {
             error!("Error getting waiting room: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error(&e.to_string()))
+            HttpResponse::InternalServerError().json(APIError::internal_error(&e.to_string()))
         }
     }
 }
@@ -491,7 +334,7 @@ pub async fn admit_participant(
     let host_email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -504,28 +347,21 @@ pub async fn admit_participant(
     match MeetingParticipant::admit(pool.get_ref(), &meeting_id, &host_email, &body.email).await {
         Ok(participant) => HttpResponse::Ok().json(ParticipantStatusResponse::from(participant)),
         Err(ParticipantError::MeetingNotFound) => {
-            HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
+            HttpResponse::NotFound().json(APIError::meeting_not_found(&meeting_id))
         }
-        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(ApiError::not_host()),
+        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(APIError::not_host()),
         Err(ParticipantError::NotFound) => {
-            HttpResponse::NotFound().json(ApiError::participant_not_found(&body.email))
+            HttpResponse::NotFound().json(APIError::participant_not_found(&body.email))
         }
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(e) => {
             error!("Error admitting participant: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error(&e.to_string()))
+            HttpResponse::InternalServerError().json(APIError::internal_error(&e.to_string()))
         }
     }
-}
-
-/// Response for admit all
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AdmitAllResponse {
-    pub admitted_count: usize,
-    pub admitted: Vec<ParticipantStatusResponse>,
 }
 
 /// POST /api/v1/meetings/{meeting_id}/admit-all - Admit all waiting participants (host only)
@@ -540,7 +376,7 @@ pub async fn admit_all_participants(
     let host_email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -562,16 +398,16 @@ pub async fn admit_all_participants(
             })
         }
         Err(ParticipantError::MeetingNotFound) => {
-            HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
+            HttpResponse::NotFound().json(APIError::meeting_not_found(&meeting_id))
         }
-        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(ApiError::not_host()),
+        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(APIError::not_host()),
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(e) => {
             error!("Error admitting all participants: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error(&e.to_string()))
+            HttpResponse::InternalServerError().json(APIError::internal_error(&e.to_string()))
         }
     }
 }
@@ -589,7 +425,7 @@ pub async fn reject_participant(
     let host_email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -602,19 +438,19 @@ pub async fn reject_participant(
     match MeetingParticipant::reject(pool.get_ref(), &meeting_id, &host_email, &body.email).await {
         Ok(participant) => HttpResponse::Ok().json(ParticipantStatusResponse::from(participant)),
         Err(ParticipantError::MeetingNotFound) => {
-            HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
+            HttpResponse::NotFound().json(APIError::meeting_not_found(&meeting_id))
         }
-        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(ApiError::not_host()),
+        Err(ParticipantError::NotHost) => HttpResponse::Forbidden().json(APIError::not_host()),
         Err(ParticipantError::NotFound) => {
-            HttpResponse::NotFound().json(ApiError::participant_not_found(&body.email))
+            HttpResponse::NotFound().json(APIError::participant_not_found(&body.email))
         }
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(e) => {
             error!("Error rejecting participant: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error(&e.to_string()))
+            HttpResponse::InternalServerError().json(APIError::internal_error(&e.to_string()))
         }
     }
 }
@@ -631,7 +467,7 @@ pub async fn get_my_status(
     let email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -640,17 +476,14 @@ pub async fn get_my_status(
         Ok(Some(participant)) => {
             HttpResponse::Ok().json(ParticipantStatusResponse::from(participant))
         }
-        Ok(None) => HttpResponse::NotFound().json(ApiError {
-            code: "NOT_IN_MEETING".to_string(),
-            message: "You have not requested to join this meeting".to_string(),
-        }),
+        Ok(None) => HttpResponse::NotFound().json(APIError::not_in_meeting()),
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(e) => {
             error!("Error getting status: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error(&e.to_string()))
+            HttpResponse::InternalServerError().json(APIError::internal_error(&e.to_string()))
         }
     }
 }
@@ -667,7 +500,7 @@ pub async fn leave_meeting(
     let email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -678,17 +511,14 @@ pub async fn leave_meeting(
         Ok(Some(participant)) => {
             HttpResponse::Ok().json(ParticipantStatusResponse::from(participant))
         }
-        Ok(None) => HttpResponse::NotFound().json(ApiError {
-            code: "NOT_IN_MEETING".to_string(),
-            message: "You are not in this meeting".to_string(),
-        }),
+        Ok(None) => HttpResponse::NotFound().json(APIError::not_in_meeting()),
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(e) => {
             error!("Error leaving meeting: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error(&e.to_string()))
+            HttpResponse::InternalServerError().json(APIError::internal_error(&e.to_string()))
         }
     }
 }
@@ -705,7 +535,7 @@ pub async fn get_participants(
     let _email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -719,15 +549,15 @@ pub async fn get_participants(
             HttpResponse::Ok().json(admitted)
         }
         Err(ParticipantError::MeetingNotFound) => {
-            HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id))
+            HttpResponse::NotFound().json(APIError::meeting_not_found(&meeting_id))
         }
         Err(ParticipantError::DatabaseError(e)) => {
             error!("Database error: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
         Err(e) => {
             error!("Error getting participants: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error(&e.to_string()))
+            HttpResponse::InternalServerError().json(APIError::internal_error(&e.to_string()))
         }
     }
 }
@@ -744,7 +574,7 @@ pub async fn delete_meeting(
     let email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -757,21 +587,18 @@ pub async fn delete_meeting(
     let meeting = match Meeting::get_by_room_id_async(pool.get_ref(), &meeting_id).await {
         Ok(Some(m)) => m,
         Ok(None) => {
-            return HttpResponse::NotFound().json(ApiError::meeting_not_found(&meeting_id));
+            return HttpResponse::NotFound().json(APIError::meeting_not_found(&meeting_id));
         }
         Err(e) => {
             error!("Database error: {}", e);
             return HttpResponse::InternalServerError()
-                .json(ApiError::internal_error("Database error"));
+                .json(APIError::internal_error("Database error"));
         }
     };
 
     // Verify the user is the owner
     if meeting.creator_id.as_ref() != Some(&email) {
-        return HttpResponse::Forbidden().json(ApiError {
-            code: "NOT_OWNER".to_string(),
-            message: "Only the meeting owner can delete this meeting".to_string(),
-        });
+        return HttpResponse::Forbidden().json(APIError::not_owner());
     }
 
     // Soft delete the meeting (set deleted_at)
@@ -791,7 +618,7 @@ pub async fn delete_meeting(
         }
         Err(e) => {
             error!("Database error deleting meeting: {}", e);
-            HttpResponse::InternalServerError().json(ApiError::internal_error("Database error"))
+            HttpResponse::InternalServerError().json(APIError::internal_error("Database error"))
         }
     }
 }
@@ -806,7 +633,7 @@ pub async fn list_meetings(
     let email = match get_email_from_cookies(&req) {
         Some(email) => email,
         None => {
-            return HttpResponse::Unauthorized().json(ApiError::unauthorized());
+            return HttpResponse::Unauthorized().json(APIError::unauthorized());
         }
     };
 
@@ -820,7 +647,7 @@ pub async fn list_meetings(
         Err(e) => {
             error!("Database error listing meetings: {}", e);
             return HttpResponse::InternalServerError()
-                .json(ApiError::internal_error("Database error"));
+                .json(APIError::internal_error("Database error"));
         }
     };
 
@@ -830,7 +657,7 @@ pub async fn list_meetings(
         Err(e) => {
             error!("Database error counting meetings: {}", e);
             return HttpResponse::InternalServerError()
-                .json(ApiError::internal_error("Database error"));
+                .json(APIError::internal_error("Database error"));
         }
     };
 
@@ -1031,7 +858,7 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 401, "Expected 401 Unauthorized");
 
-        let body: ApiError = test::read_body_json(resp).await;
+        let body: APIError = test::read_body_json(resp).await;
         assert_eq!(body.code, "UNAUTHORIZED");
     }
 
@@ -1068,7 +895,7 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 409, "Expected 409 Conflict");
 
-        let body: ApiError = test::read_body_json(resp).await;
+        let body: APIError = test::read_body_json(resp).await;
         assert_eq!(body.code, "MEETING_EXISTS");
 
         cleanup_test_data(&pool, room_id).await;
@@ -1095,7 +922,7 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 400, "Expected 400 Bad Request");
 
-        let body: ApiError = test::read_body_json(resp).await;
+        let body: APIError = test::read_body_json(resp).await;
         assert_eq!(body.code, "TOO_MANY_ATTENDEES");
     }
 
@@ -1152,7 +979,7 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 404, "Expected 404 Not Found");
 
-        let body: ApiError = test::read_body_json(resp).await;
+        let body: APIError = test::read_body_json(resp).await;
         assert_eq!(body.code, "MEETING_NOT_FOUND");
     }
 
@@ -1280,7 +1107,7 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         assert_eq!(resp.status(), 400, "Expected 400 Bad Request");
 
-        let body: ApiError = test::read_body_json(resp).await;
+        let body: APIError = test::read_body_json(resp).await;
         assert_eq!(body.code, "MEETING_NOT_ACTIVE");
 
         cleanup_test_data(&pool, room_id).await;

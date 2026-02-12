@@ -16,6 +16,9 @@
  * conditions.
  */
 
+pub mod meeting;
+pub mod meeting_participant;
+
 use actix::Addr;
 
 use crate::actors::chat_server::ChatServer;

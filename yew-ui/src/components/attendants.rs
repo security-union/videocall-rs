@@ -20,6 +20,7 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility,
     diagnostics::Diagnostics,
     host::Host,
+    host_controls::HostControls,
     peer_list::PeerList,
     peer_tile::PeerTile,
     video_control_buttons::{
@@ -154,6 +155,19 @@ pub struct AttendantsComponentProps {
 
     #[prop_or_default]
     pub on_logout: Option<Callback<()>>,
+
+    /// Display name (username) of the meeting host/owner (for displaying crown icon)
+    #[prop_or_default]
+    pub host_display_name: Option<String>,
+
+    /// If true, automatically join the meeting without showing the "Join Meeting" button.
+    /// Used when user was admitted from the waiting room.
+    #[prop_or_default]
+    pub auto_join: bool,
+
+    /// If true, the current user is the owner of the meeting.
+    #[prop_or_default]
+    pub is_owner: bool,
 }
 
 pub struct AttendantsComponent {
@@ -429,9 +443,10 @@ impl Component for AttendantsComponent {
         self_
     }
 
-    fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            // Don't auto-connect anymore
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render && ctx.props().auto_join {
+            // Auto-join: request media permissions which will trigger connection
+            ctx.link().send_message(WsAction::RequestMediaPermissions);
         }
     }
 
@@ -672,10 +687,15 @@ impl Component for AttendantsComponent {
                 self.call_start_time = None;
                 self.meeting_start_time_server = None;
 
-                Timeout::new(500, move || {
+                // Call leave_meeting API to update participant status in database
+                let meeting_id = ctx.props().id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
+                        log::error!("Error leaving meeting: {e}");
+                    }
+                    // Redirect to home after API call completes
                     let _ = window().location().set_href("/");
-                })
-                .forget();
+                });
 
                 true
             }
@@ -723,6 +743,7 @@ impl Component for AttendantsComponent {
         // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
+        let host_display_name = ctx.props().host_display_name.clone();
         let rows: Vec<Html> = display_peers_vec
             .iter()
             .take(CANVAS_LIMIT)
@@ -730,7 +751,7 @@ impl Component for AttendantsComponent {
             .map(|(i, peer_id)| {
                 let full_bleed = display_peers_vec.len() == 1
                     && !self.client.is_screen_share_enabled_for_peer(peer_id);
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} /> }
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_display_name={host_display_name.clone()} /> }
             })
             .collect();
 
@@ -831,7 +852,7 @@ impl Component for AttendantsComponent {
                             class="btn-apple btn-primary"
                             onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}
                         >
-                            {"Join Meeting"}
+                            { if ctx.props().is_owner { "Start Meeting" } else { "Join Meeting" } }
                         </button>
                     </div>
                     </div>
@@ -1021,6 +1042,7 @@ impl Component for AttendantsComponent {
                                     num_participants={num_display_peers}
                                     is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
                                     on_toggle_meeting_info={toggle_meeting_info}
+                                    host_display_name={ctx.props().host_display_name.clone()}
                                 />
                             }
                         } else {
@@ -1028,6 +1050,12 @@ impl Component for AttendantsComponent {
                         }
                     }
                 </div>
+
+                // Waiting room controls - all admitted participants can manage waiting room
+                <HostControls
+                    meeting_id={ctx.props().id.clone()}
+                    is_admitted={true}
+                />
 
                 {
                     if let Some(ref message) = self.meeting_ended_message {

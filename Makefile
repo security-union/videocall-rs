@@ -4,6 +4,8 @@ COMPOSE_IT := docker/docker-compose.integration.yaml
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d && docker compose -f $(COMPOSE_IT) run --rm rust-tests bash -c "\
+		echo '=== CLEARING CARGO REGISTRY CACHE ===' && \
+		rm -rf /usr/local/cargo/registry/src/* /usr/local/cargo/registry/cache/* 2>/dev/null || true && \
 		cd /app/dbmate && dbmate wait && dbmate up && \
 		cd /app/actix-api && \
 		cargo clippy -- -D warnings && \

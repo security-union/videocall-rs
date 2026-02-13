@@ -92,61 +92,101 @@ impl Component for PeerTile {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
             Msg::Diagnostics(evt) => {
-                if evt.subsystem != "peer_status" {
-                    return false;
-                }
-                let mut to_peer: Option<String> = None;
-                let mut audio_enabled: Option<bool> = None;
-                let mut video_enabled: Option<bool> = None;
-                let mut screen_enabled: Option<bool> = None;
-                let mut is_speaking: Option<bool> = None;
-                for m in &evt.metrics {
-                    match (m.name, &m.value) {
-                        ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
-                        ("audio_enabled", MetricValue::U64(v)) => audio_enabled = Some(*v != 0),
-                        ("video_enabled", MetricValue::U64(v)) => video_enabled = Some(*v != 0),
-                        ("screen_enabled", MetricValue::U64(v)) => screen_enabled = Some(*v != 0),
-                        ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
-                        _ => {}
-                    }
-                }
+                match evt.subsystem {
+                    "peer_status" => {
+                        // Parse peer_status metrics
+                        let mut to_peer: Option<String> = None;
+                        let mut audio_enabled: Option<bool> = None;
+                        let mut video_enabled: Option<bool> = None;
+                        let mut screen_enabled: Option<bool> = None;
+                        let mut is_speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("audio_enabled", MetricValue::U64(v)) => {
+                                    audio_enabled = Some(*v != 0)
+                                }
+                                ("video_enabled", MetricValue::U64(v)) => {
+                                    video_enabled = Some(*v != 0)
+                                }
+                                ("screen_enabled", MetricValue::U64(v)) => {
+                                    screen_enabled = Some(*v != 0)
+                                }
+                                ("is_speaking", MetricValue::U64(v)) => {
+                                    is_speaking = Some(*v != 0)
+                                }
+                                _ => {}
+                            }
+                        }
 
-                if to_peer.as_deref() != Some(ctx.props().peer_id.as_str()) {
-                    return false;
-                }
+                        if to_peer.as_deref() != Some(ctx.props().peer_id.as_str()) {
+                            return false;
+                        }
 
-                let mut changed = false;
-                if let Some(a) = audio_enabled {
-                    if a != self.audio_enabled {
-                        self.audio_enabled = a;
-                        changed = true;
+                        let mut changed = false;
+                        if let Some(a) = audio_enabled {
+                            if a != self.audio_enabled {
+                                self.audio_enabled = a;
+                                changed = true;
+                            }
+                        }
+                        if let Some(v) = video_enabled {
+                            if v != self.video_enabled {
+                                self.video_enabled = v;
+                                changed = true;
+                            }
+                        }
+                        if let Some(s) = screen_enabled {
+                            if s != self.screen_enabled {
+                                self.screen_enabled = s;
+                                changed = true;
+                            }
+                        }
+                        if let Some(s) = is_speaking {
+                            if s != self.is_speaking {
+                                self.is_speaking = s;
+                                changed = true;
+                            }
+                        }
+                        changed
                     }
-                }
-                if let Some(v) = video_enabled {
-                    if v != self.video_enabled {
-                        self.video_enabled = v;
-                        changed = true;
+                    "peer_speaking" => {
+                        // Parse peer_speaking metrics for voice activity
+                        let mut to_peer: Option<String> = None;
+                        let mut speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
+
+                        if to_peer.as_deref() != Some(ctx.props().peer_id.as_str()) {
+                            return false;
+                        }
+
+                        if let Some(s) = speaking {
+                            if s != self.is_speaking {
+                                self.is_speaking = s;
+                                return true;
+                            }
+                        }
+                        false
                     }
+                    _ => false,
                 }
-                if let Some(s) = screen_enabled {
-                    if s != self.screen_enabled {
-                        self.screen_enabled = s;
-                        changed = true;
-                    }
-                }
-                if let Some(speaking) = is_speaking {
-                    if speaking != self.is_speaking {
-                        self.is_speaking = speaking;
-                        changed = true;
-                    }
-                }
-                changed
             }
         }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        generate_for_peer(&self.client, &ctx.props().peer_id, ctx.props().full_bleed, self.is_speaking)
+        generate_for_peer(
+            &self.client,
+            &ctx.props().peer_id,
+            ctx.props().full_bleed,
+            self.is_speaking,
+        )
     }
 
     fn destroy(&mut self, _ctx: &Context<Self>) {

@@ -19,6 +19,9 @@
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
 use crate::context::UsernameCtx;
+use futures::future::{AbortHandle, Abortable};
+use std::collections::HashMap;
+use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
 use yew::{html, Component, Context};
@@ -26,12 +29,21 @@ use yew::{html, Component, Context};
 pub struct PeerList {
     search_query: String,
     show_context_menu: bool,
+    peer_audio_states: HashMap<String, bool>,
+    peer_speaking_states: HashMap<String, bool>,
+    abort_handle: Option<AbortHandle>,
 }
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct PeerListProperties {
     pub peers: Vec<String>,
     pub onclose: yew::Callback<yew::MouseEvent>,
+
+    // audio states
+    #[prop_or_default]
+    pub peer_audio_states: HashMap<String, bool>,
+    #[prop_or(true)]
+    pub self_muted: bool,
 
     // meeting info
     pub show_meeting_info: bool,
@@ -44,6 +56,7 @@ pub struct PeerListProperties {
 pub enum PeerListMsg {
     UpdateSearchQuery(String),
     ToggleContextMenu,
+    Diagnostics(DiagEvent),
 }
 
 impl Component for PeerList {
@@ -51,10 +64,33 @@ impl Component for PeerList {
 
     type Properties = PeerListProperties;
 
-    fn create(_ctx: &Context<Self>) -> Self {
+    fn create(ctx: &Context<Self>) -> Self {
+        // Initialize with audio states from props
         PeerList {
             search_query: String::new(),
             show_context_menu: false,
+            peer_audio_states: ctx.props().peer_audio_states.clone(),
+            peer_speaking_states: HashMap::new(),
+            abort_handle: None,
+        }
+    }
+
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render {
+            // Subscribe to global diagnostics for peer_status updates
+            let link = ctx.link().clone();
+            let (abort_handle, abort_reg) = AbortHandle::new_pair();
+            let fut = async move {
+                let mut rx = subscribe();
+                while let Ok(evt) = rx.recv().await {
+                    link.send_message(PeerListMsg::Diagnostics(evt));
+                }
+            };
+            let abortable = Abortable::new(fut, abort_reg);
+            self.abort_handle = Some(abort_handle);
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = abortable.await;
+            });
         }
     }
 
@@ -68,6 +104,71 @@ impl Component for PeerList {
                 self.show_context_menu = !self.show_context_menu;
                 true
             }
+            PeerListMsg::Diagnostics(evt) => {
+                match evt.subsystem {
+                    "peer_status" => {
+                        // Parse peer_status metrics for audio enabled state
+                        let mut to_peer: Option<String> = None;
+                        let mut audio_enabled: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("audio_enabled", MetricValue::U64(v)) => {
+                                    audio_enabled = Some(*v != 0)
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if let (Some(peer), Some(audio)) = (to_peer, audio_enabled) {
+                            let current = self.peer_audio_states.get(&peer).copied();
+                            if current != Some(audio) {
+                                self.peer_audio_states.insert(peer, audio);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    "peer_speaking" => {
+                        // Parse peer_speaking metrics for voice activity
+                        let mut to_peer: Option<String> = None;
+                        let mut speaking: Option<bool> = None;
+                        for m in &evt.metrics {
+                            match (m.name, &m.value) {
+                                ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                                ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
+                                _ => {}
+                            }
+                        }
+
+                        if let (Some(peer), Some(is_speaking)) = (to_peer, speaking) {
+                            let current = self.peer_speaking_states.get(&peer).copied();
+                            if current != Some(is_speaking) {
+                                self.peer_speaking_states.insert(peer, is_speaking);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    fn changed(&mut self, ctx: &Context<Self>, _old_props: &Self::Properties) -> bool {
+        // Merge new peer audio states from props (for newly joined peers)
+        for (peer, audio) in &ctx.props().peer_audio_states {
+            if !self.peer_audio_states.contains_key(peer) {
+                self.peer_audio_states.insert(peer.clone(), *audio);
+            }
+        }
+        true
+    }
+
+    fn destroy(&mut self, _ctx: &Context<Self>) {
+        if let Some(handle) = self.abort_handle.take() {
+            handle.abort();
         }
     }
 
@@ -181,13 +282,15 @@ impl Component for PeerList {
                         <div class="peer-list">
                             <ul>
                                 // show self as the first item with actual username
-                                <li><PeerListItem name={display_name.clone()} /></li>
+                                <li><PeerListItem name={display_name.clone()} muted={ctx.props().self_muted} speaking={false} /></li>
 
-                                { for filtered_peers.iter().map(|peer|
+                                { for filtered_peers.iter().map(|peer| {
+                                    let muted = !self.peer_audio_states.get(peer).copied().unwrap_or(false);
+                                    let speaking = self.peer_speaking_states.get(peer).copied().unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={peer.clone()}/></li>
-                                    })
-                                }
+                                        <li><PeerListItem name={peer.clone()} muted={muted} speaking={speaking} /></li>
+                                    }
+                                })}
                             </ul>
                         </div>
                     </div>

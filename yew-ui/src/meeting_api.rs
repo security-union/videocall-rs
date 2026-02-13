@@ -18,9 +18,16 @@
 
 //! Meeting API client for joining meetings and checking status
 
-use crate::constants::app_config;
+use crate::constants::meeting_api_base_url;
 use reqwasm::http::{Request, RequestCredentials};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+/// API response wrapper from meeting-api
+#[derive(Debug, Clone, Deserialize)]
+struct APIResponse<T> {
+    pub success: bool,
+    pub result: T,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct JoinMeetingResponse {
@@ -73,11 +80,8 @@ pub async fn join_meeting(
     meeting_id: &str,
     display_name: Option<&str>,
 ) -> Result<JoinMeetingResponse, JoinError> {
-    let config = app_config().map_err(JoinError::NetworkError)?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/join",
-        config.api_base_url, meeting_id
-    );
+    let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;
+    let url = format!("{}/api/v1/meetings/{}/join", base_url, meeting_id);
 
     log::info!("Joining meeting via API: {url} (display_name: {display_name:?})");
 
@@ -100,10 +104,11 @@ pub async fn join_meeting(
 
     match status {
         200 => {
-            let data: JoinMeetingResponse = response
+            let wrapper: APIResponse<JoinMeetingResponse> = response
                 .json()
                 .await
                 .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;
+            let data = wrapper.result;
             log::info!(
                 "Join response: status={}, is_host={}",
                 data.status,
@@ -130,8 +135,8 @@ pub async fn join_meeting(
 
 /// Get meeting info including host email
 pub async fn get_meeting_info(meeting_id: &str) -> Result<MeetingInfo, JoinError> {
-    let config = app_config().map_err(JoinError::NetworkError)?;
-    let url = format!("{}/api/v1/meetings/{}", config.api_base_url, meeting_id);
+    let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;
+    let url = format!("{}/api/v1/meetings/{}", base_url, meeting_id);
 
     let response = Request::get(&url)
         .credentials(RequestCredentials::Include)
@@ -141,11 +146,11 @@ pub async fn get_meeting_info(meeting_id: &str) -> Result<MeetingInfo, JoinError
 
     match response.status() {
         200 => {
-            let data: MeetingInfo = response
+            let wrapper: APIResponse<MeetingInfo> = response
                 .json()
                 .await
                 .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;
-            Ok(data)
+            Ok(wrapper.result)
         }
         401 => Err(JoinError::NotAuthenticated),
         404 => Err(JoinError::ServerError(404, "Meeting not found".to_string())),
@@ -158,11 +163,8 @@ pub async fn get_meeting_info(meeting_id: &str) -> Result<MeetingInfo, JoinError
 
 /// Check participant status in a meeting
 pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinError> {
-    let config = app_config().map_err(JoinError::NetworkError)?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/status",
-        config.api_base_url, meeting_id
-    );
+    let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;
+    let url = format!("{}/api/v1/meetings/{}/status", base_url, meeting_id);
 
     let response = Request::get(&url)
         .credentials(RequestCredentials::Include)
@@ -172,11 +174,11 @@ pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinE
 
     match response.status() {
         200 => {
-            let data: JoinMeetingResponse = response
+            let wrapper: APIResponse<JoinMeetingResponse> = response
                 .json()
                 .await
                 .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;
-            Ok(data)
+            Ok(wrapper.result)
         }
         401 => Err(JoinError::NotAuthenticated),
         404 => Err(JoinError::ServerError(404, "Not in meeting".to_string())),
@@ -189,11 +191,8 @@ pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinE
 
 /// Leave a meeting - updates participant status to 'left' in database
 pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
-    let config = app_config().map_err(JoinError::NetworkError)?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/leave",
-        config.api_base_url, meeting_id
-    );
+    let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;
+    let url = format!("{}/api/v1/meetings/{}/leave", base_url, meeting_id);
 
     log::info!("Leaving meeting via API: {url}");
 

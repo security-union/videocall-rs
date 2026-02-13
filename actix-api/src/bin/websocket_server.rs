@@ -28,18 +28,16 @@ use actix_web::{
 use reqwest::header::LOCATION;
 use sec_api::{
     actors::chat_server::ChatServer,
-    api,
     auth::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
-    db::{get_database_url, get_pool, PostgresPool},
+    db::{get_pool, PostgresPool},
     lobby::{ws_connect, ws_connect_authenticated},
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
     session_manager::SessionManager,
 };
-use sqlx::postgres::PgPoolOptions;
 use tracing::{debug, error, info};
 use videocall_types::truthy;
 
@@ -312,25 +310,11 @@ async fn main() -> std::io::Result<()> {
         &std::env::var("DATABASE_ENABLED").unwrap_or_else(|_| String::from("false")),
     ));
 
-    // Create sqlx pool for meeting API routes (if database is enabled)
-    let sqlx_pool: Option<sqlx::PgPool> = if db_enabled {
-        let database_url = get_database_url();
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
-            .connect(&database_url)
-            .await
-            .expect("Failed to create sqlx connection pool");
-        info!("Created sqlx connection pool for meeting API");
-        Some(pool)
-    } else {
-        None
-    };
-
     HttpServer::new(move || {
         let cors = Cors::permissive();
 
         if oauth_client_id.is_empty() {
-            let mut app = App::new()
+            App::new()
                 .wrap(cors)
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
@@ -342,19 +326,11 @@ async fn main() -> std::io::Result<()> {
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect_authenticated)
-.service(ws_connect);
-
-            // Add API routes if database is enabled
-            if let Some(ref pool) = sqlx_pool {
-                app = app
-                    .app_data(web::Data::new(pool.clone()))
-                    .configure(api::configure_api_routes);
-            }
-            app
+                .service(ws_connect)
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
-            let mut app = App::new()
+            App::new()
                 .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
@@ -377,15 +353,7 @@ async fn main() -> std::io::Result<()> {
                 .service(get_profile)
                 .service(logout)
                 .service(ws_connect_authenticated)
-.service(ws_connect);
-
-            // Add API routes with sqlx pool
-            if let Some(ref pool) = sqlx_pool {
-                app = app
-                    .app_data(web::Data::new(pool.clone()))
-                    .configure(api::configure_api_routes);
-            }
-            app
+                .service(ws_connect)
         } else {
             // OAuth configured but database disabled - skip OAuth routes
             error!("OAuth is configured but DATABASE_ENABLED=false. OAuth requires database. Skipping OAuth routes.");

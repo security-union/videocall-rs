@@ -18,11 +18,19 @@
 
 //! Waiting Room component - shown to non-host users while waiting for admission
 
-use crate::constants::app_config;
+use crate::constants::meeting_api_base_url;
 use gloo_timers::callback::Interval;
 use reqwasm::http::{Request, RequestCredentials};
 use serde::Deserialize;
 use yew::prelude::*;
+
+/// API response wrapper from meeting-api
+#[derive(Debug, Clone, Deserialize)]
+struct APIResponse<T> {
+    #[allow(dead_code)]
+    pub success: bool,
+    pub result: T,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ParticipantStatus {
@@ -154,11 +162,8 @@ impl Component for WaitingRoom {
 }
 
 async fn check_status(meeting_id: &str) -> Result<ParticipantStatus, String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/status",
-        config.api_base_url, meeting_id
-    );
+    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
+    let url = format!("{}/api/v1/meetings/{}/status", base_url, meeting_id);
 
     let response = Request::get(&url)
         .credentials(RequestCredentials::Include)
@@ -168,11 +173,11 @@ async fn check_status(meeting_id: &str) -> Result<ParticipantStatus, String> {
 
     match response.status() {
         200 => {
-            let status: ParticipantStatus = response
+            let wrapper: APIResponse<ParticipantStatus> = response
                 .json()
                 .await
                 .map_err(|e| format!("Failed to parse response: {e}"))?;
-            Ok(status)
+            Ok(wrapper.result)
         }
         401 => Err("Not authenticated".to_string()),
         404 => Err("Not in meeting".to_string()),

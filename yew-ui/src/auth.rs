@@ -4,7 +4,7 @@
 //!
 //! Handles OAuth session validation and user profile fetching
 
-use crate::constants::app_config;
+use crate::constants::meeting_api_base_url;
 use anyhow::anyhow;
 use reqwasm::http::{Request, RequestCredentials};
 use serde::Deserialize;
@@ -19,8 +19,8 @@ pub struct UserProfile {
 /// Check if there is an active session by calling the backend /session endpoint
 /// Returns Ok(()) if session is valid, Err if unauthorized (401) or other error
 pub async fn check_session() -> anyhow::Result<()> {
-    let config = app_config().map_err(|e| anyhow!("Config error: {e:?}"))?;
-    let session_url = format!("{}/session", config.api_base_url);
+    let base_url = meeting_api_base_url().map_err(|e| anyhow!("Config error: {e:?}"))?;
+    let session_url = format!("{}/session", base_url);
 
     log::info!("Checking session at: {session_url}");
 
@@ -43,8 +43,8 @@ pub async fn check_session() -> anyhow::Result<()> {
 
 /// Get the current user's profile from the backend
 pub async fn get_user_profile() -> anyhow::Result<UserProfile> {
-    let config = app_config().map_err(|e| anyhow!("Config error: {e:?}"))?;
-    let profile_url = format!("{}/profile", config.api_base_url);
+    let base_url = meeting_api_base_url().map_err(|e| anyhow!("Config error: {e:?}"))?;
+    let profile_url = format!("{}/profile", base_url);
 
     let fetched_response = Request::get(&profile_url)
         .credentials(RequestCredentials::Include)
@@ -57,8 +57,8 @@ pub async fn get_user_profile() -> anyhow::Result<UserProfile> {
 
 /// Logout - clears session cookies on the backend
 pub async fn logout() -> anyhow::Result<()> {
-    let config = app_config().map_err(|e| anyhow!("Config error: {e:?}"))?;
-    let logout_url = format!("{}/logout", config.api_base_url);
+    let base_url = meeting_api_base_url().map_err(|e| anyhow!("Config error: {e:?}"))?;
+    let logout_url = format!("{}/logout", base_url);
 
     Request::get(&logout_url)
         .credentials(RequestCredentials::Include)

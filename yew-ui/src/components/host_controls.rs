@@ -18,11 +18,19 @@
 
 //! Host Controls component - allows admitted participants to admit/reject waiting participants
 
-use crate::constants::app_config;
+use crate::constants::meeting_api_base_url;
 use gloo_timers::callback::Interval;
 use reqwasm::http::{Request, RequestCredentials};
 use serde::{Deserialize, Serialize};
 use yew::prelude::*;
+
+/// API response wrapper from meeting-api
+#[derive(Debug, Clone, Deserialize)]
+struct APIResponse<T> {
+    #[allow(dead_code)]
+    pub success: bool,
+    pub result: T,
+}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct WaitingParticipant {
@@ -306,11 +314,8 @@ impl Component for HostControls {
 }
 
 async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/waiting",
-        config.api_base_url, meeting_id
-    );
+    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
+    let url = format!("{}/api/v1/meetings/{}/waiting", base_url, meeting_id);
 
     let response = Request::get(&url)
         .credentials(RequestCredentials::Include)
@@ -320,11 +325,11 @@ async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, Stri
 
     match response.status() {
         200 => {
-            let data: WaitingRoomResponse = response
+            let wrapper: APIResponse<WaitingRoomResponse> = response
                 .json()
                 .await
                 .map_err(|e| format!("Failed to parse response: {e}"))?;
-            Ok(data.waiting)
+            Ok(wrapper.result.waiting)
         }
         401 => Err("Not authenticated".to_string()),
         403 => Err("Not authorized".to_string()),
@@ -334,11 +339,8 @@ async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, Stri
 }
 
 async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/admit",
-        config.api_base_url, meeting_id
-    );
+    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
+    let url = format!("{}/api/v1/meetings/{}/admit", base_url, meeting_id);
 
     let body = serde_json::to_string(&AdmitRequest {
         email: email.to_string(),
@@ -363,11 +365,8 @@ async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> 
 }
 
 async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/reject",
-        config.api_base_url, meeting_id
-    );
+    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
+    let url = format!("{}/api/v1/meetings/{}/reject", base_url, meeting_id);
 
     let body = serde_json::to_string(&AdmitRequest {
         email: email.to_string(),
@@ -392,11 +391,8 @@ async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String>
 }
 
 async fn admit_all_participants(meeting_id: &str) -> Result<(), String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/admit-all",
-        config.api_base_url, meeting_id
-    );
+    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
+    let url = format!("{}/api/v1/meetings/{}/admit-all", base_url, meeting_id);
 
     let response = Request::post(&url)
         .credentials(RequestCredentials::Include)

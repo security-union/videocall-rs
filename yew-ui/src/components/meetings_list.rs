@@ -16,13 +16,21 @@
  * conditions.
  */
 
-use crate::constants::app_config;
+use crate::constants::meeting_api_base_url;
 use crate::routing::Route;
 use reqwasm::http::{Request, RequestCredentials};
 use serde::Deserialize;
 use wasm_bindgen::JsCast;
 use yew::prelude::*;
 use yew_router::prelude::*;
+
+/// API response wrapper from meeting-api
+#[derive(Debug, Clone, Deserialize)]
+struct APIResponse<T> {
+    #[allow(dead_code)]
+    pub success: bool,
+    pub result: T,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MeetingSummary {
@@ -437,8 +445,8 @@ fn get_email_from_cookie() -> Option<String> {
 }
 
 async fn fetch_meetings() -> Result<ListMeetingsResponse, String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings?limit=20", config.api_base_url);
+    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
+    let url = format!("{}/api/v1/meetings?limit=20", base_url);
 
     let response = Request::get(&url)
         .credentials(RequestCredentials::Include)
@@ -448,11 +456,11 @@ async fn fetch_meetings() -> Result<ListMeetingsResponse, String> {
 
     match response.status() {
         200 => {
-            let data: ListMeetingsResponse = response
+            let wrapper: APIResponse<ListMeetingsResponse> = response
                 .json()
                 .await
                 .map_err(|e| format!("Failed to parse response: {e}"))?;
-            Ok(data)
+            Ok(wrapper.result)
         }
         401 => Err("Not authenticated. Please log in.".to_string()),
         status => Err(format!("Server error: {status}")),
@@ -460,8 +468,8 @@ async fn fetch_meetings() -> Result<ListMeetingsResponse, String> {
 }
 
 async fn delete_meeting(meeting_id: &str) -> Result<(), String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}", config.api_base_url, meeting_id);
+    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
+    let url = format!("{}/api/v1/meetings/{}", base_url, meeting_id);
 
     let response = Request::delete(&url)
         .credentials(RequestCredentials::Include)

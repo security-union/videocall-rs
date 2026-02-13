@@ -19,45 +19,10 @@
 use crate::constants::meeting_api_base_url;
 use crate::routing::Route;
 use reqwasm::http::{Request, RequestCredentials};
-use serde::Deserialize;
+use videocall_meeting_types::responses::{APIResponse, ListMeetingsResponse, MeetingSummary};
 use wasm_bindgen::JsCast;
 use yew::prelude::*;
 use yew_router::prelude::*;
-
-/// API response wrapper from meeting-api
-#[derive(Debug, Clone, Deserialize)]
-struct APIResponse<T> {
-    #[allow(dead_code)]
-    pub success: bool,
-    pub result: T,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MeetingSummary {
-    pub meeting_id: String,
-    pub host: Option<String>,
-    pub state: String,
-    pub has_password: bool,
-    #[allow(dead_code)]
-    pub created_at: i64,
-    pub participant_count: i64,
-    /// Timestamp when the meeting started (milliseconds since epoch)
-    pub started_at: i64,
-    /// Timestamp when the meeting ended (milliseconds since epoch), None if still active
-    pub ended_at: Option<i64>,
-    /// Number of participants waiting to be admitted
-    pub waiting_count: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ListMeetingsResponse {
-    pub meetings: Vec<MeetingSummary>,
-    pub total: i64,
-    #[allow(dead_code)]
-    pub limit: i64,
-    #[allow(dead_code)]
-    pub offset: i64,
-}
 
 pub enum MeetingsListMsg {
     FetchMeetings,

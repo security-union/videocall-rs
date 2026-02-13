@@ -20,33 +20,14 @@
 
 use crate::constants::meeting_api_base_url;
 use reqwasm::http::{Request, RequestCredentials};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::Serialize;
+use videocall_meeting_types::responses::{
+    APIResponse, MeetingInfoResponse, ParticipantStatusResponse,
+};
 
-/// API response wrapper from meeting-api
-#[derive(Debug, Clone, Deserialize)]
-struct APIResponse<T> {
-    pub success: bool,
-    pub result: T,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct JoinMeetingResponse {
-    pub email: String,
-    pub status: String,
-    pub is_host: bool,
-    pub joined_at: i64,
-    pub admitted_at: Option<i64>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct MeetingInfo {
-    pub meeting_id: String,
-    pub state: String,
-    pub host: String,
-    pub host_display_name: Option<String>,
-    pub has_password: bool,
-    pub your_status: Option<JoinMeetingResponse>,
-}
+// Re-export for use by other modules
+pub use videocall_meeting_types::responses::ParticipantStatusResponse as JoinMeetingResponse;
+pub use videocall_meeting_types::responses::MeetingInfoResponse as MeetingInfo;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JoinMeetingRequest {
@@ -104,7 +85,7 @@ pub async fn join_meeting(
 
     match status {
         200 => {
-            let wrapper: APIResponse<JoinMeetingResponse> = response
+            let wrapper: APIResponse<ParticipantStatusResponse> = response
                 .json()
                 .await
                 .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;
@@ -146,7 +127,7 @@ pub async fn get_meeting_info(meeting_id: &str) -> Result<MeetingInfo, JoinError
 
     match response.status() {
         200 => {
-            let wrapper: APIResponse<MeetingInfo> = response
+            let wrapper: APIResponse<MeetingInfoResponse> = response
                 .json()
                 .await
                 .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;
@@ -174,7 +155,7 @@ pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinE
 
     match response.status() {
         200 => {
-            let wrapper: APIResponse<JoinMeetingResponse> = response
+            let wrapper: APIResponse<ParticipantStatusResponse> = response
                 .json()
                 .await
                 .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;

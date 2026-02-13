@@ -21,25 +21,11 @@
 use crate::constants::meeting_api_base_url;
 use gloo_timers::callback::Interval;
 use reqwasm::http::{Request, RequestCredentials};
-use serde::Deserialize;
+use videocall_meeting_types::responses::{APIResponse, ParticipantStatusResponse};
 use yew::prelude::*;
 
-/// API response wrapper from meeting-api
-#[derive(Debug, Clone, Deserialize)]
-struct APIResponse<T> {
-    #[allow(dead_code)]
-    pub success: bool,
-    pub result: T,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct ParticipantStatus {
-    pub email: String,
-    pub status: String,
-    pub is_host: bool,
-    pub joined_at: i64,
-    pub admitted_at: Option<i64>,
-}
+/// Type alias for participant status (uses shared type)
+pub type ParticipantStatus = ParticipantStatusResponse;
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct WaitingRoomProps {

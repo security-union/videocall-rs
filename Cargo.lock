@@ -7486,6 +7486,7 @@ dependencies = [
  "urlencoding",
  "videocall-client",
  "videocall-diagnostics",
+ "videocall-meeting-types",
  "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",

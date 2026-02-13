@@ -7,7 +7,7 @@ then
     TAG=$(git rev-parse HEAD)
 fi
 
-IMAGE_URL=securityunion/rustlemania-ui:$TAG
+IMAGE_URL=securityunion/videocall-web-ui:$TAG
 echo "Building image "$IMAGE_URL
 
 if ! docker build -t $IMAGE_URL --build-arg USERS_ALLOWED_TO_STREAM="dario,griffin,hamdy" . --file Dockerfile.yew; then

@@ -93,6 +93,10 @@ impl WebTransportClient {
         self.start_heartbeat().await;
         info!("Heartbeat started for {}", self.config.user_id);
 
+        // Start inbound consumer to avoid being a slow consumer
+        self.start_inbound_consumer().await;
+        info!("Inbound consumer started for {}", self.config.user_id);
+
         Ok(())
     }
 
@@ -166,6 +170,46 @@ impl WebTransportClient {
                         debug!("Sent heartbeat for {}", user_id);
                     }
                 }
+            });
+        }
+    }
+
+    /// Start a task to consume all inbound unistreams to avoid being a slow consumer
+    async fn start_inbound_consumer(&self) {
+        if let Some(session) = &self.session {
+            let session = session.clone();
+            let user_id = self.config.user_id.clone();
+            let quit = self.quit.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    if quit.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    match session.accept_uni().await {
+                        Ok(mut stream) => {
+                            // Drain the stream - we don't need the data, just consume it
+                            let user_id = user_id.clone();
+                            tokio::spawn(async move {
+                                match stream.read_to_end(usize::MAX).await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        debug!(
+                                            "Error reading inbound unistream for {}: {}",
+                                            user_id, e
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            debug!("Inbound consumer ended for {}: {}", user_id, e);
+                            break;
+                        }
+                    }
+                }
+                info!("Inbound consumer stopped for {}", user_id);
             });
         }
     }

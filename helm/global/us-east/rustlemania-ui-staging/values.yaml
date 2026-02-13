@@ -23,7 +23,7 @@ rustlemania-ui:
 
 
   image:
-    repository: securityunion/rustlemania-ui
+    repository: securityunion/videocall-web-ui
     pullPolicy: Always
     tag: latest  # Use staging tag
 

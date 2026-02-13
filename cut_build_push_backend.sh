@@ -7,7 +7,7 @@ then
     TAG=$(git rev-parse HEAD)
 fi
 
-IMAGE_URL=securityunion/rustlemania-api:$TAG
+IMAGE_URL=securityunion/videocall-media-server:$TAG
 echo "Building image "$IMAGE_URL
 
 if ! docker build -t $IMAGE_URL . --file Dockerfile.actix; then

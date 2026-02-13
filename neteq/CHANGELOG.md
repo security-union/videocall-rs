@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/security-union/videocall-rs/compare/neteq-v0.8.0...neteq-v0.8.1) - 2026-01-27
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.8.0](https://github.com/security-union/videocall-rs/compare/neteq-v0.7.1...neteq-v0.8.0) - 2025-11-30
 
 ### Other

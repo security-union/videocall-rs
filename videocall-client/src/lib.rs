@@ -97,7 +97,8 @@
 //!     client.clone(),
 //!     "video-element",
 //!     1000000, // 1 Mbps initial bitrate
-//!     Callback::noop()
+//!     Callback::noop(),
+//!     Callback::noop() // on_error callback for camera errors
 //! );
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),
@@ -108,7 +109,8 @@
 //! let mut screen = ScreenEncoder::new(
 //!     client,
 //!     2000, // 2 Mbps bitrate
-//!     Callback::noop()
+//!     Callback::noop(),
+//!     Callback::noop() // on_state_change callback for screen share events
 //! );
 //!
 //! // Select devices and start/stop encoding
@@ -181,5 +183,8 @@ pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };
-pub use encode::{create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder};
+pub use encode::{
+    create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
+    ScreenShareEvent,
+};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};

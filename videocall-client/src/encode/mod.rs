@@ -27,7 +27,7 @@ use yew::Callback;
 
 pub use camera_encoder::CameraEncoder;
 pub use microphone_encoder::MicrophoneEncoder;
-pub use screen_encoder::ScreenEncoder;
+pub use screen_encoder::{ScreenEncoder, ScreenShareEvent};
 
 /// Trait to abstract over different microphone encoder implementations
 pub trait MicrophoneEncoderTrait {

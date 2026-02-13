@@ -17,6 +17,10 @@ on:
       - 'neteq/**'
       - 'Dockerfile.yew'
       - 'nginx.conf'
+      # Meeting API dependencies
+      - 'meeting-api/**'
+      - 'videocall-meeting-types/**'
+      - 'Dockerfile.meeting-api'
       # Docker directory changes
       - 'docker/Dockerfile.actix'
       - 'docker/Dockerfile.yew'
@@ -38,6 +42,25 @@ jobs:
         with:
           context: .
           file: Dockerfile.actix
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-meeting-api:
+    name: Build Meeting API Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Meeting API Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.meeting-api
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max

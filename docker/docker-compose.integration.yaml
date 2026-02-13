@@ -57,6 +57,8 @@ services:
         set -euo pipefail
         source /usr/local/cargo/env || true
         export PATH="/usr/local/cargo/bin:$PATH"
+        echo "=== CLEARING CARGO REGISTRY CACHE ==="
+        rm -rf /usr/local/cargo/registry/src/* /usr/local/cargo/registry/cache/* 2>/dev/null || true
         echo "=== RUNNING DATABASE MIGRATIONS ==="
         cd /app/dbmate && dbmate wait && dbmate up
         cd /app/actix-api

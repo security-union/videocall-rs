@@ -43,8 +43,7 @@ services:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-it-tests-registry:/usr/local/cargo/registry
-      - rustlemania-it-tests-git:/usr/local/cargo/git
+      # Note: Registry/git volumes removed to prevent cache corruption issues
       - rustlemania-it-tests-target:/usr/local/cargo/target
       - rustlemania-it-tests-cache:/app/actix-api/target
     depends_on:
@@ -57,8 +56,6 @@ services:
         set -euo pipefail
         source /usr/local/cargo/env || true
         export PATH="/usr/local/cargo/bin:$PATH"
-        echo "=== CLEARING CARGO REGISTRY CACHE ==="
-        rm -rf /usr/local/cargo/registry/src/* /usr/local/cargo/registry/cache/* 2>/dev/null || true
         echo "=== RUNNING DATABASE MIGRATIONS ==="
         cd /app/dbmate && dbmate wait && dbmate up
         cd /app/actix-api
@@ -70,8 +67,6 @@ services:
       '
 
 volumes:
-  rustlemania-it-tests-registry:
-  rustlemania-it-tests-git:
   rustlemania-it-tests-target:
   rustlemania-it-tests-cache:
 

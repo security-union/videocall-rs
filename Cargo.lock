@@ -3834,6 +3834,7 @@ dependencies = [
  "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
+ "url",
  "videocall-meeting-types",
 ]
 

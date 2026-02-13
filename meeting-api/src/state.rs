@@ -19,6 +19,27 @@ use crate::config::{Config, OAuthConfig};
 use crate::oauth::JwksCache;
 use sqlx::PgPool;
 
+/// Derive a provider identifier from the OIDC issuer URL.
+fn detect_provider(issuer: &str) -> &str {
+    let host = issuer
+        .strip_prefix("https://")
+        .or_else(|| issuer.strip_prefix("http://"))
+        .unwrap_or(issuer)
+        .split('/')
+        .next()
+        .unwrap_or("");
+
+    if host == "accounts.google.com" {
+        "google"
+    } else if host.ends_with(".okta.com") {
+        "okta"
+    } else if host.ends_with(".microsoftonline.com") || host.ends_with(".microsoft.com") {
+        "microsoft"
+    } else {
+        ""
+    }
+}
+
 /// Application state shared across all request handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -39,6 +60,9 @@ pub struct AppState {
     pub cookie_domain: Option<String>,
     /// Whether to set the `Secure` flag on cookies.
     pub cookie_secure: bool,
+    /// OAuth provider identifier derived from the issuer URL (e.g. "google", "okta").
+    /// Used by the frontend to render provider-branded login buttons.
+    pub oauth_provider: String,
 }
 
 impl AppState {
@@ -49,6 +73,14 @@ impl AppState {
             .and_then(|o| o.jwks_url.as_ref())
             .map(|url| JwksCache::new(url.clone()));
 
+        let oauth_provider = config
+            .oauth
+            .as_ref()
+            .and_then(|o| o.issuer.as_deref())
+            .map(detect_provider)
+            .unwrap_or_default()
+            .to_string();
+
         Self {
             db,
             jwt_secret: config.jwt_secret.clone(),
@@ -58,6 +90,7 @@ impl AppState {
             jwks_cache,
             cookie_domain: config.cookie_domain.clone(),
             cookie_secure: config.cookie_secure,
+            oauth_provider,
         }
     }
 }

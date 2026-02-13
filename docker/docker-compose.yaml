@@ -100,6 +100,8 @@ services:
       - OAUTH_JWKS_URL=${OAUTH_JWKS_URL:-}
       - OAUTH_USERINFO_URL=${OAUTH_USERINFO_URL:-}
       - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
+      - OAUTH_PROMPT=${OAUTH_PROMPT:-}
+      - OAUTH_EXTRA_PARAMS=${OAUTH_EXTRA_PARAMS:-}
       - AFTER_LOGIN_URL=${AFTER_LOGIN_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
       - RUST_LOG=debug
       - CARGO_TARGET_DIR=/app/meeting-api/target

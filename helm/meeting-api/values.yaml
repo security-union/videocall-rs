@@ -62,6 +62,12 @@ env:
     value: "https://api.videocall.rs/login/callback"
   - name: OAUTH_SCOPES
     value: "openid email profile"
+  # OIDC prompt parameter (e.g. "select_account", "login", "consent"). Omit to skip.
+  - name: OAUTH_PROMPT
+    value: ""
+  # Extra auth URL params as JSON object, e.g. '{"access_type":"offline"}' for Google refresh tokens.
+  - name: OAUTH_EXTRA_PARAMS
+    value: ""
   - name: AFTER_LOGIN_URL
     value: "https://app.videocall.rs"
 resources:

@@ -13,6 +13,7 @@
 
 //! Application configuration loaded from environment variables.
 
+use std::collections::HashMap;
 use std::env;
 
 /// Configuration for the Meeting Backend API.
@@ -61,6 +62,12 @@ pub struct OAuthConfig {
     /// Space-separated OAuth scopes (default: "openid email profile").
     pub scopes: String,
     pub after_login_url: String,
+    /// OIDC `prompt` parameter (e.g. "select_account", "login", "consent").
+    /// Omitted from the auth URL when `None`.
+    pub prompt: Option<String>,
+    /// Extra query parameters appended to the authorization URL.
+    /// Useful for provider-specific params like Google's `access_type=offline`.
+    pub extra_auth_params: HashMap<String, String>,
 }
 
 impl Config {
@@ -142,6 +149,22 @@ impl Config {
                     }
                 };
 
+                let prompt = env::var("OAUTH_PROMPT").ok().filter(|s| !s.is_empty());
+
+                let extra_auth_params: HashMap<String, String> = env::var("OAUTH_EXTRA_PARAMS")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|json| {
+                        serde_json::from_str(&json).map_err(|e| {
+                            format!(
+                                "OAUTH_EXTRA_PARAMS must be a JSON object \
+                                 (e.g. {{\"access_type\":\"offline\"}}): {e}"
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
                 Ok::<_, String>(OAuthConfig {
                     client_id,
                     client_secret,
@@ -155,6 +178,8 @@ impl Config {
                     scopes,
                     after_login_url: env::var("AFTER_LOGIN_URL")
                         .unwrap_or_else(|_| "/".to_string()),
+                    prompt,
+                    extra_auth_params,
                 })
             })
             .transpose()?;

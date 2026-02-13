@@ -28,6 +28,8 @@ use crate::state::AppState;
 /// Build the full application router with all meeting API routes.
 pub fn router() -> Router<AppState> {
     Router::new()
+        // Auth config (public, no auth required)
+        .route("/auth/config", get(oauth::auth_config))
         // OAuth / session
         .route("/login", get(oauth::login))
         .route("/login/callback", get(oauth::callback))

@@ -120,6 +120,8 @@ pub async fn login(
         pkce_challenge.as_str(),
         csrf_token.secret(),
         Some(nonce.secret()),
+        oauth_cfg.prompt.as_deref(),
+        &oauth_cfg.extra_auth_params,
     );
 
     Ok(Redirect::to(&auth_url).into_response())
@@ -270,6 +272,18 @@ pub async fn get_profile(
     Ok(Json(
         serde_json::json!({ "email": claims.sub, "name": claims.name }),
     ))
+}
+
+/// GET /auth/config -- public endpoint returning OAuth provider info for the frontend.
+///
+/// Response: `{"provider": "google", "enabled": true}`
+/// No authentication required. Only exposes the provider name (derivable from
+/// the login redirect URL anyway) and whether OAuth is enabled.
+pub async fn auth_config(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "provider": state.oauth_provider,
+        "enabled": state.oauth.is_some(),
+    }))
 }
 
 /// GET /logout -- clears the session cookie.

@@ -62,6 +62,10 @@ env:
     value: "https://api.videocall.rs/login/callback"
   - name: OAUTH_SCOPES
     value: "openid email profile"
+  - name: OAUTH_PROMPT
+    value: "select_account"
+  - name: OAUTH_EXTRA_PARAMS
+    value: '{"access_type":"offline"}'
   - name: AFTER_LOGIN_URL
     value: "https://app.videocall.rs"
 ```
@@ -236,6 +240,8 @@ env:
 | `OAUTH_JWKS_URL` | No | — | JWKS endpoint. Overrides discovery. Enables ID token verification. |
 | `OAUTH_USERINFO_URL` | No | — | UserInfo endpoint. Fallback when ID token lacks `email`. |
 | `OAUTH_SCOPES` | No | `openid email profile` | Space-separated scopes. |
+| `OAUTH_PROMPT` | No | — | OIDC `prompt` parameter (e.g. `select_account`, `login`, `consent`). |
+| `OAUTH_EXTRA_PARAMS` | No | — | JSON object of extra auth URL params (e.g. `{"access_type":"offline"}`). |
 | `AFTER_LOGIN_URL` | No | `/` | Redirect after login. |
 
 **Resolution order:**

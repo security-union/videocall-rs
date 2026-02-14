@@ -229,12 +229,12 @@ impl AttendantsComponent {
         let websocket_urls = actix_websocket_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| lobby_url(s))
+            .map(lobby_url)
             .collect::<Vec<String>>();
         let webtransport_urls = webtransport_host_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| lobby_url(s))
+            .map(lobby_url)
             .collect::<Vec<String>>();
 
         (websocket_urls, webtransport_urls)

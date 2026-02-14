@@ -41,7 +41,7 @@ videocall.rs is composed of two independent services that communicate through a 
 ┌──────────────────────────────────┐   ┌──────────────────────────────────┐
 │       Meeting Backend            │   │         Media Server             │
 │       (Port 8081)                │   │         (Port 8080)              │
-│   (Standalone deployment)        │   │   (Includes meeting API routes)  │
+│   (Standalone deployment)        │   │   (  Pure stream transport)      │
 │                                  │   │                                  │
 │  ┌────────────┐  ┌────────────┐  │   │  ┌────────────┐  ┌───────────┐  │
 │  │ OAuth      │  │ REST API   │  │   │  │ WebSocket  │  │ WebTrans- │  │

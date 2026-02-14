@@ -53,7 +53,8 @@ pub fn build_auth_url(
          &response_type=code\
          &scope={SCOPE}\
          &prompt=select_account\
-         &pkce_challenge={pkce_challenge}\
+         &code_challenge={pkce_challenge}\
+         &code_challenge_method=S256\
          &state={csrf_state}\
          &access_type=offline"
     )
@@ -75,7 +76,7 @@ pub async fn exchange_code_for_claims(
         ("client_id", client_id),
         ("code", authorization_code),
         ("client_secret", client_secret),
-        ("pkce_verifier", pkce_verifier),
+        ("code_verifier", pkce_verifier),
     ];
 
     let response = client

@@ -41,6 +41,7 @@ videocall.rs is composed of two independent services that communicate through a 
 ┌──────────────────────────────────┐   ┌──────────────────────────────────┐
 │       Meeting Backend            │   │         Media Server             │
 │       (Port 8081)                │   │         (Port 8080)              │
+│   (Standalone deployment)        │   │   (Includes meeting API routes)  │
 │                                  │   │                                  │
 │  ┌────────────┐  ┌────────────┐  │   │  ┌────────────┐  ┌───────────┐  │
 │  │ OAuth      │  │ REST API   │  │   │  │ WebSocket  │  │ WebTrans- │  │
@@ -99,6 +100,20 @@ JWT validation on the Media Server is gated behind the `FEATURE_MEETING_MANAGEME
 | `false` (default) | JWT validation is **disabled**. Connections are accepted without a token (backward compatible). |
 
 This allows the meeting management system to be deployed incrementally. Once the UI is updated to obtain and present tokens, the feature flag can be flipped to `true` to enforce token-based access.
+
+### Local Development Setup
+
+For local development, the **websocket-api (port 8080)** serves as an all-in-one solution:
+
+- **OAuth login**: Uses `email` and `name` cookies (not JWT session tokens)
+- **Meeting API routes**: Available at `/api/v1/meetings/*`
+- **WebSocket connections**: Available at `/lobby`
+
+The UI should set `apiBaseUrl: "http://localhost:8080"` to use this unified setup.
+
+> **Important**: The `COOKIE_DOMAIN` environment variable should be set to `localhost` to ensure cookies are sent correctly across ports during local development.
+
+The standalone **meeting-api (port 8081)** is available for production deployments where you want a separate microservice for meeting management with JWT session tokens.
 
 ### Why Two Services?
 

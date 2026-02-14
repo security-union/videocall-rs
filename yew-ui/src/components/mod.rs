@@ -24,12 +24,15 @@ pub mod device_selector;
 pub mod device_settings_modal;
 pub mod diagnostics;
 pub mod host;
+pub mod host_controls;
 pub mod icons;
 pub mod login;
 pub mod meeting_info;
+pub mod meetings_list;
 pub mod neteq_chart;
 pub mod top_bar;
 pub mod video_control_buttons;
+pub mod waiting_room;
 
 mod canvas_generator;
 mod peer_list;

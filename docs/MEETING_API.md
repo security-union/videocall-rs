@@ -48,7 +48,24 @@ All success and error examples below show the full envelope.
 
 ## Authentication
 
-All endpoints require a **signed session JWT**, issued by the Meeting Backend after a successful OAuth login. The session token can be delivered in two ways:
+Authentication varies depending on the deployment mode:
+
+### Local Development (websocket-api on port 8080)
+
+The websocket-api uses simple **email and name cookies** for authentication:
+
+1. After OAuth login, the server sets `Set-Cookie: email=<user_email>` and `Set-Cookie: name=<display_name>`
+2. The browser sends these cookies automatically with every request
+3. Set `COOKIE_DOMAIN=localhost` to ensure cookies work across ports
+
+```bash
+# Cookies are set automatically by the browser after OAuth login
+-H "Cookie: email=user@example.com; name=User Name"
+```
+
+### Production (meeting-api on port 8081)
+
+The standalone meeting-api uses a **signed session JWT** for enhanced security:
 
 1. **HttpOnly cookie** (web browsers): After OAuth login, the server sets `Set-Cookie: session=<JWT>; HttpOnly; Secure; SameSite=Lax`. The browser sends it automatically with every request. JavaScript cannot read it, which prevents XSS token theft.
 
@@ -120,7 +137,12 @@ All timestamps in API responses are **Unix seconds** (not milliseconds). This ap
 
 ## API Endpoints
 
-All endpoints are served by the Meeting Backend on its own port (default: 8081).
+All endpoints are served by either:
+
+- **Local development**: The websocket-api on port 8080 (includes meeting API routes)
+- **Production**: The standalone meeting-api on port 8081
+
+For local development, set `apiBaseUrl: "http://localhost:8080"` in the UI configuration.
 
 ### List Meetings (My Meetings)
 
@@ -834,17 +856,16 @@ sequenceDiagram
 ## Example: Complete Meeting Session
 
 ```bash
-# Meeting Backend runs on port 8081
-# Media Server runs on port 8080
+# Local Development: Both API and Media Server run on port 8080
+# Production: Meeting Backend on port 8081, Media Server on port 8080
 #
-# SESSION_TOKEN is a signed session JWT obtained after OAuth login.
-# In a browser, this is stored as an HttpOnly cookie and sent automatically.
-# For curl testing, use the Authorization header.
+# For local development, cookies are set automatically after OAuth login.
+# The examples below use port 8080 (local dev setup).
 
 # 1. Host creates meeting
-curl -X POST http://localhost:8081/api/v1/meetings \
+curl -X POST http://localhost:8080/api/v1/meetings \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H "Cookie: email=host@example.com" \
   -d '{"meeting_id": "standup-2024"}'
 
 # Response:
@@ -852,8 +873,8 @@ curl -X POST http://localhost:8081/api/v1/meetings \
 #   "created_at":1706918400,"state":"idle","attendees":[],"has_password":false}}
 
 # 2. Host joins meeting (activates it, receives room token)
-curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
-  -H "Authorization: Bearer $SESSION_TOKEN"
+curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/join \
+  -H "Cookie: email=host@example.com"
 
 # Response:
 # {"success":true,"result":{"email":"host@example.com","display_name":null,
@@ -864,9 +885,9 @@ curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
 #    (In practice, the client UI does this automatically)
 #    WebSocket: ws://localhost:8080/lobby?token=eyJhbGciOiJIUzI1NiIs...
 
-# 4. Attendee tries to join (using their own session token)
-curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
-  -H "Authorization: Bearer $ALICE_SESSION_TOKEN" \
+# 4. Attendee tries to join (using their own session cookie)
+curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/join \
+  -H "Cookie: email=alice@example.com" \
   -H "Content-Type: application/json" \
   -d '{"display_name": "Alice"}'
 
@@ -876,22 +897,22 @@ curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
 #   "admitted_at":null,"room_token":null}}
 
 # 5. Host checks waiting room
-curl http://localhost:8081/api/v1/meetings/standup-2024/waiting \
-  -H "Authorization: Bearer $SESSION_TOKEN"
+curl http://localhost:8080/api/v1/meetings/standup-2024/waiting \
+  -H "Cookie: email=host@example.com"
 
 # Response:
 # {"success":true,"result":{"meeting_id":"standup-2024",
 #   "waiting":[{"email":"alice@example.com","display_name":"Alice",...}]}}
 
 # 6. Host admits Alice
-curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/admit \
+curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/admit \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $SESSION_TOKEN" \
+  -H "Cookie: email=host@example.com" \
   -d '{"email": "alice@example.com"}'
 
 # 7. Alice polls and receives her room token
-curl http://localhost:8081/api/v1/meetings/standup-2024/status \
-  -H "Authorization: Bearer $ALICE_SESSION_TOKEN"
+curl http://localhost:8080/api/v1/meetings/standup-2024/status \
+  -H "Cookie: email=alice@example.com"
 
 # Response:
 # {"success":true,"result":{"email":"alice@example.com","display_name":"Alice",
@@ -902,12 +923,12 @@ curl http://localhost:8081/api/v1/meetings/standup-2024/status \
 #    WebSocket: ws://localhost:8080/lobby?token=eyJhbGciOiJIUzI1NiIs...
 
 # 9. When done, participants leave
-curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/leave \
-  -H "Authorization: Bearer $ALICE_SESSION_TOKEN"
+curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/leave \
+  -H "Cookie: email=alice@example.com"
 
 # 10. Host leaves (ends the meeting)
-curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/leave \
-  -H "Authorization: Bearer $SESSION_TOKEN"
+curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/leave \
+  -H "Cookie: email=host@example.com"
 ```
 
 ---

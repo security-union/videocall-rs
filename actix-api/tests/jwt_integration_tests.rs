@@ -40,7 +40,7 @@ use tokio_tungstenite::tungstenite::Message;
 use videocall_types::FeatureFlags;
 
 const JWT_SECRET: &str = "test-secret-for-integration-tests";
-const TOKEN_TTL_SECS: i64 = 600;
+const TOKEN_TTL_SECS: i64 = 60;
 const JWT_PORT: u16 = 18090;
 
 // =========================================================================

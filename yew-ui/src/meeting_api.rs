@@ -170,6 +170,18 @@ pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinE
     }
 }
 
+/// Fetch a fresh room access token from the meeting API.
+///
+/// Calls `GET /api/v1/meetings/{id}/status` and extracts the `room_token`
+/// from the response. Returns an error if the participant is no longer
+/// admitted or the session has expired.
+pub async fn refresh_room_token(meeting_id: &str) -> Result<String, JoinError> {
+    let response = check_status(meeting_id).await?;
+    response.room_token.ok_or_else(|| {
+        JoinError::ServerError(200, "Admitted but no room token in response".to_string())
+    })
+}
+
 /// Leave a meeting - updates participant status to 'left' in database
 pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
     let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;

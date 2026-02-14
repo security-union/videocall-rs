@@ -35,7 +35,7 @@ use crate::token::generate_room_token;
 /// Attendees enter the waiting room.
 pub async fn join_meeting(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
     body: Option<Json<JoinMeetingRequest>>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
@@ -96,7 +96,7 @@ pub async fn join_meeting(
 /// Polling endpoint. When status is 'admitted', the response includes the room_token.
 pub async fn get_my_status(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -126,7 +126,7 @@ pub async fn get_my_status(
 /// POST /api/v1/meetings/{meeting_id}/leave
 pub async fn leave_meeting(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -152,14 +152,21 @@ pub async fn leave_meeting(
 }
 
 /// GET /api/v1/meetings/{meeting_id}/participants
+///
+/// Only participants who are themselves in the meeting can list other participants.
 pub async fn get_participants(
     State(state): State<AppState>,
-    AuthUser(_email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<Vec<ParticipantStatusResponse>>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+
+    // Verify the requester is actually a participant in this meeting.
+    db_participants::get_status(&state.db, meeting.id, &email)
+        .await?
+        .ok_or_else(AppError::not_in_meeting)?;
 
     let rows = db_participants::get_admitted(&state.db, meeting.id).await?;
     let participants: Vec<ParticipantStatusResponse> = rows

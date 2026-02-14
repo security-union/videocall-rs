@@ -42,7 +42,7 @@ async fn require_admitted(state: &AppState, meeting_id: i32, email: &str) -> Res
 /// GET /api/v1/meetings/{meeting_id}/waiting
 pub async fn get_waiting_room(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<WaitingRoomResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -66,7 +66,7 @@ pub async fn get_waiting_room(
 /// POST /api/v1/meetings/{meeting_id}/admit
 pub async fn admit_participant(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
     Json(body): Json<AdmitRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {
@@ -87,7 +87,7 @@ pub async fn admit_participant(
 /// POST /api/v1/meetings/{meeting_id}/admit-all
 pub async fn admit_all(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<AdmitAllResponse>>, AppError> {
     let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -112,7 +112,7 @@ pub async fn admit_all(
 /// POST /api/v1/meetings/{meeting_id}/reject
 pub async fn reject_participant(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
     Json(body): Json<AdmitRequest>,
 ) -> Result<Json<APIResponse<ParticipantStatusResponse>>, AppError> {

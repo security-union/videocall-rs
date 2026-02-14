@@ -94,9 +94,6 @@ pub enum UserScreenToggleAction {
     MeetingInfo,
 }
 
-/// Maximum number of consecutive reconnection attempts before giving up.
-const MAX_RECONNECT_ATTEMPTS: u32 = 3;
-
 #[derive(Debug)]
 pub enum Msg {
     WsAction(WsAction),
@@ -209,8 +206,6 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
-    /// Consecutive reconnection attempts (reset on successful connection).
-    reconnect_attempts: u32,
 }
 
 impl AttendantsComponent {
@@ -481,7 +476,6 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
-            reconnect_attempts: 0,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -517,7 +511,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
-                    self.reconnect_attempts = 0;
+                    self.error = None;
                     self.call_start_time = Some(js_sys::Date::now());
                     true
                 }
@@ -528,49 +522,33 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Lost(reason) => {
                     warn!("Connection lost (reason: {reason:?})");
-                    self.reconnect_attempts += 1;
-
-                    if self.reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
-                        warn!(
-                            "Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded, giving up"
-                        );
-                        self.error = Some(
-                            "Connection lost. Maximum reconnection attempts exceeded.".to_string(),
-                        );
-                        return true;
-                    }
-
-                    log::info!(
-                        "Refreshing room token before reconnect (attempt {}/{})",
-                        self.reconnect_attempts,
-                        MAX_RECONNECT_ATTEMPTS,
-                    );
+                    self.error = Some("Connection lost, reconnecting...".to_string());
 
                     #[cfg(feature = "media-server-jwt-auth")]
                     {
-                        let meeting_id = ctx.props().id.clone();
                         let link = ctx.link().clone();
-                        wasm_bindgen_futures::spawn_local(async move {
-                            match crate::meeting_api::check_status(&meeting_id).await {
-                                Ok(response) => {
-                                    if let Some(token) = response.room_token {
-                                        link.send_message(Msg::TokenRefreshed(token));
-                                    } else {
-                                        link.send_message(Msg::TokenRefreshFailed(
-                                            "Admitted but no room token received".to_string(),
-                                        ));
+                        let meeting_id = ctx.props().id.clone();
+                        Timeout::new(1_000, move || {
+                            wasm_bindgen_futures::spawn_local(async move {
+                                match crate::meeting_api::refresh_room_token(&meeting_id).await {
+                                    Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
+                                    Err(e) => {
+                                        link.send_message(Msg::TokenRefreshFailed(e.to_string()))
                                     }
                                 }
-                                Err(e) => {
-                                    link.send_message(Msg::TokenRefreshFailed(e.to_string()));
-                                }
-                            }
-                        });
+                            });
+                        })
+                        .forget();
                     }
 
-                    // When JWT auth is disabled, just reconnect with the same URLs.
                     #[cfg(not(feature = "media-server-jwt-auth"))]
-                    ctx.link().send_message(WsAction::Connect);
+                    {
+                        let link = ctx.link().clone();
+                        Timeout::new(1_000, move || {
+                            link.send_message(WsAction::Connect);
+                        })
+                        .forget();
+                    }
 
                     true
                 }
@@ -815,6 +793,7 @@ impl Component for AttendantsComponent {
             }
             Msg::TokenRefreshed(new_token) => {
                 log::info!("Room token refreshed, reconnecting with new token");
+                self.error = None;
                 let (ws_urls, wt_urls) =
                     Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
                 self.client.update_server_urls(ws_urls, wt_urls);
@@ -827,7 +806,21 @@ impl Component for AttendantsComponent {
             }
             Msg::TokenRefreshFailed(err) => {
                 warn!("Token refresh failed: {err}");
-                self.error = Some(format!("Connection lost and could not rejoin: {err}"));
+                self.error = Some(format!("Connection lost, retrying... ({err})"));
+
+                // Schedule another attempt after 1 second.
+                let link = ctx.link().clone();
+                let meeting_id = ctx.props().id.clone();
+                Timeout::new(1_000, move || {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match crate::meeting_api::refresh_room_token(&meeting_id).await {
+                            Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
+                            Err(e) => link.send_message(Msg::TokenRefreshFailed(e.to_string())),
+                        }
+                    });
+                })
+                .forget();
+
                 true
             }
         }

@@ -79,7 +79,7 @@ services:
       - LISTEN_ADDR=0.0.0.0:8081
       - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
-      - TOKEN_TTL_SECS=${TOKEN_TTL_SECS:-600}
+      - TOKEN_TTL_SECS=${TOKEN_TTL_SECS:-60}
       - SESSION_TTL_SECS=${SESSION_TTL_SECS:-315360000}
       - COOKIE_SECURE=false
       - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}

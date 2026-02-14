@@ -4,9 +4,7 @@ on:
   pull_request:
     paths:
       - 'actix-api/**'
-      - 'meeting-api/**'
       - 'videocall-types/**'
-      - 'videocall-meeting-types/**'
       - 'protobuf/**'
       - 'yew-ui/**'
       - 'docker/**'
@@ -23,15 +21,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Clean up Docker resources
-        run: |
-          # Stop any running containers from previous runs
-          docker compose -f docker/docker-compose.integration.yaml down -v 2>/dev/null || true
-          # Remove all Docker resources including volumes
-          docker system prune -af --volumes
-          # Explicitly remove named volumes that may have corrupted cargo registry cache
-          docker volume rm -f docker_rustlemania-it-tests-registry docker_rustlemania-it-tests-git docker_rustlemania-it-tests-target docker_rustlemania-it-tests-cache 2>/dev/null || true
-          # List remaining volumes for debugging
-          docker volume ls
+        run: docker system prune -f --volumes
 
       - run: make tests_run
 

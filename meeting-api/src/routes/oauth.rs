@@ -26,6 +26,8 @@ use axum::{
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
 
+use videocall_meeting_types::responses::{APIResponse, ProfileResponse};
+
 use crate::auth::AuthUser;
 use crate::db::oauth as db_oauth;
 use crate::error::AppError;
@@ -200,13 +202,13 @@ pub async fn check_session(AuthUser { .. }: AuthUser) -> StatusCode {
     StatusCode::OK
 }
 
-/// GET /profile -- returns `{ "email": "...", "name": "..." }` from the
-/// session JWT claims.
+/// GET /profile -- returns the authenticated user's profile from the session
+/// JWT claims.
 ///
 /// Because the session JWT embeds both email and display name, this endpoint
 /// does not need a database query.
-pub async fn get_profile(AuthUser { email, name }: AuthUser) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "email": email, "name": name }))
+pub async fn get_profile(AuthUser { email, name }: AuthUser) -> Json<APIResponse<ProfileResponse>> {
+    Json(APIResponse::ok(ProfileResponse { email, name }))
 }
 
 /// GET /logout -- clears the session cookie.

@@ -7,14 +7,10 @@
 use crate::constants::meeting_api_base_url;
 use anyhow::anyhow;
 use reqwasm::http::{Request, RequestCredentials};
-use serde::Deserialize;
+use videocall_meeting_types::responses::{APIResponse, ProfileResponse};
 
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct UserProfile {
-    pub email: String,
-    pub name: String,
-}
+/// Re-export `ProfileResponse` as `UserProfile` for use across the UI.
+pub type UserProfile = ProfileResponse;
 
 /// Check if there is an active session by calling the backend /session endpoint
 /// Returns Ok(()) if session is valid, Err if unauthorized (401) or other error
@@ -51,8 +47,8 @@ pub async fn get_user_profile() -> anyhow::Result<UserProfile> {
         .send()
         .await?;
 
-    let response: UserProfile = fetched_response.json().await?;
-    Ok(response)
+    let wrapper: APIResponse<UserProfile> = fetched_response.json().await?;
+    Ok(wrapper.result)
 }
 
 /// Logout - clears session cookies on the backend

@@ -85,9 +85,13 @@ web-sys = { version = "0.3.72", features = [
 ] }
 
 [features]
-default = []
+default = ["media-server-jwt-auth"]
 fake-peers = []
 oauth = []
+## When enabled, the UI connects to the media server using a signed JWT room
+## access token (`/lobby?token=<JWT>`).  When disabled, it uses the legacy
+## unauthenticated path (`/lobby/{email}/{room}`).
+media-server-jwt-auth = []
 
 debugAssertions = []
 

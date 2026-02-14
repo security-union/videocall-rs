@@ -30,6 +30,8 @@ pub enum MeetingStatus {
     Admitted {
         is_host: bool,
         host_display_name: Option<String>,
+        /// Signed JWT room access token for connecting to the media server
+        room_token: String,
     },
     /// Rejected by the host
     Rejected,
@@ -188,11 +190,20 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
 
                                             match response.status.as_str() {
                                                 "admitted" => {
-                                                    meeting_status.set(MeetingStatus::Admitted {
-                                                        is_host: response.is_host,
-                                                        host_display_name:
-                                                            determined_host_display_name,
-                                                    });
+                                                    if let Some(token) = response.room_token {
+                                                        meeting_status.set(
+                                                            MeetingStatus::Admitted {
+                                                                is_host: response.is_host,
+                                                                host_display_name:
+                                                                    determined_host_display_name,
+                                                                room_token: token,
+                                                            },
+                                                        );
+                                                    } else {
+                                                        meeting_status.set(MeetingStatus::Error(
+                                                            "Admitted but no room token received from server".to_string(),
+                                                        ));
+                                                    }
                                                 }
                                                 "waiting" => {
                                                     came_from_waiting_room.set(true);
@@ -316,10 +327,18 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
 
                         match response.status.as_str() {
                             "admitted" => {
-                                meeting_status.set(MeetingStatus::Admitted {
-                                    is_host: response.is_host,
-                                    host_display_name: determined_host_display_name,
-                                });
+                                if let Some(token) = response.room_token {
+                                    meeting_status.set(MeetingStatus::Admitted {
+                                        is_host: response.is_host,
+                                        host_display_name: determined_host_display_name,
+                                        room_token: token,
+                                    });
+                                } else {
+                                    meeting_status.set(MeetingStatus::Error(
+                                        "Admitted but no room token received from server"
+                                            .to_string(),
+                                    ));
+                                }
                             }
                             "waiting" => {
                                 // Mark that user is going through waiting room
@@ -350,13 +369,13 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         })
     };
 
-    // Handle waiting room admission
+    // Handle waiting room admission - receives the room_token from WaitingRoom
     let on_admitted = {
         let meeting_status = meeting_status.clone();
         let host_display_name = host_display_name.clone();
         let meeting_id = props.id.clone();
 
-        Callback::from(move |_| {
+        Callback::from(move |room_token: String| {
             let meeting_status = meeting_status.clone();
             let host_display_name = host_display_name.clone();
             let meeting_id = meeting_id.clone();
@@ -373,6 +392,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                 meeting_status.set(MeetingStatus::Admitted {
                     is_host: false,
                     host_display_name: determined_host_display_name,
+                    room_token,
                 });
             });
         })
@@ -509,7 +529,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
             {
                 match (&maybe_username, &current_meeting_status) {
                     // User is admitted - show the meeting
-                    (Some(username), MeetingStatus::Admitted { is_host, host_display_name }) => {
+                    (Some(username), MeetingStatus::Admitted { is_host, host_display_name, room_token }) => {
                         html! {
                             <AttendantsComponent
                                 email={username.clone()}
@@ -522,6 +542,7 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                                 host_display_name={host_display_name.clone()}
                                 auto_join={should_auto_join}
                                 is_owner={*is_host}
+                                room_token={room_token.clone()}
                             />
                         }
                     }

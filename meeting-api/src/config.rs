@@ -24,7 +24,9 @@ pub struct Config {
     pub database_url: String,
     /// Shared secret used to sign room access tokens (HMAC-SHA256).
     pub jwt_secret: String,
-    /// Room access token time-to-live in seconds (default: 600 = 10 minutes).
+    /// Room access token time-to-live in seconds (default: 60 = 1 minute).
+    /// Tokens are "single-burner": short-lived admission tickets that the UI
+    /// refreshes automatically on every reconnect.
     pub token_ttl_secs: i64,
     /// Session JWT time-to-live in seconds (default: 315360000 = ~10 years).
     pub session_ttl_secs: i64,
@@ -60,7 +62,7 @@ impl Config {
     ///
     /// # Optional
     /// - `LISTEN_ADDR` (default: `"0.0.0.0:8081"`)
-    /// - `TOKEN_TTL_SECS` (default: `"600"`)
+    /// - `TOKEN_TTL_SECS` (default: `"60"`)
     /// - `COOKIE_DOMAIN`
     /// - OAuth: `OAUTH_CLIENT_ID`, `OAUTH_SECRET`, `OAUTH_REDIRECT_URL`,
     ///   `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `AFTER_LOGIN_URL`
@@ -73,7 +75,7 @@ impl Config {
 
         let listen_addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
         let token_ttl_secs = env::var("TOKEN_TTL_SECS")
-            .unwrap_or_else(|_| "600".to_string())
+            .unwrap_or_else(|_| "60".to_string())
             .parse::<i64>()
             .map_err(|_| "TOKEN_TTL_SECS must be a valid integer")?;
         let session_ttl_secs = env::var("SESSION_TTL_SECS")

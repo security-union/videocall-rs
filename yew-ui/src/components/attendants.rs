@@ -94,6 +94,9 @@ pub enum UserScreenToggleAction {
     MeetingInfo,
 }
 
+/// Maximum number of consecutive reconnection attempts before giving up.
+const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+
 #[derive(Debug)]
 pub enum Msg {
     WsAction(WsAction),
@@ -115,6 +118,10 @@ pub enum Msg {
     ShowCopyToast(bool),
     MeetingEnded(String),
     ScreenShareStateChange(ScreenShareEvent),
+    /// A fresh room access token was obtained from the meeting API.
+    TokenRefreshed(String),
+    /// Token refresh failed (session expired, kicked from meeting, network error).
+    TokenRefreshFailed(String),
 }
 
 impl From<WsAction> for Msg {
@@ -168,6 +175,11 @@ pub struct AttendantsComponentProps {
     /// If true, the current user is the owner of the meeting.
     #[prop_or_default]
     pub is_owner: bool,
+
+    /// Signed JWT room access token for connecting to the media server.
+    /// Obtained from the meeting API when the participant is admitted.
+    #[prop_or_default]
+    pub room_token: String,
 }
 
 pub struct AttendantsComponent {
@@ -197,28 +209,63 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    /// Consecutive reconnection attempts (reset on successful connection).
+    reconnect_attempts: u32,
 }
 
 impl AttendantsComponent {
-    fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
-        let email = ctx.props().email.clone();
-        let id = ctx.props().id.clone();
+    /// Build the WebSocket and WebTransport lobby URLs for the media server.
+    ///
+    /// When `media-server-jwt-auth` is enabled, the token is embedded as a query
+    /// parameter. When disabled, the legacy `/{email}/{room}` path is used.
+    #[allow(unused_variables)]
+    fn build_lobby_urls(token: &str, email: &str, id: &str) -> (Vec<String>, Vec<String>) {
+        #[cfg(feature = "media-server-jwt-auth")]
+        let lobby_url = |base: &str| format!("{base}/lobby?token={token}");
+
+        #[cfg(not(feature = "media-server-jwt-auth"))]
+        let lobby_url = |base: &str| format!("{base}/lobby/{email}/{id}");
+
         let websocket_urls = actix_websocket_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(|s| lobby_url(s))
             .collect::<Vec<String>>();
         let webtransport_urls = webtransport_host_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(|s| lobby_url(s))
             .collect::<Vec<String>>();
 
+        (websocket_urls, webtransport_urls)
+    }
+
+    fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
+        let email = ctx.props().email.clone();
+        let id = ctx.props().id.clone();
+
+        #[cfg(feature = "media-server-jwt-auth")]
+        let token = {
+            let t = ctx.props().room_token.clone();
+            assert!(
+                !t.is_empty(),
+                "media-server-jwt-auth is enabled but room_token is empty — \
+                 cannot connect to the media server without a signed JWT"
+            );
+            t
+        };
+
+        #[cfg(not(feature = "media-server-jwt-auth"))]
+        let token = String::new();
+
+        let (websocket_urls, webtransport_urls) = Self::build_lobby_urls(&token, &email, &id);
+
         log::info!(
-            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}",
+            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}, jwt_auth={}",
             email,
             id,
-            ctx.props().webtransport_enabled
+            ctx.props().webtransport_enabled,
+            cfg!(feature = "media-server-jwt-auth"),
         );
         if websocket_urls.is_empty() || webtransport_urls.is_empty() {
             log::error!("Runtime config missing or invalid: wsUrl or webTransportHost not set");
@@ -434,6 +481,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            reconnect_attempts: 0,
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -469,6 +517,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
+                    self.reconnect_attempts = 0;
                     self.call_start_time = Some(js_sys::Date::now());
                     true
                 }
@@ -478,8 +527,51 @@ impl Component for AttendantsComponent {
                     false
                 }
                 WsAction::Lost(reason) => {
-                    warn!("Lost with reason {reason:?}");
+                    warn!("Connection lost (reason: {reason:?})");
+                    self.reconnect_attempts += 1;
+
+                    if self.reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
+                        warn!(
+                            "Max reconnect attempts ({MAX_RECONNECT_ATTEMPTS}) exceeded, giving up"
+                        );
+                        self.error = Some(
+                            "Connection lost. Maximum reconnection attempts exceeded.".to_string(),
+                        );
+                        return true;
+                    }
+
+                    log::info!(
+                        "Refreshing room token before reconnect (attempt {}/{})",
+                        self.reconnect_attempts,
+                        MAX_RECONNECT_ATTEMPTS,
+                    );
+
+                    #[cfg(feature = "media-server-jwt-auth")]
+                    {
+                        let meeting_id = ctx.props().id.clone();
+                        let link = ctx.link().clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match crate::meeting_api::check_status(&meeting_id).await {
+                                Ok(response) => {
+                                    if let Some(token) = response.room_token {
+                                        link.send_message(Msg::TokenRefreshed(token));
+                                    } else {
+                                        link.send_message(Msg::TokenRefreshFailed(
+                                            "Admitted but no room token received".to_string(),
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    link.send_message(Msg::TokenRefreshFailed(e.to_string()));
+                                }
+                            }
+                        });
+                    }
+
+                    // When JWT auth is disabled, just reconnect with the same URLs.
+                    #[cfg(not(feature = "media-server-jwt-auth"))]
                     ctx.link().send_message(WsAction::Connect);
+
                     true
                 }
                 WsAction::RequestMediaPermissions => {
@@ -719,6 +811,23 @@ impl Component for AttendantsComponent {
                         self.user_error = Some(format!("Screen share failed: {msg}"));
                     }
                 }
+                true
+            }
+            Msg::TokenRefreshed(new_token) => {
+                log::info!("Room token refreshed, reconnecting with new token");
+                let (ws_urls, wt_urls) =
+                    Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
+                self.client.update_server_urls(ws_urls, wt_urls);
+                if let Err(e) = self.client.connect() {
+                    ctx.link().send_message(WsAction::Log(format!(
+                        "Reconnection with refreshed token failed: {e:?}"
+                    )));
+                }
+                true
+            }
+            Msg::TokenRefreshFailed(err) => {
+                warn!("Token refresh failed: {err}");
+                self.error = Some(format!("Connection lost and could not rejoin: {err}"));
                 true
             }
         }

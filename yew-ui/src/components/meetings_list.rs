@@ -20,7 +20,6 @@ use crate::constants::meeting_api_base_url;
 use crate::routing::Route;
 use reqwasm::http::{Request, RequestCredentials};
 use videocall_meeting_types::responses::{APIResponse, ListMeetingsResponse, MeetingSummary};
-use wasm_bindgen::JsCast;
 use yew::prelude::*;
 use yew_router::prelude::*;
 
@@ -61,8 +60,9 @@ impl Component for MeetingsList {
         // Fetch meetings on component creation
         ctx.link().send_message(MeetingsListMsg::FetchMeetings);
 
-        // Try to get email from cookie
-        let current_user_email = get_email_from_cookie().or_else(|| ctx.props().user_email.clone());
+        // The meetings list API returns only meetings owned by the current user,
+        // so all meetings in the response belong to us. No need to check ownership.
+        let current_user_email = ctx.props().user_email.clone();
 
         Self {
             meetings: Vec::new(),
@@ -239,12 +239,9 @@ impl MeetingsList {
         let is_active = meeting.state == "active";
         let is_ended = meeting.state == "ended";
 
-        // Check if current user is the owner
-        let is_owner = self
-            .current_user_email
-            .as_ref()
-            .map(|email| meeting.host.as_ref() == Some(email))
-            .unwrap_or(false);
+        // The meetings list API returns only meetings owned by the current user,
+        // so all meetings here are ours and we can always show the delete button.
+        let is_owner = true;
 
         let on_click = {
             let meeting_id = meeting_id.clone();
@@ -390,23 +387,6 @@ impl MeetingsList {
             </li>
         }
     }
-}
-
-fn get_email_from_cookie() -> Option<String> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.dyn_into::<web_sys::HtmlDocument>().ok())
-        .and_then(|d| d.cookie().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|cookie| {
-                let cookie = cookie.trim();
-                if cookie.starts_with("email=") {
-                    Some(cookie.trim_start_matches("email=").to_string())
-                } else {
-                    None
-                }
-            })
-        })
 }
 
 async fn fetch_meetings() -> Result<ListMeetingsResponse, String> {

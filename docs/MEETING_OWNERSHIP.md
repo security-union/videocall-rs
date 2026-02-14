@@ -103,17 +103,15 @@ This allows the meeting management system to be deployed incrementally. Once the
 
 ### Local Development Setup
 
-For local development, the **websocket-api (port 8080)** serves as an all-in-one solution:
+For local development, `docker-compose.yaml` spins up two separate services:
 
-- **OAuth login**: Uses `email` and `name` cookies (not JWT session tokens)
-- **Meeting API routes**: Available at `/api/v1/meetings/*`
-- **WebSocket connections**: Available at `/lobby`
+- **meeting-api (port 8081)**: Handles OAuth login, session JWTs, and all Meeting REST API routes (`/api/v1/meetings/*`)
+- **websocket-api (port 8080)**: Handles WebSocket media connections (`/lobby`)
+- **webtransport-api (port 4433)**: Handles WebTransport media connections (`/lobby`)
 
-The UI should set `apiBaseUrl: "http://localhost:8080"` to use this unified setup.
+The UI's `apiBaseUrl` defaults to `http://localhost:8081` (the meeting-api). The media server URLs (`wsUrl`, `webTransportHost`) point to the websocket-api and webtransport-api respectively.
 
-> **Important**: The `COOKIE_DOMAIN` environment variable should be set to `localhost` to ensure cookies are sent correctly across ports during local development.
-
-The standalone **meeting-api (port 8081)** is available for production deployments where you want a separate microservice for meeting management with JWT session tokens.
+> **Important**: The `COOKIE_DOMAIN` environment variable should be set to `localhost` to ensure session cookies are sent correctly across ports during local development.
 
 ### Why Two Services?
 

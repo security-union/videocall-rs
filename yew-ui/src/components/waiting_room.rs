@@ -30,7 +30,8 @@ pub type ParticipantStatus = ParticipantStatusResponse;
 #[derive(Properties, Clone, PartialEq)]
 pub struct WaitingRoomProps {
     pub meeting_id: String,
-    pub on_admitted: Callback<()>,
+    /// Called when participant is admitted. Carries the room access JWT token.
+    pub on_admitted: Callback<String>,
     pub on_rejected: Callback<()>,
     pub on_cancel: Callback<()>,
 }
@@ -86,7 +87,11 @@ impl Component for WaitingRoom {
             WaitingRoomMsg::StatusReceived(status) => {
                 match status.status.as_str() {
                     "admitted" => {
-                        ctx.props().on_admitted.emit(());
+                        if let Some(token) = status.room_token.clone() {
+                            ctx.props().on_admitted.emit(token);
+                        } else {
+                            self.error = Some("Admitted but no room token received".to_string());
+                        }
                     }
                     "rejected" => {
                         ctx.props().on_rejected.emit(());

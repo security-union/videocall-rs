@@ -26,8 +26,8 @@ use videocall_meeting_types::responses::{
 };
 
 // Re-export for use by other modules
-pub use videocall_meeting_types::responses::ParticipantStatusResponse as JoinMeetingResponse;
 pub use videocall_meeting_types::responses::MeetingInfoResponse as MeetingInfo;
+pub use videocall_meeting_types::responses::ParticipantStatusResponse as JoinMeetingResponse;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JoinMeetingRequest {

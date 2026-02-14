@@ -245,7 +245,7 @@ async fn test_wrong_secret_token_rejected() {
 
     let result = try_connect_with_token(port, &token).await;
     assert!(result.is_err(), "wrong-secret token should be rejected");
-    assert_eq!(result.unwrap_err(), 401);
+    assert_eq!(result.unwrap_err(), 403);
 }
 
 #[actix_rt::test]
@@ -256,7 +256,7 @@ async fn test_garbage_token_rejected() {
 
     let result = try_connect_with_token(port, "not.a.real.jwt").await;
     assert!(result.is_err(), "garbage token should be rejected");
-    assert_eq!(result.unwrap_err(), 401);
+    assert_eq!(result.unwrap_err(), 403);
 }
 
 #[actix_rt::test]

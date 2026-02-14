@@ -166,6 +166,44 @@ mod tests {
         let jwt = generate_session_token(TEST_SECRET, "bob@test.com", "Bob", 3600).unwrap();
         let auth = extract_with_bearer(&jwt).await.expect("should succeed");
         assert_eq!(auth.email, "bob@test.com");
+        assert_eq!(auth.name, "Bob");
+    }
+
+    #[tokio::test]
+    async fn valid_cookie_extracts_name() {
+        let jwt =
+            generate_session_token(TEST_SECRET, "alice@test.com", "Alice Wonder", 3600).unwrap();
+        let auth = extract_with_cookie(Some(&format!("session={jwt}")))
+            .await
+            .expect("should succeed");
+        assert_eq!(auth.email, "alice@test.com");
+        assert_eq!(auth.name, "Alice Wonder");
+    }
+
+    #[tokio::test]
+    async fn expired_bearer_token_returns_unauthorized() {
+        let jwt = generate_session_token(TEST_SECRET, "a@b.com", "A", -120).unwrap();
+        let err = extract_with_bearer(&jwt).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_token_returns_unauthorized() {
+        let err = extract_with_bearer("not-a-valid-jwt").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_secret_bearer_token_returns_unauthorized() {
+        let jwt = generate_session_token("wrong-secret", "a@b.com", "A", 3600).unwrap();
+        let err = extract_with_bearer(&jwt).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn empty_bearer_token_returns_unauthorized() {
+        let err = extract_with_bearer("").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

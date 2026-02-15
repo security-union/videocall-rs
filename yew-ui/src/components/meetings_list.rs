@@ -16,10 +16,9 @@
  * conditions.
  */
 
-use crate::constants::meeting_api_base_url;
+use crate::constants::meeting_api_client;
 use crate::routing::Route;
-use reqwasm::http::{Request, RequestCredentials};
-use videocall_meeting_types::responses::{APIResponse, ListMeetingsResponse, MeetingSummary};
+use videocall_meeting_types::responses::{ListMeetingsResponse, MeetingSummary};
 use yew::prelude::*;
 use yew_router::prelude::*;
 
@@ -390,45 +389,20 @@ impl MeetingsList {
 }
 
 async fn fetch_meetings() -> Result<ListMeetingsResponse, String> {
-    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings?limit=20", base_url);
-
-    let response = Request::get(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    client
+        .list_meetings(20, 0)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => {
-            let wrapper: APIResponse<ListMeetingsResponse> = response
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {e}"))?;
-            Ok(wrapper.result)
-        }
-        401 => Err("Not authenticated. Please log in.".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+        .map_err(|e| format!("{e}"))
 }
 
 async fn delete_meeting(meeting_id: &str) -> Result<(), String> {
-    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}", base_url, meeting_id);
-
-    let response = Request::delete(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    client
+        .delete_meeting(meeting_id)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => Ok(()),
-        401 => Err("Not authenticated".to_string()),
-        403 => Err("Only the meeting owner can delete this meeting".to_string()),
-        404 => Err("Meeting not found".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
 }
 
 /// Format a duration in milliseconds to a human-readable string (e.g., "1h 23m" or "45m 12s")

@@ -18,22 +18,13 @@
 
 //! Host Controls component - allows admitted participants to admit/reject waiting participants
 
-use crate::constants::meeting_api_base_url;
+use crate::constants::meeting_api_client;
 use gloo_timers::callback::Interval;
-use reqwasm::http::{Request, RequestCredentials};
-use serde::Serialize;
-use videocall_meeting_types::responses::{
-    APIResponse, ParticipantStatusResponse, WaitingRoomResponse,
-};
+use videocall_meeting_types::responses::ParticipantStatusResponse;
 use yew::prelude::*;
 
 /// Type alias for waiting participant (uses shared type)
 pub type WaitingParticipant = ParticipantStatusResponse;
-
-#[derive(Debug, Clone, Serialize)]
-struct AdmitRequest {
-    email: String,
-}
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct HostControlsProps {
@@ -296,98 +287,37 @@ impl Component for HostControls {
 }
 
 async fn fetch_waiting(meeting_id: &str) -> Result<Vec<WaitingParticipant>, String> {
-    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/waiting", base_url, meeting_id);
-
-    let response = Request::get(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => {
-            let wrapper: APIResponse<WaitingRoomResponse> = response
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {e}"))?;
-            Ok(wrapper.result.waiting)
-        }
-        401 => Err("Not authenticated".to_string()),
-        403 => Err("Not authorized".to_string()),
-        404 => Ok(Vec::new()), // Meeting not found, return empty
-        status => Err(format!("Server error: {status}")),
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    match client.get_waiting_room(meeting_id).await {
+        Ok(response) => Ok(response.waiting),
+        Err(videocall_meeting_client::ApiError::NotFound(_)) => Ok(Vec::new()),
+        Err(e) => Err(format!("{e}")),
     }
 }
 
 async fn admit_participant(meeting_id: &str, email: &str) -> Result<(), String> {
-    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/admit", base_url, meeting_id);
-
-    let body = serde_json::to_string(&AdmitRequest {
-        email: email.to_string(),
-    })
-    .map_err(|e| format!("Failed to serialize: {e}"))?;
-
-    let response = Request::post(&url)
-        .credentials(RequestCredentials::Include)
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    client
+        .admit_participant(meeting_id, email)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => Ok(()),
-        401 => Err("Not authenticated".to_string()),
-        403 => Err("Not authorized".to_string()),
-        404 => Err("Participant not found".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
 }
 
 async fn reject_participant(meeting_id: &str, email: &str) -> Result<(), String> {
-    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/reject", base_url, meeting_id);
-
-    let body = serde_json::to_string(&AdmitRequest {
-        email: email.to_string(),
-    })
-    .map_err(|e| format!("Failed to serialize: {e}"))?;
-
-    let response = Request::post(&url)
-        .credentials(RequestCredentials::Include)
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    client
+        .reject_participant(meeting_id, email)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => Ok(()),
-        401 => Err("Not authenticated".to_string()),
-        403 => Err("Not authorized".to_string()),
-        404 => Err("Participant not found".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
 }
 
 async fn admit_all_participants(meeting_id: &str) -> Result<(), String> {
-    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/admit-all", base_url, meeting_id);
-
-    let response = Request::post(&url)
-        .credentials(RequestCredentials::Include)
-        .header("Content-Type", "application/json")
-        .send()
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    client
+        .admit_all(meeting_id)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => Ok(()),
-        401 => Err("Not authenticated".to_string()),
-        403 => Err("Not authorized".to_string()),
-        404 => Err("Meeting not found".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
 }

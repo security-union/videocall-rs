@@ -16,158 +16,44 @@
  * conditions.
  */
 
-//! Meeting API client for joining meetings and checking status
+//! Meeting API client facade for the yew-ui.
+//!
+//! Thin wrappers around [`videocall_meeting_client::MeetingApiClient`] that
+//! create a client from the browser runtime config on each call.
 
-use crate::constants::meeting_api_base_url;
-use reqwasm::http::{Request, RequestCredentials};
-use serde::Serialize;
-use videocall_meeting_types::responses::{
-    APIResponse, MeetingInfoResponse, ParticipantStatusResponse,
-};
-
-// Re-export for use by other modules
+use crate::constants::meeting_api_client;
+pub use videocall_meeting_client::ApiError as JoinError;
 pub use videocall_meeting_types::responses::MeetingInfoResponse as MeetingInfo;
 pub use videocall_meeting_types::responses::ParticipantStatusResponse as JoinMeetingResponse;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct JoinMeetingRequest {
-    pub display_name: Option<String>,
+fn client() -> Result<videocall_meeting_client::MeetingApiClient, JoinError> {
+    meeting_api_client().map_err(JoinError::Config)
 }
 
-#[derive(Debug, Clone)]
-pub enum JoinError {
-    NotAuthenticated,
-    MeetingNotActive,
-    NetworkError(String),
-    ServerError(u16, String),
-}
-
-impl std::fmt::Display for JoinError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            JoinError::NotAuthenticated => write!(f, "Not authenticated. Please log in."),
-            JoinError::MeetingNotActive => {
-                write!(f, "Meeting is not active. The host must join first.")
-            }
-            JoinError::NetworkError(e) => write!(f, "Network error: {e}"),
-            JoinError::ServerError(code, msg) => write!(f, "Server error ({code}): {msg}"),
-        }
-    }
-}
-
-/// Join a meeting via the API
+/// Join a meeting via the API.
 /// Returns the participant status which indicates if they are admitted, waiting, etc.
 pub async fn join_meeting(
     meeting_id: &str,
     display_name: Option<&str>,
 ) -> Result<JoinMeetingResponse, JoinError> {
-    let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;
-    let url = format!("{}/api/v1/meetings/{}/join", base_url, meeting_id);
-
-    log::info!("Joining meeting via API: {url} (display_name: {display_name:?})");
-
-    let body = JoinMeetingRequest {
-        display_name: display_name.map(|s| s.to_string()),
-    };
-    let body_json = serde_json::to_string(&body)
-        .map_err(|e| JoinError::NetworkError(format!("Failed to serialize request: {e}")))?;
-
-    let response = Request::post(&url)
-        .credentials(RequestCredentials::Include)
-        .header("Content-Type", "application/json")
-        .body(body_json)
-        .send()
-        .await
-        .map_err(|e| JoinError::NetworkError(format!("{e}")))?;
-
-    let status = response.status();
-    log::info!("Join meeting response status: {status}");
-
-    match status {
-        200 => {
-            let wrapper: APIResponse<ParticipantStatusResponse> = response
-                .json()
-                .await
-                .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;
-            let data = wrapper.result;
-            log::info!(
-                "Join response: status={}, is_host={}",
-                data.status,
-                data.is_host
-            );
-            Ok(data)
-        }
-        401 => Err(JoinError::NotAuthenticated),
-        400 => {
-            // Check if it's "meeting not active"
-            let text = response.text().await.unwrap_or_default();
-            if text.contains("MEETING_NOT_ACTIVE") {
-                Err(JoinError::MeetingNotActive)
-            } else {
-                Err(JoinError::ServerError(400, text))
-            }
-        }
-        _ => {
-            let text = response.text().await.unwrap_or_default();
-            Err(JoinError::ServerError(status, text))
-        }
-    }
+    log::info!("Joining meeting via API: {meeting_id} (display_name: {display_name:?})");
+    let result = client()?.join_meeting(meeting_id, display_name).await?;
+    log::info!(
+        "Join response: status={}, is_host={}",
+        result.status,
+        result.is_host
+    );
+    Ok(result)
 }
 
-/// Get meeting info including host email
+/// Get meeting info including host email.
 pub async fn get_meeting_info(meeting_id: &str) -> Result<MeetingInfo, JoinError> {
-    let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;
-    let url = format!("{}/api/v1/meetings/{}", base_url, meeting_id);
-
-    let response = Request::get(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
-        .await
-        .map_err(|e| JoinError::NetworkError(format!("{e}")))?;
-
-    match response.status() {
-        200 => {
-            let wrapper: APIResponse<MeetingInfoResponse> = response
-                .json()
-                .await
-                .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;
-            Ok(wrapper.result)
-        }
-        401 => Err(JoinError::NotAuthenticated),
-        404 => Err(JoinError::ServerError(404, "Meeting not found".to_string())),
-        status => {
-            let text = response.text().await.unwrap_or_default();
-            Err(JoinError::ServerError(status, text))
-        }
-    }
+    client()?.get_meeting(meeting_id).await
 }
 
-/// Check participant status in a meeting
+/// Check participant status in a meeting.
 pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinError> {
-    let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;
-    let url = format!("{}/api/v1/meetings/{}/status", base_url, meeting_id);
-
-    let response = Request::get(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
-        .await
-        .map_err(|e| JoinError::NetworkError(format!("{e}")))?;
-
-    match response.status() {
-        200 => {
-            let wrapper: APIResponse<ParticipantStatusResponse> = response
-                .json()
-                .await
-                .map_err(|e| JoinError::NetworkError(format!("Failed to parse response: {e}")))?;
-            Ok(wrapper.result)
-        }
-        401 => Err(JoinError::NotAuthenticated),
-        404 => Err(JoinError::ServerError(404, "Not in meeting".to_string())),
-        status => {
-            let text = response.text().await.unwrap_or_default();
-            Err(JoinError::ServerError(status, text))
-        }
-    }
+    client()?.get_status(meeting_id).await
 }
 
 /// Fetch a fresh room access token from the meeting API.
@@ -176,39 +62,22 @@ pub async fn check_status(meeting_id: &str) -> Result<JoinMeetingResponse, JoinE
 /// from the response. Returns an error if the participant is no longer
 /// admitted or the session has expired.
 pub async fn refresh_room_token(meeting_id: &str) -> Result<String, JoinError> {
-    let response = check_status(meeting_id).await?;
-    response.room_token.ok_or_else(|| {
-        JoinError::ServerError(200, "Admitted but no room token in response".to_string())
-    })
+    client()?.refresh_room_token(meeting_id).await
 }
 
-/// Leave a meeting - updates participant status to 'left' in database
+/// Leave a meeting - updates participant status to 'left' in database.
 pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
-    let base_url = meeting_api_base_url().map_err(JoinError::NetworkError)?;
-    let url = format!("{}/api/v1/meetings/{}/leave", base_url, meeting_id);
-
-    log::info!("Leaving meeting via API: {url}");
-
-    let response = Request::post(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
-        .await
-        .map_err(|e| JoinError::NetworkError(format!("{e}")))?;
-
-    match response.status() {
-        200 => {
+    log::info!("Leaving meeting via API: {meeting_id}");
+    match client()?.leave_meeting(meeting_id).await {
+        Ok(_) => {
             log::info!("Successfully left meeting {meeting_id}");
             Ok(())
         }
-        401 => Err(JoinError::NotAuthenticated),
-        404 => {
+        Err(JoinError::NotFound(_)) => {
             // Not in meeting is fine - just means we weren't tracked
             log::warn!("Not in meeting {meeting_id} when trying to leave");
             Ok(())
         }
-        status => {
-            let text = response.text().await.unwrap_or_default();
-            Err(JoinError::ServerError(status, text))
-        }
+        Err(e) => Err(e),
     }
 }

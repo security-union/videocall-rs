@@ -18,10 +18,9 @@
 
 //! Waiting Room component - shown to non-host users while waiting for admission
 
-use crate::constants::meeting_api_base_url;
+use crate::constants::meeting_api_client;
 use gloo_timers::callback::Interval;
-use reqwasm::http::{Request, RequestCredentials};
-use videocall_meeting_types::responses::{APIResponse, ParticipantStatusResponse};
+use videocall_meeting_types::responses::ParticipantStatusResponse;
 use yew::prelude::*;
 
 /// Type alias for participant status (uses shared type)
@@ -153,25 +152,9 @@ impl Component for WaitingRoom {
 }
 
 async fn check_status(meeting_id: &str) -> Result<ParticipantStatus, String> {
-    let base_url = meeting_api_base_url().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}/status", base_url, meeting_id);
-
-    let response = Request::get(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    client
+        .get_status(meeting_id)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => {
-            let wrapper: APIResponse<ParticipantStatus> = response
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {e}"))?;
-            Ok(wrapper.result)
-        }
-        401 => Err("Not authenticated".to_string()),
-        404 => Err("Not in meeting".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+        .map_err(|e| format!("{e}"))
 }

@@ -139,3 +139,14 @@ pub fn meeting_api_base_url() -> Result<String, String> {
             .unwrap_or_else(|| c.api_base_url.clone())
     })
 }
+
+/// Create a [`MeetingApiClient`] configured from the runtime config.
+///
+/// Uses cookie-based auth (browser mode) since `yew-ui` runs in the browser.
+pub fn meeting_api_client() -> Result<videocall_meeting_client::MeetingApiClient, String> {
+    let base_url = meeting_api_base_url()?;
+    Ok(videocall_meeting_client::MeetingApiClient::new(
+        &base_url,
+        videocall_meeting_client::AuthMode::Cookie,
+    ))
+}

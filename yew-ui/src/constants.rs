@@ -47,6 +47,11 @@ pub struct RuntimeConfig {
     pub firefox_enabled: String,
     #[serde(rename = "usersAllowedToStream")]
     pub users_allowed_to_stream: String,
+    /// OAuth provider hint for branding (e.g. "google", "okta").
+    /// When set, the login screen shows provider-specific logo and text.
+    #[serde(rename = "oauthProvider")]
+    #[serde(default)]
+    pub oauth_provider: Option<String>,
     #[serde(rename = "serverElectionPeriodMs")]
     pub server_election_period_ms: u64,
     #[serde(rename = "audioBitrateKbps")]
@@ -128,6 +133,15 @@ pub fn users_allowed_to_stream() -> Result<Vec<String>, String> {
 }
 pub fn server_election_period_ms() -> Result<u64, String> {
     app_config().map(|c| c.server_election_period_ms)
+}
+
+/// Returns the configured OAuth provider hint (e.g. "google", "okta").
+/// Returns `None` when unset — the login screen shows a generic "Sign in" button.
+pub fn oauth_provider() -> Option<String> {
+    app_config()
+        .ok()
+        .and_then(|c| c.oauth_provider)
+        .filter(|s| !s.is_empty())
 }
 
 /// Returns the meeting API base URL.

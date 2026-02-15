@@ -81,8 +81,8 @@ pub struct CallbackQuery {
 
 /// GET /login?returnTo=<url>
 ///
-/// Initiates the OAuth flow: generates PKCE + CSRF, stores in DB, redirects to
-/// the identity provider.
+/// Initiates the OAuth flow: generates PKCE + CSRF + nonce, stores in DB,
+/// redirects to the identity provider.
 pub async fn login(
     State(state): State<AppState>,
     Query(query): Query<LoginQuery>,
@@ -95,12 +95,22 @@ pub async fn login(
     let csrf_token = CsrfToken::new_random();
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
+    // Generate a nonce for OIDC ID token binding (reuse oauth2's crypto RNG).
+    let nonce = CsrfToken::new_random();
+
+    // Sanitize return_to: only allow relative paths to prevent open redirect.
+    let return_to = query.return_to.as_deref().filter(|u| {
+        let u = u.trim();
+        u.starts_with('/') && !u.starts_with("//")
+    });
+
     db_oauth::store_oauth_request(
         &state.db,
         pkce_challenge.as_str(),
         pkce_verifier.secret(),
         csrf_token.secret(),
-        query.return_to.as_deref(),
+        return_to,
+        Some(nonce.secret()),
     )
     .await?;
 
@@ -108,8 +118,10 @@ pub async fn login(
         &oauth_cfg.auth_url,
         &oauth_cfg.client_id,
         &oauth_cfg.redirect_url,
+        &oauth_cfg.scopes,
         pkce_challenge.as_str(),
         csrf_token.secret(),
+        Some(nonce.secret()),
     );
 
     Ok(Redirect::to(&auth_url).into_response())
@@ -118,6 +130,7 @@ pub async fn login(
 /// GET /login/callback?state=...&code=...
 ///
 /// Handles the OAuth callback: exchanges the authorization code for tokens,
+/// verifies the ID token (signature, nonce, audience, issuer when configured),
 /// creates a signed session JWT, and sets it as an `HttpOnly` cookie.
 pub async fn callback(
     State(state): State<AppState>,
@@ -141,20 +154,54 @@ pub async fn callback(
         .pkce_verifier
         .ok_or_else(|| AppError::internal("missing PKCE verifier"))?;
 
-    let (token_response, claims) = oauth::exchange_code_for_claims(
+    let (token_response, mut claims) = oauth::exchange_code_for_claims(
         &oauth_cfg.redirect_url,
         &oauth_cfg.client_id,
-        &oauth_cfg.client_secret,
+        oauth_cfg.client_secret.as_deref(),
         &pkce_verifier,
         &oauth_cfg.token_url,
         &query.code,
+        state.jwks_cache.as_deref(),
+        oauth_cfg.issuer.as_deref(),
+        oauth_req.nonce.as_deref(),
     )
     .await?;
 
+    // If the ID token lacks an email claim, fall back to the UserInfo endpoint.
+    if claims.email.as_ref().is_none_or(|e| e.is_empty()) {
+        if let Some(userinfo_url) = &oauth_cfg.userinfo_url {
+            let user_info =
+                oauth::fetch_userinfo(userinfo_url, &token_response.access_token).await?;
+            if claims.email.as_ref().is_none_or(|e| e.is_empty()) {
+                claims.email = user_info.email;
+            }
+            if claims.name.is_empty() {
+                if let Some(name) = user_info.name {
+                    claims.name = name;
+                }
+            }
+            if claims.given_name.is_none() {
+                claims.given_name = user_info.given_name;
+            }
+            if claims.family_name.is_none() {
+                claims.family_name = user_info.family_name;
+            }
+        }
+    }
+
+    let email = claims
+        .email
+        .as_ref()
+        .filter(|e| !e.is_empty())
+        .ok_or_else(|| AppError::internal("Email not available from ID token or UserInfo"))?
+        .clone();
+
+    let display_name = claims.display_name();
+
     db_oauth::upsert_user(
         &state.db,
-        &claims.email,
-        &claims.name,
+        &email,
+        &display_name,
         &token_response.access_token,
         token_response.refresh_token.as_deref(),
     )
@@ -163,14 +210,21 @@ pub async fn callback(
     // --- Issue signed session JWT inside an HttpOnly cookie ---
     let session_jwt = token::generate_session_token(
         &state.jwt_secret,
-        &claims.email,
-        &claims.name,
+        &email,
+        &display_name,
         state.session_ttl_secs,
     )?;
 
-    let redirect_url = oauth_req
-        .return_to
-        .unwrap_or_else(|| oauth_cfg.after_login_url.clone());
+    let redirect_url = match oauth_req.return_to {
+        // return_to is a relative path (e.g. "/meeting/1") — prepend the
+        // frontend base URL so the redirect lands on the app, not the API.
+        Some(path) => format!(
+            "{}{}",
+            oauth_cfg.after_login_url.trim_end_matches('/'),
+            path
+        ),
+        None => oauth_cfg.after_login_url.clone(),
+    };
 
     let session_cookie = build_session_cookie(
         &session_jwt,
@@ -181,15 +235,16 @@ pub async fn callback(
 
     tracing::info!(
         "OAuth login successful for {} ({}), redirecting to {}",
-        claims.name,
-        claims.email,
+        display_name,
+        email,
         redirect_url
     );
 
     let mut response = Redirect::to(&redirect_url).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
-        HeaderValue::from_str(&session_cookie).unwrap(),
+        HeaderValue::from_str(&session_cookie)
+            .map_err(|_| AppError::internal("failed to build session cookie header"))?,
     );
     Ok(response)
 }
@@ -212,13 +267,15 @@ pub async fn get_profile(AuthUser { email, name }: AuthUser) -> Json<APIResponse
 }
 
 /// GET /logout -- clears the session cookie.
-pub async fn logout(State(state): State<AppState>) -> Response {
+pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError> {
     let clear = build_clear_session_cookie(state.cookie_domain.as_deref(), state.cookie_secure);
     let mut response = StatusCode::OK.into_response();
-    response
-        .headers_mut()
-        .append(header::SET_COOKIE, HeaderValue::from_str(&clear).unwrap());
-    response
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear)
+            .map_err(|_| AppError::internal("failed to build clear cookie header"))?,
+    );
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------

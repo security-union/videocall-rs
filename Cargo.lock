@@ -3804,6 +3804,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.26",
+ "rsa",
  "serde",
  "serde_json",
  "serial_test",

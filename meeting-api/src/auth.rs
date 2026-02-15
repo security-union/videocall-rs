@@ -124,6 +124,7 @@ mod tests {
             token_ttl_secs: 600,
             session_ttl_secs: 3600,
             oauth: None,
+            jwks_cache: None,
             cookie_domain: None,
             cookie_secure: false,
         }

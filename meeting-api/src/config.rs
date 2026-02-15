@@ -42,14 +42,26 @@ pub struct Config {
     pub cors_allowed_origin: Option<String>,
 }
 
-/// Google OAuth configuration.
+/// OAuth/OIDC configuration — provider-agnostic.
 #[derive(Debug, Clone)]
 pub struct OAuthConfig {
     pub client_id: String,
-    pub client_secret: String,
+    /// Client secret. `None` for public clients (e.g. native apps using PKCE only).
+    pub client_secret: Option<String>,
     pub redirect_url: String,
+    /// OIDC issuer URL (e.g. "https://accounts.google.com"). Used for discovery
+    /// and JWT `iss` validation.
+    pub issuer: Option<String>,
+    /// Authorization endpoint URL.
     pub auth_url: String,
+    /// Token endpoint URL.
     pub token_url: String,
+    /// JWKS endpoint URL for ID token signature verification.
+    pub jwks_url: Option<String>,
+    /// UserInfo endpoint URL. Used as fallback when ID token lacks email claim.
+    pub userinfo_url: Option<String>,
+    /// Space-separated OAuth scopes (default: "openid email profile").
+    pub scopes: String,
     pub after_login_url: String,
 }
 
@@ -64,8 +76,10 @@ impl Config {
     /// - `LISTEN_ADDR` (default: `"0.0.0.0:8081"`)
     /// - `TOKEN_TTL_SECS` (default: `"60"`)
     /// - `COOKIE_DOMAIN`
-    /// - OAuth: `OAUTH_CLIENT_ID`, `OAUTH_SECRET`, `OAUTH_REDIRECT_URL`,
-    ///   `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `AFTER_LOGIN_URL`
+    /// - OAuth: `OAUTH_CLIENT_ID`, `OAUTH_SECRET` (optional), `OAUTH_REDIRECT_URL`,
+    ///   `OAUTH_ISSUER`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_JWKS_URL`,
+    ///   `OAUTH_USERINFO_URL`, `OAUTH_SCOPES` (default: `"openid email profile"`),
+    ///   `AFTER_LOGIN_URL`
     /// - `CORS_ALLOWED_ORIGIN` (production: e.g. `"https://app.videocall.rs"`)
     pub fn from_env() -> Result<Self, String> {
         let database_url = env::var("DATABASE_URL")
@@ -94,17 +108,53 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .map(|client_id| {
+                let client_secret = env::var("OAUTH_SECRET").ok().filter(|s| !s.is_empty());
+                let issuer = env::var("OAUTH_ISSUER").ok().filter(|s| !s.is_empty());
+                let auth_url = env::var("OAUTH_AUTH_URL").ok().filter(|s| !s.is_empty());
+                let token_url = env::var("OAUTH_TOKEN_URL").ok().filter(|s| !s.is_empty());
+                let jwks_url = env::var("OAUTH_JWKS_URL").ok().filter(|s| !s.is_empty());
+                let userinfo_url = env::var("OAUTH_USERINFO_URL")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                let scopes = env::var("OAUTH_SCOPES")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "openid email profile".to_string());
+
+                // When no issuer is set, auth_url and token_url must be provided manually.
+                let auth_url = match auth_url {
+                    Some(u) => u,
+                    None if issuer.is_some() => {
+                        // Will be filled in by resolve_discovery().
+                        String::new()
+                    }
+                    None => {
+                        return Err(
+                            "OAUTH_AUTH_URL required when OAUTH_ISSUER is not set".to_string()
+                        );
+                    }
+                };
+                let token_url = match token_url {
+                    Some(u) => u,
+                    None if issuer.is_some() => String::new(),
+                    None => {
+                        return Err(
+                            "OAUTH_TOKEN_URL required when OAUTH_ISSUER is not set".to_string()
+                        );
+                    }
+                };
+
                 Ok::<_, String>(OAuthConfig {
                     client_id,
-                    client_secret: env::var("OAUTH_SECRET")
-                        .map_err(|_| "OAUTH_SECRET required when OAUTH_CLIENT_ID is set")?,
+                    client_secret,
                     redirect_url: env::var("OAUTH_REDIRECT_URL")
                         .map_err(|_| "OAUTH_REDIRECT_URL required when OAUTH_CLIENT_ID is set")?,
-                    auth_url: env::var("OAUTH_AUTH_URL").unwrap_or_else(|_| {
-                        "https://accounts.google.com/o/oauth2/v2/auth".to_string()
-                    }),
-                    token_url: env::var("OAUTH_TOKEN_URL")
-                        .unwrap_or_else(|_| "https://oauth2.googleapis.com/token".to_string()),
+                    issuer,
+                    auth_url,
+                    token_url,
+                    jwks_url,
+                    userinfo_url,
+                    scopes,
                     after_login_url: env::var("AFTER_LOGIN_URL")
                         .unwrap_or_else(|_| "/".to_string()),
                 })
@@ -122,5 +172,51 @@ impl Config {
             cookie_secure,
             cors_allowed_origin,
         })
+    }
+
+    /// Perform OIDC discovery to fill in missing OAuth endpoint URLs.
+    ///
+    /// Call this after `from_env()`. When `OAUTH_ISSUER` is set, fetches the
+    /// provider's `.well-known/openid-configuration` and uses discovered endpoints
+    /// as defaults (manual overrides via env vars take precedence).
+    pub async fn resolve_discovery(&mut self) -> Result<(), String> {
+        let oauth = match &mut self.oauth {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+
+        let issuer = match &oauth.issuer {
+            Some(iss) => iss.clone(),
+            None => return Ok(()),
+        };
+
+        tracing::info!("Running OIDC discovery for issuer: {issuer}");
+
+        let endpoints = crate::oauth::discover_oidc_endpoints(&issuer)
+            .await
+            .map_err(|e| format!("OIDC discovery failed: {e:?}"))?;
+
+        if oauth.auth_url.is_empty() {
+            oauth.auth_url = endpoints.authorization_endpoint;
+        }
+        if oauth.token_url.is_empty() {
+            oauth.token_url = endpoints.token_endpoint;
+        }
+        if oauth.jwks_url.is_none() {
+            oauth.jwks_url = endpoints.jwks_uri;
+        }
+        if oauth.userinfo_url.is_none() {
+            oauth.userinfo_url = endpoints.userinfo_endpoint;
+        }
+
+        tracing::info!(
+            "OIDC discovery complete: auth_url={}, token_url={}, jwks_url={:?}, userinfo_url={:?}",
+            oauth.auth_url,
+            oauth.token_url,
+            oauth.jwks_url,
+            oauth.userinfo_url
+        );
+
+        Ok(())
     }
 }

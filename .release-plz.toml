@@ -33,6 +33,12 @@ changelog_update = true
 git_release_enable = true
 
 [[package]]
+name = "videocall-meeting-client"
+publish = true
+changelog_update = true
+git_release_enable = true
+
+[[package]]
 name = "bot"
 publish = true
 changelog_update = true

@@ -32,37 +32,40 @@ async fn google_provider_shows_google_logo_and_text() {
     yew::Renderer::<Login>::with_root(mount.clone()).render();
     sleep(Duration::ZERO).await;
 
-    // The button should have the Google-specific CSS class.
+    // The button should use the official GSI Material class.
     let btn = mount
-        .query_selector(".oauth-btn-google")
+        .query_selector(".gsi-material-button")
         .unwrap()
-        .expect("should have .oauth-btn-google button");
+        .expect("should have .gsi-material-button");
 
     // Button text should say "Sign in with Google".
     let label = btn
-        .query_selector(".oauth-btn-label")
+        .query_selector(".gsi-material-button-contents")
         .unwrap()
-        .expect("should have .oauth-btn-label span");
+        .expect("should have .gsi-material-button-contents span");
     assert_eq!(
         label.text_content().unwrap_or_default(),
         "Sign in with Google"
     );
 
-    // Should contain the Google SVG logo.
-    let logo = btn.query_selector("svg.oauth-provider-logo").unwrap();
+    // Should contain the Google SVG logo inside the icon wrapper.
+    let logo = btn.query_selector(".gsi-material-button-icon svg").unwrap();
     assert!(logo.is_some(), "Google SVG logo should be present");
 
-    // Should NOT have Okta or generic classes.
+    // Should NOT have Okta or generic buttons.
     assert!(
-        mount.query_selector(".oauth-btn-okta").unwrap().is_none(),
-        "should not have Okta class"
+        mount
+            .query_selector(".okta-sign-in-button")
+            .unwrap()
+            .is_none(),
+        "should not have Okta button"
     );
     assert!(
         mount
-            .query_selector(".oauth-btn-generic")
+            .query_selector(".generic-sign-in-button")
             .unwrap()
             .is_none(),
-        "should not have generic class"
+        "should not have generic button"
     );
 
     cleanup(&mount);
@@ -77,37 +80,40 @@ async fn okta_provider_shows_okta_logo_and_text() {
     yew::Renderer::<Login>::with_root(mount.clone()).render();
     sleep(Duration::ZERO).await;
 
-    // The button should have the Okta-specific CSS class.
+    // The button should use the Okta class.
     let btn = mount
-        .query_selector(".oauth-btn-okta")
+        .query_selector(".okta-sign-in-button")
         .unwrap()
-        .expect("should have .oauth-btn-okta button");
+        .expect("should have .okta-sign-in-button");
 
     // Button text should say "Sign in with Okta".
     let label = btn
-        .query_selector(".oauth-btn-label")
+        .query_selector(".okta-sign-in-button-label")
         .unwrap()
-        .expect("should have .oauth-btn-label span");
+        .expect("should have .okta-sign-in-button-label span");
     assert_eq!(
         label.text_content().unwrap_or_default(),
         "Sign in with Okta"
     );
 
-    // Should contain the Okta SVG logo.
-    let logo = btn.query_selector("svg.oauth-provider-logo").unwrap();
+    // Should contain the Okta SVG logo inside the icon wrapper.
+    let logo = btn.query_selector(".okta-sign-in-button-icon svg").unwrap();
     assert!(logo.is_some(), "Okta SVG logo should be present");
 
-    // Should NOT have Google or generic classes.
+    // Should NOT have Google or generic buttons.
     assert!(
-        mount.query_selector(".oauth-btn-google").unwrap().is_none(),
-        "should not have Google class"
+        mount
+            .query_selector(".gsi-material-button")
+            .unwrap()
+            .is_none(),
+        "should not have Google button"
     );
     assert!(
         mount
-            .query_selector(".oauth-btn-generic")
+            .query_selector(".generic-sign-in-button")
             .unwrap()
             .is_none(),
-        "should not have generic class"
+        "should not have generic button"
     );
 
     cleanup(&mount);
@@ -122,31 +128,33 @@ async fn no_provider_shows_generic_sign_in() {
     yew::Renderer::<Login>::with_root(mount.clone()).render();
     sleep(Duration::ZERO).await;
 
-    // The button should have the generic CSS class.
+    // The button should use the generic class.
     let btn = mount
-        .query_selector(".oauth-btn-generic")
+        .query_selector(".generic-sign-in-button")
         .unwrap()
-        .expect("should have .oauth-btn-generic button");
+        .expect("should have .generic-sign-in-button");
 
     // Button text should say "Sign in" (no provider name).
-    let label = btn
-        .query_selector(".oauth-btn-label")
-        .unwrap()
-        .expect("should have .oauth-btn-label span");
-    assert_eq!(label.text_content().unwrap_or_default(), "Sign in");
+    assert_eq!(btn.text_content().unwrap_or_default(), "Sign in");
 
     // Should NOT contain any SVG logo.
-    let logo = btn.query_selector("svg.oauth-provider-logo").unwrap();
+    let logo = btn.query_selector("svg").unwrap();
     assert!(logo.is_none(), "no provider logo should be present");
 
-    // Should NOT have Google or Okta classes.
+    // Should NOT have Google or Okta buttons.
     assert!(
-        mount.query_selector(".oauth-btn-google").unwrap().is_none(),
-        "should not have Google class"
+        mount
+            .query_selector(".gsi-material-button")
+            .unwrap()
+            .is_none(),
+        "should not have Google button"
     );
     assert!(
-        mount.query_selector(".oauth-btn-okta").unwrap().is_none(),
-        "should not have Okta class"
+        mount
+            .query_selector(".okta-sign-in-button")
+            .unwrap()
+            .is_none(),
+        "should not have Okta button"
     );
 
     cleanup(&mount);
@@ -163,38 +171,15 @@ async fn unknown_provider_falls_back_to_generic() {
 
     // Should fall back to generic.
     let btn = mount
-        .query_selector(".oauth-btn-generic")
+        .query_selector(".generic-sign-in-button")
         .unwrap()
-        .expect("unknown provider should fall back to .oauth-btn-generic");
+        .expect("unknown provider should fall back to .generic-sign-in-button");
 
-    let label = btn
-        .query_selector(".oauth-btn-label")
-        .unwrap()
-        .expect("should have .oauth-btn-label span");
-    assert_eq!(label.text_content().unwrap_or_default(), "Sign in");
+    assert_eq!(btn.text_content().unwrap_or_default(), "Sign in");
 
     // No provider-specific logo.
-    let logo = btn.query_selector("svg.oauth-provider-logo").unwrap();
+    let logo = btn.query_selector("svg").unwrap();
     assert!(logo.is_none(), "no provider logo for unknown provider");
-
-    cleanup(&mount);
-    remove_app_config();
-}
-
-#[wasm_bindgen_test]
-async fn login_button_always_has_common_class() {
-    inject_app_config_with_provider("google");
-
-    let mount = create_mount_point();
-    yew::Renderer::<Login>::with_root(mount.clone()).render();
-    sleep(Duration::ZERO).await;
-
-    // Every variant should have the common .oauth-sign-in-btn class.
-    let btn = mount.query_selector(".oauth-sign-in-btn").unwrap();
-    assert!(
-        btn.is_some(),
-        "sign-in button should have .oauth-sign-in-btn class"
-    );
 
     cleanup(&mount);
     remove_app_config();

@@ -164,3 +164,10 @@ pub struct AdmitAllResponse {
 pub struct DeleteMeetingResponse {
     pub message: String,
 }
+
+/// Response payload for `GET /profile`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ProfileResponse {
+    pub email: String,
+    pub name: String,
+}

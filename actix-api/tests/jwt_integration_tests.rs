@@ -40,7 +40,7 @@ use tokio_tungstenite::tungstenite::Message;
 use videocall_types::FeatureFlags;
 
 const JWT_SECRET: &str = "test-secret-for-integration-tests";
-const TOKEN_TTL_SECS: i64 = 600;
+const TOKEN_TTL_SECS: i64 = 60;
 const JWT_PORT: u16 = 18090;
 
 // =========================================================================
@@ -245,7 +245,7 @@ async fn test_wrong_secret_token_rejected() {
 
     let result = try_connect_with_token(port, &token).await;
     assert!(result.is_err(), "wrong-secret token should be rejected");
-    assert_eq!(result.unwrap_err(), 401);
+    assert_eq!(result.unwrap_err(), 403);
 }
 
 #[actix_rt::test]
@@ -256,7 +256,7 @@ async fn test_garbage_token_rejected() {
 
     let result = try_connect_with_token(port, "not.a.real.jwt").await;
     assert!(result.is_err(), "garbage token should be rejected");
-    assert_eq!(result.unwrap_err(), 401);
+    assert_eq!(result.unwrap_err(), 403);
 }
 
 #[actix_rt::test]

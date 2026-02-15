@@ -76,8 +76,12 @@ async fn home_page_renders_with_oauth_disabled() {
         text.contains("Start or Join a Meeting"),
         "form heading missing"
     );
-    assert!(text.contains("Join Meeting"), "join button missing");
-    assert!(text.contains("Create New Meeting"), "create button missing");
+    // Note: "Start or Join Meeting" button only appears when meeting ID is entered,
+    // so we check for the always-visible "Create a New Meeting ID" button instead
+    assert!(
+        text.contains("Create a New Meeting ID"),
+        "create button missing"
+    );
 
     // The two inputs the user fills in must be present.
     assert!(

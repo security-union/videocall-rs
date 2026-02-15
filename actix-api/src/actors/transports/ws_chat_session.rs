@@ -16,51 +16,38 @@
  * conditions.
  */
 
-use crate::client_diagnostics::health_processor;
+//! WebSocket Chat Session Actor
+//!
+//! This is a thin transport adapter that delegates all business logic
+//! to `SessionLogic`. It handles WebSocket-specific I/O via `WebsocketContext`.
+
+use crate::actors::chat_server::ChatServer;
+use crate::actors::session_logic::{InboundAction, SessionLogic};
+use crate::constants::{CLIENT_TIMEOUT, HEARTBEAT_INTERVAL};
 use crate::messages::server::{ClientMessage, Leave, Packet};
 use crate::messages::session::Message;
-use crate::models::meeting::Meeting;
-use crate::server_diagnostics::{
-    send_connection_ended, send_connection_started, DataTracker, TrackerSender,
-};
+use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
-use crate::{actors::chat_server::ChatServer, constants::CLIENT_TIMEOUT};
-use std::sync::Arc;
-
-use crate::{
-    constants::HEARTBEAT_INTERVAL,
-    messages::server::{Connect, Disconnect, JoinRoom},
-};
 use actix::ActorFutureExt;
 use actix::{
-    clock::Instant, fut, ActorContext, ContextFutureSpawner, Handler, Running, StreamHandler,
-    WrapFuture,
+    clock::Instant, fut, Actor, ActorContext, Addr, AsyncContext, ContextFutureSpawner, Handler,
+    Running, StreamHandler, WrapFuture,
 };
-use actix::{Actor, Addr, AsyncContext};
 use actix_web_actors::ws::{self, WebsocketContext};
-use protobuf::Message as ProtobufMessage;
 use tracing::{error, info, trace};
-use uuid::Uuid;
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::meeting_packet::MeetingPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-pub type RoomId = String;
-pub type Email = String;
-pub type SessionId = String;
+pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
+/// WebSocket Chat Session Actor
+///
+/// A thin transport adapter that delegates business logic to `SessionLogic`.
+/// Handles WebSocket-specific I/O via `WebsocketContext`.
 pub struct WsChatSession {
-    pub id: SessionId,
-    pub room: RoomId,
-    pub addr: Addr<ChatServer>,
-    pub heartbeat: Instant,
-    pub email: Email,
-    pub creator_id: String,
-    pub nats_client: async_nats::client::Client,
-    pub tracker_sender: TrackerSender,
-    pub session_manager: SessionManager,
+    /// Shared session logic (business logic)
+    logic: SessionLogic,
+
+    /// Heartbeat tracking (transport-specific timing)
+    heartbeat: Instant,
 }
 
 impl WsChatSession {
@@ -72,52 +59,27 @@ impl WsChatSession {
         tracker_sender: TrackerSender,
         session_manager: SessionManager,
     ) -> Self {
-        let session_id = Uuid::new_v4().to_string();
-        info!(
-            "new session with room {} and email {} and session_id {:?}",
-            room, email, session_id
-        );
-
-        WsChatSession {
-            id: session_id.clone(),
-            heartbeat: Instant::now(),
-            room: room.clone(),
-            email: email.clone(),
-            creator_id: email.clone(),
+        let logic = SessionLogic::new(
             addr,
+            room,
+            email,
             nats_client,
             tracker_sender,
             session_manager,
+        );
+
+        WsChatSession {
+            logic,
+            heartbeat: Instant::now(),
         }
     }
 
-    /// Check if the binary data is an RTT packet that should be echoed back
-    fn is_rtt_packet(&self, data: &[u8]) -> bool {
-        if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-            if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-                if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                    return media_packet.media_type == MediaType::RTT.into();
-                }
-            }
-        }
-        false
-    }
-
-    fn heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
+    /// Start heartbeat check (WebSocket-specific: uses ping frames)
+    fn start_heartbeat(&self, ctx: &mut WebsocketContext<Self>) {
         ctx.run_interval(HEARTBEAT_INTERVAL, |act, ctx| {
             if Instant::now().duration_since(act.heartbeat) > CLIENT_TIMEOUT {
-                // heartbeat timed out
-                println!("Websocket Client heartbeat failed, disconnecting!");
-                // notify chat server
-                act.addr.do_send(Disconnect {
-                    session: act.id.clone(),
-                    room: act.room.clone(),
-                    user_id: act.creator_id.clone(),
-                });
-                // stop actor
-                error!("hearbeat timeout");
+                error!("WebSocket client heartbeat failed, disconnecting!");
                 ctx.stop();
-                // don't try to send a ping
                 return;
             }
             ctx.ping(b"");
@@ -125,183 +87,139 @@ impl WsChatSession {
     }
 }
 
+// =============================================================================
+// Actor Implementation
+// =============================================================================
+
 impl Actor for WsChatSession {
     type Context = WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        // Track connection start for metrics
-        send_connection_started(
-            &self.tracker_sender,
-            self.id.clone(),
-            self.email.clone(),
-            self.room.clone(),
-            "websocket".to_string(),
-        );
+        // Track connection start
+        self.logic.track_connection_start("websocket");
 
-        // Start session using SessionManager
-        let session_manager = self.session_manager.clone();
-        let room_id = self.room.clone();
-        let creator_id = self.creator_id.clone();
+        // Start session via SessionManager
+        let session_manager = self.logic.session_manager.clone();
+        let room = self.logic.room.clone();
+        let email = self.logic.email.clone();
 
         ctx.wait(
-            async move {
-                match session_manager.start_session(&room_id, &creator_id).await {
-                    // Return result.creator_id to ensure correct host is identified (not the joining user)
-                    Ok(result) => Ok((result.start_time_ms, result.creator_id)),
+            async move { session_manager.start_session(&room, &email).await }
+                .into_actor(self)
+                .map(|result, act, ctx| match result {
+                    Ok(result) => {
+                        let bytes = act
+                            .logic
+                            .build_meeting_started(result.start_time_ms, &result.creator_id);
+                        ctx.binary(bytes);
+                    }
                     Err(e) => {
-                        error!("failed to start session: {}", e);
-                        Err(e.to_string())
-                    }
-                }
-            }
-            .into_actor(self)
-            .map(|result, act, ctx| {
-                match result {
-                    Ok((start_time_ms, actual_creator_id)) => {
-                        // Send MEETING_STARTED packet (protobuf)
-                        let bytes = SessionManager::build_meeting_started_packet(
-                            &act.room,
-                            start_time_ms,
-                            &actual_creator_id,
-                        );
+                        error!("Failed to start session: {}", e);
+                        let bytes = act
+                            .logic
+                            .build_meeting_ended(&format!("Session rejected: {e}"));
                         ctx.binary(bytes);
-                    }
-                    Err(error_msg) => {
-                        // Send error to client and close connection
-                        let bytes = SessionManager::build_meeting_ended_packet(
-                            &act.room,
-                            &format!("Session rejected: {error_msg}"),
-                        );
-                        ctx.binary(bytes);
-                        ctx.close(Some(actix_web_actors::ws::CloseReason {
-                            code: actix_web_actors::ws::CloseCode::Policy,
+                        ctx.close(Some(ws::CloseReason {
+                            code: ws::CloseCode::Policy,
                             description: Some("Session rejected".to_string()),
                         }));
                         ctx.stop();
                     }
-                }
-            }),
+                }),
         );
 
-        self.heartbeat(ctx);
+        // Start heartbeat
+        self.start_heartbeat(ctx);
+
+        // Register with ChatServer
         let addr = ctx.address();
-        self.addr
-            .send(Connect {
-                id: self.id.clone(),
-                addr: addr.recipient(),
-            })
+        self.logic
+            .addr
+            .send(self.logic.create_connect_message(addr.recipient()))
             .into_actor(self)
             .then(|res, _act, ctx| {
                 if let Err(err) = res {
-                    error!("error {:?}", err);
+                    error!("Failed to connect to ChatServer: {:?}", err);
                     ctx.stop();
                 }
                 fut::ready(())
             })
             .wait(ctx);
 
-        // Join the room
-        self.join(self.room.clone(), ctx);
+        // Join room
+        self.join_room(ctx);
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> Running {
-        info!("Session stopping: {} in room {}", self.id, self.room);
-        // Track connection end for metrics
-        send_connection_ended(&self.tracker_sender, self.id.clone());
-
-        // notify chat server
-        self.addr.do_send(Disconnect {
-            session: self.id.clone(),
-            room: self.room.clone(),
-            user_id: self.creator_id.clone(),
-        });
-
+        self.logic.on_stopping();
         Running::Stop
     }
 }
 
+// =============================================================================
+// Message Handlers
+// =============================================================================
+
+/// Handle outbound messages from ChatServer
 impl Handler<Message> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Message, ctx: &mut Self::Context) -> Self::Result {
-        // Track sent data when forwarding messages to clients
-        info!(
-            "Sending {} bytes to WebSocket client session={}",
-            msg.msg.len(),
-            self.id
-        );
-        let data_tracker = DataTracker::new(self.tracker_sender.clone());
-        data_tracker.track_sent(&self.id, msg.msg.len() as u64);
-        ctx.binary(msg.msg);
+        let bytes = self.logic.handle_outbound(&msg);
+        ctx.binary(bytes);
     }
 }
 
+/// Handle outbound packets (forwarding to ChatServer)
 impl Handler<Packet> for WsChatSession {
     type Result = ();
 
     fn handle(&mut self, msg: Packet, _ctx: &mut Self::Context) -> Self::Result {
-        let room_id = self.room.clone();
         trace!(
-            "got message and sending to chat session {} email {} room {}",
-            self.id.clone(),
-            self.email.clone(),
-            room_id
+            "Forwarding packet to ChatServer: session {} room {}",
+            self.logic.id,
+            self.logic.room
         );
-        self.addr.do_send(ClientMessage {
-            session: self.id.clone(),
-            user: self.email.clone(),
-            room: room_id,
+        self.logic.addr.do_send(ClientMessage {
+            session: self.logic.id.clone(),
+            user: self.logic.email.clone(),
+            room: self.logic.room.clone(),
             msg,
         });
     }
 }
+
+// =============================================================================
+// WebSocket Stream Handler
+// =============================================================================
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
     fn handle(&mut self, item: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
         let msg = match item {
             Ok(msg) => msg,
             Err(err) => {
-                error!("protocol error 2 {:?}", err);
+                error!("WebSocket protocol error: {:?}", err);
                 ctx.stop();
                 return;
             }
         };
 
         match msg {
-            ws::Message::Binary(msg) => {
-                let msg_bytes = msg.to_vec();
+            ws::Message::Binary(data) => {
+                // Update heartbeat
+                self.heartbeat = Instant::now();
 
-                // Track received data
-                let data_tracker = DataTracker::new(self.tracker_sender.clone());
-                data_tracker.track_received(&self.id, msg_bytes.len() as u64);
-
-                // Check if this is an RTT packet that should be echoed back
-                if self.is_rtt_packet(&msg_bytes) {
-                    trace!("Echoing RTT packet back to sender: {}", self.email);
-                    // Track sent data for echo
-                    let data_tracker = DataTracker::new(self.tracker_sender.clone());
-                    data_tracker.track_sent(&self.id, msg_bytes.len() as u64);
-                    ctx.binary(msg_bytes);
-                } else if health_processor::is_health_packet_bytes(&msg_bytes) {
-                    // Process health packet for diagnostics (don't relay to other peers)
-                    health_processor::process_health_packet_bytes(
-                        &msg_bytes,
-                        self.nats_client.clone(),
-                    );
-                } else if self.is_meeting_metadata_packet(&msg_bytes) {
-                    // Process meeting metadata packet (don't relay to other peers)
-                    info!(
-                        "Broadcasting MEETING metadata from {} to room {}",
-                        self.email, self.room
-                    );
-                    ctx.notify(Packet {
-                        data: Arc::new(msg_bytes),
-                    });
-                } else {
-                    // Normal packet processing - forward to chat server
-                    ctx.notify(Packet {
-                        data: Arc::new(msg_bytes),
-                    });
+                // Delegate to shared logic
+                match self.logic.handle_inbound(&data) {
+                    InboundAction::Echo(bytes) => {
+                        ctx.binary(bytes.as_ref().clone());
+                    }
+                    InboundAction::Forward(bytes) => {
+                        ctx.notify(Packet { data: bytes });
+                    }
+                    InboundAction::Processed | InboundAction::KeepAlive => {
+                        // Already handled
+                    }
                 }
             }
             ws::Message::Ping(msg) => {
@@ -314,16 +232,13 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
             ws::Message::Close(reason) => {
                 info!(
                     "Close received for session {} in room {}",
-                    self.id, self.room
+                    self.logic.id, self.logic.room
                 );
-
-                // Send Leave message to ChatServer (which will handle session end via SessionManager)
-                self.addr.do_send(Leave {
-                    session: self.id.clone(),
-                    room: self.room.clone(),
-                    user_id: self.creator_id.clone(),
+                self.logic.addr.do_send(Leave {
+                    session: self.logic.id.clone(),
+                    room: self.logic.room.clone(),
+                    user_id: self.logic.email.clone(),
                 });
-
                 ctx.close(reason);
                 ctx.stop();
             }
@@ -338,25 +253,29 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsChatSession {
     }
 }
 
+// =============================================================================
+// Helper Methods
+// =============================================================================
+
 impl WsChatSession {
-    fn join(&self, room_id: String, ctx: &mut WebsocketContext<Self>) {
-        let join_room = self.addr.send(JoinRoom {
-            room: room_id.clone(),
-            session: self.id.clone(),
-            user_id: self.creator_id.clone(),
-        });
+    fn join_room(&self, ctx: &mut WebsocketContext<Self>) {
+        let join_room = self.logic.addr.send(self.logic.create_join_room_message());
         let join_room = join_room.into_actor(self);
         join_room
-            .then(move |response, act, ctx| {
+            .then(|response, act, ctx| {
                 match response {
-                    Ok(res) if res.is_ok() => {
-                        act.room = room_id;
+                    Ok(Ok(())) => {
+                        info!(
+                            "Successfully joined room {} for session {}",
+                            act.logic.room, act.logic.id
+                        );
                     }
-                    Ok(res) => {
-                        error!("error {:?}", res);
+                    Ok(Err(e)) => {
+                        error!("Failed to join room: {}", e);
+                        ctx.stop();
                     }
                     Err(err) => {
-                        error!("error {:?}", err);
+                        error!("Error sending JoinRoom: {:?}", err);
                         ctx.stop();
                     }
                 }
@@ -423,10 +342,10 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat = ChatServer::new(nats_client.clone(), pool.clone())
+        let chat = ChatServer::new(nats_client.clone(), Some(pool.clone()))
             .await
             .start();
-        let session_manager = SessionManager::new(pool);
+        let session_manager = SessionManager::new(Some(pool));
 
         let (_, tracker_sender, _) = ServerDiagnostics::new_with_channel(nats_client.clone());
 

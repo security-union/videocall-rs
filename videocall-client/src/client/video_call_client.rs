@@ -1029,17 +1029,55 @@ impl Inner {
             }
             Ok(PacketType::MEETING) => {
                 // Parse MeetingPacket protobuf
-                if let Ok(meeting_packet) = MeetingPacket::parse_from_bytes(&response.data) {
-                    match meeting_packet.event_type.enum_value() {
-                        Ok(MeetingEventType::MEETING_STARTED) => {
-                            info!(
-                                "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
-                                meeting_packet.room_id,
-                                meeting_packet.start_time_ms,
-                                meeting_packet.creator_id
-                            );
-                            if let Some(callback) = &self.options.on_meeting_info {
-                                callback.emit(meeting_packet.start_time_ms as f64);
+                match MeetingPacket::parse_from_bytes(&response.data) {
+                    Ok(meeting_packet) => {
+                        match meeting_packet.event_type.enum_value() {
+                            Ok(MeetingEventType::MEETING_STARTED) => {
+                                info!(
+                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
+                                    meeting_packet.room_id,
+                                    meeting_packet.start_time_ms,
+                                    meeting_packet.creator_id
+                                );
+                                if let Some(callback) = &self.options.on_meeting_info {
+                                    callback.emit(meeting_packet.start_time_ms as f64);
+                                }
+                            }
+                            Ok(MeetingEventType::MEETING_ENDED) => {
+                                info!(
+                                    "Received MEETING_ENDED: room={}, message={}",
+                                    meeting_packet.room_id, meeting_packet.message
+                                );
+                                if let Some(callback) = &self.options.on_meeting_ended {
+                                    let end_time_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as f64)
+                                        .unwrap_or(0.0);
+                                    callback.emit((end_time_ms, meeting_packet.message));
+                                }
+                            }
+                            Ok(MeetingEventType::PARTICIPANT_JOINED) => {
+                                info!(
+                                    "Received PARTICIPANT_JOINED: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
+                                );
+                                // Future: could emit participant joined event
+                            }
+                            Ok(MeetingEventType::PARTICIPANT_LEFT) => {
+                                info!(
+                                    "Received PARTICIPANT_LEFT: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
+                                );
+                                // Future: could emit participant left event
+                            }
+                            Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
+                                error!(
+                                    "Received meeting packet with unknown event type: room={}",
+                                    meeting_packet.room_id
+                                );
+                            }
+                            Err(e) => {
+                                error!("Failed to parse MeetingEventType: {e}");
                             }
                         }
                         Ok(MeetingEventType::MEETING_ENDED) => {
@@ -1097,6 +1135,12 @@ impl Inner {
                         callback.emit((session_id, display_name));
                     }
                 }
+            }
+            Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
+                error!(
+                    "Received packet with unknown packet type from {}",
+                    response.email
+                );
             }
             Err(e) => {
                 error!("Failed to parse packet: {e}");

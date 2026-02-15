@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
 use videocall_types::SYSTEM_USER_EMAIL;
 
-use super::chat_session::SessionId;
+use super::session_logic::SessionId;
 
 /// Internal message to clean up active_subs when a spawned join task fails.
 /// This fixes a race condition where start_session could fail inside the spawned task,
@@ -54,7 +54,7 @@ pub struct ChatServer {
 }
 
 impl ChatServer {
-    pub async fn new(nats_connection: async_nats::client::Client, pool: PgPool) -> Self {
+    pub async fn new(nats_connection: async_nats::client::Client, pool: Option<PgPool>) -> Self {
         ChatServer {
             nats_connection,
             active_subs: HashMap::new(),
@@ -408,7 +408,7 @@ mod tests {
             .expect("Failed to connect to NATS");
 
         // Start the ChatServer actor
-        let chat_server = ChatServer::new(nats_client, pool).await.start();
+        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
 
         // Create a mock session recipient
         // We need a real actor to receive messages, so we use a simple dummy
@@ -469,7 +469,7 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client, pool).await.start();
+        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
 
         struct DummySession;
         impl Actor for DummySession {
@@ -520,7 +520,7 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client, pool).await.start();
+        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
 
         // Try to join WITHOUT registering the session first
         let result = chat_server
@@ -562,7 +562,7 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client, pool).await.start();
+        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
 
         struct DummySession;
         impl Actor for DummySession {

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v2.0.0...videocall-client-v3.0.0) - 2026-02-04
+
+### Other
+
+- Add screen share state callback to videocall-client ([#546](https://github.com/security-union/videocall-rs/pull/546))
+
+## [2.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.29...videocall-client-v2.0.0) - 2026-01-27
+
+### Other
+
+- breaking change: Protobuf enums should always have an _UNSPECIFIED = 0 variant ([#537](https://github.com/security-union/videocall-rs/pull/537))
+- Fix firefox support by sending vp8 instead of vp9 ([#535](https://github.com/security-union/videocall-rs/pull/535))
+- Revert "Revert "Firefox support ([#522](https://github.com/security-union/videocall-rs/pull/522))" ([#533](https://github.com/security-union/videocall-rs/pull/533))" ([#534](https://github.com/security-union/videocall-rs/pull/534))
+- Revert "Firefox support ([#522](https://github.com/security-union/videocall-rs/pull/522))" ([#533](https://github.com/security-union/videocall-rs/pull/533))
+- Firefox support ([#522](https://github.com/security-union/videocall-rs/pull/522))
+- Meeting Ownership Project (behind feature flag) ([#503](https://github.com/security-union/videocall-rs/pull/503))
+
 ## [1.1.29](https://github.com/security-union/videocall-rs/compare/videocall-client-v1.1.28...videocall-client-v1.1.29) - 2025-11-30
 
 ### Other

@@ -146,7 +146,10 @@ fn main() -> Result<()> {
             }
         }
     };
-    let decoder = Decoder::new(VideoCodec::VP9, Box::new(on_decoded_frame));
+    let decoder = Decoder::new(
+        VideoCodec::Vp9Profile0Level10Bit8,
+        Box::new(on_decoded_frame),
+    );
     let mut jitter_buffer =
         JitterBuffer::<videocall_codecs::decoder::DecodedFrame>::new(Box::new(decoder));
 

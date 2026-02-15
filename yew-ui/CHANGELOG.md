@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.37](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.36...videocall-ui-v1.1.37) - 2026-02-15
+
+### Other
+
+- add generic oauth support ([#610](https://github.com/security-union/videocall-rs/pull/610))
+
 ## [1.1.36](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.35...videocall-ui-v1.1.36) - 2026-02-15
 
 ### Other

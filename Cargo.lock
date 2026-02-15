@@ -7408,7 +7408,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7443,7 +7443,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.1.36"
+version = "1.1.37"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",

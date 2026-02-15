@@ -26,6 +26,8 @@ use axum::{
 use oauth2::{CsrfToken, PkceCodeChallenge};
 use serde::Deserialize;
 
+use videocall_meeting_types::responses::{APIResponse, ProfileResponse};
+
 use crate::auth::AuthUser;
 use crate::db::oauth as db_oauth;
 use crate::error::AppError;
@@ -251,25 +253,17 @@ pub async fn callback(
 ///
 /// The `AuthUser` extractor validates the session JWT from the `session`
 /// cookie (or `Authorization: Bearer` header).
-pub async fn check_session(AuthUser(_email): AuthUser) -> StatusCode {
+pub async fn check_session(AuthUser { .. }: AuthUser) -> StatusCode {
     StatusCode::OK
 }
 
-/// GET /profile -- returns `{ "email": "...", "name": "..." }` from the
-/// session JWT claims.
+/// GET /profile -- returns the authenticated user's profile from the session
+/// JWT claims.
 ///
 /// Because the session JWT embeds both email and display name, this endpoint
 /// does not need a database query.
-pub async fn get_profile(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let token = extract_session_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    let claims = token::decode_session_token(&state.jwt_secret, &token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    Ok(Json(
-        serde_json::json!({ "email": claims.sub, "name": claims.name }),
-    ))
+pub async fn get_profile(AuthUser { email, name }: AuthUser) -> Json<APIResponse<ProfileResponse>> {
+    Json(APIResponse::ok(ProfileResponse { email, name }))
 }
 
 /// GET /logout -- clears the session cookie.
@@ -287,33 +281,3 @@ pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError>
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Extract the raw session JWT from either the `session` cookie or the
-/// `Authorization: Bearer` header.
-fn extract_session_token(headers: &axum::http::HeaderMap) -> Option<String> {
-    // 1. Try the `session` cookie.
-    if let Some(cookie_header) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
-        for pair in cookie_header.split(';') {
-            let pair = pair.trim();
-            if let Some(value) = pair.strip_prefix("session=") {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
-    }
-    // 2. Fall back to `Authorization: Bearer <token>`.
-    if let Some(auth) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(token) = auth.strip_prefix("Bearer ") {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
-}

@@ -6,6 +6,7 @@ members = [
     "bot",
     "videocall-types",
     "videocall-meeting-types",
+    "videocall-meeting-client",
     "videocall-client",
     "videocall-cli",
     "yew-ui",

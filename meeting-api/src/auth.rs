@@ -32,15 +32,18 @@ use crate::error::AppError;
 use crate::state::AppState;
 use crate::token;
 
-/// Extractor that resolves the authenticated user's email from a signed
-/// session JWT (cookie or Bearer header).
+/// Extractor that resolves the authenticated user from a signed session JWT
+/// (cookie or Bearer header).
 ///
 /// Usage in a handler:
 /// ```ignore
-/// async fn my_handler(AuthUser(email): AuthUser) { ... }
+/// async fn my_handler(AuthUser { email, .. }: AuthUser) { ... }
 /// ```
 #[derive(Debug)]
-pub struct AuthUser(pub String);
+pub struct AuthUser {
+    pub email: String,
+    pub name: String,
+}
 
 impl FromRequestParts<AppState> for AuthUser {
     type Rejection = AppError;
@@ -54,7 +57,10 @@ impl FromRequestParts<AppState> for AuthUser {
 
         let claims = token::decode_session_token(&state.jwt_secret, &token)?;
 
-        Ok(AuthUser(claims.sub))
+        Ok(AuthUser {
+            email: claims.sub,
+            name: claims.name,
+        })
     }
 }
 
@@ -153,14 +159,52 @@ mod tests {
         let auth = extract_with_cookie(Some(&format!("session={jwt}")))
             .await
             .expect("should succeed");
-        assert_eq!(auth.0, "alice@test.com");
+        assert_eq!(auth.email, "alice@test.com");
     }
 
     #[tokio::test]
     async fn valid_bearer_token_returns_auth_user() {
         let jwt = generate_session_token(TEST_SECRET, "bob@test.com", "Bob", 3600).unwrap();
         let auth = extract_with_bearer(&jwt).await.expect("should succeed");
-        assert_eq!(auth.0, "bob@test.com");
+        assert_eq!(auth.email, "bob@test.com");
+        assert_eq!(auth.name, "Bob");
+    }
+
+    #[tokio::test]
+    async fn valid_cookie_extracts_name() {
+        let jwt =
+            generate_session_token(TEST_SECRET, "alice@test.com", "Alice Wonder", 3600).unwrap();
+        let auth = extract_with_cookie(Some(&format!("session={jwt}")))
+            .await
+            .expect("should succeed");
+        assert_eq!(auth.email, "alice@test.com");
+        assert_eq!(auth.name, "Alice Wonder");
+    }
+
+    #[tokio::test]
+    async fn expired_bearer_token_returns_unauthorized() {
+        let jwt = generate_session_token(TEST_SECRET, "a@b.com", "A", -120).unwrap();
+        let err = extract_with_bearer(&jwt).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_token_returns_unauthorized() {
+        let err = extract_with_bearer("not-a-valid-jwt").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_secret_bearer_token_returns_unauthorized() {
+        let jwt = generate_session_token("wrong-secret", "a@b.com", "A", 3600).unwrap();
+        let err = extract_with_bearer(&jwt).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn empty_bearer_token_returns_unauthorized() {
+        let err = extract_with_bearer("").await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -214,7 +258,7 @@ mod tests {
         let auth = AuthUser::from_request_parts(&mut parts, &state)
             .await
             .expect("should succeed");
-        assert_eq!(auth.0, "cookie@test.com");
+        assert_eq!(auth.email, "cookie@test.com");
     }
 
     #[tokio::test]
@@ -223,6 +267,6 @@ mod tests {
         let auth = extract_with_cookie(Some(&format!("lang=en; session={jwt}; theme=dark")))
             .await
             .expect("should find session in middle");
-        assert_eq!(auth.0, "multi@test.com");
+        assert_eq!(auth.email, "multi@test.com");
     }
 }

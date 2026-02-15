@@ -41,6 +41,7 @@ videocall.rs is composed of two independent services that communicate through a 
 ┌──────────────────────────────────┐   ┌──────────────────────────────────┐
 │       Meeting Backend            │   │         Media Server             │
 │       (Port 8081)                │   │         (Port 8080)              │
+│   (Standalone deployment)        │   │   (  Pure stream transport)      │
 │                                  │   │                                  │
 │  ┌────────────┐  ┌────────────┐  │   │  ┌────────────┐  ┌───────────┐  │
 │  │ OAuth      │  │ REST API   │  │   │  │ WebSocket  │  │ WebTrans- │  │
@@ -99,6 +100,18 @@ JWT validation on the Media Server is gated behind the `FEATURE_MEETING_MANAGEME
 | `false` (default) | JWT validation is **disabled**. Connections are accepted without a token (backward compatible). |
 
 This allows the meeting management system to be deployed incrementally. Once the UI is updated to obtain and present tokens, the feature flag can be flipped to `true` to enforce token-based access.
+
+### Local Development Setup
+
+For local development, `docker-compose.yaml` spins up two separate services:
+
+- **meeting-api (port 8081)**: Handles OAuth login, session JWTs, and all Meeting REST API routes (`/api/v1/meetings/*`)
+- **websocket-api (port 8080)**: Handles WebSocket media connections (`/lobby`)
+- **webtransport-api (port 4433)**: Handles WebTransport media connections (`/lobby`)
+
+The UI's `apiBaseUrl` defaults to `http://localhost:8081` (the meeting-api). The media server URLs (`wsUrl`, `webTransportHost`) point to the websocket-api and webtransport-api respectively.
+
+> **Important**: The `COOKIE_DOMAIN` environment variable should be set to `localhost` to ensure session cookies are sent correctly across ports during local development.
 
 ### Why Two Services?
 

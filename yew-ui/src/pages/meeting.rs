@@ -562,11 +562,13 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     // Waiting for host to start the meeting
                     (Some(_), MeetingStatus::WaitingForMeeting) => {
                         html! {
-                            <div class="waiting-container">
-                                <div class="waiting-card card-apple">
-                                    <div class="loading-spinner" style="width: 48px; height: 48px; margin-bottom: 1.5rem;"></div>
+                            <div class="waiting-room-container">
+                                <div class="waiting-room-card card-apple">
+                                    <div class="waiting-room-icon">
+                                        <div class="loading-spinner" style="width: 48px; height: 48px;"></div>
+                                    </div>
                                     <h2>{"Waiting for meeting to start"}</h2>
-                                    <p style="color: #666; margin-bottom: 1.5rem;">
+                                    <p class="waiting-room-message">
                                         {"The host hasn't started this meeting yet. You'll automatically join once the meeting begins."}
                                     </p>
                                     <button

@@ -112,19 +112,12 @@ services:
       dockerfile: ../docker/Dockerfile.actix
       context: ../docker
     working_dir: /app/actix-api
-    command: bash -c "/app/dbmate/startup.sh && cargo watch -x \"run -r --bin websocket_server \""
+    command: bash -c "cargo watch -x \"run -r --bin websocket_server \""
     environment:
       - ACTIX_PORT=${ACTIX_PORT:-8080}
       - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:80}
-      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
-      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-https://accounts.google.com/o/oauth2/v2/auth}
-      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-https://oauth2.googleapis.com/token}
-      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET:-}
-      - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:8080/login/callback}
-      - DATABASE_ENABLED=${DATABASE_ENABLED:-true}
+      - DATABASE_ENABLED=false
       - RUST_LOG=debug,async_nats=info
-      - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
-      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222
       - REGION=${REGION:-us-east}
       - SERVER_ID=${SERVER_ID:-server-1}
@@ -148,7 +141,6 @@ services:
       - rustlemania-actix-web-cargo-target-cache:/usr/local/cargo/target
       - rustlemania-actix-web-target-cache:/app/actix-api/target
     depends_on:
-      - postgres
       - nats
 
   metrics-api:
@@ -226,7 +218,6 @@ services:
       - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
       - KEY_PATH=certs/localhost.key
-      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
@@ -244,7 +235,6 @@ services:
       - rustlemania-actix-webtransport-cache:/app/actix-api/target
     depends_on:
       - nats
-      - postgres
 
   synthetic-clients:
     build:

@@ -21,6 +21,7 @@ use crate::components::{
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
+    meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
     video_control_buttons::{
@@ -429,6 +430,28 @@ impl AttendantsComponent {
         html! {} // Empty html when feature is not enabled
     }
 
+    /// Schedule a token refresh attempt after 1 second.
+    ///
+    /// If the meeting has ended (`MeetingNotActive`), sends `MeetingEnded`
+    /// instead of retrying, so the user sees a clear "meeting ended" overlay.
+    #[cfg(feature = "media-server-jwt-auth")]
+    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String) {
+        Timeout::new(1_000, move || {
+            wasm_bindgen_futures::spawn_local(async move {
+                match crate::meeting_api::refresh_room_token(&meeting_id).await {
+                    Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
+                    Err(crate::meeting_api::JoinError::MeetingNotActive) => {
+                        link.send_message(Msg::MeetingEnded("The meeting has ended.".to_string()));
+                    }
+                    Err(e) => {
+                        link.send_message(Msg::TokenRefreshFailed(e.to_string()));
+                    }
+                }
+            });
+        })
+        .forget();
+    }
+
     fn play_user_joined() {
         if let Some(_window) = web_sys::window() {
             if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
@@ -528,17 +551,7 @@ impl Component for AttendantsComponent {
                     {
                         let link = ctx.link().clone();
                         let meeting_id = ctx.props().id.clone();
-                        Timeout::new(1_000, move || {
-                            wasm_bindgen_futures::spawn_local(async move {
-                                match crate::meeting_api::refresh_room_token(&meeting_id).await {
-                                    Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
-                                    Err(e) => {
-                                        link.send_message(Msg::TokenRefreshFailed(e.to_string()))
-                                    }
-                                }
-                            });
-                        })
-                        .forget();
+                        Self::schedule_token_refresh(link, meeting_id);
                     }
 
                     #[cfg(not(feature = "media-server-jwt-auth"))]
@@ -811,15 +824,7 @@ impl Component for AttendantsComponent {
                 // Schedule another attempt after 1 second.
                 let link = ctx.link().clone();
                 let meeting_id = ctx.props().id.clone();
-                Timeout::new(1_000, move || {
-                    wasm_bindgen_futures::spawn_local(async move {
-                        match crate::meeting_api::refresh_room_token(&meeting_id).await {
-                            Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
-                            Err(e) => link.send_message(Msg::TokenRefreshFailed(e.to_string())),
-                        }
-                    });
-                })
-                .forget();
+                Self::schedule_token_refresh(link, meeting_id);
 
                 true
             }
@@ -1161,30 +1166,7 @@ impl Component for AttendantsComponent {
 
                 {
                     if let Some(ref message) = self.meeting_ended_message {
-                        html! {
-                            <div class="glass-backdrop" style="z-index: 9999;">
-                                <div class="card-apple" style="width: 420px; text-align: center;">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2" style="margin: 0 auto 1rem;">
-                                        <circle cx="12" cy="12" r="10"></circle>
-                                        <line x1="15" y1="9" x2="9" y2="15"></line>
-                                        <line x1="9" y1="9" x2="15" y2="15"></line>
-                                    </svg>
-                                    <h4 style="margin-top:0; margin-bottom: 0.5rem;">{"Meeting Ended"}</h4>
-                                    <p style="font-size: 1rem; margin: 1.5rem 0; color: #666;">
-                                        {message}
-                                    </p>
-                                    <button
-                                        class="btn-apple btn-primary"
-                                        onclick={Callback::from(|_| {
-                                            if let Some(window) = web_sys::window() {
-                                                let _ = window.location().set_href("/");
-                                            }
-                                        })}>
-                                        {"Return to Home"}
-                                    </button>
-                                </div>
-                            </div>
-                        }
+                        html! { <MeetingEndedOverlay message={message.clone()} /> }
                     } else {
                         html! {}
                     }

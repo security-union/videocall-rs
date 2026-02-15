@@ -103,6 +103,11 @@ pub async fn get_my_status(
         .await?
         .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
 
+    // Refuse to issue tokens for ended meetings.
+    if meeting.state.as_deref() == Some("ended") {
+        return Err(AppError::meeting_not_active(&meeting_id));
+    }
+
     let row = db_participants::get_status(&state.db, meeting.id, &email)
         .await?
         .ok_or_else(AppError::not_in_meeting)?;

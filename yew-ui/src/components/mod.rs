@@ -27,6 +27,7 @@ pub mod host;
 pub mod host_controls;
 pub mod icons;
 pub mod login;
+pub mod meeting_ended_overlay;
 pub mod meeting_info;
 pub mod meetings_list;
 pub mod neteq_chart;

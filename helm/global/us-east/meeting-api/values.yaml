@@ -41,13 +41,13 @@ meeting-api:
     - name: OAUTH_CLIENT_ID
       valueFrom:
         secretKeyRef:
-          name: oauth-credentials
+          name: google-oauth-credentials
           key: client-id
           optional: true
     - name: OAUTH_SECRET
       valueFrom:
         secretKeyRef:
-          name: oauth-credentials
+          name: google-oauth-credentials
           key: client-secret
           optional: true
     # Discovery will auto-populate auth/token/jwks URLs based on OAUTH_ISSUER

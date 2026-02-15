@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.36](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.35...videocall-ui-v1.1.36) - 2026-02-15
+
+### Other
+
+- add UI integration to the new meetings API ([#550](https://github.com/security-union/videocall-rs/pull/550)) ([#609](https://github.com/security-union/videocall-rs/pull/609))
+- Meeting backend API ([#601](https://github.com/security-union/videocall-rs/pull/601))
+- Add component and integration testing for yew-ui ([#568](https://github.com/security-union/videocall-rs/pull/568))
+- Fix device selection ([#566](https://github.com/security-union/videocall-rs/pull/566))
+- Fix/screenshare integration branch ([#563](https://github.com/security-union/videocall-rs/pull/563))
+- Fix/ci cargo registry cache ([#559](https://github.com/security-union/videocall-rs/pull/559))
+
 ## [1.1.35](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.34...videocall-ui-v1.1.35) - 2026-02-04
 
 ### Other

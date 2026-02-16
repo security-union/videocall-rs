@@ -1717,9 +1717,9 @@ select {
    ======================================== */
 
 .meetings-list-container {
-  margin-top: 1rem;
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 12px;
+  margin-top: 0.75rem;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--radius-card, 16px);
   overflow: hidden;
 }
 
@@ -1728,13 +1728,13 @@ select {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 1rem 1.25rem;
+  padding: 0.75rem 1rem;
   background: transparent;
   border: none;
-  color: rgba(255, 255, 255, 0.8);
-  font-size: 1rem;
+  color: var(--text-secondary, #AEAEB2);
+  font-size: 0.875rem;
   cursor: pointer;
-  transition: background-color 0.2s ease;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .meetings-list-toggle:hover {
@@ -1751,23 +1751,23 @@ select {
 
 .meetings-list-toggle .meeting-count {
   margin-left: auto;
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 0.875rem;
+  color: var(--text-quaternary, #636366);
+  font-size: 0.8125rem;
 }
 
 .meetings-list-content {
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-  max-height: 300px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  max-height: 260px;
   overflow-y: auto;
 }
 
 .meetings-loading,
 .meetings-error,
 .meetings-empty {
-  padding: 1.5rem;
+  padding: 1rem;
   text-align: center;
-  color: rgba(255, 255, 255, 0.6);
-  font-size: 0.875rem;
+  color: var(--text-tertiary, #8E8E93);
+  font-size: 0.8125rem;
 }
 
 .meetings-loading {
@@ -1791,24 +1791,26 @@ select {
 }
 
 .meetings-error {
-  color: #ff6b6b;
+  color: var(--error, #FF453A);
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.5rem;
 }
 
 .retry-btn {
-  padding: 0.5rem 1rem;
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 6px;
-  color: white;
+  height: 36px;
+  padding: 0 0.875rem;
+  background: var(--glass-bg, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.15));
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-primary, #FFFFFF);
+  font-size: 0.8125rem;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .retry-btn:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--glass-bg-hover, rgba(255, 255, 255, 0.10));
 }
 
 .meetings-list {
@@ -1818,14 +1820,14 @@ select {
 }
 
 .meeting-item {
-  padding: 0.875rem 1.25rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  padding: 0.625rem 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   cursor: pointer;
-  transition: background-color 0.2s ease;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .meeting-item:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .meeting-item:last-child {
@@ -1841,40 +1843,40 @@ select {
 
 .meeting-id {
   font-weight: 500;
-  color: rgba(255, 255, 255, 0.9);
-  font-size: 0.9375rem;
+  color: var(--text-primary, #FFFFFF);
+  font-size: 0.875rem;
 }
 
 .meeting-state {
-  font-size: 0.6875rem;
-  padding: 0.125rem 0.5rem;
-  border-radius: 10px;
+  font-size: 0.625rem;
+  padding: 0.125rem 0.4375rem;
+  border-radius: var(--radius-pill, 9999px);
   text-transform: uppercase;
   font-weight: 600;
-  letter-spacing: 0.025em;
+  letter-spacing: 0.03em;
 }
 
 .meeting-state.state-active {
-  background: rgba(76, 175, 80, 0.2);
-  color: #4caf50;
+  background: rgba(48, 209, 88, 0.18);
+  color: var(--success, #30D158);
 }
 
 .meeting-state.state-idle {
-  background: rgba(255, 193, 7, 0.2);
-  color: #ffc107;
+  background: rgba(255, 159, 10, 0.18);
+  color: var(--warning, #FF9F0A);
 }
 
 .meeting-state.state-ended {
-  background: rgba(158, 158, 158, 0.2);
-  color: #9e9e9e;
+  background: rgba(142, 142, 147, 0.18);
+  color: var(--text-tertiary, #8E8E93);
 }
 
 .meeting-details {
   display: flex;
   align-items: center;
-  gap: 1rem;
-  font-size: 0.8125rem;
-  color: rgba(255, 255, 255, 0.5);
+  gap: 0.75rem;
+  font-size: 0.75rem;
+  color: var(--text-quaternary, #636366);
 }
 
 .meeting-host {

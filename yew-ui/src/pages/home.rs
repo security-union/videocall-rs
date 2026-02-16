@@ -82,7 +82,7 @@ pub fn home() -> Html {
             }
             navigator.push(&Route::Meeting { id: meeting_id });
         })
-    }
+    };
 
     fn generate_meeting_id() -> String {
         let millis = SystemTime::now()

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.1](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.0...videocall-client-v4.0.1) - 2026-02-16
+
+### Other
+
+- updated the following local packages: neteq
+
+## [4.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v3.0.0...videocall-client-v4.0.0) - 2026-02-15
+
+### Other
+
+- add UI integration to the new meetings API ([#550](https://github.com/security-union/videocall-rs/pull/550)) ([#609](https://github.com/security-union/videocall-rs/pull/609))
+- Add component and integration testing for yew-ui ([#568](https://github.com/security-union/videocall-rs/pull/568))
+- Fix device selection ([#566](https://github.com/security-union/videocall-rs/pull/566))
+- Fix/screenshare integration branch ([#563](https://github.com/security-union/videocall-rs/pull/563))
+- Fix/ci cargo registry cache ([#559](https://github.com/security-union/videocall-rs/pull/559))
+
 ## [3.0.0](https://github.com/security-union/videocall-rs/compare/videocall-client-v2.0.0...videocall-client-v3.0.0) - 2026-02-04
 
 ### Other

@@ -16,58 +16,65 @@
  * conditions.
  */
 
+//! Login page component.
+//!
+//! Renders a provider-branded sign-in button based on the `oauthProvider`
+//! value in `window.__APP_CONFIG`. Delegates to dedicated button components
+//! for each supported provider (Google, Okta) so branding stays isolated.
+
 use gloo_utils::window;
 use yew::prelude::*;
 
-use crate::constants::login_url;
+use crate::components::google_sign_in_button::GoogleSignInButton;
+use crate::components::okta_sign_in_button::OktaSignInButton;
+use crate::constants::{login_url, oauth_provider};
 
-#[function_component(Login)]
-pub fn login() -> Html {
-    let login = Callback::from(|_: MouseEvent| match login_url() {
+/// Build the login callback that redirects to the backend OAuth endpoint,
+/// forwarding any `returnTo` query parameter from the current URL.
+fn build_login_callback() -> Callback<MouseEvent> {
+    Callback::from(|_: MouseEvent| match login_url() {
         Ok(mut url) => {
-            // Check if there's a returnTo parameter in the current URL
-            if let Ok(win) = window().location().search() {
-                if !win.is_empty() {
-                    // Append the query parameters from the current URL to the backend login URL
-                    url = format!("{url}{win}");
+            if let Ok(search) = window().location().search() {
+                if !search.is_empty() {
+                    url = format!("{url}{search}");
                 }
             }
             let _ = window().location().set_href(&url);
         }
         Err(e) => log::error!("Failed to get login URL: {e:?}"),
-    });
+    })
+}
+
+/// Render the sign-in button for the configured OAuth provider.
+fn render_provider_button(onclick: Callback<MouseEvent>) -> Html {
+    match oauth_provider().as_deref() {
+        Some("google") => html! { <GoogleSignInButton {onclick} /> },
+        Some("okta") => html! { <OktaSignInButton {onclick} /> },
+        _ => html! {
+            <button class="generic-sign-in-button" {onclick}>
+                {"Sign in"}
+            </button>
+        },
+    }
+}
+
+#[function_component(Login)]
+pub fn login() -> Html {
+    let login = build_login_callback();
 
     html! {
-        <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">
-            <div class="flex flex-col items-center px-6 py-12">
-                // Logo/Brand - Large, sleek, Apple-style
-                <div style="margin-bottom: 4rem;">
-                    <h1 style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 5.5rem; font-weight: 300; letter-spacing: -0.03em; color: #ffffff; margin: 0;">{"videocall.rs"}</h1>
-                </div>
+        <div class="login-container">
+            <div class="login-card">
+                <h1 class="login-title">{"videocall.rs"}</h1>
 
-                // Sign in box
-                <div class="flex flex-col items-center">
+                { render_provider_button(login) }
 
-                    // Google Sign-in button (image)
-                    <button
-                        onclick={login}
-                        class="transition-transform hover:scale-[1.02] active:scale-[0.98]"
-                        style="background: none; border: none; padding: 0; cursor: pointer;"
-                    >
-                        <img
-                            src="/assets/btn_google.png"
-                            alt="Sign in with Google"
-                            class="h-[46px] w-auto"
-                        />
-                    </button>
-
-                    <p style="margin-top: 2rem; text-align: center; font-size: 0.75rem; color: #86868b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-                        {"By signing in, you agree to our "}
-                        <a href="https://github.com/security-union/videocall-rs" style="color: #0a84ff; text-decoration: none;" class="hover:underline">{"Terms of Service"}</a>
-                        {" and "}
-                        <a href="https://github.com/security-union/videocall-rs" style="color: #0a84ff; text-decoration: none;" class="hover:underline">{"Privacy Policy"}</a>
-                    </p>
-                </div>
+                <p class="login-footer">
+                    {"By signing in, you agree to our "}
+                    <a href="https://github.com/security-union/videocall-rs">{"Terms of Service"}</a>
+                    {" and "}
+                    <a href="https://github.com/security-union/videocall-rs">{"Privacy Policy"}</a>
+                </p>
             </div>
         </div>
     }

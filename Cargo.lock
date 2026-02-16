@@ -440,6 +440,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures",
+ "password-hash",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -668,7 +680,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
- "axum-core",
+ "axum-core 0.4.5",
  "bytes",
  "futures-util",
  "http 1.4.0",
@@ -677,13 +689,47 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "itoa",
- "matchit",
+ "matchit 0.7.3",
  "memchr",
  "mime",
  "percent-encoding",
  "pin-project-lite",
  "rustversion",
  "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
+ "sync_wrapper 1.0.2",
+ "tokio",
+ "tower 0.5.2",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "axum"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b52af3cb4058c895d37317bb27508dccc8e5f2d39454016b297bf4a400597b8"
+dependencies = [
+ "axum-core 0.5.6",
+ "axum-macros",
+ "bytes",
+ "form_urlencoded",
+ "futures-util",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "itoa",
+ "matchit 0.8.4",
+ "memchr",
+ "mime",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde_core",
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
@@ -714,6 +760,36 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "axum-core"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "sync_wrapper 1.0.2",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "axum-macros"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "604fde5e028fea851ce1d8570bbdc034bec850d157f7569d10f347d06808c05c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -865,6 +941,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60d4bd9d1db2c6bdf285e223a7fa369d5ce98ec767dec949c6ca62863ce61757"
 dependencies = [
  "core2",
+]
+
+[[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
 ]
 
 [[package]]
@@ -2422,26 +2507,6 @@ dependencies = [
 
 [[package]]
 name = "gloo-net"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2899cb1a13be9020b010967adc6b2a8a343b6f1428b90238c9d53ca24decc6db"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-sink",
- "gloo-utils 0.1.7",
- "js-sys",
- "pin-project",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "gloo-net"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9902a044653b26b99f7e3693a42f171312d9be8b26b5697bd1e43ad1f8a35e10"
@@ -3443,6 +3508,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64 0.22.1",
+ "js-sys",
+ "pem",
+ "ring",
+ "serde",
+ "serde_json",
+ "simple_asn1",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3672,6 +3752,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
+name = "matchit"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
 name = "matomo-logger"
 version = "0.1.0"
 dependencies = [
@@ -3702,6 +3788,33 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if 1.0.4",
  "digest",
+]
+
+[[package]]
+name = "meeting-api"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "axum 0.8.8",
+ "base64 0.22.1",
+ "chrono",
+ "http-body-util",
+ "jsonwebtoken",
+ "oauth2",
+ "rand 0.8.5",
+ "regex",
+ "reqwest 0.12.26",
+ "rsa",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sqlx",
+ "tokio",
+ "tower 0.5.2",
+ "tower-http 0.6.8",
+ "tracing",
+ "tracing-subscriber",
+ "videocall-meeting-types",
 ]
 
 [[package]]
@@ -3917,9 +4030,9 @@ dependencies = [
 
 [[package]]
 name = "neteq"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
- "axum",
+ "axum 0.7.9",
  "clap",
  "console_error_panic_hook",
  "cpal",
@@ -4335,6 +4448,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
+]
+
+[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4351,6 +4475,16 @@ name = "peeking_take_while"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
+
+[[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64 0.22.1",
+ "serde_core",
+]
 
 [[package]]
 name = "pem-rfc7468"
@@ -4543,7 +4677,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef4605b7c057056dd35baeb6ac0c0338e4975b1f2bef0f65da953285eb007095"
 dependencies = [
  "bytes",
- "chrono",
  "fallible-iterator",
  "postgres-protocol",
 ]
@@ -5057,15 +5190,6 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
-
-[[package]]
-name = "reqwasm"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05b89870d729c501fa7a68c43bf4d938bbb3a8c156d333d90faa0e8b3e3212fb"
-dependencies = [
- "gloo-net 0.1.0",
-]
 
 [[package]]
 name = "reqwest"
@@ -5769,6 +5893,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6"
 dependencies = [
  "quote",
+]
+
+[[package]]
+name = "simple_asn1"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297f631f50729c8c99b84667867963997ec0b50f32b2a7dbcab828ef0541e8bb"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "thiserror 2.0.17",
+ "time",
 ]
 
 [[package]]
@@ -7057,9 +7193,10 @@ dependencies = [
  "chrono",
  "futures",
  "futures-util",
+ "jsonwebtoken",
  "lazy_static",
+ "meeting-api",
  "oauth2",
- "postgres-types",
  "prometheus",
  "protobuf 3.7.1",
  "r2d2",
@@ -7079,6 +7216,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "videocall-meeting-types",
  "videocall-types",
  "web-transport-quinn 0.8.1",
 ]
@@ -7106,7 +7244,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "3.0.0"
+version = "4.0.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -7144,7 +7282,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-codecs"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "approx",
@@ -7176,6 +7314,25 @@ dependencies = [
  "serde",
  "serde_json",
  "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "videocall-meeting-client"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "reqwest 0.12.26",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "videocall-meeting-types",
+]
+
+[[package]]
+name = "videocall-meeting-types"
+version = "0.1.1"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -7252,7 +7409,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.13"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7287,7 +7444,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.1.35"
+version = "1.1.37"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -7302,7 +7459,6 @@ dependencies = [
  "neteq",
  "once_cell",
  "regex",
- "reqwasm",
  "reqwest 0.12.26",
  "serde",
  "serde-wasm-bindgen 0.6.5",
@@ -7310,6 +7466,8 @@ dependencies = [
  "urlencoding",
  "videocall-client",
  "videocall-diagnostics",
+ "videocall-meeting-client",
+ "videocall-meeting-types",
  "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -7369,8 +7527,6 @@ dependencies = [
  "cfg-if 1.0.4",
  "once_cell",
  "rustversion",
- "serde",
- "serde_json",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]

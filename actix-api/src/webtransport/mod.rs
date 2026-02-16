@@ -23,11 +23,11 @@ use crate::actors::transports::wt_chat_session::{WtChatSession, WtOutbound};
 use crate::constants::VALID_ID_PATTERN;
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
+use crate::token_validator;
 use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
 use bridge::WebTransportBridge;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use sqlx::PgPool;
 use std::io::Read;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
@@ -158,7 +158,6 @@ pub async fn start(
     opt: WebTransportOpt,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
-    pool: Option<PgPool>,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -212,7 +211,6 @@ pub async fn start(
         trace_span!("New connection being attempted");
         let chat_server = chat_server.clone();
         let nats_client = nats_client.clone();
-        let pool = pool.clone();
         let tracker_sender = tracker_sender.clone();
         let session_manager = session_manager.clone();
         actix_rt::spawn(async move {
@@ -220,7 +218,6 @@ pub async fn start(
                 request,
                 chat_server,
                 nats_client,
-                pool,
                 tracker_sender,
                 session_manager,
             )
@@ -238,32 +235,70 @@ async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
     chat_server: Addr<ChatServer>,
     nats_client: async_nats::client::Client,
-    _pool: Option<PgPool>,
     tracker_sender: TrackerSender,
     session_manager: SessionManager,
 ) -> anyhow::Result<()> {
     warn!("received WebTransport request: {}", request.url());
-    let url = request.url();
-
-    let uri = url;
+    let uri = request.url();
     let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
     let parts = path.split('/').collect::<Vec<&str>>();
     // filter out the empty strings
-    let parts = parts.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+    let parts: Vec<_> = parts.iter().filter(|s| !s.is_empty()).collect();
     info!("Parts {:?}", parts);
-    if parts.len() != 3 {
-        return Err(anyhow!("Invalid path wrong length"));
-    } else if parts[0] != &"lobby" {
-        return Err(anyhow!("Invalid path wrong prefix"));
+
+    // First part must be "lobby"
+    if parts.is_empty() || parts[0] != &"lobby" {
+        return Err(anyhow!("Invalid path: must start with /lobby"));
     }
 
-    let username = parts[1].replace(' ', "_");
-    let lobby_id = parts[2].replace(' ', "_");
-    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-    if !re.is_match(&username) && !re.is_match(&lobby_id) {
-        return Err(anyhow!("Invalid path input chars"));
-    }
+    // Extract ?token= from query string
+    let token = uri
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, val)| val.into_owned());
+
+    // Determine username and room from either the JWT or URL path params.
+    let (username, lobby_id) = if let Some(ref tok) = token {
+        // Token-based flow: identity and room come from the JWT claims.
+        let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+        if jwt_secret.is_empty() {
+            return Err(anyhow!("JWT_SECRET not set"));
+        }
+        let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
+            e.log("WT");
+            anyhow!("token validation failed: {}", e.client_message())
+        })?;
+        info!(
+            "WT token-based connection: email={}, room={}",
+            claims.sub, claims.room
+        );
+        (claims.sub, claims.room)
+    } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
+        // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
+        if parts.len() != 3 {
+            return Err(anyhow!(
+                "Invalid path: expected /lobby/{{email}}/{{room}} (deprecated) or /lobby?token=<JWT>"
+            ));
+        }
+        let username = parts[1].replace(' ', "_");
+        let lobby_id = parts[2].replace(' ', "_");
+        let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
+        if !re.is_match(&username) || !re.is_match(&lobby_id) {
+            return Err(anyhow!("Invalid path input chars"));
+        }
+        info!(
+            "WT deprecated path-based connection: email={}, room={}",
+            username, lobby_id
+        );
+        (username, lobby_id)
+    } else {
+        // FF=on but no token provided
+        info!("WT connection rejected: no token provided and meeting management is enabled");
+        return Err(anyhow!(
+            "room access token is required. Use /lobby?token=<JWT>"
+        ));
+    };
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
@@ -364,13 +399,11 @@ mod tests {
             error!("Error installing crypto provider: {e:?}");
         }
         use crate::actors::chat_server::ChatServer;
-        use crate::db_pool;
         use crate::server_diagnostics::ServerDiagnostics;
         use crate::session_manager::SessionManager;
         use crate::webtransport::{self, Certs};
         use actix::Actor;
         use std::net::ToSocketAddrs;
-        use videocall_types::feature_flags::FeatureFlags;
 
         // Connect to NATS
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
@@ -378,24 +411,11 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        // Create database pool only if enabled
-        let pool = if FeatureFlags::database_enabled() {
-            Some(
-                db_pool::create_pool()
-                    .await
-                    .expect("Failed to create database pool"),
-            )
-        } else {
-            None
-        };
-
         // Start ChatServer actor
-        let chat_server = ChatServer::new(nats_client.clone(), pool.clone())
-            .await
-            .start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         // Create SessionManager
-        let session_manager = SessionManager::new(pool.clone());
+        let session_manager = SessionManager::new();
 
         // Create connection tracker
         let (_, tracker_sender, tracker_receiver) =
@@ -434,7 +454,6 @@ mod tests {
                 opt,
                 chat_server,
                 nats_client,
-                pool,
                 tracker_sender,
                 session_manager,
             )
@@ -525,6 +544,25 @@ mod tests {
         Ok(client.connect(url).await?)
     }
 
+    /// Connect via the token-based endpoint: GET /lobby?token=<JWT>
+    async fn connect_client_with_token(
+        token: &str,
+    ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let url_str = format!(
+            "{}/lobby?token={}",
+            base.trim_end_matches('/'),
+            urlencoding::encode(token)
+        );
+        let url = url::Url::parse(&url_str)?;
+
+        let client = unsafe {
+            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
+        };
+        Ok(client.connect(url).await?)
+    }
+
     async fn send_packet(session: &web_transport_quinn::Session, bytes: Vec<u8>) {
         let mut s = session.open_uni().await.expect("open uni");
         s.write_all(&bytes).await.expect("write packet");
@@ -584,11 +622,17 @@ mod tests {
             .with_writer(std::io::stderr)
             .try_init();
 
+        // FF=off: this test verifies packet relay without JWT.
+        // JWT validation is tested separately in jwt_integration_tests.rs.
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
         // Wrap entire test with 15 second timeout
         let test_result = tokio::time::timeout(Duration::from_secs(15), async {
             test_relay_packet_impl().await
         })
         .await;
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
 
         match test_result {
             Ok(Ok(())) => println!("Test completed successfully"),
@@ -1042,15 +1086,15 @@ mod tests {
             .with_writer(std::io::stderr)
             .try_init();
 
-        // Enable meeting management for this test
-        videocall_types::FeatureFlags::set_meeting_management_override(true);
+        // FF=off: this test verifies basic session lifecycle without JWT.
+        // JWT validation is tested separately in jwt_integration_tests.rs.
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
 
         let test_result = tokio::time::timeout(Duration::from_secs(30), async {
             test_meeting_lifecycle_impl().await
         })
         .await;
 
-        // Clean up feature flag
         videocall_types::FeatureFlags::clear_meeting_management_override();
 
         match test_result {
@@ -1061,26 +1105,16 @@ mod tests {
     }
 
     async fn test_meeting_lifecycle_impl() -> anyhow::Result<()> {
-        use crate::models::meeting::Meeting;
-        use crate::models::session_participant::SessionParticipant;
+        println!("=== STARTING SESSION LIFECYCLE TEST (WebTransport) ===");
 
-        println!("=== STARTING MEETING LIFECYCLE TEST (WebTransport) ===");
-
-        // Get database pool for verification queries
-        let database_url =
-            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for this test");
-        let pool = sqlx::PgPool::connect(&database_url).await?;
-
-        // Clean up any stale test data
         let room_id = "wt-meeting-lifecycle-test";
-        cleanup_room(&pool, room_id).await;
 
         println!("Starting WebTransport server...");
         let _wt_handle = start_webtransport_server().await;
         wait_for_server_ready().await;
         println!("✓ Server ready");
 
-        // ========== STEP 1: First user connects - meeting should be created ==========
+        // ========== STEP 1: First user connects ==========
         println!("\n--- Step 1: Alice connects (first participant) ---");
 
         let session_alice = connect_client("alice", room_id)
@@ -1091,34 +1125,7 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("✓ Alice connected");
 
-        // Verify: 1 participant, meeting exists
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 1,
-            "Should have 1 active participant after Alice joins"
-        );
-        println!("✓ Participant count: {count}");
-
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert!(
-            meeting.is_some(),
-            "Meeting should exist after first participant joins"
-        );
-        let meeting = meeting.unwrap();
-        assert_eq!(
-            meeting.creator_id,
-            Some("alice".to_string()),
-            "Alice should be the meeting creator"
-        );
-        assert!(meeting.ended_at.is_none(), "Meeting should not be ended");
-        let start_time = meeting.start_time_unix_ms();
-        println!("✓ Meeting created with creator=alice, start_time={start_time}");
-
-        // ========== STEP 2: Second user connects - participant count increases ==========
+        // ========== STEP 2: Second user connects ==========
         println!("\n--- Step 2: Bob connects (second participant) ---");
 
         let session_bob = connect_client("bob", room_id).await.expect("connect bob");
@@ -1126,28 +1133,6 @@ mod tests {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("✓ Bob connected");
-
-        // Verify: 2 participants
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 2,
-            "Should have 2 active participants after Bob joins"
-        );
-        println!("✓ Participant count: {count}");
-
-        // Meeting should have same start time
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert_eq!(
-            meeting.start_time_unix_ms(),
-            start_time,
-            "Meeting start time should not change when others join"
-        );
-        println!("✓ Meeting start time unchanged");
 
         // ========== STEP 3: Third user connects ==========
         println!("\n--- Step 3: Charlie connects (third participant) ---");
@@ -1160,134 +1145,226 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e))?;
         println!("✓ Charlie connected");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 3, "Should have 3 active participants");
-        println!("✓ Participant count: {count}");
-
-        // ========== STEP 4: Charlie disconnects - count drops ==========
+        // ========== STEP 4: Charlie disconnects ==========
         println!("\n--- Step 4: Charlie disconnects ---");
-
-        // Explicitly close the session to trigger immediate disconnect
         session_charlie.close(0u32, b"test disconnect");
         drop(session_charlie);
-        // Wait for disconnect to be processed
-        wait_for_participant_count(&pool, room_id, 2, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Charlie disconnected");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 2,
-            "Should have 2 active participants after Charlie leaves"
-        );
-        println!("✓ Participant count: {count}");
-
-        // Meeting should still be active
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert!(meeting.ended_at.is_none(), "Meeting should still be active");
-        println!("✓ Meeting still active");
-
-        // ========== STEP 5: Bob disconnects - count drops ==========
+        // ========== STEP 5: Bob disconnects ==========
         println!("\n--- Step 5: Bob disconnects ---");
-
         session_bob.close(0u32, b"test disconnect");
         drop(session_bob);
-        wait_for_participant_count(&pool, room_id, 1, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Bob disconnected");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(
-            count, 1,
-            "Should have 1 active participant after Bob leaves"
-        );
-        println!("✓ Participant count: {count}");
-
-        // Meeting should still be active (Alice is still there)
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert!(
-            meeting.ended_at.is_none(),
-            "Meeting should still be active with Alice"
-        );
-        println!("✓ Meeting still active");
-
-        // ========== STEP 6: Alice (host/last) disconnects - meeting ends ==========
-        println!("\n--- Step 6: Alice (host) disconnects - meeting should end ---");
-
+        // ========== STEP 6: Alice (last) disconnects ==========
+        println!("\n--- Step 6: Alice disconnects - session ends ---");
         session_alice.close(0u32, b"test disconnect");
         drop(session_alice);
-        wait_for_participant_count(&pool, room_id, 0, Duration::from_secs(5)).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
         println!("✓ Alice disconnected");
 
-        let count = SessionParticipant::count_active(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        assert_eq!(count, 0, "Should have 0 active participants");
-        println!("✓ Participant count: {count}");
-
-        // Meeting should be ended
-        let meeting = Meeting::get_by_room_id_async(&pool, room_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .unwrap();
-        assert!(
-            meeting.ended_at.is_some(),
-            "Meeting should be ended when last participant leaves"
-        );
-        println!("✓ Meeting ended at {:?}", meeting.ended_at);
-
-        // ========== CLEANUP ==========
-        cleanup_room(&pool, room_id).await;
-
-        println!("\n=== MEETING LIFECYCLE TEST PASSED (WebTransport) ===");
+        println!("\n=== SESSION LIFECYCLE TEST PASSED (WebTransport) ===");
         Ok(())
     }
 
-    async fn cleanup_room(pool: &sqlx::PgPool, room_id: &str) {
-        let _ = sqlx::query("DELETE FROM session_participants WHERE room_id = $1")
-            .bind(room_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM meetings WHERE room_id = $1")
-            .bind(room_id)
-            .execute(pool)
-            .await;
+    /// Test helper: create a database pool for future JWT flow integration tests.
+    #[allow(dead_code)]
+    async fn get_test_pool() -> sqlx::PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for this test");
+        sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("Failed to connect to test database")
     }
 
-    async fn wait_for_participant_count(
-        pool: &sqlx::PgPool,
-        room_id: &str,
-        expected: i64,
-        timeout: Duration,
-    ) -> anyhow::Result<()> {
-        use crate::models::session_participant::SessionParticipant;
-        let room = room_id.to_string();
-        let pool = pool.clone();
-        wait_for_condition_bool(
-            || {
-                let pool = pool.clone();
-                let room = room.clone();
-                async move {
-                    SessionParticipant::count_active(&pool, &room)
-                        .await
-                        .unwrap_or(-1)
-                        == expected
-                }
-            },
-            timeout,
-            Duration::from_millis(100),
+    // =====================================================================
+    // JWT token-based WebTransport tests
+    // =====================================================================
+
+    const JWT_SECRET: &str = "test-secret-for-integration-tests";
+    const TOKEN_TTL_SECS: i64 = 600;
+
+    /// Set up env and start the real WT server for JWT tests.
+    async fn setup_jwt_wt() {
+        std::env::set_var("JWT_SECRET", JWT_SECRET);
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+        let _handle = start_webtransport_server().await;
+        wait_for_server_ready().await;
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_valid_token_connects() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "alice@test.com",
+            "wt-jwt-room-1",
+            true,
+            "Alice",
         )
-        .await
-        .map_err(|e| anyhow::anyhow!(e))
+        .expect("generate token");
+
+        let session = connect_client_with_token(&token)
+            .await
+            .expect("valid token should connect via WebTransport");
+        wait_for_session_ready(&session, "alice")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_expired_token_rejected() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            -120,
+            "alice@test.com",
+            "wt-jwt-room-2",
+            false,
+            "Alice",
+        )
+        .expect("generate token");
+
+        let result = connect_client_with_token(&token).await;
+        assert!(
+            result.is_err(),
+            "expired token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_wrong_secret_rejected() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            "completely-different-secret",
+            TOKEN_TTL_SECS,
+            "alice@test.com",
+            "wt-jwt-room-3",
+            false,
+            "Alice",
+        )
+        .expect("generate token");
+
+        let result = connect_client_with_token(&token).await;
+        assert!(
+            result.is_err(),
+            "wrong-secret token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_garbage_token_rejected() {
+        setup_jwt_wt().await;
+
+        let result = connect_client_with_token("not.a.real.jwt").await;
+        assert!(
+            result.is_err(),
+            "garbage token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_token_identity_extracted() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "bob@example.com",
+            "wt-special-room",
+            false,
+            "Bob",
+        )
+        .expect("generate token");
+
+        let session = connect_client_with_token(&token)
+            .await
+            .expect("token with identity should connect");
+        wait_for_session_ready(&session, "bob")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_deprecated_endpoint_works_ff_off() {
+        setup_jwt_wt().await;
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let session = connect_client("alice", "wt-jwt-room-6")
+            .await
+            .expect("deprecated endpoint with FF=off should work");
+        wait_for_session_ready(&session, "alice")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_deprecated_endpoint_rejected_ff_on() {
+        setup_jwt_wt().await;
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+
+        let result = connect_client("alice", "wt-jwt-room-7").await;
+        assert!(
+            result.is_err(),
+            "deprecated endpoint with FF=on should be rejected"
+        );
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_host_and_attendee_tokens_both_connect() {
+        setup_jwt_wt().await;
+
+        let room = "wt-standup";
+
+        let host_token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "host@co.com",
+            room,
+            true,
+            "Host",
+        )
+        .expect("generate host token");
+
+        let attendee_token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "attendee@co.com",
+            room,
+            false,
+            "Attendee",
+        )
+        .expect("generate attendee token");
+
+        let host = connect_client_with_token(&host_token)
+            .await
+            .expect("host token should connect");
+        wait_for_session_ready(&host, "host")
+            .await
+            .expect("host should receive MEETING_STARTED");
+
+        let attendee = connect_client_with_token(&attendee_token)
+            .await
+            .expect("attendee token should connect");
+        wait_for_session_ready(&attendee, "attendee")
+            .await
+            .expect("attendee should receive MEETING_STARTED");
+
+        host.close(0u32, b"done");
+        attendee.close(0u32, b"done");
     }
 }

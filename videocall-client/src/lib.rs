@@ -39,7 +39,9 @@
 //! For more detailed documentation see the doc for each struct.
 //!
 //! ## Client creation and connection:
-//! ```no_run
+//!
+//! With `yew-compat` feature (Yew callbacks):
+//! ```ignore
 //! use videocall_client::{VideoCallClient, VideoCallClientOptions};
 //! use yew::Callback;
 //!
@@ -62,97 +64,81 @@
 //!     on_encoder_settings_update: None,
 //!     rtt_testing_period_ms: 3000,
 //!     rtt_probe_interval_ms: None,
-//!     health_reporting_interval_ms: Some(5000), // Send health every 5 seconds
+//!     health_reporting_interval_ms: Some(5000),
 //!     on_peer_removed: None,
 //!     on_meeting_info: None,
 //!     on_meeting_ended: None,
-//!    
 //! };
 //! let mut client = VideoCallClient::new(options);
-//!
 //! client.connect().unwrap();
 //! ```
 //!
-//! ## Encoder creation:
-//! ```no_run
-//! use videocall_client::{VideoCallClient, CameraEncoder, ScreenEncoder, create_microphone_encoder};
-//! use yew::Callback;
+//! Without `yew-compat` feature (framework-agnostic):
+//! ```ignore
+//! use videocall_client::{VideoCallClient, VideoCallClientOptions, DirectCanvasIdProvider};
+//! use std::rc::Rc;
 //!
-//! # use videocall_client::VideoCallClientOptions;
-//! # let options = VideoCallClientOptions {
-//! #     enable_e2ee: false, enable_webtransport: false, on_peer_added: Callback::noop(),
-//! #     on_peer_first_frame: Callback::noop(), get_peer_video_canvas_id: Callback::from(|_| "video".to_string()),
-//! #     get_peer_screen_canvas_id: Callback::from(|_| "screen".to_string()), userid: "user".to_string(),
-//! #     meeting_id: "room".to_string(), websocket_urls: vec![], webtransport_urls: vec![],
-//! #     on_connected: Callback::noop(), on_connection_lost: Callback::noop(), enable_diagnostics: false, diagnostics_update_interval_ms: None,
-//! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
-//! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
-//! #     on_peer_removed: None,
-//! #     on_meeting_info: None,
-//! #     on_meeting_ended: None,
-//! #
-//! # };
-//! # let client = VideoCallClient::new(options);
-//! let mut camera = CameraEncoder::new(
-//!     client.clone(),
-//!     "video-element",
-//!     1000000, // 1 Mbps initial bitrate
-//!     Callback::noop(),
-//!     Callback::noop() // on_error callback for camera errors
-//! );
-//! let mut microphone = create_microphone_encoder(
-//!     client.clone(),
-//!     128, // 128 kbps bitrate
-//!     Callback::noop(),
-//!     Callback::noop(),
-//! );
-//! let mut screen = ScreenEncoder::new(
-//!     client,
-//!     2000, // 2 Mbps bitrate
-//!     Callback::noop(),
-//!     Callback::noop() // on_state_change callback for screen share events
-//! );
+//! let options = VideoCallClientOptions {
+//!     enable_e2ee: true,
+//!     enable_webtransport: true,
+//!     canvas_id_provider: Rc::new(DirectCanvasIdProvider),
+//!     userid: "user123".to_string(),
+//!     meeting_id: "room456".to_string(),
+//!     websocket_urls: vec!["ws://localhost:8080".to_string()],
+//!     webtransport_urls: vec!["https://localhost:8443".to_string()],
+//!     enable_diagnostics: false,
+//!     diagnostics_update_interval_ms: None,
+//!     enable_health_reporting: false,
+//!     health_reporting_interval_ms: Some(5000),
+//!     rtt_testing_period_ms: 3000,
+//!     rtt_probe_interval_ms: None,
+//! };
+//! let client = VideoCallClient::new(options);
+//! // Subscribe to events via event bus
+//! let mut rx = videocall_client::subscribe_client_events();
+//! ```
+//!
+//! ## Encoder creation:
+//!
+//! Note: Encoder APIs differ between `yew-compat` and framework-agnostic modes.
+//! See individual encoder documentation for details.
+//!
+//! ```ignore
+//! // Example with yew-compat feature
+//! use videocall_client::{VideoCallClient, CameraEncoder, ScreenEncoder, create_microphone_encoder};
+//!
+//! // Create encoders with a VideoCallClient instance
+//! let mut camera = CameraEncoder::new(client.clone(), "video-element", 1000000, on_settings_change);
+//! let mut screen = ScreenEncoder::new(client.clone(), 2000);
 //!
 //! // Select devices and start/stop encoding
 //! camera.select("camera-device-id".to_string());
 //! camera.start();
 //! camera.stop();
-//! microphone.select("microphone-device-id".to_string());
-//! microphone.start();
-//! microphone.stop();
 //! screen.set_enabled(true);
 //! screen.set_enabled(false);
 //! ```
 //!
 //! ## Device access permission:
 //!
-//! ```no_run
+//! ```ignore
 //! use videocall_client::MediaDeviceAccess;
-//! use yew::Callback;
 //!
 //! let mut media_device_access = MediaDeviceAccess::new();
-//! media_device_access.on_granted = Callback::from(|_| {
-//!     web_sys::console::log_1(&"Access granted!".into());
-//! });
-//! media_device_access.on_denied = Callback::from(|error| {
-//!     web_sys::console::log_2(&"Access denied:".into(), &error);
-//! });
+//! // With yew-compat, set callbacks:
+//! // media_device_access.on_granted = Callback::from(|_| { ... });
+//! // media_device_access.on_denied = Callback::from(|error| { ... });
+//! // Without yew-compat, subscribe to ClientEvent::PermissionGranted/PermissionDenied
 //! media_device_access.request();
 //! ```
 //!
 //! ### Device query and listing:
-//! ```no_run
+//! ```ignore
 //! use videocall_client::MediaDeviceList;
-//! use yew::Callback;
 //!
 //! let mut media_device_list = MediaDeviceList::new();
-//! media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
-//!     web_sys::console::log_2(&"Audio device selected:".into(), &device_id.into());
-//! });
-//! media_device_list.video_inputs.on_selected = Callback::from(|device_id: String| {
-//!     web_sys::console::log_2(&"Video device selected:".into(), &device_id.into());
-//! });
-//!
+//! // With yew-compat, set callbacks on audio_inputs/video_inputs
+//! // Without yew-compat, subscribe to ClientEvent::DevicesLoaded/DevicesChanged
 //! media_device_list.load();
 //!
 //! let microphones = media_device_list.audio_inputs.devices();
@@ -163,7 +149,6 @@
 //! if let Some(camera) = cameras.first() {
 //!     media_device_list.video_inputs.select(&camera.device_id());
 //! }
-//!
 //! ```
 
 pub mod audio;

@@ -1,0 +1,17 @@
+[package]
+name = "videocall-meeting-types"
+version = "0.1.1"
+edition = "2021"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+authors = [
+    "Dario Lencina <dario@securityunion.dev>"
+]
+keywords = ["videocall", "meeting", "api", "types"]
+categories = ["network-programming"]
+description = "Shared API types for the videocall.rs meeting backend"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }

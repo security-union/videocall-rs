@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+// Meeting lifecycle messages sent between server and clients
+message MeetingPacket {
+  enum MeetingEventType {
+    MEETING_EVENT_TYPE_UNKNOWN = 0;
+    // Meeting started - sent to participants when they join
+    MEETING_STARTED = 1;
+    // Meeting ended - sent when host leaves or last participant leaves
+    MEETING_ENDED = 2;
+    // Participant joined the meeting
+    PARTICIPANT_JOINED = 3;
+    // Participant left the meeting
+    PARTICIPANT_LEFT = 4;
+  }
+
+  MeetingEventType event_type = 1;
+  string room_id = 2;
+  uint64 start_time_ms = 3;
+  string message = 4;
+  string creator_id = 5;
+  int64 participant_count = 6;
+}
+

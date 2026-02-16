@@ -16,33 +16,27 @@
  * conditions.
  */
 
-use actix::{prelude::Stream, Actor, StreamHandler};
+use actix::Actor;
 use actix_cors::Cors;
-use actix_http::{
-    error::PayloadError,
-    ws::{Codec, Message, ProtocolError},
-};
 use actix_web::{
     cookie::{
         time::{Duration, OffsetDateTime},
         Cookie, SameSite,
     },
-    error, get,
-    web::{self, Bytes},
-    App, Error, HttpRequest, HttpResponse, HttpServer,
+    error, get, web, App, Error, HttpRequest, HttpResponse, HttpServer,
 };
-use actix_web_actors::ws::{handshake, WebsocketContext};
 use reqwest::header::LOCATION;
 use sec_api::{
-    actors::{chat_server::ChatServer, chat_session::WsChatSession},
+    actors::chat_server::ChatServer,
     auth::{
         fetch_oauth_request, generate_and_store_oauth_request, request_token, upsert_user,
         AuthRequest,
     },
-    constants::VALID_ID_PATTERN,
     db::{get_pool, PostgresPool},
+    lobby::{ws_connect, ws_connect_authenticated},
     models::{AppConfig, AppState},
     server_diagnostics::ServerDiagnostics,
+    session_manager::SessionManager,
 };
 use tracing::{debug, error, info};
 use videocall_types::truthy;
@@ -268,53 +262,6 @@ async fn logout() -> Result<HttpResponse, Error> {
     Ok(response.finish())
 }
 
-fn start_with_codec<A, S>(
-    actor: A,
-    req: &HttpRequest,
-    stream: S,
-    codec: Codec,
-) -> Result<HttpResponse, Error>
-where
-    A: Actor<Context = WebsocketContext<A>> + StreamHandler<Result<Message, ProtocolError>>,
-    S: Stream<Item = Result<Bytes, PayloadError>> + 'static,
-{
-    let mut res = handshake(req)?;
-    Ok(res.streaming(WebsocketContext::with_codec(actor, stream, codec)))
-}
-
-#[get("/lobby/{email}/{room}")]
-pub async fn ws_connect(
-    session: web::Path<(String, String)>,
-    req: HttpRequest,
-    stream: web::Payload,
-    state: web::Data<AppState>,
-) -> Result<HttpResponse, Error> {
-    let (email, room) = session.into_inner();
-
-    // Validate email and room using the same pattern as WebTransport
-    let email_clean = email.replace(' ', "_");
-    let room_clean = room.replace(' ', "_");
-    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-    if !re.is_match(&email_clean) || !re.is_match(&room_clean) {
-        error!(
-            "Invalid email or room format: email={}, room={}",
-            email, room
-        );
-        return Ok(HttpResponse::BadRequest().body("Invalid email or room format"));
-    }
-
-    debug!(
-        "socket connected for email={}, room={}",
-        email_clean, room_clean
-    );
-    let chat = state.chat.clone();
-    let nats_client = state.nats_client.clone();
-    let tracker_sender = state.tracker_sender.clone();
-    let actor = WsChatSession::new(chat, room_clean, email_clean, nats_client, tracker_sender);
-    let codec = Codec::new().max_size(1_000_000);
-    start_with_codec(actor, &req, stream, codec)
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
@@ -331,7 +278,11 @@ async fn main() -> std::io::Result<()> {
         .connect(&nats_url)
         .await
         .expect("Failed to connect to NATS");
+
     let chat = ChatServer::new(nats_client.clone()).await.start();
+
+    // Create SessionManager
+    let session_manager = SessionManager::new();
 
     // Create connection tracker with message channel
     let (connection_tracker, tracker_sender, tracker_receiver) =
@@ -369,13 +320,15 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
+                    session_manager: session_manager.clone(),
                 }))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
+                .service(ws_connect_authenticated)
                 .service(ws_connect)
         } else if db_enabled {
-            // OAuth requires database
+            // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
             App::new()
                 .app_data(web::Data::new(pool))
@@ -383,6 +336,7 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
+                    session_manager: session_manager.clone(),
                 }))
                 .app_data(web::Data::new(AppConfig {
                     oauth_client_id: oauth_client_id.clone(),
@@ -398,6 +352,7 @@ async fn main() -> std::io::Result<()> {
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
+                .service(ws_connect_authenticated)
                 .service(ws_connect)
         } else {
             // OAuth configured but database disabled - skip OAuth routes
@@ -408,10 +363,12 @@ async fn main() -> std::io::Result<()> {
                     chat: chat.clone(),
                     nats_client: nats_client.clone(),
                     tracker_sender: tracker_sender.clone(),
+                    session_manager: session_manager.clone(),
                 }))
                 .service(check_session)
                 .service(get_profile)
                 .service(logout)
+                .service(ws_connect_authenticated)
                 .service(ws_connect)
         }
     })

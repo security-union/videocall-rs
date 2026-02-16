@@ -1,4 +1,4 @@
-FROM docker.io/securityunion/rustlemania-api-base:fix-ci-7d7323a2 as build
+FROM securityunion/actix-base:meeting-ownership-branch-c4b19265 as build
 
 ENV CARGO_TARGET_DIR=/app/actix-api/target
 COPY . /app
@@ -11,16 +11,15 @@ RUN mkdir -p /app/binaries && \
     -not -name "*.so" -not -name "*.a" -not -name "*.d" -not -name "build_*" \
     -exec cp {} /app/binaries/ \;
 
-FROM debian:bookworm-slim as production
+FROM debian:trixie-slim as production
 
 RUN apt-get --yes update && apt-get --yes install libssl-dev ca-certificates
 
 COPY --from=build /usr/bin/dbmate /usr/bin/dbmate
 # Copy all binary executables from actix-api
 COPY --from=build /app/binaries/* /usr/bin/
-COPY --from=build /app/actix-api/startup.sh /usr/bin/startup.sh
 COPY --from=build /app/dbmate /app/dbmate
 
 STOPSIGNAL SIGINT
 
-CMD [ "startup.sh" ]
+CMD [ "websocket_server" ]

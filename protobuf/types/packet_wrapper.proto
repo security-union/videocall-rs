@@ -2,12 +2,14 @@ syntax = "proto3";
 
 message PacketWrapper {
   enum PacketType {
-    RSA_PUB_KEY = 0;
-    AES_KEY = 1;
-    MEDIA = 2;
-    CONNECTION = 3;
-    DIAGNOSTICS = 4;
-    HEALTH = 5;
+    PACKET_TYPE_UNKNOWN = 0;
+    RSA_PUB_KEY = 1;
+    AES_KEY = 2;
+    MEDIA = 3;
+    CONNECTION = 4;
+    DIAGNOSTICS = 5;
+    HEALTH = 6;
+    MEETING = 7;
   }
   PacketType packet_type = 1;
   string email = 2;

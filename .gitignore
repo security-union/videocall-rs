@@ -4,9 +4,13 @@
 .mov
 .mp4
 .env
+.claude
+#for jet brains products
+.idea/
 target/
 helm/digital-ocean-secret
 helm/global/us-east/grafana/secret.yaml
+helm-videocall-deployment/
 
 # iOS specific
 *.xcframework/
@@ -56,6 +60,6 @@ Carthage/Build/
 .Trashes
 .VolumeIcon.icns
 .com.apple.timemachine.donotpresent
-
+*.swg
 
 deployment-**.log

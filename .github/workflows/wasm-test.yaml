@@ -6,13 +6,17 @@ on:
     paths:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
-      - 'types/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
+      - 'yew-ui/**'
   pull_request:
     paths:
       - 'videocall-client/**'
       - 'videocall-codecs/**'
       - 'neteq/**'
-      - 'types/**'
+      - 'videocall-types/**'
+      - 'protobuf/**'
+      - 'yew-ui/**'
 
 jobs:
   wasm-test:
@@ -54,3 +58,38 @@ jobs:
       
       - name: Run tests for neteq
         run: cd neteq && cargo test --no-default-features --features web
+
+  yew-ui-component-tests:
+    name: Yew UI Component Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2024-11-01
+          target: wasm32-unknown-unknown
+          override: true
+          profile: minimal
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-yew-tests-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-yew-tests-
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.106 --locked
+
+      - uses: nanasess/setup-chromedriver@v2
+
+      - name: Run yew-ui component tests
+        run: |
+          cd yew-ui
+          CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown

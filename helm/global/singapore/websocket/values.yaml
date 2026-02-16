@@ -6,7 +6,7 @@ rustlemania-websocket:
   replicaCount: 1
 
   image:
-    repository: securityunion/rustlemania-api
+    repository: securityunion/videocall-media-server
     pullPolicy: Always
     tag: latest
 
@@ -19,10 +19,6 @@ rustlemania-websocket:
       value: https://singapore.webtransport.video
     - name: NATS_URL
       value: nats-singapore:4222  # Connect to Singapore NATS cluster
-    - name: DATABASE_ENABLED
-      value: "false"
-    - name: DATABASE_URL
-      value: abc
     - name: REGION
       value: "singapore"
     - name: HOSTNAME

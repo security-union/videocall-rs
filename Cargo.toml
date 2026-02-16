@@ -2,8 +2,11 @@
 resolver = "2"
 members = [
     "actix-api",
+    "meeting-api",
     "bot",
     "videocall-types",
+    "videocall-meeting-types",
+    "videocall-meeting-client",
     "videocall-client",
     "videocall-cli",
     "yew-ui",
@@ -30,5 +33,3 @@ anyhow = "1.0.75"
 wasm-bindgen-futures = { version = "0.4.30" }
 wasm-bindgen = "0.2.95"
 web-transport-quinn = "0.8.1"
-
-web-transport-proto = "0.2.7"

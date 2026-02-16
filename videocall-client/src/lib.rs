@@ -64,6 +64,9 @@
 //!     rtt_probe_interval_ms: None,
 //!     health_reporting_interval_ms: Some(5000), // Send health every 5 seconds
 //!     on_peer_removed: None,
+//!     on_meeting_info: None,
+//!     on_meeting_ended: None,
+//!    
 //! };
 //! let mut client = VideoCallClient::new(options);
 //!
@@ -85,13 +88,17 @@
 //! #     enable_health_reporting: false, health_reporting_interval_ms: None, on_encoder_settings_update: None,
 //! #     rtt_testing_period_ms: 3000, rtt_probe_interval_ms: None,
 //! #     on_peer_removed: None,
+//! #     on_meeting_info: None,
+//! #     on_meeting_ended: None,
+//! #
 //! # };
 //! # let client = VideoCallClient::new(options);
 //! let mut camera = CameraEncoder::new(
 //!     client.clone(),
 //!     "video-element",
 //!     1000000, // 1 Mbps initial bitrate
-//!     Callback::noop()
+//!     Callback::noop(),
+//!     Callback::noop() // on_error callback for camera errors
 //! );
 //! let mut microphone = create_microphone_encoder(
 //!     client.clone(),
@@ -102,7 +109,8 @@
 //! let mut screen = ScreenEncoder::new(
 //!     client,
 //!     2000, // 2 Mbps bitrate
-//!     Callback::noop()
+//!     Callback::noop(),
+//!     Callback::noop() // on_state_change callback for screen share events
 //! );
 //!
 //! // Select devices and start/stop encoding
@@ -175,5 +183,8 @@ pub use client::{VideoCallClient, VideoCallClientOptions};
 pub use decode::{
     create_audio_peer_decoder, AudioPeerDecoderTrait, PeerDecodeManager, VideoPeerDecoder,
 };
-pub use encode::{create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder};
+pub use encode::{
+    create_microphone_encoder, CameraEncoder, MicrophoneEncoderTrait, ScreenEncoder,
+    ScreenShareEvent,
+};
 pub use media_devices::{MediaDeviceAccess, MediaDeviceList, SelectableDevices};

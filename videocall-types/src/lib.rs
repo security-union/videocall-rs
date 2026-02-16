@@ -16,14 +16,23 @@
  * conditions.
  */
 
+pub mod feature_flags;
 pub mod protos;
 
+pub use feature_flags::FeatureFlags;
 use protobuf::Message;
+
+/// System username used for server-generated messages (meeting info, meeting started/ended).
+/// This is not a real user and should be filtered out in UI/peer management.
+pub const SYSTEM_USER_EMAIL: &str = "system-&^%$#@!";
 use yew_websocket::websocket::{Binary, Text};
 
 impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
+            protos::media_packet::media_packet::MediaType::MEDIA_TYPE_UNKNOWN => {
+                write!(f, "UNKNOWN")
+            }
             protos::media_packet::media_packet::MediaType::AUDIO => write!(f, "audio"),
             protos::media_packet::media_packet::MediaType::VIDEO => write!(f, "video"),
             protos::media_packet::media_packet::MediaType::SCREEN => write!(f, "screen"),
@@ -36,6 +45,9 @@ impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
 impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
+            protos::packet_wrapper::packet_wrapper::PacketType::PACKET_TYPE_UNKNOWN => {
+                write!(f, "UNKNOWN")
+            }
             protos::packet_wrapper::packet_wrapper::PacketType::AES_KEY => write!(f, "AES_KEY"),
             protos::packet_wrapper::packet_wrapper::PacketType::RSA_PUB_KEY => {
                 write!(f, "RSA_PUB_KEY")
@@ -49,6 +61,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             }
             protos::packet_wrapper::packet_wrapper::PacketType::HEALTH => {
                 write!(f, "HEALTH")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::MEETING => {
+                write!(f, "MEETING")
             }
         }
     }

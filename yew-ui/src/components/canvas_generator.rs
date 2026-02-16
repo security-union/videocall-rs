@@ -16,6 +16,8 @@
  * conditions.
  */
 
+use crate::components::icons::crop::CropIcon;
+use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
@@ -28,8 +30,15 @@ use yew::prelude::*;
 use yew::{html, Html};
 
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
-/// the video tile will occupy the full grid area.
-pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: bool) -> Html {
+/// the video tile will occupy the full grid area. If `host_display_name` matches `key`, a crown
+/// icon is displayed next to the name.
+pub fn generate_for_peer(
+    client: &VideoCallClient,
+    key: &String,
+    full_bleed: bool,
+    host_display_name: Option<&str>,
+) -> Html {
+    let is_host = host_display_name.map(|h| h == key).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.iter().any(|host| host == key) {
         return html! {};
@@ -51,8 +60,12 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
                     })}
                 >
                     { if is_video_enabled_for_peer { html!{ <UserVideo id={key.clone()} hidden={false}/> } } else { html!{ <div class=""><div class="placeholder-content"><PeerIcon/><span class="placeholder-text">{"Camera Off"}</span></div></div> } } }
-                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                    <h4 class="floating-name" title={if is_host { format!("Host: {key}") } else { key.clone() }} dir={"auto"}>
+                        {key.clone()}
+                        if is_host { <CrownIcon /> }
+                    </h4>
                     <div class="audio-indicator"><MicIcon muted={!is_audio_enabled_for_peer}/></div>
+                    <button onclick={Callback::from({ let canvas_id = key.clone(); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon"><CropIcon/></button>
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon"><PushPinIcon/></button>
                 </div>
             </div>
@@ -78,6 +91,9 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
                     })}>
                         <ScreenCanvas peer_id={key.clone()} />
                         <h4 class="floating-name" title={format!("{}-screen", &key)} dir={"auto"}>{format!("{}-screen", &key)}</h4>
+                        <button onclick={Callback::from({ let canvas_id = format!("screen-share-{}", key.clone()); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon">
+                            <CropIcon/>
+                        </button>
                         <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*screen_share_div_id).clone()); })} class="pin-icon">
                             <PushPinIcon/>
                         </button>
@@ -102,10 +118,16 @@ pub fn generate_for_peer(client: &VideoCallClient, key: &String, full_bleed: boo
                             <span class="placeholder-text">{"Video Disabled"}</span>
                         </div>
                     }
-                    <h4 class="floating-name" title={key.clone()} dir={"auto"}>{key.clone()}</h4>
+                    <h4 class="floating-name" title={if is_host { format!("Host: {key}") } else { key.clone() }} dir={"auto"}>
+                        {key.clone()}
+                        if is_host { <CrownIcon /> }
+                    </h4>
                     <div class="audio-indicator">
                         <MicIcon muted={!is_audio_enabled_for_peer}/>
                     </div>
+                    <button onclick={Callback::from({ let canvas_id = key.clone(); move |_| toggle_canvas_crop(&canvas_id) })} class="crop-icon">
+                        <CropIcon/>
+                    </button>
                     <button onclick={Callback::from(move |_| { toggle_pinned_div(&(*peer_video_div_id).clone()); })} class="pin-icon">
                         <PushPinIcon/>
                     </button>
@@ -145,7 +167,7 @@ fn user_video(props: &UserVideoProps) -> Html {
     }
 
     html! {
-        <canvas ref={video_ref} id={props.id.clone()} hidden={props.hidden}></canvas>
+        <canvas ref={video_ref} id={props.id.clone()} hidden={props.hidden} class={classes!("uncropped")}></canvas>
     }
 }
 
@@ -177,7 +199,7 @@ fn screen_canvas(props: &ScreenCanvasProps) -> Html {
     }
 
     html! {
-        <canvas ref={canvas_ref} id={format!("screen-share-{}", props.peer_id)}></canvas>
+        <canvas ref={canvas_ref} id={format!("screen-share-{}", props.peer_id)} class={classes!("uncropped")}></canvas>
     }
 }
 
@@ -204,4 +226,21 @@ fn is_mobile_viewport() -> bool {
         }
     }
     false
+}
+
+fn toggle_canvas_crop(canvas_id: &str) {
+    if let Some(canvas) = window()
+        .and_then(|w| w.document())
+        .and_then(|doc| doc.get_element_by_id(canvas_id))
+    {
+        let class_list = canvas.class_list();
+        let is_cropped = class_list.contains("cropped");
+        if is_cropped {
+            let _ = class_list.remove_1("cropped");
+            let _ = class_list.add_1("uncropped");
+        } else {
+            let _ = class_list.remove_1("uncropped");
+            let _ = class_list.add_1("cropped");
+        }
+    }
 }

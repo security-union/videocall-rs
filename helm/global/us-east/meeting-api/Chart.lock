@@ -1,0 +1,6 @@
+dependencies:
+- name: meeting-api
+  repository: file://../../../meeting-api
+  version: 0.1.0
+digest: sha256:e20ab715b586f9dd1feb20d613dacdc8e7173afbd05e3ebdeb63118f9ed5d309
+generated: "2026-02-11T03:03:41.407918-05:00"

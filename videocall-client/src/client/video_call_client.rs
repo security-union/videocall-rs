@@ -37,11 +37,14 @@ use std::rc::{Rc, Weak};
 use videocall_types::protos::aes_packet::AesPacket;
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::media_packet::media_packet::MediaType;
+use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
 use yew::prelude::Callback;
 
@@ -110,6 +113,12 @@ pub struct VideoCallClientOptions {
 
     /// Interval between RTT probes in milliseconds (default: 200ms)
     pub rtt_probe_interval_ms: Option<u64>,
+
+    /// Callback triggered when meeting info is received (optional)
+    pub on_meeting_info: Option<Callback<f64>>,
+
+    /// Callback triggered when the meeting ends (optional)
+    pub on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
 #[derive(Debug)]
@@ -117,6 +126,8 @@ struct InnerOptions {
     enable_e2ee: bool,
     userid: String,
     on_peer_added: Callback<String>,
+    on_meeting_info: Option<Callback<f64>>,
+    on_meeting_ended: Option<Callback<(f64, String)>>,
 }
 
 #[derive(Debug)]
@@ -228,6 +239,8 @@ impl VideoCallClient {
                     enable_e2ee: options.enable_e2ee,
                     userid: options.userid.clone(),
                     on_peer_added: options.on_peer_added.clone(),
+                    on_meeting_ended: options.on_meeting_ended.clone(),
+                    on_meeting_info: options.on_meeting_info.clone(),
                 },
                 connection_controller: None,
                 connection_state: ConnectionState::Failed {
@@ -405,6 +418,25 @@ impl VideoCallClient {
         self.connect_with_rtt_testing()
     }
 
+    /// Replace the WebSocket and WebTransport server URLs used for future
+    /// connections.
+    ///
+    /// Call this before [`connect()`][Self::connect] when you have a fresh room
+    /// access token and need to reconnect. The existing media pipeline
+    /// (encoders, decoders, peer state) is preserved.
+    pub fn update_server_urls(
+        &mut self,
+        websocket_urls: Vec<String>,
+        webtransport_urls: Vec<String>,
+    ) {
+        info!(
+            "Updating server URLs: ws={:?}, wt={:?}",
+            websocket_urls, webtransport_urls
+        );
+        self.options.websocket_urls = websocket_urls;
+        self.options.webtransport_urls = webtransport_urls;
+    }
+
     fn create_peer_decoder_manager(
         opts: &VideoCallClientOptions,
         diagnostics: Option<Rc<DiagnosticManager>>,
@@ -459,6 +491,30 @@ impl VideoCallClient {
             }
         };
         false
+    }
+
+    /// Disconnect from the current server.
+    pub fn disconnect(&self) -> anyhow::Result<()> {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            // if let Some(health_reporter) = &inner.health_reporter {
+            //     if let Ok(reporter) = health_reporter.try_borrow_mut() {
+            //         reporter.stop_health_reporting();
+            //     }
+            // }
+
+            if let Some(connection_controller) = &mut inner.connection_controller {
+                let _ = connection_controller.disconnect();
+            }
+
+            inner.connection_controller = None;
+            inner.connection_state = ConnectionState::Failed {
+                error: "Disconnected".to_string(),
+                last_known_server: None,
+            };
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Unable to borrow inner"))
+        }
     }
 
     /// Returns a vector of the userids of the currently connected remote peers, sorted alphabetically.
@@ -766,7 +822,12 @@ impl Inner {
             response.packet_type.enum_value(),
             response.email
         );
-        let peer_status = self.peer_decode_manager.ensure_peer(&response.email);
+        // Skip creating peers for system messages (meeting info, meeting started/ended)
+        let peer_status = if response.email == SYSTEM_USER_EMAIL {
+            PeerStatus::NoChange
+        } else {
+            self.peer_decode_manager.ensure_peer(&response.email)
+        };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 if !self.options.enable_e2ee {
@@ -853,7 +914,10 @@ impl Inner {
                 }
             }
             Ok(PacketType::CONNECTION) => {
-                error!("Not implemented: CONNECTION packet type");
+                // CONNECTION packets are used for other purposes now
+                // Meeting info is sent via MEETING packet type with protobuf
+                let data_str = String::from_utf8_lossy(&response.data);
+                debug!("Received CONNECTION packet: {data_str}");
             }
             Ok(PacketType::DIAGNOSTICS) => {
                 // Parse and handle the diagnostics packet
@@ -875,8 +939,73 @@ impl Inner {
                     response.email
                 );
             }
+            Ok(PacketType::MEETING) => {
+                // Parse MeetingPacket protobuf
+                match MeetingPacket::parse_from_bytes(&response.data) {
+                    Ok(meeting_packet) => {
+                        match meeting_packet.event_type.enum_value() {
+                            Ok(MeetingEventType::MEETING_STARTED) => {
+                                info!(
+                                    "Received MEETING_STARTED: room={}, start_time={}ms, creator={}",
+                                    meeting_packet.room_id,
+                                    meeting_packet.start_time_ms,
+                                    meeting_packet.creator_id
+                                );
+                                if let Some(callback) = &self.options.on_meeting_info {
+                                    callback.emit(meeting_packet.start_time_ms as f64);
+                                }
+                            }
+                            Ok(MeetingEventType::MEETING_ENDED) => {
+                                info!(
+                                    "Received MEETING_ENDED: room={}, message={}",
+                                    meeting_packet.room_id, meeting_packet.message
+                                );
+                                if let Some(callback) = &self.options.on_meeting_ended {
+                                    let end_time_ms = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as f64)
+                                        .unwrap_or(0.0);
+                                    callback.emit((end_time_ms, meeting_packet.message));
+                                }
+                            }
+                            Ok(MeetingEventType::PARTICIPANT_JOINED) => {
+                                info!(
+                                    "Received PARTICIPANT_JOINED: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
+                                );
+                                // Future: could emit participant joined event
+                            }
+                            Ok(MeetingEventType::PARTICIPANT_LEFT) => {
+                                info!(
+                                    "Received PARTICIPANT_LEFT: room={}, count={}",
+                                    meeting_packet.room_id, meeting_packet.participant_count
+                                );
+                                // Future: could emit participant left event
+                            }
+                            Ok(MeetingEventType::MEETING_EVENT_TYPE_UNKNOWN) => {
+                                error!(
+                                    "Received meeting packet with unknown event type: room={}",
+                                    meeting_packet.room_id
+                                );
+                            }
+                            Err(e) => {
+                                error!("Failed to parse MeetingEventType: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse MeetingPacket: {e}");
+                    }
+                }
+            }
+            Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
+                error!(
+                    "Received packet with unknown packet type from {}",
+                    response.email
+                );
+            }
             Err(e) => {
-                error!("Failed to parse diagnostics packet: {e}");
+                error!("Failed to parse packet type: {e}");
             }
         }
         if let PeerStatus::Added(peer_userid) = peer_status {

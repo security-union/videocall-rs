@@ -21,6 +21,59 @@ pub type UsernameCtx = UseStateHandle<Option<String>>;
 pub type VideoCallClientCtx = VideoCallClient;
 
 // -----------------------------------------------------------------------------
+// Meeting Time Context
+// -----------------------------------------------------------------------------
+
+/// Holds meeting timing information shared via Yew context.
+///
+/// # Lifecycle
+/// - Created with `Default::default()` (both fields `None`)
+/// - `call_start_time` is set when WebSocket/WebTransport connection succeeds
+/// - `meeting_start_time` is set when `MEETING_STARTED` packet is received from server
+///
+/// # Usage
+/// Components access this via `use_context::<MeetingTimeCtx>()`. If context is
+/// missing, `unwrap_or_default()` returns empty values and timers show "--:--".
+#[derive(Clone, PartialEq, Default)]
+pub struct MeetingTime {
+    /// Unix timestamp (ms) when the current user joined the call.
+    /// Set on successful connection. `None` before connection.
+    pub call_start_time: Option<f64>,
+
+    /// Unix timestamp (ms) when the meeting started (from server).
+    /// Set when `MEETING_STARTED` packet is received. `None` if not yet received.
+    pub meeting_start_time: Option<f64>,
+}
+
+/// Context type for meeting time - read-only access to timing info.
+pub type MeetingTimeCtx = MeetingTime;
+
+// -----------------------------------------------------------------------------
+// Meeting Host Context
+// -----------------------------------------------------------------------------
+
+/// Holds meeting host information shared via Yew context.
+///
+/// Used to identify the meeting owner/host and display appropriate UI indicators.
+#[derive(Clone, PartialEq, Default)]
+pub struct MeetingHost {
+    /// Email/ID of the meeting host. `None` if not yet known.
+    pub host_email: Option<String>,
+}
+
+impl MeetingHost {
+    /// Check if the given email is the meeting host
+    #[allow(dead_code)]
+    pub fn is_host(&self, email: &str) -> bool {
+        self.host_email.as_deref() == Some(email)
+    }
+}
+
+/// Context type for meeting host - read-only access to host info.
+#[allow(dead_code)]
+pub type MeetingHostCtx = MeetingHost;
+
+// -----------------------------------------------------------------------------
 // Local-storage helpers
 // -----------------------------------------------------------------------------
 

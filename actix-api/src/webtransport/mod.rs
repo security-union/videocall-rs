@@ -16,20 +16,23 @@
  * conditions.
  */
 
-use crate::client_diagnostics::health_processor;
+mod bridge;
+
+use crate::actors::chat_server::ChatServer;
+use crate::actors::transports::wt_chat_session::{WtChatSession, WtOutbound};
 use crate::constants::VALID_ID_PATTERN;
-use crate::server_diagnostics::{
-    send_connection_ended, send_connection_started, DataTracker, ServerDiagnostics, TrackerSender,
-};
+use crate::server_diagnostics::TrackerSender;
+use crate::session_manager::SessionManager;
+use crate::token_validator;
+use actix::prelude::*;
 use anyhow::{anyhow, Context, Result};
-use async_nats::Subject;
-use futures::StreamExt;
-use protobuf::Message;
+use bridge::WebTransportBridge;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read;
 use std::{fs, io};
 use std::{net::SocketAddr, path::PathBuf};
-use tracing::{debug, error, info, trace, trace_span, warn};
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, trace_span, warn};
 
 lazy_static::lazy_static! {
     static ref QUIC_MAX_IDLE_TIMEOUT_SECS: u64 = std::env::var("QUIC_MAX_IDLE_TIMEOUT_SECS")
@@ -86,11 +89,7 @@ fn reset_test_packet_counters() {
     counters_map.clear();
 }
 
-use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::MediaPacket;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
-use web_transport_quinn::{quinn, Session, SessionError};
+use web_transport_quinn::{quinn, Session};
 
 /// Videocall WebTransport API
 ///
@@ -103,19 +102,7 @@ pub const WEB_TRANSPORT_ALPN: &[&[u8]] = &[b"h3", b"h3-32", b"h3-31", b"h3-30", 
 
 pub const QUIC_ALPN: &[u8] = b"hq-29";
 
-const KEEP_ALIVE_PING: &[u8] = b"ping";
-
-/// Check if the binary data is an RTT packet that should be echoed back
-fn is_rtt_packet(data: &[u8]) -> bool {
-    if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
-        if packet_wrapper.packet_type == PacketType::MEDIA.into() {
-            if let Ok(media_packet) = MediaPacket::parse_from_bytes(&packet_wrapper.data) {
-                return media_packet.media_type == MediaType::RTT.into();
-            }
-        }
-    }
-    false
-}
+// Note: is_rtt_packet and KEEP_ALIVE_PING are now handled by WtChatSession actor
 
 #[derive(Debug)]
 pub struct WebTransportOpt {
@@ -158,7 +145,22 @@ fn get_key_and_cert_chain<'a>(
     Ok((key, chain))
 }
 
-pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error>> {
+/// Start the WebTransport server
+///
+/// # Arguments
+/// * `opt` - WebTransport server options (listen address, certs)
+/// * `chat_server` - Address of the ChatServer actor
+/// * `nats_client` - NATS client for health packet processing
+/// * `pool` - Optional database pool
+/// * `tracker_sender` - Server diagnostics tracker
+/// * `session_manager` - Session lifecycle manager
+pub async fn start(
+    opt: WebTransportOpt,
+    chat_server: Addr<ChatServer>,
+    nats_client: async_nats::client::Client,
+    tracker_sender: TrackerSender,
+    session_manager: SessionManager,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("WebTransportOpt: {opt:#?}");
 
     let (key, certs) = get_key_and_cert_chain(opt.certs)?;
@@ -202,31 +204,24 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
         opt.listen, *QUIC_MAX_IDLE_TIMEOUT_SECS, *QUIC_KEEP_ALIVE_INTERVAL_SECS
     );
 
-    let nc =
-        async_nats::connect(std::env::var("NATS_URL").expect("NATS_URL env var must be defined"))
-            .await
-            .unwrap();
-
-    // Create connection tracker with message channel
-    let (connection_tracker, tracker_sender, tracker_receiver) =
-        ServerDiagnostics::new_with_channel(nc.clone());
-
-    // Start the connection tracker message processing task
-    let connection_tracker = std::sync::Arc::new(connection_tracker);
-    let tracker_task = connection_tracker.clone();
-    tokio::spawn(async move {
-        tracker_task.run_message_loop(tracker_receiver).await;
-    });
-
-    // 2. Accept new WebTransport connections using 0.7.3 API
+    // Accept new WebTransport connections
+    // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
+    // actor requires the actix LocalSet context for spawn_local.
     while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
-        let nc = nc.clone();
+        let chat_server = chat_server.clone();
+        let nats_client = nats_client.clone();
         let tracker_sender = tracker_sender.clone();
-        tokio::spawn(async move {
-            // Handle WebTransport request directly using 0.7.3 API
-            if let Err(err) =
-                run_webtransport_connection_from_request(request, nc, tracker_sender).await
+        let session_manager = session_manager.clone();
+        actix_rt::spawn(async move {
+            if let Err(err) = run_webtransport_connection_from_request(
+                request,
+                chat_server,
+                nats_client,
+                tracker_sender,
+                session_manager,
+            )
+            .await
             {
                 error!("Failed to handle WebTransport connection: {err:?}");
             }
@@ -238,275 +233,158 @@ pub async fn start(opt: WebTransportOpt) -> Result<(), Box<dyn std::error::Error
 
 async fn run_webtransport_connection_from_request(
     request: web_transport_quinn::Request,
-    nc: async_nats::client::Client,
+    chat_server: Addr<ChatServer>,
+    nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
+    session_manager: SessionManager,
 ) -> anyhow::Result<()> {
     warn!("received WebTransport request: {}", request.url());
-    let url = request.url();
-
-    let uri = url;
+    let uri = request.url();
     let path = urlencoding::decode(uri.path()).unwrap().into_owned();
 
     let parts = path.split('/').collect::<Vec<&str>>();
     // filter out the empty strings
-    let parts = parts.iter().filter(|s| !s.is_empty()).collect::<Vec<_>>();
+    let parts: Vec<_> = parts.iter().filter(|s| !s.is_empty()).collect();
     info!("Parts {:?}", parts);
-    if parts.len() != 3 {
-        return Err(anyhow!("Invalid path wrong length"));
-    } else if parts[0] != &"lobby" {
-        return Err(anyhow!("Invalid path wrong prefix"));
+
+    // First part must be "lobby"
+    if parts.is_empty() || parts[0] != &"lobby" {
+        return Err(anyhow!("Invalid path: must start with /lobby"));
     }
 
-    let username = parts[1].replace(' ', "_");
-    let lobby_id = parts[2].replace(' ', "_");
-    let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
-    if !re.is_match(&username) && !re.is_match(&lobby_id) {
-        return Err(anyhow!("Invalid path input chars"));
-    }
+    // Extract ?token= from query string
+    let token = uri
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, val)| val.into_owned());
+
+    // Determine username and room from either the JWT or URL path params.
+    let (username, lobby_id) = if let Some(ref tok) = token {
+        // Token-based flow: identity and room come from the JWT claims.
+        let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+        if jwt_secret.is_empty() {
+            return Err(anyhow!("JWT_SECRET not set"));
+        }
+        let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
+            e.log("WT");
+            anyhow!("token validation failed: {}", e.client_message())
+        })?;
+        info!(
+            "WT token-based connection: email={}, room={}",
+            claims.sub, claims.room
+        );
+        (claims.sub, claims.room)
+    } else if !videocall_types::FeatureFlags::meeting_management_enabled() {
+        // Deprecated path-based flow (FF=off only): /lobby/{username}/{room}
+        if parts.len() != 3 {
+            return Err(anyhow!(
+                "Invalid path: expected /lobby/{{email}}/{{room}} (deprecated) or /lobby?token=<JWT>"
+            ));
+        }
+        let username = parts[1].replace(' ', "_");
+        let lobby_id = parts[2].replace(' ', "_");
+        let re = regex::Regex::new(VALID_ID_PATTERN).unwrap();
+        if !re.is_match(&username) || !re.is_match(&lobby_id) {
+            return Err(anyhow!("Invalid path input chars"));
+        }
+        info!(
+            "WT deprecated path-based connection: email={}, room={}",
+            username, lobby_id
+        );
+        (username, lobby_id)
+    } else {
+        // FF=on but no token provided
+        info!("WT connection rejected: no token provided and meeting management is enabled");
+        return Err(anyhow!(
+            "room access token is required. Use /lobby?token=<JWT>"
+        ));
+    };
 
     // Accept the session.
     let session = request.ok().await.context("failed to accept session")?;
     debug!("accepted session");
 
-    // Run the session
-    if let Err(err) =
-        handle_webtransport_session(session, &username, &lobby_id, nc, tracker_sender).await
+    // Run the session with actor
+    if let Err(err) = handle_webtransport_session(
+        session,
+        &username,
+        &lobby_id,
+        chat_server,
+        nats_client,
+        tracker_sender,
+        session_manager,
+    )
+    .await
     {
         info!("closing session: {}", err);
     }
     Ok(())
 }
 
-#[tracing::instrument(level = "trace", skip(session))]
+/// Handle a WebTransport session using the WtChatSession actor
+#[tracing::instrument(
+    level = "trace",
+    skip(session, chat_server, nats_client, tracker_sender, session_manager)
+)]
 async fn handle_webtransport_session(
     session: Session,
     username: &str,
     lobby_id: &str,
-    nc: async_nats::client::Client,
+    chat_server: Addr<ChatServer>,
+    nats_client: async_nats::client::Client,
     tracker_sender: TrackerSender,
+    session_manager: SessionManager,
 ) -> anyhow::Result<()> {
-    // Generate unique session ID for this WebTransport connection
-    let session_id = uuid::Uuid::new_v4().to_string();
+    // Create channel for actor → WebTransport I/O
+    let (outbound_tx, outbound_rx) = mpsc::channel::<WtOutbound>(256);
 
-    // Track connection start for metrics
-    send_connection_started(
-        &tracker_sender,
-        session_id.clone(),
-        username.to_string(),
+    // Start the WtChatSession actor
+    let actor = WtChatSession::new(
+        chat_server,
         lobby_id.to_string(),
-        "webtransport".to_string(),
+        username.to_string(),
+        outbound_tx,
+        nats_client,
+        tracker_sender,
+        session_manager,
     );
+    let actor_addr = actor.start();
 
-    let mut join_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-
-    // Create shutdown channel to signal connection errors
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-
-    let subject = format!("room.{lobby_id}.*").replace(' ', "_");
-    let specific_subject: Subject = format!("room.{lobby_id}.{username}")
-        .replace(' ', "_")
-        .into();
-    let mut sub = match nc
-        .queue_subscribe(subject.clone(), specific_subject.to_string())
-        .await
-    {
-        Ok(sub) => {
-            debug!("Subscribed to subject {subject}");
-            sub
-        }
-        Err(e) => {
-            let err = format!("error subscribing to subject {subject}: {e}");
-            error!("{err}");
-            return Err(anyhow!(err));
-        }
+    // Create bridge (with test callback if in test mode)
+    #[cfg(test)]
+    let on_packet_sent = {
+        let username_for_callback = username.to_string();
+        Some(
+            Box::new(move || increment_test_packet_counter_for_user(&username_for_callback))
+                as bridge::PacketSentCallback,
+        )
     };
+    #[cfg(not(test))]
+    let on_packet_sent: Option<bridge::PacketSentCallback> = None;
 
-    let specific_subject_clone = specific_subject.clone();
+    let mut bridge = WebTransportBridge::new_with_callback(
+        session,
+        actor_addr.clone(),
+        outbound_rx,
+        on_packet_sent,
+    );
+    bridge.wait_for_disconnect().await;
+    bridge.shutdown().await;
 
-    // NATS receive task
-    {
-        let session = session.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_nats = tracker_sender.clone();
-        let shutdown_tx_nats = shutdown_tx.clone();
-        #[cfg_attr(not(test), allow(unused_variables))]
-        let username_clone = username.to_string();
-        join_set.spawn(async move {
-            let _data_tracker = DataTracker::new(tracker_sender_nats.clone());
-            loop {
-                tokio::select! {
-                    msg = sub.next() => {
-                        match msg {
-                            Some(msg) => {
-                                if msg.subject == specific_subject_clone {
-                                    continue;
-                                }
+    // Signal actor to stop
+    actor_addr.do_send(crate::actors::transports::wt_chat_session::StopSession);
 
-                                #[cfg(test)]
-                                increment_test_packet_counter_for_user(&username_clone);
-                                let session_id_clone = session_id_clone.clone();
-                                let payload_size = msg.payload.len() as u64;
-                                let tracker_sender_inner = tracker_sender_nats.clone();
-                                let session = session.clone();
-                                let shutdown_tx_inner = shutdown_tx_nats.clone();
-                                tokio::spawn(async move {
-                                    let stream = session.open_uni().await;
-                                    let data_tracker_inner = DataTracker::new(tracker_sender_inner);
-                                    match stream {
-                                        Ok(mut uni_stream) => {
-                                            if let Err(e) = uni_stream.write_all(&msg.payload).await {
-                                                error!("Error writing to unidirectional stream: {}", e);
-                                            } else {
-                                                // Track data sent
-                                                data_tracker_inner.track_sent(&session_id_clone, payload_size);
-                                            }
-                                        }
-                                        Err(SessionError::ConnectionError(e)) => {
-                                            error!("Connection error: {}", e);
-                                            let _ = shutdown_tx_inner.send(()).await;
-                                        }
-                                        Err(SessionError::WebTransportError(e)) => {
-                                            error!("WebTransport error: {}", e);
-                                        }
-                                        Err(e) => {
-                                            error!("Error opening unidirectional stream: {}", e);
-                                        }
-                                    }
-                                });
-                            }
-                            None => {
-                                info!("NATS subscription ended");
-                                break;
-                            }
-                        }
-                    }
-                    _ = shutdown_rx.recv() => {
-                        info!("Received shutdown signal, stopping NATS receive task");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    // WebTransport unidirectional receive task
-    {
-        let session = session.clone();
-        let nc = nc.clone();
-        let specific_subject = specific_subject.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_wt = tracker_sender.clone();
-        join_set.spawn(async move {
-            while let Ok(mut uni_stream) = session.accept_uni().await {
-                let nc = nc.clone();
-                let specific_subject = specific_subject.clone();
-                let session_clone = session.clone();
-                let session_id_clone = session_id_clone.clone();
-                let tracker_sender_inner = tracker_sender_wt.clone();
-                tokio::spawn(async move {
-                    let data_tracker = DataTracker::new(tracker_sender_inner);
-                    let result = uni_stream.read_to_end(usize::MAX).await;
-                    match result {
-                        Ok(buf) => {
-                            let buf_size = buf.len() as u64;
-                            // Track data received
-                            data_tracker.track_received(&session_id_clone, buf_size);
-
-                            // Check if this is an RTT packet that should be echoed back
-                            if is_rtt_packet(&buf) {
-                                trace!("Echoing RTT packet back via WebTransport");
-                                match session_clone.open_uni().await {
-                                    Ok(mut echo_stream) => {
-                                        if let Err(e) = echo_stream.write_all(&buf).await {
-                                            error!("Error echoing RTT packet: {}", e);
-                                        } else {
-                                            // Track data sent for echo
-                                            data_tracker.track_sent(&session_id_clone, buf_size);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Error opening echo stream: {}", e);
-                                    }
-                                }
-                            } else if health_processor::is_health_packet_bytes(&buf) {
-                                // Process health packet for diagnostics (don't relay)
-                                debug!("WT-SERVER: Received health packet via unidirectional stream (size: {} bytes) - processing locally", buf.len());
-                                health_processor::process_health_packet_bytes(&buf, nc.clone());
-                            } else {
-                                // Normal packet processing - publish to NATS
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        nc.publish(specific_subject.clone(), buf.into()).await
-                                    {
-                                        error!(
-                                            "Error publishing to subject {}: {}",
-                                            &specific_subject, e
-                                        );
-                                    }
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error reading from unidirectional stream: {}", e);
-                        }
-                    }
-                });
-            }
-            info!("WebTransport unidirectional receive task ended");
-        });
-    }
-
-    // WebTransport datagram receive task
-    {
-        let session = session.clone();
-        let session_id_clone = session_id.clone();
-        let tracker_sender_wt_datagram = tracker_sender.clone();
-        join_set.spawn(async move {
-            let data_tracker = DataTracker::new(tracker_sender_wt_datagram);
-            while let Ok(buf) = session.read_datagram().await {
-                let buf_size = buf.len() as u64;
-                // Track data received
-                data_tracker.track_received(&session_id_clone, buf_size);
-
-                // Check if this is an RTT packet that should be echoed back
-                if is_rtt_packet(&buf) {
-                    debug!("Echoing RTT datagram back via WebTransport");
-                    if let Err(e) = session.send_datagram(buf.clone()) {
-                        error!("Error echoing RTT datagram: {}", e);
-                    } else {
-                        // Track data sent for echo
-                        data_tracker.track_sent(&session_id_clone, buf_size);
-                    }
-                } else if health_processor::is_health_packet_bytes(&buf) {
-                    // Process health packet for diagnostics (don't relay)
-                    health_processor::process_health_packet_bytes(&buf, nc.clone());
-                } else if buf.as_ref() == KEEP_ALIVE_PING {
-                    // Keep-alive packet - don't relay, just ignore
-                } else {
-                    // Normal datagram processing - publish to NATS
-                    let nc = nc.clone();
-                    if let Err(e) = nc.publish(specific_subject.clone(), buf).await {
-                        error!("Error publishing to subject {}: {}", specific_subject, e);
-                    }
-                }
-            }
-            info!("WebTransport datagram receive task ended");
-        });
-    }
-
-    join_set.join_next().await;
-    join_set.shutdown().await;
-
-    // Track connection end for metrics
-    send_connection_ended(&tracker_sender, session_id.clone());
-
-    warn!("Finished handling session: {session_id} (username: {username}, lobby: {lobby_id})");
+    warn!("Finished handling WebTransport session for {username} in {lobby_id}");
     Ok(())
 }
+
+// Note: handle_send_connection_started and handle_send_connection_ended are now
+// handled by the WtChatSession actor internally via ChatServer coordination.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protobuf::Message as ProtobufMessage;
     use rustls::crypto::CryptoProvider;
     use std::time::Duration;
     use videocall_types::protos::media_packet::media_packet::MediaType as VcMediaType;
@@ -514,12 +392,44 @@ mod tests {
     use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType as VcPacketType;
     use videocall_types::protos::packet_wrapper::PacketWrapper as VcPacketWrapper;
 
+    const KEEP_ALIVE_PING: &[u8] = b"ping";
+
     async fn start_webtransport_server() -> tokio::task::JoinHandle<()> {
         if let Err(e) = CryptoProvider::install_default(rustls::crypto::ring::default_provider()) {
             error!("Error installing crypto provider: {e:?}");
         }
+        use crate::actors::chat_server::ChatServer;
+        use crate::server_diagnostics::ServerDiagnostics;
+        use crate::session_manager::SessionManager;
         use crate::webtransport::{self, Certs};
+        use actix::Actor;
         use std::net::ToSocketAddrs;
+
+        // Connect to NATS
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        // Start ChatServer actor
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        // Create SessionManager
+        let session_manager = SessionManager::new();
+
+        // Create connection tracker
+        let (_, tracker_sender, tracker_receiver) =
+            ServerDiagnostics::new_with_channel(nats_client.clone());
+
+        // Clone nats_client for use in both spawned tasks
+        let nats_client_for_tracker = nats_client.clone();
+
+        // Start tracker message loop
+        actix_rt::spawn(async move {
+            let connection_tracker =
+                std::sync::Arc::new(ServerDiagnostics::new(nats_client_for_tracker));
+            connection_tracker.run_message_loop(tracker_receiver).await;
+        });
 
         // Start WebTransport server
         let opt = webtransport::WebTransportOpt {
@@ -539,8 +449,16 @@ mod tests {
             },
         };
 
-        tokio::spawn(async move {
-            if let Err(e) = webtransport::start(opt).await {
+        actix_rt::spawn(async move {
+            if let Err(e) = webtransport::start(
+                opt,
+                chat_server,
+                nats_client,
+                tracker_sender,
+                session_manager,
+            )
+            .await
+            {
                 eprintln!("WebTransport server error: {e}");
             }
         })
@@ -626,6 +544,25 @@ mod tests {
         Ok(client.connect(url).await?)
     }
 
+    /// Connect via the token-based endpoint: GET /lobby?token=<JWT>
+    async fn connect_client_with_token(
+        token: &str,
+    ) -> Result<web_transport_quinn::Session, Box<dyn std::error::Error>> {
+        let base = std::env::var("WEBTRANSPORT_URL")
+            .unwrap_or_else(|_| "https://127.0.0.1:4433".to_string());
+        let url_str = format!(
+            "{}/lobby?token={}",
+            base.trim_end_matches('/'),
+            urlencoding::encode(token)
+        );
+        let url = url::Url::parse(&url_str)?;
+
+        let client = unsafe {
+            web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
+        };
+        Ok(client.connect(url).await?)
+    }
+
     async fn send_packet(session: &web_transport_quinn::Session, bytes: Vec<u8>) {
         let mut s = session.open_uni().await.expect("open uni");
         s.write_all(&bytes).await.expect("write packet");
@@ -640,7 +577,44 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    /// Wait for a session to receive its MEETING_STARTED packet.
+    /// The server subscribes to NATS BEFORE sending MEETING_STARTED, so receiving
+    /// this packet confirms the session is fully initialized and ready to relay packets.
+    async fn wait_for_session_ready(
+        session: &web_transport_quinn::Session,
+        name: &str,
+    ) -> Result<(), &'static str> {
+        println!("Waiting for {name} to receive MEETING_STARTED...");
+        let session_clone = session.clone();
+        wait_for_condition(
+            || {
+                let session = session_clone.clone();
+                async move {
+                    if let Ok(mut stream) = session.accept_uni().await {
+                        if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                            if !buf.is_empty() {
+                                if let Ok(wrapper) = VcPacketWrapper::parse_from_bytes(&buf) {
+                                    if wrapper.packet_type
+                                        == videocall_types::protos::packet_wrapper::packet_wrapper::PacketType::MEETING.into()
+                                    {
+                                        println!("✓ {name} received MEETING_STARTED - session ready");
+                                        return Some(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[actix_rt::test]
     async fn test_relay_packet_webtransport_between_two_clients() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -648,11 +622,17 @@ mod tests {
             .with_writer(std::io::stderr)
             .try_init();
 
+        // FF=off: this test verifies packet relay without JWT.
+        // JWT validation is tested separately in jwt_integration_tests.rs.
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
         // Wrap entire test with 15 second timeout
         let test_result = tokio::time::timeout(Duration::from_secs(15), async {
             test_relay_packet_impl().await
         })
         .await;
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
 
         match test_result {
             Ok(Ok(())) => println!("Test completed successfully"),
@@ -685,6 +665,15 @@ mod tests {
             .await
             .expect("connect client B");
         println!("Client B connected!");
+
+        // Wait for both sessions to be fully ready (receive MEETING_STARTED)
+        // This confirms NATS subscriptions are established
+        wait_for_session_ready(&session_a, "client A")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        wait_for_session_ready(&session_b, "client B")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // Start keep-alive tasks that will be cancelled when test ends
         let session_a_keep = session_a.clone();
@@ -721,39 +710,41 @@ mod tests {
         let bytes = packet.write_to_bytes().expect("serialize wrapper");
 
         println!("Sending packet from A to B (size: {} bytes)", bytes.len());
-        // Send from A
         send_packet(&session_a, bytes.clone()).await;
         println!("Packet sent from A!");
 
-        // Give NATS time to relay the message
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
+        // Wait for B to receive the packet
         println!("Waiting for packet on B...");
-        // Receive on B
-        let condition = || async {
-            if let Ok(mut stream) = session_b.accept_uni().await {
-                if let Ok(buf) = stream.read_to_end(usize::MAX).await {
-                    if !buf.is_empty() {
-                        println!("Received packet on B (size: {} bytes)", buf.len());
-                        return Some(buf);
+        let session_b_recv = session_b.clone();
+        let received = wait_for_condition(
+            || {
+                let session = session_b_recv.clone();
+                async move {
+                    if let Ok(mut stream) = session.accept_uni().await {
+                        if let Ok(buf) = stream.read_to_end(usize::MAX).await {
+                            if !buf.is_empty() {
+                                println!("Received packet on B (size: {} bytes)", buf.len());
+                                return Some(buf);
+                            }
+                        }
                     }
+                    None
                 }
-            }
-            None
-        };
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("Should receive packet from A on B");
 
-        let received =
-            wait_for_condition(condition, Duration::from_secs(5), Duration::from_millis(50))
-                .await
-                .expect("timely receive");
-
+        println!("Packet successfully relayed!");
         assert_eq!(bytes, received, "B must receive the exact bytes sent by A");
 
         println!("=== INTEGRATION TEST PASSED ===");
         Ok(())
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[actix_rt::test]
     async fn test_lobby_isolation() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -811,8 +802,30 @@ mod tests {
             .expect("connect charlie");
         println!("✓ Charlie connected to lobby-secure");
 
+        // Wait for all sessions to be fully ready (receive MEETING_STARTED)
+        // This confirms NATS subscriptions are established before sending test packets
+        wait_for_session_ready(&session_a, "Alice")
+            .await
+            .expect("Alice session ready");
+        wait_for_session_ready(&session_b, "Bob")
+            .await
+            .expect("Bob session ready");
+        wait_for_session_ready(&session_c, "Charlie")
+            .await
+            .expect("Charlie session ready");
+
         // Keep connections alive
         start_keep_alive_tasks(&session_a, &session_b, &session_c).await;
+
+        // Wait for Alice to receive Charlie's MEETING_STARTED broadcast
+        // (Alice and Charlie are in the same room, so Alice gets notified when Charlie joins)
+        wait_for_condition_bool(
+            || async move { get_test_packet_counter_for_user(user_a) >= 2 },
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("Alice should receive Charlie's MEETING_STARTED");
 
         // ========== PHASE 1: CROSS-LOBBY ISOLATION TEST ==========
         println!("\n--- Phase 1: Testing Cross-Lobby Isolation ---");
@@ -829,7 +842,15 @@ mod tests {
             println!("✓ Alice sent packet #{i}");
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Wait for Charlie to receive Alice's 3 packets
+        let expected_charlie_count = count_c + 3;
+        wait_for_condition_bool(
+            || async move { get_test_packet_counter_for_user(user_c) >= expected_charlie_count },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("Charlie should receive Alice's packets");
 
         let [alice_count_after, bob_count_after, charlie_count_after] =
             get_all_user_counts(&[user_a, user_b, user_c])[..]
@@ -879,7 +900,15 @@ mod tests {
             println!("✓ Charlie sent reply #{i}");
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        // Wait for Alice to receive Charlie's 2 packets
+        let expected_alice_count = alice_before_bidi + 2;
+        wait_for_condition_bool(
+            || async move { get_test_packet_counter_for_user(user_a) >= expected_alice_count },
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("Alice should receive Charlie's replies");
 
         let [alice_after_bidi, bob_after_bidi, charlie_after_bidi] =
             get_all_user_counts(&[user_a, user_b, user_c])[..]
@@ -925,7 +954,20 @@ mod tests {
         send_packet(&session_b, packet).await;
         println!("✓ Bob sent packet in lobby-public");
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Wait to verify isolation - expect this to timeout since no one should receive Bob's packet
+        // We use a short timeout since we're verifying nothing happens
+        let _ = wait_for_condition_bool(
+            || async move {
+                // This should never become true - Bob is alone in his lobby
+                get_test_packet_counter_for_user(user_a) > alice_before_bob
+                    || get_test_packet_counter_for_user(user_b) > bob_before_bob
+                    || get_test_packet_counter_for_user(user_c) > charlie_before_bob
+            },
+            Duration::from_millis(300), // Short timeout - we expect this to fail
+            Duration::from_millis(50),
+        )
+        .await;
+        // We don't care if this times out - that's expected behavior
 
         let [alice_after_bob, bob_after_bob, charlie_after_bob] =
             get_all_user_counts(&[user_a, user_b, user_c])[..]
@@ -1028,5 +1070,301 @@ mod tests {
             .iter()
             .map(|user| get_test_packet_counter_for_user(user))
             .collect()
+    }
+
+    // ==========================================================================
+    // Meeting Lifecycle Integration Test (WebTransport)
+    // Tests: meeting creation, participant join/leave, meeting end
+    // ==========================================================================
+
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn test_meeting_lifecycle_webtransport() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_writer(std::io::stderr)
+            .try_init();
+
+        // FF=off: this test verifies basic session lifecycle without JWT.
+        // JWT validation is tested separately in jwt_integration_tests.rs.
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let test_result = tokio::time::timeout(Duration::from_secs(30), async {
+            test_meeting_lifecycle_impl().await
+        })
+        .await;
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+
+        match test_result {
+            Ok(Ok(())) => println!("Test completed successfully"),
+            Ok(Err(e)) => panic!("Test failed: {e}"),
+            Err(_) => panic!("Test timed out after 30 seconds"),
+        }
+    }
+
+    async fn test_meeting_lifecycle_impl() -> anyhow::Result<()> {
+        println!("=== STARTING SESSION LIFECYCLE TEST (WebTransport) ===");
+
+        let room_id = "wt-meeting-lifecycle-test";
+
+        println!("Starting WebTransport server...");
+        let _wt_handle = start_webtransport_server().await;
+        wait_for_server_ready().await;
+        println!("✓ Server ready");
+
+        // ========== STEP 1: First user connects ==========
+        println!("\n--- Step 1: Alice connects (first participant) ---");
+
+        let session_alice = connect_client("alice", room_id)
+            .await
+            .expect("connect alice");
+        wait_for_session_ready(&session_alice, "Alice")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("✓ Alice connected");
+
+        // ========== STEP 2: Second user connects ==========
+        println!("\n--- Step 2: Bob connects (second participant) ---");
+
+        let session_bob = connect_client("bob", room_id).await.expect("connect bob");
+        wait_for_session_ready(&session_bob, "Bob")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("✓ Bob connected");
+
+        // ========== STEP 3: Third user connects ==========
+        println!("\n--- Step 3: Charlie connects (third participant) ---");
+
+        let session_charlie = connect_client("charlie", room_id)
+            .await
+            .expect("connect charlie");
+        wait_for_session_ready(&session_charlie, "Charlie")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("✓ Charlie connected");
+
+        // ========== STEP 4: Charlie disconnects ==========
+        println!("\n--- Step 4: Charlie disconnects ---");
+        session_charlie.close(0u32, b"test disconnect");
+        drop(session_charlie);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        println!("✓ Charlie disconnected");
+
+        // ========== STEP 5: Bob disconnects ==========
+        println!("\n--- Step 5: Bob disconnects ---");
+        session_bob.close(0u32, b"test disconnect");
+        drop(session_bob);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        println!("✓ Bob disconnected");
+
+        // ========== STEP 6: Alice (last) disconnects ==========
+        println!("\n--- Step 6: Alice disconnects - session ends ---");
+        session_alice.close(0u32, b"test disconnect");
+        drop(session_alice);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        println!("✓ Alice disconnected");
+
+        println!("\n=== SESSION LIFECYCLE TEST PASSED (WebTransport) ===");
+        Ok(())
+    }
+
+    /// Test helper: create a database pool for future JWT flow integration tests.
+    #[allow(dead_code)]
+    async fn get_test_pool() -> sqlx::PgPool {
+        let database_url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for this test");
+        sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("Failed to connect to test database")
+    }
+
+    // =====================================================================
+    // JWT token-based WebTransport tests
+    // =====================================================================
+
+    const JWT_SECRET: &str = "test-secret-for-integration-tests";
+    const TOKEN_TTL_SECS: i64 = 600;
+
+    /// Set up env and start the real WT server for JWT tests.
+    async fn setup_jwt_wt() {
+        std::env::set_var("JWT_SECRET", JWT_SECRET);
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+        let _handle = start_webtransport_server().await;
+        wait_for_server_ready().await;
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_valid_token_connects() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "alice@test.com",
+            "wt-jwt-room-1",
+            true,
+            "Alice",
+        )
+        .expect("generate token");
+
+        let session = connect_client_with_token(&token)
+            .await
+            .expect("valid token should connect via WebTransport");
+        wait_for_session_ready(&session, "alice")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_expired_token_rejected() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            -120,
+            "alice@test.com",
+            "wt-jwt-room-2",
+            false,
+            "Alice",
+        )
+        .expect("generate token");
+
+        let result = connect_client_with_token(&token).await;
+        assert!(
+            result.is_err(),
+            "expired token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_wrong_secret_rejected() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            "completely-different-secret",
+            TOKEN_TTL_SECS,
+            "alice@test.com",
+            "wt-jwt-room-3",
+            false,
+            "Alice",
+        )
+        .expect("generate token");
+
+        let result = connect_client_with_token(&token).await;
+        assert!(
+            result.is_err(),
+            "wrong-secret token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_garbage_token_rejected() {
+        setup_jwt_wt().await;
+
+        let result = connect_client_with_token("not.a.real.jwt").await;
+        assert!(
+            result.is_err(),
+            "garbage token should be rejected via WebTransport"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_token_identity_extracted() {
+        setup_jwt_wt().await;
+
+        let token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "bob@example.com",
+            "wt-special-room",
+            false,
+            "Bob",
+        )
+        .expect("generate token");
+
+        let session = connect_client_with_token(&token)
+            .await
+            .expect("token with identity should connect");
+        wait_for_session_ready(&session, "bob")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_deprecated_endpoint_works_ff_off() {
+        setup_jwt_wt().await;
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+
+        let session = connect_client("alice", "wt-jwt-room-6")
+            .await
+            .expect("deprecated endpoint with FF=off should work");
+        wait_for_session_ready(&session, "alice")
+            .await
+            .expect("should receive MEETING_STARTED");
+        session.close(0u32, b"done");
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_deprecated_endpoint_rejected_ff_on() {
+        setup_jwt_wt().await;
+        videocall_types::FeatureFlags::set_meeting_management_override(true);
+
+        let result = connect_client("alice", "wt-jwt-room-7").await;
+        assert!(
+            result.is_err(),
+            "deprecated endpoint with FF=on should be rejected"
+        );
+
+        videocall_types::FeatureFlags::clear_meeting_management_override();
+    }
+
+    #[actix_rt::test]
+    async fn test_wt_host_and_attendee_tokens_both_connect() {
+        setup_jwt_wt().await;
+
+        let room = "wt-standup";
+
+        let host_token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "host@co.com",
+            room,
+            true,
+            "Host",
+        )
+        .expect("generate host token");
+
+        let attendee_token = meeting_api::token::generate_room_token(
+            JWT_SECRET,
+            TOKEN_TTL_SECS,
+            "attendee@co.com",
+            room,
+            false,
+            "Attendee",
+        )
+        .expect("generate attendee token");
+
+        let host = connect_client_with_token(&host_token)
+            .await
+            .expect("host token should connect");
+        wait_for_session_ready(&host, "host")
+            .await
+            .expect("host should receive MEETING_STARTED");
+
+        let attendee = connect_client_with_token(&attendee_token)
+            .await
+            .expect("attendee token should connect");
+        wait_for_session_ready(&attendee, "attendee")
+            .await
+            .expect("attendee should receive MEETING_STARTED");
+
+        host.close(0u32, b"done");
+        attendee.close(0u32, b"done");
     }
 }

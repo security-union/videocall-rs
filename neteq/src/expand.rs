@@ -16,10 +16,6 @@
  * conditions.
  */
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static RNG_STATE: AtomicU64 = AtomicU64::new(1);
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExpandPhase {
     /// Expand operation (concealment)
@@ -34,25 +30,23 @@ pub enum ExpandPhase {
 pub enum ExpandResult {
     Success,
     NoExpand,
-    Error,
 }
 
 #[derive(Debug)]
 pub struct Expand {
     used_input_samples: usize,
     overlap_length: usize,
+    rng_state: u64,
 }
+
 pub struct ExpandFactory;
 
 impl ExpandFactory {
-    /// Create an accelerate processor
+    /// Create an expand processor
     pub fn create_expand(sample_rate: u32, _channels: u8) -> Box<Expand> {
         Box::new(Expand::new(sample_rate))
     }
 }
-
-// Safe because Expand only contains owned numeric data.
-unsafe impl Send for Expand {}
 
 impl Expand {
     /// Create a new expand processor
@@ -60,6 +54,7 @@ impl Expand {
         Self {
             used_input_samples: 0,
             overlap_length: Self::calculate_overlap_length(sample_rate),
+            rng_state: 1,
         }
     }
 
@@ -87,7 +82,7 @@ impl Expand {
 
         // Generate concealment audio (simple noise for now)
         for sample in output.iter_mut() {
-            *sample = (Self::simple_random() - 0.5) * 0.0001; // Very quiet noise
+            *sample = (self.simple_random() - 0.5) * 0.0001; // Very quiet noise
         }
 
         if phase == ExpandPhase::ExpandStart {
@@ -115,7 +110,7 @@ impl Expand {
 
         self.used_input_samples = samples_required;
 
-        return ExpandResult::Success;
+        ExpandResult::Success
     }
 
     fn calculate_overlap_length(sample_rate: u32) -> usize {
@@ -127,13 +122,11 @@ impl Expand {
         self.used_input_samples
     }
 
-    fn simple_random() -> f32 {
-        let mut x = RNG_STATE.load(Ordering::Relaxed);
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        RNG_STATE.store(x, Ordering::Relaxed);
-        ((x as u32) >> 16) as f32 / 65536.0
+    fn simple_random(&mut self) -> f32 {
+        self.rng_state ^= self.rng_state << 13;
+        self.rng_state ^= self.rng_state >> 7;
+        self.rng_state ^= self.rng_state << 17;
+        ((self.rng_state as u32) >> 16) as f32 / 65536.0
     }
 }
 
@@ -155,7 +148,6 @@ mod tests {
     #[test]
     fn test_expand_processing() {
         let mut expand = Expand::new(16000);
-        // let input = generate_test_signal(1600, 440.0, 16000); // 100ms of 440Hz tone
 
         let input = vec![];
         let mut output = vec![0.0; 800];
@@ -166,9 +158,9 @@ mod tests {
 
         let result = expand.process(&input, &mut output, ExpandPhase::Expand);
 
-        // Should successfully accelerate
+        // Should successfully generate concealment noise
         assert!(matches!(result, ExpandResult::Success));
-        // Should have recorder the number of used samples
+        // Should have recorded the number of used samples
         assert!(expand.get_used_input_samples() == 0);
         // Should output non-silent signal
         let output_energy = calculate_energy(&output);
@@ -178,7 +170,6 @@ mod tests {
     #[test]
     fn test_expand_start() {
         let mut expand = Expand::new(16000);
-        // let input = generate_test_signal(1600, 440.0, 16000); // 100ms of 440Hz tone
 
         let input = vec![1.0; 48];
         let mut output = vec![0.0; 800];
@@ -189,15 +180,15 @@ mod tests {
 
         let result = expand.process(&input, &mut output, ExpandPhase::ExpandStart);
 
-        // Should successfully accelerate
+        // Should successfully crossfade into concealment
         assert!(matches!(result, ExpandResult::Success));
-        // Should have recorder the number of used samples
+        // Should have recorded the number of used samples
         assert!(expand.get_used_input_samples() == 48);
         // Should output non-silent signal
         let output_energy = calculate_energy(&output);
         assert!(output_energy > 0.000000000000001);
 
-        // Beginning of the signal should have higher energy then the rest
+        // Beginning of the signal should have higher energy than the rest
         let start_energy = calculate_energy(&output[..48]);
         assert!(start_energy > 0.001);
         let other_energy = calculate_energy(&output[48..]);
@@ -207,7 +198,6 @@ mod tests {
     #[test]
     fn test_expand_end() {
         let mut expand = Expand::new(16000);
-        // let input = generate_test_signal(1600, 440.0, 16000); // 100ms of 440Hz tone
 
         let input = vec![1.0; 48];
         let mut output = vec![0.0; 800];
@@ -218,15 +208,15 @@ mod tests {
 
         let result = expand.process(&input, &mut output, ExpandPhase::ExpandEnd);
 
-        // Should successfully accelerate
+        // Should successfully crossfade out of concealment
         assert!(matches!(result, ExpandResult::Success));
-        // Should have recorder the number of used samples
+        // Should have recorded the number of used samples
         assert!(expand.get_used_input_samples() == 48);
         // Should output non-silent signal
         let output_energy = calculate_energy(&output);
         assert!(output_energy > 0.000000000000001);
 
-        // Beginning of the signal should have higher energy then the rest
+        // End of the signal should have higher energy than the rest
         let end_start = output.len() - 48;
         let end_energy = calculate_energy(&output[end_start..]);
         assert!(end_energy > 0.001);

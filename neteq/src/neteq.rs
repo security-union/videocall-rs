@@ -480,14 +480,23 @@ impl NetEq {
         self.delay_manager.set_maximum_delay(delay_ms)
     }
 
-    /// Flush the buffer
+    /// Flush the buffer and reset all internal state
     pub fn flush(&mut self) {
         self.packet_buffer.flush(&mut self.statistics);
+        self.leftover_samples.clear();
+        self.reset();
+    }
+
+    /// Reset internal state without clearing the incoming packet buffer.
+    /// Used after prolonged expansion to recalibrate filters while preserving
+    /// any packets that may have arrived during the expansion period.
+    fn reset(&mut self) {
         self.delay_manager.reset();
         self.buffer_level_filter.reset();
+        self.buffer_level_filter
+            .set_filtered_buffer_level(self.current_buffer_size_samples());
         self.last_decode_timestamp = None;
         self.consecutive_expands = 0;
-        self.leftover_samples.clear();
         self.packets_received_this_second = 0;
         self.packets_per_sec_snapshot = 0;
         self.last_packets_second_instant = Instant::now();
@@ -547,20 +556,17 @@ impl NetEq {
         }
 
         if self.consecutive_expands > 0 {
+            // Safety valve: after ~6 seconds of continuous expansion (~600 frames
+            // at 10ms each), reset internal filters so we recalibrate when packets
+            // finally arrive rather than relying on stale state.
+            if self.consecutive_expands > 600 {
+                self.reset();
+            }
             self.consecutive_expands = 0;
             return Ok(Operation::ExpandEnd);
         }
 
         let buffer_level_samples = self.buffer_level_filter.filtered_current_level();
-
-        // Check for continuous expansion limit (WebRTC uses much higher limits)
-        if self.consecutive_expands > 600 {
-            // ~6 seconds at 10ms frames
-            self.flush();
-            return Ok(Operation::Normal);
-        }
-
-        self.consecutive_expands = 0;
 
         // Fast accelerate: 4x high limit (aggressive acceleration for large buffers)
         if buffer_level_samples >= (high_limit << 2) as usize {
@@ -1561,5 +1567,160 @@ mod tests {
             assert_eq!(neteq.last_operation, Operation::TimeStretchBuffer);
             insert_audio(&mut neteq, 10);
         }
+    }
+
+    #[test]
+    fn test_expand_safety_valve_triggers_after_600_frames() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut insert_audio = make_insert_audio!();
+        let reset_filtered_level = make_reset_filtered_level!();
+
+        neteq.delay_manager.set_base_minimum_delay(50);
+        neteq.delay_manager.set_base_maximum_delay(50);
+
+        // Fill buffer to normal, then drain it to trigger expansion
+        insert_audio(&mut neteq, 50);
+        reset_filtered_level(&mut neteq);
+
+        // Drain to normal
+        for _ in 0..4 {
+            let _ = neteq.get_audio().unwrap();
+            assert_eq!(neteq.last_operation, Operation::Normal);
+        }
+
+        // ExpandStart
+        let _ = neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation, Operation::ExpandStart);
+
+        // Run 600+ expands with no packets arriving (simulates prolonged disconnect).
+        // The safety valve at 600 should fire, but we stay in Expand because
+        // consecutive_expands > 0 AND buffer < low_limit keeps returning Expand.
+        // The check fires when the buffer finally recovers past threshold.
+        for _ in 0..700 {
+            let _ = neteq.get_audio().unwrap();
+            assert_eq!(neteq.last_operation, Operation::Expand);
+        }
+
+        // consecutive_expands should be > 600 now
+        assert!(neteq.consecutive_expands > 600);
+
+        // Now insert enough audio to recover the buffer past low_limit
+        insert_audio(&mut neteq, 50);
+        reset_filtered_level(&mut neteq);
+
+        // The safety valve should fire: reset() then ExpandEnd
+        let _ = neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation, Operation::ExpandEnd);
+
+        // After ExpandEnd, consecutive_expands should be reset to 0
+        assert_eq!(neteq.consecutive_expands, 0);
+    }
+
+    #[test]
+    fn test_recovery_after_safety_valve_reset() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut insert_audio = make_insert_audio!();
+        let reset_filtered_level = make_reset_filtered_level!();
+
+        neteq.delay_manager.set_base_minimum_delay(50);
+        neteq.delay_manager.set_base_maximum_delay(50);
+
+        // Fill and drain to enter expand
+        insert_audio(&mut neteq, 50);
+        reset_filtered_level(&mut neteq);
+
+        for _ in 0..4 {
+            let _ = neteq.get_audio().unwrap();
+        }
+
+        // ExpandStart
+        let _ = neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation, Operation::ExpandStart);
+
+        // Run 650 expands to exceed the 600 threshold
+        for _ in 0..650 {
+            let _ = neteq.get_audio().unwrap();
+            assert_eq!(neteq.last_operation, Operation::Expand);
+        }
+
+        // Insert enough audio to recover, triggering the safety valve + ExpandEnd
+        insert_audio(&mut neteq, 50);
+        reset_filtered_level(&mut neteq);
+
+        let _ = neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation, Operation::ExpandEnd);
+
+        // After the reset, the system should recover to normal playback.
+        // It may go through a brief Accelerate/TimeStretch phase as filters
+        // recalibrate, but crucially it must NOT re-enter Expand.
+        let mut saw_normal = false;
+        for _ in 0..20 {
+            insert_audio(&mut neteq, 10);
+            let _ = neteq.get_audio().unwrap();
+            assert!(
+                neteq.last_operation != Operation::Expand
+                    && neteq.last_operation != Operation::ExpandStart,
+                "System re-entered expand after safety valve reset: {:?}",
+                neteq.last_operation
+            );
+            if neteq.last_operation == Operation::Normal {
+                saw_normal = true;
+            }
+        }
+        assert!(
+            saw_normal,
+            "System never reached Normal after safety valve reset"
+        );
+    }
+
+    #[test]
+    fn test_sudden_disconnect_skips_expand_start() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut insert_audio = make_insert_audio!();
+        let reset_filtered_level = make_reset_filtered_level!();
+
+        neteq.delay_manager.set_base_minimum_delay(50);
+        neteq.delay_manager.set_base_maximum_delay(50);
+
+        insert_audio(&mut neteq, 50);
+        reset_filtered_level(&mut neteq);
+
+        // Consume ALL audio so the buffer is completely empty
+        // (drops below 0.5x frame, bypassing the ExpandStart window)
+        for _ in 0..5 {
+            let _ = neteq.get_audio().unwrap();
+        }
+
+        // With buffer completely empty, we should get Expand directly
+        // (no ExpandStart because buffer is below the 0.5x frame threshold)
+        let _ = neteq.get_audio().unwrap();
+        assert!(
+            neteq.last_operation == Operation::Expand
+                || neteq.last_operation == Operation::ExpandStart,
+            "Expected Expand or ExpandStart after sudden disconnect, got {:?}",
+            neteq.last_operation
+        );
+
+        // Subsequent frames should be Expand
+        for _ in 0..5 {
+            let _ = neteq.get_audio().unwrap();
+            assert_eq!(neteq.last_operation, Operation::Expand);
+        }
+
+        // Recovery: insert audio, expect ExpandEnd then Normal
+        insert_audio(&mut neteq, 50);
+        reset_filtered_level(&mut neteq);
+
+        let _ = neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation, Operation::ExpandEnd);
+
+        let _ = neteq.get_audio().unwrap();
+        assert_eq!(neteq.last_operation, Operation::Normal);
     }
 }

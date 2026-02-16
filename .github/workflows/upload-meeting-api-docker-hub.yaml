@@ -1,0 +1,47 @@
+name: Publish Meeting API to Docker image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - feature/meeting-backend-api
+    paths:
+      - 'meeting-api/**'
+      - 'videocall-meeting-types/**'
+      - Dockerfile.meeting-api
+      - Cargo.lock
+      - Cargo.toml
+
+jobs:
+  push_to_registry:
+    name: Push Meeting API Docker image to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+        id: checkout
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract SHA
+        id: extract_sha
+        run: echo "sha8=$(echo ${GITHUB_SHA::8})" >> "$GITHUB_OUTPUT"
+
+      - name: Extract branch name
+        id: extract_branch
+        run: echo "branch=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's/\//-/g')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Meeting API Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.meeting-api
+          push: true
+          tags: |
+            securityunion/videocall-meeting-api:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/videocall-meeting-api:latest

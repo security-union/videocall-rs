@@ -24,9 +24,13 @@ An open-source, high-performance video conferencing platform built with Rust, pr
   - [Local/Docker](#localdocker-start-yewsh)
   - [Kubernetes/Helm](#kuberneteshelm-configmap-configjsyaml)
 - [Usage](#usage)
+- [Meeting Management](#meeting-management)
 - [Performance](#performance)
 - [Security](#security)
 - [Feature Flags](#feature-flags)
+- [Testing](#testing)
+  - [UI Testing (yew-ui)](#ui-testing-yew-ui)
+  - [Backend Testing (actix-api)](#backend-testing-actix-api)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Project Structure](#project-structure)
@@ -240,6 +244,45 @@ videocall-cli stream \
 
 For detailed information about the CLI tool and all available options, see the [videocall-cli README](videocall-cli/README.md).
 
+## Meeting Management
+
+videocall.rs includes a comprehensive meeting management system with ownership, waiting rooms, and host controls.
+
+### Key Features
+
+- **Meeting Ownership**: Each meeting has an owner (the creator) identified by their email
+- **My Meetings**: Users can view and manage all meetings they own from the home page
+- **Waiting Room**: Non-owners enter a waiting room and must be admitted by an existing participant
+- **Host Identification**: The meeting owner is visually identified with "(Host)" in the UI
+- **Soft Delete**: Owners can delete their meetings; deleted meeting IDs can be reused
+
+### Meeting Workflow
+
+1. **Create/Join**: Navigate to `/meeting/{meeting-id}` - if the meeting doesn't exist, you become the owner
+2. **Start/Join Button**: Owners see "Start Meeting", others see "Join Meeting"
+3. **Waiting Room**: Non-owners wait for admission; admitted participants can manage the waiting room
+4. **Auto-Join**: When admitted from the waiting room, participants automatically enter the meeting
+
+### Documentation
+
+For detailed information about the meeting system:
+
+- **[Meeting Ownership & Workflow](docs/MEETING_OWNERSHIP.md)** - Ownership model, lifecycle, and user workflows
+- **[Meeting API Reference](docs/MEETING_API.md)** - Complete API endpoint documentation
+
+### Enabling Meeting Management
+
+Meeting management requires the `FEATURE_MEETING_MANAGEMENT` flag:
+
+```bash
+export FEATURE_MEETING_MANAGEMENT=true
+```
+
+Or in Docker:
+```bash
+docker run -e FEATURE_MEETING_MANAGEMENT=true ...
+```
+
 ## Performance
 
 videocall.rs has been benchmarked and optimized for the following scenarios:
@@ -309,6 +352,72 @@ The following values are recognized as enabling a flag (case-insensitive):
 
 Any other value (or unset variable) is treated as `false`.
 
+## Testing
+
+### UI Testing (yew-ui)
+
+The Yew frontend uses a three-layer testing pyramid, all running in a real
+browser via `wasm-bindgen-test`:
+
+| Layer | What it covers | Example |
+|-------|---------------|---------|
+| **Unit** | `MediaDeviceList` logic — hot-plug, fallback, device switching | `videocall-client/src/media_devices/media_device_list.rs` |
+| **Component** | Isolated Yew components with mock `MediaDeviceInfo` objects | `yew-ui/tests/device_selector.rs`, `yew-ui/tests/video_control_buttons.rs` |
+| **Integration** | Real Chrome fake devices → component rendering end-to-end | `yew-ui/tests/device_integration.rs` |
+
+```bash
+# Run UI component tests natively (requires Chrome + chromedriver)
+make yew-tests
+
+# Run in headed mode to watch the browser
+make yew-tests HEADED=1
+
+# Run UI component tests in Docker (no local deps needed)
+make yew-tests-docker
+```
+
+CI runs these tests automatically via `.github/workflows/wasm-test.yaml`.
+For the full testing guide — including how to write new tests, the test harness
+API, and the mock device vs real fake device strategy — see
+**[yew-ui/TESTING.md](yew-ui/TESTING.md)**.
+
+### Backend Testing (actix-api)
+
+The `actix-api` crate contains unit and integration tests that run against real
+PostgreSQL and NATS instances, spun up via Docker Compose. Tests cover:
+
+- **Session management** — meeting creation, multi-user join/leave, host
+  controls, system email rejection
+- **WebSocket transport** — full meeting lifecycle over WebSocket connections
+- **WebTransport** — meeting lifecycle over QUIC/HTTP3
+- **Packet handling** — classification of empty, garbage, and RTT packets
+- **Metrics server** — session tracking, health metrics export, stale session
+  cleanup, concurrent access
+- **Feature flags** — behavior with `FEATURE_MEETING_MANAGEMENT` on and off
+
+Tests use `#[serial_test::serial]` because they share a database, and each test
+cleans up its own data. The infrastructure is defined in
+`docker/docker-compose.integration.yaml`, which provides:
+
+| Service | Purpose |
+|---------|---------|
+| `postgres:12` | Database for meetings and sessions |
+| `nats:2.10-alpine` | Message broker with JetStream |
+| `rust-tests` | Test runner (runs `dbmate` migrations, then `cargo test`) |
+
+```bash
+# Build + run all backend tests (PostgreSQL + NATS in Docker)
+make tests_run
+
+# Tear down test containers
+make tests_down
+```
+
+CI runs these tests automatically via `.github/workflows/cargo-test.yaml`,
+triggered on PRs that touch `actix-api/`, `videocall-types/`, or `protobuf/`.
+For the full backend testing guide — including test patterns, database cleanup,
+and how to write new tests — see **[actix-api/TESTING.md](actix-api/TESTING.md)**.
+
 ## Roadmap
 
 | Version | Target Date | Key Features |
@@ -341,7 +450,7 @@ See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information
 - **Frontend**: Rust + Yew + WebAssembly + Tailwind CSS
 - **Transport**: WebTransport (QUIC/HTTP3) + WebSockets (fallback)
 - **Build System**: Cargo + Trunk + Docker + Helm
-- **Testing**: Rust test framework + Playwright for E2E tests
+- **Testing**: `cargo test` + `wasm-bindgen-test` (browser-based UI tests) + Docker Compose (backend integration)
 
 ### Key Technical Features
 

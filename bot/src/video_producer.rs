@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info, trace, warn};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
+use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -142,6 +142,7 @@ impl VideoProducer {
                     duration: (1000.0 / framerate as f64),
                     video_metadata: Some(VideoMetadata {
                         sequence,
+                        codec: VideoCodec::VP9_PROFILE0_LEVEL10_8BIT.into(),
                         ..Default::default()
                     })
                     .into(),

@@ -15,6 +15,26 @@
     ```
 1. Deploy internal nats
 1. Create an opaque secret named "rusltemania" with the key postgres-password filled in with a random password
+1. Create required Kubernetes secrets:
+    ```bash
+    # JWT secret — shared between meeting-api and media server (websocket/webtransport).
+    # Both services must use the same secret so room access tokens can be signed
+    # by meeting-api and verified by the media server.
+    kubectl create secret generic jwt-secret \
+        --from-literal=secret="$(openssl rand -base64 32)"
+
+    # OAuth credentials — used by meeting-api for OIDC login.
+    # For confidential clients (e.g. Google), include client-secret.
+    # For public clients (e.g. Okta with PKCE), omit client-secret.
+    kubectl create secret generic oauth-credentials \
+        --from-literal=client-id='YOUR_OAUTH_CLIENT_ID' \
+        --from-literal=client-secret='YOUR_OAUTH_CLIENT_SECRET'
+
+    # Postgres credentials (if not already created with the "rusltemania" secret above)
+    kubectl create secret generic postgres-credentials \
+        --from-literal=password='YOUR_POSTGRES_PASSWORD'
+    ```
+    See [OAuth Helm Configuration](../docs/OAUTH_HELM_CONFIGURATION.md) for provider-specific setup (Google, Okta, etc.).
 1. Deploy rustlemania without SSL
 1. Deploy cert-manager
 1. Create a cert-manager issuer

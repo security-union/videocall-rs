@@ -53,6 +53,9 @@ jobs:
       - name: Run wasm-pack tests for videocall-client
         run: cd videocall-client && wasm-pack test --node
 
+      - name: Run wasm-pack tests for videocall-client (no yew-compat)
+        run: cd videocall-client && wasm-pack test --node --no-default-features
+
       - name: Run wasm-pack tests for videocall-codecs
         run: cd videocall-codecs && cargo test
       

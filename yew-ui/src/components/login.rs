@@ -31,7 +31,7 @@ use crate::constants::{login_url, oauth_provider};
 
 /// Build the login callback that redirects to the backend OAuth endpoint,
 /// forwarding any `returnTo` query parameter from the current URL.
-fn build_login_callback() -> Callback<MouseEvent> {
+pub fn build_login_callback() -> Callback<MouseEvent> {
     Callback::from(|_: MouseEvent| match login_url() {
         Ok(mut url) => {
             if let Ok(search) = window().location().search() {
@@ -46,7 +46,7 @@ fn build_login_callback() -> Callback<MouseEvent> {
 }
 
 /// Render the sign-in button for the configured OAuth provider.
-fn render_provider_button(onclick: Callback<MouseEvent>) -> Html {
+pub fn render_provider_button(onclick: Callback<MouseEvent>) -> Html {
     match oauth_provider().as_deref() {
         Some("google") => html! { <GoogleSignInButton {onclick} /> },
         Some("okta") => html! { <OktaSignInButton {onclick} /> },

@@ -15,7 +15,10 @@ mod support;
 
 use std::time::Duration;
 
-use support::{cleanup, create_mount_point, inject_app_config, remove_app_config};
+use support::{
+    cleanup, create_mount_point, inject_app_config, mock_fetch_401, mock_fetch_meetings_empty,
+    remove_app_config, restore_fetch,
+};
 use wasm_bindgen_test::*;
 use yew::platform::time::sleep;
 use yew::prelude::*;
@@ -94,6 +97,78 @@ async fn home_page_renders_with_oauth_disabled() {
     );
 
     cleanup(&mount);
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_shows_login_when_unauthenticated() {
+    inject_app_config();
+    mock_fetch_401();
+
+    let mount = create_mount_point();
+    yew::Renderer::<HomeTestWrapper>::with_root(mount.clone()).render();
+
+    // Allow the mock fetch to resolve and Yew to re-render.
+    sleep(Duration::from_millis(100)).await;
+
+    // The meetings section should show the sign-in prompt instead of an error.
+    assert!(
+        mount
+            .query_selector(".meetings-auth-prompt")
+            .unwrap()
+            .is_some(),
+        "Sign-in prompt should be visible when API returns 401"
+    );
+
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("Sign in to see your meetings"),
+        "Auth prompt text should be shown"
+    );
+
+    // A sign-in button should be rendered (generic when no provider is configured).
+    assert!(
+        mount
+            .query_selector(".generic-sign-in-button")
+            .unwrap()
+            .is_some(),
+        "Sign-in button should be rendered"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
+    remove_app_config();
+}
+
+#[wasm_bindgen_test]
+async fn home_hides_login_when_authenticated() {
+    inject_app_config();
+    mock_fetch_meetings_empty();
+
+    let mount = create_mount_point();
+    yew::Renderer::<HomeTestWrapper>::with_root(mount.clone()).render();
+
+    // Allow the mock fetch to resolve and Yew to re-render.
+    sleep(Duration::from_millis(100)).await;
+
+    // The sign-in prompt should NOT be visible.
+    assert!(
+        mount
+            .query_selector(".meetings-auth-prompt")
+            .unwrap()
+            .is_none(),
+        "Sign-in prompt should NOT be visible when API returns 200"
+    );
+
+    // Should show the empty meetings state instead.
+    let text = mount.text_content().unwrap_or_default();
+    assert!(
+        text.contains("No meetings yet"),
+        "Empty meetings message should be shown when authenticated"
+    );
+
+    cleanup(&mount);
+    restore_fetch();
     remove_app_config();
 }
 

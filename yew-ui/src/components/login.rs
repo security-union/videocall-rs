@@ -63,24 +63,18 @@ pub fn login() -> Html {
     let login = build_login_callback();
 
     html! {
-        <div style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;">
-            <div class="flex flex-col items-center px-6 py-12">
-                <div style="margin-bottom: 4rem;">
-                    <h1 style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 5.5rem; font-weight: 300; letter-spacing: -0.03em; color: #ffffff; margin: 0;">
-                        {"videocall.rs"}
-                    </h1>
-                </div>
+        <div class="login-container">
+            <div class="login-card">
+                <h1 class="login-title">{"videocall.rs"}</h1>
 
-                <div class="flex flex-col items-center">
-                    { render_provider_button(login) }
+                { render_provider_button(login) }
 
-                    <p style="margin-top: 2rem; text-align: center; font-size: 0.75rem; color: #86868b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-                        {"By signing in, you agree to our "}
-                        <a href="https://github.com/security-union/videocall-rs" style="color: #0a84ff; text-decoration: none;" class="hover:underline">{"Terms of Service"}</a>
-                        {" and "}
-                        <a href="https://github.com/security-union/videocall-rs" style="color: #0a84ff; text-decoration: none;" class="hover:underline">{"Privacy Policy"}</a>
-                    </p>
-                </div>
+                <p class="login-footer">
+                    {"By signing in, you agree to our "}
+                    <a href="https://github.com/security-union/videocall-rs">{"Terms of Service"}</a>
+                    {" and "}
+                    <a href="https://github.com/security-union/videocall-rs">{"Privacy Policy"}</a>
+                </p>
             </div>
         </div>
     }

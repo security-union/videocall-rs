@@ -1763,11 +1763,27 @@ select {
 
 .meetings-loading,
 .meetings-error,
-.meetings-empty {
+.meetings-empty,
+.meetings-auth-prompt {
   padding: 1rem;
   text-align: center;
   color: var(--text-tertiary, #8E8E93);
   font-size: 0.8125rem;
+}
+
+.meetings-auth-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.5rem 1rem;
+}
+
+.meetings-auth-text {
+  color: var(--text-secondary, rgba(255, 255, 255, 0.7));
+  font-size: 0.875rem;
+  font-weight: 500;
+  margin: 0;
 }
 
 .meetings-loading {

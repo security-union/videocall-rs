@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::login::{build_login_callback, render_provider_button};
 use crate::constants::meeting_api_client;
 use crate::routing::Route;
 use videocall_meeting_types::responses::{ListMeetingsResponse, MeetingSummary};
@@ -26,16 +27,23 @@ pub enum MeetingsListMsg {
     FetchMeetings,
     FetchSuccess(ListMeetingsResponse),
     FetchError(String),
+    FetchUnauthenticated,
     ToggleExpanded,
     DeleteMeeting(String),
     DeleteSuccess(String),
     DeleteError(String),
 }
 
+enum FetchMeetingsError {
+    Unauthenticated,
+    Other(String),
+}
+
 pub struct MeetingsList {
     meetings: Vec<MeetingSummary>,
     loading: bool,
     error: Option<String>,
+    unauthenticated: bool,
     expanded: bool,
     total: i64,
     current_user_email: Option<String>,
@@ -67,7 +75,8 @@ impl Component for MeetingsList {
             meetings: Vec::new(),
             loading: true,
             error: None,
-            expanded: true, // Show active meetings by default
+            unauthenticated: false,
+            expanded: true,
             total: 0,
             current_user_email,
         }
@@ -86,6 +95,7 @@ impl Component for MeetingsList {
             MeetingsListMsg::FetchMeetings => {
                 self.loading = true;
                 self.error = None;
+                self.unauthenticated = false;
 
                 let link = ctx.link().clone();
                 wasm_bindgen_futures::spawn_local(async move {
@@ -93,7 +103,10 @@ impl Component for MeetingsList {
                         Ok(response) => {
                             link.send_message(MeetingsListMsg::FetchSuccess(response));
                         }
-                        Err(e) => {
+                        Err(FetchMeetingsError::Unauthenticated) => {
+                            link.send_message(MeetingsListMsg::FetchUnauthenticated);
+                        }
+                        Err(FetchMeetingsError::Other(e)) => {
                             link.send_message(MeetingsListMsg::FetchError(e));
                         }
                     }
@@ -111,6 +124,11 @@ impl Component for MeetingsList {
             MeetingsListMsg::FetchError(error) => {
                 self.loading = false;
                 self.error = Some(error);
+                true
+            }
+            MeetingsListMsg::FetchUnauthenticated => {
+                self.loading = false;
+                self.unauthenticated = true;
                 true
             }
             MeetingsListMsg::ToggleExpanded => {
@@ -195,6 +213,16 @@ impl Component for MeetingsList {
                                             <div class="meetings-loading">
                                                 <span class="loading-spinner"></span>
                                                 {"Loading meetings..."}
+                                            </div>
+                                        }
+                                    } else if self.unauthenticated {
+                                        let login = build_login_callback();
+                                        html! {
+                                            <div class="meetings-auth-prompt">
+                                                <p class="meetings-auth-text">
+                                                    {"Sign in to see your meetings"}
+                                                </p>
+                                                { render_provider_button(login) }
                                             </div>
                                         }
                                     } else if let Some(error) = &self.error {
@@ -388,12 +416,13 @@ impl MeetingsList {
     }
 }
 
-async fn fetch_meetings() -> Result<ListMeetingsResponse, String> {
-    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
-    client
-        .list_meetings(20, 0)
-        .await
-        .map_err(|e| format!("{e}"))
+async fn fetch_meetings() -> Result<ListMeetingsResponse, FetchMeetingsError> {
+    let client = meeting_api_client()
+        .map_err(|e| FetchMeetingsError::Other(format!("Config error: {e}")))?;
+    client.list_meetings(20, 0).await.map_err(|e| match e {
+        videocall_meeting_client::ApiError::NotAuthenticated => FetchMeetingsError::Unauthenticated,
+        other => FetchMeetingsError::Other(format!("{other}")),
+    })
 }
 
 async fn delete_meeting(meeting_id: &str) -> Result<(), String> {

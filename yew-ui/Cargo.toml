@@ -1,6 +1,6 @@
 [package]
 name = "videocall-ui"
-version = "1.1.36"
+version = "1.1.37"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A Yew UI for the videocall project"
@@ -21,7 +21,7 @@ path = "src/main.rs"
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
 wasm-bindgen = { workspace = true }
-videocall-client = { path= "../videocall-client", version = "4.0.0" }
+videocall-client = { path= "../videocall-client", version = "4.0.1" }
 videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.3" }
 videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.0" }
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.1" }
@@ -33,7 +33,7 @@ log = "0.4.19"
 gloo-timers = "0.2.6"
 gloo-utils = "0.1"
 yew-router = "0.18"
-neteq = { path = "../neteq", version = "0.8.1", features = ["web"], default-features = false }
+neteq = { path = "../neteq", version = "0.8.2", features = ["web"], default-features = false }
 wasm-bindgen-futures = { workspace = true }
 enum-display = "0.1.4"
 futures = "0.3.31"

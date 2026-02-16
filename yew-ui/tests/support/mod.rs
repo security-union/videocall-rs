@@ -101,6 +101,71 @@ pub fn remove_app_config() {
 }
 
 // ---------------------------------------------------------------------------
+// Fetch mocking (intercept network requests in tests)
+// ---------------------------------------------------------------------------
+
+/// Override `window.fetch` to return HTTP 401 for any request.
+/// This simulates an unauthenticated session.
+///
+/// Note: reqwest on WASM reads `Response.url` to reconstruct the final URL,
+/// but manually-constructed `Response` objects have an empty `.url` property.
+/// We use `Object.defineProperty` to set it from the request URL so reqwest
+/// can parse it without hitting `RelativeUrlWithoutBase`.
+pub fn mock_fetch_401() {
+    js_sys::eval(
+        r#"
+        window.__original_fetch = window.__original_fetch || window.fetch;
+        window.fetch = function(input) {
+            var url = typeof input === 'string' ? input : input.url;
+            var resp = new Response('{"error":"Unauthorized"}', {
+                status: 401,
+                headers: { 'Content-Type': 'application/json' }
+            });
+            Object.defineProperty(resp, 'url', { value: url });
+            return Promise.resolve(resp);
+        };
+        "#,
+    )
+    .expect("failed to mock fetch with 401");
+}
+
+/// Override `window.fetch` to return HTTP 200 with an empty meetings list.
+/// This simulates an authenticated session with no active meetings.
+pub fn mock_fetch_meetings_empty() {
+    js_sys::eval(
+        r#"
+        window.__original_fetch = window.__original_fetch || window.fetch;
+        window.fetch = function(input) {
+            var url = typeof input === 'string' ? input : input.url;
+            var resp = new Response(JSON.stringify({
+                success: true,
+                result: { meetings: [], total: 0, limit: 20, offset: 0 }
+            }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+            Object.defineProperty(resp, 'url', { value: url });
+            return Promise.resolve(resp);
+        };
+        "#,
+    )
+    .expect("failed to mock fetch with empty meetings");
+}
+
+/// Restore the original `window.fetch` after mocking.
+pub fn restore_fetch() {
+    js_sys::eval(
+        r#"
+        if (window.__original_fetch) {
+            window.fetch = window.__original_fetch;
+            delete window.__original_fetch;
+        }
+        "#,
+    )
+    .expect("failed to restore fetch");
+}
+
+// ---------------------------------------------------------------------------
 // Mock device construction (Layer 2 tests)
 // ---------------------------------------------------------------------------
 

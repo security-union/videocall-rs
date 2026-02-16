@@ -329,7 +329,7 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::permissive();
 
         if oauth_client_id.is_empty() {
-            let mut app = App::new()
+            App::new()
                 .wrap(cors)
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),
@@ -345,7 +345,7 @@ async fn main() -> std::io::Result<()> {
         } else if db_enabled {
             // OAuth requires database (r2d2 pool for legacy OAuth code)
             let pool = get_pool();
-            let mut app = App::new()
+            App::new()
                 .app_data(web::Data::new(pool))
                 .app_data(web::Data::new(AppState {
                     chat: chat.clone(),

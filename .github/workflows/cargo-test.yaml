@@ -23,15 +23,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Clean up Docker resources
-        run: |
-          # Stop any running containers from previous runs
-          docker compose -f docker/docker-compose.integration.yaml down -v 2>/dev/null || true
-          docker system prune -f --volumes
-          # Remove target volume if corrupted
-          docker volume rm -f docker_rustlemania-it-tests-target 2>/dev/null || true
+        run: docker system prune -f --volumes
 
-      - name: Run tests
-        run: make tests_run
+      - run: make tests_run
 
       - name: Teardown
         if: always()

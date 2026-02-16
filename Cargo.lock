@@ -2507,26 +2507,6 @@ dependencies = [
 
 [[package]]
 name = "gloo-net"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2899cb1a13be9020b010967adc6b2a8a343b6f1428b90238c9d53ca24decc6db"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-sink",
- "gloo-utils 0.1.7",
- "js-sys",
- "pin-project",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "gloo-net"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9902a044653b26b99f7e3693a42f171312d9be8b26b5697bd1e43ad1f8a35e10"
@@ -3824,6 +3804,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.26",
+ "rsa",
  "serde",
  "serde_json",
  "serial_test",
@@ -4049,7 +4030,7 @@ dependencies = [
 
 [[package]]
 name = "neteq"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "axum 0.7.9",
  "clap",
@@ -5209,15 +5190,6 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
-
-[[package]]
-name = "reqwasm"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05b89870d729c501fa7a68c43bf4d938bbb3a8c156d333d90faa0e8b3e3212fb"
-dependencies = [
- "gloo-net 0.1.0",
-]
 
 [[package]]
 name = "reqwest"
@@ -7272,7 +7244,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "3.0.0"
+version = "4.0.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -7309,7 +7281,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-codecs"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "approx",
@@ -7344,8 +7316,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "videocall-meeting-types"
+name = "videocall-meeting-client"
 version = "0.1.0"
+dependencies = [
+ "log",
+ "reqwest 0.12.26",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "videocall-meeting-types",
+]
+
+[[package]]
+name = "videocall-meeting-types"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]
@@ -7424,7 +7408,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.13"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7459,7 +7443,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.1.35"
+version = "1.1.37"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -7474,7 +7458,6 @@ dependencies = [
  "neteq",
  "once_cell",
  "regex",
- "reqwasm",
  "reqwest 0.12.26",
  "serde",
  "serde-wasm-bindgen 0.6.5",
@@ -7482,6 +7465,8 @@ dependencies = [
  "urlencoding",
  "videocall-client",
  "videocall-diagnostics",
+ "videocall-meeting-client",
+ "videocall-meeting-types",
  "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -7541,8 +7526,6 @@ dependencies = [
  "cfg-if 1.0.4",
  "once_cell",
  "rustversion",
- "serde",
- "serde_json",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]

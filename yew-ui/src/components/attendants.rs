@@ -20,6 +20,8 @@ use crate::components::{
     browser_compatibility::BrowserCompatibility,
     diagnostics::Diagnostics,
     host::Host,
+    host_controls::HostControls,
+    meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::PeerList,
     peer_tile::PeerTile,
     video_control_buttons::{
@@ -114,6 +116,10 @@ pub enum Msg {
     ShowCopyToast(bool),
     MeetingEnded(String),
     ScreenShareStateChange(ScreenShareEvent),
+    /// A fresh room access token was obtained from the meeting API.
+    TokenRefreshed(String),
+    /// Token refresh failed (session expired, kicked from meeting, network error).
+    TokenRefreshFailed(String),
 }
 
 impl From<WsAction> for Msg {
@@ -154,6 +160,24 @@ pub struct AttendantsComponentProps {
 
     #[prop_or_default]
     pub on_logout: Option<Callback<()>>,
+
+    /// Display name (username) of the meeting host/owner (for displaying crown icon)
+    #[prop_or_default]
+    pub host_display_name: Option<String>,
+
+    /// If true, automatically join the meeting without showing the "Join Meeting" button.
+    /// Used when user was admitted from the waiting room.
+    #[prop_or_default]
+    pub auto_join: bool,
+
+    /// If true, the current user is the owner of the meeting.
+    #[prop_or_default]
+    pub is_owner: bool,
+
+    /// Signed JWT room access token for connecting to the media server.
+    /// Obtained from the meeting API when the participant is admitted.
+    #[prop_or_default]
+    pub room_token: String,
 }
 
 pub struct AttendantsComponent {
@@ -186,25 +210,58 @@ pub struct AttendantsComponent {
 }
 
 impl AttendantsComponent {
-    fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
-        let email = ctx.props().email.clone();
-        let id = ctx.props().id.clone();
+    /// Build the WebSocket and WebTransport lobby URLs for the media server.
+    ///
+    /// When `media-server-jwt-auth` is enabled, the token is embedded as a query
+    /// parameter. When disabled, the legacy `/{email}/{room}` path is used.
+    #[allow(unused_variables)]
+    fn build_lobby_urls(token: &str, email: &str, id: &str) -> (Vec<String>, Vec<String>) {
+        #[cfg(feature = "media-server-jwt-auth")]
+        let lobby_url = |base: &str| format!("{base}/lobby?token={token}");
+
+        #[cfg(not(feature = "media-server-jwt-auth"))]
+        let lobby_url = |base: &str| format!("{base}/lobby/{email}/{id}");
+
         let websocket_urls = actix_websocket_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(lobby_url)
             .collect::<Vec<String>>();
         let webtransport_urls = webtransport_host_base()
             .unwrap_or_default()
             .split(',')
-            .map(|s| format!("{s}/lobby/{email}/{id}"))
+            .map(lobby_url)
             .collect::<Vec<String>>();
 
+        (websocket_urls, webtransport_urls)
+    }
+
+    fn create_video_call_client(ctx: &Context<Self>) -> VideoCallClient {
+        let email = ctx.props().email.clone();
+        let id = ctx.props().id.clone();
+
+        #[cfg(feature = "media-server-jwt-auth")]
+        let token = {
+            let t = ctx.props().room_token.clone();
+            assert!(
+                !t.is_empty(),
+                "media-server-jwt-auth is enabled but room_token is empty — \
+                 cannot connect to the media server without a signed JWT"
+            );
+            t
+        };
+
+        #[cfg(not(feature = "media-server-jwt-auth"))]
+        let token = String::new();
+
+        let (websocket_urls, webtransport_urls) = Self::build_lobby_urls(&token, &email, &id);
+
         log::info!(
-            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}",
+            "YEW-UI: Creating VideoCallClient for {} in meeting {} with webtransport_enabled={}, jwt_auth={}",
             email,
             id,
-            ctx.props().webtransport_enabled
+            ctx.props().webtransport_enabled,
+            cfg!(feature = "media-server-jwt-auth"),
         );
         if websocket_urls.is_empty() || webtransport_urls.is_empty() {
             log::error!("Runtime config missing or invalid: wsUrl or webTransportHost not set");
@@ -373,6 +430,28 @@ impl AttendantsComponent {
         html! {} // Empty html when feature is not enabled
     }
 
+    /// Schedule a token refresh attempt after 1 second.
+    ///
+    /// If the meeting has ended (`MeetingNotActive`), sends `MeetingEnded`
+    /// instead of retrying, so the user sees a clear "meeting ended" overlay.
+    #[cfg(feature = "media-server-jwt-auth")]
+    fn schedule_token_refresh(link: yew::html::Scope<Self>, meeting_id: String) {
+        Timeout::new(1_000, move || {
+            wasm_bindgen_futures::spawn_local(async move {
+                match crate::meeting_api::refresh_room_token(&meeting_id).await {
+                    Ok(token) => link.send_message(Msg::TokenRefreshed(token)),
+                    Err(crate::meeting_api::JoinError::MeetingNotActive) => {
+                        link.send_message(Msg::MeetingEnded("The meeting has ended.".to_string()));
+                    }
+                    Err(e) => {
+                        link.send_message(Msg::TokenRefreshFailed(e.to_string()));
+                    }
+                }
+            });
+        })
+        .forget();
+    }
+
     fn play_user_joined() {
         if let Some(_window) = web_sys::window() {
             if let Ok(audio) = HtmlAudioElement::new_with_src("/assets/hi.wav") {
@@ -429,9 +508,10 @@ impl Component for AttendantsComponent {
         self_
     }
 
-    fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            // Don't auto-connect anymore
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render && ctx.props().auto_join {
+            // Auto-join: request media permissions which will trigger connection
+            ctx.link().send_message(WsAction::RequestMediaPermissions);
         }
     }
 
@@ -454,6 +534,7 @@ impl Component for AttendantsComponent {
                 }
                 WsAction::Connected => {
                     log::info!("YEW-UI: Connection established successfully!");
+                    self.error = None;
                     self.call_start_time = Some(js_sys::Date::now());
                     true
                 }
@@ -463,8 +544,25 @@ impl Component for AttendantsComponent {
                     false
                 }
                 WsAction::Lost(reason) => {
-                    warn!("Lost with reason {reason:?}");
-                    ctx.link().send_message(WsAction::Connect);
+                    warn!("Connection lost (reason: {reason:?})");
+                    self.error = Some("Connection lost, reconnecting...".to_string());
+
+                    #[cfg(feature = "media-server-jwt-auth")]
+                    {
+                        let link = ctx.link().clone();
+                        let meeting_id = ctx.props().id.clone();
+                        Self::schedule_token_refresh(link, meeting_id);
+                    }
+
+                    #[cfg(not(feature = "media-server-jwt-auth"))]
+                    {
+                        let link = ctx.link().clone();
+                        Timeout::new(1_000, move || {
+                            link.send_message(WsAction::Connect);
+                        })
+                        .forget();
+                    }
+
                     true
                 }
                 WsAction::RequestMediaPermissions => {
@@ -672,10 +770,15 @@ impl Component for AttendantsComponent {
                 self.call_start_time = None;
                 self.meeting_start_time_server = None;
 
-                Timeout::new(500, move || {
+                // Call leave_meeting API to update participant status in database
+                let meeting_id = ctx.props().id.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(e) = crate::meeting_api::leave_meeting(&meeting_id).await {
+                        log::error!("Error leaving meeting: {e}");
+                    }
+                    // Redirect to home after API call completes
                     let _ = window().location().set_href("/");
-                })
-                .forget();
+                });
 
                 true
             }
@@ -701,6 +804,30 @@ impl Component for AttendantsComponent {
                 }
                 true
             }
+            Msg::TokenRefreshed(new_token) => {
+                log::info!("Room token refreshed, reconnecting with new token");
+                self.error = None;
+                let (ws_urls, wt_urls) =
+                    Self::build_lobby_urls(&new_token, &ctx.props().email, &ctx.props().id);
+                self.client.update_server_urls(ws_urls, wt_urls);
+                if let Err(e) = self.client.connect() {
+                    ctx.link().send_message(WsAction::Log(format!(
+                        "Reconnection with refreshed token failed: {e:?}"
+                    )));
+                }
+                true
+            }
+            Msg::TokenRefreshFailed(err) => {
+                warn!("Token refresh failed: {err}");
+                self.error = Some(format!("Connection lost, retrying... ({err})"));
+
+                // Schedule another attempt after 1 second.
+                let link = ctx.link().clone();
+                let meeting_id = ctx.props().id.clone();
+                Self::schedule_token_refresh(link, meeting_id);
+
+                true
+            }
         }
     }
 
@@ -723,6 +850,7 @@ impl Component for AttendantsComponent {
         // Determine if the "Add Fake Peer" button should be disabled
         let add_fake_peer_disabled = num_display_peers >= CANVAS_LIMIT;
 
+        let host_display_name = ctx.props().host_display_name.clone();
         let rows: Vec<Html> = display_peers_vec
             .iter()
             .take(CANVAS_LIMIT)
@@ -730,7 +858,7 @@ impl Component for AttendantsComponent {
             .map(|(i, peer_id)| {
                 let full_bleed = display_peers_vec.len() == 1
                     && !self.client.is_screen_share_enabled_for_peer(peer_id);
-                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} /> }
+                html!{ <PeerTile key={format!("tile-{}-{}", i, peer_id)} peer_id={peer_id.clone()} full_bleed={full_bleed} host_display_name={host_display_name.clone()} /> }
             })
             .collect();
 
@@ -831,7 +959,7 @@ impl Component for AttendantsComponent {
                             class="btn-apple btn-primary"
                             onclick={ctx.link().callback(|_| WsAction::RequestMediaPermissions)}
                         >
-                            {"Join Meeting"}
+                            { if ctx.props().is_owner { "Start Meeting" } else { "Join Meeting" } }
                         </button>
                     </div>
                     </div>
@@ -1021,6 +1149,7 @@ impl Component for AttendantsComponent {
                                     num_participants={num_display_peers}
                                     is_active={self.meeting_joined && self.meeting_ended_message.is_none()}
                                     on_toggle_meeting_info={toggle_meeting_info}
+                                    host_display_name={ctx.props().host_display_name.clone()}
                                 />
                             }
                         } else {
@@ -1029,32 +1158,15 @@ impl Component for AttendantsComponent {
                     }
                 </div>
 
+                // Waiting room controls - all admitted participants can manage waiting room
+                <HostControls
+                    meeting_id={ctx.props().id.clone()}
+                    is_admitted={true}
+                />
+
                 {
                     if let Some(ref message) = self.meeting_ended_message {
-                        html! {
-                            <div class="glass-backdrop" style="z-index: 9999;">
-                                <div class="card-apple" style="width: 420px; text-align: center;">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="#ff6b6b" stroke-width="2" style="margin: 0 auto 1rem;">
-                                        <circle cx="12" cy="12" r="10"></circle>
-                                        <line x1="15" y1="9" x2="9" y2="15"></line>
-                                        <line x1="9" y1="9" x2="15" y2="15"></line>
-                                    </svg>
-                                    <h4 style="margin-top:0; margin-bottom: 0.5rem;">{"Meeting Ended"}</h4>
-                                    <p style="font-size: 1rem; margin: 1.5rem 0; color: #666;">
-                                        {message}
-                                    </p>
-                                    <button
-                                        class="btn-apple btn-primary"
-                                        onclick={Callback::from(|_| {
-                                            if let Some(window) = web_sys::window() {
-                                                let _ = window.location().set_href("/");
-                                            }
-                                        })}>
-                                        {"Return to Home"}
-                                    </button>
-                                </div>
-                            </div>
-                        }
+                        html! { <MeetingEndedOverlay message={message.clone()} /> }
                     } else {
                         html! {}
                     }

@@ -21,6 +21,7 @@ pub mod auth;
 pub mod components;
 pub mod constants;
 pub mod context;
+pub mod meeting_api;
 pub mod pages;
 pub mod routing;
 pub mod types;

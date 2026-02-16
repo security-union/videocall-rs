@@ -265,8 +265,10 @@ async fn run_webtransport_connection_from_request(
         if jwt_secret.is_empty() {
             return Err(anyhow!("JWT_SECRET not set"));
         }
-        let claims = token_validator::decode_room_token(&jwt_secret, tok)
-            .map_err(|e| anyhow!("token validation failed: {e}"))?;
+        let claims = token_validator::decode_room_token(&jwt_secret, tok).map_err(|e| {
+            e.log("WT");
+            anyhow!("token validation failed: {}", e.client_message())
+        })?;
         info!(
             "WT token-based connection: email={}, room={}",
             claims.sub, claims.room

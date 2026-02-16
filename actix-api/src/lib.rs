@@ -17,7 +17,6 @@
  */
 
 pub mod actors;
-pub mod api;
 pub mod auth;
 pub mod client_diagnostics;
 pub mod constants;

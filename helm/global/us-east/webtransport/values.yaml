@@ -44,6 +44,11 @@ rustlemania-webtransport:
       value: "4"  # Optimal for 3500m CPU (WebTransport + crypto operations)
     - name: TOKIO_BLOCKING_THREADS
       value: "2"  # Small pool for blocking crypto operations
+    - name: JWT_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: jwt-secret
+          key: secret
 
   resources:
     limits:

@@ -30,7 +30,13 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config = Config::from_env().expect("failed to load configuration");
+    let mut config = Config::from_env().expect("failed to load configuration");
+
+    // Run OIDC discovery to fill in auth/token/jwks URLs when an issuer is configured.
+    config
+        .resolve_discovery()
+        .await
+        .expect("OIDC discovery failed");
 
     let pool = PgPoolOptions::new()
         .max_connections(20)

@@ -66,7 +66,7 @@ fn generate_meeting_id() -> String {
 /// POST /api/v1/meetings
 pub async fn create_meeting(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Json(body): Json<CreateMeetingRequest>,
 ) -> Result<(StatusCode, Json<APIResponse<CreateMeetingResponse>>), AppError> {
     let meeting_id = match &body.meeting_id {
@@ -129,7 +129,7 @@ pub async fn create_meeting(
 /// GET /api/v1/meetings
 pub async fn list_meetings(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Query(params): Query<ListMeetingsQuery>,
 ) -> Result<Json<APIResponse<ListMeetingsResponse>>, AppError> {
     let limit = params.limit.clamp(1, 100);
@@ -167,7 +167,7 @@ pub async fn list_meetings(
 /// GET /api/v1/meetings/{meeting_id}
 pub async fn get_meeting(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<MeetingInfoResponse>>, AppError> {
     let row = db_meetings::get_by_room_id(&state.db, &meeting_id)
@@ -190,7 +190,7 @@ pub async fn get_meeting(
 /// DELETE /api/v1/meetings/{meeting_id}
 pub async fn delete_meeting(
     State(state): State<AppState>,
-    AuthUser(email): AuthUser,
+    AuthUser { email, .. }: AuthUser,
     Path(meeting_id): Path<String>,
 ) -> Result<Json<APIResponse<DeleteMeetingResponse>>, AppError> {
     // Check the meeting exists first to distinguish 404 from 403.

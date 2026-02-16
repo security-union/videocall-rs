@@ -261,6 +261,120 @@ async fn test_get_my_status_success() {
     cleanup_test_data(&pool, room_id).await;
 }
 
+// ── Status refused after meeting ends ────────────────────────────────────
+
+#[tokio::test]
+#[serial]
+async fn test_status_refused_after_meeting_ends() {
+    let pool = get_test_pool().await;
+    let room_id = "test-status-after-ended";
+    setup_active_meeting(&pool, room_id).await;
+
+    // 1. Attendee joins.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        "attendee@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    // 2. Host admits attendee.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/admit"),
+        "host@example.com",
+    )
+    .header("Content-Type", "application/json")
+    .body(Body::from(r#"{"email":"attendee@example.com"}"#))
+    .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    // 3. Verify attendee can get a token while meeting is active.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "GET",
+        &format!("/api/v1/meetings/{room_id}/status"),
+        "attendee@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
+    assert!(
+        body.result.room_token.is_some(),
+        "Should get token while active"
+    );
+
+    // 4. Host leaves → meeting ends.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/leave"),
+        "host@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    // 5. Attendee tries to get status/token → should be refused.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "GET",
+        &format!("/api/v1/meetings/{room_id}/status"),
+        "attendee@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body: APIResponse<APIError> = response_json(resp).await;
+    assert_eq!(body.result.code, "MEETING_NOT_ACTIVE");
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_attendee_cannot_rejoin_ended_meeting() {
+    let pool = get_test_pool().await;
+    let room_id = "test-rejoin-ended";
+    setup_active_meeting(&pool, room_id).await;
+
+    // Host leaves → meeting ends.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/leave"),
+        "host@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let _ = app.oneshot(req).await.unwrap();
+
+    // Attendee tries to join → should be refused.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie(
+        "POST",
+        &format!("/api/v1/meetings/{room_id}/join"),
+        "attendee@example.com",
+    )
+    .body(Body::empty())
+    .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let body: APIResponse<APIError> = response_json(resp).await;
+    assert_eq!(body.result.code, "MEETING_NOT_ACTIVE");
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
 // ── Get participants ─────────────────────────────────────────────────────
 
 #[tokio::test]

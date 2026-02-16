@@ -16,8 +16,17 @@
  * conditions.
  */
 
-use actix_web::web;
+use yew::prelude::*;
 
-pub fn configure_api_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(web::scope("/api/v1"));
+/// Host indicator to show the meeting host/owner
+#[function_component(CrownIcon)]
+pub fn crown_icon() -> Html {
+    html! {
+        <span
+            class="host-indicator"
+            style="color: #888; font-size: 0.85em; margin-left: 4px;"
+        >
+            {"(Host)"}
+        </span>
+    }
 }

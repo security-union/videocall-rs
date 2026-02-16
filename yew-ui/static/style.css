@@ -2264,29 +2264,32 @@ select {
   -webkit-user-select: none;
   -ms-user-select: none;
   -webkit-appearance: none;
-  background-color: #131314;
-  background-image: none;
-  border: 1px solid #747775;
-  border-radius: 4px;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  backdrop-filter: blur(12px) saturate(150%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button);
   box-sizing: border-box;
-  color: #e3e3e3;
+  color: var(--text-primary);
   cursor: pointer;
-  font-family: 'Roboto', arial, sans-serif;
-  font-size: 14px;
-  height: 40px;
-  letter-spacing: 0.25px;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  font-size: 0.9375rem;
+  height: 44px;
+  letter-spacing: 0.01em;
   outline: none;
   overflow: hidden;
-  padding: 0 12px;
+  padding: 0 20px;
   position: relative;
   text-align: center;
-  transition: background-color 0.218s, border-color 0.218s, box-shadow 0.218s;
+  transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   vertical-align: middle;
   white-space: nowrap;
   width: auto;
   max-width: 400px;
   min-width: min-content;
-  border-color: #8e918f;
 }
 
 .gsi-material-button .gsi-material-button-icon {
@@ -2309,7 +2312,7 @@ select {
 
 .gsi-material-button .gsi-material-button-contents {
   flex-grow: 1;
-  font-family: 'Roboto', arial, sans-serif;
+  font-family: inherit;
   font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2317,7 +2320,7 @@ select {
 }
 
 .gsi-material-button .gsi-material-button-state {
-  transition: opacity 0.218s;
+  transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1);
   bottom: 0;
   left: 0;
   opacity: 0;
@@ -2328,12 +2331,12 @@ select {
 
 .gsi-material-button:disabled {
   cursor: default;
-  background-color: #13131461;
-  border-color: #8e918f1f;
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.08);
 }
 
 .gsi-material-button:disabled .gsi-material-button-state {
-  background-color: #e3e3e31f;
+  background-color: rgba(255, 255, 255, 0.03);
 }
 
 .gsi-material-button:disabled .gsi-material-button-contents {
@@ -2350,14 +2353,21 @@ select {
   opacity: 12%;
 }
 
+.gsi-material-button:not(:disabled):active {
+  transform: scale(0.98);
+}
+
 .gsi-material-button:not(:disabled):hover {
-  box-shadow: 0 1px 2px 0 rgba(60, 64, 67, 0.3),
-    0 1px 3px 1px rgba(60, 64, 67, 0.15);
+  background: var(--glass-bg-hover);
+  border-color: var(--glass-border-hover);
+  box-shadow:
+    0 4px 16px var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
 }
 
 .gsi-material-button:not(:disabled):hover .gsi-material-button-state {
   background-color: white;
-  opacity: 8%;
+  opacity: 6%;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2369,29 +2379,32 @@ select {
   -webkit-user-select: none;
   -ms-user-select: none;
   -webkit-appearance: none;
-  background-color: #131314;
-  background-image: none;
-  border: 1px solid #747775;
-  border-radius: 4px;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  backdrop-filter: blur(12px) saturate(150%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button);
   box-sizing: border-box;
-  color: #e3e3e3;
+  color: var(--text-primary);
   cursor: pointer;
-  font-family: 'Roboto', arial, sans-serif;
-  font-size: 14px;
-  height: 40px;
-  letter-spacing: 0.25px;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  font-size: 0.9375rem;
+  height: 44px;
+  letter-spacing: 0.01em;
   outline: none;
   overflow: hidden;
-  padding: 0 12px;
+  padding: 0 20px;
   position: relative;
   text-align: center;
-  transition: background-color 0.218s, border-color 0.218s, box-shadow 0.218s;
+  transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   vertical-align: middle;
   white-space: nowrap;
   width: auto;
   max-width: 400px;
   min-width: min-content;
-  border-color: #8e918f;
 }
 
 .okta-sign-in-button .okta-sign-in-button-content {
@@ -2414,7 +2427,7 @@ select {
 
 .okta-sign-in-button .okta-sign-in-button-label {
   flex-grow: 1;
-  font-family: 'Roboto', arial, sans-serif;
+  font-family: inherit;
   font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2423,13 +2436,16 @@ select {
 
 .okta-sign-in-button:not(:disabled):active,
 .okta-sign-in-button:not(:disabled):focus {
-  background-color: #1f1f20;
+  background: rgba(255, 255, 255, 0.12);
+  transform: scale(0.98);
 }
 
 .okta-sign-in-button:not(:disabled):hover {
-  box-shadow: 0 1px 2px 0 rgba(60, 64, 67, 0.3),
-    0 1px 3px 1px rgba(60, 64, 67, 0.15);
-  background-color: #1a1a1b;
+  background: var(--glass-bg-hover);
+  border-color: var(--glass-border-hover);
+  box-shadow:
+    0 4px 16px var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2438,30 +2454,38 @@ select {
 
 .generic-sign-in-button {
   -webkit-appearance: none;
-  background-color: #0a84ff;
-  border: none;
-  border-radius: 8px;
+  background: rgba(10, 132, 255, 0.25);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  backdrop-filter: blur(12px) saturate(150%);
+  border: 1px solid rgba(10, 132, 255, 0.35);
+  border-radius: var(--radius-button);
   box-sizing: border-box;
-  color: #ffffff;
+  color: var(--text-primary);
   cursor: pointer;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  font-size: 1rem;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  font-size: 0.9375rem;
   font-weight: 500;
-  height: 40px;
+  height: 44px;
   letter-spacing: 0.01em;
   outline: none;
   padding: 0 32px;
   text-align: center;
-  transition: background-color 0.218s, box-shadow 0.218s;
+  transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   white-space: nowrap;
 }
 
 .generic-sign-in-button:not(:disabled):hover {
-  background-color: #0977e6;
-  box-shadow: 0 1px 2px 0 rgba(60, 64, 67, 0.3),
-    0 1px 3px 1px rgba(60, 64, 67, 0.15);
+  background: rgba(10, 132, 255, 0.35);
+  border-color: rgba(10, 132, 255, 0.50);
+  box-shadow:
+    0 4px 16px var(--glass-shadow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
 }
 
 .generic-sign-in-button:not(:disabled):active {
-  background-color: #086bd1;
+  background: rgba(10, 132, 255, 0.40);
+  transform: scale(0.98);
 }

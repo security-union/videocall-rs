@@ -287,10 +287,7 @@ body {
   justify-content: center;
   align-items: flex-start;
   padding: 2rem 0;
-  background:
-    radial-gradient(900px 600px at 20% 10%, rgba(0, 122, 255, 0.08), transparent 60%),
-    radial-gradient(800px 500px at 80% 70%, rgba(142, 102, 255, 0.06), transparent 60%),
-    var(--bg);
+  background: var(--bg);
   overflow-y: auto;
   overflow-x: hidden;
   z-index: 0;
@@ -341,146 +338,6 @@ body {
     margin: 0.75rem auto;
     padding: 1.5rem;
   }
-}
-
-/* Background patterns and utilities */
-.bg-grid-pattern {
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
-  background-size: 20px 20px;
-}
-
-.bg-dot-pattern {
-  background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
-  background-size: 20px 20px;
-}
-
-/* Gradient text effect */
-.gradient-text {
-  background: linear-gradient(to right, #7928CA, #38BDF8);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-/* Animations */
-@keyframes shine {
-  0% {
-    left: -100%;
-  }
-  100% {
-    left: 100%;
-  }
-}
-
-.animate-shine {
-  animation: shine 2s ease-in-out;
-}
-
-@keyframes pulse {
-  0%, 100% {
-    opacity: 0.6;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-.animate-pulse-slow {
-  animation: pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
-
-/* Glass card — Liquid Glass material */
-.glass-card {
-  background: var(--glass-bg);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
-  border: 1px solid var(--glass-border);
-  box-shadow:
-    0 8px 32px var(--glass-shadow),
-    inset 0 1px 0 var(--glass-highlight);
-  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.glass-card:hover {
-  border-color: var(--glass-border-hover);
-}
-
-/* Sharp card with accent border */
-.sharp-card {
-  background: rgba(26, 35, 51, 0.8);
-  border-radius: 8px;
-  border: 1px solid rgba(56, 56, 58, 1);
-  box-shadow: 
-    0 4px 20px rgba(0, 0, 0, 0.25),
-    0 0 0 1px rgba(56, 56, 58, 1);
-  position: relative;
-  overflow: hidden;
-  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-}
-
-.sharp-card:hover {
-  box-shadow: 
-    0 8px 25px rgba(0, 0, 0, 0.3),
-    0 0 0 1px rgba(56, 56, 58, 1);
-}
-
-/* Floating card effect */
-.float-card {
-  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
-  transform: perspective(1000px) rotateX(0) rotateY(0);
-}
-
-.float-card:hover {
-  transform: perspective(1000px) rotateX(2deg) rotateY(-2deg) translateY(-5px);
-  box-shadow: 
-    0 15px 35px rgba(0, 0, 0, 0.4),
-    0 3px 10px rgba(0, 0, 0, 0.25);
-}
-
-/* Add subtle border glow for accent cards */
-.accent-glow {
-  position: relative;
-}
-
-.accent-glow::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  border-radius: inherit;
-  padding: 1px;
-  background: linear-gradient(
-    to right bottom,
-    rgba(121, 40, 202, 0.5),
-    rgba(56, 189, 248, 0.5)
-  );
-  -webkit-mask: 
-    linear-gradient(#fff 0 0) content-box, 
-    linear-gradient(#fff 0 0);
-  -webkit-mask-composite: xor;
-  mask-composite: exclude;
-  pointer-events: none;
-}
-
-/* Section spacing */
-.section {
-  padding: 6rem 0;
-  position: relative;
-  overflow: hidden;
-}
-
-/* Subtle animations */
-@keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-10px); }
-}
-
-.animate-float {
-  animation: float 5s ease-in-out infinite;
 }
 
 /* Focus styles */
@@ -777,40 +634,62 @@ body {
 
 /* Hero Header for the meeting entry page */
 .hero-container::before,
-.hero-container::after {
+/* ── Animated Mesh Gradient ──
+   Two pseudo-element layers of overlapping radial gradients drift slowly,
+   producing an organic color field behind the glass on both pages. */
+
+.hero-container::before,
+.hero-container::after,
+.login-container::before,
+.login-container::after {
   content: '';
   position: fixed;
-  inset: -20% -20% -20% -20%;
+  inset: -30%;
   pointer-events: none;
   z-index: 0;
+  will-change: transform;
 }
 
-/* Aurora layer with extremely subtle motion */
-.hero-container::before {
+.hero-container::before,
+.login-container::before {
   background:
-    radial-gradient(800px 600px at 15% 10%, rgba(10,132,255,0.10), transparent 60%),
-    radial-gradient(700px 500px at 85% 75%, rgba(191,90,242,0.08), transparent 60%);
-  filter: blur(60px);
-  animation: aurora-drift 40s ease-in-out infinite alternate;
+    radial-gradient(ellipse 650px 550px at 20% 25%, rgba(10, 132, 255, 0.28), transparent 70%),
+    radial-gradient(ellipse 500px 450px at 80% 60%, rgba(191, 90, 242, 0.22), transparent 70%),
+    radial-gradient(ellipse 400px 350px at 55% 85%, rgba(48, 209, 88, 0.12), transparent 70%);
+  filter: blur(80px);
+  animation: mesh-drift-1 26s ease-in-out infinite alternate;
 }
 
-.hero-container::after {
-  background: radial-gradient(700px 500px at 70% 15%, rgba(142,102,255,0.10), transparent 60%);
-  filter: blur(60px);
-  animation: aurora-drift-2 52s ease-in-out infinite alternate;
+.hero-container::after,
+.login-container::after {
+  background:
+    radial-gradient(ellipse 600px 500px at 75% 20%, rgba(142, 102, 255, 0.24), transparent 70%),
+    radial-gradient(ellipse 450px 400px at 15% 75%, rgba(255, 159, 10, 0.14), transparent 70%);
+  filter: blur(80px);
+  animation: mesh-drift-2 34s ease-in-out infinite alternate;
 }
 
-@keyframes aurora-drift {
-  0% { transform: translate3d(0,0,0) scale(1); }
-  100% { transform: translate3d(2%, -1%, 0) scale(1.05); }
+@keyframes mesh-drift-1 {
+  0%   { transform: translate3d(0, 0, 0) scale(1) rotate(0deg); }
+  25%  { transform: translate3d(4%, -3%, 0) scale(1.08) rotate(1.5deg); }
+  50%  { transform: translate3d(-3%, 4%, 0) scale(1.04) rotate(-1deg); }
+  75%  { transform: translate3d(2%, -2%, 0) scale(1.10) rotate(0.5deg); }
+  100% { transform: translate3d(-1%, 1%, 0) scale(1.06) rotate(-0.5deg); }
 }
-@keyframes aurora-drift-2 {
-  0% { transform: translate3d(0,0,0) scale(1); }
-  100% { transform: translate3d(-2%, 1%, 0) scale(1.06); }
+
+@keyframes mesh-drift-2 {
+  0%   { transform: translate3d(0, 0, 0) scale(1) rotate(0deg); }
+  25%  { transform: translate3d(-4%, 3%, 0) scale(1.06) rotate(-1deg); }
+  50%  { transform: translate3d(3%, -4%, 0) scale(1.02) rotate(1.5deg); }
+  75%  { transform: translate3d(-2%, 2%, 0) scale(1.08) rotate(-0.5deg); }
+  100% { transform: translate3d(1%, -1%, 0) scale(1.05) rotate(0.5deg); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .hero-container::before, .hero-container::after { animation: none; }
+  .hero-container::before,
+  .hero-container::after,
+  .login-container::before,
+  .login-container::after { animation: none; }
 }
 
 /* Hero typography */
@@ -823,54 +702,92 @@ body {
   letter-spacing: -0.02em;
 }
 
-.hero-subtitle {
-  color: var(--text-secondary);
+.hero-tagline {
+  font-size: 0.8125rem;
   font-weight: 400;
-  font-size: 1rem;
+  color: var(--text-tertiary);
+  letter-spacing: 0.04em;
+  margin-bottom: 1.25rem;
 }
 
-/* Floating ambient elements */
+.tagline-dot {
+  color: var(--text-quaternary);
+}
+
+/* ── Mesh Gradient Orbs ──
+   Large, softly blurred color orbs that drift behind the glass card,
+   providing rich chromatic content for the backdrop-filter to refract. */
+
 .floating-element {
   position: absolute;
-  opacity: 0.5;
   pointer-events: none;
   z-index: 1;
-  filter: blur(50px);
-  mix-blend-mode: overlay;
+  border-radius: 50%;
+  will-change: transform;
 }
 
 .floating-element-1 {
-  top: 15%;
-  left: 10%;
-  width: 240px;
-  height: 240px;
-  background: radial-gradient(circle, rgba(0, 122, 255, 0.15), transparent 70%);
-  animation: float-animation 20s ease-in-out infinite;
+  top: -5%;
+  left: -10%;
+  width: 500px;
+  height: 500px;
+  background: radial-gradient(circle, rgba(10, 132, 255, 0.35), transparent 70%);
+  filter: blur(70px);
+  opacity: 0.7;
+  animation: orb-float-1 24s ease-in-out infinite;
 }
 
 .floating-element-2 {
-  bottom: 10%;
-  right: 15%;
-  width: 180px;
-  height: 180px;
-  background: radial-gradient(circle, rgba(142, 102, 255, 0.12), transparent 70%);
-  animation: float-animation 14s ease-in-out 1s infinite;
+  bottom: -10%;
+  right: -5%;
+  width: 450px;
+  height: 450px;
+  background: radial-gradient(circle, rgba(191, 90, 242, 0.30), transparent 70%);
+  filter: blur(70px);
+  opacity: 0.6;
+  animation: orb-float-2 28s ease-in-out infinite;
 }
 
 .floating-element-3 {
-  top: 50%;
-  right: 5%;
-  width: 100px;
-  height: 100px;
-  background: radial-gradient(circle, rgba(0, 122, 255, 0.10), transparent 70%);
-  animation: float-animation 10s ease-in-out 0.5s infinite;
+  top: 40%;
+  right: -15%;
+  width: 380px;
+  height: 380px;
+  background: radial-gradient(circle, rgba(48, 209, 88, 0.20), transparent 70%);
+  filter: blur(80px);
+  opacity: 0.5;
+  animation: orb-float-3 32s ease-in-out infinite;
 }
 
-@keyframes float-animation {
-  0%, 100% { transform: translate(0, 0); }
-  25% { transform: translate(-8px, 8px); }
-  50% { transform: translate(8px, -12px); }
-  75% { transform: translate(-12px, -8px); }
+/* Orb 1: drifts upper-left to lower-right */
+@keyframes orb-float-1 {
+  0%   { transform: translate3d(0, 0, 0) scale(1); }
+  25%  { transform: translate3d(40px, 30px, 0) scale(1.05); }
+  50%  { transform: translate3d(20px, -20px, 0) scale(0.97); }
+  75%  { transform: translate3d(-30px, 15px, 0) scale(1.03); }
+  100% { transform: translate3d(0, 0, 0) scale(1); }
+}
+
+/* Orb 2: opposite drift pattern */
+@keyframes orb-float-2 {
+  0%   { transform: translate3d(0, 0, 0) scale(1); }
+  25%  { transform: translate3d(-35px, -25px, 0) scale(1.04); }
+  50%  { transform: translate3d(-15px, 30px, 0) scale(0.96); }
+  75%  { transform: translate3d(25px, -20px, 0) scale(1.06); }
+  100% { transform: translate3d(0, 0, 0) scale(1); }
+}
+
+/* Orb 3: gentle circular drift */
+@keyframes orb-float-3 {
+  0%   { transform: translate3d(0, 0, 0) scale(1); }
+  25%  { transform: translate3d(-20px, -35px, 0) scale(1.03); }
+  50%  { transform: translate3d(25px, -10px, 0) scale(0.98); }
+  75%  { transform: translate3d(15px, 30px, 0) scale(1.05); }
+  100% { transform: translate3d(0, 0, 0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .floating-element { animation: none !important; }
 }
 
 /* Responsive — tablet */
@@ -888,7 +805,10 @@ body {
     margin: 0.5rem;
   }
   .hero-title { font-size: 1.5rem; }
-  .floating-element { opacity: 0.3; }
+
+  .floating-element-1 { width: 300px; height: 300px; opacity: 0.5; }
+  .floating-element-2 { width: 260px; height: 260px; opacity: 0.4; }
+  .floating-element-3 { width: 220px; height: 220px; opacity: 0.35; }
 }
 
 /* GitHub Corner */
@@ -910,201 +830,6 @@ body {
   .github-corner .octo-arm {
     animation: octocat-wave 560ms ease-in-out;
   }
-}
-
-/* Tech badges — compact glass pills */
-.tech-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0.375rem 0.75rem;
-  background: var(--glass-bg);
-  -webkit-backdrop-filter: blur(8px) saturate(160%);
-  backdrop-filter: blur(8px) saturate(160%);
-  color: var(--text-primary);
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  border-radius: var(--radius-pill);
-  border: 1px solid var(--glass-border);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10);
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.tech-badge:hover {
-  background: var(--glass-bg-hover);
-  border-color: var(--glass-border-hover);
-}
-
-.tech-badge + .tech-badge {
-  margin-left: 0.5rem;
-}
-
-@media (max-width: 480px) {
-  .tech-badge { padding: 0.25rem 0.5rem; font-size: 0.6875rem; }
-}
-
-/* Code Snippet */
-.code-snippet {
-  background: rgba(13, 19, 31, 0.7);
-  border-radius: 0.75rem;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  overflow: hidden;
-  box-shadow: 
-    0 4px 12px rgba(0, 0, 0, 0.2),
-    0 0 0 1px rgba(121, 40, 202, 0.1);
-  max-width: 100%;
-  text-align: left;
-  margin: 1.5rem 0;
-  transition: all 0.3s ease;
-}
-
-.code-snippet:hover {
-  border-color: rgba(255, 255, 255, 0.15);
-  box-shadow: 
-    0 6px 16px rgba(0, 0, 0, 0.25),
-    0 0 0 1px rgba(121, 40, 202, 0.15);
-  transform: translateY(-1px);
-}
-
-.code-snippet pre {
-  margin: 1.5rem 0 0;
-  padding: 1.25rem;
-  overflow-x: auto;
-}
-
-.code-snippet code {
-  font-family: 'JetBrains Mono', 'Fira Code', monospace;
-  font-size: 0.85rem;
-  line-height: 1.5;
-  color: rgba(255, 255, 255, 0.85);
-}
-
-/* Animated cursor for code snippet */
-.code-snippet code::after {
-  content: '|';
-  animation: cursor-blink 1.2s infinite;
-  font-weight: 100;
-  color: rgba(255, 255, 255, 0.7);
-}
-
-@keyframes cursor-blink {
-  0%, 100% { opacity: 0; }
-  50% { opacity: 1; }
-}
-
-/* Make code snippet look like a terminal */
-.code-snippet {
-  position: relative;
-}
-
-.code-snippet::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 1.5rem;
-  background: rgba(31, 41, 61, 0.8);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  display: flex;
-  align-items: center;
-  padding: 0 0.5rem;
-}
-
-.code-snippet::after {
-  content: '●';
-  position: absolute;
-  top: 0.4rem;
-  left: 0.5rem;
-  font-size: 0.75rem;
-  color: #FF605C;
-  text-shadow: 0 0 3px rgba(255, 96, 92, 0.5);
-}
-
-.code-snippet pre {
-  margin-top: 1.5rem;
-}
-
-/* Features section — glass card with compact tabs */
-.features-container {
-  background: var(--glass-bg);
-  border-radius: var(--radius-card);
-  border: 1px solid var(--glass-border);
-  overflow: hidden;
-  height: 100%;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  -webkit-backdrop-filter: blur(16px) saturate(var(--glass-saturate));
-  backdrop-filter: blur(16px) saturate(var(--glass-saturate));
-}
-
-.features-tabs {
-  display: flex;
-  gap: 4px;
-  padding: 6px;
-  background: rgba(255, 255, 255, 0.03);
-}
-
-.feature-tab {
-  flex: 1;
-  padding: 0.4rem 0.75rem;
-  font-size: 0.8125rem;
-  font-weight: 600;
-  color: var(--text-secondary);
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: var(--radius-pill);
-  cursor: pointer;
-  outline: none;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.feature-tab:hover {
-  color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.07);
-}
-
-.feature-tab.active {
-  color: var(--text-primary);
-  background: rgba(0, 122, 255, 0.20);
-  border-color: rgba(0, 122, 255, 0.25);
-}
-
-.feature-tab.active::after { content: none; }
-
-.feature-content {
-  padding: 1rem;
-  min-height: 100px;
-  display: flex;
-  flex-direction: column;
-}
-
-.feature-title {
-  font-size: 0.9375rem;
-  font-weight: 600;
-  margin-bottom: 0.375rem;
-  color: var(--text-primary);
-  display: flex;
-  align-items: center;
-}
-
-.feature-title::before {
-  content: '→';
-  margin-right: 0.5rem;
-  color: var(--accent);
-  font-size: 1rem;
-}
-
-.feature-description {
-  font-size: 0.8125rem;
-  line-height: 1.5;
-  color: var(--text-secondary);
-}
-
-@media (max-width: 480px) {
-  .features-tabs { gap: 2px; }
-  .feature-tab { font-size: 0.75rem; padding: 0.35rem 0.5rem; }
-  .feature-content { padding: 0.75rem; min-height: auto; }
 }
 
 /* Stacked columns spacing on mobile */
@@ -1416,4 +1141,110 @@ body {
   .btn-pop-animate { animation: none; }
   .copy-toast { animation: none; opacity: 1; transform: none; }
   .sparkles { display: none; }
+}
+
+/* ==========================================================================
+ * Login Page — Animated Mesh Gradient + Liquid Glass
+ * ========================================================================== */
+
+.login-container {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Login card — Liquid Glass surface */
+.login-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 3rem 2.5rem;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
+  border-radius: var(--radius-outer);
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    0 8px 32px var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
+  transition: border-color 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Specular highlight edge */
+.login-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.login-card:hover {
+  border-color: var(--glass-border-hover);
+  box-shadow:
+    0 12px 40px var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
+}
+
+/* Login title */
+.login-title {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif;
+  font-size: 3rem;
+  font-weight: 300;
+  letter-spacing: -0.03em;
+  color: var(--text-primary);
+  margin: 0 0 2.5rem;
+  text-align: center;
+}
+
+/* Login footer text */
+.login-footer {
+  margin-top: 2rem;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--text-quaternary);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+}
+
+.login-footer a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.login-footer a:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+/* Responsive — tablet */
+@media (max-width: 768px) {
+  .login-title { font-size: 2.5rem; }
+  .login-card { padding: 2.5rem 2rem; }
+}
+
+/* Responsive — phone */
+@media (max-width: 480px) {
+  .login-title { font-size: 2rem; }
+  .login-card {
+    padding: 2rem 1.5rem;
+    margin: 0 1rem;
+    border-radius: 20px;
+  }
 }

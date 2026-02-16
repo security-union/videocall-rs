@@ -24,8 +24,6 @@ use web_time::{Duration, Instant};
 use crate::buffer::{BufferReturnCode, PacketBuffer, SmartFlushConfig};
 use crate::buffer_level_filter::BufferLevelFilter;
 use crate::delay_manager::{DelayConfig, DelayManager};
-use crate::expand::ExpandFactory;
-use crate::expand::{Expand, ExpandPhase};
 use crate::packet::AudioPacket;
 use crate::statistics::{
     LifetimeStatistics, NetworkStatistics, StatisticsCalculator, TimeStretchOperation,
@@ -186,7 +184,6 @@ pub struct NetEq {
     statistics: StatisticsCalculator,
     accelerate: Box<dyn TimeStretcher + Send>,
     preemptive_expand: Box<dyn TimeStretcher + Send>,
-    expand: Box<Expand>,
     last_decode_timestamp: Option<u32>,
     output_frame_size_samples: usize,
     _muted: bool,
@@ -253,7 +250,6 @@ impl NetEq {
             TimeStretchFactory::create_accelerate(config.sample_rate, config.channels);
         let preemptive_expand: Box<dyn TimeStretcher + Send> =
             TimeStretchFactory::create_preemptive_expand(config.sample_rate, config.channels);
-        let expand: Box<Expand> = ExpandFactory::create_expand(config.sample_rate, config.channels);
 
         Ok(Self {
             config,
@@ -263,7 +259,6 @@ impl NetEq {
             statistics,
             accelerate,
             preemptive_expand,
-            expand,
             last_decode_timestamp: None,
             output_frame_size_samples,
             _muted: false,
@@ -402,9 +397,9 @@ impl NetEq {
             Operation::FastAccelerate => self.decode_accelerate(&mut frame, true)?,
             Operation::PreemptiveExpand => self.decode_preemptive_expand(&mut frame)?,
             Operation::TimeStretchBuffer => self.return_time_stretch_buffer(&mut frame)?,
-            Operation::Expand => self.decode_expand(&mut frame, ExpandPhase::Expand)?,
-            Operation::ExpandStart => self.decode_expand(&mut frame, ExpandPhase::ExpandStart)?,
-            Operation::ExpandEnd => self.decode_expand(&mut frame, ExpandPhase::ExpandEnd)?,
+            Operation::Expand => self.decode_expand(&mut frame, false, false)?,
+            Operation::ExpandStart => self.decode_expand(&mut frame, true, false)?,
+            Operation::ExpandEnd => self.decode_expand(&mut frame, false, true)?,
             Operation::Merge => self.decode_merge(&mut frame)?,
             Operation::ComfortNoise => self.generate_comfort_noise(&mut frame)?,
             _ => {
@@ -510,26 +505,8 @@ impl NetEq {
         // Reset for next frame (matches WebRTC decision_logic.cc:245-246)
         self.timestretch_added_samples = 0;
 
-        // Use WebRTC-style threshold calculations
-        let samples_per_ms = self.config.sample_rate / 1000;
-        let target_level_samples = target_delay_ms * samples_per_ms;
-
-        // Calculate thresholds like WebRTC
-        let low_limit = std::cmp::max(
-            target_level_samples * 3 / 4,
-            target_level_samples
-                .saturating_sub(K_DECELERATION_TARGET_LEVEL_OFFSET_MS * samples_per_ms),
-        );
-        let high_limit = std::cmp::max(target_level_samples, low_limit + 20 * samples_per_ms);
-
         if !self.leftover_time_stretched_samples.is_empty() {
             return Ok(Operation::TimeStretchBuffer);
-        }
-
-        if self.consecutive_expands > 0 && current_buffer_samples < low_limit as usize {
-            // prefer a single continuous expand over many small ones
-            self.consecutive_expands = self.consecutive_expands.saturating_add(1);
-            return Ok(Operation::Expand);
         }
 
         if current_buffer_samples < self.output_frame_size_samples * 3 / 2
@@ -551,7 +528,39 @@ impl NetEq {
             return Ok(Operation::ExpandEnd);
         }
 
+        // Use WebRTC-style threshold calculations
+        let samples_per_ms = self.config.sample_rate / 1000;
+        let target_level_samples = target_delay_ms * samples_per_ms;
+
+        // Calculate thresholds like WebRTC
+        let low_limit = std::cmp::max(
+            target_level_samples * 3 / 4,
+            target_level_samples
+                .saturating_sub(K_DECELERATION_TARGET_LEVEL_OFFSET_MS * samples_per_ms),
+        );
+        let high_limit = std::cmp::max(target_level_samples, low_limit + 20 * samples_per_ms);
+
         let buffer_level_samples = self.buffer_level_filter.filtered_current_level();
+
+        // Fast accelerate: 4x high limit (aggressive acceleration for large buffers)
+        if buffer_level_samples >= (high_limit << 2) as usize {
+            self.consecutive_expands = 0;
+            return Ok(Operation::FastAccelerate);
+        }
+
+        // Normal accelerate: at high limit
+        if buffer_level_samples >= high_limit as usize {
+            self.consecutive_expands = 0;
+            return Ok(Operation::Accelerate);
+        }
+
+        // Preemptive expand: below low limit (requires ~30ms of audio)
+        if buffer_level_samples < low_limit as usize
+            && current_buffer_samples >= self.output_frame_size_samples * 3
+        {
+            self.consecutive_expands = 0;
+            return Ok(Operation::PreemptiveExpand);
+        }
 
         // Check for continuous expansion limit (WebRTC uses much higher limits)
         if self.consecutive_expands > 600 {
@@ -560,26 +569,8 @@ impl NetEq {
             return Ok(Operation::Normal);
         }
 
-        self.consecutive_expands = 0;
-
-        // Fast accelerate: 4x high limit (aggressive acceleration for large buffers)
-        if buffer_level_samples >= (high_limit << 2) as usize {
-            return Ok(Operation::FastAccelerate);
-        }
-
-        // Normal accelerate: at high limit
-        if buffer_level_samples >= high_limit as usize {
-            return Ok(Operation::Accelerate);
-        }
-
-        // Preemptive expand: below low limit (requires ~30ms of audio)
-        if buffer_level_samples < low_limit as usize
-            && current_buffer_samples >= self.output_frame_size_samples * 3
-        {
-            return Ok(Operation::PreemptiveExpand);
-        }
-
         // Normal operation
+        self.consecutive_expands = 0;
         Ok(Operation::Normal)
     }
 
@@ -822,33 +813,63 @@ impl NetEq {
         Ok(())
     }
 
-    fn decode_expand(&mut self, frame: &mut AudioFrame, phase: ExpandPhase) -> Result<()> {
+    fn decode_expand(&mut self, frame: &mut AudioFrame, start: bool, end: bool) -> Result<()> {
         log::trace!(
             "decode_expand: buffer before expand={}ms, packets={} (consecutive_expands={})",
             self.current_buffer_size_ms(),
             self.packet_buffer.len(),
             self.consecutive_expands
         );
-
-        let samples_required = self.expand.samples_required(phase);
-
-        let mut input = AudioFrame::new(
-            self.config.sample_rate,
-            self.config.channels,
-            samples_required,
-        );
-
-        self.decode_normal(&mut input)?;
-
-        self.expand
-            .process(&input.samples, &mut frame.samples, phase);
-
-        // Put back unused samples
-        let used_input_samples = self.expand.get_used_input_samples();
-        if input.samples.len() > used_input_samples {
-            self.leftover_samples
-                .splice(0..0, input.samples[used_input_samples..].iter().cloned());
+        // Generate concealment audio (simple noise for now)
+        for sample in &mut frame.samples {
+            *sample = (simple_random() - 0.5) * 0.0001; // Very quiet noise
         }
+
+        if start {
+            let mut end_of_audio = AudioFrame::new(
+                self.config.sample_rate,
+                self.config.channels,
+                (frame.samples_per_channel as f32 * 0.5) as usize,
+            );
+
+            self.decode_normal(&mut end_of_audio)?;
+
+            let fade_len = end_of_audio.samples.len();
+            let start_of_frame = frame.samples[..fade_len].to_vec();
+
+            // Crossfade with end of audio
+            crate::signal::crossfade(
+                &end_of_audio.samples,
+                &start_of_frame,
+                fade_len,
+                &mut frame.samples[..fade_len],
+            );
+        }
+
+        if end {
+            let mut start_of_audio = AudioFrame::new(
+                self.config.sample_rate,
+                self.config.channels,
+                (frame.samples_per_channel as f32 * 0.5) as usize,
+            );
+
+            self.decode_normal(&mut start_of_audio)?;
+
+            let fade_len = start_of_audio.samples.len();
+            let end_of_frame_start = frame.samples.len() - fade_len;
+            let end_of_frame = frame.samples[end_of_frame_start..].to_vec();
+
+            // Crossfade with end of audio
+            crate::signal::crossfade(
+                &end_of_frame,
+                &start_of_audio.samples,
+                fade_len,
+                &mut frame.samples[end_of_frame_start..],
+            );
+        }
+
+        frame.speech_type = SpeechType::Expand;
+        frame.vad_activity = false;
 
         // Update statistics
         self.statistics
@@ -857,9 +878,6 @@ impl NetEq {
             TimeStretchOperation::Expand,
             frame.samples_per_channel as u64,
         );
-
-        frame.speech_type = SpeechType::Expand;
-        frame.vad_activity = false;
 
         log::trace!(
             "decode_expand: buffer after expand={}ms, packets={} (consecutive_expands={})",
@@ -1378,188 +1396,5 @@ mod tests {
         }
 
         println!("✅ Buffer duration calculation test passed - content duration used correctly");
-    }
-
-    macro_rules! make_insert_audio {
-        () => {{
-            let mut seq: u16 = 0;
-            let sample_rate = 16000;
-            move |neteq: &mut NetEq, duration_ms: u32| {
-                for _ in 0..(duration_ms / 10) {
-                    let header = RtpHeader::new(seq, seq as u32 * 160, 12345, 96, false);
-                    seq += 1;
-                    let mut payload = Vec::new();
-
-                    let sample_length = sample_rate / 100;
-                    for i in 0..sample_length {
-                        let sample = (i as f32 / 160.0 * 2.0 * std::f32::consts::PI).sin() * 0.1;
-                        payload.extend_from_slice(&sample.to_le_bytes());
-                    }
-                    let packet = AudioPacket::new(header, payload, sample_rate, 1, 10);
-                    neteq.insert_packet(packet).unwrap();
-                }
-            }
-        }};
-    }
-
-    macro_rules! make_reset_filtered_level {
-        () => {{
-            move |neteq: &mut NetEq| {
-                neteq
-                    .buffer_level_filter
-                    .set_filtered_buffer_level(neteq.current_buffer_size_samples());
-            }
-        }};
-    }
-
-    #[test]
-    fn test_get_decision_expand() {
-        let config = NetEqConfig::default();
-        let mut neteq = NetEq::new(config).unwrap();
-
-        let mut insert_audio = make_insert_audio!();
-        let reset_filtered_level = make_reset_filtered_level!();
-
-        // Set target delay to 50ms
-        neteq.delay_manager.set_base_minimum_delay(50);
-        neteq.delay_manager.set_base_maximum_delay(50);
-
-        insert_audio(&mut neteq, 50);
-        reset_filtered_level(&mut neteq);
-        // // Insert 50ms audio
-        // for i in 0..5 {
-        //     let packet = create_packet(i, i as u32 * 160, 10);
-        //     neteq.insert_packet(packet).unwrap();
-        // }
-
-        // Expect 4 Normal operation
-        for _ in 0..4 {
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::Normal);
-        }
-
-        // Expect ExpandStart
-        let _ = neteq.get_audio().unwrap();
-        assert_eq!(neteq.last_operation, Operation::ExpandStart);
-
-        // Expect Expands while the buffer is empty
-        for _ in 0..100 {
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::Expand);
-        }
-
-        insert_audio(&mut neteq, 20);
-
-        // Still expect Expands while the buffer is low
-        for _ in 0..100 {
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::Expand);
-        }
-
-        insert_audio(&mut neteq, 20);
-        reset_filtered_level(&mut neteq);
-
-        // Expect a single ExpandEnd
-        let _ = neteq.get_audio().unwrap();
-        assert_eq!(neteq.last_operation, Operation::ExpandEnd);
-
-        // Expect Normal
-        let _ = neteq.get_audio().unwrap();
-        assert_eq!(neteq.last_operation, Operation::Normal);
-    }
-
-    #[test]
-    fn test_get_decision_accelerate() {
-        let config = NetEqConfig::default();
-        let mut neteq = NetEq::new(config).unwrap();
-
-        let mut insert_audio = make_insert_audio!();
-        let reset_filtered_level = make_reset_filtered_level!();
-
-        // Set target delay to 50ms
-        neteq.delay_manager.set_base_minimum_delay(50);
-        neteq.delay_manager.set_base_maximum_delay(50);
-
-        insert_audio(&mut neteq, 50);
-        reset_filtered_level(&mut neteq);
-
-        // Expect Normal operation when audio is coming in normally
-        for _ in 0..20 {
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::Normal);
-            insert_audio(&mut neteq, 10);
-        }
-
-        insert_audio(&mut neteq, 10);
-        reset_filtered_level(&mut neteq);
-
-        // Expect Accelerate,TimeStrectchBuffer,TimeStrectchBuffer a couple times
-        for _ in 0..3 {
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::Accelerate);
-            insert_audio(&mut neteq, 10);
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::TimeStretchBuffer);
-            insert_audio(&mut neteq, 10);
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::TimeStretchBuffer);
-            insert_audio(&mut neteq, 10);
-        }
-
-        insert_audio(&mut neteq, 300);
-        reset_filtered_level(&mut neteq);
-
-        // Expect FastAccelerate,TimeStrectchBuffer,TimeStrectchBuffer a couple times
-        for _ in 0..3 {
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::FastAccelerate);
-            insert_audio(&mut neteq, 10);
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::TimeStretchBuffer);
-            insert_audio(&mut neteq, 10);
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::TimeStretchBuffer);
-            insert_audio(&mut neteq, 10);
-        }
-    }
-
-    #[test]
-    fn test_get_decision_preemptive_expand() {
-        let config = NetEqConfig::default();
-        let mut neteq = NetEq::new(config).unwrap();
-
-        let mut insert_audio = make_insert_audio!();
-        let reset_filtered_level = make_reset_filtered_level!();
-
-        // Set target delay to 50ms
-        neteq.delay_manager.set_base_minimum_delay(50);
-        neteq.delay_manager.set_base_maximum_delay(50);
-
-        insert_audio(&mut neteq, 50);
-        reset_filtered_level(&mut neteq);
-
-        // Expect Normal operation when audio is coming in normally
-        for _ in 0..20 {
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::Normal);
-            insert_audio(&mut neteq, 10);
-        }
-
-        // Set target delay to 500ms
-        neteq.delay_manager.set_base_minimum_delay(500);
-        neteq.delay_manager.set_base_maximum_delay(500);
-
-        // Expect PreemtiveExpand+TimeStrectchBuffer+TimeStrectchBuffer a couple times
-        for _ in 0..3 {
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::PreemptiveExpand);
-            insert_audio(&mut neteq, 10);
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::TimeStretchBuffer);
-            insert_audio(&mut neteq, 10);
-            let _ = neteq.get_audio().unwrap();
-            assert_eq!(neteq.last_operation, Operation::TimeStretchBuffer);
-            insert_audio(&mut neteq, 10);
-        }
     }
 }

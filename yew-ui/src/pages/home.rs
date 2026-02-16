@@ -92,13 +92,6 @@ pub fn home() -> Html {
         let _ = window.open_with_url("https://github.com/security-union/videocall-rs");
     });
 
-    let set_active_tab = {
-        let active_tab = active_tab.clone();
-        Callback::from(move |tab: usize| {
-            active_tab.set(tab);
-        })
-    };
-
     fn generate_meeting_id() -> String {
         let millis = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -148,14 +141,13 @@ pub fn home() -> Html {
 
             <div class="hero-content">
                 <h1 class="hero-title text-center">{ "videocall.rs" }</h1>
-                <h2 class="hero-subtitle text-center text-xl mb-6">{ "Video calls with anyone, anywhere" }</h2>
-
-                // Tech stack badges
-                <div class="flex justify-center items-center gap-6 mb-8" style="margin-top:1em">
-                    <div class="tech-badge hover:scale-110 transition-transform">{"Rust"}</div>
-                    <div class="tech-badge hover:scale-110 transition-transform">{"WebTransport"}</div>
-                    <div class="tech-badge hover:scale-110 transition-transform">{"WASM"}</div>
-                </div>
+                <p class="hero-tagline text-center">
+                    {"Built with Rust"}
+                    <span class="tagline-dot">{" · "}</span>
+                    {"WebTransport"}
+                    <span class="tagline-dot">{" · "}</span>
+                    {"WASM"}
+                </p>
 
                 <div class="content-separator"></div>
 
@@ -233,62 +225,9 @@ pub fn home() -> Html {
                     </div>
                 </form>
 
-                <p class="text-white/60 text-sm mb-3 text-center">{"Secure, simple video meetings"}</p>
-
                 <div class="content-separator"></div>
 
-                <h3 class="text-center text-lg font-medium mb-6 text-white/70">{"Developer Information"}</h3>
-
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-8" style="margin-top:1em">
-                    <div>
-                        // Features section
-                        <div class="features-container mb-6">
-                            <div class="features-tabs">
-                                <button
-                                    class={if *active_tab == 0 { "feature-tab active" } else { "feature-tab" }}
-                                    onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(0))}
-                                >
-                                    {"Secure"}
-                                </button>
-                                <button
-                                    class={if *active_tab == 1 { "feature-tab active" } else { "feature-tab" }}
-                                    onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(1))}
-                                >
-                                    {"Fast"}
-                                </button>
-                                <button
-                                    class={if *active_tab == 2 { "feature-tab active" } else { "feature-tab" }}
-                                    onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(2))}
-                                >
-                                    {"Open Source"}
-                                </button>
-                            </div>
-                            <div class="feature-content">
-                                {match *active_tab {
-                                    0 => html! {
-                                        <>
-                                            <h3 class="feature-title">{"Simple"}</h3>
-                                            <p class="feature-description">{"No SFU's, no NAT traversal, no complicated setup. Just a simple, secure, and fast video calls via WebTransport."}</p>
-                                        </>
-                                    },
-                                    1 => html! {
-                                        <>
-                                            <h3 class="feature-title">{"High Performance"}</h3>
-                                            <p class="feature-description">{"Leveraging Rust's zero-cost abstractions and WebAssembly for maximum efficiency. Optimized WebTransport implementation with low latency for smooth video calls."}</p>
-                                        </>
-                                    },
-                                    2 => html! {
-                                        <>
-                                            <h3 class="feature-title">{"100% Open Source"}</h3>
-                                            <p class="feature-description">{"Fully transparent codebase under permissive licensing. Active community of contributors. Audit the code yourself - no black boxes or proprietary elements."}</p>
-                                        </>
-                                    },
-                                    _ => html! {}
-                                }}
-                            </div>
-                        </div>
-                    </div>
-
                     <div>
                         // Developer call-to-action
                         <button

@@ -1717,9 +1717,9 @@ select {
    ======================================== */
 
 .meetings-list-container {
-  margin-top: 1rem;
-  background: rgba(255, 255, 255, 0.05);
-  border-radius: 12px;
+  margin-top: 0.75rem;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: var(--radius-card, 16px);
   overflow: hidden;
 }
 
@@ -1728,13 +1728,13 @@ select {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 1rem 1.25rem;
+  padding: 0.75rem 1rem;
   background: transparent;
   border: none;
-  color: rgba(255, 255, 255, 0.8);
-  font-size: 1rem;
+  color: var(--text-secondary, #AEAEB2);
+  font-size: 0.875rem;
   cursor: pointer;
-  transition: background-color 0.2s ease;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .meetings-list-toggle:hover {
@@ -1751,23 +1751,39 @@ select {
 
 .meetings-list-toggle .meeting-count {
   margin-left: auto;
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 0.875rem;
+  color: var(--text-quaternary, #636366);
+  font-size: 0.8125rem;
 }
 
 .meetings-list-content {
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-  max-height: 300px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  max-height: 260px;
   overflow-y: auto;
 }
 
 .meetings-loading,
 .meetings-error,
-.meetings-empty {
-  padding: 1.5rem;
+.meetings-empty,
+.meetings-auth-prompt {
+  padding: 1rem;
   text-align: center;
-  color: rgba(255, 255, 255, 0.6);
+  color: var(--text-tertiary, #8E8E93);
+  font-size: 0.8125rem;
+}
+
+.meetings-auth-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.5rem 1rem;
+}
+
+.meetings-auth-text {
+  color: var(--text-secondary, rgba(255, 255, 255, 0.7));
   font-size: 0.875rem;
+  font-weight: 500;
+  margin: 0;
 }
 
 .meetings-loading {
@@ -1791,24 +1807,26 @@ select {
 }
 
 .meetings-error {
-  color: #ff6b6b;
+  color: var(--error, #FF453A);
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.5rem;
 }
 
 .retry-btn {
-  padding: 0.5rem 1rem;
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 6px;
-  color: white;
+  height: 36px;
+  padding: 0 0.875rem;
+  background: var(--glass-bg, rgba(255, 255, 255, 0.06));
+  border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.15));
+  border-radius: var(--radius-button, 10px);
+  color: var(--text-primary, #FFFFFF);
+  font-size: 0.8125rem;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .retry-btn:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--glass-bg-hover, rgba(255, 255, 255, 0.10));
 }
 
 .meetings-list {
@@ -1818,14 +1836,14 @@ select {
 }
 
 .meeting-item {
-  padding: 0.875rem 1.25rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  padding: 0.625rem 1rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
   cursor: pointer;
-  transition: background-color 0.2s ease;
+  transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .meeting-item:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .meeting-item:last-child {
@@ -1841,40 +1859,40 @@ select {
 
 .meeting-id {
   font-weight: 500;
-  color: rgba(255, 255, 255, 0.9);
-  font-size: 0.9375rem;
+  color: var(--text-primary, #FFFFFF);
+  font-size: 0.875rem;
 }
 
 .meeting-state {
-  font-size: 0.6875rem;
-  padding: 0.125rem 0.5rem;
-  border-radius: 10px;
+  font-size: 0.625rem;
+  padding: 0.125rem 0.4375rem;
+  border-radius: var(--radius-pill, 9999px);
   text-transform: uppercase;
   font-weight: 600;
-  letter-spacing: 0.025em;
+  letter-spacing: 0.03em;
 }
 
 .meeting-state.state-active {
-  background: rgba(76, 175, 80, 0.2);
-  color: #4caf50;
+  background: rgba(48, 209, 88, 0.18);
+  color: var(--success, #30D158);
 }
 
 .meeting-state.state-idle {
-  background: rgba(255, 193, 7, 0.2);
-  color: #ffc107;
+  background: rgba(255, 159, 10, 0.18);
+  color: var(--warning, #FF9F0A);
 }
 
 .meeting-state.state-ended {
-  background: rgba(158, 158, 158, 0.2);
-  color: #9e9e9e;
+  background: rgba(142, 142, 147, 0.18);
+  color: var(--text-tertiary, #8E8E93);
 }
 
 .meeting-details {
   display: flex;
   align-items: center;
-  gap: 1rem;
-  font-size: 0.8125rem;
-  color: rgba(255, 255, 255, 0.5);
+  gap: 0.75rem;
+  font-size: 0.75rem;
+  color: var(--text-quaternary, #636366);
 }
 
 .meeting-host {
@@ -2250,4 +2268,240 @@ select {
 .error-card p {
   color: rgba(255, 255, 255, 0.7);
   margin-bottom: 2rem;
+}
+
+/* ---------------------------------------------------------------------------
+ * Google Sign-In (GSI) Material Button — dark theme
+ * Based on Google Identity Services branding guidelines.
+ * ------------------------------------------------------------------------- */
+
+.gsi-material-button {
+  -moz-user-select: none;
+  -webkit-user-select: none;
+  -ms-user-select: none;
+  -webkit-appearance: none;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  backdrop-filter: blur(12px) saturate(150%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button);
+  box-sizing: border-box;
+  color: var(--text-primary);
+  cursor: pointer;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  font-size: 0.9375rem;
+  height: 44px;
+  letter-spacing: 0.01em;
+  outline: none;
+  overflow: hidden;
+  padding: 0 20px;
+  position: relative;
+  text-align: center;
+  transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  vertical-align: middle;
+  white-space: nowrap;
+  width: auto;
+  max-width: 400px;
+  min-width: min-content;
+}
+
+.gsi-material-button .gsi-material-button-icon {
+  height: 20px;
+  margin-right: 10px;
+  min-width: 20px;
+  width: 20px;
+}
+
+.gsi-material-button .gsi-material-button-content-wrapper {
+  align-items: center;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  height: 100%;
+  justify-content: space-between;
+  position: relative;
+  width: 100%;
+}
+
+.gsi-material-button .gsi-material-button-contents {
+  flex-grow: 1;
+  font-family: inherit;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+
+.gsi-material-button .gsi-material-button-state {
+  transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  bottom: 0;
+  left: 0;
+  opacity: 0;
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+
+.gsi-material-button:disabled {
+  cursor: default;
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.gsi-material-button:disabled .gsi-material-button-state {
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.gsi-material-button:disabled .gsi-material-button-contents {
+  opacity: 38%;
+}
+
+.gsi-material-button:disabled .gsi-material-button-icon {
+  opacity: 38%;
+}
+
+.gsi-material-button:not(:disabled):active .gsi-material-button-state,
+.gsi-material-button:not(:disabled):focus .gsi-material-button-state {
+  background-color: white;
+  opacity: 12%;
+}
+
+.gsi-material-button:not(:disabled):active {
+  transform: scale(0.98);
+}
+
+.gsi-material-button:not(:disabled):hover {
+  background: var(--glass-bg-hover);
+  border-color: var(--glass-border-hover);
+  box-shadow:
+    0 4px 16px var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
+}
+
+.gsi-material-button:not(:disabled):hover .gsi-material-button-state {
+  background-color: white;
+  opacity: 6%;
+}
+
+/* ---------------------------------------------------------------------------
+ * Okta Sign-In Button — dark theme, matching GSI dimensions
+ * ------------------------------------------------------------------------- */
+
+.okta-sign-in-button {
+  -moz-user-select: none;
+  -webkit-user-select: none;
+  -ms-user-select: none;
+  -webkit-appearance: none;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  backdrop-filter: blur(12px) saturate(150%);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-button);
+  box-sizing: border-box;
+  color: var(--text-primary);
+  cursor: pointer;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  font-size: 0.9375rem;
+  height: 44px;
+  letter-spacing: 0.01em;
+  outline: none;
+  overflow: hidden;
+  padding: 0 20px;
+  position: relative;
+  text-align: center;
+  transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  vertical-align: middle;
+  white-space: nowrap;
+  width: auto;
+  max-width: 400px;
+  min-width: min-content;
+}
+
+.okta-sign-in-button .okta-sign-in-button-content {
+  align-items: center;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  height: 100%;
+  justify-content: space-between;
+  position: relative;
+  width: 100%;
+}
+
+.okta-sign-in-button .okta-sign-in-button-icon {
+  height: 20px;
+  margin-right: 10px;
+  min-width: 20px;
+  width: 20px;
+}
+
+.okta-sign-in-button .okta-sign-in-button-label {
+  flex-grow: 1;
+  font-family: inherit;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+
+.okta-sign-in-button:not(:disabled):active,
+.okta-sign-in-button:not(:disabled):focus {
+  background: rgba(255, 255, 255, 0.12);
+  transform: scale(0.98);
+}
+
+.okta-sign-in-button:not(:disabled):hover {
+  background: var(--glass-bg-hover);
+  border-color: var(--glass-border-hover);
+  box-shadow:
+    0 4px 16px var(--glass-shadow),
+    inset 0 1px 0 var(--glass-highlight);
+}
+
+/* ---------------------------------------------------------------------------
+ * Generic OAuth Sign-In Button — fallback when no provider is configured
+ * ------------------------------------------------------------------------- */
+
+.generic-sign-in-button {
+  -webkit-appearance: none;
+  background: rgba(10, 132, 255, 0.25);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  backdrop-filter: blur(12px) saturate(150%);
+  border: 1px solid rgba(10, 132, 255, 0.35);
+  border-radius: var(--radius-button);
+  box-sizing: border-box;
+  color: var(--text-primary);
+  cursor: pointer;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  height: 44px;
+  letter-spacing: 0.01em;
+  outline: none;
+  padding: 0 32px;
+  text-align: center;
+  transition: background 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+              transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  white-space: nowrap;
+}
+
+.generic-sign-in-button:not(:disabled):hover {
+  background: rgba(10, 132, 255, 0.35);
+  border-color: rgba(10, 132, 255, 0.50);
+  box-shadow:
+    0 4px 16px var(--glass-shadow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+.generic-sign-in-button:not(:disabled):active {
+  background: rgba(10, 132, 255, 0.40);
+  transform: scale(0.98);
 }

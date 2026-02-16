@@ -32,7 +32,6 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ['meeting-api']
           env:
             {{- toYaml .Values.env | nindent 12 }}
           ports:

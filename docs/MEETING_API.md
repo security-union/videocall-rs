@@ -48,36 +48,19 @@ All success and error examples below show the full envelope.
 
 ## Authentication
 
-Authentication varies depending on the deployment mode:
+All meeting-api endpoints (except OAuth login/callback and logout) require a valid **signed session JWT**.
 
-### Local Development (websocket-api on port 8080)
+### How to authenticate
 
-The websocket-api uses simple **email and name cookies** for authentication:
-
-1. After OAuth login, the server sets `Set-Cookie: email=<user_email>` and `Set-Cookie: name=<display_name>`
-2. The browser sends these cookies automatically with every request
-3. Set `COOKIE_DOMAIN=localhost` to ensure cookies work across ports
+Pass the session JWT in the `Authorization` header:
 
 ```bash
-# Cookies are set automatically by the browser after OAuth login
--H "Cookie: email=user@example.com; name=User Name"
-```
-
-### Production (meeting-api on port 8081)
-
-The standalone meeting-api uses a **signed session JWT** for enhanced security:
-
-1. **HttpOnly cookie** (web browsers): After OAuth login, the server sets `Set-Cookie: session=<JWT>; HttpOnly; Secure; SameSite=Lax`. The browser sends it automatically with every request. JavaScript cannot read it, which prevents XSS token theft.
-
-2. **Authorization header** (non-browser clients): `Authorization: Bearer <session_jwt>`. Use this for CLI tools, mobile apps, or API testing.
-
-```bash
-# Option 1: Cookie (set automatically by the browser after OAuth login)
--H "Cookie: session=<session_jwt>"
-
-# Option 2: Bearer header (for curl, mobile, CLI)
 -H "Authorization: Bearer <session_jwt>"
 ```
+
+The session JWT is obtained after a successful OAuth login via `GET /login`. The OAuth callback issues the token, and all subsequent API calls must include it in the `Authorization: Bearer` header.
+
+> **Browser note**: The web UI (`yew-ui`) uses an `HttpOnly` session cookie that the browser sends automatically. This is an implementation detail of the browser client -- for API testing, CLI tools, mobile apps, and all documentation examples, always use the `Authorization: Bearer` header.
 
 ### Session JWT Claims
 
@@ -105,8 +88,60 @@ Key points:
 - Issued when a participant's status becomes `admitted`
 - Scoped to a specific room and participant
 - Contains identity, room, host status, and display name
-- Has a configurable TTL (expiration applies to initial connection only)
+- **Single-burner design**: tokens have a short TTL (default: 60 seconds, configurable via `TOKEN_TTL_SECS`). They are intended as one-time admission tickets, not long-lived credentials
 - Delivered in the `room_token` field of API responses
+- A fresh token is generated on every call to `GET /api/v1/meetings/{id}/status` when the participant is admitted
+
+### Token Lifecycle and Auto-Refresh
+
+The following diagram shows the complete lifecycle of a room access token, including the automatic refresh flow when a media server connection is lost:
+
+```mermaid
+sequenceDiagram
+    participant UI as yew-ui
+    participant API as meeting-api :8081
+    participant MS as media-server :8080
+
+    rect rgb(40, 40, 60)
+    note right of UI: Initial Connection
+    UI->>API: POST /api/v1/meetings/{id}/join
+    API-->>UI: 200 OK + room_token (60s TTL)
+    UI->>MS: WebSocket /lobby?token=<JWT>
+    MS->>MS: Validate JWT signature + expiry
+    MS-->>UI: 101 Switching Protocols
+    note over UI, MS: Video call in progress...
+    end
+
+    rect rgb(60, 40, 40)
+    note right of UI: Connection Lost (network drop, server restart, etc.)
+    MS--xUI: Connection closed
+    end
+
+    rect rgb(40, 60, 40)
+    note right of UI: Auto-Refresh and Reconnect
+    UI->>API: GET /api/v1/meetings/{id}/status
+    API-->>UI: 200 OK + new room_token (60s TTL)
+    UI->>MS: WebSocket /lobby?token=<newJWT>
+    MS->>MS: Validate JWT signature + expiry
+    MS-->>UI: 101 Switching Protocols
+    note over UI, MS: Video call resumed
+    end
+```
+
+**Why single-burner tokens?**
+
+- **Security**: Even if a token is intercepted, it expires in 60 seconds and cannot be reused for long
+- **Revocation**: No need for a token revocation list; expired tokens are automatically invalid
+- **Simplicity**: The media server only needs to validate the JWT signature and expiry, with no database lookup required
+
+**Error handling on the media server:**
+
+| Token Error | HTTP Response | Description |
+|-------------|---------------|-------------|
+| Expired | `401 Unauthorized` | Token was valid but has expired. Client should fetch a fresh token. |
+| Invalid signature | `403 Forbidden` | Token has been tampered with. This incident is logged. |
+| Missing | `401 Unauthorized` | No token provided. Use `/lobby?token=<JWT>`. |
+| Room join denied | `403 Forbidden` | Token does not grant room join permission. |
 
 ## Meeting States
 
@@ -137,12 +172,9 @@ All timestamps in API responses are **Unix seconds** (not milliseconds). This ap
 
 ## API Endpoints
 
-All endpoints are served by either:
+All endpoints are served by the **meeting-api on port 8081** (both local development and production).
 
-- **Local development**: The websocket-api on port 8080 (includes meeting API routes)
-- **Production**: The standalone meeting-api on port 8081
-
-For local development, set `apiBaseUrl: "http://localhost:8080"` in the UI configuration.
+The UI's `apiBaseUrl` should point to `http://localhost:8081` for local development (this is the default in `docker-compose.yaml`). The media server (WebSocket/WebTransport) runs separately on port 8080.
 
 ### List Meetings (My Meetings)
 
@@ -856,16 +888,15 @@ sequenceDiagram
 ## Example: Complete Meeting Session
 
 ```bash
-# Local Development: Both API and Media Server run on port 8080
-# Production: Meeting Backend on port 8081, Media Server on port 8080
+# Meeting API runs on port 8081 (both local dev and production).
+# Media Server (WebSocket/WebTransport) runs on port 8080.
 #
-# For local development, cookies are set automatically after OAuth login.
-# The examples below use port 8080 (local dev setup).
+# Replace $HOST_TOKEN and $ATTENDEE_TOKEN with session JWTs obtained after OAuth login.
 
 # 1. Host creates meeting
-curl -X POST http://localhost:8080/api/v1/meetings \
+curl -X POST http://localhost:8081/api/v1/meetings \
   -H "Content-Type: application/json" \
-  -H "Cookie: email=host@example.com" \
+  -H "Authorization: Bearer $HOST_TOKEN" \
   -d '{"meeting_id": "standup-2024"}'
 
 # Response:
@@ -873,8 +904,8 @@ curl -X POST http://localhost:8080/api/v1/meetings \
 #   "created_at":1706918400,"state":"idle","attendees":[],"has_password":false}}
 
 # 2. Host joins meeting (activates it, receives room token)
-curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/join \
-  -H "Cookie: email=host@example.com"
+curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
+  -H "Authorization: Bearer $HOST_TOKEN"
 
 # Response:
 # {"success":true,"result":{"email":"host@example.com","display_name":null,
@@ -885,9 +916,9 @@ curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/join \
 #    (In practice, the client UI does this automatically)
 #    WebSocket: ws://localhost:8080/lobby?token=eyJhbGciOiJIUzI1NiIs...
 
-# 4. Attendee tries to join (using their own session cookie)
-curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/join \
-  -H "Cookie: email=alice@example.com" \
+# 4. Attendee tries to join
+curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/join \
+  -H "Authorization: Bearer $ATTENDEE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"display_name": "Alice"}'
 
@@ -897,22 +928,22 @@ curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/join \
 #   "admitted_at":null,"room_token":null}}
 
 # 5. Host checks waiting room
-curl http://localhost:8080/api/v1/meetings/standup-2024/waiting \
-  -H "Cookie: email=host@example.com"
+curl http://localhost:8081/api/v1/meetings/standup-2024/waiting \
+  -H "Authorization: Bearer $HOST_TOKEN"
 
 # Response:
 # {"success":true,"result":{"meeting_id":"standup-2024",
 #   "waiting":[{"email":"alice@example.com","display_name":"Alice",...}]}}
 
 # 6. Host admits Alice
-curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/admit \
+curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/admit \
   -H "Content-Type: application/json" \
-  -H "Cookie: email=host@example.com" \
+  -H "Authorization: Bearer $HOST_TOKEN" \
   -d '{"email": "alice@example.com"}'
 
 # 7. Alice polls and receives her room token
-curl http://localhost:8080/api/v1/meetings/standup-2024/status \
-  -H "Cookie: email=alice@example.com"
+curl http://localhost:8081/api/v1/meetings/standup-2024/status \
+  -H "Authorization: Bearer $ATTENDEE_TOKEN"
 
 # Response:
 # {"success":true,"result":{"email":"alice@example.com","display_name":"Alice",
@@ -923,12 +954,12 @@ curl http://localhost:8080/api/v1/meetings/standup-2024/status \
 #    WebSocket: ws://localhost:8080/lobby?token=eyJhbGciOiJIUzI1NiIs...
 
 # 9. When done, participants leave
-curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/leave \
-  -H "Cookie: email=alice@example.com"
+curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/leave \
+  -H "Authorization: Bearer $ATTENDEE_TOKEN"
 
 # 10. Host leaves (ends the meeting)
-curl -X POST http://localhost:8080/api/v1/meetings/standup-2024/leave \
-  -H "Cookie: email=host@example.com"
+curl -X POST http://localhost:8081/api/v1/meetings/standup-2024/leave \
+  -H "Authorization: Bearer $HOST_TOKEN"
 ```
 
 ---

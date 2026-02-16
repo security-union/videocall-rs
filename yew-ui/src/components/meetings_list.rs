@@ -16,55 +16,34 @@
  * conditions.
  */
 
-use crate::constants::app_config;
+use crate::components::login::{build_login_callback, render_provider_button};
+use crate::constants::meeting_api_client;
 use crate::routing::Route;
-use reqwasm::http::{Request, RequestCredentials};
-use serde::Deserialize;
-use wasm_bindgen::JsCast;
+use videocall_meeting_types::responses::{ListMeetingsResponse, MeetingSummary};
 use yew::prelude::*;
 use yew_router::prelude::*;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MeetingSummary {
-    pub meeting_id: String,
-    pub host: Option<String>,
-    pub state: String,
-    pub has_password: bool,
-    #[allow(dead_code)]
-    pub created_at: i64,
-    pub participant_count: i64,
-    /// Timestamp when the meeting started (milliseconds since epoch)
-    pub started_at: i64,
-    /// Timestamp when the meeting ended (milliseconds since epoch), None if still active
-    pub ended_at: Option<i64>,
-    /// Number of participants waiting to be admitted
-    pub waiting_count: i64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ListMeetingsResponse {
-    pub meetings: Vec<MeetingSummary>,
-    pub total: i64,
-    #[allow(dead_code)]
-    pub limit: i64,
-    #[allow(dead_code)]
-    pub offset: i64,
-}
 
 pub enum MeetingsListMsg {
     FetchMeetings,
     FetchSuccess(ListMeetingsResponse),
     FetchError(String),
+    FetchUnauthenticated,
     ToggleExpanded,
     DeleteMeeting(String),
     DeleteSuccess(String),
     DeleteError(String),
 }
 
+enum FetchMeetingsError {
+    Unauthenticated,
+    Other(String),
+}
+
 pub struct MeetingsList {
     meetings: Vec<MeetingSummary>,
     loading: bool,
     error: Option<String>,
+    unauthenticated: bool,
     expanded: bool,
     total: i64,
     current_user_email: Option<String>,
@@ -88,14 +67,16 @@ impl Component for MeetingsList {
         // Fetch meetings on component creation
         ctx.link().send_message(MeetingsListMsg::FetchMeetings);
 
-        // Try to get email from cookie
-        let current_user_email = get_email_from_cookie().or_else(|| ctx.props().user_email.clone());
+        // The meetings list API returns only meetings owned by the current user,
+        // so all meetings in the response belong to us. No need to check ownership.
+        let current_user_email = ctx.props().user_email.clone();
 
         Self {
             meetings: Vec::new(),
             loading: true,
             error: None,
-            expanded: true, // Show active meetings by default
+            unauthenticated: false,
+            expanded: true,
             total: 0,
             current_user_email,
         }
@@ -114,6 +95,7 @@ impl Component for MeetingsList {
             MeetingsListMsg::FetchMeetings => {
                 self.loading = true;
                 self.error = None;
+                self.unauthenticated = false;
 
                 let link = ctx.link().clone();
                 wasm_bindgen_futures::spawn_local(async move {
@@ -121,7 +103,10 @@ impl Component for MeetingsList {
                         Ok(response) => {
                             link.send_message(MeetingsListMsg::FetchSuccess(response));
                         }
-                        Err(e) => {
+                        Err(FetchMeetingsError::Unauthenticated) => {
+                            link.send_message(MeetingsListMsg::FetchUnauthenticated);
+                        }
+                        Err(FetchMeetingsError::Other(e)) => {
                             link.send_message(MeetingsListMsg::FetchError(e));
                         }
                     }
@@ -139,6 +124,11 @@ impl Component for MeetingsList {
             MeetingsListMsg::FetchError(error) => {
                 self.loading = false;
                 self.error = Some(error);
+                true
+            }
+            MeetingsListMsg::FetchUnauthenticated => {
+                self.loading = false;
+                self.unauthenticated = true;
                 true
             }
             MeetingsListMsg::ToggleExpanded => {
@@ -225,6 +215,16 @@ impl Component for MeetingsList {
                                                 {"Loading meetings..."}
                                             </div>
                                         }
+                                    } else if self.unauthenticated {
+                                        let login = build_login_callback();
+                                        html! {
+                                            <div class="meetings-auth-prompt">
+                                                <p class="meetings-auth-text">
+                                                    {"Sign in to see your meetings"}
+                                                </p>
+                                                { render_provider_button(login) }
+                                            </div>
+                                        }
                                     } else if let Some(error) = &self.error {
                                         html! {
                                             <div class="meetings-error">
@@ -266,12 +266,9 @@ impl MeetingsList {
         let is_active = meeting.state == "active";
         let is_ended = meeting.state == "ended";
 
-        // Check if current user is the owner
-        let is_owner = self
-            .current_user_email
-            .as_ref()
-            .map(|email| meeting.host.as_ref() == Some(email))
-            .unwrap_or(false);
+        // The meetings list API returns only meetings owned by the current user,
+        // so all meetings here are ours and we can always show the delete button.
+        let is_owner = true;
 
         let on_click = {
             let meeting_id = meeting_id.clone();
@@ -419,63 +416,22 @@ impl MeetingsList {
     }
 }
 
-fn get_email_from_cookie() -> Option<String> {
-    web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.dyn_into::<web_sys::HtmlDocument>().ok())
-        .and_then(|d| d.cookie().ok())
-        .and_then(|cookies| {
-            cookies.split(';').find_map(|cookie| {
-                let cookie = cookie.trim();
-                if cookie.starts_with("email=") {
-                    Some(cookie.trim_start_matches("email=").to_string())
-                } else {
-                    None
-                }
-            })
-        })
-}
-
-async fn fetch_meetings() -> Result<ListMeetingsResponse, String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings?limit=20", config.api_base_url);
-
-    let response = Request::get(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => {
-            let data: ListMeetingsResponse = response
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {e}"))?;
-            Ok(data)
-        }
-        401 => Err("Not authenticated. Please log in.".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+async fn fetch_meetings() -> Result<ListMeetingsResponse, FetchMeetingsError> {
+    let client = meeting_api_client()
+        .map_err(|e| FetchMeetingsError::Other(format!("Config error: {e}")))?;
+    client.list_meetings(20, 0).await.map_err(|e| match e {
+        videocall_meeting_client::ApiError::NotAuthenticated => FetchMeetingsError::Unauthenticated,
+        other => FetchMeetingsError::Other(format!("{other}")),
+    })
 }
 
 async fn delete_meeting(meeting_id: &str) -> Result<(), String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!("{}/api/v1/meetings/{}", config.api_base_url, meeting_id);
-
-    let response = Request::delete(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    client
+        .delete_meeting(meeting_id)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => Ok(()),
-        401 => Err("Not authenticated".to_string()),
-        403 => Err("Only the meeting owner can delete this meeting".to_string()),
-        404 => Err("Meeting not found".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
 }
 
 /// Format a duration in milliseconds to a human-readable string (e.g., "1h 23m" or "45m 12s")

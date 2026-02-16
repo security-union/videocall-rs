@@ -18,25 +18,19 @@
 
 //! Waiting Room component - shown to non-host users while waiting for admission
 
-use crate::constants::app_config;
+use crate::constants::meeting_api_client;
 use gloo_timers::callback::Interval;
-use reqwasm::http::{Request, RequestCredentials};
-use serde::Deserialize;
+use videocall_meeting_types::responses::ParticipantStatusResponse;
 use yew::prelude::*;
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct ParticipantStatus {
-    pub email: String,
-    pub status: String,
-    pub is_host: bool,
-    pub joined_at: i64,
-    pub admitted_at: Option<i64>,
-}
+/// Type alias for participant status (uses shared type)
+pub type ParticipantStatus = ParticipantStatusResponse;
 
 #[derive(Properties, Clone, PartialEq)]
 pub struct WaitingRoomProps {
     pub meeting_id: String,
-    pub on_admitted: Callback<()>,
+    /// Called when participant is admitted. Carries the room access JWT token.
+    pub on_admitted: Callback<String>,
     pub on_rejected: Callback<()>,
     pub on_cancel: Callback<()>,
 }
@@ -92,7 +86,11 @@ impl Component for WaitingRoom {
             WaitingRoomMsg::StatusReceived(status) => {
                 match status.status.as_str() {
                     "admitted" => {
-                        ctx.props().on_admitted.emit(());
+                        if let Some(token) = status.room_token.clone() {
+                            ctx.props().on_admitted.emit(token);
+                        } else {
+                            self.error = Some("Admitted but no room token received".to_string());
+                        }
                     }
                     "rejected" => {
                         ctx.props().on_rejected.emit(());
@@ -154,28 +152,9 @@ impl Component for WaitingRoom {
 }
 
 async fn check_status(meeting_id: &str) -> Result<ParticipantStatus, String> {
-    let config = app_config().map_err(|e| format!("Config error: {e}"))?;
-    let url = format!(
-        "{}/api/v1/meetings/{}/status",
-        config.api_base_url, meeting_id
-    );
-
-    let response = Request::get(&url)
-        .credentials(RequestCredentials::Include)
-        .send()
+    let client = meeting_api_client().map_err(|e| format!("Config error: {e}"))?;
+    client
+        .get_status(meeting_id)
         .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    match response.status() {
-        200 => {
-            let status: ParticipantStatus = response
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {e}"))?;
-            Ok(status)
-        }
-        401 => Err("Not authenticated".to_string()),
-        404 => Err("Not in meeting".to_string()),
-        status => Err(format!("Server error: {status}")),
-    }
+        .map_err(|e| format!("{e}"))
 }

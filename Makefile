@@ -1,6 +1,6 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up dioxus-ui dioxus-ui-only dioxus-tests-docker yew-ui yew-tests yew-tests-docker
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d && docker compose -f $(COMPOSE_IT) run --rm rust-tests bash -c "\
@@ -99,3 +99,29 @@ yew-tests-docker:
 	docker build -f docker/Dockerfile.yew -t yew-dev docker
 	docker run --rm -v "$$(pwd):/app" -w /app/yew-ui yew-dev \
 		bash -c "CHROMEDRIVER=/usr/bin/chromedriver cargo test --target wasm32-unknown-unknown"
+
+# ---------------------------------------------------------------------------
+# Dioxus UI
+# ---------------------------------------------------------------------------
+
+# Start dioxus-ui with required backend services
+dioxus-ui:
+	docker compose -f docker/docker-compose.yaml up dioxus-ui websocket-api meeting-api postgres nats
+
+# Start just dioxus-ui (assumes backend is already running)
+dioxus-ui-only:
+	docker compose -f docker/docker-compose.yaml up dioxus-ui
+
+# Run dioxus-ui tests in Docker
+dioxus-tests-docker:
+	docker build -f docker/Dockerfile.yew -t dioxus-dev docker
+	docker run --rm -v "$$(pwd):/app" -w /app/dioxus-ui dioxus-dev \
+		bash -c "CHROMEDRIVER=/usr/bin/chromedriver cargo test --target wasm32-unknown-unknown"
+
+# ---------------------------------------------------------------------------
+# Yew UI
+# ---------------------------------------------------------------------------
+
+# Start yew-ui with required backend services
+yew-ui:
+	docker compose -f docker/docker-compose.yaml up yew-ui websocket-api meeting-api postgres nats

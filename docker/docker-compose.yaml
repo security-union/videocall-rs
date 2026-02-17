@@ -47,7 +47,56 @@ services:
     working_dir: /app/yew-ui
     entrypoint: ["/bin/sh", "-c"]
     command: "tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify"
-    
+
+  dioxus-ui:
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - rustlemania-dioxus-ui-cargo-registry-cache:/usr/local/cargo/registry
+      - rustlemania-dioxus-ui-cargo-git-cache:/usr/local/cargo/git
+      - rustlemania-dioxus-ui-cargo-target-cache:/usr/local/cargo/target
+      - rustlemania-dioxus-ui-cache:/app/dioxus-ui/target
+    build:
+      dockerfile: ../docker/Dockerfile.yew
+      context: ../docker
+    working_dir: /app/dioxus-ui
+    command: ["/bin/sh", "-lc", "/app/docker/start-dioxus.sh"]
+    environment:
+      - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
+      - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
+      - TRUNK_SERVE_PORT=${DIOXUS_TRUNK_SERVE_PORT:-81}
+      - ENABLE_OAUTH=${ENABLE_OAUTH:-false}
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8081}
+      - LOGIN_URL=http://localhost:8081/login
+      - RUSTFLAGS=--cfg=web_sys_unstable_apis
+      - RUST_BACKTRACE=1
+      - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
+      - E2EE_ENABLED=${E2EE_ENABLED:-false}
+      - FIREFOX_ENABLED=${FIREFOX_ENABLED:-false}
+      - USERS_ALLOWED_TO_STREAM=${USERS_ALLOWED_TO_STREAM:-}
+      - CARGO_TARGET_DIR=/app/dioxus-ui/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+      - OAUTH_PROVIDER=${OAUTH_PROVIDER:-google}
+      - UI_URL=${UI_URL:-http://localhost:${DIOXUS_TRUNK_SERVE_PORT:-81}}
+    ports:
+      - "${DIOXUS_TRUNK_SERVE_PORT:-81}:${DIOXUS_TRUNK_SERVE_PORT:-81}"
+    depends_on:
+      - tailwind-dioxus
+
+  tailwind-dioxus:
+    build:
+      dockerfile: ../docker/Dockerfile.tailwind
+      context: ../docker
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+    working_dir: /app/dioxus-ui
+    entrypoint: ["/bin/sh", "-c"]
+    command: "tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify"
+
   website:
     volumes:
       - type: bind
@@ -360,5 +409,9 @@ volumes:
   rustlemania-bot-cargo-git-cache:
   rustlemania-bot-cargo-target-cache:
   rustlemania-bot-cache:
+  rustlemania-dioxus-ui-cargo-registry-cache:
+  rustlemania-dioxus-ui-cargo-git-cache:
+  rustlemania-dioxus-ui-cargo-target-cache:
+  rustlemania-dioxus-ui-cache:
   prometheus_data:
   grafana_data:

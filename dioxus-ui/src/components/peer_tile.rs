@@ -114,6 +114,13 @@ pub fn PeerTile(props: PeerTileProps) -> Element {
         }
     });
 
+    // Subscribe to the diagnostic signals so the component re-renders when
+    // the remote peer's video/audio/screen state changes. Without these reads,
+    // Dioxus has no way to know that generate_for_peer()'s output would differ.
+    let _ = *audio_enabled.read();
+    let _ = *video_enabled.read();
+    let _ = *screen_enabled.read();
+
     // Render using the canvas generator
     if let Some(ref client) = client {
         generate_for_peer(

@@ -1,8 +1,8 @@
 FROM rust:1.89-slim
 
 # Build for native platform (works on both ARM64 and AMD64)
-# Use nightly-2024-11-01 which is Rust 1.84 (meets ICU deps requirement for rustc >= 1.83)
-RUN rustup default nightly-2024-11-01
+# Use nightly-2025-02-01 which supports edition2024 (required by aligned crate)
+RUN rustup default nightly-2025-02-01
 RUN apt-get --yes update && apt-get --yes install \
     git pkg-config libssl-dev \
     chromium chromium-driver \

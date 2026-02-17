@@ -84,6 +84,8 @@ pub enum Msg {
     MeetingAction(MeetingAction),
     OnPeerAdded(String),
     OnPeerRemoved(String),
+    OnPeerDisplayNameChanged(String, String),
+    OnLocalNameChanged(String),
     OnFirstFrame((String, MediaType)),
     OnMicrophoneError(String),
     DismissUserError,
@@ -168,8 +170,11 @@ pub struct AttendantsComponent {
     show_dropdown: bool,
     meeting_ended_message: Option<String>,
     meeting_info_open: bool,
+    #[allow(dead_code)]
     pub session_id: String,
     pub display_name: String,
+    /// Map of session_id -> display_name for all peers
+    pub peer_display_names: std::collections::HashMap<String, String>,
 }
 
 impl AttendantsComponent {
@@ -458,6 +463,7 @@ impl Component for AttendantsComponent {
             show_dropdown: false,
             meeting_ended_message: None,
             meeting_info_open: false,
+            peer_display_names: std::collections::HashMap::new(),
         };
         if let Err(e) = crate::constants::app_config() {
             log::error!("{e:?}");
@@ -549,15 +555,34 @@ impl Component for AttendantsComponent {
                     true
                 }
             },
-            Msg::OnPeerAdded(email) => {
-                log::info!("New user joined: {email}");
+            Msg::OnPeerAdded(session_id) => {
+                log::info!("New user joined: {session_id}");
+                // Get display name from client if available, otherwise use session_id
+                let display_name = self
+                    .client
+                    .get_peer_display_name(&session_id)
+                    .unwrap_or_else(|| session_id.clone());
+                self.peer_display_names.insert(session_id, display_name);
                 // Play notification sound when a new user joins the call
                 Self::play_user_joined();
 
                 true
             }
-            Msg::OnPeerRemoved(_peer_id) => {
-                // Trigger a re-render; tiles are rebuilt from current client peer list
+            Msg::OnPeerRemoved(peer_id) => {
+                // Remove from display names map and trigger re-render
+                self.peer_display_names.remove(&peer_id);
+                true
+            }
+            Msg::OnPeerDisplayNameChanged(session_id, new_name) => {
+                log::info!("Peer {session_id} changed name to: {new_name}");
+                self.peer_display_names.insert(session_id, new_name);
+                // Trigger re-render to update UI with new name
+                true
+            }
+            Msg::OnLocalNameChanged(new_name) => {
+                log::info!("Local user changed name to: {new_name}");
+                // Update the local display_name state so the UI reflects the change
+                self.display_name = new_name;
                 true
             }
             Msg::OnFirstFrame((_email, media_type)) => matches!(media_type, MediaType::SCREEN),
@@ -1028,6 +1053,7 @@ impl Component for AttendantsComponent {
                                                  on_device_settings_toggle={ctx.link().callback(|_| UserScreenToggleAction::DeviceSettings)}
                                                  on_microphone_error={ctx.link().callback(Msg::OnMicrophoneError)}
                                                  on_screen_share_state={ctx.link().callback(Msg::ScreenShareStateChange)}
+                                                 on_name_changed={Some(ctx.link().callback(Msg::OnLocalNameChanged))}
                                              />}
                                          } else {
                                              html! {<></>}
@@ -1052,7 +1078,9 @@ impl Component for AttendantsComponent {
                             html! {
                                 <PeerList
                                     peers={display_peers_vec.clone()}
+                                    peer_display_names={self.peer_display_names.clone()}
                                     onclose={toggle_peer_list}
+                                    local_user_name={self.display_name.clone()}
                                     show_meeting_info={self.meeting_info_open}
                                     room_id={ctx.props().id.clone()}
                                     num_participants={num_display_peers}

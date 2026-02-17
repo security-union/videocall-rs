@@ -12,6 +12,8 @@ message MeetingPacket {
     PARTICIPANT_JOINED = 3;
     // Participant left the meeting
     PARTICIPANT_LEFT = 4;
+    // Participant changed their display name
+    NAME_UPDATED = 5;
   }
 
   MeetingEventType event_type = 1;
@@ -20,5 +22,9 @@ message MeetingPacket {
   string message = 4;
   string creator_id = 5;
   int64 participant_count = 6;
+  // Session ID of user who changed name (for NAME_UPDATED events)
+  string user_session_id = 7;
+  // New display name (for NAME_UPDATED events)
+  string new_display_name = 8;
 }
 

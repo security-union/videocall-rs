@@ -56,6 +56,7 @@ pub enum PeerDecodeError {
 pub enum PeerStatus {
     Added(String),
     NoChange,
+    NameChanged(String, String),
 }
 
 impl Display for PeerDecodeError {
@@ -374,7 +375,7 @@ impl Peer {
             MediaType::MEDIA_TYPE_UNKNOWN => {
                 log::error!(
                     "Received packet with unknown media type from peer {}",
-                    self.email
+                    self.session_id
                 );
                 Err(PeerDecodeError::UnknownMediaType)
             }
@@ -564,7 +565,15 @@ impl PeerDecodeManager {
         if self.connected_peers.contains_key(&session_id.to_string()) {
             if let Some(peer) = self.connected_peers.get_mut(&session_id.to_string()) {
                 if peer.display_name != *display_name {
+                    let old_name = peer.display_name.clone();
                     peer.set_display_name(display_name.to_string());
+                    log::info!(
+                        "Peer {session_id} display name changed: '{old_name}' -> '{display_name}'"
+                    );
+                    return PeerStatus::NameChanged(
+                        session_id.to_string(),
+                        display_name.to_string(),
+                    );
                 }
             }
             PeerStatus::NoChange

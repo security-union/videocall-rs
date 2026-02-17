@@ -34,7 +34,11 @@ use actix::{
     Running, StreamHandler, WrapFuture,
 };
 use actix_web_actors::ws::{self, WebsocketContext};
+use protobuf::Message as ProtoMessage;
 use tracing::{error, info, trace};
+use videocall_types::protos::meeting_packet::MeetingPacket;
+use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{Email, RoomId, SessionId};
 
@@ -284,6 +288,7 @@ impl WsChatSession {
             .wait(ctx);
     }
 
+    #[allow(dead_code)]
     fn is_meeting_metadata_packet(&self, data: &[u8]) -> bool {
         if let Ok(packet_wrapper) = PacketWrapper::parse_from_bytes(data) {
             if packet_wrapper.packet_type == PacketType::MEETING.into() {

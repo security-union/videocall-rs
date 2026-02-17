@@ -30,6 +30,8 @@ use yew::prelude::Callback;
 #[derive(Clone)]
 pub struct ConnectOptions {
     pub userid: String,
+    pub session_id: String,
+    pub display_name: String,
     pub websocket_url: String,
     pub webtransport_url: String,
     pub on_inbound_media: Callback<PacketWrapper>,

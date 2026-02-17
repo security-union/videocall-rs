@@ -90,6 +90,8 @@ pub struct ConnectionManagerOptions {
     pub websocket_urls: Vec<String>,
     pub webtransport_urls: Vec<String>,
     pub userid: String,
+    pub session_id: String,
+    pub display_name: String,
     pub on_inbound_media: Callback<PacketWrapper>,
     pub on_state_changed: Callback<ConnectionState>,
     pub peer_monitor: Callback<()>,
@@ -178,6 +180,8 @@ impl ConnectionManager {
             let conn_id = format!("ws_{i}");
             let connect_options = ConnectOptions {
                 userid: self.options.userid.clone(),
+                session_id: self.options.session_id.clone(),
+                display_name: self.options.display_name.clone(),
                 websocket_url: url.clone(),
                 webtransport_url: String::new(), // Not used for WebSocket
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
@@ -215,6 +219,8 @@ impl ConnectionManager {
             let conn_id = format!("wt_{i}");
             let connect_options = ConnectOptions {
                 userid: self.options.userid.clone(),
+                session_id: self.options.session_id.clone(),
+                display_name: self.options.display_name.clone(),
                 websocket_url: String::new(), // Not used for WebTransport
                 webtransport_url: url.clone(),
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
@@ -802,6 +808,18 @@ impl ConnectionManager {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
             if let Some(connection) = self.connections.get(active_id) {
                 connection.set_screen_enabled(enabled);
+                return Ok(());
+            }
+        }
+
+        Err(anyhow!("No active connection available"))
+    }
+
+    /// Set display name on active connection (for heartbeat packets)
+    pub fn set_display_name(&self, name: String) -> Result<()> {
+        if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
+            if let Some(connection) = self.connections.get(active_id) {
+                connection.set_display_name(name);
                 return Ok(());
             }
         }

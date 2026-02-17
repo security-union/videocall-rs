@@ -123,6 +123,11 @@ pub struct MeetingProps {
     /// Called when screen share state changes (started, cancelled, stopped).
     /// This allows the parent component to react to screen share lifecycle events.
     pub on_screen_share_state: Callback<ScreenShareEvent>,
+
+    /// Called when the user changes their display name.
+    /// This allows the parent component to update the UsernameCtx.
+    #[prop_or_default]
+    pub on_name_changed: Option<Callback<String>>,
 }
 
 impl Component for Host {
@@ -338,8 +343,13 @@ impl Component for Host {
             }
             Msg::SaveChangeName => {
                 let new_name = self.pending_name.trim().to_string();
-                
-                log::info!(">>> SaveChangeName triggered, new_name='{}', valid={}, empty={}", new_name, is_valid_username(&new_name), new_name.is_empty());
+
+                log::info!(
+                    ">>> SaveChangeName triggered, new_name='{}', valid={}, empty={}",
+                    new_name,
+                    is_valid_username(&new_name),
+                    new_name.is_empty()
+                );
 
                 if is_valid_username(&new_name) && !new_name.is_empty() {
                     save_username_to_storage(&new_name);
@@ -354,12 +364,17 @@ impl Component for Host {
                         return true;
                     }
 
-                    log::info!(">>> Display name updated to: {}", new_name);
+                    // Notify parent to update UsernameCtx so the UI reflects the change
+                    if let Some(callback) = &ctx.props().on_name_changed {
+                        callback.emit(new_name.clone());
+                    }
+
+                    log::info!(">>> Display name updated to: {new_name}");
                     self.show_change_name = false;
                     self.change_name_error = None;
 
                     true
-                } else { 
+                } else {
                     self.change_name_error =
                         Some("Use letters, numbers, and underscore only.".to_string());
                     true
@@ -425,7 +440,7 @@ impl Component for Host {
                     true
                 } else {
                     false
-                } 
+                }
             }
             Msg::ScreenEncoderSettingsUpdated(settings) => {
                 // Only update if settings have changed

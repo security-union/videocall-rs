@@ -25,7 +25,7 @@ use super::ConnectOptions;
 use crate::crypto::aes::Aes128State;
 use gloo::timers::callback::Interval;
 use protobuf::Message;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use videocall_types::protos::media_packet::media_packet::MediaType;
@@ -52,6 +52,10 @@ pub struct Connection {
     audio_enabled: Rc<AtomicBool>,
     screen_enabled: Rc<AtomicBool>,
     url: String,
+    /// Session ID for this connection
+    #[allow(dead_code)]
+    session_id: String,
+    display_name: Rc<RefCell<String>>,
 }
 
 impl Connection {
@@ -62,6 +66,8 @@ impl Connection {
     ) -> anyhow::Result<Self> {
         let mut new_options = options.clone();
         let userid = new_options.userid.clone();
+        let session_id = new_options.session_id.clone();
+        let display_name = Rc::new(RefCell::new(new_options.display_name.clone()));
         let status = Rc::new(Cell::new(Status::Connecting));
 
         let url = if webtransport {
@@ -97,8 +103,10 @@ impl Connection {
             video_enabled: Rc::new(AtomicBool::new(false)),
             screen_enabled: Rc::new(AtomicBool::new(false)),
             url,
+            session_id: session_id.clone(),
+            display_name: Rc::clone(&display_name),
         };
-        connection.start_heartbeat(userid);
+        connection.start_heartbeat(userid, session_id, display_name);
 
         Ok(connection)
     }
@@ -107,7 +115,12 @@ impl Connection {
         matches!(self.status.get(), Status::Connected)
     }
 
-    fn start_heartbeat(&mut self, userid: String) {
+    fn start_heartbeat(
+        &mut self,
+        userid: String,
+        session_id: String,
+        display_name: Rc<RefCell<String>>,
+    ) {
         let task = Rc::clone(&self.task);
         let status = Rc::clone(&self.status);
         let aes = Rc::clone(&self.aes);
@@ -115,6 +128,7 @@ impl Connection {
         let audio_enabled = Rc::clone(&self.audio_enabled);
         let screen_enabled = Rc::clone(&self.screen_enabled);
         self.heartbeat = Some(Interval::new(1000, move || {
+            let current_display_name = display_name.borrow().clone();
             let heartbeat_metadata = HeartbeatMetadata {
                 video_enabled: video_enabled.load(std::sync::atomic::Ordering::Relaxed),
                 audio_enabled: audio_enabled.load(std::sync::atomic::Ordering::Relaxed),
@@ -125,6 +139,8 @@ impl Connection {
             let packet = MediaPacket {
                 media_type: MediaType::HEARTBEAT.into(),
                 email: userid.clone(),
+                session_id: session_id.clone(),
+                display_name: current_display_name.clone(),
                 timestamp: js_sys::Date::now(),
                 heartbeat_metadata: Some(heartbeat_metadata).into(),
                 ..Default::default()
@@ -133,6 +149,8 @@ impl Connection {
             let packet = PacketWrapper {
                 data,
                 email: userid.clone(),
+                session_id: session_id.clone(),
+                display_name: current_display_name,
                 packet_type: PacketType::MEDIA.into(),
                 ..Default::default()
             };
@@ -173,6 +191,18 @@ impl Connection {
         log::debug!("Setting screen enabled to {enabled}");
         self.screen_enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Update the display name for subsequent heartbeat packets
+    pub fn set_display_name(&self, name: String) {
+        log::debug!("Setting display name to {name}");
+        *self.display_name.borrow_mut() = name;
+    }
+
+    /// Get the current session ID
+    #[allow(dead_code)]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }
 

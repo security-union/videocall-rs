@@ -348,6 +348,8 @@ impl VideoCallClient {
                 Vec::new() // Empty if WebTransport is disabled
             },
             userid: self.options.userid.clone(),
+            session_id: self.options.session_id.clone(),
+            display_name: self.options.display_name.clone(),
             on_inbound_media: {
                 let inner = Rc::downgrade(&self.inner);
                 Callback::from(move |packet| {
@@ -812,7 +814,7 @@ impl VideoCallClient {
 
     /// Update the display name and broadcast to all peers
     pub fn update_display_name(&self, new_name: &str) -> Result<()> {
-        log::info!("update_display_name called with: {}", new_name);
+        log::info!("update_display_name called with: {new_name}");
 
         match self.inner.try_borrow() {
             Ok(inner) => {
@@ -820,6 +822,13 @@ impl VideoCallClient {
                 *inner.options.display_name.borrow_mut() = new_name.to_string();
 
                 if let Some(connection_controller) = &inner.connection_controller {
+                    // Update the connection's display_name for future heartbeat packets
+                    if let Err(e) = connection_controller.set_display_name(new_name.to_string()) {
+                        log::warn!("Failed to update connection display_name: {e:?}");
+                    } else {
+                        log::info!("Updated connection display_name to: {new_name}");
+                    }
+
                     let packet = PacketWrapper {
                         packet_type: PacketType::MEETING.into(),
                         email: inner.options.userid.clone(),
@@ -829,10 +838,9 @@ impl VideoCallClient {
                         special_fields: Default::default(),
                     };
 
+                    let session_id = &inner.options.session_id;
                     log::info!(
-                        ">>> Sending display name update packet: session_id={}, display_name={}",
-                        inner.options.session_id,
-                        new_name
+                        ">>> Sending display name update packet: session_id={session_id}, display_name={new_name}"
                     );
                     connection_controller.send_packet(packet)?;
                 } else {
@@ -842,37 +850,10 @@ impl VideoCallClient {
                 info!("Sent display name update: {new_name}");
             }
             Err(e) => {
-                log::error!("Failed to borrow inner: {:?}", e);
+                log::error!("Failed to borrow inner: {e:?}");
                 return Err(anyhow::anyhow!("Failed to borrow inner"));
             }
         }
-
-        // if let Ok(inner) = self.inner.try_borrow() {
-        //     log::info!("Successfully borrowed inner");
-        //     *inner.options.display_name.borrow_mut() = new_name.to_string();
-
-        //     if let Some(connection_controller) = &inner.connection_controller {
-
-        //         let packet = PacketWrapper {
-        //             packet_type: PacketType::MEETING.into(),
-        //             email: inner.options.userid.clone(),
-        //             session_id: inner.options.userid.clone(), //am not certain
-        //             display_name: new_name.to_string(),
-        //             data: vec![],
-        //             special_fields: Default::default(),
-        //         };
-
-        //         log::info!(">>> Sending display name update packet: session_id={}, display_name={}",
-        //                inner.options.userid, new_name);
-        //         connection_controller.send_packet(packet)?;
-        //     }
-
-        //     else {
-        //         log::warn!("No connection_controller available!");
-        //     }
-
-        //     info!("Sent display name update: {new_name}");
-        // }
 
         Ok(())
     }
@@ -884,6 +865,14 @@ impl VideoCallClient {
         }
 
         String::new()
+    }
+
+    /// Get the display name of a peer by their session ID
+    pub fn get_peer_display_name(&self, session_id: &str) -> Option<String> {
+        if let Ok(inner) = self.inner.try_borrow() {
+            return inner.peer_decode_manager.get_peer_display_name(session_id);
+        }
+        None
     }
 }
 
@@ -904,10 +893,10 @@ impl Inner {
         log::info!(
             "<<< RECEIVED packet type={:?} from email={} session_id={} display_name={}",
             response.packet_type.enum_value(),
-            response.email, 
+            response.email,
             response.session_id,
             response.display_name
-        ); 
+        );
 
         // Skip creating peers for system messages (meeting info, meeting started/ended)
         let peer_status = if response.email == SYSTEM_USER_EMAIL {
@@ -1076,63 +1065,27 @@ impl Inner {
                                     meeting_packet.room_id
                                 );
                             }
+                            Ok(MeetingEventType::NAME_UPDATED) => {
+                                let session_id = meeting_packet.user_session_id.clone();
+                                let new_name = meeting_packet.new_display_name.clone();
+                                info!(
+                                    "Received NAME_UPDATED: session_id={session_id}, new_name={new_name}"
+                                );
+                                // Update the peer's display name
+                                self.peer_decode_manager
+                                    .update_peer_display_name(&session_id, &new_name);
+                                // Emit callback to notify UI
+                                if let Some(callback) = &self.options.on_peer_display_name_changed {
+                                    callback.emit((session_id, new_name));
+                                }
+                            }
                             Err(e) => {
                                 error!("Failed to parse MeetingEventType: {e}");
                             }
                         }
-                        Ok(MeetingEventType::MEETING_ENDED) => {
-                            info!(
-                                "Received MEETING_ENDED: room={}, message={}",
-                                meeting_packet.room_id, meeting_packet.message
-                            );
-                            if let Some(callback) = &self.options.on_meeting_ended {
-                                let end_time_ms = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as f64)
-                                    .unwrap_or(0.0);
-                                callback.emit((end_time_ms, meeting_packet.message));
-                            }
-                        }
-                        Ok(MeetingEventType::PARTICIPANT_JOINED) => {
-                            info!(
-                                "Received PARTICIPANT_JOINED: room={}, count={}",
-                                meeting_packet.room_id, meeting_packet.participant_count
-                            );
-                            // Future: could emit participant joined event
-                        }
-                        Ok(MeetingEventType::PARTICIPANT_LEFT) => {
-                            info!(
-                                "Received PARTICIPANT_LEFT: room={}, count={}",
-                                meeting_packet.room_id, meeting_packet.participant_count
-                            );
-                            // Future: could emit participant left event
-                        }
-                        Err(e) => {
-                            error!("Unknown MeetingEventType: {e}");
-                        }
                     }
-                } else {
-                    let session_id = if response.session_id.is_empty() {
-                        response.email.clone()
-                    } else {
-                        response.session_id.clone()
-                    };
-
-                    let display_name = if response.display_name.is_empty() {
-                        response.email.clone()
-                    } else {
-                        response.display_name.clone()
-                    };
-
-                    info!(
-                        "Received METADATA packet with session_id: {session_id}, display_name: {display_name}"
-                    );
-
-                    self.peer_decode_manager
-                        .update_peer_display_name(&session_id, &display_name);
-
-                    if let Some(callback) = &self.options.on_peer_display_name_changed {
-                        callback.emit((session_id, display_name));
+                    Err(e) => {
+                        error!("Failed to parse MeetingPacket: {e}");
                     }
                 }
             }
@@ -1146,13 +1099,22 @@ impl Inner {
                 error!("Failed to parse packet: {e}");
             }
         }
-        if let PeerStatus::Added(peer_userid) = peer_status {
-            if peer_userid != self.options.userid {
-                self.options.on_peer_added.emit(peer_userid);
-                self.send_public_key();
-            } else {
-                log::debug!("Rejecting packet from same user: {peer_userid}");
+        match peer_status {
+            PeerStatus::Added(peer_userid) => {
+                if peer_userid != self.options.userid {
+                    self.options.on_peer_added.emit(peer_userid);
+                    self.send_public_key();
+                } else {
+                    log::debug!("Rejecting packet from same user: {peer_userid}");
+                }
             }
+            PeerStatus::NameChanged(session_id, new_name) => {
+                log::info!("Peer {session_id} changed display name to: {new_name}");
+                if let Some(callback) = &self.options.on_peer_display_name_changed {
+                    callback.emit((session_id, new_name));
+                }
+            }
+            PeerStatus::NoChange => {}
         }
     }
 

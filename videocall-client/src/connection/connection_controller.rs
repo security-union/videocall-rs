@@ -150,6 +150,15 @@ impl ConnectionController {
         inner.connection_manager.set_screen_enabled(enabled)
     }
 
+    /// Set display name on active connection (for heartbeat packets)
+    pub fn set_display_name(&self, name: String) -> Result<()> {
+        let inner = self
+            .inner
+            .try_borrow()
+            .map_err(|_| anyhow!("Failed to borrow ConnectionController inner"))?;
+        inner.connection_manager.set_display_name(name)
+    }
+
     /// Check if manager has an active connection
     pub fn is_connected(&self) -> bool {
         if let Ok(inner) = self.inner.try_borrow() {

@@ -25,6 +25,8 @@ on:
       - 'docker/Dockerfile.actix'
       - 'docker/Dockerfile.yew'
       - 'docker/start-yew.sh'
+      # Workflow changes (test workflow modifications)
+      - '.github/workflows/docker-build-check.yaml'
 
 permissions:
   contents: read

@@ -215,7 +215,7 @@ pub struct PeerState {
 }
 
 /// Hook to manage peer state updates from VideoCallClient events
-pub fn use_peer_state() -> (Signal<PeerState>, impl Fn(VideoCallEvent)) {
+pub fn use_peer_state() -> (Signal<PeerState>, impl FnMut(VideoCallEvent)) {
     let mut peer_state = use_signal(PeerState::default);
 
     let handle_event = move |event: VideoCallEvent| {

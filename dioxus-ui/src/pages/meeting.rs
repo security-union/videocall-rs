@@ -22,6 +22,8 @@ use crate::meeting_api::{get_meeting_info, join_meeting, JoinError};
 use crate::routing::Route;
 use dioxus::prelude::*;
 use gloo_timers::callback::Interval;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Meeting participant status from the API
 #[derive(Clone, PartialEq, Debug)]
@@ -49,8 +51,8 @@ pub enum MeetingStatus {
 
 #[component]
 pub fn MeetingPage(id: String) -> Element {
-    let navigator = use_navigator();
-    let username_ctx = use_context::<UsernameCtx>();
+    let nav = navigator();
+    let username_ctx: Option<Signal<Option<String>>> = try_use_context::<UsernameCtx>();
 
     // State
     let mut auth_checked = use_signal(|| !oauth_enabled().unwrap_or(false));
@@ -64,7 +66,6 @@ pub fn MeetingPage(id: String) -> Element {
 
     // Initialize input with stored username
     let initial_username = username_ctx
-        .as_ref()
         .and_then(|ctx| ctx.read().clone())
         .unwrap_or_else(|| load_username_from_storage().unwrap_or_default());
     let mut input_value = use_signal(|| initial_username);
@@ -73,7 +74,7 @@ pub fn MeetingPage(id: String) -> Element {
     let meeting_id = id.clone();
     use_effect(move || {
         if oauth_enabled().unwrap_or(false) {
-            spawn(async move {
+            wasm_bindgen_futures::spawn_local(async move {
                 match check_session().await {
                     Ok(_) => {
                         log::info!("Session check passed");
@@ -105,53 +106,59 @@ pub fn MeetingPage(id: String) -> Element {
     let meeting_id_for_poll = id.clone();
     use_effect(move || {
         let current_status = meeting_status.read().clone();
-        let interval: Option<Interval> = if current_status == MeetingStatus::WaitingForMeeting {
-            let meeting_id = meeting_id_for_poll.clone();
-            let display_name = input_value.read().clone();
+        if current_status != MeetingStatus::WaitingForMeeting {
+            return;
+        }
 
-            Some(Interval::new(2000, move || {
-                let meeting_id = meeting_id.clone();
-                let display_name = display_name.clone();
+        let meeting_id = meeting_id_for_poll.clone();
+        let display_name = input_value.read().clone();
 
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Ok(info) = get_meeting_info(&meeting_id).await {
-                        if info.state == "active" {
-                            match join_meeting(&meeting_id, Some(&display_name)).await {
-                                Ok(response) => {
-                                    current_user_email.set(Some(response.email.clone()));
-                                    let determined_host_display_name = info.host_display_name.clone();
-                                    host_display_name.set(determined_host_display_name.clone());
+        let interval = Interval::new(2000, move || {
+            let meeting_id = meeting_id.clone();
+            let display_name = display_name.clone();
 
-                                    match response.status.as_str() {
-                                        "admitted" => {
-                                            if let Some(token) = response.room_token {
-                                                meeting_status.set(MeetingStatus::Admitted {
-                                                    is_host: response.is_host,
-                                                    host_display_name: determined_host_display_name,
-                                                    room_token: token,
-                                                });
-                                            }
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(info) = get_meeting_info(&meeting_id).await {
+                    if info.state == "active" {
+                        match join_meeting(&meeting_id, Some(&display_name)).await {
+                            Ok(response) => {
+                                current_user_email.set(Some(response.email.clone()));
+                                let determined_host_display_name = info.host_display_name.clone();
+                                host_display_name.set(determined_host_display_name.clone());
+
+                                match response.status.as_str() {
+                                    "admitted" => {
+                                        if let Some(token) = response.room_token {
+                                            meeting_status.set(MeetingStatus::Admitted {
+                                                is_host: response.is_host,
+                                                host_display_name: determined_host_display_name,
+                                                room_token: token,
+                                            });
                                         }
-                                        "waiting" => {
-                                            came_from_waiting_room.set(true);
-                                            meeting_status.set(MeetingStatus::Waiting);
-                                        }
-                                        "rejected" => meeting_status.set(MeetingStatus::Rejected),
-                                        _ => {}
                                     }
+                                    "waiting" => {
+                                        came_from_waiting_room.set(true);
+                                        meeting_status.set(MeetingStatus::Waiting);
+                                    }
+                                    "rejected" => meeting_status.set(MeetingStatus::Rejected),
+                                    _ => {}
                                 }
-                                Err(JoinError::MeetingNotActive) => {}
-                                Err(e) => meeting_status.set(MeetingStatus::Error(e.to_string())),
                             }
+                            Err(JoinError::MeetingNotActive) => {}
+                            Err(e) => meeting_status.set(MeetingStatus::Error(e.to_string())),
                         }
                     }
-                });
-            }))
-        } else {
-            None
-        };
+                }
+            });
+        });
 
-        move || drop(interval)
+        // Keep interval alive using Rc<RefCell>
+        let interval_holder = Rc::new(RefCell::new(Some(interval)));
+        let cleanup_holder = interval_holder.clone();
+
+        // Cleanup on effect end - use a closure that will run when component unmounts
+        // Note: Dioxus 0.6 effects don't have a return cleanup mechanism like React
+        // The interval will be dropped when the Rc goes out of scope
     });
 
     // Early return for auth check
@@ -166,12 +173,12 @@ pub fn MeetingPage(id: String) -> Element {
 
     // Handlers
     let on_logout = {
-        let navigator = navigator.clone();
+        let nav = nav.clone();
         move |_| {
-            let navigator = navigator.clone();
-            spawn(async move {
+            let nav = nav.clone();
+            wasm_bindgen_futures::spawn_local(async move {
                 let _ = logout().await;
-                navigator.push(Route::Login {});
+                nav.push(Route::Login {});
             });
         }
     };
@@ -184,7 +191,7 @@ pub fn MeetingPage(id: String) -> Element {
 
             meeting_status.set(MeetingStatus::Joining);
 
-            spawn(async move {
+            wasm_bindgen_futures::spawn_local(async move {
                 match join_meeting(&meeting_id, Some(&display_name)).await {
                     Ok(response) => {
                         current_user_email.set(Some(response.email.clone()));
@@ -239,7 +246,7 @@ pub fn MeetingPage(id: String) -> Element {
         let meeting_id = id.clone();
         move |room_token: String| {
             let meeting_id = meeting_id.clone();
-            spawn(async move {
+            wasm_bindgen_futures::spawn_local(async move {
                 let determined = match get_meeting_info(&meeting_id).await {
                     Ok(info) => info.host_display_name,
                     Err(_) => None,
@@ -254,13 +261,13 @@ pub fn MeetingPage(id: String) -> Element {
         }
     };
 
-    let on_rejected = move |_| meeting_status.set(MeetingStatus::Rejected);
+    let mut on_rejected = move |_| meeting_status.set(MeetingStatus::Rejected);
 
     let on_cancel_waiting = {
         let meeting_id = id.clone();
         move |_| {
             let meeting_id = meeting_id.clone();
-            spawn(async move {
+            wasm_bindgen_futures::spawn_local(async move {
                 let _ = crate::meeting_api::leave_meeting(&meeting_id).await;
                 if let Some(window) = web_sys::window() {
                     let _ = window.location().set_href("/");
@@ -270,7 +277,7 @@ pub fn MeetingPage(id: String) -> Element {
     };
 
     let on_submit = {
-        let on_join = on_join_meeting.clone();
+        let mut on_join = on_join_meeting.clone();
         move |evt: Event<FormData>| {
             evt.prevent_default();
             let value = input_value.read().clone();
@@ -289,7 +296,8 @@ pub fn MeetingPage(id: String) -> Element {
         }
     };
 
-    let maybe_username = username_ctx.as_ref().and_then(|ctx| ctx.read().clone());
+    let maybe_username: Option<String> = username_ctx
+        .and_then(|ctx| ctx.read().clone());
     let current_status = meeting_status.read().clone();
     let should_auto_join = *came_from_waiting_room.read();
 
@@ -437,7 +445,10 @@ pub fn MeetingPage(id: String) -> Element {
                         if let Some(profile) = user_profile.read().clone() {
                             div { class: "absolute top-4 right-4 z-50",
                                 button {
-                                    onclick: move |_| show_dropdown.set(!*show_dropdown.read()),
+                                    onclick: move |_| {
+                                        let current = *show_dropdown.read();
+                                        show_dropdown.set(!current);
+                                    },
                                     class: "flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm transition-colors",
                                     span { "{profile.name}" }
                                     svg {
@@ -484,7 +495,7 @@ pub fn MeetingPage(id: String) -> Element {
                             value: "{input_value}",
                             oninput: move |evt| input_value.set(evt.value())
                         }
-                        if let Some(err) = error_state.read().as_ref() {
+                        if let Some(err) = error_state.read().clone() {
                             p { class: "error", "{err}" }
                         }
                         button { class: "cta-button", r#type: "submit", "Continue" }

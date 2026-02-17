@@ -54,14 +54,20 @@ pub fn Diagnostics(props: DiagnosticsProps) -> Element {
 
     // Subscribe to diagnostics when panel is open
     let is_open = props.is_open;
+    let mut abort_handle_signal = use_signal(|| None::<AbortHandle>);
+
     use_effect(move || {
         if !is_open {
-            // Clear state when closed
+            // Abort previous subscription and clear state
+            if let Some(handle) = abort_handle_signal.read().as_ref() {
+                handle.abort();
+            }
             state.set(DiagnosticsState::default());
             return;
         }
 
         let (abort_handle, abort_reg) = AbortHandle::new_pair();
+        abort_handle_signal.write().replace(abort_handle);
 
         let fut = async move {
             let mut rx = subscribe();
@@ -188,11 +194,6 @@ pub fn Diagnostics(props: DiagnosticsProps) -> Element {
         wasm_bindgen_futures::spawn_local(async move {
             let _ = abortable.await;
         });
-
-        // Cleanup
-        move || {
-            abort_handle.abort();
-        }
     });
 
     // Get available peers for selection
@@ -242,7 +243,10 @@ pub fn Diagnostics(props: DiagnosticsProps) -> Element {
                 // Application Version
                 div { class: "diagnostics-section",
                     h3 { "Application Version" }
-                    pre { "VideoCall UI: {}", env!("CARGO_PKG_VERSION") }
+                    {
+                        let version = env!("CARGO_PKG_VERSION");
+                        rsx! { pre { "VideoCall UI: {version}" } }
+                    }
                 }
 
                 // Connection Status
@@ -290,7 +294,10 @@ pub fn Diagnostics(props: DiagnosticsProps) -> Element {
                 div { class: "diagnostics-section",
                     h3 { "Audio Buffer" }
                     p { "Average buffer: {avg_buffer}ms" }
-                    p { "Samples: {}", buffer_history.len() }
+                    {
+                        let samples_count = buffer_history.len();
+                        rsx! { p { "Samples: {samples_count}" } }
+                    }
                 }
 
                 // Decoder Stats
@@ -316,11 +323,11 @@ pub fn Diagnostics(props: DiagnosticsProps) -> Element {
                 // Media Status
                 div { class: "diagnostics-section",
                     h3 { "Media Status" }
-                    pre {
-                        "Video: {}\nAudio: {}\nScreen Share: {}",
-                        if props.video_enabled { "Enabled" } else { "Disabled" },
-                        if props.mic_enabled { "Enabled" } else { "Disabled" },
-                        if props.share_screen { "Enabled" } else { "Disabled" }
+                    {
+                        let video_status = if props.video_enabled { "Enabled" } else { "Disabled" };
+                        let audio_status = if props.mic_enabled { "Enabled" } else { "Disabled" };
+                        let screen_status = if props.share_screen { "Enabled" } else { "Disabled" };
+                        rsx! { pre { "Video: {video_status}\nAudio: {audio_status}\nScreen Share: {screen_status}" } }
                     }
                 }
             }

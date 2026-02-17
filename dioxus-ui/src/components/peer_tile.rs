@@ -18,7 +18,8 @@
 
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
-use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
+use videocall_client::VideoCallClient;
+use videocall_diagnostics::{subscribe, MetricValue};
 
 use crate::components::canvas_generator::generate_for_peer;
 use crate::context::VideoCallClientCtx;
@@ -36,7 +37,7 @@ pub struct PeerTileProps {
 
 #[component]
 pub fn PeerTile(props: PeerTileProps) -> Element {
-    let client = use_context::<VideoCallClientCtx>();
+    let client: Option<VideoCallClient> = try_use_context::<VideoCallClientCtx>();
 
     let mut audio_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);
@@ -44,8 +45,9 @@ pub fn PeerTile(props: PeerTileProps) -> Element {
 
     // Initialize from client snapshot and subscribe to diagnostics
     let peer_id = props.peer_id.clone();
+    let client_for_effect = client.clone();
     use_effect(move || {
-        if let Some(ref client) = client {
+        if let Some(ref client) = client_for_effect {
             // Initialize from client snapshot to avoid waiting for first diagnostic
             audio_enabled.set(client.is_audio_enabled_for_peer(&peer_id));
             video_enabled.set(client.is_video_enabled_for_peer(&peer_id));

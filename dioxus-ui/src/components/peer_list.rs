@@ -40,7 +40,7 @@ pub fn PeerList(props: PeerListProps) -> Element {
     let mut search_query = use_signal(String::new);
     let mut show_context_menu = use_signal(|| false);
 
-    let username_ctx = use_context::<UsernameCtx>();
+    let username_ctx: Option<Signal<Option<String>>> = try_use_context::<UsernameCtx>();
 
     // Filter peers based on search query
     let query = search_query.read().to_lowercase();
@@ -52,7 +52,7 @@ pub fn PeerList(props: PeerListProps) -> Element {
         .collect();
 
     // Get current user name and check if they're the host
-    let current_user_name = username_ctx.as_ref().and_then(|ctx| ctx.read().clone());
+    let current_user_name = username_ctx.and_then(|ctx| ctx.read().clone());
 
     let display_name = current_user_name
         .clone()
@@ -85,9 +85,10 @@ pub fn PeerList(props: PeerListProps) -> Element {
                         class: "menu-button",
                         onclick: move |e| {
                             e.stop_propagation();
-                            show_context_menu.set(!*show_context_menu.read());
+                            let current = *show_context_menu.read();
+                            show_context_menu.set(!current);
                         },
-                        aria_label: "More options",
+                        "aria-label": "More options",
                         svg {
                             xmlns: "http://www.w3.org/2000/svg",
                             width: "20",

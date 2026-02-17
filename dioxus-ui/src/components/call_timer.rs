@@ -31,28 +31,24 @@ pub fn CallTimer(
     start_time_ms: Option<f64>,
 ) -> Element {
     let mut duration = use_signal(|| NO_TIME_PLACEHOLDER.to_string());
+    let mut interval_holder: Signal<Option<Interval>> = use_signal(|| None);
 
     // Effect to update duration and set up interval
     use_effect(move || {
+        // Clean up previous interval
+        interval_holder.write().take();
+
         // Initial update
         if let Some(start_ms) = start_time_ms {
             duration.set(format_duration(start_ms));
+
+            // Set up interval for continuous updates
+            let new_interval = Interval::new(1000, move || {
+                duration.set(format_duration(start_ms));
+            });
+            interval_holder.write().replace(new_interval);
         } else {
             duration.set(NO_TIME_PLACEHOLDER.to_string());
-        }
-
-        // Set up interval for continuous updates
-        let interval = if let Some(start_ms) = start_time_ms {
-            Some(Interval::new(1000, move || {
-                duration.set(format_duration(start_ms));
-            }))
-        } else {
-            None
-        };
-
-        // Cleanup on unmount or when start_time changes
-        move || {
-            drop(interval);
         }
     });
 

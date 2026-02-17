@@ -41,7 +41,6 @@ pub fn MeetingsList(
 ) -> Element {
     let mut fetch_state = use_signal(|| FetchState::Loading);
     let mut expanded = use_signal(|| true);
-    let navigator = use_navigator();
 
     // Fetch meetings on mount and when expanded
     let fetch_meetings = move || {
@@ -144,8 +143,7 @@ pub fn MeetingsList(
                                                 }
                                                 fetch_meetings();
                                             });
-                                        },
-                                        navigator: navigator.clone()
+                                        }
                                     }
                                 }
                             }
@@ -162,8 +160,8 @@ fn MeetingItem(
     meeting: MeetingSummary,
     on_select: Option<EventHandler<String>>,
     on_delete: EventHandler<String>,
-    navigator: Navigator,
 ) -> Element {
+    let nav = navigator();
     let meeting_id = meeting.meeting_id.clone();
     let is_active = meeting.state == "active";
     let is_ended = meeting.state == "ended";
@@ -171,12 +169,11 @@ fn MeetingItem(
     let on_click = {
         let meeting_id = meeting_id.clone();
         let on_select = on_select.clone();
-        let navigator = navigator.clone();
         move |_| {
             if let Some(ref callback) = on_select {
                 callback.call(meeting_id.clone());
             } else {
-                navigator.push(Route::Meeting {
+                nav.push(Route::Meeting {
                     id: meeting_id.clone(),
                 });
             }

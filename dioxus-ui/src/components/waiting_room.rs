@@ -42,10 +42,11 @@ pub struct WaitingRoomProps {
 pub fn WaitingRoom(props: WaitingRoomProps) -> Element {
     let mut status = use_signal(|| None::<ParticipantStatus>);
     let mut error = use_signal(|| None::<String>);
+    let mut interval_holder: Signal<Option<Rc<RefCell<Option<Interval>>>>> = use_signal(|| None);
 
     // Track if callbacks have been fired to avoid double-calling
-    let admitted_fired = use_signal(|| false);
-    let rejected_fired = use_signal(|| false);
+    let mut admitted_fired = use_signal(|| false);
+    let mut rejected_fired = use_signal(|| false);
 
     // Set up polling for status updates
     let meeting_id = props.meeting_id.clone();
@@ -53,6 +54,11 @@ pub fn WaitingRoom(props: WaitingRoomProps) -> Element {
     let on_rejected = props.on_rejected.clone();
 
     use_effect(move || {
+        // Clean up previous interval
+        if let Some(interval_rc) = interval_holder.read().as_ref() {
+            interval_rc.borrow_mut().take();
+        }
+
         let meeting_id = meeting_id.clone();
         let on_admitted = on_admitted.clone();
         let on_rejected = on_rejected.clone();
@@ -105,17 +111,8 @@ pub fn WaitingRoom(props: WaitingRoomProps) -> Element {
 
         // Set up polling interval
         let interval = Interval::new(2000, check_status);
-
-        // Keep interval alive
-        let interval = Rc::new(RefCell::new(Some(interval)));
-        let interval_cleanup = interval.clone();
-
-        // Cleanup on unmount
-        move || {
-            if let Some(interval) = interval_cleanup.borrow_mut().take() {
-                drop(interval);
-            }
-        }
+        let interval_rc = Rc::new(RefCell::new(Some(interval)));
+        interval_holder.write().replace(interval_rc);
     });
 
     rsx! {

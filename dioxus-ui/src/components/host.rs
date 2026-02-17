@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use videocall_client::{
     create_microphone_encoder, CameraEncoder, MediaDeviceList, MicrophoneEncoderTrait,
-    ScreenEncoder, ScreenShareEvent,
+    ScreenEncoder, ScreenShareEvent, VideoCallClient,
 };
 use videocall_types::protos::media_packet::media_packet::MediaType;
 
@@ -89,7 +89,10 @@ struct HostEncoders {
 
 #[component]
 pub fn Host(props: HostProps) -> Element {
-    let client = use_context::<VideoCallClientCtx>();
+    let client: Option<VideoCallClient> = try_use_context::<VideoCallClientCtx>();
+    let client_for_init = client.clone();
+    let client_for_update = client.clone();
+    let client_for_speaker = client.clone();
 
     // State for encoder settings
     let mut encoder_settings = use_signal(EncoderSettings::default);
@@ -115,7 +118,7 @@ pub fn Host(props: HostProps) -> Element {
     let mut share_screen = use_signal(|| props.share_screen);
 
     // Encoders reference (stored in Rc<RefCell> for sharing across closures)
-    let encoders: Signal<Option<Rc<RefCell<HostEncoders>>>> = use_signal(|| None);
+    let mut encoders: Signal<Option<Rc<RefCell<HostEncoders>>>> = use_signal(|| None);
 
     // Initialize encoders on mount
     let on_encoder_settings_update = props.on_encoder_settings_update.clone();
@@ -123,30 +126,37 @@ pub fn Host(props: HostProps) -> Element {
     let on_microphone_error = props.on_microphone_error.clone();
     let on_camera_error = props.on_camera_error.clone();
 
+    // Use Rc<RefCell> for encoder settings shared with Yew callbacks
+    // (Yew's Callback::from requires Fn, not FnMut)
+    let encoder_settings_rc = Rc::new(RefCell::new(EncoderSettings::default()));
+
     use_effect(move || {
-        if let Some(ref client) = client {
+        if let Some(ref client) = client_for_init {
             // Create encoder callbacks using Yew callbacks (videocall-client requires them)
             let camera_callback = {
                 let on_update = on_encoder_settings_update.clone();
+                let settings_rc = encoder_settings_rc.clone();
                 yew::Callback::from(move |settings: String| {
-                    encoder_settings.write().camera = Some(settings.clone());
-                    on_update.call(encoder_settings.read().to_string());
+                    settings_rc.borrow_mut().camera = Some(settings.clone());
+                    on_update.call(settings_rc.borrow().to_string());
                 })
             };
 
             let microphone_callback = {
                 let on_update = on_encoder_settings_update.clone();
+                let settings_rc = encoder_settings_rc.clone();
                 yew::Callback::from(move |settings: String| {
-                    encoder_settings.write().microphone = Some(settings.clone());
-                    on_update.call(encoder_settings.read().to_string());
+                    settings_rc.borrow_mut().microphone = Some(settings.clone());
+                    on_update.call(settings_rc.borrow().to_string());
                 })
             };
 
             let screen_callback = {
                 let on_update = on_encoder_settings_update.clone();
+                let settings_rc = encoder_settings_rc.clone();
                 yew::Callback::from(move |settings: String| {
-                    encoder_settings.write().screen = Some(settings.clone());
-                    on_update.call(encoder_settings.read().to_string());
+                    settings_rc.borrow_mut().screen = Some(settings.clone());
+                    on_update.call(settings_rc.borrow().to_string());
                 })
             };
 
@@ -290,66 +300,73 @@ pub fn Host(props: HostProps) -> Element {
             }
 
             // Update client states
-            if let Some(ref client) = client {
+            if let Some(ref client) = client_for_update {
                 client.set_audio_enabled(props.mic_enabled);
                 client.set_video_enabled(props.video_enabled);
             }
         }
     });
 
-    // Device change handlers
-    let on_microphone_change = move |device: DeviceInfo| {
-        log::info!("Microphone changed: {:?}", device);
-        if let Some(ref enc) = *encoders.read() {
-            let mut enc = enc.borrow_mut();
-            enc.media_devices.audio_inputs.select(&device.device_id);
-            if enc.microphone.select(device.device_id.clone()) {
-                // Restart microphone after a delay
-                let enc_clone = encoders.read().clone();
-                Timeout::new(1000, move || {
-                    if let Some(ref enc) = enc_clone {
-                        enc.borrow_mut().microphone.start();
-                    }
-                })
-                .forget();
+    // Device change handler factory functions
+    let make_microphone_handler = || {
+        move |device: DeviceInfo| {
+            log::info!("Microphone changed: {:?}", device);
+            if let Some(ref enc) = *encoders.read() {
+                let mut enc = enc.borrow_mut();
+                enc.media_devices.audio_inputs.select(&device.device_id);
+                if enc.microphone.select(device.device_id.clone()) {
+                    let enc_clone = encoders.read().clone();
+                    Timeout::new(1000, move || {
+                        if let Some(ref enc) = enc_clone {
+                            enc.borrow_mut().microphone.start();
+                        }
+                    })
+                    .forget();
+                }
             }
+            selected_microphone_id.set(device.device_id);
         }
-        selected_microphone_id.set(device.device_id);
     };
 
-    let on_camera_change = move |device: DeviceInfo| {
-        log::info!("Camera changed: {:?}", device);
-        if let Some(ref enc) = *encoders.read() {
-            let mut enc = enc.borrow_mut();
-            enc.media_devices.video_inputs.select(&device.device_id);
-            if enc.camera.select(device.device_id.clone()) {
-                // Restart camera after a delay
-                let enc_clone = encoders.read().clone();
-                Timeout::new(1000, move || {
-                    if let Some(ref enc) = enc_clone {
-                        enc.borrow_mut().camera.start();
-                    }
-                })
-                .forget();
+    let make_camera_handler = || {
+        move |device: DeviceInfo| {
+            log::info!("Camera changed: {:?}", device);
+            if let Some(ref enc) = *encoders.read() {
+                let mut enc = enc.borrow_mut();
+                enc.media_devices.video_inputs.select(&device.device_id);
+                if enc.camera.select(device.device_id.clone()) {
+                    let enc_clone = encoders.read().clone();
+                    Timeout::new(1000, move || {
+                        if let Some(ref enc) = enc_clone {
+                            enc.borrow_mut().camera.start();
+                        }
+                    })
+                    .forget();
+                }
             }
+            selected_camera_id.set(device.device_id);
         }
-        selected_camera_id.set(device.device_id);
     };
 
-    let on_speaker_change = move |device: DeviceInfo| {
-        log::info!("Speaker changed: {:?}", device);
-        if let Some(ref enc) = *encoders.read() {
-            enc.borrow_mut()
-                .media_devices
-                .audio_outputs
-                .select(&device.device_id);
-        }
-        if let Some(ref client) = client {
-            if let Err(e) = client.update_speaker_device(Some(device.device_id.clone())) {
-                log::error!("Failed to update speaker device: {e:?}");
+    let client_for_speaker_1 = client.clone();
+    let client_for_speaker_2 = client.clone();
+
+    let make_speaker_handler = |speaker_client: Option<VideoCallClient>| {
+        move |device: DeviceInfo| {
+            log::info!("Speaker changed: {:?}", device);
+            if let Some(ref enc) = *encoders.read() {
+                enc.borrow_mut()
+                    .media_devices
+                    .audio_outputs
+                    .select(&device.device_id);
             }
+            if let Some(ref client) = speaker_client {
+                if let Err(e) = client.update_speaker_device(Some(device.device_id.clone())) {
+                    log::error!("Failed to update speaker device: {e:?}");
+                }
+            }
+            selected_speaker_id.set(device.device_id);
         }
-        selected_speaker_id.set(device.device_id);
     };
 
     // Change name handlers
@@ -470,9 +487,9 @@ pub fn Host(props: HostProps) -> Element {
                 selected_microphone_id: selected_microphone_id.read().clone(),
                 selected_camera_id: selected_camera_id.read().clone(),
                 selected_speaker_id: selected_speaker_id.read().clone(),
-                on_microphone_select: on_microphone_change,
-                on_camera_select: on_camera_change,
-                on_speaker_select: on_speaker_change
+                on_microphone_select: make_microphone_handler(),
+                on_camera_select: make_camera_handler(),
+                on_speaker_select: make_speaker_handler(client_for_speaker_1.clone())
             }
         }
 
@@ -484,9 +501,9 @@ pub fn Host(props: HostProps) -> Element {
             selected_microphone_id: selected_microphone_id.read().clone(),
             selected_camera_id: selected_camera_id.read().clone(),
             selected_speaker_id: selected_speaker_id.read().clone(),
-            on_microphone_select: on_microphone_change,
-            on_camera_select: on_camera_change,
-            on_speaker_select: on_speaker_change,
+            on_microphone_select: make_microphone_handler(),
+            on_camera_select: make_camera_handler(),
+            on_speaker_select: make_speaker_handler(client_for_speaker_2.clone()),
             visible: props.device_settings_open,
             on_close: move |_| props.on_device_settings_toggle.call(())
         }

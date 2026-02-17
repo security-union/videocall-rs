@@ -18,6 +18,7 @@
 
 use dioxus::prelude::*;
 use videocall_client::VideoCallClient;
+use wasm_bindgen::JsCast;
 use web_sys::{window, HtmlCanvasElement};
 
 use crate::components::icons::crop::CropIcon;
@@ -202,7 +203,7 @@ struct UserVideoProps {
 
 #[component]
 fn UserVideo(props: UserVideoProps) -> Element {
-    let client = use_context::<VideoCallClientCtx>();
+    let client: Option<VideoCallClient> = try_use_context::<VideoCallClientCtx>();
 
     // Pass canvas reference to client when mounted
     let peer_id = props.id.clone();
@@ -236,7 +237,7 @@ struct ScreenCanvasProps {
 
 #[component]
 fn ScreenCanvas(props: ScreenCanvasProps) -> Element {
-    let client = use_context::<VideoCallClientCtx>();
+    let client: Option<VideoCallClient> = try_use_context::<VideoCallClientCtx>();
     let canvas_id = format!("screen-share-{}", props.peer_id);
 
     // Pass canvas reference to client when mounted

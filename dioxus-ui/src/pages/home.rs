@@ -38,12 +38,11 @@ fn generate_meeting_id() -> String {
 
 #[component]
 pub fn Home() -> Element {
-    let navigator = use_navigator();
-    let mut username_ctx = use_context::<UsernameCtx>();
+    let nav = navigator();
+    let username_ctx: Option<Signal<Option<String>>> = try_use_context::<UsernameCtx>();
 
     let mut username_input = use_signal(|| {
         username_ctx
-            .as_ref()
             .and_then(|ctx| ctx.read().clone())
             .unwrap_or_else(|| load_username_from_storage().unwrap_or_default())
     });
@@ -75,7 +74,7 @@ pub fn Home() -> Element {
             ctx.set(Some(username.clone()));
         }
         matomo_logger::set_user_id(&username);
-        navigator.push(Route::Meeting { id: meeting_id });
+        nav.push(Route::Meeting { id: meeting_id });
     };
 
     let create_meeting = move |_| {
@@ -93,7 +92,7 @@ pub fn Home() -> Element {
             ctx.set(Some(username.clone()));
         }
         matomo_logger::set_user_id(&username);
-        navigator.push(Route::Meeting { id: meeting_id });
+        nav.push(Route::Meeting { id: meeting_id });
     };
 
     let open_github = |_| {
@@ -114,13 +113,13 @@ pub fn Home() -> Element {
             a {
                 href: "https://github.com/security-union/videocall-rs",
                 class: "github-corner",
-                aria_label: "View source on GitHub",
+                "aria-label": "View source on GitHub",
                 svg {
                     width: "80",
                     height: "80",
                     view_box: "0 0 250 250",
                     style: "fill:#7928CA; color:#0D131F; position: absolute; top: 0; border: 0; right: 0;",
-                    aria_hidden: "true",
+                    "aria-hidden": "true",
                     path { d: "M0,0 L115,115 L130,115 L142,142 L250,250 L250,0 Z" }
                     path {
                         d: "M128.3,109.0 C113.8,99.7 119.0,89.6 119.0,89.6 C122.0,82.7 120.5,78.6 120.5,78.6 C119.2,72.0 123.4,76.3 123.4,76.3 C127.3,80.9 125.5,87.3 125.5,87.3 C122.9,97.6 130.6,101.9 134.4,103.2",

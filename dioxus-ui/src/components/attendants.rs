@@ -131,72 +131,98 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
         let mut mda = MediaDeviceAccess::new();
 
         mda.on_granted = {
+            // Clone values for use in the callback
+            let email_for_granted = email.clone();
+            let id_for_granted = id.clone();
+            let room_token_for_granted = room_token.clone();
+
             yew::Callback::from(move |_| {
                 log::info!("DIOXUS-UI: Media permissions granted");
-                // Create and connect client after permissions granted
-                let config = VideoCallClientConfig {
-                    userid: email.clone(),
-                    meeting_id: id.clone(),
-                    room_token: room_token.clone(),
-                    e2ee_enabled,
-                    webtransport_enabled,
-                };
+                // Clone again for the async block
+                let email = email_for_granted.clone();
+                let id = id_for_granted.clone();
+                let room_token = room_token_for_granted.clone();
 
-                let vcc = create_video_call_client(config, move |event| {
-                    match event {
-                        VideoCallEvent::Connected => {
-                            log::info!("DIOXUS-UI: Connected!");
-                            error.set(None);
-                            call_start_time.set(Some(js_sys::Date::now()));
-                        }
-                        VideoCallEvent::ConnectionLost => {
-                            log::warn!("DIOXUS-UI: Connection lost");
-                            error.set(Some("Connection lost, reconnecting...".to_string()));
-                            // Schedule reconnection
-                            Timeout::new(1000, move || {
-                                if let Some(ref c) = *client.read() {
-                                    if let Err(e) = c.connect() {
-                                        log::error!("Reconnection failed: {e:?}");
+                // Use spawn_local to defer signal mutations (makes callback Fn instead of FnMut)
+                wasm_bindgen_futures::spawn_local(async move {
+                    // Create and connect client after permissions granted
+                    let config = VideoCallClientConfig {
+                        userid: email,
+                        meeting_id: id,
+                        room_token,
+                        e2ee_enabled,
+                        webtransport_enabled,
+                    };
+
+                    let mut vcc = create_video_call_client(config, move |event| {
+                        // Each event handler also uses spawn_local to defer mutations
+                        match event {
+                            VideoCallEvent::Connected => {
+                                log::info!("DIOXUS-UI: Connected!");
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    error.set(None);
+                                    call_start_time.set(Some(js_sys::Date::now()));
+                                });
+                            }
+                            VideoCallEvent::ConnectionLost => {
+                                log::warn!("DIOXUS-UI: Connection lost");
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    error.set(Some("Connection lost, reconnecting...".to_string()));
+                                });
+                                // Schedule reconnection
+                                Timeout::new(1000, move || {
+                                    if let Some(ref mut c) = *client.write() {
+                                        if let Err(e) = c.connect() {
+                                            log::error!("Reconnection failed: {e:?}");
+                                        }
                                     }
-                                }
-                            })
-                            .forget();
+                                })
+                                .forget();
+                            }
+                            VideoCallEvent::PeerAdded(peer_id) => {
+                                log::info!("DIOXUS-UI: Peer added: {peer_id}");
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    peers.write().push(peer_id);
+                                });
+                                // Play notification sound
+                                play_user_joined();
+                            }
+                            VideoCallEvent::PeerRemoved(peer_id) => {
+                                log::info!("DIOXUS-UI: Peer removed: {peer_id}");
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    peers.write().retain(|p| p != &peer_id);
+                                });
+                            }
+                            VideoCallEvent::FirstFrame(_peer_id, _media_type) => {
+                                // Handled by PeerTile
+                            }
+                            VideoCallEvent::EncoderSettingsUpdated(_settings) => {
+                                // Handled by Host
+                            }
+                            VideoCallEvent::MeetingInfo(start_time) => {
+                                log::info!("DIOXUS-UI: Meeting info received, start_time: {start_time}");
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    meeting_start_time_server.set(Some(start_time as f64));
+                                });
+                            }
+                            VideoCallEvent::MeetingEnded(message) => {
+                                log::info!("DIOXUS-UI: Meeting ended");
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    meeting_ended_message.set(Some(message));
+                                });
+                            }
                         }
-                        VideoCallEvent::PeerAdded(peer_id) => {
-                            log::info!("DIOXUS-UI: Peer added: {peer_id}");
-                            peers.write().push(peer_id);
-                            // Play notification sound
-                            play_user_joined();
-                        }
-                        VideoCallEvent::PeerRemoved(peer_id) => {
-                            log::info!("DIOXUS-UI: Peer removed: {peer_id}");
-                            peers.write().retain(|p| p != &peer_id);
-                        }
-                        VideoCallEvent::FirstFrame(_peer_id, _media_type) => {
-                            // Handled by PeerTile
-                        }
-                        VideoCallEvent::EncoderSettingsUpdated(_settings) => {
-                            // Handled by Host
-                        }
-                        VideoCallEvent::MeetingInfo(start_time) => {
-                            log::info!("DIOXUS-UI: Meeting info received, start_time: {start_time}");
-                            meeting_start_time_server.set(Some(start_time as f64));
-                        }
-                        VideoCallEvent::MeetingEnded(message) => {
-                            log::info!("DIOXUS-UI: Meeting ended");
-                            meeting_ended_message.set(Some(message));
-                        }
+                    });
+
+                    // Connect
+                    if let Err(e) = vcc.connect() {
+                        log::error!("Connection failed: {e:?}");
+                        error.set(Some(format!("Connection failed: {e:?}")));
                     }
+
+                    client.set(Some(vcc));
+                    meeting_joined.set(true);
                 });
-
-                // Connect
-                if let Err(e) = vcc.connect() {
-                    log::error!("Connection failed: {e:?}");
-                    error.set(Some(format!("Connection failed: {e:?}")));
-                }
-
-                client.set(Some(vcc));
-                meeting_joined.set(true);
             })
         };
 
@@ -204,8 +230,11 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
             yew::Callback::from(move |e| {
                 let msg = format!("Error requesting permissions: Please make sure to allow access to both camera and microphone. ({e:?})");
                 log::error!("{msg}");
-                error.set(Some(msg));
-                meeting_joined.set(false);
+                // Use spawn_local to defer signal mutations
+                wasm_bindgen_futures::spawn_local(async move {
+                    error.set(Some(msg));
+                    meeting_joined.set(false);
+                });
             })
         };
 
@@ -368,39 +397,48 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                     style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000000; z-index: 1000;",
 
                     // Logout dropdown
-                    if let (Some(name), Some(email_addr), Some(on_logout)) = (&props.user_name, &props.user_email, &props.on_logout) {
-                        div {
-                            style: "position: absolute; top: 1rem; right: 1rem; z-index: 1001;",
-                            button {
-                                onclick: move |_| show_dropdown.set(!*show_dropdown.read()),
-                                style: "display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; background: #1f2937; border-radius: 0.5rem; color: white; font-size: 0.875rem; border: none; cursor: pointer;",
-                                span { "{name}" }
-                                svg {
-                                    style: "width: 1rem; height: 1rem;",
-                                    fill: "none",
-                                    stroke: "currentColor",
-                                    view_box: "0 0 24 24",
-                                    path {
-                                        stroke_linecap: "round",
-                                        stroke_linejoin: "round",
-                                        stroke_width: "2",
-                                        d: "M19 9l-7 7-7-7"
-                                    }
-                                }
-                            }
-
-                            if *show_dropdown.read() {
+                    if let (Some(name), Some(email_addr)) = (&props.user_name, &props.user_email) {
+                        {
+                            let logout_handler = props.on_logout.clone();
+                            rsx! {
                                 div {
-                                    style: "position: absolute; right: 0; margin-top: 0.5rem; width: 14rem; background: white; border-radius: 0.5rem; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); border: 1px solid #e5e7eb; padding: 0.25rem 0;",
-                                    div {
-                                        style: "padding: 0.75rem 1rem; border-bottom: 1px solid #e5e7eb;",
-                                        p { style: "font-size: 0.875rem; font-weight: 500; color: #111827; margin: 0;", "{name}" }
-                                        p { style: "font-size: 0.75rem; color: #6b7280; margin: 0; overflow: hidden; text-overflow: ellipsis;", "{email_addr}" }
-                                    }
+                                    style: "position: absolute; top: 1rem; right: 1rem; z-index: 1001;",
                                     button {
-                                        onclick: move |_| on_logout.call(()),
-                                        style: "width: 100%; text-align: left; padding: 0.5rem 1rem; font-size: 0.875rem; color: #dc2626; background: transparent; border: none; cursor: pointer;",
-                                        "Sign out"
+                                        onclick: move |_| { let v = *show_dropdown.read(); show_dropdown.set(!v) },
+                                        style: "display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem 1rem; background: #1f2937; border-radius: 0.5rem; color: white; font-size: 0.875rem; border: none; cursor: pointer;",
+                                        span { "{name}" }
+                                        svg {
+                                            style: "width: 1rem; height: 1rem;",
+                                            fill: "none",
+                                            stroke: "currentColor",
+                                            view_box: "0 0 24 24",
+                                            path {
+                                                stroke_linecap: "round",
+                                                stroke_linejoin: "round",
+                                                stroke_width: "2",
+                                                d: "M19 9l-7 7-7-7"
+                                            }
+                                        }
+                                    }
+
+                                    if *show_dropdown.read() {
+                                        div {
+                                            style: "position: absolute; right: 0; margin-top: 0.5rem; width: 14rem; background: white; border-radius: 0.5rem; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); border: 1px solid #e5e7eb; padding: 0.25rem 0;",
+                                            div {
+                                                style: "padding: 0.75rem 1rem; border-bottom: 1px solid #e5e7eb;",
+                                                p { style: "font-size: 0.875rem; font-weight: 500; color: #111827; margin: 0;", "{name}" }
+                                                p { style: "font-size: 0.75rem; color: #6b7280; margin: 0; overflow: hidden; text-overflow: ellipsis;", "{email_addr}" }
+                                            }
+                                            button {
+                                                onclick: move |_| {
+                                                    if let Some(ref handler) = logout_handler {
+                                                        handler.call(());
+                                                    }
+                                                },
+                                                style: "width: 100%; text-align: left; padding: 0.5rem 1rem; font-size: 0.875rem; color: #dc2626; background: transparent; border: none; cursor: pointer;",
+                                                "Sign out"
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -448,7 +486,7 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                         BrowserCompatibility {}
                         div {
                             id: "grid-container",
-                            data_peers: "{num_peers_for_styling}",
+                            "data-peers": "{num_peers_for_styling}",
                             style: "{container_style}",
 
                             // Peer tiles
@@ -533,7 +571,7 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                                                     PeerListButton {
                                                         open: *peer_list_open.read(),
                                                         onclick: move |_| {
-                                                            peer_list_open.set(!*peer_list_open.read());
+                                                            { let v = *peer_list_open.read(); peer_list_open.set(!v) };
                                                             if *peer_list_open.read() {
                                                                 diagnostics_open.set(false);
                                                             }
@@ -542,7 +580,7 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                                                     DiagnosticsButton {
                                                         open: *diagnostics_open.read(),
                                                         onclick: move |_| {
-                                                            diagnostics_open.set(!*diagnostics_open.read());
+                                                            { let v = *diagnostics_open.read(); diagnostics_open.set(!v) };
                                                             if *diagnostics_open.read() {
                                                                 peer_list_open.set(false);
                                                             }
@@ -551,7 +589,7 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                                                     DeviceSettingsButton {
                                                         open: *device_settings_open.read(),
                                                         onclick: move |_| {
-                                                            device_settings_open.set(!*device_settings_open.read());
+                                                            { let v = *device_settings_open.read(); device_settings_open.set(!v) };
                                                             if *device_settings_open.read() {
                                                                 peer_list_open.set(false);
                                                                 diagnostics_open.set(false);
@@ -589,7 +627,7 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                                                     video_enabled: *video_enabled.read(),
                                                     on_encoder_settings_update: |_settings: String| {},
                                                     device_settings_open: *device_settings_open.read(),
-                                                    on_device_settings_toggle: move |_| device_settings_open.set(!*device_settings_open.read()),
+                                                    on_device_settings_toggle: move |_| { let v = *device_settings_open.read(); device_settings_open.set(!v) },
                                                     on_microphone_error: move |err: String| {
                                                         mic_enabled.set(false);
                                                         user_error.set(Some(format!("Microphone error: {err}")));
@@ -627,7 +665,7 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                                     room_id: props.id.clone(),
                                     num_participants: num_display_peers,
                                     is_active: *meeting_joined.read() && meeting_ended_message.read().is_none(),
-                                    on_toggle_meeting_info: move |_| meeting_info_open.set(!*meeting_info_open.read()),
+                                    on_toggle_meeting_info: move |_| { let v = *meeting_info_open.read(); meeting_info_open.set(!v) },
                                     host_display_name: props.host_display_name.clone()
                                 }
                             }

@@ -12,7 +12,7 @@
  */
 
 use crate::components::call_timer::CallTimer;
-use crate::context::MeetingTimeCtx;
+use crate::context::{MeetingTime, MeetingTimeCtx};
 use dioxus::prelude::*;
 
 #[component]
@@ -23,8 +23,8 @@ pub fn MeetingInfo(
     #[props(default = 0)] num_participants: usize,
     #[props(default = false)] is_active: bool,
 ) -> Element {
-    let meeting_time = use_context::<MeetingTimeCtx>();
-    let meeting_time = meeting_time.map(|s| s.read().clone()).unwrap_or_default();
+    let meeting_time_ctx: Option<Signal<MeetingTime>> = try_use_context::<MeetingTimeCtx>();
+    let meeting_time = meeting_time_ctx.map(|s| s.read().clone()).unwrap_or_default();
 
     if !is_open {
         return rsx! {};

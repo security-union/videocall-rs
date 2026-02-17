@@ -41,12 +41,18 @@ pub fn HostControls(props: HostControlsProps) -> Element {
     let mut waiting = use_signal(Vec::<WaitingParticipant>::new);
     let mut error = use_signal(|| None::<String>);
     let mut expanded = use_signal(|| true);
+    let mut interval_holder: Signal<Option<Rc<RefCell<Option<Interval>>>>> = use_signal(|| None);
 
     let meeting_id = props.meeting_id.clone();
     let is_admitted = props.is_admitted;
 
     // Set up polling for waiting users when admitted
     use_effect(move || {
+        // Clean up previous interval
+        if let Some(interval_rc) = interval_holder.read().as_ref() {
+            interval_rc.borrow_mut().take();
+        }
+
         if !is_admitted {
             return;
         }
@@ -78,17 +84,8 @@ pub fn HostControls(props: HostControlsProps) -> Element {
 
         // Set up polling interval
         let interval = Interval::new(3000, fetch_waiting);
-
-        // Keep interval alive
-        let interval = Rc::new(RefCell::new(Some(interval)));
-        let interval_cleanup = interval.clone();
-
-        // Cleanup on unmount
-        move || {
-            if let Some(interval) = interval_cleanup.borrow_mut().take() {
-                drop(interval);
-            }
-        }
+        let interval_rc = Rc::new(RefCell::new(Some(interval)));
+        interval_holder.write().replace(interval_rc);
     });
 
     // Don't render if not admitted or no waiting participants
@@ -103,7 +100,10 @@ pub fn HostControls(props: HostControlsProps) -> Element {
         div { class: "host-controls-container",
             button {
                 class: "host-controls-toggle",
-                onclick: move |_| expanded.set(!*expanded.read()),
+                onclick: move |_| {
+                    let current = *expanded.read();
+                    expanded.set(!current);
+                },
                 span { class: "waiting-badge", "{waiting_count}" }
                 span { "Waiting to join" }
                 svg {

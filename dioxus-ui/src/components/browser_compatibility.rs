@@ -23,8 +23,9 @@ use wasm_bindgen::JsValue;
 #[component]
 pub fn BrowserCompatibility() -> Element {
     let error = use_signal(|| check_browser_compatibility());
+    let error_value = error.read().clone();
 
-    if let Some(error_msg) = error.read().as_ref() {
+    if let Some(error_msg) = error_value {
         rsx! {
             div { class: "error-container",
                 p { class: "error-message", "{error_msg}" }

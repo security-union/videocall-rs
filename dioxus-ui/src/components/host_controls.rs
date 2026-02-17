@@ -48,8 +48,8 @@ pub fn HostControls(props: HostControlsProps) -> Element {
 
     // Set up polling for waiting users when admitted
     use_effect(move || {
-        // Clean up previous interval
-        if let Some(interval_rc) = interval_holder.read().as_ref() {
+        // Clean up previous interval (use peek to avoid subscribing to this signal)
+        if let Some(interval_rc) = interval_holder.peek().as_ref() {
             interval_rc.borrow_mut().take();
         }
 

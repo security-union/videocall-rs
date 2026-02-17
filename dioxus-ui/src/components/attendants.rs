@@ -240,9 +240,9 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
 
         media_device_access.set(Some(mda));
 
-        // Auto-join if requested
+        // Auto-join if requested (use peek to avoid subscribing to the signal we just wrote)
         if auto_join {
-            if let Some(ref mda) = *media_device_access.read() {
+            if let Some(ref mda) = *media_device_access.peek() {
                 mda.request();
             }
         }
@@ -497,6 +497,7 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                                         PeerTile {
                                             key: "{i}-{peer_id}",
                                             peer_id: peer_id.clone(),
+                                            client: client.read().clone(),
                                             full_bleed: full_bleed,
                                             host_display_name: host_display_name.clone()
                                         }
@@ -622,6 +623,7 @@ pub fn AttendantsComponent(props: AttendantsComponentProps) -> Element {
                                             // Host component for encoders
                                             if media_access_granted {
                                                 Host {
+                                                    client: client.read().clone(),
                                                     share_screen: screen_share_state.read().is_sharing(),
                                                     mic_enabled: *mic_enabled.read(),
                                                     video_enabled: *video_enabled.read(),

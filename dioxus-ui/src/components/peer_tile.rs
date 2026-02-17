@@ -22,11 +22,12 @@ use videocall_client::VideoCallClient;
 use videocall_diagnostics::{subscribe, MetricValue};
 
 use crate::components::canvas_generator::generate_for_peer;
-use crate::context::VideoCallClientCtx;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct PeerTileProps {
     pub peer_id: String,
+    /// The VideoCallClient instance
+    pub client: Option<VideoCallClient>,
     /// True when layout has only this peer and no screen share; affects styling
     #[props(default = false)]
     pub full_bleed: bool,
@@ -37,7 +38,7 @@ pub struct PeerTileProps {
 
 #[component]
 pub fn PeerTile(props: PeerTileProps) -> Element {
-    let client: Option<VideoCallClient> = try_use_context::<VideoCallClientCtx>();
+    let client = props.client.clone();
 
     let mut audio_enabled = use_signal(|| false);
     let mut video_enabled = use_signal(|| false);

@@ -54,8 +54,8 @@ pub fn WaitingRoom(props: WaitingRoomProps) -> Element {
     let on_rejected = props.on_rejected.clone();
 
     use_effect(move || {
-        // Clean up previous interval
-        if let Some(interval_rc) = interval_holder.read().as_ref() {
+        // Clean up previous interval (use peek to avoid subscribing to this signal)
+        if let Some(interval_rc) = interval_holder.peek().as_ref() {
             interval_rc.borrow_mut().take();
         }
 

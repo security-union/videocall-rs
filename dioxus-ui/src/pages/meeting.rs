@@ -105,7 +105,8 @@ pub fn MeetingPage(id: String) -> Element {
     // Poll for meeting activation when in WaitingForMeeting state
     let meeting_id_for_poll = id.clone();
     use_effect(move || {
-        let current_status = meeting_status.read().clone();
+        // Use peek to avoid subscribing to meeting_status (writes happen in the interval callbacks)
+        let current_status = meeting_status.peek().clone();
         if current_status != MeetingStatus::WaitingForMeeting {
             return;
         }

@@ -58,8 +58,8 @@ pub fn Diagnostics(props: DiagnosticsProps) -> Element {
 
     use_effect(move || {
         if !is_open {
-            // Abort previous subscription and clear state
-            if let Some(handle) = abort_handle_signal.read().as_ref() {
+            // Abort previous subscription and clear state (use peek to avoid subscribing)
+            if let Some(handle) = abort_handle_signal.peek().as_ref() {
                 handle.abort();
             }
             state.set(DiagnosticsState::default());

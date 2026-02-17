@@ -27,7 +27,6 @@ use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::constants::users_allowed_to_stream;
-use crate::context::VideoCallClientCtx;
 
 /// Render a single peer tile. If `full_bleed` is true and the peer is not screen sharing,
 /// the video tile will occupy the full grid area. If `host_display_name` matches `key`, a crown
@@ -70,7 +69,7 @@ pub fn generate_for_peer(
                         }
                     },
                     if is_video_enabled_for_peer {
-                        UserVideo { id: key_clone.clone(), hidden: false }
+                        UserVideo { id: key_clone.clone(), hidden: false, client: client.clone() }
                     } else {
                         div { class: "",
                             div { class: "placeholder-content",
@@ -137,7 +136,7 @@ pub fn generate_for_peer(
                             toggle_pinned_div(&screen_share_div_id_clone);
                         }
                     },
-                    ScreenCanvas { peer_id: key_for_screen.clone() }
+                    ScreenCanvas { peer_id: key_for_screen.clone(), client: client.clone() }
                     h4 { class: "floating-name", title: "{key}-screen", dir: "auto",
                         "{key}-screen"
                     }
@@ -164,7 +163,7 @@ pub fn generate_for_peer(
                     }
                 },
                 if is_video_enabled_for_peer {
-                    UserVideo { id: key_clone.clone(), hidden: false }
+                    UserVideo { id: key_clone.clone(), hidden: false, client: client.clone() }
                 } else {
                     div { class: "placeholder-content",
                         PeerIcon {}
@@ -199,24 +198,23 @@ pub fn generate_for_peer(
 struct UserVideoProps {
     pub id: String,
     pub hidden: bool,
+    pub client: VideoCallClient,
 }
 
 #[component]
 fn UserVideo(props: UserVideoProps) -> Element {
-    let client: Option<VideoCallClient> = try_use_context::<VideoCallClientCtx>();
+    let client = props.client.clone();
 
     // Pass canvas reference to client when mounted
     let peer_id = props.id.clone();
     use_effect(move || {
-        if let Some(client) = &client {
-            if let Some(canvas) = window()
-                .and_then(|w| w.document())
-                .and_then(|doc| doc.get_element_by_id(&peer_id))
-                .and_then(|el| el.dyn_into::<HtmlCanvasElement>().ok())
-            {
-                if let Err(e) = client.set_peer_video_canvas(&peer_id, canvas) {
-                    log::debug!("Canvas not yet ready for peer {peer_id}: {e:?}");
-                }
+        if let Some(canvas) = window()
+            .and_then(|w| w.document())
+            .and_then(|doc| doc.get_element_by_id(&peer_id))
+            .and_then(|el| el.dyn_into::<HtmlCanvasElement>().ok())
+        {
+            if let Err(e) = client.set_peer_video_canvas(&peer_id, canvas) {
+                log::debug!("Canvas not yet ready for peer {peer_id}: {e:?}");
             }
         }
     });
@@ -233,26 +231,25 @@ fn UserVideo(props: UserVideoProps) -> Element {
 #[derive(Props, Clone, PartialEq)]
 struct ScreenCanvasProps {
     pub peer_id: String,
+    pub client: VideoCallClient,
 }
 
 #[component]
 fn ScreenCanvas(props: ScreenCanvasProps) -> Element {
-    let client: Option<VideoCallClient> = try_use_context::<VideoCallClientCtx>();
+    let client = props.client.clone();
     let canvas_id = format!("screen-share-{}", props.peer_id);
 
     // Pass canvas reference to client when mounted
     let peer_id = props.peer_id.clone();
     let canvas_id_clone = canvas_id.clone();
     use_effect(move || {
-        if let Some(client) = &client {
-            if let Some(canvas) = window()
-                .and_then(|w| w.document())
-                .and_then(|doc| doc.get_element_by_id(&canvas_id_clone))
-                .and_then(|el| el.dyn_into::<HtmlCanvasElement>().ok())
-            {
-                if let Err(e) = client.set_peer_screen_canvas(&peer_id, canvas) {
-                    log::debug!("Screen canvas not yet ready for peer {peer_id}: {e:?}");
-                }
+        if let Some(canvas) = window()
+            .and_then(|w| w.document())
+            .and_then(|doc| doc.get_element_by_id(&canvas_id_clone))
+            .and_then(|el| el.dyn_into::<HtmlCanvasElement>().ok())
+        {
+            if let Err(e) = client.set_peer_screen_canvas(&peer_id, canvas) {
+                log::debug!("Screen canvas not yet ready for peer {peer_id}: {e:?}");
             }
         }
     });

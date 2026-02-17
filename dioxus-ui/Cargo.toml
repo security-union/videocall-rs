@@ -1,0 +1,106 @@
+[package]
+name = "dioxus-ui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A Dioxus UI for the videocall project"
+homepage = "https://github.com/security-union/videocall-rs"
+repository = "https://github.com/security-union/videocall-rs"
+keywords = ["quic", "webtransport", "zoom", "webrtc", "dioxus"]
+categories = ["network-programming", "multimedia", "web-programming"]
+readme = "../README.md"
+
+[lib]
+name = "dioxus_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dioxus-ui"
+path = "src/main.rs"
+
+[dependencies]
+# Dioxus framework
+dioxus = { version = "0.6", features = ["web"] }
+
+# Internal crates
+videocall-client = { path = "../videocall-client", version = "4.0.1", features = ["yew-compat"] }
+videocall-diagnostics = { path = "../videocall-diagnostics", version = "0.1.3" }
+videocall-meeting-client = { path = "../videocall-meeting-client", version = "0.1.0" }
+videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.1" }
+videocall-types = { path = "../videocall-types", version = "4.0.0" }
+neteq = { path = "../neteq", version = "0.8.2", features = ["web"], default-features = false }
+
+# Yew (for callback bridging with videocall-client)
+yew = { version = "0.21", features = ["csr"] }
+
+# WASM bindings
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = "0.3.72"
+
+# Web APIs
+[dependencies.web-sys]
+version = "0.3.72"
+features = [
+    "HtmlDocument",
+    "console",
+    "Navigator",
+    "Storage",
+    "Document",
+    "Clipboard",
+    "HtmlAudioElement",
+    "Window",
+    "Location",
+    "MediaDevices",
+    "MediaDeviceInfo",
+    "MediaDeviceKind",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "HtmlCanvasElement",
+    "HtmlVideoElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlOptionElement",
+    "HtmlElement",
+    "Element",
+    "Node",
+    "NodeList",
+    "CanvasRenderingContext2d",
+    "EventTarget",
+    "Event",
+    "MouseEvent",
+    "KeyboardEvent",
+]
+
+# Utilities
+console_error_panic_hook = "0.1.7"
+console_log = "1.0.0"
+once_cell = "1.19"
+log = "0.4.19"
+gloo-timers = "0.2.6"
+gloo-utils = "0.1"
+futures = "0.3.31"
+web-time = "1.1.0"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-wasm-bindgen = "0.6"
+anyhow = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+urlencoding = "2.1"
+matomo-logger = { path = "../matomo-logger", version = "0.1.0" }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3.37"
+wasm-bindgen-futures = { workspace = true }
+gloo-utils = "0.1"
+
+[features]
+default = ["media-server-jwt-auth"]
+fake-peers = []
+oauth = []
+## When enabled, the UI connects to the media server using a signed JWT room
+## access token (`/lobby?token=<JWT>`).  When disabled, it uses the legacy
+## unauthenticated path (`/lobby/{email}/{room}`).
+media-server-jwt-auth = []
+debugAssertions = []

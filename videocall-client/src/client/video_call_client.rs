@@ -435,6 +435,22 @@ impl VideoCallClient {
         self.connect_with_rtt_testing()
     }
 
+    /// Replace the WebSocket and WebTransport server URLs used for future
+    /// connections.
+    ///
+    /// Call this before [`connect()`][Self::connect] when you have a fresh room
+    /// access token and need to reconnect. The existing media pipeline
+    /// (encoders, decoders, peer state) is preserved.
+    pub fn update_server_urls(
+        &mut self,
+        websocket_urls: Vec<String>,
+        webtransport_urls: Vec<String>,
+    ) {
+        info!("Updating server URLs: ws={websocket_urls:?}, wt={webtransport_urls:?}");
+        self.options.websocket_urls = websocket_urls;
+        self.options.webtransport_urls = webtransport_urls;
+    }
+
     fn create_peer_decoder_manager(
         opts: &VideoCallClientOptions,
         diagnostics: Option<Rc<DiagnosticManager>>,

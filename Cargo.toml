@@ -2,8 +2,11 @@
 resolver = "2"
 members = [
     "actix-api",
+    "meeting-api",
     "bot",
     "videocall-types",
+    "videocall-meeting-types",
+    "videocall-meeting-client",
     "videocall-client",
     "videocall-cli",
     "yew-ui",

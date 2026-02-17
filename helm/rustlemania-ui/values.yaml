@@ -6,7 +6,7 @@ fullnameOverride: ""
 
 replicaCount: 1
 image:
-  repository: securityunion/rustlemania-ui
+  repository: securityunion/videocall-web-ui
   pullPolicy: Always
   tag: latest
 resources:

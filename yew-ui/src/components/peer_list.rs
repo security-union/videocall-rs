@@ -18,6 +18,7 @@
 
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
+use crate::context::UsernameCtx;
 use std::collections::HashMap;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -45,6 +46,10 @@ pub struct PeerListProperties {
     pub num_participants: usize,
     pub is_active: bool,
     pub on_toggle_meeting_info: yew::Callback<()>,
+
+    /// Display name (username) of the meeting host (for displaying crown icon)
+    #[prop_or_default]
+    pub host_display_name: Option<String>,
 }
 
 pub enum PeerListMsg {
@@ -106,8 +111,23 @@ impl Component for PeerList {
             PeerListMsg::ToggleContextMenu
         });
 
-        // Use the local_user_name prop and append (You)
-        let display_name = format!("{} (You)", ctx.props().local_user_name);
+        // Get username from context and append (You)
+        let current_user_name: Option<String> = ctx
+            .link()
+            .context::<UsernameCtx>(Callback::noop())
+            .and_then(|(state, _handle)| state.as_ref().cloned());
+
+        let display_name = current_user_name
+            .clone()
+            .map(|name| format!("{name} (You)"))
+            .unwrap_or_else(|| "(You)".to_string());
+
+        // Check if current user is host by comparing display names
+        let host_display_name = ctx.props().host_display_name.clone();
+        let is_current_user_host = host_display_name
+            .as_ref()
+            .map(|h| current_user_name.as_ref().map(|c| h == c).unwrap_or(false))
+            .unwrap_or(false);
 
         html! {
             <div>
@@ -189,7 +209,7 @@ impl Component for PeerList {
                         <div class="peer-list">
                             <ul>
                                 // show self as the first item with actual username
-                                <li><PeerListItem name={display_name.clone()} /></li>
+                                <li><PeerListItem name={display_name.clone()} is_host={is_current_user_host} /></li>
 
                                 { for filtered_peers.iter().map(|session_id| {
                                     // Look up display name, fallback to session_id
@@ -197,8 +217,12 @@ impl Component for PeerList {
                                         .get(session_id)
                                         .cloned()
                                         .unwrap_or_else(|| session_id.clone());
+                                    // Check if this peer is the host
+                                    let is_peer_host = host_display_name.as_ref()
+                                        .map(|h| h == &name)
+                                        .unwrap_or(false);
                                     html!{
-                                        <li><PeerListItem name={name}/></li>
+                                        <li><PeerListItem name={name} is_host={is_peer_host} /></li>
                                     }
                                 })
                                 }

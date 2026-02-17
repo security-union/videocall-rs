@@ -179,14 +179,10 @@ impl MicrophoneEncoder {
         let aes = client.aes();
         let on_error = self.on_error.clone();
         let EncoderState {
-            destroy,
-            enabled,
-            switching,
-            ..
+            enabled, switching, ..
         } = self.state.clone();
 
         // Clone atomic values for use in different closures
-        let destroy_for_handler = destroy.clone();
         let enabled_for_handler = enabled.clone();
 
         let audio_output_handler = {
@@ -195,12 +191,9 @@ impl MicrophoneEncoder {
 
             Box::new(move |chunk: MessageEvent| {
                 // Check if encoder should stop
-                if destroy_for_handler.load(Ordering::Acquire)
-                    || !enabled_for_handler.load(Ordering::Acquire)
-                {
+                if !enabled_for_handler.load(Ordering::Acquire) {
                     log::debug!(
-                        "Audio handler stopping: destroy={}, enabled={}",
-                        destroy_for_handler.load(Ordering::Acquire),
+                        "Audio handler stopping: enabled={}",
                         enabled_for_handler.load(Ordering::Acquire)
                     );
                     return;
@@ -244,7 +237,18 @@ impl MicrophoneEncoder {
             };
             let constraints = MediaStreamConstraints::new();
             let media_info = web_sys::MediaTrackConstraints::new();
-            media_info.set_device_id(&device_id.into());
+
+            // Force exact deviceId match (avoids falling back to the default mic).
+            let exact = js_sys::Object::new();
+            js_sys::Reflect::set(
+                &exact,
+                &JsValue::from_str("exact"),
+                &JsValue::from_str(&device_id),
+            )
+            .unwrap();
+
+            log::info!("MicrophoneEncoder: deviceId.exact = {device_id}");
+            media_info.set_device_id(&exact.into());
 
             constraints.set_audio(&media_info.into());
             constraints.set_video(&Boolean::from(false));
@@ -396,7 +400,6 @@ impl MicrophoneEncoder {
 
             // Monitor for stop conditions and clean up when needed
             let check_interval = 100; // Check every 100ms
-            let destroy_check = destroy.clone();
             let enabled_check = enabled.clone();
             let switching_check = switching.clone();
             loop {
@@ -413,9 +416,7 @@ impl MicrophoneEncoder {
                 let _ = wasm_bindgen_futures::JsFuture::from(delay_promise).await;
 
                 // Check if we should stop
-                if destroy_check.load(Ordering::Acquire)
-                    || !enabled_check.load(Ordering::Acquire)
-                    || switching_check.load(Ordering::Acquire)
+                if !enabled_check.load(Ordering::Acquire) || switching_check.load(Ordering::Acquire)
                 {
                     log::info!("Stopping Microphone audio encoder");
                     switching_check.store(false, Ordering::Release);

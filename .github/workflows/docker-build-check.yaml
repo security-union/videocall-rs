@@ -26,6 +26,11 @@ on:
       - 'docker/Dockerfile.yew'
       - 'docker/start-yew.sh'
 
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
 jobs:
   build-api:
     name: Build API Docker image
@@ -37,12 +42,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build API Docker image (no push)
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile.actix
-          push: false
+          push: true
+          tags: ghcr.io/security-union/videocall-media-server:pr-${{ github.event.pull_request.number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -56,12 +69,20 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Meeting API Docker image (no push)
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Meeting API Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile.meeting-api
-          push: false
+          push: true
+          tags: ghcr.io/security-union/videocall-meeting-api:pr-${{ github.event.pull_request.number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -75,12 +96,44 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build UI Docker image (no push)
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push UI Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile.yew
-          push: false
+          push: true
+          tags: ghcr.io/security-union/videocall-web-ui:pr-${{ github.event.pull_request.number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  comment:
+    name: Comment on PR with image tags
+    needs: [build-api, build-meeting-api, build-ui]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **PR images built successfully!**
+
+            Images pushed to GitHub Container Registry:
+            - \`ghcr.io/security-union/videocall-media-server:pr-${prNumber}\`
+            - \`ghcr.io/security-union/videocall-meeting-api:pr-${prNumber}\`
+            - \`ghcr.io/security-union/videocall-web-ui:pr-${prNumber}\`
+
+            Comment \`/deploy\` to create a preview environment (coming soon).`
+            })
 

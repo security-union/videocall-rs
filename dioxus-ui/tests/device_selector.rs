@@ -355,8 +355,15 @@ async fn device_selector_onchange_fires_microphone_callback() {
         .dyn_into::<web_sys::HtmlSelectElement>()
         .unwrap();
     select.set_value("m2");
-    let event = web_sys::Event::new("change").unwrap();
+    // Dioxus uses event delegation — attaches a single "change" listener on the root
+    // element. The dispatched event must bubble so it reaches the root.
+    let init = web_sys::EventInit::new();
+    init.set_bubbles(true);
+    let event = web_sys::Event::new_with_event_init_dict("change", &init).unwrap();
     select.dispatch_event(&event).unwrap();
+    // Yield twice: once for the event to propagate through Dioxus's scheduler,
+    // and once more for the callback side-effects to settle.
+    yield_now().await;
     yield_now().await;
 
     let info = get_received();

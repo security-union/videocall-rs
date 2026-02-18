@@ -94,7 +94,7 @@ wasm-bindgen-futures = { workspace = true }
 gloo-utils = "0.1"
 gloo-timers = { version = "0.2.6", features = ["futures"] }
 js-sys = "0.3.72"
-web-sys = { version = "0.3.72", features = ["HtmlButtonElement", "HtmlOptionElement", "HtmlOptionsCollection", "HtmlSelectElement", "DomTokenList"] }
+web-sys = { version = "0.3.72", features = ["HtmlButtonElement", "HtmlOptionElement", "HtmlOptionsCollection", "HtmlSelectElement", "DomTokenList", "EventInit"] }
 
 [features]
 default = ["media-server-jwt-auth"]

@@ -255,15 +255,28 @@ jobs:
           helm dependency update helm/global/us-east/nats/
 
           # Deploy using the production NATS chart with preview-specific overrides
+          # Note: Can't disable sidecars in this chart version, so we set minimal resources instead
           helm upgrade --install nats-pr-${PR_NUM} helm/global/us-east/nats/ \
             --namespace ${NAMESPACE} \
             --set nats.natsbox.enabled=false \
             --set nats.reloader.enabled=false \
-            --set nats.promExporter.enabled=false \
-            --set nats.container.resources.limits.cpu=100m \
-            --set nats.container.resources.limits.memory=128Mi \
-            --set nats.container.resources.requests.cpu=50m \
-            --set nats.container.resources.requests.memory=64Mi \
+            --set nats.exporter.enabled=false \
+            --set nats.natsbox.resources.limits.cpu=10m \
+            --set nats.natsbox.resources.limits.memory=32Mi \
+            --set nats.natsbox.resources.requests.cpu=5m \
+            --set nats.natsbox.resources.requests.memory=16Mi \
+            --set nats.reloader.resources.limits.cpu=10m \
+            --set nats.reloader.resources.limits.memory=32Mi \
+            --set nats.reloader.resources.requests.cpu=5m \
+            --set nats.reloader.resources.requests.memory=16Mi \
+            --set nats.exporter.resources.limits.cpu=10m \
+            --set nats.exporter.resources.limits.memory=32Mi \
+            --set nats.exporter.resources.requests.cpu=5m \
+            --set nats.exporter.resources.requests.memory=16Mi \
+            --set nats.nats.resources.limits.cpu=100m \
+            --set nats.nats.resources.limits.memory=128Mi \
+            --set nats.nats.resources.requests.cpu=50m \
+            --set nats.nats.resources.requests.memory=64Mi \
             --set gateway.enabled=false \
             --wait --timeout 3m
 

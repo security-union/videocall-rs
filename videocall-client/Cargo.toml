@@ -3,13 +3,13 @@ name = "videocall-client"
 version = "4.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "A client for the videocall project"
+description = "High-performance WebAssembly video conferencing client for videocall.rs, supporting WebTransport and WebSocket."
 homepage = "https://github.com/security-union/videocall-rs"
 repository = "https://github.com/security-union/videocall-rs"
 authors = [
     "Dario Lencina <dario@securityunion.dev>",
 ]
-keywords = ["quic", "webtransport", "zoom", "webrtc"]
+keywords = ["quic", "webtransport", "wasm", "video-conferencing"]
 categories = ["network-programming", "multimedia"]
 
 

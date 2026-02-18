@@ -187,9 +187,9 @@ jobs:
           # If images don't exist, the helm deployment will fail with ImagePullBackOff.
 
           echo "Images expected:"
-          echo "  - ghcr.io/security-union/videocall-media-server:pr-${PR_NUM}"
-          echo "  - ghcr.io/security-union/videocall-meeting-api:pr-${PR_NUM}"
-          echo "  - ghcr.io/security-union/videocall-web-ui:pr-${PR_NUM}"
+          echo "  - ghcr.io/jboyd01/videocall-media-server:pr-${PR_NUM}"
+          echo "  - ghcr.io/jboyd01/videocall-meeting-api:pr-${PR_NUM}"
+          echo "  - ghcr.io/jboyd01/videocall-web-ui:pr-${PR_NUM}"
 
           echo "✅ Proceeding with deployment (images will be verified during pod startup)"
 
@@ -282,7 +282,7 @@ jobs:
 
           helm upgrade --install preview-${PR_NUM}-ws helm/rustlemania-websocket/ \
             --namespace ${NAMESPACE} \
-            --set image.repository=ghcr.io/security-union/videocall-media-server \
+            --set image.repository=ghcr.io/jboyd01/videocall-media-server \
             --set image.tag=pr-${PR_NUM} \
             --set fullnameOverride=websocket-pr-${PR_NUM} \
             --set "env[0].name=NATS_URL" \
@@ -318,7 +318,7 @@ jobs:
 
           helm upgrade --install preview-${PR_NUM}-api helm/meeting-api/ \
             --namespace ${NAMESPACE} \
-            --set image.repository=ghcr.io/security-union/videocall-meeting-api \
+            --set image.repository=ghcr.io/jboyd01/videocall-meeting-api \
             --set image.tag=pr-${PR_NUM} \
             --set fullnameOverride=api-pr-${PR_NUM} \
             --set "env[0].name=DATABASE_URL" \
@@ -355,7 +355,7 @@ jobs:
 
           helm upgrade --install preview-${PR_NUM}-ui helm/rustlemania-ui/ \
             --namespace ${NAMESPACE} \
-            --set image.repository=ghcr.io/security-union/videocall-web-ui \
+            --set image.repository=ghcr.io/jboyd01/videocall-web-ui \
             --set image.tag=pr-${PR_NUM} \
             --set fullnameOverride=ui-pr-${PR_NUM} \
             --set "runtimeConfig.apiBaseUrl=https://pr-${PR_NUM}-api.sandbox.videocall.rs" \

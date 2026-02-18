@@ -64,6 +64,29 @@ jobs:
               content: 'eyes'
             })
 
+      - name: Comment build started
+        if: steps.check.outputs.authorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🔨 **Building PR images...**
+
+            Started by @${{ github.event.comment.user.login }}
+
+            Building 3 Docker images:
+            - Media Server (WebSocket/WebTransport)
+            - Meeting API (REST backend)
+            - Web UI (WASM frontend)
+
+            ⏱️ This typically takes 10-15 minutes. You'll be notified when complete.
+
+            [View workflow run →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            })
+
       - name: Post error if unauthorized
         if: steps.check.outputs.authorized == 'false'
         uses: actions/github-script@v7

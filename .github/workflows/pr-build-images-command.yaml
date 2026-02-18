@@ -82,7 +82,7 @@ jobs:
             - Meeting API (REST backend)
             - Web UI (WASM frontend)
 
-            ⏱️ This typically takes 10-15 minutes. You'll be notified when complete.
+            ⏱️ This typically takes 5-10 minutes. I will post another comment once the build is complete.
 
             [View workflow run →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             })

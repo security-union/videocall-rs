@@ -210,8 +210,8 @@ jobs:
           NAMESPACE="preview-${PR_NUM}"
 
           echo "Copying wildcard TLS secret from default namespace..."
-          kubectl get secret sandbox-wildcard-tls -n default -o yaml \
-            | sed "s/namespace: default/namespace: ${NAMESPACE}/" \
+          kubectl get secret sandbox-wildcard-tls -n default -o json \
+            | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields) | .metadata.namespace = "'${NAMESPACE}'"' \
             | kubectl apply -f -
 
           echo "✅ TLS secret copied"

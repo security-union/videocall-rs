@@ -396,6 +396,7 @@ jobs:
             --set image.repository=ghcr.io/jboyd01/videocall-web-ui \
             --set image.tag=pr-${PR_NUM} \
             --set fullnameOverride=ui-pr-${PR_NUM} \
+            --set ingress.redirect=false \
             --set "runtimeConfig.apiBaseUrl=https://pr-${PR_NUM}-api.sandbox.videocall.rs" \
             --set "runtimeConfig.wsUrl=wss://pr-${PR_NUM}-ws.sandbox.videocall.rs" \
             --set "runtimeConfig.webTransportHost=" \

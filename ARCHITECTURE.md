@@ -130,9 +130,7 @@ message PacketWrapper {
 
 Inside the `data` field, different packet types are serialized based on the `packet_type`:
 
-- **RSA_PUB_KEY**: Contains an RSA public key for initial E2EE key exchange
-- **AES_KEY**: Contains an AES encryption key encrypted with the recipient's RSA public key
-- **MEDIA**: Contains encrypted media data (audio/video frames)
+- **MEDIA**: Contains media data (audio/video frames)
 - **CONNECTION**: Contains information about the meeting being joined
 
 For media packets specifically, the structure is:

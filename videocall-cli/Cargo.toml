@@ -10,7 +10,7 @@ authors = [
     "Griffin Obeid <griffin@securityunion.dev>",
     "Dario Lencina <dario@securityunion.dev>",
 ]
-keywords = ["quic", "webtransport", "zoom"]
+keywords = ["quic", "webtransport", "robotics", "iot", "embedded"]
 categories = ["network-programming", "multimedia"]
 description = "Effortlessly stream video from the CLI with our native client, designed for your desktop, robot, or Raspberry Pi."
 include = ["src/**/*", "assets/**/*"]

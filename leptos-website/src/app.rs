@@ -26,6 +26,27 @@ pub fn App() -> impl IntoView {
     let formatter = |text| format!("{text} - videocall.rs");
     provide_meta_context();
 
+    let json_ld = r#"
+    {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "videocall.rs",
+        "operatingSystem": "Any",
+        "applicationCategory": "DeveloperApplication",
+        "offers": {
+            "@type": "Offer",
+            "price": "0",
+            "priceCurrency": "USD"
+        },
+        "description": "Open source, ultra-low-latency video conferencing API and platform built with Rust. Supports WebTransport and WebSocket.",
+        "aggregateRating": {
+            "@type": "AggregateRating",
+            "ratingValue": "5",
+            "ratingCount": "1"
+        }
+    }
+    "#;
+
     view! {
         <Html lang="en"/>
         <Stylesheet id="leptos" href="/pkg/leptos_website.css"/>
@@ -62,24 +83,7 @@ pub fn App() -> impl IntoView {
             </Routes>
         </Router>
         <script type="application/ld+json">
-        {
-            "@context": "https://schema.org",
-            "@type": "SoftwareApplication",
-            "name": "videocall.rs",
-            "operatingSystem": "Any",
-            "applicationCategory": "DeveloperApplication",
-            "offers": {
-                "@type": "Offer",
-                "price": "0",
-                "priceCurrency": "USD"
-            },
-            "description": "Open source, ultra-low-latency video conferencing API and platform built with Rust. Supports WebTransport and WebSocket.",
-            "aggregateRating": {
-                "@type": "AggregateRating",
-                "ratingValue": "5",
-                "ratingCount": "1"
-            }
-        }
+            {json_ld}
         </script>
         <script>
             "var _paq = window._paq = window._paq || [];

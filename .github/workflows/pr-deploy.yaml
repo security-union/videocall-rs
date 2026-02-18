@@ -325,6 +325,7 @@ jobs:
             --set-string "env[2].value=8080" \
             --set "env[3].name=RUST_LOG" \
             --set "env[3].value=info" \
+            --set-string "runtimeConfig.oauthEnabled=false" \
             --set "ingress.hosts[0].host=pr-${PR_NUM}-ws.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
@@ -369,6 +370,7 @@ jobs:
             --set "env[5].value=0.0.0.0:8081" \
             --set "env[6].name=RUST_LOG" \
             --set "env[6].value=info" \
+            --set-string "runtimeConfig.oauthEnabled=false" \
             --set "ingress.hosts[0].host=pr-${PR_NUM}-api.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

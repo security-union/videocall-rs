@@ -310,7 +310,7 @@ jobs:
             --set "env[1].name=DATABASE_URL" \
             --set "env[1].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_${PR_NUM}?sslmode=disable" \
             --set "env[2].name=ACTIX_PORT" \
-            --set "env[2].value=8080" \
+            --set-string "env[2].value=8080" \
             --set "env[3].name=RUST_LOG" \
             --set "env[3].value=info" \
             --set "ingress.hosts[0].host=pr-${PR_NUM}-ws.sandbox.videocall.rs" \

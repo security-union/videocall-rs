@@ -31,8 +31,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
-  pull-requests: write
 
 jobs:
   build-api:
@@ -91,27 +89,4 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  comment:
-    name: Comment on PR
-    needs: [build-api, build-meeting-api, build-ui]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Comment on PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const prNumber = context.issue.number;
-            github.rest.issues.createComment({
-              issue_number: prNumber,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `✅ **Docker images build successfully!**
-
-            All Docker images compiled without errors. Images were validated but not pushed to registry.
-
-            **To push images to GHCR**, a maintainer must comment \`/build-images\` after reviewing the changes.
-
-            Once images are pushed, you can deploy a preview environment with \`/deploy\` (coming soon).`
-            })
 

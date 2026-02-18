@@ -397,10 +397,10 @@ jobs:
             --set "runtimeConfig.apiBaseUrl=https://pr-${PR_NUM}-api.sandbox.videocall.rs" \
             --set "runtimeConfig.wsUrl=wss://pr-${PR_NUM}-ws.sandbox.videocall.rs" \
             --set "runtimeConfig.webTransportHost=" \
-            --set "runtimeConfig.webTransportEnabled=false" \
-            --set "runtimeConfig.oauthEnabled=false" \
-            --set "runtimeConfig.e2eeEnabled=false" \
-            --set "runtimeConfig.firefoxEnabled=false" \
+            --set-string "runtimeConfig.webTransportEnabled=false" \
+            --set-string "runtimeConfig.oauthEnabled=false" \
+            --set-string "runtimeConfig.e2eeEnabled=false" \
+            --set-string "runtimeConfig.firefoxEnabled=false" \
             --set "runtimeConfig.usersAllowedToStream=" \
             --set "runtimeConfig.serverElectionPeriodMs=2000" \
             --set "runtimeConfig.audioBitrateKbps=65" \

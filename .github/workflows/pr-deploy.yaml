@@ -204,6 +204,18 @@ jobs:
           echo "Labeling namespace"
           kubectl label namespace ${NAMESPACE} app=preview pr=${PR_NUM} --overwrite
 
+      - name: Copy wildcard TLS certificate to preview namespace
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          echo "Copying wildcard TLS secret from default namespace..."
+          kubectl get secret sandbox-wildcard-tls -n default -o yaml \
+            | sed "s/namespace: default/namespace: ${NAMESPACE}/" \
+            | kubectl apply -f -
+
+          echo "✅ TLS secret copied"
+
       - name: Apply ResourceQuota
         run: |
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
@@ -322,6 +334,8 @@ jobs:
             --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}-ws.sandbox.videocall.rs" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
           echo "✅ WebSocket server deployed"
@@ -362,6 +376,8 @@ jobs:
             --set "ingress.hosts[0].paths[0].service.port.number=8081" \
             --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
             --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}-api.sandbox.videocall.rs" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
           echo "✅ Meeting API deployed"
@@ -397,6 +413,8 @@ jobs:
             --set "ingress.hosts[0].paths[0].service.port.number=80" \
             --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
             --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}.sandbox.videocall.rs" \
+            --set "ingress.annotations.cert-manager\.io/issuer=null" \
+            --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
           echo "✅ UI deployed"

@@ -257,11 +257,13 @@ jobs:
           # Deploy using the production NATS chart with preview-specific overrides
           helm upgrade --install nats-pr-${PR_NUM} helm/global/us-east/nats/ \
             --namespace ${NAMESPACE} \
-            --set nats.nats.natsbox.enabled=false \
-            --set nats.nats.resources.limits.cpu=100m \
-            --set nats.nats.resources.limits.memory=128Mi \
-            --set nats.nats.resources.requests.cpu=50m \
-            --set nats.nats.resources.requests.memory=64Mi \
+            --set nats.natsbox.enabled=false \
+            --set nats.reloader.enabled=false \
+            --set nats.promExporter.enabled=false \
+            --set nats.container.resources.limits.cpu=100m \
+            --set nats.container.resources.limits.memory=128Mi \
+            --set nats.container.resources.requests.cpu=50m \
+            --set nats.container.resources.requests.memory=64Mi \
             --set gateway.enabled=false \
             --wait --timeout 3m
 

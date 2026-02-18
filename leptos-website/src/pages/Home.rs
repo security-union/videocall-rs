@@ -41,7 +41,7 @@ pub async fn perform_markdown_code_to_html(markdown: String) -> Result<String, S
 #[component]
 pub fn Home() -> impl IntoView {
     view! {
-        <Title text="Home"/>
+        <Title text="Ultra-low-latency Video API for Developers"/>
         <Page>
             <HeroHeader/>
 

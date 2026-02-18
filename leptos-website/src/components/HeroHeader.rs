@@ -69,7 +69,7 @@ pub fn HeroHeader() -> impl IntoView {
                                 " for web, mobile, and embedded devices"
                             </h1>
                             <p class="text-body-large text-foreground-secondary mb-12 max-w-2xl mx-auto">
-                                "Build cameras, kiosks, drones, and robots with the same ultra-low-latency engine — open source and production-ready"
+                                "Engineered for software professionals and video robotics. Build cameras, kiosks, drones, and robots with our high-performance Rust engine — open source and production-ready."
                             </p>
                             <div class="flex flex-col sm:flex-row gap-4 justify-center items-center">
                                 <a
@@ -126,6 +126,14 @@ fn SocialLinks() -> impl IntoView {
             >
                 <img class="h-5 w-5" src="/images/github_logo.svg" alt="GitHub" />
             </a>
+            <iframe
+                src="https://ghbtns.com/github-btn.html?user=security-union&repo=videocall-rs&type=star&count=true"
+                frameborder="0"
+                scrolling="0"
+                width="90"
+                height="20"
+                title="GitHub"
+            ></iframe>
             <a
                 href="https://m.do.co/c/6de4e19c5193"
                 class="text-foreground-tertiary hover:text-foreground-secondary transition-colors"

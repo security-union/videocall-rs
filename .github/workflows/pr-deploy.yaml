@@ -251,15 +251,19 @@ jobs:
 
           echo "Deploying NATS instance for preview-${PR_NUM}..."
 
-          helm upgrade --install nats-pr-${PR_NUM} nats/nats \
+          # Build helm dependencies for the NATS chart
+          helm dependency update helm/global/us-east/nats/
+
+          # Deploy using the production NATS chart with preview-specific overrides
+          helm upgrade --install nats-pr-${PR_NUM} helm/global/us-east/nats/ \
             --namespace ${NAMESPACE} \
-            --set nats.jetstream.enabled=false \
-            --set nats.cluster.enabled=false \
-            --set nats.resources.limits.cpu=100m \
-            --set nats.resources.limits.memory=128Mi \
-            --set nats.resources.requests.cpu=50m \
-            --set nats.resources.requests.memory=64Mi \
-            --wait --timeout 2m
+            --set nats.nats.natsbox.enabled=false \
+            --set nats.nats.resources.limits.cpu=100m \
+            --set nats.nats.resources.limits.memory=128Mi \
+            --set nats.nats.resources.requests.cpu=50m \
+            --set nats.nats.resources.requests.memory=64Mi \
+            --set gateway.enabled=false \
+            --wait --timeout 3m
 
           echo "✅ NATS deployed"
 

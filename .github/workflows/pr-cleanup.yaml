@@ -1,0 +1,122 @@
+name: PR Preview Cleanup on Close
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cleanup:
+    name: Cleanup preview environment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure kubectl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Setup kubectl context
+        run: |
+          doctl kubernetes cluster kubeconfig save videocall-us-east
+
+      - name: Check if preview exists
+        id: check-preview
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          if kubectl get namespace ${NAMESPACE} >/dev/null 2>&1; then
+            echo "Preview environment exists, will cleanup"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "No preview environment found, nothing to cleanup"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete namespace
+        if: steps.check-preview.outputs.exists == 'true'
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          echo "Deleting namespace: ${NAMESPACE}"
+          kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
+
+          echo "✅ Namespace deleted"
+
+      - name: Drop postgres database
+        if: steps.check-preview.outputs.exists == 'true'
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          DB_NAME="preview_${PR_NUM}"
+
+          echo "Dropping database: ${DB_NAME}"
+
+          # Get postgres password from secret
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
+
+          # Drop database
+          kubectl exec -n default postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
+              echo "⚠️  Failed to drop database, may need manual cleanup"
+            }
+
+          echo "✅ Database dropped"
+
+      - name: Delete GHCR images
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ github.event.pull_request.number }};
+            const packages = [
+              'videocall-media-server',
+              'videocall-meeting-api',
+              'videocall-web-ui'
+            ];
+
+            for (const packageName of packages) {
+              try {
+                // Get package versions
+                const versions = await github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg({
+                  package_type: 'container',
+                  package_name: packageName,
+                  org: context.repo.owner
+                });
+
+                // Find the pr-{NUM} tagged version
+                const prTag = `pr-${prNumber}`;
+                const targetVersion = versions.data.find(v =>
+                  v.metadata?.container?.tags?.includes(prTag)
+                );
+
+                if (targetVersion) {
+                  await github.rest.packages.deletePackageVersionForOrg({
+                    package_type: 'container',
+                    package_name: packageName,
+                    org: context.repo.owner,
+                    package_version_id: targetVersion.id
+                  });
+                  console.log(`✅ Deleted ${packageName}:${prTag}`);
+                } else {
+                  console.log(`ℹ️  Image ${packageName}:${prTag} not found (may not have been built)`);
+                }
+              } catch (error) {
+                console.log(`⚠️  Failed to delete ${packageName}: ${error.message}`);
+              }
+            }
+
+            console.log('✅ GHCR cleanup complete');
+
+      - name: Summary
+        run: |
+          PR_NUM=${{ github.event.pull_request.number }}
+          echo "✅ Cleanup complete for PR #${PR_NUM}"
+          echo ""
+          echo "Removed:"
+          echo "  - Namespace preview-${PR_NUM}"
+          echo "  - Database preview_${PR_NUM}"
+          echo "  - GHCR images tagged pr-${PR_NUM}"

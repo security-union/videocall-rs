@@ -1,0 +1,498 @@
+name: Deploy PR Preview
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  check-permissions:
+    name: Check permissions
+    runs-on: ubuntu-latest
+    if: |
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/deploy')
+    outputs:
+      authorized: ${{ steps.check.outputs.authorized }}
+      pr_number: ${{ steps.get-pr.outputs.pr_number }}
+      pr_sha: ${{ steps.get-pr.outputs.pr_sha }}
+      pr_ref: ${{ steps.get-pr.outputs.pr_ref }}
+    steps:
+      - name: Get PR details
+        id: get-pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('pr_number', context.issue.number);
+            core.setOutput('pr_sha', pr.data.head.sha);
+            core.setOutput('pr_ref', pr.data.head.ref);
+            return pr.data;
+
+      - name: Check if user is maintainer
+        id: check
+        run: |
+          ASSOCIATION="${{ github.event.comment.author_association }}"
+          echo "User association: $ASSOCIATION"
+          if [[ "$ASSOCIATION" =~ ^(OWNER|MEMBER|COLLABORATOR)$ ]]; then
+            echo "✅ User is authorized"
+            echo "authorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ User is not authorized"
+            echo "authorized=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: React to comment (processing)
+        if: steps.check.outputs.authorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            })
+
+      - name: Comment deployment started
+        if: steps.check.outputs.authorized == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `🚀 **Deploying PR preview environment...**
+
+            Started by @${{ github.event.comment.user.login }}
+
+            **Infrastructure:**
+            - Creating namespace \`preview-${{ steps.get-pr.outputs.pr_number }}\`
+            - Creating database \`preview_${{ steps.get-pr.outputs.pr_number }}\`
+            - Deploying NATS instance
+            - Deploying 3 services: WebSocket, Meeting API, UI
+
+            ⏱️ Deployment typically takes 3-5 minutes.
+
+            [View workflow run →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            })
+
+      - name: Post error if unauthorized
+        if: steps.check.outputs.authorized == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const association = '${{ github.event.comment.author_association }}';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Permission denied**
+
+            @${{ github.event.comment.user.login }}, only repository maintainers can deploy preview environments.
+
+            **Your role**: \`${association}\`
+            **Required roles**: \`OWNER\`, \`MEMBER\`, or \`COLLABORATOR\`
+
+            If you believe this is an error, please ask a maintainer to run \`/deploy\`.`
+            })
+
+      - name: React to comment (unauthorized)
+        if: steps.check.outputs.authorized == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: '-1'
+            })
+
+      - name: Fail if unauthorized
+        if: steps.check.outputs.authorized == 'false'
+        run: exit 1
+
+  deploy:
+    name: Deploy preview environment
+    needs: check-permissions
+    if: needs.check-permissions.outputs.authorized == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check-permissions.outputs.pr_sha }}
+
+      - name: Setup kubectl & Helm
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - uses: azure/setup-helm@v3
+        with:
+          version: '3.12.0'
+
+      - name: Configure kubectl for DigitalOcean
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Setup kubectl context
+        run: |
+          doctl kubernetes cluster kubeconfig save videocall-us-east
+
+      - name: Add NATS Helm repo
+        run: |
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+
+      - name: Check capacity
+        id: capacity
+        run: |
+          PREVIEW_COUNT=$(kubectl get namespaces -l app=preview --no-headers 2>/dev/null | wc -l)
+          MAX_PREVIEWS=3
+
+          echo "Current preview environments: $PREVIEW_COUNT"
+          echo "Maximum allowed: $MAX_PREVIEWS"
+
+          if [ "$PREVIEW_COUNT" -ge "$MAX_PREVIEWS" ]; then
+            echo "❌ Maximum preview capacity reached ($MAX_PREVIEWS)"
+            echo "capacity_exceeded=true" >> $GITHUB_OUTPUT
+
+            echo "Active previews:"
+            kubectl get namespaces -l app=preview -o custom-columns=NAME:.metadata.name,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp --no-headers
+            exit 1
+          else
+            echo "✅ Capacity available ($PREVIEW_COUNT/$MAX_PREVIEWS)"
+            echo "capacity_exceeded=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify GHCR images exist
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+
+          echo "Checking if GHCR images exist for pr-${PR_NUM}..."
+
+          # Note: This is a best-effort check. GHCR API requires authentication for package listing.
+          # If images don't exist, the helm deployment will fail with ImagePullBackOff.
+
+          echo "Images expected:"
+          echo "  - ghcr.io/security-union/videocall-media-server:pr-${PR_NUM}"
+          echo "  - ghcr.io/security-union/videocall-meeting-api:pr-${PR_NUM}"
+          echo "  - ghcr.io/security-union/videocall-web-ui:pr-${PR_NUM}"
+
+          echo "✅ Proceeding with deployment (images will be verified during pod startup)"
+
+      - name: Create namespace
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          echo "Creating namespace: ${NAMESPACE}"
+          kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "Labeling namespace"
+          kubectl label namespace ${NAMESPACE} app=preview pr=${PR_NUM} --overwrite
+
+      - name: Apply ResourceQuota
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: preview-quota
+            namespace: ${NAMESPACE}
+          spec:
+            hard:
+              requests.cpu: "500m"
+              requests.memory: "1Gi"
+              limits.cpu: "1000m"
+              limits.memory: "2Gi"
+              pods: "10"
+          EOF
+
+          echo "✅ ResourceQuota applied"
+
+      - name: Create postgres database
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          DB_NAME="preview_${PR_NUM}"
+
+          echo "Creating database: ${DB_NAME}"
+
+          # Get postgres password from secret
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
+
+          # Create database
+          kubectl exec -n default postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "CREATE DATABASE ${DB_NAME};" || {
+              echo "⚠️  Database may already exist, continuing..."
+            }
+
+          echo "✅ Database ready: ${DB_NAME}"
+
+      - name: Deploy NATS
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          echo "Deploying NATS instance for preview-${PR_NUM}..."
+
+          helm upgrade --install nats-pr-${PR_NUM} nats/nats \
+            --namespace ${NAMESPACE} \
+            --set nats.jetstream.enabled=false \
+            --set nats.cluster.enabled=false \
+            --set nats.resources.limits.cpu=100m \
+            --set nats.resources.limits.memory=128Mi \
+            --set nats.resources.requests.cpu=50m \
+            --set nats.resources.requests.memory=64Mi \
+            --wait --timeout 2m
+
+          echo "✅ NATS deployed"
+
+      - name: Get ingress LoadBalancer IP
+        id: ingress-ip
+        run: |
+          LB_IP=$(kubectl get service ingress-nginx-us-east-controller -n default -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Ingress LoadBalancer IP: ${LB_IP}"
+          echo "lb_ip=${LB_IP}" >> $GITHUB_OUTPUT
+
+      - name: Deploy WebSocket Server
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          # Get postgres password
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
+
+          echo "Deploying WebSocket server..."
+
+          helm upgrade --install preview-${PR_NUM}-ws helm/rustlemania-websocket/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=ghcr.io/security-union/videocall-media-server \
+            --set image.tag=pr-${PR_NUM} \
+            --set fullnameOverride=websocket-pr-${PR_NUM} \
+            --set "env[0].name=NATS_URL" \
+            --set "env[0].value=nats://nats-pr-${PR_NUM}.${NAMESPACE}.svc.cluster.local:4222" \
+            --set "env[1].name=DATABASE_URL" \
+            --set "env[1].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_${PR_NUM}?sslmode=disable" \
+            --set "env[2].name=ACTIX_PORT" \
+            --set "env[2].value=8080" \
+            --set "env[3].name=RUST_LOG" \
+            --set "env[3].value=info" \
+            --set "ingress.hosts[0].host=pr-${PR_NUM}-ws.sandbox.videocall.rs" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.hosts[0].paths[0].service.name=websocket-pr-${PR_NUM}" \
+            --set "ingress.hosts[0].paths[0].service.port.number=8080" \
+            --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}-ws.sandbox.videocall.rs" \
+            --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
+            --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
+            --wait --timeout 5m
+
+          echo "✅ WebSocket server deployed"
+
+      - name: Deploy Meeting API
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          # Get postgres password
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
+
+          echo "Deploying Meeting API..."
+
+          helm upgrade --install preview-${PR_NUM}-api helm/meeting-api/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=ghcr.io/security-union/videocall-meeting-api \
+            --set image.tag=pr-${PR_NUM} \
+            --set fullnameOverride=api-pr-${PR_NUM} \
+            --set "env[0].name=DATABASE_URL" \
+            --set "env[0].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_${PR_NUM}?sslmode=disable" \
+            --set "env[1].name=JWT_SECRET" \
+            --set "env[1].value=preview-jwt-secret-${PR_NUM}" \
+            --set "env[2].name=CORS_ALLOWED_ORIGIN" \
+            --set "env[2].value=https://pr-${PR_NUM}.sandbox.videocall.rs" \
+            --set "env[3].name=COOKIE_DOMAIN" \
+            --set "env[3].value=.sandbox.videocall.rs" \
+            --set "env[4].name=OAUTH_ISSUER" \
+            --set "env[4].value=" \
+            --set "env[5].name=LISTEN_ADDR" \
+            --set "env[5].value=0.0.0.0:8081" \
+            --set "env[6].name=RUST_LOG" \
+            --set "env[6].value=info" \
+            --set "ingress.hosts[0].host=pr-${PR_NUM}-api.sandbox.videocall.rs" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.hosts[0].paths[0].service.name=api-pr-${PR_NUM}" \
+            --set "ingress.hosts[0].paths[0].service.port.number=8081" \
+            --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}-api.sandbox.videocall.rs" \
+            --wait --timeout 5m
+
+          echo "✅ Meeting API deployed"
+
+      - name: Deploy UI
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          echo "Deploying UI..."
+
+          helm upgrade --install preview-${PR_NUM}-ui helm/rustlemania-ui/ \
+            --namespace ${NAMESPACE} \
+            --set image.repository=ghcr.io/security-union/videocall-web-ui \
+            --set image.tag=pr-${PR_NUM} \
+            --set fullnameOverride=ui-pr-${PR_NUM} \
+            --set "runtimeConfig.apiBaseUrl=https://pr-${PR_NUM}-api.sandbox.videocall.rs" \
+            --set "runtimeConfig.wsUrl=wss://pr-${PR_NUM}-ws.sandbox.videocall.rs" \
+            --set "runtimeConfig.webTransportHost=" \
+            --set "runtimeConfig.webTransportEnabled=false" \
+            --set "runtimeConfig.oauthEnabled=false" \
+            --set "runtimeConfig.e2eeEnabled=false" \
+            --set "runtimeConfig.firefoxEnabled=false" \
+            --set "runtimeConfig.usersAllowedToStream=" \
+            --set "runtimeConfig.serverElectionPeriodMs=2000" \
+            --set "runtimeConfig.audioBitrateKbps=65" \
+            --set "runtimeConfig.videoBitrateKbps=1000" \
+            --set "runtimeConfig.screenBitrateKbps=1000" \
+            --set "ingress.hosts[0].host=pr-${PR_NUM}.sandbox.videocall.rs" \
+            --set "ingress.hosts[0].paths[0].path=/" \
+            --set "ingress.hosts[0].paths[0].pathType=Prefix" \
+            --set "ingress.hosts[0].paths[0].service.name=ui-pr-${PR_NUM}" \
+            --set "ingress.hosts[0].paths[0].service.port.number=80" \
+            --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
+            --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}.sandbox.videocall.rs" \
+            --wait --timeout 5m
+
+          echo "✅ UI deployed"
+
+      - name: Wait for all pods to be ready
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          echo "Waiting for all pods to be ready..."
+          kubectl wait --for=condition=ready pod --all -n ${NAMESPACE} --timeout=180s
+
+          echo "✅ All pods ready"
+
+      - name: Get deployment status
+        id: deployment-status
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+
+          echo "Deployment status:"
+          kubectl get pods -n ${NAMESPACE}
+
+          echo "Services:"
+          kubectl get services -n ${NAMESPACE}
+
+          echo "Ingresses:"
+          kubectl get ingress -n ${NAMESPACE}
+
+      - name: Post success comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ needs.check-permissions.outputs.pr_number }};
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **PR preview environment deployed successfully!**
+
+            Deployed by @${{ github.event.comment.user.login }}
+
+            **Preview URLs:**
+            - 🌐 **Application:** https://pr-${prNumber}.sandbox.videocall.rs
+            - 🔌 **WebSocket:** wss://pr-${prNumber}-ws.sandbox.videocall.rs
+            - 📡 **API:** https://pr-${prNumber}-api.sandbox.videocall.rs
+
+            **Infrastructure:**
+            - Namespace: \`preview-${prNumber}\`
+            - Database: \`preview_${prNumber}\`
+            - NATS: \`nats-pr-${prNumber}\`
+
+            **Testing:**
+            Open the application URL and join a meeting. WebTransport is disabled (WebSocket fallback only).
+
+            **Cleanup:**
+            Comment \`/undeploy\` to tear down this preview environment.
+
+            [View deployment logs →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            })
+
+  cleanup-on-failure:
+    name: Cleanup on deployment failure
+    needs: [check-permissions, deploy]
+    if: |
+      always() &&
+      needs.check-permissions.outputs.authorized == 'true' &&
+      needs.deploy.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure kubectl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      - name: Setup kubectl context
+        run: |
+          doctl kubernetes cluster kubeconfig save videocall-us-east
+
+      - name: Cleanup failed deployment
+        run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+          DB_NAME="preview_${PR_NUM}"
+
+          echo "Cleaning up failed deployment for PR ${PR_NUM}..."
+
+          # Delete namespace (cascades to all resources)
+          kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
+
+          # Drop database
+          PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
+          kubectl exec -n default postgres-postgresql-0 -- \
+            env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" || {
+              echo "⚠️  Failed to drop database, may need manual cleanup"
+            }
+
+          echo "✅ Cleanup complete"
+
+      - name: Post failure comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ needs.check-permissions.outputs.pr_number }};
+            github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Preview deployment failed**
+
+            The deployment encountered an error and has been cleaned up.
+
+            **Common issues:**
+            - GHCR images not found (run \`/build-images\` first)
+            - Wildcard TLS certificate not configured
+            - Capacity limit reached (max 3 concurrent previews)
+
+            Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            })

@@ -320,8 +320,8 @@ jobs:
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
             --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
             --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}-ws.sandbox.videocall.rs" \
-            --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
-            --set "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
+            --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
             --wait --timeout 5m
 
           echo "✅ WebSocket server deployed"

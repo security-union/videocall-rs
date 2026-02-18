@@ -325,7 +325,8 @@ jobs:
             --set-string "env[2].value=8080" \
             --set "env[3].name=RUST_LOG" \
             --set "env[3].value=info" \
-            --set-string "runtimeConfig.oauthEnabled=false" \
+            --set "env[4].name=FEATURE_MEETING_MANAGEMENT" \
+            --set-string "env[4].value=false" \
             --set "ingress.hosts[0].host=pr-${PR_NUM}-ws.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \

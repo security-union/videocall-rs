@@ -159,13 +159,19 @@ jobs:
       - name: Check capacity
         id: capacity
         run: |
+          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
           PREVIEW_COUNT=$(kubectl get namespaces -l app=preview --no-headers 2>/dev/null | wc -l)
           MAX_PREVIEWS=3
 
           echo "Current preview environments: $PREVIEW_COUNT"
           echo "Maximum allowed: $MAX_PREVIEWS"
 
-          if [ "$PREVIEW_COUNT" -ge "$MAX_PREVIEWS" ]; then
+          # Check if this PR already has a deployment (redeployment scenario)
+          if kubectl get namespace ${NAMESPACE} >/dev/null 2>&1; then
+            echo "✅ Redeploying existing preview environment for PR #${PR_NUM}"
+            echo "capacity_exceeded=false" >> $GITHUB_OUTPUT
+          elif [ "$PREVIEW_COUNT" -ge "$MAX_PREVIEWS" ]; then
             echo "❌ Maximum preview capacity reached ($MAX_PREVIEWS)"
             echo "capacity_exceeded=true" >> $GITHUB_OUTPUT
 

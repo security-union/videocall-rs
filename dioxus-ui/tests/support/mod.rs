@@ -50,7 +50,7 @@ pub async fn yield_now() {
 /// Mount a Dioxus component into the given element and yield for rendering.
 pub async fn mount_dioxus(app: fn() -> dioxus::prelude::Element, mount: &web_sys::Element) {
     let cfg = dioxus::web::Config::new().rootelement(mount.clone());
-    dioxus::web::launch_cfg(app, (), cfg);
+    dioxus::web::launch::launch_cfg(app, cfg);
     yield_now().await;
 }
 

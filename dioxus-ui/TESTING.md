@@ -33,7 +33,7 @@ make dioxus-tests-docker
 Each test follows a five-step pattern:
 
 1. **Mount** — Create a `<div>` and attach it to `<body>`.
-2. **Render** — Call `dioxus::web::launch_cfg(wrapper_fn, (), Config::new().rootelement(div))`.
+2. **Render** — Call `dioxus::web::launch::launch_cfg(wrapper_fn, Config::new().rootelement(div))`.
 3. **Yield** — Await `gloo_timers::future::TimeoutFuture::new(0)` so the Dioxus scheduler flushes the render.
 4. **Assert** — Query the real DOM with `query_selector` and check elements, classes, text, and attributes.
 5. **Cleanup** — Remove the mount `<div>` from `<body>`.
@@ -42,7 +42,7 @@ Each test follows a five-step pattern:
 
 | Aspect | yew-ui | dioxus-ui |
 |--------|--------|-----------|
-| Mount component | `Renderer::<W>::with_root(el).render()` | `dioxus::web::launch_cfg(wrapper, (), Config::new().rootelement(el))` |
+| Mount component | `Renderer::<W>::with_root(el).render()` | `dioxus::web::launch::launch_cfg(wrapper, Config::new().rootelement(el))` |
 | Yield to scheduler | `yew::platform::time::sleep(Duration::ZERO).await` | `gloo_timers::future::TimeoutFuture::new(0).await` |
 | Wrapper component | `#[function_component] fn w() -> Html { html!{} }` | `fn w() -> Element { rsx!{} }` |
 | Passing props | `with_root_and_props(el, props)` | `thread_local!` + read inside wrapper fn |
@@ -50,7 +50,7 @@ Each test follows a five-step pattern:
 
 ### Passing Props via `thread_local!`
 
-Dioxus's `launch_cfg` takes a bare `fn() -> Element` — there is no `with_root_and_props` equivalent. Tests that need dynamic data use the `thread_local!` pattern:
+Dioxus's `launch::launch_cfg` takes a bare `fn() -> Element` — there is no `with_root_and_props` equivalent. Tests that need dynamic data use the `thread_local!` pattern:
 
 ```rust
 thread_local! {

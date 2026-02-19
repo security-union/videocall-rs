@@ -2,13 +2,18 @@
 	"info": {
 		"_postman_id": "meeting-api-collection-v1",
 		"name": "Meeting API",
-		"description": "API collection for testing the videocall.rs Meeting Backend.\n\n## Setup\n\n1. **Local Development**: Set `baseUrl` to `http://localhost:8080`\n2. **Production**: Set `baseUrl` to your meeting-api endpoint (e.g., `http://localhost:8081`)\n\n## Authentication\n\n- **Local Dev**: Uses `email` cookie (set in collection variables)\n- **Production**: Uses `session` JWT cookie or `Authorization: Bearer` header\n\n## Variables\n\n- `baseUrl`: API base URL\n- `email`: Your email for authentication\n- `meeting_id`: Meeting ID for requests\n- `participant_email`: Email of participant to admit/reject",
+		"description": "API collection for testing the videocall.rs Meeting Backend.\n\n## Setup\n\n1. **Local Development**: Set `baseUrl` to `http://localhost:8081`\n2. **Production**: Set `baseUrl` to your meeting-api endpoint\n\n## Authentication\n\nAll requests use JWT authentication via `Authorization: Bearer <session_token>` header.\n\nObtain a session token by completing the OAuth login flow, then set the `session_token` variable.\n\n## Variables\n\n- `baseUrl`: API base URL\n- `session_token`: JWT session token (obtained via OAuth login)\n- `email`: Your email (for reference)\n- `meeting_id`: Meeting ID for requests\n- `participant_email`: Email of participant to admit/reject",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 	},
 	"variable": [
 		{
 			"key": "baseUrl",
-			"value": "http://localhost:8080",
+			"value": "http://localhost:8081",
+			"type": "string"
+		},
+		{
+			"key": "session_token",
+			"value": "",
 			"type": "string"
 		},
 		{
@@ -24,6 +29,11 @@
 		{
 			"key": "participant_email",
 			"value": "attendee@example.com",
+			"type": "string"
+		},
+		{
+			"key": "participant_session_token",
+			"value": "",
 			"type": "string"
 		},
 		{
@@ -43,8 +53,8 @@
 						"method": "GET",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -75,8 +85,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							},
 							{
@@ -104,8 +114,8 @@
 						"method": "GET",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -124,8 +134,8 @@
 						"method": "DELETE",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -150,8 +160,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							},
 							{
@@ -179,8 +189,8 @@
 						"method": "GET",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -199,8 +209,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -225,8 +235,8 @@
 						"method": "GET",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -245,8 +255,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							},
 							{
@@ -274,8 +284,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -294,8 +304,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							},
 							{
@@ -329,8 +339,8 @@
 						"method": "GET",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -355,8 +365,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							},
 							{
@@ -374,7 +384,7 @@
 							"host": ["{{baseUrl}}"],
 							"path": ["api", "v1", "meetings", "{{meeting_id}}", "join"]
 						},
-						"description": "**Step 1 for Host**: Join a meeting (creates it if it doesn't exist).\n\nAs the first user to join, you become the host and receive a `room_token` immediately.\n\nUse this token to connect to the Media Server:\n```\nws://localhost:8080/lobby?token=<room_token>\n```"
+						"description": "**Step 1 for Host**: Join a meeting (creates it if it doesn't exist).\n\nAs the first user to join, you become the host and receive a `room_token` immediately.\n\nUse this token to connect to the Media Server:\n```\nws://localhost:8081/lobby?token=<room_token>\n```"
 					},
 					"response": []
 				},
@@ -384,8 +394,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{participant_email}}",
+								"key": "Authorization",
+								"value": "Bearer {{participant_session_token}}",
 								"type": "text"
 							},
 							{
@@ -413,8 +423,8 @@
 						"method": "GET",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							}
 						],
@@ -433,8 +443,8 @@
 						"method": "POST",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{email}}",
+								"key": "Authorization",
+								"value": "Bearer {{session_token}}",
 								"type": "text"
 							},
 							{
@@ -462,8 +472,8 @@
 						"method": "GET",
 						"header": [
 							{
-								"key": "Cookie",
-								"value": "email={{participant_email}}",
+								"key": "Authorization",
+								"value": "Bearer {{participant_session_token}}",
 								"type": "text"
 							}
 						],

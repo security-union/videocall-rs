@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.2](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.1...videocall-client-v4.0.2) - 2026-02-19
+
+### Other
+
+- Decouple yew from videocall client ([#633](https://github.com/security-union/videocall-rs/pull/633))
+- SEO improvement ([#630](https://github.com/security-union/videocall-rs/pull/630))
+
 ## [4.0.1](https://github.com/security-union/videocall-rs/compare/videocall-client-v4.0.0...videocall-client-v4.0.1) - 2026-02-16
 
 ### Other

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.38](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.37...videocall-ui-v1.1.38) - 2026-02-19
+
+### Other
+
+- Decouple yew from videocall client ([#633](https://github.com/security-union/videocall-rs/pull/633))
+- Nixify videocall.rs website ([#631](https://github.com/security-union/videocall-rs/pull/631))
+- SEO improvement ([#630](https://github.com/security-union/videocall-rs/pull/630))
+- Fix profile dropdown layout and focus styling ([#624](https://github.com/security-union/videocall-rs/pull/624))
+- Add login component to home page if unauthenticated ([#620](https://github.com/security-union/videocall-rs/pull/620))
+
 ## [1.1.37](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.36...videocall-ui-v1.1.37) - 2026-02-16
 
 ### Other

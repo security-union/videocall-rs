@@ -29,6 +29,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
@@ -45,7 +46,6 @@ use web_sys::VideoEncoderEncodeOptions;
 use web_sys::VideoEncoderInit;
 use web_sys::VideoFrame;
 use web_sys::VideoTrack;
-use yew::Callback;
 
 use super::super::client::VideoCallClient;
 use super::encoder_state::EncoderState;

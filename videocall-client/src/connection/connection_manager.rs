@@ -31,8 +31,8 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::Callback;
 use wasm_bindgen::JsValue;
-use yew::prelude::Callback;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionState {

@@ -32,7 +32,7 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{HeartbeatMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
-use yew::prelude::Callback;
+use videocall_types::Callback;
 
 #[derive(Clone, Copy, Debug)]
 enum Status {

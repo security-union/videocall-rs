@@ -14,6 +14,8 @@ on:
       - Dockerfile.actix
       - Cargo.lock
       - Cargo.toml
+      - flake.nix
+      - flake.lock
 
 jobs:
   push_to_registry:

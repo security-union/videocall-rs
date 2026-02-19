@@ -63,18 +63,13 @@ jobs:
     name: Yew UI Component Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2024-11-01
-          target: wasm32-unknown-unknown
-          override: true
-          profile: minimal
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Cache dependencies
-        uses: actions/cache@v3
+      - name: Cache cargo dependencies
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -84,12 +79,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-yew-tests-
 
-      - name: Install wasm-bindgen-cli
-        run: cargo install wasm-bindgen-cli --version 0.2.106 --locked
-
       - uses: nanasess/setup-chromedriver@v2
 
       - name: Run yew-ui component tests
         run: |
-          cd yew-ui
-          CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown
+          nix develop .#yew-ui --command bash -c "\
+            cd yew-ui && \
+            CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown"

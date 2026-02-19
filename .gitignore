@@ -63,3 +63,7 @@ Carthage/Build/
 *.swg
 
 deployment-**.log
+
+# Nix
+result
+result-*

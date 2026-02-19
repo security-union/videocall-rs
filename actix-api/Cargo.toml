@@ -55,7 +55,7 @@ tokio = { version = "1.28.2", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["fmt", "ansi", "env-filter", "time", "tracing-log"] }
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.1" }
-videocall-types = { path= "../videocall-types", version = "4.0.0" }
+videocall-types = { path= "../videocall-types", version = "4.0.1" }
 urlencoding = "2.1.3"
 uuid = { version = "0.8", features = ["serde", "v4"] }
 web-transport-quinn = { workspace = true }
@@ -65,7 +65,7 @@ chrono = "0.4"
 url = "2"
 serial_test = "3"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"] }
-videocall-types = { path = "../videocall-types", version = "4.0.0", features = ["testing"] }
+videocall-types = { path = "../videocall-types", version = "4.0.1", features = ["testing"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 meeting-api = { path = "../meeting-api" }

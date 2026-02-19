@@ -16,16 +16,23 @@
  * conditions.
  */
 
+pub mod callback;
 pub mod feature_flags;
 pub mod protos;
 
+pub use callback::Callback;
 pub use feature_flags::FeatureFlags;
 use protobuf::Message;
+
+/// A representation of a value which can be stored and restored as a text.
+pub type Text = Result<String, anyhow::Error>;
+
+/// A representation of a value which can be stored and restored as a binary.
+pub type Binary = Result<Vec<u8>, anyhow::Error>;
 
 /// System username used for server-generated messages (meeting info, meeting started/ended).
 /// This is not a real user and should be filtered out in UI/peer management.
 pub const SYSTEM_USER_EMAIL: &str = "system-&^%$#@!";
-use yew_websocket::websocket::{Binary, Text};
 
 impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {

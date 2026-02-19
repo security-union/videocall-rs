@@ -17,6 +17,8 @@ on:
       - Dockerfile.yew
       - nginx.conf
       - docker/start-yew.sh
+      - flake.nix
+      - flake.lock
 
 jobs:
   push_to_registry:

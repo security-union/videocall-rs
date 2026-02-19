@@ -35,6 +35,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Docker Setup](#docker-setup)
+  - [Nix Build System (WIP)](#nix-build-system-wip)
   - [Manual Setup](#manual-setup)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
   - [Local (no Docker)](#local-no-docker-create-yew-uiscriptsconfigjs)
@@ -170,6 +171,25 @@ The quickest way to get started is with our Docker-based setup:
    ```
    http://<server-ip>/meeting/<username>/<meeting-id>
    ```
+
+### Nix Build System (WIP)
+
+We are migrating the build infrastructure to [Nix](https://nixos.org/) for reproducible, fast builds. Currently the `leptos-website` is the first component being nixified.
+
+**Status:** Work in progress — see the `nixify-docker-build` branch.
+
+**What Nix replaces:** Previously, Docker builds spent 15-20 minutes compiling tools like `cargo-leptos` and `wasm-bindgen-cli` from source on every build. Nix provides these as pre-built binaries from the binary cache, reducing tool setup from minutes to seconds.
+
+**What's done so far:**
+- `flake.nix` at the repo root provides dev shells with pinned versions of the Rust nightly toolchain, `cargo-leptos`, `wasm-bindgen-cli`, `binaryen`, Node.js, and system dependencies
+- `docker/Dockerfile.website` and `docker/Dockerfile.website.dev` use `nixos/nix` as a builder image
+- `.github/workflows/leptos-website-build.yaml` uses `DeterminateSystems/nix-installer-action` with `magic-nix-cache-action` for cached CI builds
+
+**Quick start (requires [Nix](https://install.determinate.systems/nix)):**
+
+The integration is transparent to the user, and the development experience is the same as with Docker.
+
+**What's next:** Nixifying additional components (actix-api, yew-ui) and evaluating [crane](https://github.com/ipetkov/crane) for full Nix-managed Rust dependency caching.
 
 ### Manual Setup (Experimental)
 
@@ -465,7 +485,7 @@ See our [Contributing Guidelines](CONTRIBUTING.md) for more detailed information
 - **Backend**: Rust + Actix Web + PostgreSQL + NATS
 - **Frontend**: Rust + Yew + WebAssembly + Tailwind CSS
 - **Transport**: WebTransport (QUIC/HTTP3) + WebSockets (fallback)
-- **Build System**: Cargo + Trunk + Docker + Helm
+- **Build System**: Cargo + Trunk + Nix (WIP) + Docker + Helm
 - **Testing**: `cargo test` + `wasm-bindgen-test` (browser-based UI tests) + Docker Compose (backend integration)
 
 ### Key Technical Features

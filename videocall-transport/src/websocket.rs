@@ -86,13 +86,13 @@ pub struct WebSocketService {}
 impl WebSocketService {
     /// Connects to a server through a WebSocket connection. Needs two callbacks; one is passed
     /// data, the other is passed updates about the WebSocket's status.
-    pub fn connect<OUT: 'static>(
+    pub fn connect<OUT>(
         url: &str,
         callback: Callback<OUT>,
         notification: Callback<WebSocketStatus>,
     ) -> Result<WebSocketTask, WebSocketError>
     where
-        OUT: From<Text> + From<Binary>,
+        OUT: From<Text> + From<Binary> + 'static,
     {
         let ConnectCommon(ws, listeners) = Self::connect_common(url, &notification)?;
         let listener = EventListener::new(&ws, "message", move |event: &Event| {
@@ -104,13 +104,13 @@ impl WebSocketService {
 
     /// Connects to a server through a WebSocket connection, like connect,
     /// but only processes binary frames. Text frames are silently ignored.
-    pub fn connect_binary<OUT: 'static>(
+    pub fn connect_binary<OUT>(
         url: &str,
         callback: Callback<OUT>,
         notification: Callback<WebSocketStatus>,
     ) -> Result<WebSocketTask, WebSocketError>
     where
-        OUT: From<Binary>,
+        OUT: From<Binary> + 'static,
     {
         let ConnectCommon(ws, listeners) = Self::connect_common(url, &notification)?;
         let listener = EventListener::new(&ws, "message", move |event: &Event| {
@@ -122,13 +122,13 @@ impl WebSocketService {
 
     /// Connects to a server through a WebSocket connection, like connect,
     /// but only processes text frames. Binary frames are silently ignored.
-    pub fn connect_text<OUT: 'static>(
+    pub fn connect_text<OUT>(
         url: &str,
         callback: Callback<OUT>,
         notification: Callback<WebSocketStatus>,
     ) -> Result<WebSocketTask, WebSocketError>
     where
-        OUT: From<Text>,
+        OUT: From<Text> + 'static,
     {
         let ConnectCommon(ws, listeners) = Self::connect_common(url, &notification)?;
         let listener = EventListener::new(&ws, "message", move |event: &Event| {
@@ -180,9 +180,9 @@ impl WebSocketService {
 
 struct ConnectCommon(WebSocket, [EventListener; 3]);
 
-fn process_binary<OUT: 'static>(event: &MessageEvent, callback: &Callback<OUT>)
+fn process_binary<OUT>(event: &MessageEvent, callback: &Callback<OUT>)
 where
-    OUT: From<Binary>,
+    OUT: From<Binary> + 'static,
 {
     let bytes = if !event.data().is_string() {
         Some(event.data())
@@ -201,9 +201,9 @@ where
     callback.emit(out);
 }
 
-fn process_text<OUT: 'static>(event: &MessageEvent, callback: &Callback<OUT>)
+fn process_text<OUT>(event: &MessageEvent, callback: &Callback<OUT>)
 where
-    OUT: From<Text>,
+    OUT: From<Text> + 'static,
 {
     let text = event.data().as_string();
 
@@ -217,9 +217,9 @@ where
     callback.emit(out);
 }
 
-fn process_both<OUT: 'static>(event: &MessageEvent, callback: &Callback<OUT>)
+fn process_both<OUT>(event: &MessageEvent, callback: &Callback<OUT>)
 where
-    OUT: From<Text> + From<Binary>,
+    OUT: From<Text> + From<Binary> + 'static,
 {
     let is_text = event.data().is_string();
     if is_text {

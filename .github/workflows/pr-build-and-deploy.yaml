@@ -176,7 +176,9 @@ jobs:
             - \`ghcr.io/jboyd01/videocall-meeting-api:pr-${prNumber}\`
             - \`ghcr.io/jboyd01/videocall-web-ui:pr-${prNumber}\`
 
-            🚀 **Starting deployment...**`
+            🚀 **Starting deployment...**
+
+            [View workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             });
 
   deploy:

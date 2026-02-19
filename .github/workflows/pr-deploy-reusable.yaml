@@ -478,7 +478,7 @@ jobs:
 
             **Redeploy:** If new commits are pushed, comment \`/deploy\` again to redeploy.
 
-            [View deployment logs →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            [View deployment logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             });
 
   cleanup-on-failure:

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.1](https://github.com/security-union/videocall-rs/compare/videocall-types-v4.0.0...videocall-types-v4.0.1) - 2026-02-19
+
+### Other
+
+- Decouple yew from videocall client ([#633](https://github.com/security-union/videocall-rs/pull/633))
+
 ## [4.0.0](https://github.com/security-union/videocall-rs/compare/videocall-types-v3.0.1...videocall-types-v4.0.0) - 2026-01-27
 
 ### Other

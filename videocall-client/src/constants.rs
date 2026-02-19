@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use crate::utils::is_firefox;
 use videocall_types::protos::media_packet::VideoCodec;
 
 pub static AUDIO_CODEC: &str = "opus"; // https://www.w3.org/TR/webcodecs-codec-registry/#audio-codec-registry
@@ -29,8 +28,9 @@ pub static VIDEO_CODEC_VP9: &str = "vp09.00.10.08"; // profile 0, level 1.0, bit
 
 /// Returns the appropriate video codec string based on the browser.
 /// Firefox uses VP8 (software VP9 is too slow), others use VP9.
+#[cfg(target_arch = "wasm32")]
 pub fn get_video_codec_string() -> &'static str {
-    if is_firefox() {
+    if crate::utils::is_firefox() {
         VIDEO_CODEC_VP8
     } else {
         VIDEO_CODEC_VP9
@@ -38,12 +38,25 @@ pub fn get_video_codec_string() -> &'static str {
 }
 
 /// Returns the VideoCodec enum value based on the browser.
+#[cfg(target_arch = "wasm32")]
 pub fn get_video_codec() -> VideoCodec {
-    if is_firefox() {
+    if crate::utils::is_firefox() {
         VideoCodec::VP8
     } else {
         VideoCodec::VP9_PROFILE0_LEVEL10_8BIT
     }
+}
+
+/// Returns the video codec string on native (always VP9).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn get_video_codec_string() -> &'static str {
+    VIDEO_CODEC_VP9
+}
+
+/// Returns the VideoCodec enum value on native (always VP9).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn get_video_codec() -> VideoCodec {
+    VideoCodec::VP9_PROFILE0_LEVEL10_8BIT
 }
 
 // H.264 - requires description field in decoder config (SPS/PPS)

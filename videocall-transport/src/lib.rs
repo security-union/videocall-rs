@@ -16,5 +16,25 @@
  * conditions.
  */
 
+//! Cross-platform transport layer for videocall.rs.
+//!
+//! Provides WebSocket and WebTransport wrappers for both WASM (browser) and
+//! native (desktop/server) targets.
+//!
+//! # Features
+//!
+//! - **`wasm`** — Browser-based transports using `web-sys` APIs
+//! - **`native`** — Native transports using `web-transport-quinn` and `tokio`
+
+// ── WASM transports ───────────────────────────────────────────────────────────
+
+#[cfg(feature = "wasm")]
 pub mod websocket;
+
+#[cfg(feature = "wasm")]
 pub mod webtransport;
+
+// ── Native transports ─────────────────────────────────────────────────────────
+
+#[cfg(feature = "native")]
+pub mod native_webtransport;

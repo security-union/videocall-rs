@@ -95,9 +95,12 @@ impl Aes128State {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::*;
 
-    #[wasm_bindgen_test]
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     fn test_aes() {
         let aes = Aes128State::new(true);
         let data = aes.encrypt(b"hello world").unwrap();
@@ -105,7 +108,8 @@ mod test {
         assert_eq!(data2, b"hello world");
     }
 
-    #[wasm_bindgen_test]
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     fn test_aes_large_payload() {
         let aes = Aes128State::new(true);
         let mut data = Vec::new();
@@ -117,7 +121,8 @@ mod test {
         assert_eq!(data2, data);
     }
 
-    #[wasm_bindgen_test]
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     fn test_aes_disabled() {
         let aes = Aes128State::new(false);
         let mut data = Vec::new();

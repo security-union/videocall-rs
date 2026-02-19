@@ -17,13 +17,15 @@ on:
       - 'neteq/**'
       - 'Dockerfile.yew'
       - 'nginx.conf'
+      - 'flake.nix'
+      - 'flake.lock'
       # Meeting API dependencies
       - 'meeting-api/**'
       - 'videocall-meeting-types/**'
       - 'Dockerfile.meeting-api'
       # Docker directory changes
       - 'docker/Dockerfile.actix'
-      - 'docker/Dockerfile.yew'
+      - 'docker/Dockerfile.yew.dev'
       - 'docker/start-yew.sh'
       # Website image dependencies
       - 'leptos-website/**'

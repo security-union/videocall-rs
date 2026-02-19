@@ -2,10 +2,12 @@
   description = "videocall-rs - WebTransport video calling platform";
 
   inputs = {
-    # Pinned nixpkgs with pre-built:
-    #   cargo-leptos        = 0.2.42 (0.2.x line, compatible with leptos 0.5.x)
-    #   wasm-bindgen-cli    = 0.2.100 (exact match for Cargo.toml's =0.2.100)
     nixpkgs.url =
+      "github:NixOS/nixpkgs/d1c15b7d5806069da59e819999d70e1cec0760bf";
+
+    # cargo-leptos 0.2.42 lives in this older nixpkgs (0.2.x is required for
+    # leptos 0.5.x; the main nixpkgs has jumped to 0.3.x).
+    nixpkgs-leptos.url =
       "github:NixOS/nixpkgs/ee09932cedcef15aaf476f9343d1dea2cb77e261";
 
     rust-overlay = {
@@ -16,48 +18,83 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, rust-overlay, flake-utils }:
+  outputs = { self, nixpkgs, nixpkgs-leptos, rust-overlay, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
+        pkgsLeptos = import nixpkgs-leptos { inherit system; };
 
-        rustMinimal = pkgs.rust-bin.nightly."2024-11-01".minimal.override {
+        # leptos-website: pinned nightly required by cargo-leptos 0.2.x
+        leptosRustMinimal = pkgs.rust-bin.nightly."2024-11-01".minimal.override {
           targets = [ "wasm32-unknown-unknown" ];
         };
 
-        rustDev = pkgs.rust-bin.nightly."2024-11-01".default.override {
+        leptosRustDev = pkgs.rust-bin.nightly."2024-11-01".default.override {
           targets = [ "wasm32-unknown-unknown" ];
           extensions = [ "rust-src" "rust-analyzer" ];
         };
 
-        commonBuildInputs = [
-          pkgs.cargo-leptos
-          pkgs.wasm-bindgen-cli_0_2_100
-          pkgs.nodejs_20
+        # yew-ui: pinned stable (needs >= 1.85 for edition 2024 deps)
+        yewRustMinimal = pkgs.rust-bin.stable."1.93.1".minimal.override {
+          targets = [ "wasm32-unknown-unknown" ];
+        };
+
+        yewRustDev = pkgs.rust-bin.stable."1.93.1".default.override {
+          targets = [ "wasm32-unknown-unknown" ];
+          extensions = [ "rust-src" "rust-analyzer" ];
+        };
+
+        coreInputs = [
           pkgs.binaryen
           pkgs.pkg-config
           pkgs.openssl
           pkgs.git
         ];
 
-        commonEnv = {
+        leptosBuildInputs = [
+          pkgsLeptos.cargo-leptos
+          pkgs.wasm-bindgen-cli_0_2_100
+          pkgs.nodejs_20
+        ] ++ coreInputs;
+
+        yewBuildInputs = [
+          pkgs.trunk
+          pkgs.wasm-bindgen-cli_0_2_108
+          pkgs.tailwindcss
+        ] ++ coreInputs;
+
+        leptosEnv = {
           LEPTOS_HASH_FILES = "false";
           LEPTOS_TAILWIND_VERSION = "v3.4.17";
         };
+
+        # trunk 0.21.x reads NO_COLOR but chokes on the value "1" that
+        # mkShell injects; fully unsetting it avoids the clash.
+        yewHook = ''
+          unset NO_COLOR
+        '';
       in
       {
-        # Minimal shell for Docker and CI builds (no docs, no rust-analyzer)
-        devShells.leptos-website = pkgs.mkShell (commonEnv // {
-          nativeBuildInputs = [ rustMinimal ] ++ commonBuildInputs;
+        devShells.leptos-website = pkgs.mkShell (leptosEnv // {
+          nativeBuildInputs = [ leptosRustMinimal ] ++ leptosBuildInputs;
         });
 
-        # Full shell for local development (includes rust-analyzer, docs)
-        devShells.leptos-website-dev = pkgs.mkShell (commonEnv // {
-          nativeBuildInputs = [ rustDev ] ++ commonBuildInputs;
+        devShells.leptos-website-dev = pkgs.mkShell (leptosEnv // {
+          nativeBuildInputs = [ leptosRustDev ] ++ leptosBuildInputs;
         });
 
-        devShells.default = self.devShells.${system}.leptos-website-dev;
+        devShells.yew-ui = pkgs.mkShell {
+          nativeBuildInputs = [ yewRustMinimal ] ++ yewBuildInputs;
+          shellHook = yewHook;
+        };
+
+        devShells.yew-ui-dev = pkgs.mkShell {
+          nativeBuildInputs = [ yewRustDev ] ++ yewBuildInputs;
+          shellHook = yewHook;
+        };
+
+        devShells.default = self.devShells.${system}.yew-ui-dev;
       }
     );
 }

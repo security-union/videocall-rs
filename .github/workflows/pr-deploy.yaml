@@ -3,6 +3,7 @@ name: Deploy PR Preview
 on:
   issue_comment:
     types: [created]
+  # Force reload
 
 permissions:
   contents: read

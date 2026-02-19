@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.39](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.38...videocall-ui-v1.1.39) - 2026-02-19
+
+### Other
+
+- yew-ui ([#635](https://github.com/security-union/videocall-rs/pull/635))
+
+## [1.1.38](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.37...videocall-ui-v1.1.38) - 2026-02-19
+
+### Other
+
+- Decouple yew from videocall client ([#633](https://github.com/security-union/videocall-rs/pull/633))
+- Nixify videocall.rs website ([#631](https://github.com/security-union/videocall-rs/pull/631))
+- SEO improvement ([#630](https://github.com/security-union/videocall-rs/pull/630))
+- Fix profile dropdown layout and focus styling ([#624](https://github.com/security-union/videocall-rs/pull/624))
+- Add login component to home page if unauthenticated ([#620](https://github.com/security-union/videocall-rs/pull/620))
+
+## [1.1.37](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.36...videocall-ui-v1.1.37) - 2026-02-16
+
+### Other
+
+- Liquid glass for login and join screen ([#613](https://github.com/security-union/videocall-rs/pull/613))
+- add generic oauth support ([#610](https://github.com/security-union/videocall-rs/pull/610))
+
+## [1.1.36](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.35...videocall-ui-v1.1.36) - 2026-02-15
+
+### Other
+
+- add UI integration to the new meetings API ([#550](https://github.com/security-union/videocall-rs/pull/550)) ([#609](https://github.com/security-union/videocall-rs/pull/609))
+- Meeting backend API ([#601](https://github.com/security-union/videocall-rs/pull/601))
+- Add component and integration testing for yew-ui ([#568](https://github.com/security-union/videocall-rs/pull/568))
+- Fix device selection ([#566](https://github.com/security-union/videocall-rs/pull/566))
+- Fix/screenshare integration branch ([#563](https://github.com/security-union/videocall-rs/pull/563))
+- Fix/ci cargo registry cache ([#559](https://github.com/security-union/videocall-rs/pull/559))
+
 ## [1.1.35](https://github.com/security-union/videocall-rs/compare/videocall-ui-v1.1.34...videocall-ui-v1.1.35) - 2026-02-04
 
 ### Other

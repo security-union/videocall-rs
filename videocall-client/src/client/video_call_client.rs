@@ -44,9 +44,9 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::rsa_packet::RsaPacket;
+use videocall_types::Callback;
 use videocall_types::SYSTEM_USER_EMAIL;
 use wasm_bindgen::JsValue;
-use yew::prelude::Callback;
 
 /// Options struct for constructing a client via [VideoCallClient::new(options)][VideoCallClient::new]
 #[derive(Clone, Debug, PartialEq)]
@@ -418,6 +418,25 @@ impl VideoCallClient {
         // Always use RTT testing - it handles single server case efficiently
         info!("Connecting with RTT testing");
         self.connect_with_rtt_testing()
+    }
+
+    /// Replace the WebSocket and WebTransport server URLs used for future
+    /// connections.
+    ///
+    /// Call this before [`connect()`][Self::connect] when you have a fresh room
+    /// access token and need to reconnect. The existing media pipeline
+    /// (encoders, decoders, peer state) is preserved.
+    pub fn update_server_urls(
+        &mut self,
+        websocket_urls: Vec<String>,
+        webtransport_urls: Vec<String>,
+    ) {
+        info!(
+            "Updating server URLs: ws={:?}, wt={:?}",
+            websocket_urls, webtransport_urls
+        );
+        self.options.websocket_urls = websocket_urls;
+        self.options.webtransport_urls = webtransport_urls;
     }
 
     fn create_peer_decoder_manager(

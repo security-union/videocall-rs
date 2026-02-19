@@ -16,13 +16,11 @@ window.__APP_CONFIG = Object.freeze({
   serverElectionPeriodMs: ${SERVER_ELECTION_PERIOD_MS:-2000},
   audioBitrateKbps: ${AUDIO_BITRATE_KBPS:-65},
   videoBitrateKbps: ${VIDEO_BITRATE_KBPS:-100},
-  screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-100}
+  screenBitrateKbps: ${SCREEN_BITRATE_KBPS:-100},
+  oauthProvider: "${OAUTH_PROVIDER:-}"
 });
 EOF
 
-# Ensure trunk is on PATH (common install locations)
-# trigger ci
-export PATH="$PATH:/usr/local/cargo/bin:/root/.cargo/bin"
+tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify &
 
-# Run the dev server
 exec trunk serve --address 0.0.0.0 --port "${TRUNK_SERVE_PORT:-80}"

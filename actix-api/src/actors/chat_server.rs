@@ -29,7 +29,6 @@ use actix::{
     Actor, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
 };
 use futures::StreamExt;
-use sqlx::PgPool;
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use tracing::{error, info, trace, warn};
@@ -57,7 +56,7 @@ pub struct ChatServer {
 }
 
 impl ChatServer {
-    pub async fn new(nats_connection: async_nats::client::Client, pool: Option<PgPool>) -> Self {
+    pub async fn new(nats_connection: async_nats::client::Client) -> Self {
         ChatServer {
             nats_connection,
             active_subs: HashMap::new(),
@@ -412,12 +411,14 @@ mod tests {
     use super::*;
     use actix::Actor;
     use serial_test::serial;
-    use sqlx::PgPool;
 
-    async fn get_test_pool() -> PgPool {
+    /// Test helper: create a database pool for integration tests.
+    /// Kept for future JWT flow testing (create meeting -> get JWT -> connect via WS/WT).
+    #[allow(dead_code)]
+    async fn get_test_pool() -> sqlx::PgPool {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
-        PgPool::connect(&database_url)
+        sqlx::PgPool::connect(&database_url)
             .await
             .expect("Failed to connect to test database")
     }
@@ -431,14 +432,13 @@ mod tests {
     #[actix_rt::test]
     #[serial]
     async fn test_join_room_rejects_system_email_synchronously() {
-        let pool = get_test_pool().await;
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
         // Start the ChatServer actor
-        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
+        let chat_server = ChatServer::new(nats_client).await.start();
 
         // Create a mock session recipient
         // We need a real actor to receive messages, so we use a simple dummy
@@ -493,13 +493,12 @@ mod tests {
     #[actix_rt::test]
     #[serial]
     async fn test_join_room_succeeds_with_valid_user() {
-        let pool = get_test_pool().await;
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
+        let chat_server = ChatServer::new(nats_client).await.start();
 
         struct DummySession;
         impl Actor for DummySession {
@@ -544,13 +543,12 @@ mod tests {
     #[actix_rt::test]
     #[serial]
     async fn test_join_room_fails_without_session() {
-        let pool = get_test_pool().await;
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
+        let chat_server = ChatServer::new(nats_client).await.start();
 
         // Try to join WITHOUT registering the session first
         let result = chat_server
@@ -581,18 +579,12 @@ mod tests {
     #[actix_rt::test]
     #[serial]
     async fn test_cleanup_failed_join_allows_retry() {
-        use videocall_types::FeatureFlags;
-
-        // Enable meeting management to trigger DB operations (which can fail)
-        FeatureFlags::set_meeting_management_override(true);
-
-        let pool = get_test_pool().await;
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
         let nats_client = async_nats::connect(&nats_url)
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client, Some(pool)).await.start();
+        let chat_server = ChatServer::new(nats_client).await.start();
 
         struct DummySession;
         impl Actor for DummySession {
@@ -643,8 +635,6 @@ mod tests {
             result2.is_ok(),
             "Second join with same session should return Ok (already active)"
         );
-
-        FeatureFlags::clear_meeting_management_override();
     }
 
     // ==========================================================================

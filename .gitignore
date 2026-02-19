@@ -10,6 +10,7 @@
 target/
 helm/digital-ocean-secret
 helm/global/us-east/grafana/secret.yaml
+helm-videocall-deployment/
 
 # iOS specific
 *.xcframework/
@@ -62,3 +63,7 @@ Carthage/Build/
 *.swg
 
 deployment-**.log
+
+# Nix
+result
+result-*

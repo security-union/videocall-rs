@@ -6,7 +6,7 @@ fullnameOverride: ""
 
 replicaCount: 1
 image:
-  repository: securityunion/rustlemania-api
+  repository: securityunion/videocall-media-server
   pullPolicy: Always
   tag: high-availability-cf63fcce
 command: ['webtransport_server']

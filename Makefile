@@ -3,7 +3,15 @@ COMPOSE_IT := docker/docker-compose.integration.yaml
 .PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up
 
 tests_run:
-	docker compose -f $(COMPOSE_IT) up -d && docker compose -f $(COMPOSE_IT) run --rm rust-tests bash -c "cd /app/dbmate && dbmate wait && dbmate up && cd /app/actix-api && cargo clippy -- -D warnings && cargo fmt --check && cargo machete && cargo test -- --nocapture --test-threads=1"
+	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
+		nix develop /app#backend-dev --command bash -c "\
+		cd /app/dbmate && dbmate wait && dbmate up && \
+		cd /app/actix-api && \
+		cargo clippy -- -D warnings && \
+		cargo fmt --check && \
+		cargo machete && \
+		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
+		cargo test -p meeting-api -- --nocapture --test-threads=1"
 
 tests_build:
 	docker compose -f $(COMPOSE_IT) build

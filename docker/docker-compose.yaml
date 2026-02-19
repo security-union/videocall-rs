@@ -4,22 +4,25 @@ services:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-yew-ui-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-yew-ui-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-yew-ui-cargo-target-cache:/usr/local/cargo/target
+      - nix-store-yew:/nix
+      - rustlemania-yew-ui-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-yew-ui-cargo-git-cache:/root/.cargo/git
       - rustlemania-yew-ui-cache:/app/yew-ui/target
     build:
-      dockerfile: ../docker/Dockerfile.yew
-      context: ../docker
+      dockerfile: docker/Dockerfile.yew.dev
+      context: ../
     working_dir: /app/yew-ui
-    command: ["/bin/sh", "-lc", "/app/docker/start-yew.sh"]
+    command: >
+      nix develop /app#yew-ui --command bash -c
+      "/app/docker/start-yew.sh"
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
       - WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}
       - TRUNK_SERVE_PORT=${TRUNK_SERVE_PORT:-80}
       - ENABLE_OAUTH=${ENABLE_OAUTH:-false}
-      - API_BASE_URL=${API_BASE_URL:-http://localhost:8080}
-      - LOGIN_URL=http://localhost:${ACTIX_PORT:-8080}/login
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:8081}
+      - LOGIN_URL=http://localhost:8081/login
       - RUSTFLAGS=--cfg=web_sys_unstable_apis
       - RUST_BACKTRACE=1
       - WEBTRANSPORT_ENABLED=${WEBTRANSPORT_ENABLED:-false}
@@ -29,39 +32,29 @@ services:
       - CARGO_TARGET_DIR=/app/yew-ui/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
+      - OAUTH_PROVIDER=${OAUTH_PROVIDER:-google}
       - UI_URL=${UI_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
     ports:
       - "${TRUNK_SERVE_PORT:-80}:${TRUNK_SERVE_PORT:-80}"
-    depends_on:
-      - tailwind-yew
 
-  tailwind-yew:
-    build:
-      dockerfile: ../docker/Dockerfile.tailwind
-      context: ../docker
-    volumes:
-      - type: bind
-        source: ../
-        target: /app
-    working_dir: /app/yew-ui
-    entrypoint: ["/bin/sh", "-c"]
-    command: "tailwindcss -i ./static/leptos-style.css -o ./static/tailwind.css --watch --minify"
-    
   website:
     volumes:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-leptos-ui-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-leptos-ui-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-leptos-ui-cargo-target-cache:/usr/local/cargo/target
+      - nix-store-website:/nix
+      - rustlemania-leptos-ui-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-leptos-ui-cargo-git-cache:/root/.cargo/git
       - rustlemania-leptos-ui-cache:/app/leptos-website/target
     build:
-      dockerfile: ../docker/Dockerfile.website.dev
-      context: ../docker
+      dockerfile: docker/Dockerfile.website.dev
+      context: ../
     working_dir: /app/leptos-website
-    command: bash -c "cargo leptos watch"
+    command: >
+      nix develop /app#leptos-website --command bash -c
+      "npm install && cargo leptos watch"
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - LEPTOS_SITE_ADDR=0.0.0.0:4600
       - CARGO_TARGET_DIR=/app/leptos-website/target
       - CARGO_INCREMENTAL=1
@@ -69,24 +62,65 @@ services:
     ports:
       - "4600:4600"
   
+  meeting-api:
+    build:
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
+    working_dir: /app/meeting-api
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "/app/dbmate/startup.sh && cargo watch -x 'run --bin meeting-api'"
+    environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - LISTEN_ADDR=0.0.0.0:8081
+      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
+      - TOKEN_TTL_SECS=${TOKEN_TTL_SECS:-60}
+      - SESSION_TTL_SECS=${SESSION_TTL_SECS:-315360000}
+      - COOKIE_SECURE=false
+      - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
+      - CORS_ALLOWED_ORIGIN=${CORS_ALLOWED_ORIGIN:-}
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
+      - OAUTH_SECRET=${OAUTH_CLIENT_SECRET:-}
+      - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:8081/login/callback}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-}
+      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-}
+      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-}
+      - OAUTH_JWKS_URL=${OAUTH_JWKS_URL:-}
+      - OAUTH_USERINFO_URL=${OAUTH_USERINFO_URL:-}
+      - OAUTH_SCOPES=${OAUTH_SCOPES:-openid email profile}
+      - AFTER_LOGIN_URL=${AFTER_LOGIN_URL:-http://localhost:${TRUNK_SERVE_PORT:-80}}
+      - RUST_LOG=debug
+      - CARGO_TARGET_DIR=/app/meeting-api/target
+      - CARGO_INCREMENTAL=1
+      - CARGO_NET_OFFLINE=false
+    ports:
+      - "8081:8081"
+    volumes:
+      - type: bind
+        source: ../
+        target: /app
+      - nix-store-meeting-api:/nix
+      - rustlemania-meeting-api-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-meeting-api-cargo-git-cache:/root/.cargo/git
+      - rustlemania-meeting-api-cache:/app/meeting-api/target
+    depends_on:
+      - postgres
+
   websocket-api:
     build:
-      dockerfile: ../docker/Dockerfile.actix
-      context: ../docker
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
     working_dir: /app/actix-api
-    command: bash -c "/app/dbmate/startup.sh && cargo watch -x \"run -r --bin websocket_server \""
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "cargo watch -x 'run -r --bin websocket_server'"
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - ACTIX_PORT=${ACTIX_PORT:-8080}
       - UI_ENDPOINT=${UI_ENDPOINT:-http://localhost:80}
-      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-}
-      - OAUTH_AUTH_URL=${OAUTH_AUTH_URL:-https://accounts.google.com/o/oauth2/v2/auth}
-      - OAUTH_TOKEN_URL=${OAUTH_TOKEN_URL:-https://oauth2.googleapis.com/token}
-      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET:-}
-      - OAUTH_REDIRECT_URL=${OAUTH_REDIRECT_URL:-http://localhost:8080/login/callback}
-      - DATABASE_ENABLED=${DATABASE_ENABLED:-true}
+      - DATABASE_ENABLED=false
       - RUST_LOG=debug,async_nats=info
-      - COOKIE_DOMAIN=${COOKIE_DOMAIN:-}
-      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - NATS_URL=nats:4222
       - REGION=${REGION:-us-east}
       - SERVER_ID=${SERVER_ID:-server-1}
@@ -94,31 +128,34 @@ services:
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
-      - LOGIN_URL="" # needed for UI CI tests
-      - ACTIX_UI_BACKEND_URL="" # needed for UI CI tests
-      - WEBTRANSPORT_HOST="" # needed for UI CI tests
+      - LOGIN_URL=""
+      - ACTIX_UI_BACKEND_URL=""
+      - WEBTRANSPORT_HOST=""
       - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
     ports:
       - "${ACTIX_PORT:-8080}:${ACTIX_PORT:-8080}"
     volumes:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-actix-web-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-actix-web-cargo-target-cache:/usr/local/cargo/target
+      - nix-store-websocket-api:/nix
+      - rustlemania-actix-web-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-actix-web-cargo-git-cache:/root/.cargo/git
       - rustlemania-actix-web-target-cache:/app/actix-api/target
     depends_on:
-      - postgres
       - nats
 
   metrics-api:
     build:
-      dockerfile: ../docker/Dockerfile.actix
-      context: ../docker
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
     working_dir: /app/actix-api
-    command: bash -c "cargo watch -x \"run -r --bin metrics_server \""
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "cargo watch -x 'run -r --bin metrics_server'"
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - METRICS_PORT=9091
       - NATS_URL=nats:4222
       - REGION=${REGION:-us-east}
@@ -135,20 +172,23 @@ services:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-actix-web-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-actix-web-cargo-target-cache:/usr/local/cargo/target
+      - nix-store-metrics-api:/nix
+      - rustlemania-actix-web-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-actix-web-cargo-git-cache:/root/.cargo/git
       - rustlemania-actix-web-target-cache:/app/actix-api/target
     depends_on:
       - nats
 
   server-stats-api:
     build:
-      dockerfile: ../docker/Dockerfile.actix
-      context: ../docker
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
     working_dir: /app/actix-api
-    command: bash -c "cargo watch -x \"run -r --bin metrics_server_snapshot \""
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "cargo watch -x 'run -r --bin metrics_server_snapshot'"
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - METRICS_PORT=9092
       - NATS_URL=nats:4222
       - REGION=${REGION:-us-east}
@@ -164,20 +204,23 @@ services:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-actix-web-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-actix-web-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-actix-web-cargo-target-cache:/usr/local/cargo/target
+      - nix-store-server-stats-api:/nix
+      - rustlemania-actix-web-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-actix-web-cargo-git-cache:/root/.cargo/git
       - rustlemania-actix-web-target-cache:/app/actix-api/target
     depends_on:
       - nats
 
   webtransport-api:
     build:
-      dockerfile: ../docker/Dockerfile.actix
-      context: ../docker
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
     working_dir: /app/actix-api
-    command: bash -c "cargo watch -x \"run -r --bin webtransport_server \""
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "cargo watch -x 'run -r --bin webtransport_server'"
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - RUST_LOG=info
       - NATS_URL=nats:4222
       - REGION=${REGION:-us-east}
@@ -187,35 +230,37 @@ services:
       - HEALTH_LISTEN_URL=0.0.0.0:5321
       - CERT_PATH=certs/localhost.pem
       - KEY_PATH=certs/localhost.key
-      - DATABASE_URL=postgres://postgres:docker@postgres:5432/actix-api-db?sslmode=disable
       - CARGO_TARGET_DIR=/app/actix-api/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
       - FEATURE_MEETING_MANAGEMENT=${FEATURE_MEETING_MANAGEMENT:-false}
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-me}
     ports:
       - "4433:4433/udp"
     volumes:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-actix-webtransport-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-actix-webtransport-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-actix-webtransport-cargo-target-cache:/usr/local/cargo/target
-      - rustlemania-actix-webtransport-cache:/app/actix-api/target
+      - nix-store-webtransport-api:/nix
+      - rustlemania-actix-web-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-actix-web-cargo-git-cache:/root/.cargo/git
+      - rustlemania-actix-web-target-cache:/app/actix-api/target
     depends_on:
       - nats
-      - postgres
 
   synthetic-clients:
     build:
-      dockerfile: ../docker/Dockerfile.actix
-      context: ../docker
+      dockerfile: docker/Dockerfile.actix.dev
+      context: ../
     working_dir: /app/bot
-    command: bash -c "cargo run --release"
+    command: >
+      nix develop /app#backend-dev --command bash -c
+      "cargo run --release"
     environment:
-      - RUST_LOG=debug  # Enable debug logging to see VP9 frame details
-      - BOT_CONFIG_PATH=/config/bot-config.yaml  # Use YAML config
-      - INSECURE=true  # Skip certificate verification for development
+      - NIX_CONFIG=experimental-features = nix-command flakes
+      - RUST_LOG=debug
+      - BOT_CONFIG_PATH=/config/bot-config.yaml
+      - INSECURE=true
       - CARGO_TARGET_DIR=/app/bot/target
       - CARGO_INCREMENTAL=1
       - CARGO_NET_OFFLINE=false
@@ -223,14 +268,13 @@ services:
       - type: bind
         source: ../
         target: /app
-      # Mount the YAML config file
       - type: bind
         source: ./bot-config.yaml
         target: /config/bot-config.yaml
         read_only: true
-      - rustlemania-bot-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-bot-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-bot-cargo-target-cache:/usr/local/cargo/target
+      - nix-store-synthetic-clients:/nix
+      - rustlemania-bot-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-bot-cargo-git-cache:/root/.cargo/git
       - rustlemania-bot-cache:/app/bot/target
     depends_on:
       - webtransport-api
@@ -294,25 +338,28 @@ services:
   
 
 volumes:
+  nix-store-yew:
+  nix-store-website:
+  nix-store-meeting-api:
+  nix-store-websocket-api:
+  nix-store-metrics-api:
+  nix-store-server-stats-api:
+  nix-store-webtransport-api:
+  nix-store-synthetic-clients:
+  rustlemania-meeting-api-cargo-registry-cache:
+  rustlemania-meeting-api-cargo-git-cache:
+  rustlemania-meeting-api-cache:
   rustlemania-actix-web-cargo-registry-cache:
   rustlemania-actix-web-cargo-git-cache:
-  rustlemania-actix-web-cargo-target-cache:
   rustlemania-actix-web-target-cache:
-  rustlemania-actix-webtransport-cargo-registry-cache:
-  rustlemania-actix-webtransport-cargo-git-cache:
-  rustlemania-actix-webtransport-cargo-target-cache:
-  rustlemania-actix-webtransport-cache:
   rustlemania-yew-ui-cargo-registry-cache:
   rustlemania-yew-ui-cargo-git-cache:
-  rustlemania-yew-ui-cargo-target-cache:
   rustlemania-yew-ui-cache:
   rustlemania-leptos-ui-cargo-registry-cache:
   rustlemania-leptos-ui-cargo-git-cache:
-  rustlemania-leptos-ui-cargo-target-cache:
   rustlemania-leptos-ui-cache:
   rustlemania-bot-cargo-registry-cache:
   rustlemania-bot-cargo-git-cache:
-  rustlemania-bot-cargo-target-cache:
   rustlemania-bot-cache:
   prometheus_data:
   grafana_data:

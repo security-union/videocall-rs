@@ -7,7 +7,7 @@ fullnameOverride: ""
 
 replicaCount: 1
 image:
-  repository: securityunion/rustlemania-api
+  repository: securityunion/videocall-media-server
   pullPolicy: Always
   tag: high-availability-cf63fcce
 env:
@@ -19,10 +19,6 @@ env:
     value: https://rustlemania.com
   - name: NATS_URL
     value: nats:4222
-  - name: DATABASE_ENABLED
-    value: "false"
-  - name: DATABASE_URL
-    value: abc
   - name: TOKIO_WORKER_THREADS
     value: "1"  # Default for WebSocket services - adjust per region as needed
 resources:

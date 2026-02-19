@@ -24,8 +24,8 @@
 use log::error;
 use protobuf::Message;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::Callback;
 use wasm_bindgen::JsValue;
-use yew::prelude::Callback;
 
 #[derive(Clone)]
 pub struct ConnectOptions {

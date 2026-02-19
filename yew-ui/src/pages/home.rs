@@ -21,6 +21,7 @@ use yew::prelude::*;
 use yew_router::prelude::*;
 
 use crate::components::browser_compatibility::BrowserCompatibility;
+use crate::components::meetings_list::MeetingsList;
 use crate::context::{
     is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
 };
@@ -36,8 +37,8 @@ pub fn home() -> Html {
     let username_ref = use_node_ref();
     let meeting_id_ref = use_node_ref();
 
-    // Tab state for features section
-    let active_tab = use_state(|| 0);
+    // Track meeting ID value for enabling/disabling the submit button
+    let meeting_id_value = use_state(String::new);
 
     let username_ctx = use_context::<UsernameCtx>().expect("Username context missing");
 
@@ -88,13 +89,6 @@ pub fn home() -> Html {
         let _ = window.open_with_url("https://github.com/security-union/videocall-rs");
     });
 
-    let set_active_tab = {
-        let active_tab = active_tab.clone();
-        Callback::from(move |tab: usize| {
-            active_tab.set(tab);
-        })
-    };
-
     fn generate_meeting_id() -> String {
         let millis = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -144,14 +138,13 @@ pub fn home() -> Html {
 
             <div class="hero-content">
                 <h1 class="hero-title text-center">{ "videocall.rs" }</h1>
-                <h2 class="hero-subtitle text-center text-xl mb-6">{ "Video calls with anyone, anywhere" }</h2>
-
-                // Tech stack badges
-                <div class="flex justify-center items-center gap-6 mb-8" style="margin-top:1em">
-                    <div class="tech-badge hover:scale-110 transition-transform">{"Rust"}</div>
-                    <div class="tech-badge hover:scale-110 transition-transform">{"WebTransport"}</div>
-                    <div class="tech-badge hover:scale-110 transition-transform">{"WASM"}</div>
-                </div>
+                <p class="hero-tagline text-center">
+                    {"Built with Rust"}
+                    <span class="tagline-dot">{" · "}</span>
+                    {"WebTransport"}
+                    <span class="tagline-dot">{" · "}</span>
+                    {"WASM"}
+                </p>
 
                 <div class="content-separator"></div>
 
@@ -181,87 +174,57 @@ pub fn home() -> Html {
                                 class={TEXT_INPUT_CLASSES}
                                 type="text"
                                 placeholder="Enter meeting code"
-                                ref={meeting_id_ref}
+                                ref={meeting_id_ref.clone()}
                                 required={true}
                                 pattern="^[a-zA-Z0-9_]*$"
+                                oninput={
+                                    let meeting_id_value = meeting_id_value.clone();
+                                    Callback::from(move |e: InputEvent| {
+                                        let input: HtmlInputElement = e.target_unchecked_into();
+                                        meeting_id_value.set(input.value());
+                                    })
+                                }
                             />
                             <p class="text-sm text-foreground-subtle mt-2 ml-1">{ "Characters allowed: a-z, A-Z, 0-9, and _" }</p>
                         </div>
 
-                        <div class="mt-8">
-                            <button type="submit" class="btn-apple btn-primary w-full flex items-center justify-center gap-2">
-                                <span class="text-lg">{ "Join Meeting" }</span>
-                                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M5 12h14"></path>
-                                    <path d="m12 5 7 7-7 7"></path>
-                                </svg>
-                            </button>
-                        </div>
+                        {
+                            if !meeting_id_value.is_empty() {
+                                html! {
+                                    <div class="mt-4">
+                                        <button type="submit" class="btn-apple btn-primary w-full">
+                                            <span class="text-lg">{ "Start or Join Meeting" }</span>
+                                        </button>
+                                    </div>
+                                }
+                            } else {
+                                html! {}
+                            }
+                        }
 
                         <div class="mt-2">
                             <button type="button" class="btn-apple btn-secondary w-full flex items-center justify-center gap-2" onclick={create_meeting.clone()}>
-                                <span class="text-lg">{"Create New Meeting"}</span>
+                                <span class="text-lg">{"Create a New Meeting ID"}</span>
                             </button>
                         </div>
+
+                        // Active meetings list
+                        <MeetingsList on_select_meeting={
+                            let meeting_id_ref = meeting_id_ref.clone();
+                            let meeting_id_value = meeting_id_value.clone();
+                            Callback::from(move |meeting_id: String| {
+                                if let Some(input) = meeting_id_ref.cast::<HtmlInputElement>() {
+                                    input.set_value(&meeting_id);
+                                }
+                                meeting_id_value.set(meeting_id);
+                            })
+                        } />
                     </div>
                 </form>
 
-                <p class="text-white/60 text-sm mb-3 text-center">{"Secure, simple video meetings"}</p>
-
                 <div class="content-separator"></div>
 
-                <h3 class="text-center text-lg font-medium mb-6 text-white/70">{"Developer Information"}</h3>
-
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-8" style="margin-top:1em">
-                    <div>
-                        // Features section
-                        <div class="features-container mb-6">
-                            <div class="features-tabs">
-                                <button
-                                    class={if *active_tab == 0 { "feature-tab active" } else { "feature-tab" }}
-                                    onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(0))}
-                                >
-                                    {"Secure"}
-                                </button>
-                                <button
-                                    class={if *active_tab == 1 { "feature-tab active" } else { "feature-tab" }}
-                                    onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(1))}
-                                >
-                                    {"Fast"}
-                                </button>
-                                <button
-                                    class={if *active_tab == 2 { "feature-tab active" } else { "feature-tab" }}
-                                    onclick={let cb = set_active_tab.clone(); Callback::from(move |_| cb.emit(2))}
-                                >
-                                    {"Open Source"}
-                                </button>
-                            </div>
-                            <div class="feature-content">
-                                {match *active_tab {
-                                    0 => html! {
-                                        <>
-                                            <h3 class="feature-title">{"Simple"}</h3>
-                                            <p class="feature-description">{"No SFU's, no NAT traversal, no complicated setup. Just a simple, secure, and fast video calls via WebTransport."}</p>
-                                        </>
-                                    },
-                                    1 => html! {
-                                        <>
-                                            <h3 class="feature-title">{"High Performance"}</h3>
-                                            <p class="feature-description">{"Leveraging Rust's zero-cost abstractions and WebAssembly for maximum efficiency. Optimized WebTransport implementation with low latency for smooth video calls."}</p>
-                                        </>
-                                    },
-                                    2 => html! {
-                                        <>
-                                            <h3 class="feature-title">{"100% Open Source"}</h3>
-                                            <p class="feature-description">{"Fully transparent codebase under permissive licensing. Active community of contributors. Audit the code yourself - no black boxes or proprietary elements."}</p>
-                                        </>
-                                    },
-                                    _ => html! {}
-                                }}
-                            </div>
-                        </div>
-                    </div>
-
                     <div>
                         // Developer call-to-action
                         <button

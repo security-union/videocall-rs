@@ -27,6 +27,7 @@ pub mod buffer_level_filter;
 pub mod codec;
 pub mod delay_manager;
 pub mod error;
+pub mod expand;
 pub mod histogram;
 pub mod neteq;
 pub mod packet;

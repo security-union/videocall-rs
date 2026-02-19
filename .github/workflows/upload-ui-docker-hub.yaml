@@ -1,13 +1,12 @@
 name: Publish UI to Docker image
 
 on:
-  # pull_request:
-  #   paths:
-  #     - '*'
+  workflow_dispatch:
   push:
     branches:
       - main
       - add-auth
+      - feature/meeting-backend-api
     paths:
       - 'yew-ui/**'
       - 'videocall-types/**'
@@ -18,7 +17,8 @@ on:
       - Dockerfile.yew
       - nginx.conf
       - docker/start-yew.sh
-  workflow_dispatch:
+      - flake.nix
+      - flake.lock
 
 jobs:
   push_to_registry:
@@ -37,11 +37,11 @@ jobs:
       
       - name: Extract SHA
         id: extract_sha
-        run: echo "::set-output name=sha8::$(echo ${GITHUB_SHA::8})"
+        run: echo "sha8=$(echo ${GITHUB_SHA::8})" >> "$GITHUB_OUTPUT"
 
       - name: Extract branch name
         id: extract_branch
-        run: echo "::set-output name=branch::${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+        run: echo "branch=$(echo ${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}} | sed 's/\//-/g')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push  UI Docker image
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671
@@ -50,5 +50,5 @@ jobs:
           file: Dockerfile.yew
           push: true
           tags: |
-            securityunion/rustlemania-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
-            securityunion/rustlemania-ui:latest
+            securityunion/videocall-web-ui:${{ steps.extract_branch.outputs.branch }}-${{ steps.extract_sha.outputs.sha8 }}
+            securityunion/videocall-web-ui:latest

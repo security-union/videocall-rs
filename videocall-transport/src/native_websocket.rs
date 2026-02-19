@@ -114,9 +114,7 @@ impl NativeWebSocketClient {
     /// * `url` — Full WebSocket URL, e.g. `"wss://host:port/lobby/user/room"`
     ///   or `"ws://host:port/lobby/user/room"` for unencrypted connections.
     pub async fn connect(url: &str) -> Result<(Self, mpsc::Receiver<Vec<u8>>)> {
-        Self::try_connect(url)
-            .await
-            .map_err(|e| anyhow!("{e}"))
+        Self::try_connect(url).await.map_err(|e| anyhow!("{e}"))
     }
 
     /// Connect to a WebSocket server, returning a typed error on failure.
@@ -160,10 +158,7 @@ impl NativeWebSocketClient {
                     )),
                 })?;
 
-        info!(
-            "WebSocket connected to {url} (HTTP {})",
-            response.status()
-        );
+        info!("WebSocket connected to {url} (HTTP {})", response.status());
 
         Ok(Self::setup_streams(ws_stream))
     }

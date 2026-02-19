@@ -28,15 +28,15 @@
 //! The correct implementation is selected at compile time via `cfg(target_arch = "wasm32")`,
 //! following the same pattern used by `videocall-codecs` and `neteq`.
 
-#[cfg(target_arch = "wasm32")]
-mod web;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
-
 #[cfg(target_arch = "wasm32")]
-pub use web::*;
+mod web;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
+#[cfg(target_arch = "wasm32")]
+pub use web::*;
 
 /// The error type used for connection failures.
 ///

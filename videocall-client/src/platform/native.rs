@@ -158,6 +158,9 @@ mod tests {
 
         // Give the spawned task time to run
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(flag.load(Ordering::Relaxed), "spawned future should have run");
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "spawned future should have run"
+        );
     }
 }

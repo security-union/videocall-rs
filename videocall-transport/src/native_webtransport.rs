@@ -70,23 +70,18 @@ impl NativeWebTransportClient {
     /// # Arguments
     /// * `url` — Full WebTransport URL (e.g. `https://host:port/lobby/user/room`)
     /// * `insecure` — If `true`, skip TLS certificate verification (testing only!)
-    pub async fn connect(
-        url: &str,
-        insecure: bool,
-    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>)> {
+    pub async fn connect(url: &str, insecure: bool) -> Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         info!("NativeWebTransport connecting to {url}");
 
         let client = if insecure {
             warn!("TLS certificate verification disabled (insecure mode)");
-            unsafe {
-                web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
-            }
+            unsafe { web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()? }
         } else {
             web_transport_quinn::ClientBuilder::new().with_system_roots()?
         };
 
-        let parsed_url = Url::parse(url)
-            .map_err(|e| anyhow!("Invalid WebTransport URL '{url}': {e}"))?;
+        let parsed_url =
+            Url::parse(url).map_err(|e| anyhow!("Invalid WebTransport URL '{url}': {e}"))?;
 
         let session = client.connect(parsed_url).await?;
         info!("WebTransport session established to {url}");

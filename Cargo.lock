@@ -844,18 +844,18 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
-version = "0.72.1"
+version = "0.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
 dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash 2.1.1",
+ "rustc-hash 1.1.0",
  "shlex",
  "syn 2.0.111",
 ]
@@ -943,7 +943,7 @@ checksum = "cfa8873f51c92e232f9bac4065cddef41b714152812bfc5f7672ba16d6ef8cd9"
 
 [[package]]
 name = "bot"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1485,11 +1485,11 @@ dependencies = [
 
 [[package]]
 name = "coreaudio-sys"
-version = "0.2.17"
+version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ceec7a6067e62d6f931a2baf6f3a751f4a892595bcec1461a3c94ef9949864b6"
+checksum = "2ce857aa0b77d77287acc1ac3e37a05a8c95a2af3647d23b15f263bdaeb7562b"
 dependencies = [
- "bindgen 0.72.1",
+ "bindgen 0.70.1",
 ]
 
 [[package]]
@@ -3355,15 +3355,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3933,7 +3924,7 @@ dependencies = [
 
 [[package]]
 name = "neteq"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "axum 0.7.9",
  "clap",
@@ -7143,7 +7134,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "3.0.6"
+version = "3.0.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -7165,7 +7156,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "4.0.2"
+version = "4.0.3"
 dependencies = [
  "aes",
  "anyhow",
@@ -7203,7 +7194,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-codecs"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "approx",
@@ -7330,7 +7321,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7355,7 +7346,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "futures",
@@ -7387,7 +7378,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-ui"
-version = "1.1.38"
+version = "1.1.39"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",

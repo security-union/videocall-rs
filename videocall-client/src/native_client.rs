@@ -136,9 +136,7 @@ impl NativeVideoCallClient {
 
         let client = if self.options.insecure {
             warn!("TLS certificate verification disabled (insecure mode)");
-            unsafe {
-                web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()?
-            }
+            unsafe { web_transport_quinn::ClientBuilder::new().with_no_certificate_verification()? }
         } else {
             web_transport_quinn::ClientBuilder::new().with_system_roots()?
         };
@@ -166,10 +164,7 @@ impl NativeVideoCallClient {
                     break;
                 }
                 if let Err(e) = Self::send_via_session(&session_send, data).await {
-                    warn!(
-                        "Failed to send packet for {}: {}",
-                        user_id_send, e
-                    );
+                    warn!("Failed to send packet for {}: {}", user_id_send, e);
                 }
             }
             debug!("Send loop stopped for {}", user_id_send);
@@ -252,10 +247,7 @@ impl NativeVideoCallClient {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    async fn send_via_session(
-        session: &web_transport_quinn::Session,
-        data: Vec<u8>,
-    ) -> Result<()> {
+    async fn send_via_session(session: &web_transport_quinn::Session, data: Vec<u8>) -> Result<()> {
         let mut stream = session.open_uni().await?;
         stream.write_all(&data).await?;
         stream.finish()?;
@@ -277,7 +269,9 @@ impl NativeVideoCallClient {
 
         let data = packet.write_to_bytes()?;
         if let Some(tx) = &self.packet_tx {
-            tx.send(data).await.map_err(|e| anyhow!("Send error: {e}"))?;
+            tx.send(data)
+                .await
+                .map_err(|e| anyhow!("Send error: {e}"))?;
         }
         info!("Sent connection packet for '{}'", self.options.userid);
         Ok(())
@@ -378,10 +372,7 @@ impl NativeVideoCallClient {
                                     }
                                 }
                                 Err(e) => {
-                                    debug!(
-                                        "Error reading inbound stream for {}: {}",
-                                        user_id, e
-                                    );
+                                    debug!("Error reading inbound stream for {}: {}", user_id, e);
                                 }
                             }
                         });

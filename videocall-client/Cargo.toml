@@ -1,6 +1,6 @@
 [package]
 name = "videocall-client"
-version = "4.0.2"
+version = "4.0.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform video conferencing client for videocall.rs, supporting WebTransport and WebSocket on both WASM and native targets."
@@ -49,9 +49,9 @@ url = { version = "2.4.1", optional = true }
 web-transport-quinn = { workspace = true, optional = true }
 
 # === Conditional crate dependencies ===
-videocall-transport = { path = "../videocall-transport", version = "0.1.0", optional = true }
-videocall-codecs = { path = "../videocall-codecs", version = "0.1.12", optional = true }
-neteq = { path = "../neteq", version = "0.8.2", optional = true, default-features = false }
+videocall-transport = { path = "../videocall-transport", version = "0.1.1", optional = true }
+videocall-codecs = { path = "../videocall-codecs", version = "0.1.13", optional = true }
+neteq = { path = "../neteq", version = "0.8.3", optional = true, default-features = false }
 
 [features]
 default = []
@@ -167,4 +167,6 @@ optional = true
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3.20"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1.28.1", features = ["full", "test-util"] }

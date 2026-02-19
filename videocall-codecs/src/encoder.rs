@@ -188,11 +188,7 @@ impl VideoEncoderBuilder {
                 vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int,
                 4,
             );
-            vpx_codec_control_(
-                &mut ctx,
-                vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int,
-                1,
-            );
+            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int, 1);
             vpx_codec_control_(
                 &mut ctx,
                 vp8e_enc_control_id::VP9E_SET_FRAME_PARALLEL_DECODING as c_int,

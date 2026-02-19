@@ -119,4 +119,4 @@ pub use videocall_types::Callback;
 mod native_client;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native_client::{NativeVideoCallClient, NativeClientOptions};
+pub use native_client::{NativeClientOptions, NativeVideoCallClient};

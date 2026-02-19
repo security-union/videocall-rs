@@ -1,6 +1,6 @@
 [package]
 name = "videocall-cli"
-version = "3.0.6"
+version = "3.0.7"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -35,9 +35,9 @@ cpal = "0.15.2"
 opus = "0.3.0"
 image = "0.25.5"
 env-libvpx-sys = { version = "5.1.3", features=["generate"] }
-videocall-codecs = { path = "../videocall-codecs", version = "0.1.12" }
+videocall-codecs = { path = "../videocall-codecs", version = "0.1.13" }
 videocall-nokhwa = { path = "nokhwa", version = "0.10.9", features = ["input-native", "output-threaded"] }
-videocall-client = { path = "../videocall-client", version = "4.0.2", features = ["native"] }
+videocall-client = { path = "../videocall-client", version = "4.0.3", features = ["native"] }
 
 [dependencies.videocall-types]
 path = "../videocall-types"

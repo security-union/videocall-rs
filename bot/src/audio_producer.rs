@@ -48,9 +48,7 @@ impl AudioProducer {
         let user_id_clone = user_id.clone();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                Self::audio_loop(user_id_clone, audio_data, client, quit_clone).await
-            {
+            if let Err(e) = Self::audio_loop(user_id_clone, audio_data, client, quit_clone).await {
                 error!("Audio producer error: {}", e);
             }
         });

@@ -123,10 +123,7 @@ mod tests {
 
         let bytes = wrapper.write_to_bytes().unwrap();
         let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
-        assert_eq!(
-            parsed.packet_type.enum_value().unwrap(),
-            PacketType::MEDIA
-        );
+        assert_eq!(parsed.packet_type.enum_value().unwrap(), PacketType::MEDIA);
         assert_eq!(parsed.email, "user");
 
         // Verify inner packet

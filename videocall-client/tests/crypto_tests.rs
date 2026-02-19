@@ -31,7 +31,10 @@ mod tests {
         let aes = Aes128State::new(true);
         let plaintext = b"hello world";
         let ciphertext = aes.encrypt(plaintext).unwrap();
-        assert_ne!(&ciphertext, plaintext, "Ciphertext should differ from plaintext");
+        assert_ne!(
+            &ciphertext, plaintext,
+            "Ciphertext should differ from plaintext"
+        );
         let decrypted = aes.decrypt(&ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
     }
@@ -50,7 +53,10 @@ mod tests {
         let aes = Aes128State::new(false);
         let data = b"plaintext passes through";
         let encrypted = aes.encrypt(data).unwrap();
-        assert_eq!(&encrypted, data, "Disabled AES should pass through data unchanged");
+        assert_eq!(
+            &encrypted, data,
+            "Disabled AES should pass through data unchanged"
+        );
         let decrypted = aes.decrypt(&encrypted).unwrap();
         assert_eq!(&decrypted, data);
     }
@@ -79,7 +85,10 @@ mod tests {
         let plaintext = b"deterministic keys";
         let ciphertext = aes1.encrypt(plaintext).unwrap();
         let decrypted = aes2.decrypt(&ciphertext).unwrap();
-        assert_eq!(decrypted, plaintext, "Same key/IV should produce same result");
+        assert_eq!(
+            decrypted, plaintext,
+            "Same key/IV should produce same result"
+        );
     }
 
     #[test]

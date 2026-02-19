@@ -16,7 +16,6 @@
  * conditions.
  */
 
-use videocall_codecs::encoder::VideoEncoderBuilder;
 use image::imageops::FilterType;
 use image::{ImageBuffer, ImageReader, Rgb};
 use protobuf::Message;
@@ -26,6 +25,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 use videocall_client::NativeVideoCallClient;
+use videocall_codecs::encoder::VideoEncoderBuilder;
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetadata};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;

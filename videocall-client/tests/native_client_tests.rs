@@ -50,7 +50,10 @@ mod tests {
     #[test]
     fn test_client_not_connected_initially() {
         let client = NativeVideoCallClient::new(create_test_options());
-        assert!(!client.is_connected(), "Client should not be connected before connect()");
+        assert!(
+            !client.is_connected(),
+            "Client should not be connected before connect()"
+        );
     }
 
     #[test]
@@ -58,7 +61,10 @@ mod tests {
         let client = NativeVideoCallClient::new(create_test_options());
         let packet = videocall_types::protos::packet_wrapper::PacketWrapper::default();
         let result = client.send_packet(packet);
-        assert!(result.is_err(), "send_packet should fail when not connected");
+        assert!(
+            result.is_err(),
+            "send_packet should fail when not connected"
+        );
     }
 
     #[test]
@@ -95,7 +101,10 @@ mod tests {
         let mut client = NativeVideoCallClient::new(create_test_options());
         // Should not error even when not connected
         let result = client.disconnect();
-        assert!(result.is_ok(), "disconnect should succeed even when not connected");
+        assert!(
+            result.is_ok(),
+            "disconnect should succeed even when not connected"
+        );
         assert!(!client.is_connected());
     }
 
@@ -179,7 +188,10 @@ mod tests {
         });
 
         let result = client.connect().await;
-        assert!(result.is_err(), "connect should fail with unreachable server");
+        assert!(
+            result.is_err(),
+            "connect should fail with unreachable server"
+        );
         assert!(!client.is_connected());
     }
 }

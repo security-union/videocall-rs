@@ -60,18 +60,13 @@ mod websocket_tests {
 
     #[tokio::test]
     async fn test_connect_fails_with_unreachable_server() {
-        let result =
-            NativeWebSocketClient::connect("ws://127.0.0.1:1/lobby/test/room").await;
-        assert!(
-            result.is_err(),
-            "Should fail when server is unreachable"
-        );
+        let result = NativeWebSocketClient::connect("ws://127.0.0.1:1/lobby/test/room").await;
+        assert!(result.is_err(), "Should fail when server is unreachable");
     }
 
     #[tokio::test]
     async fn test_connect_fails_with_bad_scheme() {
-        let result =
-            NativeWebSocketClient::connect("ftp://localhost:8080/lobby/test/room").await;
+        let result = NativeWebSocketClient::connect("ftp://localhost:8080/lobby/test/room").await;
         assert!(result.is_err(), "Should fail with non-ws scheme");
     }
 
@@ -92,19 +87,15 @@ mod websocket_tests {
     #[tokio::test]
     #[ignore]
     async fn test_connect_send_close_roundtrip() {
-        let (client, _rx) = NativeWebSocketClient::connect(
-            "ws://localhost:8080/lobby/test-user/test-room",
-        )
-        .await
-        .expect("Failed to connect");
+        let (client, _rx) =
+            NativeWebSocketClient::connect("ws://localhost:8080/lobby/test-user/test-room")
+                .await
+                .expect("Failed to connect");
 
         assert!(client.is_connected());
 
         // Send some binary data
-        client
-            .send(vec![1, 2, 3, 4])
-            .await
-            .expect("Failed to send");
+        client.send(vec![1, 2, 3, 4]).await.expect("Failed to send");
 
         // Gracefully close
         client.close().await.expect("Failed to close");

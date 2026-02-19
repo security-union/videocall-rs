@@ -20,10 +20,10 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
-    use videocall_client::platform::{self, ConnectionError, IntervalHandle};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+    use videocall_client::platform::{self, ConnectionError, IntervalHandle};
 
     #[test]
     fn test_now_ms_is_monotonic() {
@@ -51,7 +51,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(35)).await;
         let count = counter.load(Ordering::Relaxed);
-        assert!(count >= 3, "Expected at least 3 ticks in 35ms with 5ms interval, got {count}");
+        assert!(
+            count >= 3,
+            "Expected at least 3 ticks in 35ms with 5ms interval, got {count}"
+        );
     }
 
     #[tokio::test]

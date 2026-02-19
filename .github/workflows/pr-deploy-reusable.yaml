@@ -52,71 +52,70 @@ jobs:
           helm repo add nats https://nats-io.github.io/k8s/helm/charts/
           helm repo update
 
-      - name: Check capacity
-        id: capacity
+      - name: Check for running undeploy workflows
+        id: check-undeploy
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const { exec } = require('child_process');
-            const util = require('util');
-            const execAsync = util.promisify(exec);
+            const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'pr-undeploy.yaml',
+              status: 'in_progress',
+              per_page: 10
+            });
 
-            const prNum = '${{ inputs.pr_number }}';
-            const namespace = `preview-${prNum}`;
-            const maxPreviews = 3;
+            const hasRunning = runs.total_count > 0;
+            console.log(`Found ${runs.total_count} undeploy workflow(s) in progress`);
+            core.setOutput('has_running_undeploys', hasRunning ? 'true' : 'false');
+            core.setOutput('undeploy_count', runs.total_count);
 
-            // Check if this PR already has a deployment (redeployment scenario)
-            try {
-              await execAsync(`kubectl get namespace ${namespace}`);
-              console.log(`✅ Redeploying existing preview environment for PR #${prNum}`);
-              core.setOutput('capacity_exceeded', 'false');
-              return;
-            } catch (e) {
-              // Namespace doesn't exist, continue with capacity check
-            }
+      - name: Check capacity
+        id: capacity
+        run: |
+          PR_NUM=${{ inputs.pr_number }}
+          NAMESPACE="preview-${PR_NUM}"
+          PREVIEW_COUNT=$(kubectl get namespaces -l app=preview --no-headers 2>/dev/null | wc -l)
+          MAX_PREVIEWS=3
 
-            // Count active preview namespaces
-            const { stdout } = await execAsync(`kubectl get namespaces -l app=preview --no-headers 2>/dev/null | wc -l`);
-            let previewCount = parseInt(stdout.trim());
+          echo "Current preview environments: $PREVIEW_COUNT"
+          echo "Maximum allowed: $MAX_PREVIEWS"
 
-            console.log(`Current preview environments: ${previewCount}`);
-            console.log(`Maximum allowed: ${maxPreviews}`);
+          # Check if this PR already has a deployment (redeployment scenario)
+          if kubectl get namespace ${NAMESPACE} >/dev/null 2>&1; then
+            echo "✅ Redeploying existing preview environment for PR #${PR_NUM}"
+            echo "capacity_exceeded=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-            if (previewCount >= maxPreviews) {
-              // Check if any undeploy workflows are currently running
-              const { data: runs } = await github.rest.actions.listWorkflowRunsForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: 'pr-undeploy.yaml',
-                status: 'in_progress',
-                per_page: 10
-              });
+          # If capacity reached but undeploys are running, wait and re-check
+          if [ "$PREVIEW_COUNT" -ge "$MAX_PREVIEWS" ] && [ "${{ steps.check-undeploy.outputs.has_running_undeploys }}" = "true" ]; then
+            echo "⏳ Capacity full but ${{ steps.check-undeploy.outputs.undeploy_count }} undeploy(s) in progress. Waiting 30 seconds..."
+            sleep 30
 
-              if (runs.total_count > 0) {
-                console.log(`⏳ Found ${runs.total_count} undeploy workflow(s) in progress. Waiting 30 seconds...`);
-                await new Promise(resolve => setTimeout(resolve, 30000));
+            # Re-check capacity
+            PREVIEW_COUNT=$(kubectl get namespaces -l app=preview --no-headers 2>/dev/null | wc -l)
+            echo "Rechecked capacity: $PREVIEW_COUNT/$MAX_PREVIEWS"
+          fi
 
-                // Re-check capacity after waiting
-                const { stdout: newStdout } = await execAsync(`kubectl get namespaces -l app=preview --no-headers 2>/dev/null | wc -l`);
-                previewCount = parseInt(newStdout.trim());
-                console.log(`Rechecked capacity: ${previewCount}/${maxPreviews}`);
-              }
-            }
+          # Final capacity check
+          if [ "$PREVIEW_COUNT" -ge "$MAX_PREVIEWS" ]; then
+            echo "❌ Maximum preview capacity reached ($MAX_PREVIEWS)"
+            echo "capacity_exceeded=true" >> $GITHUB_OUTPUT
 
-            if (previewCount >= maxPreviews) {
-              console.log(`❌ Maximum preview capacity reached (${maxPreviews})`);
+            echo "Active previews:"
+            kubectl get namespaces -l app=preview -o custom-columns=NAME:.metadata.name,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp --no-headers
 
-              // Get active preview PRs
-              const { stdout: prStdout } = await execAsync(`kubectl get namespaces -l app=preview -o jsonpath='{range .items[*]}{.metadata.labels.pr}{"\\n"}{end}'`);
-              const prNumbers = prStdout.trim().split('\n').filter(n => n).sort((a, b) => parseInt(a) - parseInt(b));
-
-              core.setOutput('capacity_exceeded', 'true');
-              core.setOutput('pr_numbers', prNumbers.join('\n'));
-            } else {
-              console.log(`✅ Capacity available (${previewCount}/${maxPreviews})`);
-              core.setOutput('capacity_exceeded', 'false');
-            }
+            # Get PR numbers for error message
+            PR_NUMBERS=$(kubectl get namespaces -l app=preview -o jsonpath='{range .items[*]}{.metadata.labels.pr}{"\n"}{end}' | sort -n)
+            echo "pr_numbers<<EOF" >> $GITHUB_OUTPUT
+            echo "$PR_NUMBERS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Capacity available ($PREVIEW_COUNT/$MAX_PREVIEWS)"
+            echo "capacity_exceeded=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Post capacity error comment
         if: steps.capacity.outputs.capacity_exceeded == 'true'

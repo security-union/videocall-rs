@@ -83,9 +83,9 @@ jobs:
             - Deploying NATS instance
             - Deploying 3 services: WebSocket, Meeting API, UI
 
-            ⏱️ Deployment typically takes 3-5 minutes.
+            ⏱️ Deployment typically takes 3-5 minutes, I'll post another comment when it's ready.
 
-            [View workflow run →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             })
 
       - name: Post error if unauthorized

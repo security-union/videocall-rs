@@ -85,9 +85,11 @@ jobs:
             - Creating namespace \`preview-${{ steps.get-pr.outputs.pr_number }}\`
             - Deploying services
 
-            ⏱️ Total time: ~15-20 minutes
+            ⏱️ Total time expected: ~15-20 minutes
 
-            [View workflow run →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            I'll post updates in this thread as each phase completes.
+
+            [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             })
 
       - name: Post error if unauthorized

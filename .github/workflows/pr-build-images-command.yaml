@@ -84,7 +84,7 @@ jobs:
 
             ⏱️ This typically takes 5-10 minutes. I will post another comment once the build is complete.
 
-            [View workflow run →](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
+            [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             })
 
       - name: Post error if unauthorized

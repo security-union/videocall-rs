@@ -1,6 +1,6 @@
 [package]
 name = "videocall-client"
-version = "4.0.2"
+version = "4.0.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Cross-platform video conferencing client for videocall.rs, supporting WebTransport and WebSocket on both WASM and native targets."

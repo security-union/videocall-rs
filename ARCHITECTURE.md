@@ -235,7 +235,7 @@ graph TB
 
     subgraph "Shared Libraries"
         Types["videocall-types<br/>Protobuf: PacketWrapper, MediaPacket"]
-        Transport["videocall-transport<br/>WASM: web-sys WebSocket/WebTransport<br/>Native: web-transport-quinn"]
+        Transport["videocall-transport<br/>WASM: web-sys WebSocket/WebTransport<br/>Native: web-transport-quinn + tokio-tungstenite"]
         Codecs["videocall-codecs<br/>VP9 encoder (VideoEncoderBuilder)<br/>VP9 decoder (native + WASM)"]
         NetEq["neteq<br/>Adaptive audio jitter buffer"]
         Diag["videocall-diagnostics<br/>Metrics event bus"]

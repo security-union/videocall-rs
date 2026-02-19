@@ -7366,6 +7366,7 @@ dependencies = [
  "protobuf 3.7.1",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "url",
  "videocall-types",
  "wasm-bindgen",

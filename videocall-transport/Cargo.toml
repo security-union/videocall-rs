@@ -33,6 +33,7 @@ wasm = [
 native = [
     "web-transport-quinn",
     "tokio",
+    "tokio-tungstenite",
     "protobuf",
     "url",
 ]
@@ -55,6 +56,7 @@ wasm-bindgen-futures = { workspace = true, optional = true }
 # === Native-only dependencies (optional, enabled by "native" feature) ===
 web-transport-quinn = { workspace = true, optional = true }
 tokio = { version = "1.28.1", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"], optional = true }
 protobuf = { version = "3.3.0", optional = true }
 url = { version = "2.4.1", optional = true }
 

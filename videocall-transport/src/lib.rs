@@ -37,4 +37,7 @@ pub mod webtransport;
 // ── Native transports ─────────────────────────────────────────────────────────
 
 #[cfg(feature = "native")]
+pub mod native_websocket;
+
+#[cfg(feature = "native")]
 pub mod native_webtransport;

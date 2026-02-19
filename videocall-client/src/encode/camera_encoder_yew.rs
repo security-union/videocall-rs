@@ -1,108 +1,25 @@
-/*
- * Copyright 2025 Security Union LLC
- *
- * Licensed under either of
- *
- * * Apache License, Version 2.0
- *   (http://www.apache.org/licenses/LICENSE-2.0)
- * * MIT license
- *   (http://opensource.org/licenses/MIT)
- *
- * at your option.
- *
- * Unless you explicitly state otherwise, any contribution intentionally
- * submitted for inclusion in the work by you, as defined in the Apache-2.0
- * license, shall be dual licensed as above, without any additional terms or
- * conditions.
- */
-
-use gloo_timers::future::sleep;
-use gloo_utils::window;
-use js_sys::Array;
-use js_sys::Boolean;
-use js_sys::JsString;
-use js_sys::Reflect;
-use log::error;
-use std::rc::Rc;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
-use wasm_bindgen::prelude::Closure;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::HtmlVideoElement;
-use web_sys::LatencyMode;
-use web_sys::MediaStream;
-use web_sys::MediaStreamConstraints;
-use web_sys::MediaStreamTrack;
-use web_sys::MediaStreamTrackProcessor;
-use web_sys::MediaStreamTrackProcessorInit;
-use web_sys::ReadableStreamDefaultReader;
-use web_sys::VideoEncoder;
-use web_sys::VideoEncoderConfig;
-use web_sys::VideoEncoderEncodeOptions;
-use web_sys::VideoEncoderInit;
-use web_sys::VideoFrame;
-use web_sys::VideoTrack;
-
-#[cfg(feature = "yew-compat")]
+use super::*;
 use yew::Callback;
 
-use super::super::client::VideoCallClient;
-use super::encoder_state::EncoderState;
-use super::transform::transform_video_chunk;
-
-use crate::constants::get_video_codec_string;
-use crate::diagnostics::EncoderBitrateController;
-
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
-
-// Threshold for bitrate changes, represents 20% (0.2)
-const BITRATE_CHANGE_THRESHOLD: f64 = 0.20;
-
-/// [CameraEncoder] encodes the video from a camera and sends it through a [`VideoCallClient`](crate::VideoCallClient) connection.
-///
-/// To use this struct, the caller must first create an `HtmlVideoElement` DOM node, to which the
-/// camera will be connected.
-///
-/// See also:
-/// * [MicrophoneEncoder](crate::MicrophoneEncoder)
-/// * [ScreenEncoder](crate::ScreenEncoder)
-///
-#[cfg(feature = "yew-compat")]
-pub struct CameraEncoder {
-    client: VideoCallClient,
-    video_elem_id: String,
-    state: EncoderState,
-    current_bitrate: Rc<AtomicU32>,
-    current_fps: Rc<AtomicU32>,
-    on_encoder_settings_update: Callback<String>,
-    on_error: Option<Callback<String>>,
-}
-
-#[cfg(not(feature = "yew-compat"))]
-pub struct CameraEncoder {
-    client: VideoCallClient,
-    video_elem_id: String,
-    state: EncoderState,
-    current_bitrate: Rc<AtomicU32>,
-    current_fps: Rc<AtomicU32>,
-    on_encoder_settings_update: Rc<dyn Fn(String)>,
-    on_error: Option<Rc<dyn Fn(String)>>,
-}
-
-#[cfg(not(feature = "yew-compat"))]
 impl CameraEncoder {
-    /// Construct a camera encoder (framework-agnostic version)
+    /// Construct a camera encoder, with arguments:
+    ///
+    /// * `client` - an instance of a [`VideoCallClient`](crate::VideoCallClient).  It does not need to be currently connected.
+    ///
+    /// * `video_elem_id` - the the ID of an `HtmlVideoElement` to which the camera will be connected.  It does not need to currently exist.
+    ///
+    /// * `initial_bitrate` - the initial bitrate for the encoder, in kbps.
+    ///
+    /// * `on_encoder_settings_update` - a callback that will be called when the encoder settings change.
+    ///
+    /// The encoder is created in a disabled state, [`encoder.set_enabled(true)`](Self::set_enabled) must be called before it can start encoding.
+    /// The encoder is created without a camera selected, [`encoder.select(device_id)`](Self::select) must be called before it can start encoding.
     pub fn new(
         client: VideoCallClient,
         video_elem_id: &str,
         initial_bitrate: u32,
-        on_encoder_settings_update: Box<dyn Fn(String)>,
+        on_encoder_settings_update: Callback<String>,
+        on_error: Callback<String>,
     ) -> Self {
         Self {
             client,
@@ -110,14 +27,9 @@ impl CameraEncoder {
             state: EncoderState::new(),
             current_bitrate: Rc::new(AtomicU32::new(initial_bitrate)),
             current_fps: Rc::new(AtomicU32::new(0)),
-            on_encoder_settings_update: Rc::from(on_encoder_settings_update),
-            on_error: None,
+            on_encoder_settings_update,
+            on_error: Some(on_error),
         }
-    }
-
-    /// Set the error callback
-    pub fn set_error_callback_fn(&mut self, callback: Rc<dyn Fn(String)>) {
-        self.on_error = Some(callback);
     }
 
     pub fn set_encoder_control(
@@ -137,66 +49,31 @@ impl CameraEncoder {
                 let output_wasted = encoder_control.process_diagnostics_packet(event);
                 if let Some(bitrate) = output_wasted {
                     if enabled.load(Ordering::Acquire) {
+                        // Only update if change is greater than threshold
                         let current = current_bitrate.load(Ordering::Relaxed) as f64;
                         let new = bitrate;
                         let percent_change = (new - current).abs() / current;
 
                         if percent_change > BITRATE_CHANGE_THRESHOLD {
-                            on_encoder_settings_update(format!("Bitrate: {bitrate:.2} kbps"));
+                            on_encoder_settings_update.emit(format!("Bitrate: {bitrate:.2} kbps"));
                             current_bitrate.store(bitrate as u32, Ordering::Relaxed);
                         }
                     } else {
-                        on_encoder_settings_update("Disabled".to_string());
+                        on_encoder_settings_update.emit("Disabled".to_string());
                     }
                 }
             }
         });
     }
-}
 
-// Common methods for both yew-compat and non-yew-compat modes
-impl CameraEncoder {
-    /// Gets the current encoder output frame rate
-    pub fn get_current_fps(&self) -> u32 {
-        self.current_fps.load(Ordering::Relaxed)
-    }
-
-    // The next three methods delegate to self.state
-
-    /// Enables/disables the encoder.   Returns true if the new value is different from the old value.
-    ///
-    /// The encoder starts disabled, [`encoder.set_enabled(true)`](Self::set_enabled) must be
-    /// called prior to starting encoding.
-    ///
-    /// Disabling encoding after it has started will cause it to stop.
-    pub fn set_enabled(&mut self, value: bool) -> bool {
-        self.state.set_enabled(value)
-    }
-
-    /// Selects a camera:
-    ///
-    /// * `device_id` - The value of `entry.device_id` for some entry in
-    ///   [`media_device_list.video_inputs.devices()`](crate::MediaDeviceList::video_inputs)
-    ///
-    /// The encoder starts without a camera associated,
-    /// [`encoder.selected(device_id)`](Self::select) must be called prior to starting encoding.
-    pub fn select(&mut self, device_id: String) -> bool {
-        self.state.select(device_id)
-    }
-
-    /// Stops encoding after it has been started.
-    pub fn stop(&mut self) {
-        self.state.stop()
-    }
-}
-
-#[cfg(not(feature = "yew-compat"))]
-impl CameraEncoder {
     /// Start encoding and sending the data to the client connection (if it's currently connected).
     ///
     /// This will not do anything if [`encoder.set_enabled(true)`](Self::set_enabled) has not been
     /// called, or if [`encoder.select(device_id)`](Self::select) has not been called.
     pub fn start(&mut self) {
+        // 1. Query the first device with a camera and a mic attached.
+        // 2. setup WebCodecs, in particular
+        // 3. send encoded video frames and raw audio to the server.
         let client = self.client.clone();
         let userid = client.userid().clone();
         let aes = client.aes();
@@ -216,6 +93,7 @@ impl CameraEncoder {
                 let now = window().performance().unwrap().now();
                 let chunk = web_sys::EncodedVideoChunk::from(chunk);
 
+                // Update FPS calculation
                 chunks_in_last_second += 1;
                 if now - last_chunk_time >= 1000.0 {
                     let fps = chunks_in_last_second;
@@ -225,6 +103,7 @@ impl CameraEncoder {
                     last_chunk_time = now;
                 }
 
+                // Ensure the backing buffer is large enough for this chunk
                 let byte_length = chunk.byte_length() as usize;
                 if buffer.len() < byte_length {
                     buffer.resize(byte_length, 0);
@@ -256,6 +135,8 @@ impl CameraEncoder {
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
 
+            // Wait for <video id="{video_elem_id}"> to be mounted in the DOM
+            // Yew renders components asynchronously
             let mut attempt = 0;
             let video_element = loop {
                 if let Some(doc) = window().document() {
@@ -270,6 +151,7 @@ impl CameraEncoder {
                         }
                     }
                 }
+                // Sleep a bit and retry
                 sleep(Duration::from_millis(50)).await;
                 attempt += 1;
                 if attempt > 20 {
@@ -279,7 +161,7 @@ impl CameraEncoder {
                     );
                     error!("{msg}");
                     if let Some(cb) = &on_error {
-                        cb(msg);
+                        cb.emit(msg);
                     }
                     return;
                 }
@@ -291,7 +173,7 @@ impl CameraEncoder {
                     let msg = format!("Failed to access media devices: {e:?}");
                     error!("{msg}");
                     if let Some(cb) = &on_error {
-                        cb(msg);
+                        cb.emit(msg);
                     }
                     return;
                 }
@@ -299,6 +181,7 @@ impl CameraEncoder {
             let constraints = MediaStreamConstraints::new();
             let media_info = web_sys::MediaTrackConstraints::new();
 
+            // Force exact deviceId match (avoids partial/ideal matching surprises).
             let exact = js_sys::Object::new();
             js_sys::Reflect::set(
                 &exact,
@@ -319,7 +202,7 @@ impl CameraEncoder {
                     let msg = format!("Camera access failed: {e:?}");
                     error!("{msg}");
                     if let Some(cb) = &on_error {
-                        cb(msg);
+                        cb.emit(msg);
                     }
                     return;
                 }
@@ -331,7 +214,7 @@ impl CameraEncoder {
                     let msg = format!("Failed to get camera stream: {e:?}");
                     error!("{msg}");
                     if let Some(cb) = &on_error {
-                        cb(msg);
+                        cb.emit(msg);
                     }
                     return;
                 }
@@ -342,6 +225,8 @@ impl CameraEncoder {
                 device.id(),
                 device.get_tracks().length()
             );
+            // Configure the local preview element
+            // Muted must be set before calling play() to avoid autoplay restrictions
             video_element.set_muted(true);
             video_element.set_attribute("playsinline", "true").unwrap();
             video_element.set_src_object(None);
@@ -363,6 +248,7 @@ impl CameraEncoder {
                     .unchecked_into::<VideoTrack>(),
             );
 
+            // Setup video encoder
             let video_error_handler = Closure::wrap(Box::new(move |e: JsValue| {
                 error!("error_handler error {e:?}");
             }) as Box<dyn FnMut(JsValue)>);
@@ -381,12 +267,13 @@ impl CameraEncoder {
                     let msg = format!("Failed to create video encoder: {e:?}");
                     error!("{msg}");
                     if let Some(cb) = &on_error {
-                        cb(msg);
+                        cb.emit(msg);
                     }
                     return;
                 }
             };
 
+            // Get track settings to get actual width and height
             let media_track = video_track
                 .as_ref()
                 .clone()
@@ -416,8 +303,13 @@ impl CameraEncoder {
                 .get_reader()
                 .unchecked_into::<ReadableStreamDefaultReader>();
 
+            // Start encoding video and audio.
             let mut video_frame_counter = 0;
+
+            // Cache the initial bitrate
             let mut local_bitrate: u32 = current_bitrate.load(Ordering::Relaxed) * 1000;
+
+            // Track current encoder dimensions for dynamic reconfiguration
             let mut current_encoder_width = width as u32;
             let mut current_encoder_height = height as u32;
 
@@ -433,6 +325,7 @@ impl CameraEncoder {
                     return;
                 }
 
+                // Update the bitrate if it has changed more than the threshold percentage
                 let new_current_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
                 if new_current_bitrate != local_bitrate {
                     log::info!("Updating video bitrate to {new_current_bitrate}");
@@ -449,6 +342,7 @@ impl CameraEncoder {
                             .unwrap()
                             .unchecked_into::<VideoFrame>();
 
+                        // Check for dimension changes (rotation, camera switch)
                         let frame_width = video_frame.display_width();
                         let frame_height = video_frame.display_height();
 
@@ -494,7 +388,3 @@ impl CameraEncoder {
         });
     }
 }
-
-#[cfg(feature = "yew-compat")]
-#[path = "camera_encoder_yew.rs"]
-mod yew_compat;

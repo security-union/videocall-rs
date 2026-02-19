@@ -22,30 +22,12 @@ mod microphone_encoder;
 mod screen_encoder;
 mod transform;
 
+#[cfg(not(feature = "yew-compat"))]
 use crate::VideoCallClient;
-
-#[cfg(feature = "yew-compat")]
-use yew::Callback;
 
 pub use camera_encoder::CameraEncoder;
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{ScreenEncoder, ScreenShareEvent};
-
-/// Trait to abstract over different microphone encoder implementations
-#[cfg(feature = "yew-compat")]
-pub trait MicrophoneEncoderTrait {
-    fn start(&mut self);
-    fn stop(&mut self);
-    fn select(&mut self, device_id: String) -> bool;
-    fn set_enabled(&mut self, enabled: bool) -> bool;
-    fn set_error_callback(&mut self, on_error: yew::Callback<String>);
-    fn set_encoder_control(
-        &mut self,
-        rx: futures::channel::mpsc::UnboundedReceiver<
-            videocall_types::protos::diagnostics_packet::DiagnosticsPacket,
-        >,
-    );
-}
 
 /// Trait to abstract over different microphone encoder implementations (framework-agnostic)
 #[cfg(not(feature = "yew-compat"))]
@@ -61,39 +43,6 @@ pub trait MicrophoneEncoderTrait {
             videocall_types::protos::diagnostics_packet::DiagnosticsPacket,
         >,
     );
-}
-
-// Implement trait for microphone encoder (yew-compat)
-#[cfg(feature = "yew-compat")]
-impl MicrophoneEncoderTrait for MicrophoneEncoder {
-    fn start(&mut self) {
-        self.start();
-    }
-
-    fn stop(&mut self) {
-        self.stop();
-    }
-
-    fn select(&mut self, device_id: String) -> bool {
-        self.select(device_id)
-    }
-
-    fn set_enabled(&mut self, enabled: bool) -> bool {
-        self.set_enabled(enabled)
-    }
-
-    fn set_error_callback(&mut self, on_error: yew::Callback<String>) {
-        self.set_error_callback(on_error)
-    }
-
-    fn set_encoder_control(
-        &mut self,
-        rx: futures::channel::mpsc::UnboundedReceiver<
-            videocall_types::protos::diagnostics_packet::DiagnosticsPacket,
-        >,
-    ) {
-        self.set_encoder_control(rx);
-    }
 }
 
 // Implement trait for microphone encoder (framework-agnostic)
@@ -129,22 +78,6 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
     }
 }
 
-/// Factory function to create the appropriate microphone encoder based on platform detection
-#[cfg(feature = "yew-compat")]
-pub fn create_microphone_encoder(
-    client: VideoCallClient,
-    bitrate_kbps: u32,
-    on_encoder_settings_update: Callback<String>,
-    on_error: Callback<String>,
-) -> Box<dyn MicrophoneEncoderTrait> {
-    Box::new(MicrophoneEncoder::new(
-        client,
-        bitrate_kbps,
-        on_encoder_settings_update,
-        on_error,
-    ))
-}
-
 /// Factory function to create the appropriate microphone encoder (framework-agnostic)
 #[cfg(not(feature = "yew-compat"))]
 pub fn create_microphone_encoder(
@@ -158,3 +91,10 @@ pub fn create_microphone_encoder(
     encoder.set_error_callback_fn(on_error);
     Box::new(encoder)
 }
+
+#[cfg(feature = "yew-compat")]
+#[path = "yew_compat.rs"]
+mod yew_compat_mod;
+
+#[cfg(feature = "yew-compat")]
+pub use yew_compat_mod::{MicrophoneEncoderTrait, create_microphone_encoder};

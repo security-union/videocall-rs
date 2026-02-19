@@ -1,131 +1,24 @@
-/*
- * Copyright 2025 Security Union LLC
- *
- * Licensed under either of
- *
- * * Apache License, Version 2.0
- *   (http://www.apache.org/licenses/LICENSE-2.0)
- * * MIT license
- *   (http://opensource.org/licenses/MIT)
- *
- * at your option.
- *
- * Unless you explicitly state otherwise, any contribution intentionally
- * submitted for inclusion in the work by you, as defined in the Apache-2.0
- * license, shall be dual licensed as above, without any additional terms or
- * conditions.
- */
-
-use crate::audio_worklet_codec::EncoderInitOptions;
-use crate::audio_worklet_codec::{AudioWorkletCodec, CodecMessages};
-use crate::constants::AUDIO_CHANNELS;
-use crate::constants::AUDIO_SAMPLE_RATE;
-use crate::crypto::aes::Aes128State;
-use crate::encode::encoder_state::EncoderState;
-use crate::wrappers::EncodedAudioChunkTypeWrapper;
-use crate::VideoCallClient;
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::StreamExt;
-use gloo_utils::window;
-use js_sys::Array;
-use js_sys::Boolean;
-use js_sys::Uint8Array;
-use protobuf::Message;
-use std::rc::Rc;
-use std::sync::atomic::Ordering;
-use videocall_types::protos::diagnostics_packet::DiagnosticsPacket;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
-use videocall_types::protos::{
-    media_packet::{media_packet::MediaType, AudioMetadata, MediaPacket},
-    packet_wrapper::packet_wrapper::PacketType,
-};
-use wasm_bindgen::prelude::Closure;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::JsFuture;
-use web_sys::AudioContext;
-use web_sys::AudioContextOptions;
-use web_sys::EncodedAudioChunkType;
-use web_sys::MediaStream;
-use web_sys::MediaStreamConstraints;
-use web_sys::MediaStreamTrack;
-use web_sys::MessageEvent;
-use web_time::SystemTime;
-
-#[cfg(feature = "yew-compat")]
+use super::*;
 use yew::Callback;
 
-pub fn transform_audio_chunk(
-    chunk: &Uint8Array,
-    email: &str,
-    sequence: u64,
-    aes: Rc<Aes128State>,
-) -> PacketWrapper {
-    let now_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as f64;
-    // chunk length in bytes
-
-    let media_packet: MediaPacket = MediaPacket {
-        email: email.to_owned(),
-        media_type: MediaType::AUDIO.into(),
-        frame_type: EncodedAudioChunkTypeWrapper(EncodedAudioChunkType::Key).to_string(),
-        data: chunk.to_vec(),
-        timestamp: now_ms,
-        audio_metadata: Some(AudioMetadata {
-            sequence,
-            ..Default::default()
-        })
-        .into(),
-        ..Default::default()
-    };
-    let data = media_packet.write_to_bytes().unwrap();
-    let data = aes.encrypt(&data).unwrap();
-    PacketWrapper {
-        data,
-        email: media_packet.email,
-        packet_type: PacketType::MEDIA.into(),
-        ..Default::default()
-    }
-}
-
-#[cfg(feature = "yew-compat")]
-pub struct MicrophoneEncoder {
-    client: VideoCallClient,
-    state: EncoderState,
-    _on_encoder_settings_update: Option<Callback<String>>,
-    codec: AudioWorkletCodec,
-    on_error: Option<Callback<String>>,
-}
-
-#[cfg(not(feature = "yew-compat"))]
-pub struct MicrophoneEncoder {
-    client: VideoCallClient,
-    state: EncoderState,
-    _on_encoder_settings_update: Option<Rc<dyn Fn(String)>>,
-    codec: AudioWorkletCodec,
-    on_error: Option<Rc<dyn Fn(String)>>,
-}
-
-#[cfg(not(feature = "yew-compat"))]
 impl MicrophoneEncoder {
-    pub fn new(client: VideoCallClient, _bitrate_kbps: u32) -> Self {
+    pub fn new(
+        client: VideoCallClient,
+        _bitrate_kbps: u32,
+        on_encoder_settings_update: Callback<String>,
+        on_error: Callback<String>,
+    ) -> Self {
         Self {
             client,
             state: EncoderState::new(),
-            _on_encoder_settings_update: None,
+            _on_encoder_settings_update: Some(on_encoder_settings_update),
             codec: AudioWorkletCodec::default(),
-            on_error: None,
+            on_error: Some(on_error),
         }
     }
 
-    pub fn set_error_callback_fn(&mut self, on_error: Box<dyn Fn(String)>) {
-        self.on_error = Some(Rc::from(on_error));
-    }
-
-    pub fn set_encoder_settings_callback_fn(&mut self, callback: Box<dyn Fn(String)>) {
-        self._on_encoder_settings_update = Some(Rc::from(callback));
+    pub fn set_error_callback(&mut self, on_error: Callback<String>) {
+        self.on_error = Some(on_error);
     }
 
     pub fn set_encoder_control(
@@ -228,7 +121,7 @@ impl MicrophoneEncoder {
                 Ok(md) => md,
                 Err(e) => {
                     if let Some(cb) = &on_error {
-                        cb(format!("Failed to access media devices: {e:?}"));
+                        cb.emit(format!("Failed to access media devices: {e:?}"));
                     }
                     return;
                 }
@@ -254,7 +147,7 @@ impl MicrophoneEncoder {
                 Ok(p) => p,
                 Err(e) => {
                     if let Some(cb) = &on_error {
-                        cb(format!("Microphone access failed: {e:?}"));
+                        cb.emit(format!("Microphone access failed: {e:?}"));
                     }
                     return;
                 }
@@ -263,7 +156,7 @@ impl MicrophoneEncoder {
                 Ok(ok) => ok.unchecked_into::<MediaStream>(),
                 Err(e) => {
                     if let Some(cb) = &on_error {
-                        cb(format!("Failed to get microphone stream: {e:?}"));
+                        cb.emit(format!("Failed to get microphone stream: {e:?}"));
                     }
                     return;
                 }
@@ -294,7 +187,7 @@ impl MicrophoneEncoder {
                             }
                             Err(e) => {
                                 if let Some(cb) = &on_error {
-                                    cb(format!(
+                                    cb.emit(format!(
                                         "Could not determine microphone sample rate: {e:?}"
                                     ));
                                 }
@@ -305,7 +198,7 @@ impl MicrophoneEncoder {
                 },
                 Err(e) => {
                     if let Some(cb) = &on_error {
-                        cb(format!("Failed reading microphone settings: {e:?}"));
+                        cb.emit(format!("Failed reading microphone settings: {e:?}"));
                     }
                     return;
                 }
@@ -320,7 +213,7 @@ impl MicrophoneEncoder {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     if let Some(cb) = &on_error {
-                        cb(format!("Failed to create audio context: {e:?}"));
+                        cb.emit(format!("Failed to create audio context: {e:?}"));
                     }
                     return;
                 }
@@ -339,7 +232,7 @@ impl MicrophoneEncoder {
                 Ok(node) => node,
                 Err(e) => {
                     if let Some(cb) = &on_error {
-                        cb(format!("Failed to initialize audio encoder: {e:?}"));
+                        cb.emit(format!("Failed to initialize audio encoder: {e:?}"));
                     }
                     let _ = context.close();
                     return;
@@ -365,7 +258,7 @@ impl MicrophoneEncoder {
                 Ok(s) => s,
                 Err(e) => {
                     if let Some(cb) = &on_error {
-                        cb(format!("Failed to create media source: {e:?}"));
+                        cb.emit(format!("Failed to create media source: {e:?}"));
                     }
                     let _ = context.close();
                     return;
@@ -375,7 +268,7 @@ impl MicrophoneEncoder {
                 Ok(g) => g,
                 Err(e) => {
                     if let Some(cb) = &on_error {
-                        cb(format!("Failed to create gain node: {e:?}"));
+                        cb.emit(format!("Failed to create gain node: {e:?}"));
                     }
                     let _ = context.close();
                     return;
@@ -386,7 +279,7 @@ impl MicrophoneEncoder {
                 .and_then(|n| n.connect_with_audio_node(&worklet))
             {
                 if let Some(cb) = &on_error {
-                    cb(format!("Failed to connect audio graph: {e:?}"));
+                    cb.emit(format!("Failed to connect audio graph: {e:?}"));
                 }
                 let _ = context.close();
                 return;
@@ -433,7 +326,3 @@ impl MicrophoneEncoder {
         });
     }
 }
-
-#[cfg(feature = "yew-compat")]
-#[path = "microphone_encoder_yew.rs"]
-mod yew_compat;

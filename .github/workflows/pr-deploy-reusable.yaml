@@ -74,17 +74,25 @@ jobs:
       - name: Assign deployment slot
         id: assign-slot
         run: |
+          set -e  # Exit on error
           PR_NUM=${{ inputs.pr_number }}
           MAX_SLOTS=${{ vars.PR_PREVIEW_MAX_SLOTS }}
           MAX_SLOTS=${MAX_SLOTS:-3}  # Default to 3 if not set
 
           echo "Maximum preview slots configured: ${MAX_SLOTS}"
+          echo "Looking for existing deployment of PR #${PR_NUM}..."
+
+          # Test kubectl connectivity
+          echo "Testing kubectl connectivity..."
+          kubectl version --client || { echo "kubectl not available"; exit 1; }
 
           # Check if this PR already has a slot assigned
+          echo "Checking for existing slot assignment..."
           EXISTING_SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
-            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null)
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>&1 || true)
+          echo "Existing slot query result: '${EXISTING_SLOT}'"
 
-          if [ -n "$EXISTING_SLOT" ]; then
+          if [ -n "$EXISTING_SLOT" ] && [[ ! "$EXISTING_SLOT" =~ "Error" ]]; then
             echo "✅ PR #${PR_NUM} already deployed in slot ${EXISTING_SLOT}"
             echo "SLOT=$EXISTING_SLOT" >> $GITHUB_OUTPUT
             echo "slot_assigned=true" >> $GITHUB_OUTPUT
@@ -95,11 +103,15 @@ jobs:
 
           # Find first available slot
           AVAILABLE_SLOT=""
+          echo "Checking slots 1-${MAX_SLOTS} for availability..."
           for SLOT in $(seq 1 $MAX_SLOTS); do
+            echo "Checking slot ${SLOT}..."
             if ! kubectl get namespace preview-slot-${SLOT} >/dev/null 2>&1; then
               AVAILABLE_SLOT=$SLOT
               echo "✅ Found available slot: ${SLOT}"
               break
+            else
+              echo "  Slot ${SLOT} is occupied"
             fi
           done
 

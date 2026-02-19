@@ -74,6 +74,30 @@
         yewHook = ''
           unset NO_COLOR
         '';
+
+        # Backend: native Rust servers (actix-api, meeting-api, bot)
+        backendRustMinimal = pkgs.rust-bin.stable."1.93.1".minimal;
+
+        backendRustDev = pkgs.rust-bin.stable."1.93.1".default.override {
+          extensions = [ "rust-src" "rust-analyzer" ];
+        };
+
+        backendBuildInputs = [
+          pkgs.pkg-config
+          pkgs.openssl
+          pkgs.git
+          pkgs.dbmate
+          pkgs.cmake
+          pkgs.nasm
+        ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+          pkgs.libvpx
+          pkgs.alsa-lib
+          pkgs.libclang
+        ];
+
+        backendEnv = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+        };
       in
       {
         devShells.leptos-website = pkgs.mkShell (leptosEnv // {
@@ -93,6 +117,14 @@
           nativeBuildInputs = [ yewRustDev ] ++ yewBuildInputs;
           shellHook = yewHook;
         };
+
+        devShells.backend = pkgs.mkShell (backendEnv // {
+          nativeBuildInputs = [ backendRustMinimal ] ++ backendBuildInputs;
+        });
+
+        devShells.backend-dev = pkgs.mkShell (backendEnv // {
+          nativeBuildInputs = [ backendRustDev pkgs.cargo-watch ] ++ backendBuildInputs;
+        });
 
         devShells.default = self.devShells.${system}.yew-ui-dev;
       }

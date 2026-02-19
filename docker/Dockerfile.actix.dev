@@ -1,0 +1,12 @@
+FROM nixos/nix:2.33.2
+
+ENV NIX_CONFIG="experimental-features = nix-command flakes"
+
+WORKDIR /app
+
+COPY flake.nix flake.lock ./
+
+RUN git init && git add flake.nix flake.lock
+
+# Pre-download all tools from the Nix binary cache.
+RUN nix develop .#backend-dev --command true

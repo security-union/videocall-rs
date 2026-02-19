@@ -51,13 +51,17 @@ urlencoding = "2.1"
 [dependencies.web-sys]
 version = "0.3.72"
 features = [
+    "DomTokenList",
+    "Element",
+    "HtmlAudioElement",
     "HtmlDocument",
-    "console",
+    "HtmlSelectElement",
+    "MediaDeviceInfo",
     "Navigator",
     "Storage",
     "Document",
     "Clipboard",
-    "HtmlAudioElement",
+    "console",
 ]
 
 [dev-dependencies]

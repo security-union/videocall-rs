@@ -20,13 +20,13 @@ use gloo_utils::window;
 use js_sys::{Array, Promise};
 use std::cell::RefCell;
 use std::rc::Rc;
+use videocall_types::Callback;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 #[cfg(test)]
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Event, MediaDeviceInfo, MediaDeviceKind};
-use yew::prelude::Callback;
 
 /// Trait to abstract media device functionality for testing
 pub trait MediaDevicesProvider: 'static {
@@ -207,7 +207,7 @@ impl Clone for SelectableDevices {
 ///
 /// ```no_run
 /// use videocall_client::MediaDeviceList;
-/// use yew::Callback;
+/// use videocall_client::Callback;
 ///
 /// let mut media_device_list = MediaDeviceList::new();
 /// media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {
@@ -537,7 +537,7 @@ impl MediaDeviceList {
     ///
     /// ```no_run
     /// use videocall_client::MediaDeviceList;
-    /// use yew::Callback;
+    /// use videocall_client::Callback;
     ///
     /// let mut media_device_list = MediaDeviceList::new();
     /// media_device_list.audio_inputs.on_selected = Callback::from(|device_id: String| {

@@ -2312,18 +2312,6 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gloo"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ce6f2dfa9f57f15b848efa2aade5e1850dc72986b87a2b0752d44ca08f4967"
-dependencies = [
- "gloo-console-timer",
- "gloo-events 0.1.2",
- "gloo-file 0.1.0",
- "gloo-timers 0.2.6",
-]
-
-[[package]]
-name = "gloo"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28999cda5ef6916ffd33fb4a7b87e1de633c47c0dc6d97905fee1cdaa142b94d"
@@ -2387,15 +2375,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gloo-console-timer"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b48675544b29ac03402c6dffc31a912f716e38d19f7e74b78b7e900ec3c941ea"
-dependencies = [
- "web-sys",
-]
-
-[[package]]
 name = "gloo-dialogs"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2431,18 +2410,6 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c26fb45f7c385ba980f5fa87ac677e363949e065a083722697ef1b2cc91e41"
 dependencies = [
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "gloo-file"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f9fecfe46b5dc3cc46f58e98ba580cc714f2c93860796d002eb3527a465ef49"
-dependencies = [
- "gloo-events 0.1.2",
- "js-sys",
  "wasm-bindgen",
  "web-sys",
 ]
@@ -2502,26 +2469,6 @@ dependencies = [
  "serde_urlencoded",
  "thiserror 1.0.69",
  "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "gloo-net"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9902a044653b26b99f7e3693a42f171312d9be8b26b5697bd1e43ad1f8a35e10"
-dependencies = [
- "futures-channel",
- "futures-core",
- "futures-sink",
- "gloo-utils 0.1.7",
- "js-sys",
- "pin-project",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "wasm-bindgen-futures",
  "web-sys",
 ]
 
@@ -7268,15 +7215,13 @@ dependencies = [
  "serde_json",
  "videocall-codecs",
  "videocall-diagnostics",
+ "videocall-transport",
  "videocall-types",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
  "web-time",
- "yew",
- "yew-websocket",
- "yew-webtransport",
 ]
 
 [[package]]
@@ -7432,13 +7377,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "videocall-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "gloo 0.8.1",
+ "gloo-console 0.3.0",
+ "js-sys",
+ "log",
+ "thiserror 1.0.69",
+ "videocall-types",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "videocall-types"
 version = "4.0.0"
 dependencies = [
+ "anyhow",
  "protobuf 3.7.1",
  "serde",
  "serde_json",
- "yew-websocket",
 ]
 
 [[package]]
@@ -8559,50 +8521,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.111",
-]
-
-[[package]]
-name = "yew-websocket"
-version = "1.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d75b4aa6d3a7644d649b80413f6095281c3897aeda85b5519ed12fd3de5b013"
-dependencies = [
- "anyhow",
- "futures",
- "gloo 0.8.1",
- "gloo-console 0.2.3",
- "gloo-net 0.2.6",
- "js-sys",
- "serde",
- "serde_derive",
- "serde_json",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "yew",
-]
-
-[[package]]
-name = "yew-webtransport"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07927158193ae08918f87237b93432648c08d0ccd56412c580f5a93017790af5"
-dependencies = [
- "anyhow",
- "futures",
- "futures-util",
- "gloo 0.2.1",
- "gloo-console 0.2.3",
- "js-sys",
- "serde",
- "serde_derive",
- "serde_json",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "yew",
 ]
 
 [[package]]

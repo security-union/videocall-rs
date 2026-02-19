@@ -78,14 +78,29 @@ jobs:
               'videocall-web-ui'
             ];
 
+            // Detect if owner is a user or organization
+            const owner = context.repo.owner;
+            const { data: ownerInfo } = await github.rest.users.getByUsername({
+              username: owner
+            });
+            const isOrg = ownerInfo.type === 'Organization';
+
+            console.log(`Owner "${owner}" is a ${ownerInfo.type}`);
+
             for (const packageName of packages) {
               try {
-                // Get package versions
-                const versions = await github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg({
-                  package_type: 'container',
-                  package_name: packageName,
-                  org: context.repo.owner
-                });
+                // Get package versions using appropriate API
+                const versions = isOrg
+                  ? await github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg({
+                      package_type: 'container',
+                      package_name: packageName,
+                      org: owner
+                    })
+                  : await github.rest.packages.getAllPackageVersionsForPackageOwnedByUser({
+                      package_type: 'container',
+                      package_name: packageName,
+                      username: owner
+                    });
 
                 // Find the pr-{NUM} tagged version
                 const prTag = `pr-${prNumber}`;
@@ -94,15 +109,25 @@ jobs:
                 );
 
                 if (targetVersion) {
-                  await github.rest.packages.deletePackageVersionForOrg({
-                    package_type: 'container',
-                    package_name: packageName,
-                    org: context.repo.owner,
-                    package_version_id: targetVersion.id
-                  });
+                  // Delete using appropriate API
+                  if (isOrg) {
+                    await github.rest.packages.deletePackageVersionForOrg({
+                      package_type: 'container',
+                      package_name: packageName,
+                      org: owner,
+                      package_version_id: targetVersion.id
+                    });
+                  } else {
+                    await github.rest.packages.deletePackageVersionForUser({
+                      package_type: 'container',
+                      package_name: packageName,
+                      username: owner,
+                      package_version_id: targetVersion.id
+                    });
+                  }
                   console.log(`✅ Deleted ${packageName}:${prTag}`);
                 } else {
-                  console.log(`ℹ️  Image ${packageName}:${prTag} not found (may not have been built)`);
+                  console.log(`⚠️  Image ${packageName}:${prTag} not found`);
                 }
               } catch (error) {
                 console.log(`⚠️  Failed to delete ${packageName}: ${error.message}`);

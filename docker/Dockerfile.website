@@ -1,40 +1,33 @@
-FROM rust:1.83-slim-bookworm as builder
+FROM nixos/nix:latest AS builder
 
-# Due to https://github.com/leptos-rs/cargo-leptos/issues/271
-ENV LEPTOS_HASH_FILES=false
+RUN echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
 
-RUN rustup default nightly-2024-11-01
+WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    libssl-dev \
-    pkg-config \
-    g++ \
-    git-all \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+COPY flake.nix flake.lock ./
 
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/*
+RUN nix profile install nixpkgs#git
+RUN git init && git add flake.nix flake.lock
 
-ENV LEPTOS_TAILWIND_VERSION=v3.4.17
-RUN cargo install --locked cargo-leptos@0.2.29
+# Downloads all tools from the Nix binary cache (~seconds).
+# This layer is cached by Docker as long as flake.nix/flake.lock are unchanged.
+RUN nix develop .#leptos-website --command true
 
-WORKDIR /app/leptos-website
+COPY leptos-website/ leptos-website/
+RUN git add leptos-website/
 
-COPY leptos-website .
+RUN nix develop .#leptos-website --command bash -c "\
+    cd leptos-website && \
+    npm install && \
+    cargo leptos build --release"
 
-RUN cargo install wasm-bindgen-cli@0.2.100 --locked
-RUN cargo leptos build --release
-
+# ---------------------------------------------------------------------------
 FROM debian:bookworm-slim
 
-# Copy the server binary to the /app directory
 COPY --from=builder /app/leptos-website/target/release/leptos_website /app/
-# /target/site contains our JS/WASM/CSS, etc.
 COPY --from=builder /app/leptos-website/target/site /app/site
-# Copy Cargo.toml if it's needed at runtime
 COPY --from=builder /app/leptos-website/Cargo.toml /app/
+
 WORKDIR /app
 ENV RUST_LOG="info"
 ENV LEPTOS_SITE_ADDR="0.0.0.0:8080"

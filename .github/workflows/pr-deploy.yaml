@@ -69,19 +69,21 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const maxSlots = '${{ vars.PR_PREVIEW_MAX_SLOTS }}' || '3';
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `🚀 **Deploying PR preview environment...**
+              body: `🚀 **Deploying PR preview to available slot...**
 
             Started by @${{ github.event.comment.user.login }}
 
             **Infrastructure:**
-            - Creating namespace \`preview-${{ steps.get-pr.outputs.pr_number }}\`
-            - Creating database \`preview_${{ steps.get-pr.outputs.pr_number }}\`
-            - Deploying NATS instance
-            - Deploying 3 services: WebSocket, Meeting API, UI
+            - Assigning deployment slot (1-${maxSlots} available)
+            - Creating/reusing namespace for the slot
+            - Creating/reusing database for the slot
+            - Deploying NATS, WebSocket, Meeting API, and UI
+            - Configuring Google OAuth authentication
 
             ⏱️ Deployment typically takes 3-5 minutes, I'll post another comment when it's ready.
 

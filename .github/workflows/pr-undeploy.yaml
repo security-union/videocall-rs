@@ -89,38 +89,44 @@ jobs:
         run: |
           doctl kubernetes cluster kubeconfig save videocall-us-east
 
-      - name: Check if preview exists
-        id: check-preview
+      - name: Find deployment slot
+        id: find-slot
         run: |
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
 
-          if kubectl get namespace ${NAMESPACE} >/dev/null 2>&1; then
-            echo "Preview environment exists"
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "Preview environment does not exist"
+          # Find which slot this PR is using
+          SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null)
+
+          if [ -z "$SLOT" ]; then
+            echo "PR #${PR_NUM} is not deployed"
             echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "PR #${PR_NUM} is deployed in slot ${SLOT}"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "slot=${SLOT}" >> $GITHUB_OUTPUT
           fi
 
       - name: Delete namespace
-        if: steps.check-preview.outputs.exists == 'true'
+        if: steps.find-slot.outputs.exists == 'true'
         run: |
           PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Deleting namespace: ${NAMESPACE}"
+          echo "Deleting namespace: ${NAMESPACE} (slot ${SLOT}, PR #${PR_NUM})"
           kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
 
           echo "✅ Namespace deleted (includes NATS and all services)"
+          echo "✅ Slot ${SLOT} is now available"
 
       - name: Drop postgres database
-        if: steps.check-preview.outputs.exists == 'true'
+        if: steps.find-slot.outputs.exists == 'true'
         run: |
-          PR_NUM=${{ needs.check-permissions.outputs.pr_number }}
-          DB_NAME="preview_${PR_NUM}"
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          DB_NAME="preview_slot_${SLOT}"
 
-          echo "Dropping database: ${DB_NAME}"
+          echo "Dropping database: ${DB_NAME} (slot ${SLOT})"
 
           # Get postgres password from secret
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
@@ -131,10 +137,10 @@ jobs:
               echo "⚠️  Failed to drop database, may need manual cleanup"
             }
 
-          echo "✅ Database dropped"
+          echo "✅ Database dropped for slot ${SLOT}"
 
       - name: Delete GHCR images
-        if: steps.check-preview.outputs.exists == 'true'
+        if: steps.find-slot.outputs.exists == 'true'
         continue-on-error: true
         uses: actions/github-script@v7
         with:
@@ -214,29 +220,32 @@ jobs:
             })
 
       - name: Post success comment
-        if: steps.check-preview.outputs.exists == 'true'
+        if: steps.find-slot.outputs.exists == 'true'
         uses: actions/github-script@v7
         with:
           script: |
             const prNumber = ${{ needs.check-permissions.outputs.pr_number }};
+            const slot = ${{ steps.find-slot.outputs.slot }};
             github.rest.issues.createComment({
               issue_number: prNumber,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `✅ **PR preview environment undeployed**
+              body: `✅ **Preview undeployed - slot ${slot} freed**
 
             Cleaned up by @${{ github.event.comment.user.login }}
 
             **Resources removed:**
-            - Namespace \`preview-${prNumber}\` (includes all pods and services)
-            - Database \`preview_${prNumber}\`
+            - Namespace \`preview-slot-${slot}\` (includes all pods and services)
+            - Database \`preview_slot_${slot}\`
             - GHCR images tagged \`pr-${prNumber}\`
 
-            You can redeploy by commenting \`/deploy\` again.`
+            📊 **Slot ${slot} is now available** for other PRs.
+
+            You can redeploy by commenting \`/build-and-deploy\` again.`
             })
 
       - name: Post not-found comment
-        if: steps.check-preview.outputs.exists == 'false'
+        if: steps.find-slot.outputs.exists == 'false'
         uses: actions/github-script@v7
         with:
           script: |
@@ -247,7 +256,7 @@ jobs:
               repo: context.repo.repo,
               body: `ℹ️ **No preview environment found**
 
-            There is no active preview environment for PR #${prNumber}.
+            PR #${prNumber} is not currently deployed to any slot.
 
-            To deploy one, comment \`/deploy\`.`
+            To deploy, comment \`/build-and-deploy\`.`
             })

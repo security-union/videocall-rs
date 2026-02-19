@@ -22,38 +22,44 @@ jobs:
         run: |
           doctl kubernetes cluster kubeconfig save videocall-us-east
 
-      - name: Check if preview exists
-        id: check-preview
+      - name: Find deployment slot
+        id: find-slot
         run: |
           PR_NUM=${{ github.event.pull_request.number }}
-          NAMESPACE="preview-${PR_NUM}"
 
-          if kubectl get namespace ${NAMESPACE} >/dev/null 2>&1; then
-            echo "Preview environment exists, will cleanup"
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "No preview environment found, nothing to cleanup"
+          # Find which slot this PR is using
+          SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null)
+
+          if [ -z "$SLOT" ]; then
+            echo "No preview environment found for PR #${PR_NUM}, nothing to cleanup"
             echo "exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "PR #${PR_NUM} is deployed in slot ${SLOT}, will cleanup"
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "slot=${SLOT}" >> $GITHUB_OUTPUT
           fi
 
       - name: Delete namespace
-        if: steps.check-preview.outputs.exists == 'true'
+        if: steps.find-slot.outputs.exists == 'true'
         run: |
           PR_NUM=${{ github.event.pull_request.number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Deleting namespace: ${NAMESPACE}"
+          echo "Deleting namespace: ${NAMESPACE} (slot ${SLOT}, PR #${PR_NUM})"
           kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
 
           echo "✅ Namespace deleted"
+          echo "✅ Slot ${SLOT} is now available"
 
       - name: Drop postgres database
-        if: steps.check-preview.outputs.exists == 'true'
+        if: steps.find-slot.outputs.exists == 'true'
         run: |
-          PR_NUM=${{ github.event.pull_request.number }}
-          DB_NAME="preview_${PR_NUM}"
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          DB_NAME="preview_slot_${SLOT}"
 
-          echo "Dropping database: ${DB_NAME}"
+          echo "Dropping database: ${DB_NAME} (slot ${SLOT})"
 
           # Get postgres password from secret
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
@@ -64,7 +70,7 @@ jobs:
               echo "⚠️  Failed to drop database, may need manual cleanup"
             }
 
-          echo "✅ Database dropped"
+          echo "✅ Database dropped for slot ${SLOT}"
 
       - name: Delete GHCR images
         continue-on-error: true
@@ -137,11 +143,15 @@ jobs:
             console.log('✅ GHCR cleanup complete');
 
       - name: Summary
+        if: steps.find-slot.outputs.exists == 'true'
         run: |
           PR_NUM=${{ github.event.pull_request.number }}
-          echo "✅ Cleanup complete for PR #${PR_NUM}"
+          SLOT=${{ steps.find-slot.outputs.slot }}
+          echo "✅ Cleanup complete for PR #${PR_NUM} (slot ${SLOT})"
           echo ""
           echo "Removed:"
-          echo "  - Namespace preview-${PR_NUM}"
-          echo "  - Database preview_${PR_NUM}"
+          echo "  - Namespace preview-slot-${SLOT}"
+          echo "  - Database preview_slot_${SLOT}"
           echo "  - GHCR images tagged pr-${PR_NUM}"
+          echo ""
+          echo "📊 Slot ${SLOT} is now available for other PRs"

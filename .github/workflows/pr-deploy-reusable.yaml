@@ -71,77 +71,98 @@ jobs:
             core.setOutput('has_running_undeploys', hasRunning ? 'true' : 'false');
             core.setOutput('undeploy_count', runs.total_count);
 
-      - name: Check capacity
-        id: capacity
+      - name: Assign deployment slot
+        id: assign-slot
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
-          PREVIEW_COUNT=$(kubectl get namespaces -l app=preview --no-headers 2>/dev/null | wc -l)
-          MAX_PREVIEWS=3
+          MAX_SLOTS=${{ vars.PR_PREVIEW_MAX_SLOTS }}
+          MAX_SLOTS=${MAX_SLOTS:-3}  # Default to 3 if not set
 
-          echo "Current preview environments: $PREVIEW_COUNT"
-          echo "Maximum allowed: $MAX_PREVIEWS"
+          echo "Maximum preview slots configured: ${MAX_SLOTS}"
 
-          # Check if this PR already has a deployment (redeployment scenario)
-          if kubectl get namespace ${NAMESPACE} >/dev/null 2>&1; then
-            echo "✅ Redeploying existing preview environment for PR #${PR_NUM}"
-            echo "capacity_exceeded=false" >> $GITHUB_OUTPUT
+          # Check if this PR already has a slot assigned
+          EXISTING_SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null)
+
+          if [ -n "$EXISTING_SLOT" ]; then
+            echo "✅ PR #${PR_NUM} already deployed in slot ${EXISTING_SLOT}"
+            echo "SLOT=$EXISTING_SLOT" >> $GITHUB_OUTPUT
+            echo "slot_assigned=true" >> $GITHUB_OUTPUT
+            echo "is_redeployment=true" >> $GITHUB_OUTPUT
+            echo "max_slots=${MAX_SLOTS}" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          # Find first available slot
+          AVAILABLE_SLOT=""
+          for SLOT in $(seq 1 $MAX_SLOTS); do
+            if ! kubectl get namespace preview-slot-${SLOT} >/dev/null 2>&1; then
+              AVAILABLE_SLOT=$SLOT
+              echo "✅ Found available slot: ${SLOT}"
+              break
+            fi
+          done
+
           # If capacity reached but undeploys are running, wait and re-check
-          if [ "$PREVIEW_COUNT" -ge "$MAX_PREVIEWS" ] && [ "${{ steps.check-undeploy.outputs.has_running_undeploys }}" = "true" ]; then
-            echo "⏳ Capacity full but ${{ steps.check-undeploy.outputs.undeploy_count }} undeploy(s) in progress. Waiting 30 seconds..."
+          if [ -z "$AVAILABLE_SLOT" ] && [ "${{ steps.check-undeploy.outputs.has_running_undeploys }}" = "true" ]; then
+            echo "⏳ All slots full but ${{ steps.check-undeploy.outputs.undeploy_count }} undeploy(s) in progress. Waiting 30 seconds..."
             sleep 30
 
-            # Re-check capacity
-            PREVIEW_COUNT=$(kubectl get namespaces -l app=preview --no-headers 2>/dev/null | wc -l)
-            echo "Rechecked capacity: $PREVIEW_COUNT/$MAX_PREVIEWS"
+            # Re-check for available slots
+            for SLOT in 1 2 3; do
+              if ! kubectl get namespace preview-slot-${SLOT} >/dev/null 2>&1; then
+                AVAILABLE_SLOT=$SLOT
+                echo "✅ Found available slot after waiting: ${SLOT}"
+                break
+              fi
+            done
           fi
 
-          # Final capacity check
-          if [ "$PREVIEW_COUNT" -ge "$MAX_PREVIEWS" ]; then
-            echo "❌ Maximum preview capacity reached ($MAX_PREVIEWS)"
-            echo "capacity_exceeded=true" >> $GITHUB_OUTPUT
+          if [ -z "$AVAILABLE_SLOT" ]; then
+            echo "❌ All ${MAX_SLOTS} preview slots are occupied"
+            echo "slot_assigned=false" >> $GITHUB_OUTPUT
+            echo "max_slots=${MAX_SLOTS}" >> $GITHUB_OUTPUT
 
-            echo "Active previews:"
-            kubectl get namespaces -l app=preview -o custom-columns=NAME:.metadata.name,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp --no-headers
-
-            # Get PR numbers for error message
-            PR_NUMBERS=$(kubectl get namespaces -l app=preview -o jsonpath='{range .items[*]}{.metadata.labels.pr}{"\n"}{end}' | sort -n)
-            echo "pr_numbers<<EOF" >> $GITHUB_OUTPUT
-            echo "$PR_NUMBERS" >> $GITHUB_OUTPUT
+            # Get slot occupancy for error message
+            echo "slot_info<<EOF" >> $GITHUB_OUTPUT
+            kubectl get namespaces -l app=preview \
+              -o custom-columns=SLOT:.metadata.labels.slot,PR:.metadata.labels.pr,AGE:.metadata.creationTimestamp \
+              --no-headers | while read slot pr age; do
+              echo "- **Slot ${slot}**: PR #${pr} → https://pr${slot}.sandbox.videocall.rs ([undeploy](https://github.com/${{ github.repository }}/pull/${pr}#issuecomment-new))"
+            done
             echo "EOF" >> $GITHUB_OUTPUT
           else
-            echo "✅ Capacity available ($PREVIEW_COUNT/$MAX_PREVIEWS)"
-            echo "capacity_exceeded=false" >> $GITHUB_OUTPUT
+            echo "SLOT=$AVAILABLE_SLOT" >> $GITHUB_OUTPUT
+            echo "slot_assigned=true" >> $GITHUB_OUTPUT
+            echo "is_redeployment=false" >> $GITHUB_OUTPUT
+            echo "max_slots=${MAX_SLOTS}" >> $GITHUB_OUTPUT
           fi
 
       - name: Post capacity error comment
-        if: steps.capacity.outputs.capacity_exceeded == 'true'
+        if: steps.assign-slot.outputs.slot_assigned == 'false'
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const prNumbers = `${{ steps.capacity.outputs.pr_numbers }}`.trim().split('\n').filter(n => n);
-            const prLinks = prNumbers.map(num => `- PR #${num}: https://github.com/${{ github.repository }}/pull/${num} ([undeploy](https://github.com/${{ github.repository }}/pull/${num}#issuecomment-new) with \`/undeploy\`)`).join('\n');
+            const slotInfo = `${{ steps.assign-slot.outputs.slot_info }}`;
+            const maxSlots = ${{ steps.assign-slot.outputs.max_slots }};
 
             github.rest.issues.createComment({
               issue_number: ${{ inputs.pr_number }},
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `❌ **Preview capacity exceeded**
+              body: `❌ **All preview slots are in use (${maxSlots}/${maxSlots})**
 
-            Cannot deploy preview for PR #${{ inputs.pr_number }} because the maximum of 3 concurrent preview environments is already reached.
+            Cannot deploy preview for PR #${{ inputs.pr_number }} because all deployment slots are occupied.
 
-            **Active preview environments:**
-            ${prLinks}
+            **Active deployments:**
+            ${slotInfo}
 
-            **Action required:** Please undeploy one or more existing previews by commenting \`/undeploy\` on any of the PRs listed above, then try again.`
+            **Action required:** Comment \`/undeploy\` on one of the PRs above to free a slot, then try again.`
             });
 
       - name: React to comment (capacity exceeded)
-        if: steps.capacity.outputs.capacity_exceeded == 'true' && inputs.comment_id != ''
+        if: steps.assign-slot.outputs.slot_assigned == 'false' && inputs.comment_id != ''
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -154,7 +175,7 @@ jobs:
             })
 
       - name: Fail if capacity exceeded
-        if: steps.capacity.outputs.capacity_exceeded == 'true'
+        if: steps.assign-slot.outputs.slot_assigned == 'false'
         run: exit 1
 
       - name: Login to GitHub Container Registry
@@ -244,20 +265,21 @@ jobs:
       - name: Create namespace
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Creating namespace: ${NAMESPACE}"
+          echo "Creating namespace: ${NAMESPACE} for PR #${PR_NUM} in slot ${SLOT}"
           kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
-          echo "Labeling namespace"
-          kubectl label namespace ${NAMESPACE} app=preview pr=${PR_NUM} --overwrite
+          echo "Labeling namespace with slot and PR metadata"
+          kubectl label namespace ${NAMESPACE} app=preview slot=${SLOT} pr=${PR_NUM} --overwrite
 
       - name: Copy wildcard TLS certificate to preview namespace
         run: |
-          PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Copying wildcard TLS secret from default namespace..."
+          echo "Copying wildcard TLS secret to slot ${SLOT} namespace..."
           kubectl get secret sandbox-wildcard-tls -n default -o json \
             | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.selfLink, .metadata.managedFields) | .metadata.namespace = "'${NAMESPACE}'"' \
             | kubectl apply -f -
@@ -266,8 +288,8 @@ jobs:
 
       - name: Apply ResourceQuota
         run: |
-          PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
           cat <<EOF | kubectl apply -f -
           apiVersion: v1
@@ -284,22 +306,22 @@ jobs:
               pods: "10"
           EOF
 
-          echo "✅ ResourceQuota applied"
+          echo "✅ ResourceQuota applied to slot ${SLOT}"
 
       - name: Create postgres database
         run: |
-          PR_NUM=${{ inputs.pr_number }}
-          DB_NAME="preview_${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          DB_NAME="preview_slot_${SLOT}"
 
-          echo "Creating database: ${DB_NAME}"
+          echo "Creating database: ${DB_NAME} for slot ${SLOT}"
 
           # Get postgres password from secret
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
 
-          # Create database
+          # Create database (or reuse existing if slot being reassigned)
           kubectl exec -n default postgres-postgresql-0 -- \
             env PGPASSWORD="${PG_PASSWORD}" psql -U postgres -c "CREATE DATABASE ${DB_NAME};" || {
-              echo "⚠️  Database may already exist, continuing..."
+              echo "⚠️  Database already exists (slot reuse), continuing..."
             }
 
           echo "✅ Database ready: ${DB_NAME}"
@@ -307,9 +329,10 @@ jobs:
       - name: Deploy NATS
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Deploying NATS instance for preview-${PR_NUM}..."
+          echo "Deploying NATS instance for slot ${SLOT} (PR #${PR_NUM})..."
 
           # Build helm dependencies for the NATS chart
           helm dependency update helm/global/us-east/nats/
@@ -339,17 +362,18 @@ jobs:
             --set gateway.enabled=false \
             --wait --timeout 3m
 
-          echo "✅ NATS deployed"
+          echo "✅ NATS deployed to slot ${SLOT}"
 
       - name: Deploy WebSocket Server
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
           # Get postgres password
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
 
-          echo "Deploying WebSocket server..."
+          echo "Deploying WebSocket server to slot ${SLOT}..."
 
           helm upgrade --install preview-${PR_NUM}-ws helm/rustlemania-websocket/ \
             --namespace ${NAMESPACE} \
@@ -359,37 +383,42 @@ jobs:
             --set "env[0].name=NATS_URL" \
             --set "env[0].value=nats://nats-pr-${PR_NUM}.${NAMESPACE}.svc.cluster.local:4222" \
             --set "env[1].name=DATABASE_URL" \
-            --set "env[1].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_${PR_NUM}?sslmode=disable" \
+            --set "env[1].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_slot_${SLOT}?sslmode=disable" \
             --set "env[2].name=ACTIX_PORT" \
             --set-string "env[2].value=8080" \
             --set "env[3].name=RUST_LOG" \
             --set "env[3].value=info" \
             --set "env[4].name=FEATURE_MEETING_MANAGEMENT" \
             --set-string "env[4].value=false" \
-            --set "ingress.hosts[0].host=pr-${PR_NUM}-ws.sandbox.videocall.rs" \
+            --set "ingress.hosts[0].host=pr${SLOT}-ws.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=websocket-pr-${PR_NUM}" \
             --set "ingress.hosts[0].paths[0].service.port.number=8080" \
             --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}-ws.sandbox.videocall.rs" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}-ws.sandbox.videocall.rs" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-read-timeout=3600" \
             --set-string "ingress.annotations.nginx\.ingress\.kubernetes\.io/proxy-send-timeout=3600" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
-          echo "✅ WebSocket server deployed"
+          echo "✅ WebSocket server deployed to slot ${SLOT}"
 
       - name: Deploy Meeting API
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
           # Get postgres password
           PG_PASSWORD=$(kubectl get secret postgres-credentials -n default -o jsonpath='{.data.password}' | base64 -d)
 
-          echo "Deploying Meeting API..."
+          # Get OAuth credentials
+          OAUTH_CLIENT_ID=$(kubectl get secret google-oauth-credentials -n default -o jsonpath='{.data.client-id}' | base64 -d || echo "")
+          OAUTH_CLIENT_SECRET=$(kubectl get secret google-oauth-credentials -n default -o jsonpath='{.data.client-secret}' | base64 -d || echo "")
+
+          echo "Deploying Meeting API to slot ${SLOT} with OAuth enabled..."
 
           helm upgrade --install preview-${PR_NUM}-api helm/meeting-api/ \
             --namespace ${NAMESPACE} \
@@ -397,38 +426,47 @@ jobs:
             --set image.tag=pr-${PR_NUM} \
             --set fullnameOverride=api-pr-${PR_NUM} \
             --set "env[0].name=DATABASE_URL" \
-            --set "env[0].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_${PR_NUM}?sslmode=disable" \
+            --set "env[0].value=postgres://postgres:${PG_PASSWORD}@postgres-postgresql.default.svc.cluster.local:5432/preview_slot_${SLOT}?sslmode=disable" \
             --set "env[1].name=JWT_SECRET" \
-            --set "env[1].value=preview-jwt-secret-${PR_NUM}" \
+            --set "env[1].value=preview-jwt-secret-slot-${SLOT}" \
             --set "env[2].name=CORS_ALLOWED_ORIGIN" \
-            --set "env[2].value=https://pr-${PR_NUM}.sandbox.videocall.rs" \
+            --set "env[2].value=https://pr${SLOT}.sandbox.videocall.rs" \
             --set "env[3].name=COOKIE_DOMAIN" \
             --set "env[3].value=.sandbox.videocall.rs" \
             --set "env[4].name=OAUTH_ISSUER" \
-            --set "env[4].value=" \
-            --set "env[5].name=LISTEN_ADDR" \
-            --set "env[5].value=0.0.0.0:8081" \
-            --set "env[6].name=RUST_LOG" \
-            --set "env[6].value=info" \
-            --set "ingress.hosts[0].host=pr-${PR_NUM}-api.sandbox.videocall.rs" \
+            --set "env[4].value=https://accounts.google.com" \
+            --set "env[5].name=OAUTH_CLIENT_ID" \
+            --set "env[5].value=${OAUTH_CLIENT_ID}" \
+            --set "env[6].name=OAUTH_CLIENT_SECRET" \
+            --set "env[6].value=${OAUTH_CLIENT_SECRET}" \
+            --set "env[7].name=OAUTH_REDIRECT_URL" \
+            --set "env[7].value=https://pr${SLOT}-api.sandbox.videocall.rs/login/callback" \
+            --set "env[8].name=AFTER_LOGIN_URL" \
+            --set "env[8].value=https://pr${SLOT}.sandbox.videocall.rs" \
+            --set "env[9].name=LISTEN_ADDR" \
+            --set "env[9].value=0.0.0.0:8081" \
+            --set "env[10].name=RUST_LOG" \
+            --set "env[10].value=info" \
+            --set "ingress.hosts[0].host=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=api-pr-${PR_NUM}" \
             --set "ingress.hosts[0].paths[0].service.port.number=8081" \
             --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}-api.sandbox.videocall.rs" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}-api.sandbox.videocall.rs" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
-          echo "✅ Meeting API deployed"
+          echo "✅ Meeting API deployed to slot ${SLOT} with OAuth"
 
       - name: Deploy UI
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Deploying UI..."
+          echo "Deploying UI to slot ${SLOT} with OAuth enabled..."
 
           helm upgrade --install preview-${PR_NUM}-ui helm/rustlemania-ui/ \
             --namespace ${NAMESPACE} \
@@ -436,11 +474,12 @@ jobs:
             --set image.tag=pr-${PR_NUM} \
             --set fullnameOverride=ui-pr-${PR_NUM} \
             --set ingress.redirect=false \
-            --set "runtimeConfig.apiBaseUrl=https://pr-${PR_NUM}-api.sandbox.videocall.rs" \
-            --set "runtimeConfig.wsUrl=wss://pr-${PR_NUM}-ws.sandbox.videocall.rs" \
+            --set "runtimeConfig.apiBaseUrl=https://pr${SLOT}-api.sandbox.videocall.rs" \
+            --set "runtimeConfig.meetingApiBaseUrl=https://pr${SLOT}-api.sandbox.videocall.rs" \
+            --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.sandbox.videocall.rs" \
             --set "runtimeConfig.webTransportHost=" \
             --set-string "runtimeConfig.webTransportEnabled=false" \
-            --set-string "runtimeConfig.oauthEnabled=false" \
+            --set-string "runtimeConfig.oauthEnabled=true" \
             --set-string "runtimeConfig.e2eeEnabled=false" \
             --set-string "runtimeConfig.firefoxEnabled=false" \
             --set "runtimeConfig.usersAllowedToStream=" \
@@ -448,36 +487,36 @@ jobs:
             --set "runtimeConfig.audioBitrateKbps=65" \
             --set "runtimeConfig.videoBitrateKbps=1000" \
             --set "runtimeConfig.screenBitrateKbps=1000" \
-            --set "ingress.hosts[0].host=pr-${PR_NUM}.sandbox.videocall.rs" \
+            --set "ingress.hosts[0].host=pr${SLOT}.sandbox.videocall.rs" \
             --set "ingress.hosts[0].paths[0].path=/" \
             --set "ingress.hosts[0].paths[0].pathType=Prefix" \
             --set "ingress.hosts[0].paths[0].service.name=ui-pr-${PR_NUM}" \
             --set "ingress.hosts[0].paths[0].service.port.number=80" \
             --set "ingress.tls[0].secretName=sandbox-wildcard-tls" \
-            --set "ingress.tls[0].hosts[0]=pr-${PR_NUM}.sandbox.videocall.rs" \
+            --set "ingress.tls[0].hosts[0]=pr${SLOT}.sandbox.videocall.rs" \
             --set "ingress.annotations.cert-manager\.io/issuer=null" \
             --set "ingress.annotations.kubernetes\.io/tls-acme=null" \
             --wait --timeout 5m
 
-          echo "✅ UI deployed"
+          echo "✅ UI deployed to slot ${SLOT} with OAuth"
 
       - name: Wait for all pods to be ready
         run: |
-          PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Waiting for all pods to be ready..."
+          echo "Waiting for all pods to be ready in slot ${SLOT}..."
           kubectl wait --for=condition=ready pod --all -n ${NAMESPACE} --timeout=180s
 
-          echo "✅ All pods ready"
+          echo "✅ All pods ready in slot ${SLOT}"
 
       - name: Get deployment status
         id: deployment-status
         run: |
-          PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
+          SLOT=${{ steps.assign-slot.outputs.SLOT }}
+          NAMESPACE="preview-slot-${SLOT}"
 
-          echo "Deployment status:"
+          echo "Deployment status for slot ${SLOT}:"
           kubectl get pods -n ${NAMESPACE}
 
           echo "Services:"
@@ -492,24 +531,34 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const prNumber = ${{ inputs.pr_number }};
+            const slot = ${{ steps.assign-slot.outputs.SLOT }};
+            const maxSlots = ${{ steps.assign-slot.outputs.max_slots }};
+            const isRedeployment = '${{ steps.assign-slot.outputs.is_redeployment }}' === 'true';
+
+            const deploymentType = isRedeployment ? 'redeployed' : 'deployed';
+            const slotStatus = isRedeployment ? '(slot reused)' : '';
+
             github.rest.issues.createComment({
               issue_number: prNumber,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `✅ **PR preview environment deployed successfully!**
+              body: `✅ **Preview ${deploymentType} to slot ${slot}** ${slotStatus}
 
             🌐 **Preview URLs:**
-            - **UI:** https://pr-${prNumber}.sandbox.videocall.rs
-            - **API:** https://pr-${prNumber}-api.sandbox.videocall.rs
-            - **WebSocket:** wss://pr-${prNumber}-ws.sandbox.videocall.rs
+            - **UI:** https://pr${slot}.sandbox.videocall.rs
+            - **API:** https://pr${slot}-api.sandbox.videocall.rs
+            - **WebSocket:** wss://pr${slot}-ws.sandbox.videocall.rs
 
-            ⚠️ **Configuration:**
+            🔐 **Configuration:**
+            - **Authentication:** Google OAuth enabled (login required)
             - WebTransport: Disabled (WebSocket fallback only)
-            - Authentication: Disabled (no OAuth required)
+            - End-to-end encryption: Disabled
 
-            **Cleanup:** Comment \`/undeploy\` to tear down this preview environment.
+            📊 **Slot occupancy:** Slot ${slot} of ${maxSlots} maximum slots
 
-            **Redeploy:** If new commits are pushed, comment \`/build-and-deploy\` again to redeploy (an explicit build is required).
+            **Cleanup:** Comment \`/undeploy\` to free this slot.
+
+            **Redeploy:** Push new commits, then comment \`/build-and-deploy\` to update.
 
             [View deployment logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             });
@@ -532,10 +581,20 @@ jobs:
       - name: Cleanup failed deployment
         run: |
           PR_NUM=${{ inputs.pr_number }}
-          NAMESPACE="preview-${PR_NUM}"
-          DB_NAME="preview_${PR_NUM}"
 
-          echo "Cleaning up failed deployment for PR ${PR_NUM}..."
+          # Find slot assigned to this PR (if any)
+          SLOT=$(kubectl get namespaces -l app=preview,pr=${PR_NUM} \
+            -o jsonpath='{.items[0].metadata.labels.slot}' 2>/dev/null)
+
+          if [ -z "$SLOT" ]; then
+            echo "No slot was assigned, nothing to clean up"
+            exit 0
+          fi
+
+          NAMESPACE="preview-slot-${SLOT}"
+          DB_NAME="preview_slot_${SLOT}"
+
+          echo "Cleaning up failed deployment for PR ${PR_NUM} in slot ${SLOT}..."
 
           # Delete namespace (cascades to all resources)
           kubectl delete namespace ${NAMESPACE} --ignore-not-found=true
@@ -547,7 +606,7 @@ jobs:
               echo "⚠️  Failed to drop database, may need manual cleanup"
             }
 
-          echo "✅ Cleanup complete"
+          echo "✅ Cleanup complete for slot ${SLOT}"
 
       - name: Post failure comment
         uses: actions/github-script@v7

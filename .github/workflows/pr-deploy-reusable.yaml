@@ -193,7 +193,7 @@ jobs:
             echo "images_missing=true" >> $GITHUB_OUTPUT
             echo "missing_list<<EOF" >> $GITHUB_OUTPUT
             for IMG in "${MISSING_IMAGES[@]}"; do
-              echo "- \`${IMG}\`" >> $GITHUB_OUTPUT
+              echo "- **${IMG}**" >> $GITHUB_OUTPUT
             done
             echo "EOF" >> $GITHUB_OUTPUT
           else
@@ -509,7 +509,7 @@ jobs:
 
             **Cleanup:** Comment \`/undeploy\` to tear down this preview environment.
 
-            **Redeploy:** If new commits are pushed, comment \`/deploy\` again to redeploy.
+            **Redeploy:** If new commits are pushed, comment \`/build-and-deploy\` again to redeploy (an explicit build is required).
 
             [View deployment logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`
             });

@@ -35,6 +35,7 @@ cpal = "0.15.2"
 opus = "0.3.0"
 image = "0.25.5"
 env-libvpx-sys = { version = "5.1.3", features=["generate"] }
+videocall-codecs = { path = "../videocall-codecs", version = "0.1.12" }
 videocall-nokhwa = { path = "nokhwa", version = "0.10.9", features = ["input-native", "output-threaded"] }
 videocall-client = { path = "../videocall-client", version = "4.0.2", features = ["native"] }
 

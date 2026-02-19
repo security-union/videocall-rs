@@ -16,7 +16,7 @@
  * conditions.
  */
 
-use crate::video_encoder::VideoEncoderBuilder;
+use videocall_codecs::encoder::VideoEncoderBuilder;
 use image::imageops::FilterType;
 use image::{ImageBuffer, ImageReader, Rgb};
 use protobuf::Message;

@@ -18,7 +18,6 @@
 
 mod audio_producer;
 mod config;
-mod video_encoder;
 mod video_producer;
 
 use audio_producer::AudioProducer;

@@ -948,7 +948,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "dotenv",
- "env-libvpx-sys",
  "futures",
  "hound",
  "image 0.25.5",
@@ -961,6 +960,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "videocall-client",
+ "videocall-codecs",
  "videocall-types",
 ]
 
@@ -7158,6 +7158,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "videocall-client",
+ "videocall-codecs",
  "videocall-nokhwa",
  "videocall-types",
 ]

@@ -2,7 +2,7 @@ use crate::components::attendants::AttendantsComponent;
 use crate::components::waiting_room::WaitingRoom;
 use crate::constants::{e2ee_enabled, webtransport_enabled};
 use crate::context::{
-    is_valid_username, load_username_from_storage, save_username_to_storage, UsernameCtx,
+    load_username_from_storage, save_username_to_storage, UsernameCtx
 };
 use crate::meeting_api::{get_meeting_info, join_meeting, JoinError};
 use gloo_timers::callback::Interval;
@@ -14,6 +14,8 @@ use yew_router::prelude::*;
 use crate::auth::{check_session, get_user_profile, logout, UserProfile};
 use crate::constants::oauth_enabled;
 use crate::routing::Route;
+
+use std::collections::BTreeSet;
 
 /// Meeting participant status from the API
 #[derive(Clone, PartialEq, Debug)]
@@ -46,6 +48,74 @@ pub struct MeetingPageProps {
 
 #[function_component(MeetingPage)]
 pub fn meeting_page(props: &MeetingPageProps) -> Html {
+    
+    // Display name validation rules
+
+    const DISPLAY_NAME_MAX_LEN: usize = 50;
+
+    fn normalize_spaces(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut prev_space = false;
+
+        for ch in s.trim().chars() {
+            if ch.is_whitespace() {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            } else {
+                out.push(ch);
+                prev_space = false;
+            }
+        }
+
+        out
+    }
+
+    fn is_allowed_char(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == ' ' || ch == '_' || ch == '-' || ch == '\''
+    }
+
+    fn validate_display_name(raw: &str) -> Result<String, String> {
+        let value = normalize_spaces(raw);
+
+        if value.is_empty() {
+            return Err("Name cannot be empty.".to_string());
+        }
+
+        if value.chars().count() > DISPLAY_NAME_MAX_LEN {
+            return Err(format!("Name is too long (max {} characters).", DISPLAY_NAME_MAX_LEN));
+        }
+
+        let mut invalid_chars = vec![];
+
+        for ch in value.chars() {
+            if !is_allowed_char(ch) {
+                invalid_chars.push(ch);
+            }
+        }
+
+        if !invalid_chars.is_empty() {
+            return Err(format!(
+                "Invalid characters found: {:?}. Allowed: letters, numbers, spaces, '_', '-', apostrophe.",
+                invalid_chars
+            ));
+        }
+
+        Ok(value)
+    }
+
+    fn email_to_display_name(local: &str) -> String {
+        let replaced: String = local
+            .chars()
+            .map(|c| match c {
+                '.' | '_' | '-' => ' ',
+                _ => c,
+            })
+            .collect();
+
+        normalize_spaces(&replaced)
+    }
     // --- ALL Hooks MUST be declared first (unconditionally) ---
     // Retrieve the username context (may be None on first load)
     let username_state =
@@ -57,7 +127,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
 
     // User profile state (for displaying in dropdown when OAuth is enabled)
     let user_profile = use_state(|| None as Option<UserProfile>);
-    let show_dropdown = use_state(|| false);
 
     // Meeting status state
     let meeting_status = use_state(|| MeetingStatus::NotJoined);
@@ -263,14 +332,6 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         })
     };
 
-    // Toggle dropdown
-    let on_toggle_dropdown = {
-        let show_dropdown = show_dropdown.clone();
-        Callback::from(move |_| {
-            show_dropdown.set(!*show_dropdown);
-        })
-    };
-
     // Early return for auth check (AFTER all hooks are declared)
     if !*auth_checked && oauth_enabled().unwrap_or(false) {
         return html! {
@@ -430,36 +491,18 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         Callback::from(move |e: SubmitEvent| {
             e.prevent_default();
             let value = (*input_value_state).clone();
-            if is_valid_username(&value) {
-                save_username_to_storage(&value);
+            match validate_display_name(&value) {
+                Ok(valid_name) => {
+                    input_value_state.set(valid_name.clone());
+                    save_username_to_storage(&valid_name);
 
-                // Check if we are in the username-reset flow (flag set by the
-                // "Change name" button). If so, trigger a full page reload
-                // *before* creating a new connection. The page will boot
-                // fresh, read the new cached username, and initiate a clean
-                // connection — the old one is gone.
-                if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                    if let Ok(Some(flag)) = storage.get_item("vc_username_reset") {
-                        if flag == "1" {
-                            let _ = storage.remove_item("vc_username_reset");
-                            if let Some(win) = window() {
-                                let _ = win.location().reload();
-                            }
-                            return; // skip state update – page is reloading
-                        }
-                    }
+                    username_state.set(Some(valid_name));
+                    error_state.set(None);
+                    on_join_meeting.emit(());
                 }
-
-                // Normal flow (first time entering username or via Home page)
-                username_state.set(Some(value));
-                error_state.set(None);
-
-                // Trigger join meeting API call
-                on_join_meeting.emit(());
-            } else {
-                error_state.set(Some(
-                    "Please enter a valid username (letters, numbers, underscore).".to_string(),
-                ));
+                Err(message) => {
+                    error_state.set(Some(message));
+                }
             }
         })
     };
@@ -483,29 +526,18 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
         Callback::from(move |e: KeyboardEvent| {
             if e.key() == "Enter" {
                 let value = (*input_value_state).clone();
-                if is_valid_username(&value) {
-                    save_username_to_storage(&value);
+                match validate_display_name(&value) {
+                    Ok(valid_name) => {
+                        input_value_state.set(valid_name.clone());
+                        save_username_to_storage(&valid_name);
 
-                    if let Some(storage) = window().and_then(|w| w.local_storage().ok().flatten()) {
-                        if let Ok(Some(flag)) = storage.get_item("vc_username_reset") {
-                            if flag == "1" {
-                                let _ = storage.remove_item("vc_username_reset");
-                                if let Some(win) = window() {
-                                    let _ = win.location().reload();
-                                }
-                                e.prevent_default();
-                                return;
-                            }
-                        }
+                        username_state.set(Some(valid_name));
+                        error_state.set(None);
+                        on_join_meeting.emit(());
                     }
-
-                    username_state.set(Some(value));
-                    error_state.set(None);
-                    on_join_meeting.emit(());
-                } else {
-                    error_state.set(Some(
-                        "Please enter a valid username (letters, numbers, underscore).".to_string(),
-                    ));
+                    Err(message) => {
+                        error_state.set(Some(message));
+                    }
                 }
                 e.prevent_default();
             }
@@ -523,7 +555,27 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
     let current_meeting_status = (*meeting_status).clone();
     // let current_host_display_name = (*host_display_name).clone();
     let should_auto_join = *came_from_waiting_room;
+    let display_name_options: Vec<String> = {
+        let mut set = BTreeSet::<String>::new();
 
+        if let Some(profile) = (*user_profile).as_ref() {
+
+            let name = normalize_spaces(profile.name.trim());
+            if !name.is_empty() {
+                set.insert(name);
+            }
+
+            let email = profile.email.trim();
+            if let Some(local) = email.split('@').next() {
+                let candidate = email_to_display_name(local);
+                if !candidate.is_empty() {
+                    set.insert(candidate);
+                }
+            }
+        }
+
+        set.into_iter().collect()
+    };
     html! {
         <>
             {
@@ -654,66 +706,29 @@ pub fn meeting_page(props: &MeetingPageProps) -> Html {
                     _ => {
                         html! {
                             <div id="username-prompt" class="username-prompt-container relative">
-                                // User profile dropdown (only show if OAuth is enabled and profile is loaded)
-                                {
-                                    if oauth_enabled().unwrap_or(false) {
-                                        if let Some(profile) = (*user_profile).clone() {
-                                            html! {
-                                                <div class="fixed top-4 right-4 z-50">
-                                                    <button
-                                                        type="button"
-                                                        onclick={on_toggle_dropdown.clone()}
-                                                        class="flex items-center gap-2 px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-white text-sm transition-colors
-                                                              focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 focus-visible:ring-offset-2 focus-visible:ring-offset-black"
-                                                    >
-                                                        <span>{&profile.name}</span>
-                                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-                                                        </svg>
-                                                    </button>
-
-                                                    {
-                                                        if *show_dropdown {
-                                                            html! {
-                                                                <div class="absolute right-0 mt-2 w-56 bg-white rounded-lg shadow-lg border border-gray-200 py-1">
-                                                                    <div class="px-4 py-3 border-b border-gray-200">
-                                                                        <p class="text-sm font-medium text-gray-900">{&profile.name}</p>
-                                                                        <p class="text-xs text-gray-500 truncate">{&profile.email}</p>
-                                                                    </div>
-                                                                    <button
-                                                                        onclick={on_logout.reform(|_| ())}
-                                                                        class="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors"
-                                                                    >
-                                                                        {"Sign out"}
-                                                                    </button>
-                                                                </div>
-                                                            }
-                                                        } else {
-                                                            html! {}
-                                                        }
-                                                    }
-                                                </div>
-                                            }
-                                        } else {
-                                            html! {}
-                                        }
-                                    } else {
-                                        html! {}
-                                    }
-                                }
 
                                 <form onsubmit={on_submit} class="username-form">
                                     <h1>{"Choose a display name"}</h1>
                                     <input
                                         class="username-input"
                                         placeholder="Your name"
-                                        pattern="^[a-zA-Z0-9_]*$"
                                         required=true
                                         autofocus=true
+                                        maxlength="50"
+                                        list="display-name-options"
                                         onkeydown={on_keydown}
                                         oninput={on_input}
                                         value={(*input_value_state).clone()}
                                     />
+                                    <datalist id="display-name-options">
+                                    {
+                                        display_name_options
+                                            .iter()
+                                            .cloned()
+                                            .map(|opt| html! { <option value={opt} /> })
+                                            .collect::<Html>()
+                                    }
+                                    </datalist>
                                     { error_html }
                                     <button class="cta-button" type="submit">{"Continue"}</button>
                                 </form>

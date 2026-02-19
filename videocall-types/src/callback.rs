@@ -46,7 +46,7 @@ impl<IN, OUT> Clone for Callback<IN, OUT> {
     }
 }
 
-#[allow(clippy::vtable_address_comparisons)]
+#[allow(clippy::ambiguous_wide_pointer_comparisons)]
 impl<IN, OUT> PartialEq for Callback<IN, OUT> {
     fn eq(&self, other: &Callback<IN, OUT>) -> bool {
         Rc::ptr_eq(&self.cb, &other.cb)

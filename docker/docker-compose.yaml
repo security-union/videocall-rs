@@ -53,16 +53,18 @@ services:
       - type: bind
         source: ../
         target: /app
-      - rustlemania-leptos-ui-cargo-registry-cache:/usr/local/cargo/registry
-      - rustlemania-leptos-ui-cargo-git-cache:/usr/local/cargo/git
-      - rustlemania-leptos-ui-cargo-target-cache:/usr/local/cargo/target
+      - rustlemania-leptos-ui-cargo-registry-cache:/root/.cargo/registry
+      - rustlemania-leptos-ui-cargo-git-cache:/root/.cargo/git
       - rustlemania-leptos-ui-cache:/app/leptos-website/target
     build:
-      dockerfile: ../docker/Dockerfile.website.dev
-      context: ../docker
+      dockerfile: docker/Dockerfile.website.dev
+      context: ../
     working_dir: /app/leptos-website
-    command: bash -c "cargo leptos watch"
+    command: >
+      nix develop /app#leptos-website --command bash -c
+      "npm install && cargo leptos watch"
     environment:
+      - NIX_CONFIG=experimental-features = nix-command flakes
       - LEPTOS_SITE_ADDR=0.0.0.0:4600
       - CARGO_TARGET_DIR=/app/leptos-website/target
       - CARGO_INCREMENTAL=1

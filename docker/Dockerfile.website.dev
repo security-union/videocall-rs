@@ -1,12 +1,11 @@
 FROM nixos/nix:2.33.2
 
-RUN echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
+ENV NIX_CONFIG="experimental-features = nix-command flakes"
 
 WORKDIR /app
 
 COPY flake.nix flake.lock ./
 
-RUN nix profile install nixpkgs#git
 RUN git init && git add flake.nix flake.lock
 
 # Pre-download all tools from the Nix binary cache.

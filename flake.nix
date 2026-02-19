@@ -22,29 +22,42 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
-        rustNightly = pkgs.rust-bin.nightly."2024-11-01".default.override {
+        rustMinimal = pkgs.rust-bin.nightly."2024-11-01".minimal.override {
+          targets = [ "wasm32-unknown-unknown" ];
+        };
+
+        rustDev = pkgs.rust-bin.nightly."2024-11-01".default.override {
           targets = [ "wasm32-unknown-unknown" ];
           extensions = [ "rust-src" "rust-analyzer" ];
         };
-      in
-      {
-        devShells.leptos-website = pkgs.mkShell {
-          nativeBuildInputs = [
-            rustNightly
-            pkgs.cargo-leptos
-            pkgs.wasm-bindgen-cli_0_2_100
-            pkgs.nodejs_20
-            pkgs.binaryen
-            pkgs.pkg-config
-            pkgs.openssl
-            pkgs.git
-          ];
 
+        commonBuildInputs = [
+          pkgs.cargo-leptos
+          pkgs.wasm-bindgen-cli_0_2_100
+          pkgs.nodejs_20
+          pkgs.binaryen
+          pkgs.pkg-config
+          pkgs.openssl
+          pkgs.git
+        ];
+
+        commonEnv = {
           LEPTOS_HASH_FILES = "false";
           LEPTOS_TAILWIND_VERSION = "v3.4.17";
         };
+      in
+      {
+        # Minimal shell for Docker and CI builds (no docs, no rust-analyzer)
+        devShells.leptos-website = pkgs.mkShell (commonEnv // {
+          nativeBuildInputs = [ rustMinimal ] ++ commonBuildInputs;
+        });
 
-        devShells.default = self.devShells.${system}.leptos-website;
+        # Full shell for local development (includes rust-analyzer, docs)
+        devShells.leptos-website-dev = pkgs.mkShell (commonEnv // {
+          nativeBuildInputs = [ rustDev ] ++ commonBuildInputs;
+        });
+
+        devShells.default = self.devShells.${system}.leptos-website-dev;
       }
     );
 }
